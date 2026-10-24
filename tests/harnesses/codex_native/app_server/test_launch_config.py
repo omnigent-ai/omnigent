@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import shlex
 import sys
 from pathlib import Path
 from typing import Any
@@ -130,6 +131,22 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
     overrides = "\n".join(app_server.config_overrides)
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
+    # The helper runs through the failure recorder, which names this profile
+    # and host when a mint fails and shares Codex's own timeout budget.
+    auth = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]["auth"]
+    assert auth["command"] == "sh"
+    words = shlex.split(auth["args"][-1])
+    assert words[:4] == [
+        sys.executable,
+        "-I",
+        "-m",
+        "omnigent.harnesses.codex_native.provider_auth",
+    ]
+    assert words[words.index("--provider") + 1] == "Databricks"
+    assert words[words.index("--databricks-profile") + 1] == "oss"
+    assert words[words.index("--databricks-host") + 1] == "https://example.cloud.databricks.com"
+    assert words[words.index("--timeout-ms") + 1] == str(auth["timeout_ms"])
+    assert 'databricks auth token --profile "oss"' in words[-1]
 
 
 _UCODE_HOST = "https://example.cloud.databricks.com"

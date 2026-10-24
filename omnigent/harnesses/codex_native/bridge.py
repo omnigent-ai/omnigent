@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from omnigent.harnesses.codex_egress import CertificateFailure
+from omnigent.harnesses.codex_native.provider_auth import ProviderAuthFailure
 from omnigent.native import native_bridge_common
 
 if TYPE_CHECKING:
@@ -59,6 +60,9 @@ _STATE_LOCK_FILE = "state.lock"
 _STARTUP_ERROR_FILE = "startup_error.json"
 _STARTUP_TIMEOUT_FILE = "startup_timeout.json"
 _EGRESS_CERTIFICATE_FILE = "egress_certificate_failure.json"
+_PROVIDER_AUTH_FAILURE_FILE = "provider_auth_failure.json"
+#: Basename of the private per-session ``CODEX_HOME`` inside a bridge directory.
+CODEX_HOME_DIR_NAME = "codex-home"
 # Applied model/effort that config.toml failed to record, for every reader of it.
 _UNMIRRORED_SETTINGS_FILE = "unmirrored_settings.json"
 _UNMIRRORED_SETTINGS_LOCK_FILE = "unmirrored_settings.lock"
@@ -534,7 +538,7 @@ def codex_home_for_bridge_dir(bridge_dir: Path) -> Path:
     :param bridge_dir: Native Codex bridge directory.
     :returns: Absolute per-session ``CODEX_HOME`` directory.
     """
-    return bridge_dir / "codex-home"
+    return bridge_dir / CODEX_HOME_DIR_NAME
 
 
 def bridge_dir_for_codex_home(codex_home: Path) -> Path:
@@ -1160,6 +1164,7 @@ def clear_bridge_state(bridge_dir: Path) -> None:
             _STARTUP_TIMEOUT_FILE,
             _MCP_STARTUP_FILE,
             _EGRESS_CERTIFICATE_FILE,
+            _PROVIDER_AUTH_FAILURE_FILE,
         ):
             try:
                 (bridge_dir / name).unlink()
@@ -1347,6 +1352,45 @@ def clear_certificate_failure(bridge_dir: Path) -> None:
     """
     with contextlib.suppress(OSError):
         (bridge_dir / _EGRESS_CERTIFICATE_FILE).unlink()
+
+
+def record_provider_auth_failure(bridge_dir: Path, failure: ProviderAuthFailure) -> None:
+    """
+    Record a failed run of the provider's bearer helper.
+
+    Written by the helper wrapper; the forwarder reads it when Codex fails the
+    turn with a ``provider auth command`` error.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param failure: The redacted, bounded account of the failed run.
+    :returns: None.
+    """
+    _write_bridge_record(bridge_dir, _PROVIDER_AUTH_FAILURE_FILE, failure.to_record())
+
+
+def read_provider_auth_failure(bridge_dir: Path) -> ProviderAuthFailure | None:
+    """
+    Read the latest recorded bearer-helper failure, if any.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: The failure, or ``None`` if absent/unreadable.
+    """
+    try:
+        raw = json.loads((bridge_dir / _PROVIDER_AUTH_FAILURE_FILE).read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return None
+    return ProviderAuthFailure.from_record(raw)
+
+
+def clear_provider_auth_failure(bridge_dir: Path) -> None:
+    """
+    Forget a recorded bearer-helper failure once the helper minted a token.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :returns: None.
+    """
+    with contextlib.suppress(OSError):
+        (bridge_dir / _PROVIDER_AUTH_FAILURE_FILE).unlink()
 
 
 def read_mcp_startup(bridge_dir: Path) -> dict[str, dict[str, str | None]]:
