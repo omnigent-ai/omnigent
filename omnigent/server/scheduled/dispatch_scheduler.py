@@ -248,6 +248,8 @@ class PersistentTaskScheduler:
         self._startups.clear()
         self._loop = None
         self._recovery = None
+        self._recovery_cursor = None
+        self._recovery_cutoff = None
 
     async def _run(self) -> None:
         while True:

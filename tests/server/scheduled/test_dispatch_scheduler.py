@@ -806,6 +806,7 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
     store, failure, deleted, caplog
 ) -> None:
     task = _task(store, execution_target="managed_sandbox")
+    healthy_task = _task(store, "healthy-expired", execution_target="managed_sandbox")
     clock = FakeClock(task.next_run_at)
     run = store.claim_scheduled_run(
         task,
@@ -814,13 +815,23 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
         host_id=occurrence_host_id(task, f"schedule:{task.next_run_at}"),
         lease_seconds=120,
     )
+    # One second later, so the failing run is first in the scan order.
+    healthy_run = store.claim_scheduled_run(
+        healthy_task,
+        now=int(clock.now()) + 1,
+        next_run_at=healthy_task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
     if deleted:
         assert store.delete(task.id)
-    clock.advance(120)
+    clock.advance(121)
 
-    async def recovery(run):
+    async def recovery(recovered):
+        if recovered.id == healthy_run.id:
+            return "failed"
         assert store.get(task.id) is not None
-        assert run.host_id == occurrence_host_id(task, f"schedule:{task.next_run_at}")
+        assert recovered.host_id == occurrence_host_id(task, f"schedule:{task.next_run_at}")
         if recover.await_count == 1:
             if failure == "unknown":
                 return None
@@ -833,7 +844,9 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
 
     recover = AsyncMock(side_effect=recovery)
     fire = AsyncMock()
-    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now, recovery_seconds=0.05)
+    scheduler = PersistentTaskScheduler(
+        store, fire, recover, now=clock.now, recovery_seconds=0.05, batch_size=1
+    )
     await scheduler.poll_once()
     await _drain(scheduler)
     assert store.list_runs(task.id)[0] == [run]
@@ -841,6 +854,13 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
         assert "Invalid recovery result" in caplog.text
     elif failure == "timeout":
         assert "Recovery timed out" in caplog.text
+    # The next page is the healthy run; the failed run waits for the scan to wrap.
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert recover.await_args.args == (healthy_run,)
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    assert recover.await_count == 2
     await scheduler.poll_once()
     await _drain(scheduler)
     if deleted:
@@ -848,7 +868,8 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
         assert store.list_runs(task.id)[0] == []
     else:
         assert store.list_runs(task.id)[0][0].status == "failed"
-    assert recover.await_count == 2
+    assert recover.await_count == 3
+    assert recover.await_args.args == (run,)
     fire.assert_not_awaited()
 
 
@@ -870,6 +891,15 @@ async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, 
         lease_seconds=120,
     )
     clock.advance(120)
+    # Expires after the first scan's cutoff, so it must wait for the scan to wrap.
+    late_task = _task(store, "expires-after-cutoff")
+    late_run = store.claim_scheduled_run(
+        late_task,
+        now=int(clock.now()),
+        next_run_at=late_task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
     original_list = store.list_expired_starting_runs
     original_purge = store.purge_deleted_tasks
     discovery_calls = 0
@@ -900,10 +930,24 @@ async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, 
         recover.assert_not_awaited()
         cursor = scheduler._cleanup_cursor
         assert cursor is not None and cursor[2] is not None
+        scan_cutoff = scheduler._recovery_cutoff
+        assert scan_cutoff == int(clock.now())
+        # The discovery failure leaves the cutoff in place while time passes.
+        clock.advance(120)
         await scheduler.poll_once()
         await _drain(scheduler)
         assert scheduler._cleanup_cursor == cursor
         recover.assert_awaited_once_with(run)
+        assert scheduler._recovery_cutoff == scan_cutoff
+        # The empty page after the first run wraps the scan, so late_run waits.
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        recover.assert_awaited_once_with(run)
+        assert scheduler._recovery_cutoff is None
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert recover.await_count == 2
+        assert recover.await_args.args == (late_run,)
         for _ in range(10):
             await scheduler.poll_once()
             await _drain(scheduler)
@@ -1265,21 +1309,25 @@ async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(
     recover = AsyncMock(return_value=None)
     scheduler = PersistentTaskScheduler(store, AsyncMock(), recover, now=clock.now, batch_size=1)
     try:
-        for index in range(len(runs)):
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert [call.args[0] for call in recover.await_args_list] == runs[:1]
+        assert store.get(deleted.id) is None
+        # Expires after the scan's cutoff, so it must wait for the next scan.
+        later = _task(store, "expires-during-scan")
+        later_run = store.claim_scheduled_run(
+            later,
+            now=int(clock.now()),
+            next_run_at=int(clock.now()) + 3600,
+            host_id=None,
+            lease_seconds=120,
+        )
+        clock.advance(120)
+        for index in range(1, len(runs)):
             await scheduler.poll_once()
             await _drain(scheduler)
             assert [call.args[0] for call in recover.await_args_list] == runs[: index + 1]
             assert store.get(deleted.id) is None
-            if index == 0:
-                later = _task(store, "expires-during-scan")
-                later_run = store.claim_scheduled_run(
-                    later,
-                    now=int(clock.now()),
-                    next_run_at=int(clock.now()) + 3600,
-                    host_id=None,
-                    lease_seconds=120,
-                )
-                clock.advance(120)
         # New expirations wait for the next scan, so older uncertain work gets a turn.
         # The empty page ends this scan; the following poll revisits uncertain work.
         await scheduler.poll_once()
@@ -1290,5 +1338,55 @@ async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(
             await _drain(scheduler)
             assert recover.await_args.args == (run,)
         assert recover.await_count == 2 * len(runs) + 1
+    finally:
+        await scheduler.stop()
+
+
+async def test_restart_after_stop_starts_recovery_scan_from_the_beginning(store):
+    tasks = [_task(store, f"restart-{index}") for index in range(2)]
+    clock = FakeClock(max(task.next_run_at for task in tasks))
+    for task in tasks:
+        store.claim_scheduled_run(
+            task,
+            now=int(clock.now()),
+            next_run_at=int(clock.now()) + 3600,
+            host_id=None,
+            lease_seconds=120,
+        )
+    clock.advance(120)
+    runs = store.list_expired_starting_runs(int(clock.now()))
+    recovered = []
+    recovery_started = asyncio.Event()
+
+    async def recover(run):
+        recovered.append(run)
+        recovery_started.set()
+        return
+
+    # The loop polls once on start; the long interval keeps the test to that poll.
+    scheduler = PersistentTaskScheduler(
+        store,
+        AsyncMock(),
+        AsyncMock(side_effect=recover),
+        now=clock.now,
+        batch_size=1,
+        poll_seconds=3600,
+    )
+    try:
+        await scheduler.start()
+        await asyncio.wait_for(recovery_started.wait(), 10)
+        await _drain(scheduler)
+        assert recovered == runs[:1]
+        await scheduler.stop()
+        assert scheduler._recovery_cursor is None
+        assert scheduler._recovery_cutoff is None
+        clock.advance(10)
+        recovery_started.clear()
+        await scheduler.start()
+        await asyncio.wait_for(recovery_started.wait(), 10)
+        await _drain(scheduler)
+        # The restarted scan begins at the first run, with a cutoff taken after the restart.
+        assert recovered == [runs[0], runs[0]]
+        assert scheduler._recovery_cutoff == int(clock.now())
     finally:
         await scheduler.stop()
