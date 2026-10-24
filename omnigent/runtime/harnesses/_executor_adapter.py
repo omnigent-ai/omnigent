@@ -44,7 +44,7 @@ from omnigent.inner.executor import (
     TurnCancelled,
     TurnComplete,
 )
-from omnigent.inner.tracing import TracingContext, is_tracing_enabled
+from omnigent.inner.tracing import AGENT_MODEL, TracingContext, is_tracing_enabled
 from omnigent.native.input_diagnostics import (
     INPUT_FIELDS,
     input_attributes,
@@ -303,6 +303,7 @@ class ExecutorAdapter(HarnessApp):
         from omnigent.runtime.telemetry import (
             current_session_id,
             reset_active_skill,
+            session_attributes_scope,
             session_scope,
             set_active_skill,
         )
@@ -340,6 +341,7 @@ class ExecutorAdapter(HarnessApp):
                     _logger.debug("trace_context_for_response unavailable", exc_info=True)
             with (
                 session_scope(turn_session_id),
+                session_attributes_scope(request.telemetry_attributes),
                 phase_scope(ErrorPhase.TURN),
                 trace_cm,
                 input_delivery_scope(input_identity, response_id=ctx.response_id),
@@ -348,10 +350,20 @@ class ExecutorAdapter(HarnessApp):
                     _logger, "native_input_execution_started", session_id=turn_session_id
                 )
                 if tctx is not None:
+                    session_attributes = request.telemetry_attributes or {}
                     agent_span = tctx.start_agent_span(
                         agent_name=request.model or "unknown",
                         user_message=user_message,
                         model=request.model_override or request.model,
+                        # ``request.model`` is the agent name, never a requested model.
+                        request_model=request.model_override
+                        or session_attributes.get(AGENT_MODEL),
+                    )
+                    tctx.set_requested_turn_settings(
+                        agent_span,
+                        requested_model=request.model_override,
+                        requested_effort=extra.get("reasoning_effort"),
+                        session_attributes=request.telemetry_attributes,
                     )
 
                 response_text: str | None = None
@@ -427,6 +439,11 @@ class ExecutorAdapter(HarnessApp):
                                 from omnigent.runtime.telemetry import record_llm_usage
 
                                 record_llm_usage(agent_span, event.usage)
+                            tctx.set_observed_turn_settings(
+                                agent_span,
+                                usage=event.usage,
+                                reasoning_effort=event.reasoning_effort,
+                            )
                     # --- End tracing ---
                     self._translate_event(event, ctx)
                     if isinstance(event, TurnComplete):

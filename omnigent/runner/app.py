@@ -1274,6 +1274,9 @@ def create_runner_app(
     _session_agent_revisions: dict[str, str] = {}
     _session_snapshot_cache: dict[str, _SessionSnapshot] = {}  # session_id → snapshot
     _session_snapshot_locks: dict[str, asyncio.Lock] = {}  # session_id → snapshot fetch lock
+    # session_id → machine-local span attributes (workspace, git remote, host)
+    _session_telemetry_local_attributes: dict[str, dict[str, str]] = {}
+    _session_telemetry_project_names: dict[str, str] = {}  # project_id → name
     _session_spec_locks: dict[str, asyncio.Lock] = {}  # session_id → spec resolution lock
     _session_init_tasks: dict[
         tuple[str, str, str | None, str | None], asyncio.Task[JSONResponse]
@@ -2111,6 +2114,33 @@ def create_runner_app(
         if workspace and workspace.strip():
             return Path(workspace.strip()).expanduser().resolve()
         return runner_workspace.resolve() if runner_workspace is not None else None
+
+    async def _session_span_attributes(session_id: str) -> dict[str, str]:
+        """Session-level span attributes for a turn; empty when telemetry is off."""
+        from omnigent.runtime.telemetry import telemetry_enabled
+
+        if not telemetry_enabled():
+            return {}
+        from omnigent.runner.session_telemetry import (
+            local_session_attributes,
+            resolve_session_attributes,
+        )
+
+        cwd = await _session_runtime_cwd(session_id)
+        workspace = str(cwd) if cwd is not None else None
+        local = _session_telemetry_local_attributes.get(session_id)
+        if local is None:
+            local = await asyncio.to_thread(local_session_attributes, workspace)
+            _session_telemetry_local_attributes[session_id] = local
+        spec = _unwrap_resolved_spec(_session_spec_cache.get(session_id))
+        return await resolve_session_attributes(
+            server_client,
+            session_id,
+            workspace=workspace,
+            local=local,
+            project_names=_session_telemetry_project_names,
+            configured_model=getattr(getattr(spec, "executor", None), "model", None),
+        )
 
     async def _load_legacy_session_init_context() -> _SessionInitContext:
         await _get_server_version(server_client)
@@ -3471,6 +3501,7 @@ def create_runner_app(
         _session_workspace_cache.pop(session_id, None)
         _session_snapshot_cache.pop(session_id, None)
         _session_snapshot_locks.pop(session_id, None)
+        _session_telemetry_local_attributes.pop(session_id, None)
         _session_init_envelopes.pop(session_id, None)
         _session_reasoning_effort.pop(session_id, None)
         _session_spec_locks.pop(session_id, None)
@@ -5114,6 +5145,8 @@ def create_runner_app(
             "role": "user",
             "model": msg_body.get("model", ""),
         }
+        if _span_attributes := await _session_span_attributes(conv):
+            harness_body["telemetry_attributes"] = _span_attributes
         # The routed model rides in-band on the forwarded message. This body is
         # built field by field (not copied), so it must be threaded explicitly:
         # the harness forwards it onto CreateResponseRequest.model_override and

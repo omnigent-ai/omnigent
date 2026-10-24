@@ -293,7 +293,7 @@ All standard OpenTelemetry env vars; nothing backend-specific in code.
 | `OTEL_SERVICE_NAME` | per component | Service identity in Jaeger |
 | `OTEL_TRACES_SAMPLER` | `parentbased_always_on` (dev) | Always sample locally; ratio-based in prod |
 | `OMNIGENT_OTEL_FASTAPI_INSTRUMENTATION` | `true` | Server/runner HTTP spans + extract |
-| `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` (dev only) | Include payloads on spans; **off in prod** (PII) |
+| `OMNIGENT_OTEL_CAPTURE_CONTENT` | `true` (dev only) | Include payloads on spans, and the session title (§15); **off in prod** (PII) |
 
 Telemetry is **opt-in**: nothing is instrumented and no spans are created unless
 `OMNIGENT_TELEMETRY_ENABLED` is truthy, so a default install is never burdened with
@@ -468,7 +468,7 @@ low-cardinality labels — never content, never ids like `session.id`.
 | Need | Seam | Reference |
 |---|---|---|
 | Structured, per-turn, tree-nested span (agent/tool/skill-like) | New `start_X_span`/`end_X_span` on `TracingContext` + an `elif isinstance(event, …)` branch in the executor-adapter event loop | `omnigent/inner/tracing.py`, `omnigent/runtime/harnesses/_executor_adapter.py` |
-| Cross-cutting attribute on **every** span from ambient context | `make_span_attribute_processor(attr, get_value)` (e.g. a `ContextVar`'s `.get`), registered in `_init_otel_traces` | `telemetry.py` (`session.id`, `omnigent.skill.active`) |
+| Cross-cutting attribute on **every** span from ambient context | `make_span_attribute_processor(attr, get_value)` (e.g. a `ContextVar`'s `.get`), or `make_span_attributes_processor(get_mapping)` for a whole mapping, registered in `_init_otel_traces` | `telemetry.py` (`session.id`, `omnigent.skill.active`, `session_attributes_scope`) |
 | Aggregatable counts / latency (dashboards, alerting) | A metric module copied from `omnigent/db/metrics.py`, with module-level `record_*` wrapped in `@telemetry_guarded` | `omnigent/runtime/skill_metrics.py`, `omnigent/db/metrics.py` |
 | Ad-hoc span around a code block | `telemetry.span()` (+ `record_message_payload` for a gated body) | `telemetry.py`, `omnigent/runtime/policies/engine.py` |
 
@@ -501,7 +501,8 @@ The skill name is read only from the tool's name field (`skill` / `command` for
 `plugin:skill`). Anything else is treated as content: nothing is exported, so a
 malformed call can't leak argument text past content capture.
 
-Ambient attributes (`session.id`, `omnigent.skill.active`) come from span
+Ambient attributes (`session.id`, `omnigent.skill.active`, the session
+attributes of §15) come from span
 processors that `_init_otel_traces` registers on the provider it creates. If the
 process uses an externally installed `TracerProvider` instead, `omnigent.skill.name`
 is still stamped on the skill tool span but `omnigent.skill.active` is not.
@@ -534,3 +535,72 @@ bare or MCP-prefixed `load_skill` tool call, plus claude-sdk's native `Skill`:
 
 </content>
 </invoke>
+
+## 14. Model and effort attributes
+
+The per-turn agent span (`gen_ai.operation.name = invoke_agent`) records both
+what a turn asked for and what it ran with, so a session left on the default
+model or effort still reports a concrete value.
+
+| Attribute | Value |
+|---|---|
+| `gen_ai.request.model` | What the turn asked for: the model override, else the agent's configured model. Unset when neither exists; `gen_ai.agent.name` names the agent. `llm.model_name` keeps its OpenInference value (the override, else the agent name). |
+| `gen_ai.response.model` | The model that ran, whenever it is known. |
+| `omnigent.model.source` | Where `gen_ai.response.model` came from: `observed` (the harness or provider reported it), `resolved_default` (the agent's configured model; nothing reported yet), or `requested` (only the turn's override is known). |
+| `omnigent.reasoning_effort.requested` | The effort the turn asked for, as given, e.g. `high`. Omitted when none was asked for. |
+| `omnigent.reasoning_effort` | The effort that applied, as a level from the shared effort ladder (`low` … `max`). Omitted when unknown; never guessed. |
+| `omnigent.reasoning_effort.source` | Same values as `omnigent.model.source`. |
+
+A value observed at turn end replaces the one stamped at turn start. With
+`OMNIGENT_TELEMETRY_ENABLED` on, the runner also stamps every span of the turn
+with `omnigent.agent.model` (the configured model), `omnigent.session.model`,
+`omnigent.session.model.source` and `omnigent.session.reasoning_effort`, read
+from the session snapshot it already fetches for the session attributes of
+§15, so there are no extra calls. The session model is the harness's last
+report (`observed`), else the session's override (`requested`), else the
+agent's configured model (`resolved_default`). `omnigent.agent.model` is the
+configured default on every span; `gen_ai.request.model` is what this turn
+asked for. The source is inferred: a snapshot `llm_model` that differs from the
+configured model counts as a harness report.
+
+Where the values come from:
+
+| Harness / path | `gen_ai.response.model` | `omnigent.reasoning_effort` |
+|---|---|---|
+| SDK harnesses that report a model in turn usage (claude-sdk, codex, pi, openai-agents, copilot, cursor, kimi, ACP, antigravity) | `observed` at turn end; before that, or if the turn fails, the session model | `requested` when asked for; codex reports the thread's own default as `observed`; otherwise unset |
+| SDK harnesses without turn usage (databricks, goose, hermes, qwen) | Session model (`observed` from an earlier report, else `resolved_default`) | `requested`, else unset |
+| Native terminal harnesses (claude-native, codex-native, cursor-native, kimi-native, kiro-native, opencode-native, antigravity-native) | Session model: the terminal's own report (Claude Code's status line, Codex's thread settings), `observed`; `resolved_default` until it first reports | `requested` (codex-native's effort is mirrored back from Codex); unset when left at the terminal's own default |
+| Turns typed directly in a native terminal | No agent span | No agent span |
+
+An effort left at the harness's own default is unset for Claude Code, the
+Claude Agent SDK, pi and OpenAI Agents: none of them reports the level it
+picked. Omnigent emits no per-LLM-call spans of its own, so these attributes
+live only on the agent span.
+
+## 15. Session attributes
+
+With `OMNIGENT_TELEMETRY_ENABLED` on, the runner resolves session-level
+metadata for every turn it forwards and sends it on the turn body as
+`telemetry_attributes` (`omnigent/runner/session_telemetry.py`). The executor
+adapter binds it with `session_attributes_scope`, and a span processor stamps
+every key on every span the harness emits for the turn, so a downstream job can
+classify spans without joining the Omnigent database.
+
+| Attribute | Source | Gate |
+|---|---|---|
+| `omnigent.session.title` | The session title, re-read each turn | `OMNIGENT_OTEL_CAPTURE_CONTENT`: titles are usually generated from the first message |
+| `omnigent.session.labels.<key>` | Each session label, re-read each turn; internal `omnigent.*` labels are skipped | None: labels are the classification keys this exists for. Keys become attribute names and values are exported as free text, as-is |
+| `omnigent.project.id`, `omnigent.project.name` | The session's project; the name is looked up once per project id for the runner's lifetime | None (metadata) |
+| `omnigent.agent.name` | The session's agent, re-read each turn | None (metadata) |
+| `omnigent.git.branch` | The branch the session records, else the branch checked out in its workspace | None (metadata) |
+| `omnigent.workspace` | The session's runtime working folder, resolved once per session | None (metadata; the path can embed a user name) |
+| `omnigent.git.remote` | The workspace's `origin` URL with any credentials or SSH user stripped, resolved once per session | None (metadata) |
+| `omnigent.host.name` | The runner machine's host name, resolved once per session | None (metadata) |
+
+The gate is evaluated in the runner when the attributes are resolved; the
+harness stamps whatever the runner sent. Every lookup is best-effort and
+bounded: a server read that fails or does not finish within a few seconds
+leaves the turn with the machine-local attributes only, and the turn itself is
+never delayed or failed by telemetry. Nothing is resolved or sent when
+telemetry is off. No user attribute is stamped here: the acting user belongs
+to the semconv `enduser.id`, proposed separately.

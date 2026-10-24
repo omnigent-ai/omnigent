@@ -987,6 +987,69 @@ async def test_forwarded_model_override_reaches_the_harness() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("enabled", [True, False])
+async def test_session_span_attributes_reach_the_harness_only_with_telemetry(
+    monkeypatch: pytest.MonkeyPatch, enabled: bool
+) -> None:
+    """With telemetry on, the runner resolves session span attributes onto the turn body."""
+    from omnigent.runner import session_telemetry
+
+    monkeypatch.setenv("OMNIGENT_TELEMETRY_ENABLED", "true" if enabled else "false")
+    resolved: list[str] = []
+
+    async def fake_resolve(
+        _client: object,
+        session_id: str,
+        *,
+        workspace: str | None,
+        local: dict,
+        project_names: dict,
+        configured_model: str | None,
+    ) -> dict:
+        assert configured_model is None  # no agent spec is cached for this session
+        resolved.append(session_id)
+        return {**local, "omnigent.session.title": "Fix login"}
+
+    monkeypatch.setattr(
+        session_telemetry, "local_session_attributes", lambda _: {"omnigent.host.name": "dev"}
+    )
+    monkeypatch.setattr(session_telemetry, "resolve_session_attributes", fake_resolve)
+    hc = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+        ]
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(hc),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        resp = await client.post(
+            "/v1/sessions/0b5f3c1e9d2a4b7c8e6f1a2b3c4d5e6f/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "model": "test-agent",
+                "content": [{"type": "input_text", "text": "hi"}],
+            },
+        )
+        assert resp.status_code == 202
+        for _ in range(200):
+            if hc.posted_bodies:
+                break
+            await asyncio.sleep(0.01)
+
+    assert hc.posted_bodies, "harness never received a turn"
+    expected = (
+        {"omnigent.host.name": "dev", "omnigent.session.title": "Fix login"} if enabled else None
+    )
+    assert hc.posted_bodies[0].get("telemetry_attributes") == expected
+    assert resolved == (["0b5f3c1e9d2a4b7c8e6f1a2b3c4d5e6f"] if enabled else [])
+
+
+@pytest.mark.asyncio
 async def test_forwarded_reasoning_effort_reaches_the_harness() -> None:
     """The turn's reasoning effort rides the forwarded message to the harness.
 

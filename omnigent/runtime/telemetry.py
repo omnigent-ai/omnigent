@@ -69,6 +69,12 @@ _session_id_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "omnigent_session_id", default=None
 )
 
+# Session-level metadata (title, labels, project, workspace, ...) bound for the
+# current turn; every key/value is stamped on every span started in the context.
+_session_attributes_var: contextvars.ContextVar[Mapping[str, str] | None] = contextvars.ContextVar(
+    "omnigent_session_attributes", default=None
+)
+
 # Skill active in the current turn; stamped on every span as `omnigent.skill.active`.
 _active_skill_var: contextvars.ContextVar[str | None] = contextvars.ContextVar(
     "omnigent_active_skill", default=None
@@ -304,6 +310,27 @@ def session_scope(session_id: str | None) -> Iterator[None]:
         _session_id_var.reset(token)
 
 
+@contextmanager
+def session_attributes_scope(attributes: Mapping[str, str] | None) -> Iterator[None]:
+    """
+    Bind session-level span attributes for the current execution context.
+
+    Every span started while this scope is active carries each key/value,
+    e.g. ``{"omnigent.session.title": "Fix login"}``. No-op for an empty
+    mapping or when telemetry is off.
+
+    :param attributes: Span attribute names mapped to string values.
+    """
+    if not attributes or not telemetry_enabled():
+        yield
+        return
+    token = _session_attributes_var.set(dict(attributes))
+    try:
+        yield
+    finally:
+        _session_attributes_var.reset(token)
+
+
 def set_active_skill(skill_name: str) -> contextvars.Token[str | None]:
     """
     Bind *skill_name* as the active skill; spans started until reset carry
@@ -320,6 +347,28 @@ def reset_active_skill(token: contextvars.Token[str | None]) -> None:
     _active_skill_var.reset(token)
 
 
+def make_span_attributes_processor(get_attributes: Callable[[], Mapping[str, str] | None]) -> Any:
+    """
+    Build a span processor that stamps every key/value of ``get_attributes()``
+    on each recording span (skipped when the mapping is empty).
+
+    :param get_attributes: Called at span start, e.g. ``some_context_var.get``.
+    :returns: A ``SpanProcessor`` instance.
+    """
+    from opentelemetry.sdk.trace import SpanProcessor
+
+    class _AttributeSpanProcessor(SpanProcessor):
+        def on_start(self, span: Any, parent_context: Any = None) -> None:
+            try:
+                attributes = get_attributes()
+                if attributes and span.is_recording():
+                    span.set_attributes(attributes)
+            except Exception:  # pragma: no cover - telemetry must never break spans
+                pass
+
+    return _AttributeSpanProcessor()
+
+
 def make_span_attribute_processor(attribute_key: str, get_value: Callable[[], str | None]) -> Any:
     """
     Build a span processor that stamps *attribute_key* with ``get_value()`` on
@@ -329,23 +378,22 @@ def make_span_attribute_processor(attribute_key: str, get_value: Callable[[], st
     :param get_value: Called at span start, e.g. ``some_context_var.get``.
     :returns: A ``SpanProcessor`` instance.
     """
-    from opentelemetry.sdk.trace import SpanProcessor
 
-    class _AttributeSpanProcessor(SpanProcessor):
-        def on_start(self, span: Any, parent_context: Any = None) -> None:
-            try:
-                value = get_value()
-                if value and span.is_recording():
-                    span.set_attribute(attribute_key, value)
-            except Exception:  # pragma: no cover - telemetry must never break spans
-                pass
+    def get_attributes() -> Mapping[str, str] | None:
+        value = get_value()
+        return {attribute_key: value} if value else None
 
-    return _AttributeSpanProcessor()
+    return make_span_attributes_processor(get_attributes)
 
 
 def _make_session_id_processor() -> Any:
     """Span processor stamping ``session.id`` from :data:`_session_id_var`."""
     return make_span_attribute_processor("session.id", _session_id_var.get)
+
+
+def _make_session_attributes_processor() -> Any:
+    """Span processor stamping the attributes bound by :func:`session_attributes_scope`."""
+    return make_span_attributes_processor(_session_attributes_var.get)
 
 
 def _make_active_skill_processor() -> Any:
@@ -1073,6 +1121,7 @@ def _init_otel_traces(endpoint: str) -> None:
             # Enrich every span with session.id from the active context (set via
             # session_scope at the request hook / executor turn / forwarder).
             provider.add_span_processor(_make_session_id_processor())
+            provider.add_span_processor(_make_session_attributes_processor())
             # Tag every span with the skill active in the turn, if any.
             provider.add_span_processor(_make_active_skill_processor())
             provider.add_span_processor(BatchSpanProcessor(_create_otlp_span_exporter()))

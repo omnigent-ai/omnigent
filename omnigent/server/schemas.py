@@ -1154,6 +1154,9 @@ class CreateResponseRequest(BaseModel):
     model_override: str | None = None
     # Compaction strategy objects, e.g. [{"type": "compaction", ...}]
     context_management: list[dict[str, Any]] | None = None
+    # Session-level span attributes the runner resolves when telemetry is on,
+    # e.g. {"omnigent.session.title": "Fix login"}; stamped on the turn's spans.
+    telemetry_attributes: dict[str, str] | None = None
     # Ignored fields — agent controls these; silently dropped.
     # Typed loosely because we only need to accept and discard them.
     temperature: float | None = None
