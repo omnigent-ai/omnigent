@@ -27,6 +27,7 @@ import secrets
 import shutil
 import signal
 import socket
+import stat
 import sys
 import time
 import uuid
@@ -211,6 +212,41 @@ def _default_tmp_parent() -> Path:
         ``/tmp/omnigent-<uid>`` on POSIX.
     """
     return harness_tmp_parent()
+
+
+def _ensure_private_dir(path: Path, *, parents: bool = False) -> None:
+    """
+    Create ``path`` if needed and verify only the current user can write it.
+
+    ``mkdir(exist_ok=True)`` accepts whatever already sits at a predictable
+    shared-``/tmp`` name, and on POSIX the directory mode is the only guard
+    on harness sockets. An operator-configured symlink is allowed only when
+    both the link and its target belong to the current user.
+
+    :param path: Directory to create and verify.
+    :param parents: Whether to create missing ancestors.
+    :raises OSError: When ``path`` is not a directory owned by the current user,
+        or its group/other write access cannot be removed.
+    """
+    path.mkdir(mode=_DIR_MODE, parents=parents, exist_ok=True)
+    if IS_WINDOWS:
+        # Windows temp dirs are already per-user; POSIX ownership doesn't apply.
+        return
+    link_stat = os.lstat(path)
+    target_stat = os.stat(path)
+    uid = os.getuid()
+    if (
+        link_stat.st_uid != uid
+        or target_stat.st_uid != uid
+        or not stat.S_ISDIR(target_stat.st_mode)
+    ):
+        raise OSError(
+            f"harness socket directory {path} is not a directory owned by the current user"
+        )
+    loose_bits = target_stat.st_mode & (stat.S_IWGRP | stat.S_IWOTH)
+    if loose_bits:
+        # Other principals with write access could rename or replace sockets.
+        path.chmod(stat.S_IMODE(target_stat.st_mode) & ~loose_bits)
 
 
 def _socket_path(instance_dir: Path, conversation_id: str) -> Path:
@@ -683,16 +719,12 @@ class HarnessProcessManager:
         if self._started:
             return
         self._shutting_down = False
-        self._tmp_parent.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
+        _ensure_private_dir(self._tmp_parent, parents=True)
         if sweep_orphans:
             # Sweep BEFORE creating our own dir, so a crashed prior instance
             # whose dir uuid happens to collide with ours gets cleaned first.
             await sweep_orphaned_harness_processes(tmp_parent=self._tmp_parent)
-        self._instance_dir.mkdir(mode=_DIR_MODE, parents=True, exist_ok=True)
-        # Write the AP_PID sentinel so other instances' sweeps can tell our
-        # dir is live. The PID-namespace-qualified claim keeps a sweep that
-        # cannot see our PID (e.g. inside an agent sandbox) from deleting it.
-        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
+        self._prepare_instance_dir()
         self._reaper_task = asyncio.create_task(
             self._idle_reaper_loop(),
             name="harness-process-manager-idle-reaper",
@@ -1247,6 +1279,12 @@ class HarnessProcessManager:
                 self._spawn_locks[conversation_id] = lock
             return lock
 
+    def _prepare_instance_dir(self) -> None:
+        """Restore private socket storage and ownership after temporary-file cleanup."""
+        _ensure_private_dir(self._tmp_parent, parents=True)
+        _ensure_private_dir(self._instance_dir)
+        write_owner_claim(self._instance_dir, filename=_AP_PID_FILE)
+
     async def _spawn_entry(
         self,
         conversation_id: str,
@@ -1273,6 +1311,9 @@ class HarnessProcessManager:
             ``_SPAWN_READY_TIMEOUT_S``.
         """
         module_path = _resolve_module_path(harness)
+        # A temporary-directory cleaner may remove the socket's parents while
+        # the manager remains live. Restore them before the child tries to bind.
+        self._prepare_instance_dir()
         endpoint = _HarnessEndpoint.create(self._instance_dir, conversation_id)
         # Defensive: a stale socket file from a previous spawn
         # (released but not cleaned up because of an OS quirk)
