@@ -195,6 +195,7 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
+    SessionCreateInput,
     SessionCreateRequest,
     SessionEventInput,
     SessionForkRequest,
@@ -236,6 +237,38 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+# Strong references to creates still finishing after their client disconnected
+# (asyncio only holds weak refs to tasks).
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_detached_create_tasks: set[asyncio.Task[SessionResponse]] = set()
+
+
+def _log_detached_create(task: asyncio.Task[SessionResponse]) -> None:
+    """
+    Record how a create that outlived its client connection ended.
+
+    :param task: The finished create task.
+    """
+    _detached_create_tasks.discard(task)
+    if task.cancelled():
+        _logger.warning(
+            "Session create was cancelled after its client disconnected",
+            extra=debug_event("session_create_detached", outcome="cancelled"),
+        )
+    elif (exc := task.exception()) is not None:
+        _logger.error(
+            "Session create failed after its client disconnected",
+            exc_info=exc,
+            extra=debug_event("session_create_detached", outcome="failed"),
+        )
+    else:
+        session_id = task.result().id
+        _logger.info(
+            "Session %s was created after its client disconnected",
+            session_id,
+            extra=debug_event("session_create_detached", session_id=session_id, outcome="created"),
+        )
 
 
 def _require_attachment_compatible_history(
@@ -943,6 +976,38 @@ def register_core_routes(
         if body.requested_host_id is not None:
             await _check_requested_host_id(request, body.requested_host_id, user_id)
         creation_metadata(parent_session_id=body.parent_session_id, host_type=body.host_type)
+        create = _create_validated_session(request, body, user_id)
+        if body.parent_session_id is not None:
+            # A runner reconciles its own timed-out sub-agent create and then
+            # retries, so finishing an abandoned one would leak a duplicate child.
+            return await create
+        # A host create can take a minute (``git worktree add`` on a large
+        # repo) while the web UI already shows the new session, so a refresh in
+        # that window must not drop the session and strand the worktree the
+        # host goes on to create. Finish the create even if the client leaves.
+        task = asyncio.create_task(create)
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if not task.done():
+                _detached_create_tasks.add(task)
+                task.add_done_callback(_log_detached_create)
+            raise
+
+    async def _create_validated_session(
+        request: Request,
+        body: SessionCreateInput,
+        user_id: str | None,
+    ) -> SessionResponse:
+        """
+        Create, grant, announce, and launch a session from a validated body.
+
+        :param request: The create request; supplies app state and any
+            multipart initial files.
+        :param body: The validated JSON create body.
+        :param user_id: Authenticated caller, e.g. ``"alice@example.com"``.
+        :returns: The new session's snapshot.
+        """
         resp, conv = await _create_session_from_existing_agent(
             conversation_store,
             agent_store,
