@@ -5688,3 +5688,80 @@ async def test_events_codex_side_chat_message_failure_is_structured(
     if detail is not None:
         assert response.json()["detail"] == detail
     assert fake_client.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("terminal_name", "retired"),
+    [("cursor", True), ("worker", False)],
+    ids=["cursor-retires", "generic-keeps"],
+)
+async def test_required_terminal_exit_retires_pane_bound_forwarder(
+    tmp_path: Path, terminal_name: str, retired: bool
+) -> None:
+    """A required cursor pane exiting cancels its transcript forwarder.
+
+    An orphaned forwarder keeps refreshing its chat claim and can adopt the chat
+    the next cursor-native session in the same cwd creates, so that session
+    completes with no output. Harnesses whose forwarder is not pane-bound keep
+    theirs across the exit.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from omnigent.runner.native import orchestration as native_runtime
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = uuid.uuid4().hex
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance(terminal_name, "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[(terminal_name, "main")] = instance
+    callbacks: dict[str, Any] = {}
+
+    def _capture_watcher(
+        on_idle: object | None = None,
+        *,
+        on_activity: object | None = None,
+        on_exit: object | None = None,
+        on_tick: object | None = None,
+        idle_threshold_s: float | None = None,
+        poll_interval_s: float | None = None,
+        replace: bool = False,
+    ) -> None:
+        del on_idle, on_activity, on_tick, idle_threshold_s, poll_interval_s, replace
+        callbacks["on_exit"] = on_exit
+
+    instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[method-assign]
+    pm = _FakeProcessManager(_ScriptedHarnessClient([]))
+    pm._sessions.add(conv_id)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        terminal_registry=terminal_registry,
+    )
+    forwarder = asyncio.create_task(asyncio.Event().wait(), name=f"forwarder-{conv_id}")
+    native_runtime._register_auto_forwarder_task(conv_id, forwarder)
+    try:
+        await app.state.session_resource_registry.observe_required_terminal(
+            conv_id, terminal_name, "main", instance
+        )
+        on_exit = callbacks.get("on_exit")
+        assert callable(on_exit)
+        instance.running = False
+        on_exit()
+
+        async def _settled() -> None:
+            while not forwarder.cancelled():
+                await asyncio.sleep(0)
+
+        if retired:
+            await asyncio.wait_for(_settled(), timeout=budget(2.0))
+            assert conv_id not in native_runtime._AUTO_FORWARDER_TASKS
+        else:
+            for _ in range(50):
+                await asyncio.sleep(0)
+            assert not forwarder.cancelled()
+            assert native_runtime._AUTO_FORWARDER_TASKS.get(conv_id) is forwarder
+    finally:
+        forwarder.cancel()
+        await asyncio.gather(forwarder, return_exceptions=True)
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv_id, None)
+        _session_event_queues_ref.pop(conv_id, None)

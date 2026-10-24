@@ -422,6 +422,81 @@ class TestChatClaim:
         )
         assert fwd._chat_claimed_by_other(live, Path(store), my_launch_ms=2_000) is False
 
+    def test_released_claim_frees_the_chat_but_keeps_the_resume_cursor(
+        self, tmp_path: Path
+    ) -> None:
+        root = tmp_path / "cursor-native"
+        stopped = root / "sessStopped"
+        successor = root / "sessNext"
+        stopped.mkdir(parents=True)
+        successor.mkdir(parents=True)
+        store = "/cursor/chats/h/c/store.db"
+        fwd._write_state(
+            stopped, fwd._ForwardState(store_path=store, last_rowid=7, launch_epoch_ms=1_000)
+        )
+        assert fwd._chat_claimed_by_other(successor, Path(store), my_launch_ms=2_000) is True
+
+        fwd.release_cursor_chat_claim(stopped)
+
+        # The successor may take the chat at once instead of waiting out the
+        # heartbeat window, while the stopped session's cursor survives for resume.
+        assert fwd._chat_claimed_by_other(successor, Path(store), my_launch_ms=2_000) is False
+        released = fwd._read_state(stopped)
+        assert (released.store_path, released.last_rowid, released.launch_epoch_ms) == (
+            store,
+            7,
+            1_000,
+        )
+        assert released.heartbeat_ms == 0
+
+    def test_release_without_a_claim_writes_nothing(self, tmp_path: Path) -> None:
+        bridge_dir = tmp_path / "cursor-native" / "sessUnbound"
+        bridge_dir.mkdir(parents=True)
+        fwd.release_cursor_chat_claim(bridge_dir)
+        assert not (bridge_dir / fwd._STATE_FILE).exists()
+
+
+@pytest.mark.asyncio
+async def test_supervisor_cancellation_releases_the_chat_claim(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Cancelling the supervised forwarder zeroes its heartbeat on the way out."""
+    bridge_dir = tmp_path / "cursor-native" / "sess"
+    bridge_dir.mkdir(parents=True)
+    store = "/cursor/chats/h/c/store.db"
+    started = asyncio.Event()
+
+    async def _claim_then_block(**kwargs: object) -> None:
+        claimed_dir = kwargs["bridge_dir"]
+        assert isinstance(claimed_dir, Path)
+        fwd._write_state(
+            claimed_dir, fwd._ForwardState(store_path=store, last_rowid=3, launch_epoch_ms=1_000)
+        )
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(fwd, "forward_cursor_store_to_session", _claim_then_block)
+    task = asyncio.create_task(
+        fwd.supervise_cursor_forwarder(
+            base_url="http://test",
+            headers={},
+            session_id="conv_1",
+            bridge_dir=bridge_dir,
+            agent_name="cursor-native-ui",
+            workspace="/ws",
+            launch_epoch_ms=1_000,
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=5)
+    assert fwd._read_state(bridge_dir).heartbeat_ms > 0
+
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    released = fwd._read_state(bridge_dir)
+    assert released.heartbeat_ms == 0
+    assert (released.store_path, released.last_rowid) == (store, 3)
+
 
 class _RecordingClient:
     """Async httpx-client stub that records POSTs and returns HTTP 200."""

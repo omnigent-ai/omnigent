@@ -142,7 +142,7 @@ from omnigent.runner.native import (
     _unwrap_resolved_spec,
 )
 from omnigent.runner.native import orchestration as _native_runtime
-from omnigent.runner.native.interrupt import NativeInterruptRunner
+from omnigent.runner.native.interrupt import NativeInterruptRunner, forwarder_retires_with_pane
 from omnigent.runner.native_controls import build_native_controls
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
@@ -1858,6 +1858,12 @@ def create_runner_app(
         )
         _teardown_task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(_teardown_task)
+        if forwarder_retires_with_pane(event.terminal_name):
+            # A forwarder that outlives its pane keeps its chat claim fresh and
+            # can adopt the next same-cwd session's chat, silencing that session.
+            _forwarder_task = asyncio.create_task(_cancel_auto_forwarder_task(event.session_id))
+            _forwarder_task.add_done_callback(_background_tasks.discard)
+            _background_tasks.add(_forwarder_task)
 
         # Record the exit before releasing the harness: the release severs any
         # in-flight turn stream, whose failure handler then reports this exit
