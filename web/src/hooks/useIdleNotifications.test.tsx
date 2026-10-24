@@ -284,6 +284,98 @@ describe("useIdleNotifications turn-end transitions", () => {
   });
 });
 
+describe("useIdleNotifications cross-device watched-finish suppression", () => {
+  // The server stamps `last_finished_at` when a turn reaches a terminal
+  // status, and a device actively viewing the session raises the shared
+  // read baseline (`viewer_last_seen`) past that stamp the moment it lands
+  // (`useMarkConversationSeen`). A finish the user watched on another
+  // device must stay quiet here; a finish nobody watched must notify even
+  // when its content was already read.
+  it("does NOT notify a turn end the user already watched on another device", async () => {
+    setConversations([{ ...conv("a", "running"), updated_at: 90 }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    // The finish arrives with the read state already past the stamp (the
+    // watching device acked the finish before this client's diff tick).
+    setConversations([
+      { ...conv("a", "idle"), updated_at: 100, last_finished_at: 101, viewer_last_seen: 101 },
+    ]);
+    rerender();
+    await settle();
+
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("cancels a pending turn-end when the finish-ack lands during the settle window", async () => {
+    setConversations([{ ...conv("a", "running"), updated_at: 90 }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    // The finish is observed while the read state still lags the stamp — a
+    // cue is scheduled.
+    setConversations([
+      { ...conv("a", "idle"), updated_at: 100, last_finished_at: 101, viewer_last_seen: 50 },
+    ]);
+    rerender();
+    await act(async () => {
+      vi.advanceTimersByTime(SETTLE_MS / 2);
+    });
+
+    // Mid-window, the watching device's finish-ack lands on this client.
+    setConversations([
+      { ...conv("a", "idle"), updated_at: 100, last_finished_at: 101, viewer_last_seen: 101 },
+    ]);
+    rerender();
+    await settle();
+
+    expect(showMock).not.toHaveBeenCalled();
+  });
+
+  it("DOES notify when the read state lags the finish (nobody watched it)", async () => {
+    setConversations([{ ...conv("a", "running"), updated_at: 90 }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([
+      { ...conv("a", "idle"), updated_at: 100, last_finished_at: 101, viewer_last_seen: 50 },
+    ]);
+    rerender();
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+    expect(showMock.mock.calls[0][0]).toMatchObject({ tag: "omnigent:session:a" });
+  });
+
+  it("DOES notify a finish whose content was already read but not watched", async () => {
+    // The user viewed the session mid-turn (read state caught up with the
+    // last append) and left before the turn ended: seen content, unwatched
+    // finish. This is the regression guard for anchoring suppression on
+    // `updated_at` — a content-less finish must still notify.
+    setConversations([{ ...conv("a", "running"), updated_at: 90, viewer_last_seen: 95 }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([
+      { ...conv("a", "idle"), updated_at: 90, last_finished_at: 100, viewer_last_seen: 95 },
+    ]);
+    rerender();
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+    expect(showMock.mock.calls[0][0]).toMatchObject({ tag: "omnigent:session:a" });
+  });
+
+  it("DOES notify when no finish stamp is available (fail-open)", async () => {
+    // A replica that never observed the edge serves no stamp; suppression
+    // must never engage on read state alone.
+    setConversations([{ ...conv("a", "running"), updated_at: 90 }]);
+    const { rerender } = renderHook(() => useIdleNotifications());
+
+    setConversations([{ ...conv("a", "idle"), updated_at: 100, viewer_last_seen: 200 }]);
+    rerender();
+    await settle();
+
+    expect(showMock).toHaveBeenCalledOnce();
+  });
+});
+
 describe("useIdleNotifications elicitation transitions", () => {
   it("notifies when pending_elicitations_count increases (0 -> 1)", () => {
     setConversations([conv("a", "running", 0)]);
