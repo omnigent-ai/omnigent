@@ -7103,9 +7103,9 @@ async def _forward_event_to_runner(
             # The router may land this session on any auto-routing harness, so
             # every one of them must be gateway-backed for the workspace router
             # to serve the pick; otherwise the built-in judge does.
-            _auto_backed = _gateway_backed(
-                await _session_routing_host(conv, host_store), _AUTO_ROUTING_HARNESSES
-            )
+            _auto_host = await _session_routing_host(conv, host_store)
+            _auto_backed = _gateway_backed(_auto_host, _AUTO_ROUTING_HARNESSES)
+            _auto_static = _static_table_backed(_auto_host, _AUTO_ROUTING_HARNESSES)
             # For a forced-auto child, route against the parent's catalog (full
             # spawnable-worker map) rather than the child's leaf "self" catalog.
             _auto_harness, _auto_model, _auto_verdict, _auto_error = await route_session_harness(
@@ -7114,7 +7114,7 @@ async def _forward_event_to_runner(
                 catalog_session_id=conv.parent_conversation_id,
                 runner_client=runner_client,
                 gateway_backed=_auto_backed,
-                allow_static_fallback=_auto_backed,
+                allow_static_fallback=_auto_static,
             )
             try:
                 # Always clear the "auto" sentinel even when routing
@@ -7251,6 +7251,7 @@ async def _forward_event_to_runner(
                 if _child_host is None and _parent_conv is not None:
                     _child_host = await _session_routing_host(_parent_conv, host_store)
                 _child_backed = _gateway_backed(_child_host, _child_gateway_harnesses)
+                _child_static = _static_table_backed(_child_host, _child_gateway_harnesses)
                 # Route against the PARENT's catalog: it enumerates the
                 # spawnable workers (claude_code/codex/pi) with full model
                 # lists, whereas this child's own leaf catalog is "self"-only
@@ -7263,7 +7264,7 @@ async def _forward_event_to_runner(
                     allowed_family=_child_family,
                     harness_candidates=_child_candidates,
                     gateway_backed=_child_backed,
-                    allow_static_fallback=_child_backed,
+                    allow_static_fallback=_child_static,
                 )
                 if _routed_model is not None:
                     effective_runner_override = _routed_model
@@ -7307,9 +7308,9 @@ async def _forward_event_to_runner(
                 _harness = _resolve_harness(conv)
                 # A turn cannot change harness, so only this session's own
                 # family has to be gateway-backed for the workspace router.
-                _turn_backed = _gateway_backed(
-                    await _session_routing_host(conv, host_store), (_harness or "",)
-                )
+                _turn_host = await _session_routing_host(conv, host_store)
+                _turn_backed = _gateway_backed(_turn_host, (_harness or "",))
+                _turn_static = _static_table_backed(_turn_host, (_harness or "",))
                 # ``_or_decline``: a routing outage returns an error string
                 # rather than raising. Raised here it became a 500 on the
                 # events POST, so a router that was merely down cost the user
@@ -7321,7 +7322,7 @@ async def _forward_event_to_runner(
                     runner_client=runner_client,
                     catalog=await _native_turn_catalog(session_id, conv, runner_client),
                     gateway_backed=_turn_backed,
-                    allow_static_fallback=_turn_backed,
+                    allow_static_fallback=_turn_static,
                 )
                 if _turn_route_err is not None:
                     # Not routed, and visibly so — the turn runs on the
@@ -10523,6 +10524,15 @@ def _gateway_backed(host: Host | None, harnesses: Sequence[str]) -> bool:
     return not _ungatewayed_native_harnesses(host, harnesses)
 
 
+def _static_table_backed(host: Host | None, harnesses: Sequence[str]) -> bool:
+    """Whether *host* may fill a routing menu from the gateway-only static ``databricks-*`` table.
+    Stricter than :func:`_gateway_backed`; :func:`gateway_backs_static_table` holds the rule."""
+    from omnigent.gateway_inference import gateway_backs_static_table
+    from omnigent.server.routing_backend import reported_gateway_inference
+
+    return gateway_backs_static_table(reported_gateway_inference(host), harnesses)
+
+
 def _oss_routing_available(caps: Any = None) -> bool:  # type: ignore[explicit-any]
     """Whether the built-in judge can answer for a harness off the gateway.
 
@@ -10608,20 +10618,15 @@ async def _session_routing_host(
         return None
 
 
-async def _spawn_gateway_backed(
+async def _spawn_routing_backing(
     request: Request,
     conv: Conversation,
     harnesses: Sequence[str],
-) -> bool:
-    """Whether the workspace router can serve a spawn over *harnesses*.
-
-    :param request: Used to reach the app's host store.
-    :param conv: The parent session row.
-    :param harnesses: Every harness family the spawn may land on.
-    :returns: ``True`` unless the host explicitly reports one as not backed.
-    """
+) -> tuple[bool, bool]:
+    """``(gateway_backed, allow_static_fallback)`` for a spawn, from a single host read."""
     host_store = getattr(request.app.state, "host_store", None)
-    return _gateway_backed(await _session_routing_host(conv, host_store), harnesses)
+    host = await _session_routing_host(conv, host_store)
+    return _gateway_backed(host, harnesses), _static_table_backed(host, harnesses)
 
 
 def _harness_labels(harnesses: Sequence[str]) -> str:
@@ -13611,9 +13616,9 @@ __all__ = [
     "_runner_reject_detail",
     "_schedule_deferred_elicitation_clear",
     "_spawn_archive_stop",
-    "_spawn_gateway_backed",
     "_spawn_native_approval_popup_forward",
     "_spawn_native_blocked_notice_forward",
+    "_spawn_routing_backing",
     "_stop_host_runner_intentionally",
     "_wait_for_host_bound_runner_client",
     "_wait_for_host_reconnect",

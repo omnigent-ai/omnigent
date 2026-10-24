@@ -176,3 +176,25 @@ def not_gateway_backed(
     :returns: The not-backed ids, in the order given.
     """
     return [harness for harness in harnesses if gateway_inference_state(gateway, harness) is False]
+
+
+def gateway_inference_reports(harness: str) -> bool:
+    """Whether gateway inference evaluates *harness*'s family; never for ``claude-sdk``/``pi``."""
+    return _family_spellings(harness) in (CLAUDE_GATEWAY_HARNESSES, CODEX_GATEWAY_HARNESSES)
+
+
+def gateway_backs_static_table(
+    gateway: Mapping[str, object] | None,
+    harnesses: Iterable[str],
+) -> bool:
+    """Whether the gateway-only static ``databricks-*`` table may route *harnesses*.
+    Declines an explicit ``False``, or an unreported ``claude-sdk``/``pi`` on a host that backs no
+    reported family; unknown/any-True stays lenient. Admission only, not router source."""
+    host_off_gateway = bool(gateway) and not any(value is True for value in gateway.values())
+    for harness in harnesses:
+        state = gateway_inference_state(gateway, harness)
+        if state is False:
+            return False
+        if state is None and host_off_gateway and not gateway_inference_reports(harness):
+            return False
+    return True
