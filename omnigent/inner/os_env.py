@@ -32,6 +32,7 @@ from omnigent.runner.identity import (
 from omnigent.sandbox.copy_on_write import SHARED_ENVIRONMENT_VAR, CopyOnWriteEnvironment
 from omnigent.util.json_types import JsonValue
 
+from ._proc import kill_tree
 from .agent_env import strip_desktop_session_env
 from .async_utils import run_sync_on_thread
 from .credential_proxy import (
@@ -1800,49 +1801,62 @@ def _shell_impl(
     """
     argv = _shell_argv(shell_path, command)
     try:
-        completed = subprocess.run(
+        with subprocess.Popen(
             argv,
             cwd=str(cwd),
             env=_child_shell_env(),
             text=True,
-            capture_output=True,
-            timeout=timeout,
-        )
-    except subprocess.TimeoutExpired as exc:
-        # ``subprocess.TimeoutExpired.stdout``/``stderr`` are ``str | bytes
-        # | None`` from the stdlib; widening the op result at this boundary
-        # would leak ``None`` into a JSON-serialized field that downstream
-        # consumers treat as a plain string.
-        stdout = exc.stdout if isinstance(exc.stdout, str) else ""
-        stderr = exc.stderr if isinstance(exc.stderr, str) else ""
-        return {
-            "stdout": _truncate_output(stdout, "stdout", max_output),
-            "stderr": _truncate_output(stderr, "stderr", max_output),
-            "exit_code": None,
-            "timed_out": True,
-            "error": f"Command timed out after {timeout} seconds",
-            "shell": shell_path,
-            "cwd": str(cwd),
-        }
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+        ) as proc:
+            # The command stays in the helper's process group, so group teardown
+            # still reaches it; ``kill_tree`` walks the shell's own descendants.
+            try:
+                stdout, stderr = proc.communicate(timeout=timeout)
+            except subprocess.TimeoutExpired as exc:
+                kill_tree(proc)
+                partial_stdout: object = exc.stdout
+                partial_stderr: object = exc.stderr
+                if IS_WINDOWS:
+                    partial_stdout, partial_stderr = proc.communicate()
+                else:
+                    proc.wait()
+                # ``subprocess.TimeoutExpired.stdout``/``stderr`` are ``str | bytes
+                # | None`` from the stdlib; widening the op result at this boundary
+                # would leak ``None`` into a JSON-serialized field that downstream
+                # consumers treat as a plain string.
+                stdout = partial_stdout if isinstance(partial_stdout, str) else ""
+                stderr = partial_stderr if isinstance(partial_stderr, str) else ""
+                return {
+                    "stdout": _truncate_output(stdout, "stdout", max_output),
+                    "stderr": _truncate_output(stderr, "stderr", max_output),
+                    "exit_code": None,
+                    "timed_out": True,
+                    "error": f"Command timed out after {timeout} seconds",
+                    "shell": shell_path,
+                    "cwd": str(cwd),
+                }
+            except BaseException:
+                # Any other failure (an interrupt, say) must not leave the tree running.
+                kill_tree(proc)
+                raise
     except OSError as exc:
         return {"error": f"Failed to run shell command: {exc}"}
 
-    stdout = _truncate_output(completed.stdout, "stdout", max_output)
-    stderr = _truncate_output(completed.stderr, "stderr", max_output)
     result: OpResult = {
-        "stdout": stdout,
-        "stderr": stderr,
-        "exit_code": completed.returncode,
+        "stdout": _truncate_output(stdout, "stdout", max_output),
+        "stderr": _truncate_output(stderr, "stderr", max_output),
+        "exit_code": proc.returncode,
         "timed_out": False,
         "shell": shell_path,
         "cwd": str(cwd),
     }
-    if completed.returncode != 0:
-        detail = completed.stderr.strip() or completed.stdout.strip()
+    if proc.returncode != 0:
+        detail = stderr.strip() or stdout.strip()
         if detail:
-            result["error"] = f"Command exited with status {completed.returncode}: {detail}"
+            result["error"] = f"Command exited with status {proc.returncode}: {detail}"
         else:
-            result["error"] = f"Command exited with status {completed.returncode}"
+            result["error"] = f"Command exited with status {proc.returncode}"
     return result
 
 
