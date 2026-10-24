@@ -22,7 +22,7 @@ from tests.e2e.conftest import find_free_port
 
 _REPO = Path(__file__).resolve().parents[2]
 _AGENT = r"""
-import json, sys
+import asyncio, json, os, sys
 from pathlib import Path
 name, record = sys.argv[1:]
 current_model = "unset"
@@ -30,6 +30,18 @@ with Path(record).open("a") as f:
     f.write(name + "\n")
 def send(value):
     print(json.dumps(value), flush=True)
+async def rename_through_mcp():
+    from mcp import ClientSession, StdioServerParameters
+    from mcp.client.stdio import stdio_client
+    with open(os.environ["TEST_MCP_SETTINGS_PATH"]) as settings:
+        spec = json.load(settings)["mcpServers"]["omnigent"]
+    async with stdio_client(StdioServerParameters(
+        command=spec["command"], args=spec["args"], env={**os.environ, **spec["env"]}
+    )) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            result = await session.call_tool("sys_session_rename", {"title": "ACP relay title"})
+            assert not result.isError, result
 for line in sys.stdin:
     msg = json.loads(line)
     mid, method = msg.get("id"), msg.get("method")
@@ -41,6 +53,8 @@ for line in sys.stdin:
         current_model = msg["params"]["value"]
         result = {"configOptions": [{"id": "model", "currentValue": current_model}]}
     elif method == "session/prompt":
+        if os.environ.get("TEST_MCP_SETTINGS_PATH"):
+            asyncio.run(rename_through_mcp())
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": msg["params"]["sessionId"], "update": {
                 "sessionUpdate": "agent_message_chunk",
@@ -76,6 +90,10 @@ def acp_server(
         }
         for name in ("Gemini", "Goose")
     ]
+    entries[1]["command"] = (
+        "env TEST_MCP_SETTINGS_PATH={omnigent_mcp_config} " + entries[1]["command"]
+    )
+    entries[1]["omnigent_mcp"] = True
     server_settings: dict = {}
     runner_settings: dict = {"acp": {"agents": entries}}
     executor: dict = {"harness": "openai-agents", "model": "gpt-4o"}
@@ -272,6 +290,8 @@ def test_acp_choice_is_resolved_on_runner(
                 i for i in items if i["type"] == "message" and i["data"].get("role") == "assistant"
             ]
             assert len(replies) == turn, items
+            if expected == "Goose":
+                assert snapshot["title"] == "ACP relay title", snapshot
             assert all(f"Reply from {expected}" in json.dumps(i) for i in replies), items
             if has_model_policy:
                 assert all(f"model={expected.lower()}-model" in json.dumps(i) for i in replies), (

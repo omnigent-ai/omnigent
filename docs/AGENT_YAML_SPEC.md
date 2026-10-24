@@ -327,6 +327,34 @@ Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
 app. See the [OpenClaw integration guide](openclaw.md) for registry import,
 Gateway setup, and compatibility details.
 
+An ACP agent that ignores `session/new.mcpServers` can use
+`{omnigent_mcp_config}` in its launch command. Omnigent expands only that marker,
+after splitting the command into arguments, to a private JSON settings file for
+the session's existing MCP relay. The file is created before the agent starts,
+uses owner-only permissions, and is removed with the relay. If the relay is
+disabled or unavailable, the command fails before the agent starts.
+
+For Cline CLI 3.0.72 on Linux or WSL, use its documented settings-path override
+and a local runtime so a shared Cline background process does not reuse another
+session's settings:
+
+```yaml
+acp:
+  agents:
+    - name: Cline
+      command: >-
+        env CLINE_SESSION_BACKEND_MODE=local
+        CLINE_MCP_SETTINGS_PATH={omnigent_mcp_config}
+        cline --acp
+```
+
+Keep any existing provider/model flags and permission settings on that entry.
+This adds Omnigent's tools through the same policy-enforced relay; it does not
+edit Cline's shared settings or create a separate login. The private file contains
+the Omnigent server entry; it does not copy other servers from a global MCP file.
+Other operating systems need their equivalent command for setting process-local
+environment variables. See [Cline's MCP configuration](https://github.com/cline/cline/blob/main/docs/mcp/mcp-overview.mdx).
+
 To offer a curated model picker for a custom ACP agent, explicitly reference a
 named provider in its agent spec:
 
