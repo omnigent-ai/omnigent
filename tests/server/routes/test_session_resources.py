@@ -1425,6 +1425,26 @@ async def test_get_resource_by_id_rejects_non_mapping_runner_json(
     assert resp.json()["detail"] == "runner resource endpoint returned non-object JSON"
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("suffix", ["/changes", "/diff/file.txt"])
+async def test_workspace_git_status_failure_reaches_client_as_detail(
+    client: httpx.AsyncClient, suffix: str
+) -> None:
+    """The web Changes and diff views read this 502 ``detail`` to explain the failure."""
+    reason = "git status timed out after 30.0s"
+    fake_runner = _FakeRunnerClient(
+        payload={"error": {"code": "git_status_failed", "message": reason}}, status_code=500
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    resp = await client.get(
+        f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default{suffix}"
+    )
+
+    assert resp.status_code == 502, resp.text
+    assert resp.json() == {"detail": reason}
+
+
 @pytest.fixture
 def bash_terminal_spec(monkeypatch: pytest.MonkeyPatch) -> None:
     """Resolve the session's agent spec to one declaring a ``bash`` terminal.

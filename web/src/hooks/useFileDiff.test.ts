@@ -265,17 +265,16 @@ describe("useFileDiff — error handling", () => {
     expect(result.current.error).toMatchObject({ message: expect.stringContaining("500") });
   });
 
-  it("surfaces the server's reason from the error body when present", async () => {
-    // A git_status_failed 500 carries the real cause in error.message; the
-    // hook must propagate it so the diff view shows what went wrong rather
-    // than a bare status code.
+  it.each([
+    [
+      "runner error envelope",
+      500,
+      { error: { code: "git_status_failed", message: "git status timed out after 5.0s" } },
+    ],
+    ["server proxy detail", 502, { detail: "git status timed out after 5.0s" }],
+  ])("surfaces the server's reason from a %s", async (_shape, status, body) => {
     setHooks({ serveable: true, changedPaths: ["a.ts"] });
-    fetchMock.mockResolvedValueOnce(
-      mockResponse(
-        { error: { code: "git_status_failed", message: "git status timed out after 5.0s" } },
-        { ok: false, status: 500 },
-      ),
-    );
+    fetchMock.mockResolvedValueOnce(mockResponse(body, { ok: false, status }));
     const { result } = renderDiff("conv_1", "a.ts");
     await waitFor(() => expect(result.current.isError).toBe(true));
     expect(result.current.error).toMatchObject({
