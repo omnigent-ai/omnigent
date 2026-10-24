@@ -83,8 +83,10 @@ import { readFileViewPreferences, writeFileViewPreferences } from "@/lib/fileVie
 import { gitProviderCopy, type GitProviderCopy } from "@/lib/gitProviders";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
 import { absoluteTime, relativeTime } from "@/lib/relativeTime";
+import { setSessionPrPick, useSessionPrPick } from "@/lib/sessionPrPicks";
 import {
   fetchPullRequestFileContents,
+  fetchPullRequestInfo,
   normalizePullRequestInfo,
   usePullRequestChangedFiles,
   usePullRequestDiff,
@@ -1018,14 +1020,15 @@ function pullRequestLabel(pr: PullRequestAssociation, sessionProvider?: string |
 
 export function PullRequestPanel({ conversationId }: { conversationId: string }) {
   const isMobileViewport = useIsMobileViewport();
-  const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
+  const pick = useSessionPrPick(conversationId);
+  const [defaultPin, setDefaultPin] = useState<{ sessionId: string; url?: string }>();
   const [prPickerOpen, setPrPickerOpen] = useState(false);
   const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
   // Select focuses rows on both pointer hover and keyboard navigation.
   const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
-  const selected = selection?.sessionId === conversationId ? selection.url : undefined;
+  const selected = pick ?? (defaultPin?.sessionId === conversationId ? defaultPin.url : undefined);
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: selected });
   const queryClient = useQueryClient();
   const [refreshing, setRefreshing] = useState(false);
@@ -1080,10 +1083,33 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
   const update = useUpdateSessionPr(conversationId);
   useEffect(() => {
     if (!selected && info.data?.selected_pr_url) {
-      setSelection({ sessionId: conversationId, url: info.data.selected_pr_url });
+      setDefaultPin({ sessionId: conversationId, url: info.data.selected_pr_url });
     }
   }, [conversationId, selected, info.data?.selected_pr_url]);
-  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
+  // A failed load doesn't say whether the PR was unlinked (cached data may still show it), so
+  // forget the pick only once a recent session PR list leaves it out.
+  const pickFailed = !!pick && !!info.error && !(info.error instanceof RunnerOfflineError);
+  useEffect(() => {
+    if (!pick || !pickFailed) return;
+    let current = true;
+    queryClient
+      .fetchQuery({
+        queryKey: ["github-info", conversationId],
+        queryFn: () => fetchPullRequestInfo(conversationId),
+        staleTime: 30_000,
+      })
+      .then((sessionInfo) => {
+        if (current && sessionInfo.prs && !sessionInfo.prs.some((pr) => pr.url === pick)) {
+          setSessionPrPick(conversationId, undefined);
+          setDefaultPin({ sessionId: conversationId, url: sessionInfo.selected_pr_url });
+        }
+      })
+      .catch(() => {});
+    return () => {
+      current = false;
+    };
+  }, [conversationId, pick, pickFailed, info.errorUpdatedAt, queryClient]);
+  const changeSelection = (next?: string) => setSessionPrPick(conversationId, next);
   const prs = associations?.prs ?? [];
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const linkInEmptyState = prs.length === 0 && panelState.kind === "no-pr";
@@ -1246,7 +1272,10 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                       update.mutate(
                         { url: selected, action: "remove" },
                         {
-                          onSuccess: (data) => changeSelection(data.selected_pr_url),
+                          onSuccess: (data) => {
+                            setSessionPrPick(conversationId, undefined);
+                            setDefaultPin({ sessionId: conversationId, url: data.selected_pr_url });
+                          },
                         },
                       )
                     }
