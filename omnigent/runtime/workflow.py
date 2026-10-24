@@ -1438,7 +1438,24 @@ def _build_claude_sdk_spawn_env(
     # Explicitly clear inherited presets for agents that have not opted in.
     preset = spec.executor.config.get("system_prompt_preset")
     env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] = str(preset) if preset is not None else ""
+    # Opt-in Claude Code session transcripts. Off by default: Omnigent owns
+    # conversation persistence, so the file exists only for tooling that reads
+    # per-request usage out of it.
+    if _is_truthy_config(spec.executor.config.get("session_persistence")):
+        env["HARNESS_CLAUDE_SDK_SESSION_PERSISTENCE"] = "true"
     return env
+
+
+def _is_truthy_config(value: object) -> bool:
+    """
+    Read a spec config flag that YAML may deliver as a bool or a string.
+
+    :param value: The raw ``executor.config`` value, e.g. ``True`` or ``"yes"``.
+    :returns: Whether the flag is on.
+    """
+    if isinstance(value, bool):
+        return value
+    return isinstance(value, str) and value.strip().lower() in ("1", "true", "yes")
 
 
 def _apply_harness_path_override(

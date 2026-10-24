@@ -2477,6 +2477,34 @@ async def test_hermetic_turn_reads_relative_config_dir_from_cli_cwd(
     assert options.env.get("ANTHROPIC_BEDROCK_BASE_URL") == "https://gateway.example"
 
 
+@pytest.mark.asyncio
+async def test_session_persistence_off_keeps_the_cli_flag() -> None:
+    """The default suppresses Claude Code's own transcript.
+
+    Omnigent owns conversation persistence, so an agent that did not opt in
+    must not start writing session files under ``~/.claude/projects``.
+    """
+    executor = _default_executor(skills_filter="none")
+
+    options = await _turn_options(executor)
+
+    assert "no-session-persistence" in options.extra_args
+
+
+@pytest.mark.asyncio
+async def test_session_persistence_on_drops_the_cli_flag() -> None:
+    """Opting in lets the CLI write the transcript usage tooling reads.
+
+    Dropping the flag is the whole fix: with it present the CLI writes
+    nothing, so a hook's ``transcript_path`` names a file that never exists.
+    """
+    executor = _default_executor(skills_filter="none", session_persistence=True)
+
+    options = await _turn_options(executor)
+
+    assert "no-session-persistence" not in options.extra_args
+
+
 @pytest.mark.parametrize(
     ("make_executor", "max_tokens", "expected_thinking"),
     [
