@@ -560,10 +560,15 @@ def test_poll_after_stop_reports_live_runner_as_none(manager: ZygoteManager, tmp
 
 @pytest.mark.parametrize("exit_before_restart", [False, True])
 def test_old_runner_exit_is_detected_after_zygote_restart(
-    manager: ZygoteManager, tmp_path: Path, exit_before_restart: bool
+    manager: ZygoteManager,
+    tmp_path: Path,
+    exit_before_restart: bool,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A new forkserver cannot supply exit status for the old one's children."""
     proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "old.log"), str(tmp_path))
+    parent = manager._proc
+    assert parent is not None
     manager.stop()
     try:
         if exit_before_restart:
@@ -579,6 +584,17 @@ def test_old_runner_exit_is_detected_after_zygote_restart(
             time.sleep(0.01)
         assert proc.poll() == _ZYGOTE_LOST_EXIT_CODE
         assert proc.wait(timeout=1) == _ZYGOTE_LOST_EXIT_CODE
+        evidence = [
+            record.attributes
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "runner_zygote_status_unavailable"
+        ]
+        assert len(evidence) == (1 if exit_before_restart else 2)
+        assert evidence[-1]["zygote_pid"] == parent.pid
+        assert evidence[-1]["zygote_pid"] != manager.pid
+        assert evidence[-1]["zygote_returncode"] == parent.returncode
+        assert evidence[-1]["loss_reason"] == "generation_changed"
+        assert evidence[-1]["runner_exit_code_known"] is False
 
         fresh = manager.fork_runner(_fork_env(7), str(tmp_path / "new.log"), str(tmp_path))
         assert _wait_exit(fresh) == 7
@@ -1188,6 +1204,80 @@ def test_poll_after_zygote_crash_reports_dead_runner(manager: ZygoteManager, tmp
             break
         time.sleep(0.05)
     assert code == _ZYGOTE_LOST_EXIT_CODE
+
+
+def test_parent_crash_logs_status_loss_once_per_child_state(
+    manager: ZygoteManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "child.log"), str(tmp_path))
+    parent = manager._proc
+    assert parent is not None
+    try:
+        parent.kill()
+        assert parent.wait(timeout=10) == -signal.SIGKILL
+        assert proc.poll() is None
+        assert proc.poll() is None
+        proc.kill()
+        assert _wait_exit(proc) == _ZYGOTE_LOST_EXIT_CODE
+        assert proc.poll() == _ZYGOTE_LOST_EXIT_CODE
+        evidence = [
+            record.attributes
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "runner_zygote_status_unavailable"
+        ]
+        assert len(evidence) == 2
+        assert [row["child_alive"] for row in evidence] == [True, False]
+        assert [row["reported_runner_exit_code"] for row in evidence] == [None, 254]
+        assert all(row["runner_pid"] == proc.pid for row in evidence)
+        assert all(row["zygote_pid"] == parent.pid for row in evidence)
+        assert all(row["zygote_returncode"] == -signal.SIGKILL for row in evidence)
+        assert all(row["zygote_signal"] == signal.SIGKILL for row in evidence)
+        assert all(row["runner_exit_code_known"] is False for row in evidence)
+    finally:
+        proc.kill()
+
+
+def test_control_error_logs_type_without_exception_contents(
+    manager: ZygoteManager,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    proc = manager.fork_runner(_sleep_env(30), str(tmp_path / "child.log"), str(tmp_path))
+
+    def unavailable(*_args: object, **_kwargs: object) -> dict[str, object]:
+        try:
+            raise TimeoutError("private-control-error")
+        except TimeoutError as exc:
+            raise ZygoteUnavailable("private-control-message", reason="control_error") from exc
+
+    monkeypatch.setattr(manager, "_exchange", unavailable)
+    try:
+        assert proc.poll() is None
+        assert proc.poll() is None
+        evidence = [
+            record.attributes
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "runner_zygote_status_unavailable"
+        ]
+        assert len(evidence) == 1
+        assert evidence[0]["control_error_type"] == "TimeoutError"
+        assert evidence[0]["loss_reason"] == "control_error"
+        assert evidence[0]["zygote_returncode"] is None
+        assert "private-control" not in caplog.text + json.dumps(evidence)
+    finally:
+        proc.kill()
+
+
+def test_actual_exit_254_is_not_labelled_as_lost_status(
+    manager: ZygoteManager, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    proc = manager.fork_runner(_fork_env(254), str(tmp_path / "child.log"), str(tmp_path))
+    assert _wait_exit(proc) == 254
+    assert not any(
+        getattr(record, "event_name", None) == "runner_zygote_status_unavailable"
+        for record in caplog.records
+    )
 
 
 def test_dropped_runner_harness_exit_codes_do_not_leak(manager: ZygoteManager, tmp_path) -> None:
