@@ -946,6 +946,13 @@ _granted_tool_names_cache: dict[
 ] = {}
 _GRANTED_TOOL_NAMES_CACHE_MAX = 256
 
+# Flat MCP schemas for the local tools ``tools/list`` advertises, keyed and
+# weakref-guarded like ``_granted_tool_names_cache``. Caching avoids rebuilding a
+# ToolManager (and its synchronous filesystem probes) on every discovery call.
+_mcp_local_tool_schemas_cache: dict[
+    tuple[int, str | None], tuple[weakref.ref[AgentSpec], list[_JsonObject]]
+] = {}
+
 
 def _effective_harness_name(agent_spec: AgentSpec, effective_harness: str | None) -> str | None:
     """Return the canonical harness a session actually runs.
@@ -1050,6 +1057,86 @@ def _is_spec_local_python_tool(tool_name: str, agent_spec: AgentSpec | None) -> 
         and getattr(info, "path", None)
         for info in local_tools
     )
+
+
+def client_runtime_tool_names(agent_spec: AgentSpec | None) -> frozenset[str]:
+    """Names of spec-local tools that run on the client, not server-side.
+
+    ``runtime: client`` tools register as :class:`ClientSideTool`: the LLM
+    sees the schema but dispatch short-circuits to an action required for the
+    client to satisfy. The session MCP endpoint has no client to relay that
+    to, so these names are neither advertised nor dispatchable there.
+    """
+    from omnigent.spec.types import AgentSpec as _AgentSpec
+    from omnigent.spec.types import ToolRuntime
+
+    # Covers None and legacy/test resolver stand-ins, matching the dispatch
+    # gate so the tools/call route never raises on one.
+    if not isinstance(agent_spec, _AgentSpec):
+        return frozenset()
+    return frozenset(lt.name for lt in agent_spec.local_tools if lt.runtime == ToolRuntime.CLIENT)
+
+
+def build_mcp_local_tool_schemas(
+    agent_spec: AgentSpec, effective_harness: str | None = None
+) -> list[_JsonObject]:
+    """Return flat schemas for the local tools ``tools/call`` accepts for *agent_spec*.
+
+    Built from the same granted surface as the dispatch gate, so ``tools/list``
+    and bare-name ``tools/call`` agree. Native harnesses add the ``sys_os_*``
+    relay tools; spec-local file tools need the agent workdir and are not listed.
+    Client-runtime tools and names containing ``__`` are also omitted: the
+    former run on the client and the latter route to the external MCP manager,
+    so neither is dispatchable as a bare local tool through this endpoint.
+    """
+    from omnigent.spec.types import AgentSpec as _AgentSpec
+
+    if not isinstance(agent_spec, _AgentSpec):
+        # Partial stand-ins (legacy or test resolver objects) cannot build a
+        # ToolManager; match the dispatch gate and advertise no local surface.
+        return []
+    harness = _effective_harness_name(agent_spec, effective_harness)
+    cache_key = (id(agent_spec), harness)
+    cached = _mcp_local_tool_schemas_cache.get(cache_key)
+    if cached is not None and cached[0]() is agent_spec:
+        return list(cached[1])
+    granted = _granted_tool_names(agent_spec, harness)
+    client_names = client_runtime_tool_names(agent_spec)
+    manager = ToolManager(agent_spec, os_env_schema_only=True)
+    try:
+        source_schemas = manager.get_tool_schemas()
+    finally:
+        manager.shutdown()
+    if is_native_harness(harness):
+        source_schemas.extend(tool_cls.get_schema() for tool_cls in OS_ENV_TOOL_TYPES)
+
+    schemas: dict[str, _JsonObject] = {}
+    for schema in source_schemas:
+        function = _string_object_dict(schema.get("function"))
+        if function is None:
+            continue
+        name = function.get("name")
+        if not isinstance(name, str) or name not in granted:
+            continue
+        if "__" in name or name in client_names:
+            # Neither is dispatchable here; listing would desync tools/list from tools/call.
+            continue
+        description = function.get("description")
+        parameters = _string_object_dict(function.get("parameters"))
+        schemas[name] = {
+            "type": "function",
+            "name": name,
+            "description": description if isinstance(description, str) else "",
+            "parameters": parameters or {"type": "object", "properties": {}},
+        }
+    result = list(schemas.values())
+    if len(_mcp_local_tool_schemas_cache) >= _GRANTED_TOOL_NAMES_CACHE_MAX:
+        _mcp_local_tool_schemas_cache.clear()
+    _mcp_local_tool_schemas_cache[cache_key] = (weakref.ref(agent_spec), result)
+    # Copy the list here and on cache hits so a caller adding or reordering
+    # entries cannot disturb the cache. Only list-level mutation is guarded; the
+    # sole caller spreads the schemas read-only, so the dicts need no deep copy.
+    return list(result)
 
 
 async def _execute_local_python_tool(

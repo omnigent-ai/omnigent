@@ -48,6 +48,55 @@ class _DisconnectedRunnerClient:
         raise ConnectionError("tunnel closed before request completed")
 
 
+class _UnknownToolRunnerClient:
+    async def post(self, *_args: object, **_kwargs: object) -> Any:
+        class _Response:
+            def raise_for_status(self) -> None:
+                pass
+
+            def json(self) -> dict[str, Any]:
+                return {"error": {"code": -32602, "message": "Unknown tool: qa_missing_tool"}}
+
+        return _Response()
+
+
+@pytest.mark.asyncio
+async def test_unknown_runner_tool_error_reaches_mcp_client(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The AP proxy must keep the runner's protocol error, not wrap it as output."""
+    engine = _AllowPolicyEngine()
+    monkeypatch.setattr(
+        sessions_mod, "_load_agent_spec_for_session", lambda conv, agent_store: object()
+    )
+    monkeypatch.setattr(
+        sessions_mod,
+        "_build_policy_engine_from_spec",
+        lambda spec, session_id, conversation_store, conversation=None: engine,
+    )
+
+    async def _runner_client(session_id: str, runner_router: Any) -> Any:
+        del session_id, runner_router
+        return _UnknownToolRunnerClient()
+
+    monkeypatch.setattr(sessions_mod, "_get_runner_client", _runner_client)
+
+    response = await _handle_mcp_tools_call(
+        rpc_id=8,
+        session_id=_SESSION_ID,
+        params={"name": "qa_missing_tool", "arguments": {}},
+        conversation_store=_ConversationStore(),  # type: ignore[arg-type]
+        agent_store=object(),  # type: ignore[arg-type]
+        runner_router=object(),  # type: ignore[arg-type]
+    )
+
+    assert json.loads(bytes(response.body)) == {
+        "jsonrpc": "2.0",
+        "id": 8,
+        "error": {"code": -32602, "message": "Unknown tool: qa_missing_tool"},
+    }
+
+
 @pytest.mark.asyncio
 async def test_tunnel_disconnect_marks_retained_execution_as_detached(
     monkeypatch: pytest.MonkeyPatch,
