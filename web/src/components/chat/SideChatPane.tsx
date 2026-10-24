@@ -54,6 +54,8 @@ import { Button } from "@/components/ui/button";
 import {
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
+  isCompactControl,
+  rejectBusyCompact,
   restoredSendDraftUnchanged,
   takeFailedSendDraft,
   type SideChatComposerDraft,
@@ -797,15 +799,13 @@ function SideChatComposer({
       return;
     }
     const outgoing = files;
+    const message = serializeReplyDraft({ quotes, text: trimmed });
+    // A running Codex chat refuses /compact; keep the draft as the main composer does.
+    if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(childId);
-    void send(
-      serializeReplyDraft({ quotes, text: trimmed }),
-      agentId,
-      outgoing.length > 0 ? outgoing : undefined,
-      {
-        pinnedConversationId: childId,
-      },
-    ).finally(refreshLabels);
+    void send(message, agentId, outgoing.length > 0 ? outgoing : undefined, {
+      pinnedConversationId: childId,
+    }).finally(refreshLabels);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => {

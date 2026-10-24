@@ -873,6 +873,20 @@ describe("side-chat interrupt", () => {
     expect(sessionsApi.interrupt).not.toHaveBeenCalled();
   });
 
+  it("keeps a /compact draft that a running Codex side chat refuses", () => {
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "/compact" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith(
+      "Compact is disabled while a chat is in progress",
+      { richColors: true },
+    );
+    expect(input).toHaveValue("/compact");
+  });
+
   it("keeps a running grid session's draft until its turn ends", () => {
     renderPane(<SideChatPane childId={childId} fullSession />);
     const input = screen.getByTestId("side-chat-input");
