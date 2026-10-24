@@ -32,6 +32,7 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerResponseError,
     CodexMessage,
     client_for_transport,
+    is_no_active_turn_error,
 )
 from omnigent.harnesses.codex_native.bridge import (
     CODEX_NATIVE_BRIDGE_ID_LABEL_KEY,
@@ -84,6 +85,14 @@ _logger = logging.getLogger(__name__)
 
 _AGENT_NAME = "codex-native-ui"
 _SUBSCRIBE_RETRY_DELAY_SECONDS = 0.2
+_REFUSED_SUBSCRIPTION_TURN_WAIT_SECONDS = 10.0
+_REFUSED_SUBSCRIPTION_POLLS = int(
+    _REFUSED_SUBSCRIPTION_TURN_WAIT_SECONDS / _SUBSCRIBE_RETRY_DELAY_SECONDS
+)
+# JSON-RPC "method not found"; Codex also uses it for an operation its build
+# does not support, e.g. ``list_turns is not supported yet``.
+_CODEX_UNSUPPORTED_REQUEST_CODE = -32601
+_REFUSED_TURN_MAY_BE_RUNNING = "may still be running"
 _NO_ROLLOUT_FRAGMENT = "no rollout found for thread id"
 # A freshly created thread passes through a second transient state: its rollout
 # file exists but is still empty (the TUI created the thread but no turn has
@@ -2652,19 +2661,43 @@ async def _subscribe_until_ready(
     forwarder_state: _CodexForwarderState | None = None,
     ready_signal: asyncio.Event | None = None,
 ) -> None:
-    """Reserve authoritative delivery order while subscribing and replaying."""
-    async with _conversation_item_delivery_scope(session_id):
-        await _subscribe_until_ready_inner(
+    """
+    Reserve authoritative delivery order while subscribing and replaying.
+
+    A subscription Codex cannot support fails the running turn and is retried
+    when *ready_signal* next reports the thread active, with the order lock
+    released while waiting.
+    """
+    while True:
+        async with _conversation_item_delivery_scope(session_id):
+            refusal = await _subscribe_until_ready_inner(
+                client,
+                ap_client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                thread_id=thread_id,
+                usage_coalescer=usage_coalescer,
+                elicitation_tracker=elicitation_tracker,
+                forwarder_state=forwarder_state,
+                ready_signal=ready_signal,
+            )
+        if refusal is None:
+            return
+        if ready_signal is not None:
+            # Cleared first so a turn that starts while this one fails re-arms the retry.
+            ready_signal.clear()
+        await _fail_turn_after_refused_subscription(
             client,
             ap_client,
             session_id=session_id,
             bridge_dir=bridge_dir,
             thread_id=thread_id,
-            usage_coalescer=usage_coalescer,
-            elicitation_tracker=elicitation_tracker,
+            refusal=refusal,
             forwarder_state=forwarder_state,
-            ready_signal=ready_signal,
         )
+        if ready_signal is None:
+            return
+        await ready_signal.wait()
 
 
 async def _subscribe_until_ready_inner(
@@ -2678,7 +2711,7 @@ async def _subscribe_until_ready_inner(
     elicitation_tracker: _CodexElicitationTaskTracker,
     forwarder_state: _CodexForwarderState | None = None,
     ready_signal: asyncio.Event | None = None,
-) -> None:
+) -> CodexAppServerResponseError | None:
     """
     Subscribe this app-server connection to a Codex thread.
 
@@ -2694,10 +2727,16 @@ async def _subscribe_until_ready_inner(
     idle window before the user's first turn), this parks on
     *ready_signal* and only retries once the caller observes the thread
     become active on the live event stream (its first turn, which
-    materializes the rollout). ``thread/status/changed``/turn/item events
-    reach the connection without a successful resume, so the caller can
-    detect activity and set the signal. A short poll still covers the
+    materializes the rollout). ``thread/status/changed`` is broadcast to
+    every connection, so the caller can detect activity without a
+    successful resume and set the signal. A short poll still covers the
     brief window between "thread active" and the rollout being flushed.
+
+    Codex routes turn and item notifications only to subscribed connections.
+    When Codex cannot return the thread's turns (``-32601``), the subscription
+    is retried without them. If that is refused too, the error is returned for
+    the caller to fail the running turn instead of leaving it ``running``
+    unobserved. Other failures are only logged.
 
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
@@ -2714,7 +2753,8 @@ async def _subscribe_until_ready_inner(
         thread parks here instead of polling. ``None`` falls back to the
         fixed-interval retry (used where no live event stream drives the
         signal).
-    :returns: None.
+    :returns: Codex's error when it does not support the subscription, else
+        ``None``.
     """
     bridge_state = read_bridge_state(bridge_dir)
     replay_from_turn_id = (
@@ -2723,11 +2763,12 @@ async def _subscribe_until_ready_inner(
         else None
     )
     saw_not_ready = False
+    turns_refused = False
     while True:
+        params: _JsonObject = {"threadId": thread_id}
+        if turns_refused or (not saw_not_ready and replay_from_turn_id is None):
+            params["excludeTurns"] = True
         try:
-            params: _JsonObject = {"threadId": thread_id}
-            if not saw_not_ready and replay_from_turn_id is None:
-                params["excludeTurns"] = True
             response = await client.request("thread/resume", params)
         except asyncio.CancelledError:
             raise
@@ -2751,8 +2792,22 @@ async def _subscribe_until_ready_inner(
                     # poll covers that window.
                     await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
                 continue
+            refusal = (
+                exc
+                if isinstance(exc, CodexAppServerResponseError)
+                and exc.code == _CODEX_UNSUPPORTED_REQUEST_CODE
+                else None
+            )
+            if refusal is not None and "excludeTurns" not in params:
+                _logger.warning(
+                    "Codex could not return thread %s's turns (%s); subscribing without replay",
+                    thread_id,
+                    refusal,
+                )
+                turns_refused = True
+                continue
             _logger.warning("failed to subscribe to Codex thread %s", thread_id, exc_info=True)
-            return
+            return refusal
         if forwarder_state is not None:
             forwarder_state.note_resume_response(response)
             # Source of truth for the cost policy is config.toml's model (what
@@ -2789,9 +2844,138 @@ async def _subscribe_until_ready_inner(
             usage_coalescer=usage_coalescer,
             elicitation_tracker=elicitation_tracker,
             forwarder_state=forwarder_state,
-            replay_from_turn_id=replay_from_turn_id,
+            replay_from_turn_id=None if turns_refused else replay_from_turn_id,
+        )
+        return None
+
+
+async def _wait_for_refused_turn_id(bridge_dir: Path, thread_id: str) -> str | None:
+    """
+    Return the thread's active turn id, waiting briefly for a turn still starting.
+
+    Codex reports the thread active before ``turn/start`` returns the turn id
+    the executor records, so a refusal can arrive before the turn is known.
+
+    :param bridge_dir: Native Codex bridge directory.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :returns: The active turn id, e.g. ``"turn_123"``, or ``None`` when none
+        is recorded for *thread_id* within the wait.
+    """
+    for poll in range(_REFUSED_SUBSCRIPTION_POLLS + 1):
+        if poll:
+            await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
+        state = read_bridge_state(bridge_dir)
+        if state is None or state.thread_id != thread_id:
+            return None
+        if state.active_turn_id is not None:
+            return state.active_turn_id
+    return None
+
+
+async def _interrupt_refused_turn(
+    client: CodexAppServerClient, *, thread_id: str, turn_id: str
+) -> str:
+    """
+    Interrupt a turn the forwarder cannot follow, waiting out turn startup.
+
+    Codex rejects ``turn/interrupt`` with "no active turn" for a moment after
+    ``turn/start`` returns, so that rejection is retried within the wait.
+
+    :param client: Codex app-server client used to interrupt the turn.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :param turn_id: Codex turn id to interrupt, e.g. ``"turn_123"``.
+    :returns: The turn's outcome for the failure message: ``"was stopped"``,
+        ``"had already ended"`` when Codex reports no active turn throughout
+        the wait, or :data:`_REFUSED_TURN_MAY_BE_RUNNING`. A turn that "had
+        already ended" may have finished normally; its unfollowed output is lost.
+    """
+    for poll in range(_REFUSED_SUBSCRIPTION_POLLS + 1):
+        if poll:
+            await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
+        try:
+            await client.request("turn/interrupt", {"threadId": thread_id, "turnId": turn_id})
+            return "was stopped"
+        except asyncio.CancelledError:
+            raise
+        except CodexAppServerResponseError as exc:
+            if is_no_active_turn_error(exc):
+                continue
+            _logger.warning("Codex turn interrupt after a refused subscription failed: %s", exc)
+            return _REFUSED_TURN_MAY_BE_RUNNING
+        except Exception:  # noqa: BLE001 - the failure is surfaced either way.
+            _logger.warning(
+                "Codex turn interrupt after a refused subscription failed", exc_info=True
+            )
+            return _REFUSED_TURN_MAY_BE_RUNNING
+    return "had already ended"
+
+
+async def _fail_turn_after_refused_subscription(
+    client: CodexAppServerClient,
+    ap_client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    thread_id: str,
+    refusal: CodexAppServerResponseError,
+    forwarder_state: _CodexForwarderState | None,
+) -> None:
+    """
+    Interrupt and fail the bridge's active turn after Codex refused the subscription.
+
+    A turn already failed, or cleared or replaced meanwhile by an owner that
+    reports its own outcome, posts nothing. A turn Codex would not stop keeps
+    its recorded id so the user's stop can still interrupt it.
+
+    :param client: Codex app-server client used to interrupt the turn.
+    :param ap_client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param bridge_dir: Native Codex bridge directory.
+    :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+    :param refusal: Codex's ``thread/resume`` error, e.g. ``-32601
+        list_turns is not supported yet``.
+    :param forwarder_state: Optional connection state that suppresses the
+        interrupted turn's later terminal boundary.
+    :returns: None.
+    """
+    turn_id = await _wait_for_refused_turn_id(bridge_dir, thread_id)
+    if turn_id is None:
+        _logger.warning(
+            "Codex refused the subscription to thread %s with no running turn to fail",
+            thread_id,
         )
         return
+    if forwarder_state is not None and turn_id in forwarder_state.surfaced_terminal_error_turns:
+        return
+    outcome = await _interrupt_refused_turn(client, thread_id=thread_id, turn_id=turn_id)
+    if outcome == _REFUSED_TURN_MAY_BE_RUNNING:
+        state = read_bridge_state(bridge_dir)
+        still_active = state is None or state.active_turn_id == turn_id
+    else:
+        still_active = clear_active_turn_id_if_matches(bridge_dir, turn_id)
+    if not still_active:
+        _logger.info("Codex turn %s was cleared before its refusal was surfaced", turn_id)
+        return
+    if forwarder_state is not None:
+        forwarder_state.surfaced_terminal_error_turns.add(turn_id)
+    reason = refusal.message or str(refusal)
+    async with _conversation_item_delivery_scope(session_id):
+        await _post_turn_status_edge(
+            ap_client,
+            session_id,
+            _CodexTurnStatusEdge(
+                status="failed",
+                turn_id=turn_id,
+                source="thread/resume:refused",
+                error=_CodexTerminalError(
+                    message=(
+                        "Codex refused Omnigent's subscription to this thread, so the turn "
+                        f"could not be followed and {outcome}: {reason}"
+                    ),
+                    kind=_CODEX_ERROR_KIND_GENERIC,
+                ),
+            ),
+        )
 
 
 def _event_indicates_thread_active(event: CodexMessage) -> bool:
@@ -2800,13 +2984,13 @@ def _event_indicates_thread_active(event: CodexMessage) -> bool:
 
     A fresh thread's rollout is only materialized once its first turn
     starts, so the subscription's ``thread/resume`` keeps failing until
-    then. These notifications all imply a turn has begun (hence the
-    rollout now exists), and — crucially — they reach a connection
-    *without* a successful resume, so the forwarder's main loop can use
-    them to release :func:`_subscribe_until_ready` from its parked wait:
+    then. The forwarder's main loop uses these notifications, which all
+    imply a turn has begun, to release :func:`_subscribe_until_ready` from
+    its parked wait:
 
     - any ``turn/*`` or ``item/*`` notification, and
-    - ``thread/status/changed`` transitioning to an ``active`` status.
+    - ``thread/status/changed`` transitioning to an ``active`` status, the
+      only one of these that reaches a connection without a subscription.
 
     :param event: A Codex JSON-RPC notification envelope.
     :returns: ``True`` if the event implies the thread became active.
