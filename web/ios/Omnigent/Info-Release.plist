@@ -43,6 +43,8 @@
 	<string>Omnigent uses the camera when you choose to take a photo for an attachment.</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Omnigent uses the microphone for voice dictation in the message composer.</string>
+	<key>NSPhotoLibraryAddUsageDescription</key>
+	<string>Omnigent saves generated images to your photo library when you choose Save to Photos.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
 	<string>Omnigent uses speech recognition to turn voice dictation into message text.</string>
 	<key>UIApplicationSupportsIndirectInputEvents</key>
