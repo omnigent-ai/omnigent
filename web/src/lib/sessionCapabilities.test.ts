@@ -53,6 +53,18 @@ describe("session action restrictions", () => {
       switchHostDisabledReason: undefined,
     });
   });
+
+  it("allows an explicitly eligible managed fork without enabling host switching", () => {
+    expect(
+      sessionActionRestrictions({
+        labels: { "omnigent.host_type": "managed" },
+        sandboxForkProvider: "lakebox",
+      }),
+    ).toEqual({
+      forkDisabledReason: undefined,
+      switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+    });
+  });
 });
 
 describe("effortLevelsForFamily", () => {

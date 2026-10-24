@@ -92,6 +92,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_wrapper_label,
 )
 from omnigent.native.session_todos import validate_session_todos
+from omnigent.onboarding.sandboxes.types import SandboxForkSource
 from omnigent.policies.types import EvaluationContext
 from omnigent.runner.identity import (
     token_bound_runner_id,
@@ -6463,6 +6464,7 @@ async def _provision_managed_sandbox(
     agent_name: str | None = None,
     host_id: str | None = None,
     relaunch_slice_key_enabled: bool = False,
+    fork_source: SandboxForkSource | None = None,
 ) -> ManagedHostLaunch | None:
     """
     Run the provision phase of a background managed launch.
@@ -6529,6 +6531,7 @@ async def _provision_managed_sandbox(
             agent_name=agent_name,
             on_stage=_on_stage,
             host_id=host_id,
+            fork_source=fork_source,
         )
     except HTTPException as exc:
         _logger.warning(

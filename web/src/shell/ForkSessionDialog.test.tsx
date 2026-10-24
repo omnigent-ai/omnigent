@@ -1434,11 +1434,119 @@ describe("ForkSessionDialog", () => {
       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
     }
 
+    it.each([true, false])(
+      "defaults to copying an eligible shared sandbox and can opt out (%s)",
+      async (copySandbox) => {
+        useSessionMock.mockReturnValue({
+          session: {
+            hostId: "shared_host",
+            sandboxForkProvider: "agent_sandbox",
+            labels: { [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/repo#main" },
+          },
+          isLoading: false,
+          error: null,
+        } as unknown as ReturnType<typeof useSession>);
+        forkSessionMock.mockResolvedValue({ id: "conv_fork" } as Awaited<
+          ReturnType<typeof forkSession>
+        >);
+        renderDialog({
+          ...CODING,
+          sourceHostId: "shared_host",
+          upToResponseId: "resp_earlier",
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            sandbox_providers: ["modal", "agent_sandbox"],
+          },
+        });
+
+        const checkbox = screen.getByRole("checkbox", { name: "Fork sandbox as well" });
+        expect(checkbox).toBeChecked();
+        expect(checkbox).toHaveAccessibleDescription(/Files reflect the current sandbox/);
+        expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+        openAdvanced();
+        expect(screen.queryByTestId("fork-session-sandbox-repo-input")).not.toBeInTheDocument();
+        expect(screen.queryByTestId("fork-session-branch-input")).not.toBeInTheDocument();
+
+        if (!copySandbox) {
+          fireEvent.click(checkbox);
+          expect(screen.getByTestId("fork-session-host-select")).toBeInTheDocument();
+          expect(screen.getByTestId("fork-session-sandbox-repo-input")).toHaveValue(
+            "https://github.com/org/repo",
+          );
+          expect(screen.getByTestId("fork-session-sandbox-hint")).toHaveTextContent(
+            "fresh sandbox",
+          );
+        }
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+        expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+          title: undefined,
+          agentId: undefined,
+          upToResponseId: "resp_earlier",
+          config: {},
+          sandbox: {
+            provider: "agent_sandbox",
+            ...(copySandbox ? { fork: true } : { workspace: "https://github.com/org/repo#main" }),
+          },
+        });
+        expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+        expect(launchRunnerMock).not.toHaveBeenCalled();
+        await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+      },
+    );
+
+    it("pins a rechecked sandbox copy to the source provider despite another selected host", async () => {
+      useSessionMock.mockReturnValue({
+        session: {
+          hostId: "shared_host",
+          sandboxForkProvider: "lakebox",
+          labels: {
+            "omnigent.host_type": "managed",
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/api https://github.com/org/web",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as Awaited<
+        ReturnType<typeof forkSession>
+      >);
+      renderDialog({
+        ...CODING,
+        sourceHostId: "shared_host",
+        info: { managed_sandboxes_enabled: true, sandbox_provider: "lakebox" },
+      });
+
+      const checkbox = screen.getByRole("checkbox", { name: "Fork sandbox as well" });
+      fireEvent.click(checkbox);
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("fork-session-host-option-host_1"));
+      fireEvent.click(checkbox);
+      openAdvanced();
+      expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-sandbox-repos-readonly")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-branch-input")).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledOnce());
+      expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+        provider: "lakebox",
+        fork: true,
+      });
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+    });
+
     it("hides the sandbox option on a server that can't provision one", () => {
       // Fails closed, mirroring the new-session picker: a server with no
       // launch-capable sandbox config must not offer a target it will reject.
       renderDialog({ ...CODING, info: { managed_sandboxes_enabled: false } });
 
+      expect(
+        screen.queryByRole("checkbox", { name: "Fork sandbox as well" }),
+      ).not.toBeInTheDocument();
       openHostSelect();
       expect(screen.queryByTestId("fork-session-sandbox-option")).not.toBeInTheDocument();
     });

@@ -176,6 +176,7 @@ describe("createSession", () => {
       codexModelOptions: [],
       terminalPending: false,
       sandboxStatus: null,
+      sandboxForkProvider: null,
       mcpStartup: null,
       activeResponseId: null,
       workspace: null,
@@ -539,6 +540,22 @@ describe("forkSession", () => {
     const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(JSON.parse(init.body as string)).toEqual({ host_type: "managed", workspace: null });
   });
+
+  it.each([true, false])(
+    "only requests a sandbox copy when explicitly selected (%s)",
+    async (fork) => {
+      fetchMock.mockResolvedValueOnce(mockJsonResponse({ id: "conv_fork", status: "idle" }));
+
+      await forkSession("conv_src", { sandbox: { provider: "agent_sandbox", fork } });
+
+      const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+      expect(JSON.parse(init.body as string)).toEqual({
+        host_type: "managed",
+        sandbox_provider: "agent_sandbox",
+        ...(fork ? { fork_sandbox: true } : {}),
+      });
+    },
+  );
 
   it("sends no host_type when no sandbox target is given (the fork stays unbound)", async () => {
     fetchMock.mockResolvedValueOnce(
@@ -1098,6 +1115,7 @@ describe("getSession", () => {
         usage_included: false,
         total_cost_usd: null,
         usage_by_model: null,
+        sandbox_fork_provider: "agent_sandbox",
       }),
     );
 
@@ -1112,6 +1130,7 @@ describe("getSession", () => {
     expect(session.usageIncluded).toBe(false);
     expect(session.totalCostUsd).toBeNull();
     expect(session.usageByModel).toBeNull();
+    expect(session.sandboxForkProvider).toBe("agent_sandbox");
   });
 
   it("getSessionSlim can request a runner-backed state refresh", async () => {

@@ -24,6 +24,7 @@ import yaml
 from omnigent.host import HOST_FATAL_EXIT_CODE
 from omnigent.onboarding.sandboxes.base import (
     RemoteCommandResult,
+    SandboxCapabilityError,
     SandboxGoneError,
     SandboxLauncher,
     render_host_config_write_command,
@@ -63,6 +64,15 @@ class _RecordingLauncher(SandboxLauncher):
         # honors its env prefix, independent of the setsid/nohup wrapper.
         self.backgrounded.append(command)
         return super().run_background(sandbox_id, command, log_path=log_path)
+
+
+def test_fork_requires_provider_support() -> None:
+    launcher = _RecordingLauncher()
+    with pytest.raises(SandboxCapabilityError, match="fork a sandbox"):
+        launcher.fork(
+            "source", "copy", target_user_id="bob@example.com", idempotency_key="new-host"
+        )
+    assert launcher.commands == []
 
 
 def test_run_background_wraps_command_in_sh_c() -> None:

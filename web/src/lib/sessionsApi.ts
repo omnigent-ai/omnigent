@@ -261,6 +261,7 @@ interface SessionResponseWire {
    * `omnigent.server.schemas.SandboxStatus`.
    */
   sandbox_status?: SandboxStatus | null;
+  sandbox_fork_provider?: string | null;
   mcp_startup?: Record<string, McpServerStartup> | null;
   /**
    * Response id of the turn currently in flight, or absent/null when
@@ -374,6 +375,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
       : {}),
     terminalPending: wire.terminal_pending ?? false,
     sandboxStatus: wire.sandbox_status ?? null,
+    sandboxForkProvider: wire.sandbox_fork_provider ?? null,
     mcpStartup: wire.mcp_startup ?? null,
     activeResponseId: wire.active_response_id ?? null,
   };
@@ -810,7 +812,8 @@ export async function createBundledSession(
  *   repository the server clones into the sandbox; `null` gives the fork an
  *   empty sandbox, and leaving the key off inherits the repository the
  *   source session recorded. `hostId` names the new sandbox host, as on a
- *   managed create; omitted, the server mints one.
+ *   managed create; omitted, the server mints one. `fork: true` copies the
+ *   source sandbox's current files instead and requires omitting `workspace`.
  */
 export async function forkSession(
   sourceId: string,
@@ -824,7 +827,13 @@ export async function forkSession(
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
-    sandbox?: { provider?: string | null; workspace?: string | null; hostId?: string };
+    sandbox?: {
+      provider?: string | null;
+      workspace?: string | null;
+      hostId?: string;
+      /** Copy the source sandbox's current files instead of cloning repositories. */
+      fork?: boolean;
+    };
     /** Mark the fork as a side chat (hidden from the left sidebar). */
     sideChat?: boolean;
   } = {},
@@ -840,6 +849,7 @@ export async function forkSession(
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
+    fork_sandbox?: boolean;
     host_id?: string;
     workspace?: string | null;
     side_chat?: boolean;
@@ -872,6 +882,7 @@ export async function forkSession(
   }
   if (sandbox !== undefined) {
     body.host_type = "managed";
+    if (sandbox.fork) body.fork_sandbox = true;
     // A provider the server didn't name is omitted so it picks its first.
     if (sandbox.provider != null) {
       body.sandbox_provider = sandbox.provider;

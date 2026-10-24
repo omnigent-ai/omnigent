@@ -37,6 +37,7 @@ from omnigent.onboarding.sandboxes.registry import (
     SandboxProviderMetadata,
     reset_plugin_state_for_tests,
 )
+from omnigent.onboarding.sandboxes.types import SandboxForkSource
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -141,6 +142,40 @@ class _ClassifyingFakeSandboxLauncher(FakeSandboxLauncher):
         """Record the threaded agent name, then run the shared exec-model start."""
         self.agent_names.append(agent_name)
         return super().start_host(sandbox_id, **kwargs)
+
+
+class _ForkingFakeSandboxLauncher(FakeSandboxLauncher):
+    """A provider that keeps a copied workspace during host bootstrap."""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.fork_calls: list[tuple[str, str, str, str, str | None]] = []
+        self.forked_sandbox_id = "sb-forked"
+        self.fork_error: click.ClickException | None = None
+
+    @property
+    def capabilities(self) -> Any:
+        return replace(super().capabilities, fork_sandbox=True)
+
+    def fork(
+        self,
+        source_sandbox_id: str,
+        name: str,
+        *,
+        target_user_id: str,
+        idempotency_key: str,
+        source_workspace: str | None = None,
+    ) -> str:
+        self.fork_calls.append(
+            (source_sandbox_id, name, target_user_id, idempotency_key, source_workspace)
+        )
+        if self.fork_error is not None:
+            raise self.fork_error
+        return self.forked_sandbox_id
+
+    def prepare_workspace(self, sandbox_id: str, **kwargs: Any) -> str:
+        assert sandbox_id == self.forked_sandbox_id
+        return "/copied/workspace/subdirectory"
 
 
 class _StubAgentStore:
@@ -2187,14 +2222,14 @@ def test_read_managed_repo_workspaces_orders_numerically_and_falls_back() -> Non
     assert read_managed_repo_workspaces({}) == []
 
 
-def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
-    """The /v1/info map reflects each launchable provider's declared multi_repo,
+def test_provider_ui_capabilities_reports_opt_in_features_per_provider() -> None:
+    """The /v1/info map reflects each launchable provider's declared features,
     keyed by provider name; a provider declaring nothing stays off."""
 
     class _MultiRepoFake(FakeSandboxLauncher):
         @property
         def capabilities(self) -> Any:
-            return replace(super().capabilities, multi_repo=True)
+            return replace(super().capabilities, multi_repo=True, fork_sandbox=True)
 
     single = FakeSandboxLauncher()  # exec-model default → multi_repo False
     multi = _MultiRepoFake()
@@ -2215,8 +2250,8 @@ def test_provider_ui_capabilities_reports_multi_repo_per_provider() -> None:
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "single": {"multi_repo": False},
-        "multi": {"multi_repo": True},
+        "single": {"multi_repo": False, "fork_sandbox": False},
+        "multi": {"multi_repo": True, "fork_sandbox": True},
     }
 
 
@@ -2243,9 +2278,9 @@ def test_provider_ui_capabilities_enable_inference_only_on_configured_target() -
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "kubernetes": {"multi_repo": False},
-        "modal": {"multi_repo": False},
-        "agent_sandbox": {"multi_repo": False, "inference_models": True},
+        "kubernetes": {"multi_repo": False, "fork_sandbox": False},
+        "modal": {"multi_repo": False, "fork_sandbox": False},
+        "agent_sandbox": {"multi_repo": False, "fork_sandbox": False, "inference_models": True},
     }
 
 
@@ -2297,12 +2332,12 @@ def test_provider_ui_capabilities_advertise_default_models_for_unbound_discovery
         )
     )
     assert deployment.provider_ui_capabilities() == {
-        "hooked": {"multi_repo": False, "default_models": True},
-        "discovered": {"multi_repo": False, "default_models": True},
-        "static": {"multi_repo": False},
-        "bound": {"multi_repo": False, "inference_models": True},
-        "malformed": {"multi_repo": False},
-        "malformed-inference": {"multi_repo": False},
+        "hooked": {"multi_repo": False, "fork_sandbox": False, "default_models": True},
+        "discovered": {"multi_repo": False, "fork_sandbox": False, "default_models": True},
+        "static": {"multi_repo": False, "fork_sandbox": False},
+        "bound": {"multi_repo": False, "fork_sandbox": False, "inference_models": True},
+        "malformed": {"multi_repo": False, "fork_sandbox": False},
+        "malformed-inference": {"multi_repo": False, "fork_sandbox": False},
     }
 
 
@@ -2526,6 +2561,108 @@ async def test_launch_success_registers_host_and_returns_workspace(
     assert resolved.host_id == result.host_id
     # Nothing was torn down on the success path.
     assert fake.terminated == []
+
+
+async def test_launch_forks_with_target_identity_and_preserves_workspace(db_uri: str) -> None:
+    host_store = HostStore(db_uri)
+    source = host_store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="source",
+        user_id=_OWNER,
+        token="source-token",
+        provider="modal",
+        sandbox_id="sb-source",
+        token_expires_at=now_epoch() + 3600,
+    )
+    target_owner = "bob@example.com"
+    target_id = "0123456789abcdef0123456789abcdef"
+
+    def register(invocation: HostStartInvocation) -> None:
+        target = host_store.resolve_launch_token(invocation.host_id, invocation.token)
+        assert target is not None and target.user_id == target_owner
+        assert host_store.resolve_launch_token(invocation.host_id, "source-token") is None
+        host_store.upsert_on_connect(
+            host_id=invocation.host_id, name=invocation.host_name, user_id=target_owner
+        )
+
+    fake = _ForkingFakeSandboxLauncher(on_host_start=register)
+    config = _injected_config(fake)
+    result = await launch_managed_host(
+        config=config,
+        owner=target_owner,
+        host_store=host_store,
+        host_id=target_id,
+        fork_source=SandboxForkSource("sb-source", "/source/workspace/subdirectory"),
+        repos=[parse_repo_workspace("https://github.com/org/repo")],
+    )
+
+    assert fake.fork_calls == [
+        (
+            "sb-source",
+            "managed-01234567",
+            target_owner,
+            target_id,
+            "/source/workspace/subdirectory",
+        )
+    ]
+    assert fake.provisioned_names == []
+    assert not any("git clone" in command for command in fake.commands)
+    assert result.workspace == "/copied/workspace/subdirectory"
+    target = host_store.get_host(result.host_id)
+    assert target is not None and target.sandbox_id == "sb-forked"
+    assert host_store.resolve_launch_token(source.host_id, "source-token") is not None
+    assert fake.terminated == []
+
+
+async def test_launch_fork_rejects_unsupported_provider_before_preparation(db_uri: str) -> None:
+    fake = FakeSandboxLauncher()
+    host_store = HostStore(db_uri)
+    with pytest.raises(HTTPException, match="does not support sandbox forking") as error:
+        await launch_managed_host(
+            config=_injected_config(fake),
+            owner=_OWNER,
+            host_store=host_store,
+            fork_source=SandboxForkSource("source"),
+        )
+    assert error.value.status_code == 400
+    assert fake.prepared is False
+    assert fake.provisioned_names == []
+    assert host_store.list_hosts(_OWNER) == []
+
+
+@pytest.mark.parametrize("failure", ["copy", "same_id", "empty_id", "startup"])
+async def test_launch_fork_failure_never_terminates_source(db_uri: str, failure: str) -> None:
+    host_store = HostStore(db_uri)
+    source = host_store.register_managed_host(
+        host_id=uuid.uuid4().hex,
+        name="source",
+        user_id=_OWNER,
+        token="source-token",
+        provider="modal",
+        sandbox_id="sb-source",
+        token_expires_at=now_epoch() + 3600,
+    )
+    fake = _ForkingFakeSandboxLauncher(fail_on_host_start=failure == "startup")
+    if failure == "copy":
+        fake.fork_error = click.ClickException("copy rejected")
+    elif failure == "same_id":
+        fake.forked_sandbox_id = "sb-source"
+    elif failure == "empty_id":
+        fake.forked_sandbox_id = ""
+
+    with pytest.raises(HTTPException) as error:
+        await launch_managed_host(
+            config=_injected_config(fake),
+            owner="bob@example.com",
+            host_store=host_store,
+            fork_source=SandboxForkSource("sb-source"),
+        )
+    assert error.value.status_code == 502
+    assert fake.terminated == (["sb-forked"] if failure == "startup" else [])
+    assert fake.provisioned_names == []
+    assert host_store.list_hosts("bob@example.com") == []
+    assert host_store.get_host(source.host_id) == source
+    assert host_store.resolve_launch_token(source.host_id, "source-token") is not None
 
 
 async def test_launch_threads_agent_name_only_to_a_classifying_launcher(db_uri: str) -> None:

@@ -1921,6 +1921,8 @@ class ConversationStore(ABC):
         override_reasoning_effort_set: bool = False,
         override_terminal_launch_args: list[str] | None = None,
         override_terminal_launch_args_set: bool = False,
+        override_inference_snapshot: dict[str, Any] | None = None,
+        override_inference_snapshot_set: bool = False,
         dropped_label_keys: frozenset[str] = frozenset(),
         extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
@@ -1991,6 +1993,10 @@ class ConversationStore(ABC):
             — then it supersedes the ``copy_terminal_launch_args`` copy.
         :param override_terminal_launch_args_set: Whether the caller chose
             explicit launch args.
+        :param override_inference_snapshot: Target owner's inference configuration,
+            including ``None`` to clear it, when the set flag is true.
+        :param override_inference_snapshot_set: Replace the source configuration
+            instead of inheriting it when forking across users.
         :param dropped_label_keys: Source labels to NOT copy onto the fork,
             beyond the always-dropped instance-scoped set (e.g. the
             permission-mode / codex-bypass label keys when the dialog picks

@@ -94,6 +94,9 @@ class SandboxCapabilities:
         handed a multi-repo request; providers opt in explicitly.
     :param git_clone_options: Provider honors ``RepoWorkspace.git_clone``
         when creating checkouts. Custom materializers must opt in.
+    :param fork_sandbox: Provider can copy an existing sandbox's workspace into an
+        independent sandbox owned by the requesting user. ``start_host``
+        preserves the copied files and installs fresh host credentials.
     """
 
     cli_bootstrap: bool = False
@@ -110,6 +113,15 @@ class SandboxCapabilities:
     snapshot_restore: bool = False
     multi_repo: bool = False
     git_clone_options: bool = False
+    fork_sandbox: bool = False
+
+
+@dataclass(frozen=True)
+class SandboxForkSource:
+    """Server-resolved sandbox generation and session cwd to copy."""
+
+    sandbox_id: str
+    workspace: str | None = None
 
 
 @dataclass(frozen=True)

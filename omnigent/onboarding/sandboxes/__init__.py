@@ -50,6 +50,7 @@ from omnigent.onboarding.sandboxes.types import (
     SandboxCommandError,
     SandboxConfigError,
     SandboxError,
+    SandboxForkSource,
     SandboxInfo,
     SandboxSpec,
 )
@@ -69,6 +70,7 @@ __all__ = [
     "SandboxCommandError",
     "SandboxConfigError",
     "SandboxError",
+    "SandboxForkSource",
     "SandboxGoneError",
     "SandboxHostLauncher",
     "SandboxInfo",

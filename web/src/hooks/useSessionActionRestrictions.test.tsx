@@ -164,6 +164,21 @@ describe("useSessionActionRestrictions", () => {
     await waitFor(() => expect(result.current).toEqual(unrestricted));
   });
 
+  it("allows an eligible shared sandbox fork when the source host is not listed", async () => {
+    getSessionMock.mockResolvedValue({
+      ...session({ "omnigent.host_type": "managed" }),
+      sandboxForkProvider: "agent_sandbox",
+    });
+    fetchMock.mockImplementation(async () => new Response(JSON.stringify({ hosts: [] })));
+    const { result } = renderRestrictions();
+    await waitFor(() =>
+      expect(result.current).toEqual({
+        forkDisabledReason: undefined,
+        switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+      }),
+    );
+  });
+
   it.each([false, true])(
     "preserves hostless session capabilities without requesting hosts (managed=%s)",
     async (managed) => {

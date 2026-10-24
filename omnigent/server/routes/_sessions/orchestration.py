@@ -85,6 +85,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.onboarding.sandboxes.types import SandboxForkSource
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -364,6 +365,7 @@ from omnigent.server.routes._sessions.helpers import (
     _wait_for_runner_client,
 )
 from omnigent.server.runner_session_init import RunnerSessionInitializer
+from omnigent.server.sandbox_forks import sandbox_fork_provider
 from omnigent.server.schemas import (
     BackgroundTaskInfo,
     ChildSessionSummary,
@@ -4328,6 +4330,7 @@ async def _run_managed_launch(
     agent_store: AgentStore | None = None,
     agent_id: str | None = None,
     host_id: str | None = None,
+    fork_source: SandboxForkSource | None = None,
 ) -> None:
     """
     Provision a managed sandbox for a session in the background.
@@ -4433,6 +4436,7 @@ async def _run_managed_launch(
                 and saved_conversation is not None
                 and host_slice_key_enabled(saved_conversation.labels, relaunch_host.host_id)
             ),
+            fork_source=fork_source,
         )
         if managed is None:
             return
@@ -13220,6 +13224,7 @@ async def _get_session_snapshot(
     viewer_id: str | None = None,
     request: Request | None = None,
     include_usage: bool = True,
+    workspace_readable: bool = False,
 ) -> SessionResponse:
     """
     Read a full session snapshot from the store.
@@ -13506,10 +13511,14 @@ async def _get_session_snapshot(
     # liveness arrives via the poll/stream). One indexed host read, gated to
     # host-bound sessions.
     host_resumable = False
+    fork_provider = None
     if host_store is not None and sandbox_config is not None and conv.host_id is not None:
         host_for_resume = await asyncio.to_thread(host_store.get_host, conv.host_id)
         if host_for_resume is not None:
             host_resumable = host_resume_supported(host_for_resume, sandbox_config)
+            fork_provider = sandbox_fork_provider(
+                conv, workspace_readable, host_for_resume, sandbox_config
+            )
     response = _build_session_response(
         conv,
         items,
@@ -13539,6 +13548,7 @@ async def _get_session_snapshot(
     )
     response.inference_configured = inference_configured
     response.inference_error = inference_error
+    response.sandbox_fork_provider = fork_provider
     response.usage_included = include_usage
     startup = getattr(request.app.state, "startup_inputs", None) if request is not None else None
     if startup is not None and STARTUP_LABEL in conv.labels:

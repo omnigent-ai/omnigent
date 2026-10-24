@@ -4638,6 +4638,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         override_reasoning_effort_set: bool = False,
         override_terminal_launch_args: list[str] | None = None,
         override_terminal_launch_args_set: bool = False,
+        override_inference_snapshot: dict[str, Any] | None = None,
+        override_inference_snapshot_set: bool = False,
         dropped_label_keys: frozenset[str] = frozenset(),
         extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
@@ -4721,6 +4723,10 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param override_terminal_launch_args_set: Whether the caller chose
             explicit launch args. ``False`` (default) inherits per
             ``copy_terminal_launch_args``.
+        :param override_inference_snapshot: Target owner's inference configuration,
+            including ``None`` to clear it, when the set flag is true.
+        :param override_inference_snapshot_set: Replace the source configuration
+            instead of inheriting it when forking across users.
         :param dropped_label_keys: Source labels to NOT copy onto the fork,
             beyond the always-dropped instance-scoped set. The fork route
             passes the permission-mode / codex-bypass label keys here when
@@ -4797,6 +4803,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             override_reasoning_effort_set=override_reasoning_effort_set,
             override_terminal_launch_args=override_terminal_launch_args,
             override_terminal_launch_args_set=override_terminal_launch_args_set,
+            override_inference_snapshot=override_inference_snapshot,
+            override_inference_snapshot_set=override_inference_snapshot_set,
             dropped_label_keys=dropped_label_keys,
             extra_labels=extra_labels,
             carry_history_into_native=carry_history_into_native,
@@ -4826,6 +4834,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         override_reasoning_effort_set: bool = False,
         override_terminal_launch_args: list[str] | None = None,
         override_terminal_launch_args_set: bool = False,
+        override_inference_snapshot: dict[str, Any] | None = None,
+        override_inference_snapshot_set: bool = False,
         dropped_label_keys: frozenset[str] = frozenset(),
         extra_labels: dict[str, str] | None = None,
         carry_history_into_native: bool = False,
@@ -4853,9 +4863,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                 SqlConversationMetadata, (current_workspace_id(), source_conversation_id)
             )
 
-        _validate_inference_snapshot(
-            source_meta_ref.inference_snapshot if source_meta_ref else None
+        fork_inference_snapshot = (
+            (
+                json.dumps(override_inference_snapshot)
+                if override_inference_snapshot is not None
+                else None
+            )
+            if override_inference_snapshot_set
+            else (source_meta_ref.inference_snapshot if source_meta_ref else None)
         )
+        _validate_inference_snapshot(fork_inference_snapshot)
 
         with self._conv_session("prepare_fork_conversation") as session:
             source = session.get(SqlConversation, (current_workspace_id(), source_conversation_id))
@@ -5262,9 +5279,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 id=new_conv_id,
                 kind=encoded_default_kind,
                 terminal_launch_args=source_terminal_args,
-                inference_snapshot=(
-                    source_meta_ref.inference_snapshot if source_meta_ref else None
-                ),
+                inference_snapshot=fork_inference_snapshot,
                 project_id=project_id,
             )
             meta_sess.add(fork_meta)

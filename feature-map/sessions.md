@@ -60,6 +60,10 @@ the header menu), and each place is a separate entry point.
   fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
+- `fork-sandbox`: eligible sandbox sessions offer **Fork sandbox as well**,
+  checked by default. The fork gets a separate sandbox owned by the caller,
+  copying its current files. Unchecking offers the usual host or fresh sandbox
+  choices. Cross-user copies also require access to the source's workspace files.
 - `unsupported-sandbox-actions`: Databricks Sandbox and Arclet fork and
   host-switch controls stay visible but disabled, with hover and keyboard
   explanations. Their forms cannot submit.
@@ -222,6 +226,15 @@ agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
 
+**Sandbox forks:** use Fork from the header, sidebar, or a message, or Clone in
+the reconnect dialog. When the provider supports copying the source sandbox and
+you can access its files, **Fork sandbox as well** starts checked. The copy stays
+on the source provider; agent and model choices remain available. Uncheck it to
+choose another host or a fresh sandbox, whose repositories can be changed under
+Advanced settings. Forking from an earlier message truncates the conversation
+but copies the sandbox's current files, as the dialog explains. The new session
+opens immediately and shows provisioning progress or its failure.
+
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers
 "No, archive only" and "Yes, delete worktree", plus Remember my choice.
@@ -301,7 +314,7 @@ than the main session.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
-**Databricks Sandbox and Arclet sessions:** Fork is disabled in the header,
+**Databricks Sandbox and Arclet sessions without sandbox-fork support:** Fork is disabled in the header,
 sidebar menus, and message actions. The composer's host menu shows a disabled
 **Switch host…** item when you have write access. Read-only viewers retain the
 existing host menu without switching controls. Hover or focus a disabled action
@@ -522,6 +535,17 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/server/integration/test_sessions_permissions.py::test_fork_switch_denies_session_scoped_target_without_access`.
   These exercise authenticated routes and stores; the single-user browser
   recipe cannot prove cross-user access rules.
+- **`fork-sandbox`:**
+  `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`
+  covers message, header, sidebar dropdown/context-menu, and reconnect Clone
+  entry points, including phone layouts and the unchecked fresh-sandbox path.
+  Sandbox capability metadata and managed request forwarding are mocked; the
+  conversation fork, navigation, and transcript readback use the real server.
+  This does not provision a sandbox or prove a controller copies files.
+  For a live controller, create an uncommitted file, share the session and its
+  workspace files with another user, and fork as that user with the checkbox
+  on. Confirm a new sandbox contains the file and edits do not affect the source.
+  Repeat unchecked and confirm the fresh sandbox uses the selected repository.
 - **`clone`:**
   `tests/e2e_ui/sessions/test_clone_session.py::test_clone_session_copies_transcript_and_navigates`,
   `tests/e2e_ui/fork_session/test_typed_workspace_enables_clone.py::test_typed_tilde_workspace_enables_clone`
@@ -821,7 +845,9 @@ plain `uv run pytest`, which starts a private server for the test.
   forked session and confirm the image still loads; the transcript text alone
   does not prove the file came along.
 - Databricks Sandbox and Arclet restrictions apply to managed sources, including
-  shared sessions. Other sandbox providers support forking. Verify the supported
+  shared sessions, unless the server explicitly enables sandbox copying for that
+  source and user. Other sandbox providers support conversation forks onto fresh
+  sandboxes; copying current sandbox files requires provider support. Verify the supported
   path with
   `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
 - A custom agent outlives its sessions: forks of your own sessions share it,

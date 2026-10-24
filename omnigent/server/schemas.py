@@ -2441,6 +2441,10 @@ class SessionResponse(BaseModel):
     inference_error: str | None = None
     terminal_pending: bool = False
     sandbox_status: SandboxStatus | None = None
+    sandbox_fork_provider: str | None = Field(
+        default=None,
+        description="Source sandbox provider supporting a copy for the current viewer.",
+    )
     # Per-MCP-server startup state for native harness sessions
     # (codex-native), present while the harness boots its MCP servers or
     # when servers were cancelled/failed. ``None`` otherwise. Sourced from
@@ -2812,6 +2816,11 @@ class SessionForkRequest(BaseModel):
         an external fork's directory is chosen when it binds a host.
     """
 
+    fork_sandbox: bool = Field(
+        default=False,
+        description="Copy the source sandbox's current workspace through its provider. "
+        "Requires a managed destination and does not rewind files to up_to_response_id.",
+    )
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     agent_id: str | None = None
     up_to_response_id: str | None = None
@@ -2855,6 +2864,13 @@ class SessionForkRequest(BaseModel):
         # at module scope would risk import cycles.
         from omnigent.server.managed_hosts import parse_repo_workspace
 
+        if self.fork_sandbox:
+            if self.host_type != "managed":
+                raise ValueError("fork_sandbox requires host_type 'managed'")
+            if self.side_chat:
+                raise ValueError("fork_sandbox cannot be combined with side_chat")
+            if "workspace" in self.model_fields_set:
+                raise ValueError("fork_sandbox cannot override the source workspace")
         if self.host_type == "managed":
             if self.host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(self.host_id):
                 raise ValueError(
