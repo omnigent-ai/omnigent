@@ -24,6 +24,17 @@ vi.mock("@/lib/clipboard", () => ({ copyText: copyTextMock }));
 import { useSession } from "@/hooks/useSession";
 import { FilesPanel } from "./FilesPanel";
 import { FilesPanelDrawer } from "./FilesPanelDrawer";
+import type { ReactNode } from "react";
+
+vi.mock("./WorkspaceUploads", () => ({
+  useWorkspaceUpload: () => null,
+  WorkspaceUploadProvider: ({ children }: { children: ReactNode }) => children,
+  WorkspaceUploadDropRoot: ({ children }: { children: ReactNode }) => <div>{children}</div>,
+  UploadsTray: () => <div data-testid="uploads-tray-stub" />,
+  UploadPicker: ({ directory }: { directory: string }) => (
+    <button type="button" aria-label="Upload files" data-directory={directory} />
+  ),
+}));
 import { FolderTree } from "./FolderTree";
 import { SCROLL_RESTORE_BUDGET_MS } from "./useScrollRestore";
 
@@ -318,6 +329,12 @@ describe("FilesPanel working folder directory", () => {
 });
 
 describe("FilesPanel header role", () => {
+  it("mounts the upload picker in the header with a workspace-relative destination", () => {
+    renderPanel({ conversationId: "conv_upload_header", files: [], workingDir: "/home/user/proj" });
+    const upload = screen.getByRole("button", { name: "Upload files" });
+    expect(upload).toHaveAttribute("data-directory", "");
+    expect(upload.closest(".h-11")).toBeTruthy();
+  });
   it("omits the redundant Working folder heading in the standalone card", () => {
     renderPanel({ conversationId: "conv_header_card", files: [] });
     expect(screen.queryByText("Working folder")).toBeNull();

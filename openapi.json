@@ -1122,6 +1122,32 @@
         "title": "ChildSessionSummary",
         "type": "object"
       },
+      "ChunkLimits": {
+        "properties": {
+          "initial": {
+            "format": "int64",
+            "title": "Initial",
+            "type": "integer"
+          },
+          "max": {
+            "format": "int64",
+            "title": "Max",
+            "type": "integer"
+          },
+          "min": {
+            "format": "int64",
+            "title": "Min",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "min",
+          "initial",
+          "max"
+        ],
+        "title": "ChunkLimits",
+        "type": "object"
+      },
       "ClearCodexGoalResponse": {
         "description": "Response body for `DELETE /v1/sessions/{id}/codex_goal`.",
         "properties": {
@@ -1551,6 +1577,45 @@
         "title": "CompletedEvent",
         "type": "object"
       },
+      "CompletedUpload": {
+        "properties": {
+          "final_name": {
+            "title": "Final Name",
+            "type": "string"
+          },
+          "outcome": {
+            "enum": [
+              "created",
+              "replaced",
+              "renamed"
+            ],
+            "title": "Outcome",
+            "type": "string"
+          },
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "sha256": {
+            "title": "Sha256",
+            "type": "string"
+          },
+          "size": {
+            "format": "int64",
+            "title": "Size",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "path",
+          "size",
+          "sha256",
+          "outcome",
+          "final_name"
+        ],
+        "title": "CompletedUpload",
+        "type": "object"
+      },
       "ConversationDeleted": {
         "description": "Confirmation payload returned after deleting a conversation.",
         "properties": {
@@ -1861,6 +1926,37 @@
           "response"
         ],
         "title": "CreatedEvent",
+        "type": "object"
+      },
+      "CreatedUpload": {
+        "properties": {
+          "chunk_bytes": {
+            "format": "int64",
+            "title": "Chunk Bytes",
+            "type": "integer"
+          },
+          "expires_at": {
+            "format": "double",
+            "title": "Expires At",
+            "type": "number"
+          },
+          "offset": {
+            "format": "int64",
+            "title": "Offset",
+            "type": "integer"
+          },
+          "upload_id": {
+            "title": "Upload Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "upload_id",
+          "offset",
+          "chunk_bytes",
+          "expires_at"
+        ],
+        "title": "CreatedUpload",
         "type": "object"
       },
       "DailyCost": {
@@ -5053,6 +5149,54 @@
           "ordered_project_ids"
         ],
         "title": "ProjectOrderResponse",
+        "type": "object"
+      },
+      "PublicLimits": {
+        "properties": {
+          "chunk": {
+            "$ref": "#/components/schemas/ChunkLimits"
+          },
+          "max_batch_bytes": {
+            "default": 5368709120,
+            "format": "int64",
+            "title": "Max Batch Bytes",
+            "type": "integer"
+          },
+          "max_file_bytes": {
+            "format": "int64",
+            "title": "Max File Bytes",
+            "type": "integer"
+          },
+          "max_files_per_batch": {
+            "default": 100,
+            "format": "int64",
+            "title": "Max Files Per Batch",
+            "type": "integer"
+          },
+          "max_open_bytes": {
+            "format": "int64",
+            "title": "Max Open Bytes",
+            "type": "integer"
+          },
+          "max_open_uploads": {
+            "format": "int64",
+            "title": "Max Open Uploads",
+            "type": "integer"
+          },
+          "parallel_files": {
+            "default": 2,
+            "format": "int64",
+            "title": "Parallel Files",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "max_file_bytes",
+          "chunk",
+          "max_open_uploads",
+          "max_open_bytes"
+        ],
+        "title": "PublicLimits",
         "type": "object"
       },
       "QueuedEvent": {
@@ -10002,6 +10146,34 @@
           }
         },
         "title": "UpdateSessionRequest",
+        "type": "object"
+      },
+      "UploadCapability": {
+        "properties": {
+          "limits": {
+            "$ref": "#/components/schemas/PublicLimits"
+          },
+          "reason": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Reason"
+          },
+          "supported": {
+            "title": "Supported",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "supported",
+          "limits"
+        ],
+        "title": "UploadCapability",
         "type": "object"
       },
       "UpsertMCPServerRequest": {
@@ -16460,6 +16632,422 @@
           }
         },
         "summary": "Run Environment Shell",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}/uploads": {
+      "get": {
+        "operationId": "get_capability_v1_sessions__session_id__resources_environments__environment_id__uploads_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/UploadCapability"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Capability",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "post": {
+        "operationId": "create_v1_sessions__session_id__resources_environments__environment_id__uploads_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Idempotency-Key"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "additionalProperties": false,
+                "description": "Public declaration; caller identity is supplied by the server.",
+                "properties": {
+                  "dir": {
+                    "title": "Dir",
+                    "type": "string"
+                  },
+                  "name": {
+                    "title": "Name",
+                    "type": "string"
+                  },
+                  "on_conflict": {
+                    "default": "fail",
+                    "enum": [
+                      "fail",
+                      "replace",
+                      "rename"
+                    ],
+                    "title": "On Conflict",
+                    "type": "string"
+                  },
+                  "sha256": {
+                    "anyOf": [
+                      {
+                        "pattern": "^[0-9a-f]{64}$",
+                        "type": "string"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ],
+                    "title": "Sha256"
+                  },
+                  "size": {
+                    "minimum": 0,
+                    "title": "Size",
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "dir",
+                  "name",
+                  "size"
+                ],
+                "title": "UploadDeclaration",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CreatedUpload"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}/uploads/{upload_id}": {
+      "delete": {
+        "operationId": "abort_v1_sessions__session_id__resources_environments__environment_id__uploads__upload_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "upload_id",
+            "required": true,
+            "schema": {
+              "title": "Upload Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompletedUpload"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "204": {
+            "description": "Upload aborted"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Abort",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "head": {
+        "operationId": "status_v1_sessions__session_id__resources_environments__environment_id__uploads__upload_id__head",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "upload_id",
+            "required": true,
+            "schema": {
+              "title": "Upload Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Status",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "patch": {
+        "operationId": "append_v1_sessions__session_id__resources_environments__environment_id__uploads__upload_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "upload_id",
+            "required": true,
+            "schema": {
+              "title": "Upload Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "Upload-Offset",
+            "required": true,
+            "schema": {
+              "minimum": 0,
+              "type": "integer"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/offset+octet-stream": {
+              "schema": {
+                "format": "binary",
+                "type": "string"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "204": {
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Append",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}/uploads/{upload_id}/complete": {
+      "post": {
+        "operationId": "complete_v1_sessions__session_id__resources_environments__environment_id__uploads__upload_id__complete_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "upload_id",
+            "required": true,
+            "schema": {
+              "title": "Upload Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CompletedUpload"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Complete",
         "tags": [
           "session_resources"
         ]

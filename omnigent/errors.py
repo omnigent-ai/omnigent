@@ -259,6 +259,30 @@ class ErrorCode:
     UPSTREAM_CANCELLED = "upstream_cancelled"
     UPSTREAM_PERMISSION_DENIED = "upstream_permission_denied"
     STALE_CURSOR = "stale_cursor"
+    INVALID_NAME = "invalid_name"
+    INVALID_PATH = "invalid_path"
+    INVALID_REQUEST = "invalid_request"
+    IDEMPOTENCY_KEY_CONFLICT = "idempotency_key_conflict"
+    INVALID_OFFSET = "invalid_offset"
+    FILE_EXISTS = "file_exists"
+    IS_DIRECTORY = "is_directory"
+    OFFSET_MISMATCH = "offset_mismatch"
+    INCOMPLETE = "incomplete"
+    CHECKSUM_MISMATCH = "checksum_mismatch"
+    ALREADY_COMPLETE = "already_complete"
+    PLAN_CHANGED = "plan_changed"
+    TOO_LARGE = "too_large"
+    UNSUPPORTED_MEDIA_TYPE = "unsupported_media_type"
+    GONE = "gone"
+    PARENT_GONE = "parent_gone"
+    STAGING_GONE = "staging_gone"
+    PERMISSION_DENIED = "permission_denied"
+    UPLOAD_OWNER_MISMATCH = "upload_owner_mismatch"
+    BUSY = "busy"
+    UPLOAD_LIMIT = "upload_limit"
+    NO_SPACE = "no_space"
+    UPLOAD_RELAY_FAILED = "upload_relay_failed"
+    UPLOAD_TIMEOUT = "timeout"
 
 
 # Client-facing text for ``SESSION_AGENT_MISSING``: the session's agent was
@@ -318,6 +342,30 @@ _CODE_TO_HTTP_STATUS: dict[str, int] = {
     # succeed — the fix is to restart the enumeration without the cursor. The
     # distinct code is what a paging client keys that restart off.
     ErrorCode.STALE_CURSOR: 400,
+    ErrorCode.INVALID_NAME: 400,
+    ErrorCode.INVALID_PATH: 400,
+    ErrorCode.INVALID_REQUEST: 400,
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: 422,
+    ErrorCode.INVALID_OFFSET: 400,
+    ErrorCode.FILE_EXISTS: 409,
+    ErrorCode.IS_DIRECTORY: 409,
+    ErrorCode.OFFSET_MISMATCH: 409,
+    ErrorCode.INCOMPLETE: 409,
+    ErrorCode.CHECKSUM_MISMATCH: 409,
+    ErrorCode.ALREADY_COMPLETE: 409,
+    ErrorCode.PLAN_CHANGED: 409,
+    ErrorCode.TOO_LARGE: 413,
+    ErrorCode.UNSUPPORTED_MEDIA_TYPE: 415,
+    ErrorCode.GONE: 410,
+    ErrorCode.PARENT_GONE: 410,
+    ErrorCode.STAGING_GONE: 410,
+    ErrorCode.PERMISSION_DENIED: 403,
+    ErrorCode.UPLOAD_OWNER_MISMATCH: 403,
+    ErrorCode.BUSY: 429,
+    ErrorCode.UPLOAD_LIMIT: 429,
+    ErrorCode.NO_SPACE: 507,
+    ErrorCode.UPLOAD_RELAY_FAILED: 502,
+    ErrorCode.UPLOAD_TIMEOUT: 504,
 }
 
 
@@ -361,6 +409,30 @@ _CODE_TO_CATEGORY: dict[str, ErrorCategory] = {
     # A stale reference: the cursor row was deleted (often by the same user
     # in another client) between two page fetches.
     ErrorCode.STALE_CURSOR: ErrorCategory.USER,
+    ErrorCode.INVALID_NAME: ErrorCategory.USER,
+    ErrorCode.INVALID_PATH: ErrorCategory.USER,
+    ErrorCode.INVALID_REQUEST: ErrorCategory.USER,
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: ErrorCategory.USER,
+    ErrorCode.INVALID_OFFSET: ErrorCategory.USER,
+    ErrorCode.FILE_EXISTS: ErrorCategory.USER,
+    ErrorCode.IS_DIRECTORY: ErrorCategory.USER,
+    ErrorCode.OFFSET_MISMATCH: ErrorCategory.USER,
+    ErrorCode.INCOMPLETE: ErrorCategory.USER,
+    ErrorCode.CHECKSUM_MISMATCH: ErrorCategory.USER,
+    ErrorCode.ALREADY_COMPLETE: ErrorCategory.USER,
+    ErrorCode.PLAN_CHANGED: ErrorCategory.USER,
+    ErrorCode.TOO_LARGE: ErrorCategory.USER,
+    ErrorCode.UNSUPPORTED_MEDIA_TYPE: ErrorCategory.USER,
+    ErrorCode.GONE: ErrorCategory.USER,
+    ErrorCode.PARENT_GONE: ErrorCategory.USER,
+    ErrorCode.STAGING_GONE: ErrorCategory.USER,
+    ErrorCode.PERMISSION_DENIED: ErrorCategory.USER,
+    ErrorCode.UPLOAD_OWNER_MISMATCH: ErrorCategory.USER,
+    ErrorCode.BUSY: ErrorCategory.SERVER,
+    ErrorCode.UPLOAD_LIMIT: ErrorCategory.USER,
+    ErrorCode.NO_SPACE: ErrorCategory.RUNNER,
+    ErrorCode.UPLOAD_RELAY_FAILED: ErrorCategory.RUNNER,
+    ErrorCode.UPLOAD_TIMEOUT: ErrorCategory.RUNNER,
 }
 
 
@@ -406,6 +478,30 @@ _CODE_TO_IMPACT: dict[str, ErrorImpact] = {
     ErrorCode.CONFLICT: ErrorImpact.BENIGN,
     ErrorCode.REFRESH_UNSUPPORTED: ErrorImpact.BENIGN,
     ErrorCode.STALE_CURSOR: ErrorImpact.BENIGN,
+    ErrorCode.INVALID_NAME: ErrorImpact.BENIGN,
+    ErrorCode.INVALID_PATH: ErrorImpact.BENIGN,
+    ErrorCode.INVALID_REQUEST: ErrorImpact.BENIGN,
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: ErrorImpact.BENIGN,
+    ErrorCode.INVALID_OFFSET: ErrorImpact.BENIGN,
+    ErrorCode.FILE_EXISTS: ErrorImpact.BENIGN,
+    ErrorCode.IS_DIRECTORY: ErrorImpact.BENIGN,
+    ErrorCode.OFFSET_MISMATCH: ErrorImpact.BENIGN,
+    ErrorCode.INCOMPLETE: ErrorImpact.BENIGN,
+    ErrorCode.CHECKSUM_MISMATCH: ErrorImpact.BENIGN,
+    ErrorCode.ALREADY_COMPLETE: ErrorImpact.BENIGN,
+    ErrorCode.PLAN_CHANGED: ErrorImpact.BENIGN,
+    ErrorCode.TOO_LARGE: ErrorImpact.BENIGN,
+    ErrorCode.UNSUPPORTED_MEDIA_TYPE: ErrorImpact.BENIGN,
+    ErrorCode.GONE: ErrorImpact.BENIGN,
+    ErrorCode.PARENT_GONE: ErrorImpact.BENIGN,
+    ErrorCode.STAGING_GONE: ErrorImpact.BENIGN,
+    ErrorCode.PERMISSION_DENIED: ErrorImpact.BENIGN,
+    ErrorCode.UPLOAD_OWNER_MISMATCH: ErrorImpact.BENIGN,
+    ErrorCode.BUSY: ErrorImpact.TRANSIENT,
+    ErrorCode.UPLOAD_LIMIT: ErrorImpact.TRANSIENT,
+    ErrorCode.NO_SPACE: ErrorImpact.BENIGN,
+    ErrorCode.UPLOAD_RELAY_FAILED: ErrorImpact.TRANSIENT,
+    ErrorCode.UPLOAD_TIMEOUT: ErrorImpact.TRANSIENT,
 }
 
 
@@ -447,6 +543,30 @@ _CODE_TO_PHASE: dict[str, ErrorPhase] = {
     ErrorCode.UPSTREAM_CANCELLED: ErrorPhase.UNKNOWN,
     ErrorCode.UPSTREAM_PERMISSION_DENIED: ErrorPhase.UNKNOWN,
     ErrorCode.STALE_CURSOR: ErrorPhase.REQUEST,
+    ErrorCode.INVALID_NAME: ErrorPhase.REQUEST,
+    ErrorCode.INVALID_PATH: ErrorPhase.REQUEST,
+    ErrorCode.INVALID_REQUEST: ErrorPhase.REQUEST,
+    ErrorCode.IDEMPOTENCY_KEY_CONFLICT: ErrorPhase.REQUEST,
+    ErrorCode.INVALID_OFFSET: ErrorPhase.REQUEST,
+    ErrorCode.FILE_EXISTS: ErrorPhase.REQUEST,
+    ErrorCode.IS_DIRECTORY: ErrorPhase.REQUEST,
+    ErrorCode.OFFSET_MISMATCH: ErrorPhase.REQUEST,
+    ErrorCode.INCOMPLETE: ErrorPhase.REQUEST,
+    ErrorCode.CHECKSUM_MISMATCH: ErrorPhase.REQUEST,
+    ErrorCode.ALREADY_COMPLETE: ErrorPhase.REQUEST,
+    ErrorCode.PLAN_CHANGED: ErrorPhase.REQUEST,
+    ErrorCode.TOO_LARGE: ErrorPhase.REQUEST,
+    ErrorCode.UNSUPPORTED_MEDIA_TYPE: ErrorPhase.REQUEST,
+    ErrorCode.GONE: ErrorPhase.REQUEST,
+    ErrorCode.PARENT_GONE: ErrorPhase.REQUEST,
+    ErrorCode.STAGING_GONE: ErrorPhase.REQUEST,
+    ErrorCode.PERMISSION_DENIED: ErrorPhase.REQUEST,
+    ErrorCode.UPLOAD_OWNER_MISMATCH: ErrorPhase.REQUEST,
+    ErrorCode.BUSY: ErrorPhase.REQUEST,
+    ErrorCode.UPLOAD_LIMIT: ErrorPhase.REQUEST,
+    ErrorCode.NO_SPACE: ErrorPhase.REQUEST,
+    ErrorCode.UPLOAD_RELAY_FAILED: ErrorPhase.REQUEST,
+    ErrorCode.UPLOAD_TIMEOUT: ErrorPhase.REQUEST,
 }
 
 

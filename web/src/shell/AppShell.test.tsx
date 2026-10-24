@@ -738,6 +738,14 @@ afterEach(() => {
 });
 
 describe("AppShell header", () => {
+  it("mounts the file-drop navigation guard across shell routes", () => {
+    mockConversations([]);
+    renderShell("/");
+    expect(fireEvent.drop(document.body, { dataTransfer: { types: ["Files"], files: [] } })).toBe(
+      false,
+    );
+    expect(fireEvent.drop(document.body, { dataTransfer: { types: ["text/plain"] } })).toBe(true);
+  });
   it("renders the sidebar toggle on all pages", () => {
     mockConversations([]);
     renderShell("/");
