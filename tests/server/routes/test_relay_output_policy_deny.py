@@ -443,13 +443,25 @@ async def test_mid_turn_boundary_flush_gates_response_phase() -> None:
 
 
 @pytest.mark.parametrize("outcome", ["completed", "failed", "cancelled", "incomplete"])
-async def test_relay_only_completed_text_is_final(db_uri: str, outcome: str) -> None:
+@pytest.mark.parametrize("remote", [False, True])
+async def test_relay_only_completed_text_is_final(db_uri: str, outcome: str, remote: bool) -> None:
     """Unsuccessful turns still gate their text without triggering final-response actions."""
     from omnigent.runtime import session_stream
     from omnigent.server.routes._sessions.orchestration import _relay_runner_stream_once
 
     store = SqlAlchemyConversationStore(db_uri)
-    session_id = store.create_conversation().id
+    parent = store.create_conversation()
+    session_id = parent.id
+    if remote:
+        from omnigent.server.remote_children import claim_remote_dispatch
+
+        session_id = store.create_conversation(
+            kind="sub_agent",
+            parent_conversation_id=parent.id,
+            host_id="a" * 32,
+            workspace="/work/repo",
+        ).id
+        claim_remote_dispatch(store, session_id, "dispatch_a")
     response = {"id": "resp_final", "model": "test-agent"}
     events = [
         {"type": "response.in_progress", "response": response},
@@ -475,6 +487,12 @@ async def test_relay_only_completed_text_is_final(db_uri: str, outcome: str) -> 
         assert messages[0].to_api_dict()["content"] == [
             {"type": "output_text", "text": "[Denied by policy: output gated]"}
         ]
+        if remote:
+            from omnigent.remote_child_protocol import remote_child_state
+
+            receipt = remote_child_state(store.get_conversation(session_id).labels)
+            assert receipt["status"] == ("failed" if outcome == "incomplete" else outcome)
+            assert receipt["result_item_id"] == messages[0].id
     finally:
         session_stream.close(session_id)
 

@@ -160,20 +160,40 @@ async def test_top_level_create_rejects_unavailable_harness(
     assert response.json()["error"]["code"] == "harness_not_configured"
 
 
-async def test_agent_id_child_uses_parent_host_even_if_request_names_another(
+@pytest.mark.parametrize("bundle", [False, True])
+@pytest.mark.parametrize(
+    ("explicit_host", "target_ready", "expected_status", "expected_code"),
+    [
+        pytest.param(False, False, 412, "harness_not_configured", id="inherited-unavailable"),
+        pytest.param(True, False, 412, "harness_not_configured", id="explicit-unavailable"),
+        pytest.param(True, True, 409, "conflict", id="explicit-ready-but-offline"),
+    ],
+)
+async def test_child_readiness_uses_resolved_host(
     client: httpx.AsyncClient,
     app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
+    bundle: bool,
+    explicit_host: bool,
+    target_ready: bool,
+    expected_status: int,
+    expected_code: str,
 ) -> None:
     from unittest.mock import AsyncMock
 
+    from omnigent.server.routes import _session_create_validation
     from omnigent.server.routes._sessions import orchestration
     from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
     from omnigent.stores.host_store import HostStore
 
     monkeypatch.setattr(
         orchestration, "_validate_session_workspace", AsyncMock(return_value="/tmp/workspace")
+    )
+    monkeypatch.setattr(
+        _session_create_validation,
+        "validate_uploaded_bundle_host_workspace",
+        AsyncMock(return_value="/tmp/workspace"),
     )
 
     parent_agent = await create_test_agent(client)
@@ -194,26 +214,47 @@ async def test_agent_id_child_uses_parent_host_even_if_request_names_another(
         "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         "parent-host",
         "local",
-        configured_harnesses={"jcode": False},
+        configured_harnesses={"jcode": not target_ready if explicit_host else target_ready},
     )
     hosts.upsert_on_connect(
         "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "other-host",
         "local",
-        configured_harnesses={"jcode": True},
+        configured_harnesses={"jcode": target_ready if explicit_host else not target_ready},
     )
     app.state.host_store = hosts
-    response = await client.post(
-        "/v1/sessions",
-        json={
-            "agent_id": jcode["id"],
-            "parent_session_id": parent["id"],
-            "host_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-            "workspace": "/tmp/workspace",
-        },
-    )
-    assert response.status_code == 412, response.text
-    assert response.json()["error"]["code"] == "harness_not_configured"
+    before = store.list_conversations(limit=100).data
+    metadata = {"parent_session_id": parent["id"]}
+    if explicit_host:
+        metadata.update(
+            {
+                "host_id": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                "workspace": "/tmp/workspace",
+            }
+        )
+    if bundle:
+        response = await client.post(
+            "/v1/sessions",
+            data={"metadata": json.dumps(metadata)},
+            files={
+                "bundle": (
+                    "agent.tar.gz",
+                    build_agent_bundle(
+                        "jcode-child",
+                        executor={"type": "omnigent", "config": {"harness": "jcode"}},
+                    ),
+                    "application/gzip",
+                )
+            },
+        )
+    else:
+        response = await client.post("/v1/sessions", json={"agent_id": jcode["id"], **metadata})
+    assert response.status_code == expected_status, response.text
+    assert response.json()["error"]["code"] == expected_code
+    if expected_status == 412:
+        assert len(store.list_conversations(limit=100).data) == len(before)
+    else:
+        assert response.json()["error"]["message"] == "host is offline"
 
 
 async def test_loaded_parent_does_not_require_another_session_read(

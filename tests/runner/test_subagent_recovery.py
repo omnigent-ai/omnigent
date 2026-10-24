@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -525,3 +526,40 @@ async def test_stale_server_dispatch_cannot_finish_a_newer_waiting_turn() -> Non
         assert entry.status == "waiting"
         assert entry.work_id == "dispatch-newer"
         assert entry.output is None
+
+
+@pytest.mark.parametrize("initial", ["pending", "running"])
+async def test_remote_work_finishing_after_parent_restart_remains_reconcilable(
+    initial: str,
+) -> None:
+    from omnigent.remote_child_protocol import REMOTE_CHILD_STATE
+
+    completed = False
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == _CHILDREN_PATH
+        receipt = {
+            "dispatch_id": _DISPATCH,
+            "status": "completed" if completed else initial,
+            "response_id": None if initial == "pending" and not completed else "a" * 64,
+            "result_item_id": None,
+        }
+        return httpx.Response(
+            200,
+            json=_page(
+                _child(
+                    status="completed" if completed else "in_progress",
+                    labels={REMOTE_CHILD_STATE: json.dumps(receipt)},
+                )
+            ),
+        )
+
+    async with _recovery_harness(handler) as harness:
+        await harness.recovery.recover_undrained_subagent_results(_PARENT)
+        entry = subagent_work.get_subagent_work(_CHILD)
+        assert entry is not None and entry.remote and entry.status == "waiting"
+        assert harness.drain() == []
+        completed = True
+        await harness.app.state.reconcile_pending_subagent_results()
+        assert [(m["work_id"], m["status"]) for m in harness.drain()] == [(_DISPATCH, "completed")]
+        assert harness.wakes == [(_CHILD, _DISPATCH)]
