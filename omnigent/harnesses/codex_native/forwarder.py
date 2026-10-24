@@ -63,6 +63,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.inner.native_attachments import restore_spilled_text
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -454,6 +455,9 @@ class _CodexForwarderState:
     :param codex_client: Connected Codex app-server client. Set by
         ``supervise_forwarder`` so child backfill can issue
         ``thread/resume`` requests.
+    :param bridge_dir: The session's bridge directory. Set by
+        ``supervise_forwarder`` so a recovered user message can restore a
+        spilled paste from the session's attachment cache.
     :param subagents_by_thread: Maps Codex child thread ids to Omnigent child
         session ids, e.g. ``{"thread_child": "conv_child"}``.
     :param pending_child_threads: Codex child thread ids announced by
@@ -522,6 +526,7 @@ class _CodexForwarderState:
     posted_approval_preset: str | None = None
     parent_session_id: str | None = None
     codex_client: CodexAppServerClient | None = None
+    bridge_dir: Path | None = None
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
@@ -2223,6 +2228,7 @@ async def supervise_forwarder(
         forwarder_state = _CodexForwarderState(
             parent_session_id=session_id,
             codex_client=client,
+            bridge_dir=bridge_dir,
         )
         # Released when the live event stream shows the thread became
         # active (its first turn materializes the rollout). Lets the
@@ -5389,7 +5395,9 @@ async def _handle_completed_item_inner(
     if source_id is None:
         return
     if item_type == "userMessage":
-        posted = await _post_user_message(client, session_id, params, item, source_id=source_id)
+        posted = await _post_user_message(
+            client, session_id, params, item, source_id=source_id, bridge_dir=bridge_dir
+        )
         if posted and forwarder_state is not None:
             turn_id = _turn_id_from_payload(params)
             if turn_id:
@@ -6322,6 +6330,7 @@ async def _ensure_user_message_posted(
         recovered_params,
         user_item,
         source_id=source_id,
+        bridge_dir=forwarder_state.bridge_dir,
     ):
         forwarder_state.note_user_message_posted(turn_id)
 
@@ -6364,6 +6373,7 @@ async def _post_user_message(
     item: _JsonObject,
     *,
     source_id: str | None = None,
+    bridge_dir: Path | None = None,
 ) -> bool:
     """
     Persist a Codex user message observed from the TUI.
@@ -6373,9 +6383,13 @@ async def _post_user_message(
     :param params: Codex notification params.
     :param item: Codex ``userMessage`` item.
     :param source_id: Stable native item id used for server-side deduplication.
+    :param bridge_dir: The session's bridge directory, whose attachment cache
+        holds any paste the executor moved out of the message.
     :returns: Whether the item was accepted by the server.
     """
     text = _user_message_text(item)
+    if bridge_dir is not None:
+        text = await asyncio.to_thread(_with_spilled_pastes_restored, text, bridge_dir)
     # An image/file-only message has no text but must still be posted: the
     # server drains its optimistic pending-input entry (FIFO) and folds the
     # image in by file_id (``_merge_pending_file_blocks``). Bailing here would
@@ -8551,6 +8565,25 @@ def _delta_recovery_status_edge(
         turn_id=turn_id,
         source="delta:recovered",
     )
+
+
+def _with_spilled_pastes_restored(text: str, bridge_dir: Path) -> str:
+    """
+    Mirror the paste the person sent in place of the file reference Codex saw.
+
+    The server then records and matches the message as sent, whatever its
+    version. The executor refuses a paste whose restored message could not fit
+    one event, so the reference survives only if that check was bypassed.
+
+    :param text: User message text as Codex echoed it.
+    :param bridge_dir: The session's bridge directory.
+    :returns: The text to mirror.
+    """
+    restored = restore_spilled_text(text, bridge_dir)
+    if restored is None:
+        _logger.warning("Codex user message too large to mirror with its paste restored")
+        return text
+    return restored
 
 
 def _user_message_text(item: _JsonObject) -> str:

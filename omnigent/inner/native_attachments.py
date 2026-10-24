@@ -19,6 +19,7 @@ import binascii
 import contextlib
 import errno
 import hashlib
+import json
 import logging
 import mimetypes
 import os
@@ -36,6 +37,7 @@ import httpx
 
 from omnigent.debug_logging import debug_event
 from omnigent.process_logging import data_dir
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 
 _logger = logging.getLogger(__name__)
 _ATTACHMENT_READ_ATTEMPTS = 3
@@ -287,7 +289,132 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
     if decoded is None:
         return None
     raw_bytes, filename = decoded
+    return _materialize_bytes(raw_bytes, filename, bridge_dir)
 
+
+def attachment_content_digest(raw_bytes: bytes) -> str:
+    """Return the content digest carried by native cache filenames."""
+    return hashlib.sha256(raw_bytes).hexdigest()[:12]
+
+
+def materialize_text(text: str, bridge_dir: Path) -> Path | None:
+    """
+    Write *text* into the session's attachment cache as a UTF-8 ``.txt`` file.
+
+    Takes the same no-follow placement as :func:`materialize_attachment`. The
+    name carries a digest of the text, so sending the same text again reuses
+    the file instead of writing another.
+
+    :param text: Text to store, e.g. a message too long to send inline.
+    :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :returns: Path to the written file, e.g.
+        ``.../attachments/<key>/pasted_text_1a2b3c4d5e6f.txt``, or ``None`` if
+        it could not be written.
+    """
+    try:
+        raw_bytes = text.encode("utf-8")
+    except UnicodeEncodeError:
+        return None
+    digest = attachment_content_digest(raw_bytes)
+    return _materialize_bytes(raw_bytes, f"pasted_text_{digest}.txt", bridge_dir)
+
+
+# What a mirrored user message's event spends outside its text: keys, ids, a bounded source id.
+_MIRRORED_MESSAGE_ENVELOPE_BYTES = 4 * 1024
+
+
+def restore_spilled_text(text: str, bridge_dir: Path) -> str | None:
+    """
+    Put back the text each :func:`materialize_text` reference in *text* stands for.
+
+    A harness echoes a spilled paste as its ``[Attached file: ...]`` line. Only a
+    whole-line reference into this session's cache is replaced, and only when the
+    file still holds text with the digest in its name; anything else stays as is.
+
+    :param text: Message text as the harness echoed it.
+    :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :returns: *text* with each such reference replaced, or ``None`` when the
+        restored message would not fit one session event. Restoring stops at that
+        budget, so repeated references never expand past it.
+    """
+    if "pasted_text_" not in text:
+        return text
+    cache = attachment_cache_dir(bridge_dir)
+    reference = re.compile(
+        rf"(?m)^[ \t]*\[Attached file: {re.escape(str(cache))}/"
+        r"(?P<name>pasted_text_(?P<digest>[0-9a-f]{12})(?:_(?P=digest))?\.txt)\][ \t]*(?=\r?$)"
+    )
+    budget = MAX_SESSION_EVENT_REQUEST_BYTES - _MIRRORED_MESSAGE_ENVELOPE_BYTES
+    # Each file is read and verified once, however often the message repeats it.
+    pastes: dict[str, str | None] = {}
+    parts: list[str] = []
+    size = end = 0
+    restored_any = False
+    for match in reference.finditer(text):
+        name = match.group("name")
+        if name not in pastes:
+            raw_bytes = _read_cached_file(cache, name)
+            verified = raw_bytes is not None and (
+                attachment_content_digest(raw_bytes) == match.group("digest")
+            )
+            pastes[name] = raw_bytes.decode("utf-8", errors="replace") if verified else None
+        paste = pastes[name]
+        restored_any = restored_any or paste is not None
+        parts += [text[end : match.start()], match.group(0) if paste is None else paste]
+        end = match.end()
+        # UTF-8 length is a lower bound on the event's JSON, so stop before building more.
+        size += len(parts[-2].encode("utf-8")) + len(parts[-1].encode("utf-8"))
+        if size > budget and restored_any:
+            return None
+    if not restored_any:
+        return text
+    parts.append(text[end:])
+    restored = "".join(parts)
+    encoded = json.dumps(restored, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    return restored if len(encoded) <= budget else None
+
+
+def _read_cached_file(cache: Path, name: str) -> bytes | None:
+    """
+    Read the regular file *name* from *cache* without following symlinks.
+
+    :param cache: A session's attachment cache directory.
+    :param name: Base filename, no directory components.
+    :returns: The file's bytes, or ``None`` if it can't be read safely.
+    """
+    try:
+        root_fd = os.open(cache.parent, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            dir_fd = os.open(
+                cache.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=root_fd
+            )
+        finally:
+            os.close(root_fd)
+        try:
+            fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=dir_fd)
+        finally:
+            os.close(dir_fd)
+        try:
+            info = os.fstat(fd)
+            # No restorable paste exceeds one session event, so a larger file is never read.
+            if not stat.S_ISREG(info.st_mode) or info.st_size > MAX_SESSION_EVENT_REQUEST_BYTES:
+                return None
+            return _read_fd(fd, info.st_size)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+
+
+def _materialize_bytes(raw_bytes: bytes, filename: str, bridge_dir: Path) -> Path | None:
+    """
+    Place *raw_bytes* as *filename* in the session's attachment cache.
+
+    :param raw_bytes: File content.
+    :param filename: Base filename with no directory components.
+    :param bridge_dir: Session bridge path, used to identify its attachment cache.
+    :returns: Path to the file, or ``None`` if it could not be placed safely.
+    """
     if filename in (".", "..") or os.sep in filename:
         return None
 
@@ -310,7 +437,7 @@ def materialize_attachment(block: Mapping[str, object], bridge_dir: Path) -> Pat
         return None
     try:
         stem, suffix = os.path.splitext(filename)
-        digest = hashlib.sha256(raw_bytes).hexdigest()[:12]
+        digest = attachment_content_digest(raw_bytes)
         for name in (filename, f"{stem}_{digest}{suffix}"):
             outcome = _place_no_follow(dir_fd, name, raw_bytes)
             if outcome == "symlink":

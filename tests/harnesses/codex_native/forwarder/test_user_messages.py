@@ -2,9 +2,16 @@
 
 from __future__ import annotations
 
+import asyncio
+import threading
+from pathlib import Path
+
 import pytest
 
 from omnigent.harnesses.codex_native import forwarder as fwd
+from omnigent.inner import native_attachments
+from omnigent.inner.native_attachments import materialize_text
+from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
 )
@@ -90,3 +97,79 @@ async def test_post_user_message_truly_empty_is_skipped() -> None:
     await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item)
 
     assert client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("bridge_known", [True, False], ids=["bridge", "no-bridge"])
+async def test_post_user_message_mirrors_a_spilled_paste_as_sent(
+    tmp_path: Path, bridge_known: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The server receives the paste itself, not the cache reference Codex was given."""
+    paste = "line of a long log\n" * 50
+    reference = f"[Attached file: {materialize_text(paste, tmp_path)}]"
+    item = {
+        "type": "userMessage",
+        "content": [{"type": "text", "text": "what failed?"}, {"type": "text", "text": reference}],
+    }
+    client = _RecordingClient()
+    loop = asyncio.get_running_loop()
+    read_started = asyncio.Event()
+    read_release = threading.Event()
+    loop_progressed: list[bool] = []
+    read_cache = native_attachments._read_cached_file
+
+    def slow_read(cache: Path, name: str) -> bytes | None:
+        loop.call_soon_threadsafe(read_started.set)
+        loop_progressed.append(read_release.wait(timeout=1.0))
+        return read_cache(cache, name)
+
+    monkeypatch.setattr(native_attachments, "_read_cached_file", slow_read)
+    task = asyncio.create_task(
+        fwd._post_user_message(
+            client, "conv_x", {"turnId": "t1"}, item, bridge_dir=tmp_path if bridge_known else None
+        )
+    )
+    try:
+        if bridge_known:
+            await asyncio.wait_for(read_started.wait(), timeout=2.0)
+        read_release.set()
+        await task
+    finally:
+        read_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert loop_progressed == ([True] if bridge_known else [])
+    [(_url, body)] = client.posts
+    sent = paste if bridge_known else reference
+    assert body["data"]["item_data"]["content"] == [
+        {"type": "input_text", "text": f"what failed?\n\n{sent}"}
+    ]
+
+
+@pytest.mark.asyncio
+async def test_post_user_message_restores_a_paste_whose_whole_event_fits(tmp_path: Path) -> None:
+    """Sizing uses the real event, so a paste just under the limit is mirrored in full."""
+    paste = "x" * 10_450_000
+    reference = f"[Attached file: {materialize_text(paste, tmp_path)}]"
+    item = {"type": "userMessage", "content": [{"type": "text", "text": reference}]}
+    client = _RecordingClient()
+
+    await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item, bridge_dir=tmp_path)
+
+    [(_url, body)] = client.posts
+    assert body["data"]["item_data"]["content"] == [{"type": "input_text", "text": paste}]
+
+
+async def test_post_user_message_keeps_the_reference_only_past_the_event_limit(
+    tmp_path: Path,
+) -> None:
+    """The executor refuses such a paste first; this only guards a bypassed check."""
+    paste = "x" * MAX_SESSION_EVENT_REQUEST_BYTES
+    reference = f"[Attached file: {materialize_text(paste, tmp_path)}]"
+    item = {"type": "userMessage", "content": [{"type": "text", "text": reference}]}
+    client = _RecordingClient()
+
+    await fwd._post_user_message(client, "conv_x", {"turnId": "t1"}, item, bridge_dir=tmp_path)
+
+    [(_url, body)] = client.posts
+    assert body["data"]["item_data"]["content"] == [{"type": "input_text", "text": reference}]
