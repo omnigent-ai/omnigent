@@ -898,6 +898,9 @@ class _ForwardDedupeState:
     # Observation advances even when delivery fails; a pending switch must
     # survive retries, including a switch back to the last posted mode.
     observed_permission_mode: str | None = None
+    # Unix time of the observation behind ``observed_permission_mode``. An older
+    # hook record or pane read is ignored, so it cannot revert a newer switch.
+    observed_permission_mode_at: float = 0.0
     permission_mode_change_pending: bool = False
     # Mode the server rejected as unsupported, skipped until the pane shows
     # another mode or the retry deadline passes, so a mixed-version
@@ -908,6 +911,9 @@ class _ForwardDedupeState:
     # single ``capture-pane`` subprocess (feeding both the permission-mode and
     # /btw signals) spawns at _PANE_POLL_INTERVAL_S, not every poll.
     pane_next_read: float = 0.0
+    # Byte offset into hooks.jsonl scanned for permission modes. Seeded to the
+    # current end on the first poll, so a record from a previous run is not a switch.
+    permission_hook_byte_offset: int | None = None
     # Turn-settle latch driving the scheduled-wake boundary. The Stop edge
     # records the ended turn's id as PENDING; it activates (moves to
     # ``settled_response_id``) only once a fully-consumed transcript batch
@@ -1646,6 +1652,14 @@ async def forward_claude_transcript_to_session(
                         # before the user's next message, so model-gated policies
                         # (cost-budget hard cap) no longer lag a switch by one turn.
                         await _forward_model_from_status(
+                            client=client,
+                            session_id=current_session_id,
+                            bridge_dir=bridge_dir,
+                            dedupe=dedupe,
+                        )
+                        # Hook records name the mode too, so a switch still reaches
+                        # the web view while the footer read is failing or lagging.
+                        await _forward_hook_permission_mode(
                             client=client,
                             session_id=current_session_id,
                             bridge_dir=bridge_dir,
@@ -6018,6 +6032,67 @@ async def _post_external_permission_mode_change(
     resp.raise_for_status()
 
 
+async def _forward_hook_permission_mode(
+    client: httpx.AsyncClient,
+    *,
+    session_id: str,
+    bridge_dir: Path,
+    dedupe: _ForwardDedupeState,
+) -> None:
+    """
+    Relay the permission mode carried by new main-thread hook records.
+
+    Every hook payload the bridge records names the mode it fired under, so a
+    switch reaches the web view by the next prompt or turn end even when the
+    pane read fails or lags; most tool calls are not recorded. A shift+tab fires
+    no hook, so :func:`_forward_pane_signals` still polls the footer. A poll with
+    no new record offers the last observation again, so a post that failed is
+    retried while the footer stays unreadable.
+
+    :param client: Omnigent HTTP client.
+    :param session_id: Omnigent session/conversation id.
+    :param bridge_dir: Native Claude bridge directory.
+    :param dedupe: Shared per-session dedupe state; mutated in place.
+    """
+    if dedupe.permission_hook_byte_offset is None:
+        # Records written before this forwarder started are not live switches.
+        dedupe.permission_hook_byte_offset = await asyncio.to_thread(_hook_end_offset, bridge_dir)
+    result = await asyncio.to_thread(
+        read_hook_events_from_offset,
+        bridge_dir,
+        dedupe.permission_hook_byte_offset,
+        start_event_count=0,
+    )
+    dedupe.permission_hook_byte_offset = result.byte_offset
+    # The relay skips a mode that already posted, so this re-offer only retries a failed post.
+    observed_at, mode = dedupe.observed_permission_mode_at, dedupe.observed_permission_mode
+    if result.records:
+        parent_claude_session_ids = await asyncio.to_thread(
+            read_seen_claude_session_ids, bridge_dir
+        )
+        # Only the newest record matters: a footer poll would not see the modes in between.
+        newest: tuple[float, str] | None = None
+        for record in result.records:
+            if record.recorded_at is None or record.permission_mode is None:
+                continue
+            # Skip subagents: unpinned session id (background) or agent_id set (in-process).
+            if _is_subagent_hook_record(
+                record, parent_claude_session_ids=parent_claude_session_ids
+            ):
+                continue
+            if newest is None or record.recorded_at >= newest[0]:
+                newest = (record.recorded_at, record.permission_mode)
+        if newest is not None:
+            observed_at, mode = newest
+    await _relay_permission_mode(
+        client,
+        session_id=session_id,
+        mode=mode,
+        dedupe=dedupe,
+        observed_at=observed_at,
+    )
+
+
 async def _forward_pane_signals(
     client: httpx.AsyncClient,
     *,
@@ -6046,8 +6121,14 @@ async def _forward_pane_signals(
         return
     dedupe.pane_next_read = now + _PANE_POLL_INTERVAL_S
     signals = await asyncio.to_thread(read_pane_signals, bridge_dir)
+    # Stamped once the capture returns, so a hook recorded during the read counts as older.
+    observed_at = time.time()
     await _relay_permission_mode(
-        client, session_id=session_id, mode=signals.permission_mode, dedupe=dedupe
+        client,
+        session_id=session_id,
+        mode=signals.permission_mode,
+        dedupe=dedupe,
+        observed_at=observed_at,
     )
     await _relay_btw_overlay(
         client, session_id=session_id, overlay=signals.btw_overlay, dedupe=dedupe
@@ -6060,6 +6141,7 @@ async def _relay_permission_mode(
     session_id: str,
     mode: str | None,
     dedupe: _ForwardDedupeState,
+    observed_at: float | None = None,
 ) -> None:
     """
     Mirror the pane's permission-mode footer to the session label.
@@ -6078,13 +6160,24 @@ async def _relay_permission_mode(
     A switch before the first readable footer is indistinguishable from a
     settings-derived startup mode and remains a passive observation.
 
+    Observations are ordered by ``observed_at``: one older than the observation
+    already applied is dropped, so a late hook record cannot revert a newer pane read.
+
     :param client: Omnigent HTTP client.
     :param session_id: Omnigent session/conversation id.
-    :param mode: The permission-mode footer parsed from the pane, or ``None``.
+    :param mode: The permission mode from the pane footer or a hook record,
+        or ``None`` when unreadable.
     :param dedupe: Shared per-session dedupe state; mutated in place.
+    :param observed_at: Unix time the mode was observed, e.g. ``1779922393.2``
+        for a hook record's ``recorded_at``. ``None`` means now.
     """
     if mode is None:
         return
+    if observed_at is None:
+        observed_at = time.time()
+    if observed_at < dedupe.observed_permission_mode_at:
+        return
+    dedupe.observed_permission_mode_at = observed_at
     if dedupe.observed_permission_mode is not None and mode != dedupe.observed_permission_mode:
         dedupe.permission_mode_change_pending = True
         dedupe.rejected_permission_mode = None

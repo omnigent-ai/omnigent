@@ -982,6 +982,9 @@ class ClaudeHookRecord:
     :param agent_id: Claude subagent id from the hook payload, e.g.
         ``"a4892977eed616593"``. Claude Code sets it only for hooks fired
         inside a subagent; ``None`` for the parent process.
+    :param permission_mode: Claude permission mode the hook fired under,
+        e.g. ``"auto"``. ``None`` when the payload omits it or names a mode
+        outside :data:`_PERMISSION_MODE_FOOTERS`.
     :param previous_claude_session_id: Claude session id that was
         active immediately before this hook, e.g.
         ``"a1b2c3d4-1234-5678-9abc-def012345678"``, or ``None``
@@ -1041,6 +1044,7 @@ class ClaudeHookRecord:
     claude_session_id: str | None = None
     transcript_path: Path | None = None
     agent_id: str | None = None
+    permission_mode: str | None = None
     previous_claude_session_id: str | None = None
     claude_session_was_seen: bool | None = None
     clear_rotated_to: str | None = None
@@ -3904,6 +3908,12 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
     raw_claude_session_id = payload.get("session_id") if isinstance(payload, dict) else None
     raw_transcript_path = payload.get("transcript_path") if isinstance(payload, dict) else None
     raw_agent_id = payload.get("agent_id") if isinstance(payload, dict) else None
+    raw_permission_mode = payload.get("permission_mode") if isinstance(payload, dict) else None
+    permission_mode = (
+        raw_permission_mode
+        if isinstance(raw_permission_mode, str) and raw_permission_mode in _PERMISSION_MODE_FOOTERS
+        else None
+    )
     raw_previous_claude_session_id = (
         payload.get("omnigent_previous_claude_session_id") if isinstance(payload, dict) else None
     )
@@ -4019,6 +4029,7 @@ def _hook_record_from_jsonl_record(record: _JsonlRecord) -> ClaudeHookRecord:
             else None
         ),
         agent_id=raw_agent_id if isinstance(raw_agent_id, str) and raw_agent_id else None,
+        permission_mode=permission_mode,
         previous_claude_session_id=(
             raw_previous_claude_session_id
             if isinstance(raw_previous_claude_session_id, str) and raw_previous_claude_session_id

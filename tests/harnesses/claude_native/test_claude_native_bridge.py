@@ -2542,6 +2542,33 @@ def test_read_hook_events_from_offset_skips_existing_prefix(
     assert [record.event_name for record in result.records] == ["Stop"]
 
 
+@pytest.mark.parametrize(
+    ("payload", "expected_mode"),
+    [
+        pytest.param({"permission_mode": "auto"}, "auto", id="known-mode"),
+        pytest.param({"permission_mode": "sideways"}, None, id="unknown-mode"),
+        pytest.param({}, None, id="absent"),
+    ],
+)
+def test_read_hook_events_from_offset_exposes_only_known_permission_modes(
+    tmp_path: Path,
+    payload: dict[str, str],
+    expected_mode: str | None,
+) -> None:
+    """
+    A hook record exposes its permission mode only when it names a footer mode.
+
+    The forwarder relays this value to the session label, so an unrecognized
+    string must read as absent instead of reaching the server.
+    """
+    bridge_dir = tmp_path / "bridge"
+    record_hook_event(bridge_dir, {"hook_event_name": "Stop"} | payload)
+
+    (record,) = read_hook_events_from_offset(bridge_dir, 0, start_event_count=0).records
+
+    assert record.permission_mode == expected_mode
+
+
 def test_read_hook_events_from_offset_preserves_partial_trailing_line(tmp_path: Path) -> None:
     """
     A partial trailing hook JSON record is not skipped.

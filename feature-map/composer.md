@@ -38,7 +38,11 @@ and steers messages while the agent is busy.
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
-  marked and the choice persists.
+  marked and the choice persists. For Claude native sessions, the label also
+  follows the mode the recorded hooks carry (the next prompt or turn end; most
+  tool calls are not recorded), so it catches up when the footer read fails or
+  lags. A Shift+Tab switch fires no hook and shows at the footer poll, about 2
+  seconds later.
 - `permission-mode-hotkey`: Shift+Tab in the in-session composer for Claude,
   Codex, and Devin native sessions steps through every mode in the chip's menu,
   including Full Access and Dangerous, wrapping while the chip is clickable. States:
@@ -357,6 +361,20 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
 - **`permission-mode`:**
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
+- **`permission-mode`, Claude mode carried by hooks (component checks, plain `uv run --no-sync pytest --reruns 0`):**
+  `tests/harnesses/claude_native/forwarder/test_metadata.py::test_hook_permission_mode_relays_while_the_pane_is_unreadable`,
+  `tests/harnesses/claude_native/forwarder/test_metadata.py::test_hook_permission_mode_retries_a_refused_post_while_the_pane_is_unreadable`,
+  `tests/harnesses/claude_native/forwarder/test_metadata.py::test_hook_permission_mode_does_not_revert_a_newer_pane_read`,
+  `tests/harnesses/claude_native/forwarder/test_metadata.py::test_hook_permission_mode_skips_records_it_cannot_attribute`,
+  and
+  `tests/harnesses/claude_native/forwarder/test_metadata.py::test_relay_permission_mode_ignores_an_observation_older_than_the_applied_one`
+  cover the relay: records before the first poll are not switches, the newest
+  record wins by time, a refused post is retried while the footer stays
+  unreadable, and subagent or unattributable records are skipped.
+  `tests/harnesses/claude_native/test_claude_native_bridge.py::test_read_hook_events_from_offset_exposes_only_known_permission_modes`
+  covers the hook reader. The hook path differs from the footer only when a footer
+  read fails or lags, so use the Shift+Tab steps in `permission-mode-hotkey` for
+  keypress switches and do not count them as hook-path proof.
 - **`permission-mode-hotkey`:** in session with a real Claude CLI,
   `tests/e2e_ui/chat/test_claude_native_permission_switch_from_dont_ask.py::test_shift_tab_cycles_permission_mode_from_composer`.
   The E2E is nightly; Codex and Devin have component tests but no dedicated
