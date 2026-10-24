@@ -118,6 +118,10 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
 - `files`, `read`, and `modes`:
   `tests/e2e_ui/files/test_markdown_rich_rendering.py::test_markdown_renders_rich_constructs_and_source_toggle`
   opens from Files and checks rich constructs, reflow, copying, and Source.
+- `modes`, Source selection:
+  `tests/browser_ui/files/test_markdown_source_selection.py::test_source_selection_wash_covers_heading_markers`
+  drag-selects a heading in Source and checks that the highlight covers its
+  `###` markers, also with a test font that ligates them into one glyph.
 - `files`, oversized read-only content:
   `tests/e2e_ui/files/test_right_panel.py::test_file_viewer_download_saves_the_complete_file`
   includes a single-line Markdown file beyond the server read cap. Its loaded
