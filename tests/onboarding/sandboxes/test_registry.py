@@ -347,6 +347,17 @@ def test_instantiate_rejects_non_launcher_class(
         instantiate("not-a-launcher")
 
 
+def test_boat_is_builtin_managed_only_provider() -> None:
+    """Boat is a built-in, managed-only provider with no optional SDK."""
+    from omnigent.server.managed_hosts import BOAT_MANAGED_TOKEN_TTL_S
+
+    assert "boat" in available_providers()
+    launcher = instantiate("boat")
+    assert launcher.provider == "boat"
+    assert launcher.supports_cli_bootstrap is False
+    assert get_provider_metadata("boat").managed_token_ttl_s == BOAT_MANAGED_TOKEN_TTL_S
+
+
 def test_databricks_provider_is_builtin_and_instantiates_without_extras() -> None:
     """Instantiating the launcher touches no SDK; it is imported on first use."""
     reset_plugin_state_for_tests()

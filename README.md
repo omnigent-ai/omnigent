@@ -43,6 +43,7 @@ Omnigent lets you:
 
 - **☁️ Run agents in cloud sandboxes.** No laptop required: run sessions in
   disposable [Modal](https://modal.com), [Daytona](https://www.daytona.io),
+  [Boat](https://boat.dev),
   [Blaxel](https://blaxel.ai),
   [Islo](https://islo.dev), [E2B](https://e2b.dev),
   [Gensee](https://gensee.ai),

@@ -154,6 +154,11 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 launcher_class="omnigent.onboarding.sandboxes.modal:ModalSandboxLauncher",
                 managed_token_ttl_s=25 * 3600,
             ),
+            "boat": SandboxProviderMetadata(
+                name="boat",
+                launcher_class="omnigent.onboarding.sandboxes.boat:BoatSandboxLauncher",
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
             "daytona": SandboxProviderMetadata(
                 name="daytona",
                 launcher_class="omnigent.onboarding.sandboxes.daytona:DaytonaSandboxLauncher",
