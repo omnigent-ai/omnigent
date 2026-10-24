@@ -110,6 +110,7 @@ def _make_policy(
     cwd_hidden_scan_overflow: str | None = None,
     cwd_hidden_scan_recursive: bool | None = None,
     mask_paths: list[Path] | None = None,
+    write_files: list[Path] | None = None,
 ) -> SandboxPolicy:
     """
     Build a :class:`SandboxPolicy` directly without going through the
@@ -137,6 +138,7 @@ def _make_policy(
         top-level only).
     :param mask_paths: Explicit absolute paths to mask; ``None`` keeps
         the dataclass default (no explicit masks).
+    :param write_files: Per-file write grants; defaults to ``[]``.
     :returns: A populated :class:`SandboxPolicy`.
     """
     kwargs: dict[str, object] = {
@@ -144,7 +146,7 @@ def _make_policy(
         "active": True,
         "read_roots": read_roots,
         "write_roots": write_roots if write_roots is not None else [],
-        "write_files": [],
+        "write_files": write_files if write_files is not None else [],
         "allow_network": allow_network,
         "cwd_allow_hidden": allow_hidden,
     }
@@ -1045,6 +1047,459 @@ def test_wrap_launcher_argv_reexposes_interpreter_under_masked_dotdir(
     assert not _has_pair(argv, "--ro-bind-try", local_dir, local_dir), (
         ".local was re-bound wholesale, defeating the dotfile mask."
     )
+
+
+# ---------------------------------------------------------------------------
+# Grant re-expose after dotfile masks
+# ---------------------------------------------------------------------------
+
+
+def _last_covering_mount(argv: list[str], path: Path) -> tuple[str, str] | None:
+    """Replay bwrap's last-mount-wins semantics over *argv* for *path*.
+
+    :param argv: The generated ``bwrap`` argv.
+    :param path: Absolute path to evaluate inside the namespace.
+    :returns: ``(verb, source)`` of the last mount covering *path*
+        (``--tmpfs`` reports its destination as source), or ``None``
+        when no mount covers it. Unlike argv-position checks this
+        captures effective permissions: a ``--ro-bind*`` parent emitted
+        after a ``--bind*`` child makes the child read-only.
+    """
+    probe = str(path)
+    hit: tuple[str, str] | None = None
+    i = 0
+    while i < len(argv):
+        token = argv[i]
+        if token == "--":
+            break
+        if token in ("--bind", "--bind-try", "--ro-bind", "--ro-bind-try"):
+            dst = argv[i + 2]
+            if probe == dst or probe.startswith(dst.rstrip("/") + "/"):
+                hit = (token, argv[i + 1])
+            i += 3
+        elif token == "--tmpfs":
+            dst = argv[i + 1]
+            if probe == dst or probe.startswith(dst.rstrip("/") + "/"):
+                hit = (token, dst)
+            i += 2
+        else:
+            i += 1
+    return hit
+
+
+def test_wrap_launcher_argv_reexposes_write_grant_under_masked_dotdir(
+    tmp_path: Path,
+) -> None:
+    """
+    An explicit ``write_paths`` grant nested under a cwd dotdir must
+    survive the dotfile mask: the ``--tmpfs`` mask of the dotdir is
+    emitted after the grant bind and would otherwise win
+    (last-mount-wins), voiding the grant. The grant must be re-bound
+    AFTER the mask, without re-exposing the masked dotdir itself.
+    """
+    cwd = tmp_path.resolve(strict=False)
+    grant = cwd / ".omnigent" / "codex-native"
+    grant.mkdir(parents=True)
+    dotdir = cwd / ".omnigent"
+    (dotdir / "chat.db").write_text("secret")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_roots=[grant])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _last_covering_mount(argv, grant / "config.toml") == ("--bind-try", str(grant)), (
+        "the --tmpfs mask of the dotdir is emitted after the granted write root "
+        f"and wins (last-mount-wins), voiding the grant. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, dotdir / "chat.db") == ("--tmpfs", str(dotdir)), (
+        f".omnigent was re-bound wholesale, defeating the dotfile mask. argv: {argv}"
+    )
+
+
+def test_wrap_launcher_argv_grant_equal_to_masked_dotdir_keeps_nested_dotfiles_masked(
+    tmp_path: Path,
+) -> None:
+    """
+    Granting the masked dotdir itself re-binds it whole, but the dotfiles
+    nested inside it stay masked.
+    """
+    cwd = tmp_path.resolve(strict=False)
+    dotdir = cwd / ".omnigent"
+    dotdir.mkdir()
+    (dotdir / "chat.db").write_text("data")
+    (dotdir / ".env").write_text("SECRET=1")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_roots=[dotdir])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _has_pair_single_dest(argv, "--tmpfs", str(dotdir)), (
+        f"precondition: the cwd scan should mask {dotdir}. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, dotdir / "chat.db") == ("--bind-try", str(dotdir)), (
+        f"the granted dotdir must win over its own mask. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, dotdir / ".env") == ("--bind-try", "/dev/null"), (
+        f"a dotfile inside the granted dotdir leaked. argv: {argv}"
+    )
+
+
+def test_wrap_launcher_argv_reexposes_write_file_masked_by_devnull(
+    tmp_path: Path,
+) -> None:
+    """
+    ``write_files`` grants must survive the dotfile masks over them: the
+    ``/dev/null`` overlay on a cwd dotfile and the ``--tmpfs`` of a
+    dotdir holding the file (the claude CLI wrap's ``~/.claude.json``
+    and ``~/.claude/.credentials.json`` auth grants with cwd=``$HOME``).
+    """
+    cwd = tmp_path.resolve(strict=False)
+    auth = cwd / ".claude.json"
+    auth.write_text("{}")
+    (cwd / ".claude").mkdir()
+    credentials = cwd / ".claude" / ".credentials.json"
+    credentials.write_text("{}")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_files=[auth, credentials])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _has_pair(argv, "--bind-try", "/dev/null", str(auth)), (
+        f"precondition: .claude.json should be /dev/null-masked. argv: {argv}"
+    )
+    for granted in (auth, credentials):
+        assert _last_covering_mount(argv, granted) == ("--bind-try", str(granted)), (
+            f"the granted write file {granted} must win over its dotfile mask. argv: {argv}"
+        )
+
+
+def test_wrap_launcher_argv_reexposes_read_grant_under_masked_dotdir(
+    tmp_path: Path,
+) -> None:
+    """
+    ``read_paths`` grants get the same treatment as write grants: a
+    read root under a masked cwd dotdir is re-bound read-only after the
+    mask instead of silently vanishing.
+    """
+    cwd = tmp_path.resolve(strict=False)
+    grant = cwd / ".config" / "service"
+    grant.mkdir(parents=True)
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, read_roots=[grant])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _last_covering_mount(argv, grant / "settings.ini") == ("--ro-bind-try", str(grant)), (
+        "the granted read root must be re-bound read-only after the dotdir "
+        f"mask so it wins. argv: {argv}"
+    )
+
+
+def test_wrap_launcher_argv_mask_paths_wins_over_grant_reexpose(
+    tmp_path: Path,
+) -> None:
+    """
+    An operator-declared ``mask_paths`` entry outranks a grant: a write
+    root at/under an explicit mask is never re-exposed (explicit deny
+    beats explicit allow).
+    """
+    cwd = tmp_path.resolve(strict=False)
+    grant = cwd / ".omnigent" / "codex-native"
+    grant.mkdir(parents=True)
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_roots=[grant], mask_paths=[grant])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _last_covering_mount(argv, grant) == ("--tmpfs", str(grant)), (
+        "A grant covered by an operator mask_paths entry must not be "
+        f"re-exposed after the mask. argv: {argv}"
+    )
+
+
+def test_wrap_launcher_argv_remasks_dotfiles_inside_reexposed_grant(
+    tmp_path: Path,
+) -> None:
+    """
+    A re-exposed grant keeps the dotfile hygiene it would get outside a
+    masked dotdir: the masked ancestor made the walker prune before
+    reaching the grant, so the grant subtree is scanned separately and
+    its dotfiles are masked AFTER the re-expose bind — except paths
+    that are themselves explicit grants, which stay visible. An escaping
+    symlink in the grant gets no mount (bwrap cannot mount onto one).
+    """
+    cwd = tmp_path.resolve(strict=False)
+    grant = cwd / ".omnigent" / "codex-native"
+    grant.mkdir(parents=True)
+    (grant / ".env").write_text("SECRET=1")
+    (grant / ".git").mkdir()
+    (grant / "hosts").symlink_to("/etc/hosts")
+    credentials = grant / ".credentials.json"
+    credentials.write_text("{}")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_roots=[grant], write_files=[credentials])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _last_covering_mount(argv, grant / "config.toml") == ("--bind-try", str(grant))
+    assert _last_covering_mount(argv, grant / "hosts") == ("--bind-try", str(grant))
+    assert _last_covering_mount(argv, grant / ".env") == ("--bind-try", "/dev/null"), (
+        "Dotfiles inside a re-exposed grant must be re-masked AFTER the "
+        f"re-expose bind so deny still wins. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, grant / ".git" / "HEAD") == (
+        "--tmpfs",
+        str(grant / ".git"),
+    ), f"Dotdirs inside a re-exposed grant must be re-masked. argv: {argv}"
+    assert _last_covering_mount(argv, credentials) == ("--bind-try", str(credentials)), (
+        "The granted write file inside the re-exposed grant must not end up "
+        f"re-masked (the deeper grant wins). argv: {argv}"
+    )
+
+
+@pytest.mark.parametrize("via_target", [False, True], ids=["argv0", "target"])
+def test_wrap_launcher_argv_interpreter_survives_reexposed_grant_remask(
+    tmp_path: Path, via_target: bool
+) -> None:
+    """
+    An interpreter (or ``target``) inside a dotdir of a re-exposed grant
+    must stay reachable: the grant's fresh dotfile scan re-masks that
+    dotdir after the interpreter re-expose, so the interpreter binds are
+    replayed after the re-mask. Ungranted dotfiles beside it stay masked.
+    """
+    cwd = tmp_path.resolve(strict=False)
+    grant = cwd / ".cache" / "tool"
+    venv = grant / ".venv"
+    (venv / "bin").mkdir(parents=True)
+    (venv / "pyvenv.cfg").write_text("home = /usr/bin\n")
+    interp = venv / "bin" / "python"
+    interp.write_text("#!/bin/sh\n")
+    interp.chmod(0o755)
+    (grant / ".env").write_text("SECRET=1")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, read_roots=[grant])
+    if via_target:
+        argv = backend.wrap_launcher_argv(
+            [sys.executable, "-c", "pass"], policy, tmp_path, target=str(interp)
+        )
+    else:
+        argv = backend.wrap_launcher_argv([str(interp), "-c", "pass"], policy, tmp_path)
+
+    for needed in (interp, venv / "pyvenv.cfg"):
+        verb, _ = _last_covering_mount(argv, needed) or ("", "")
+        assert verb == "--ro-bind-try", (
+            f"{needed} is hidden by the re-exposed grant's re-mask of .venv, so "
+            f"the helper interpreter cannot start. argv: {argv}"
+        )
+    assert _last_covering_mount(argv, grant / ".env") == ("--bind-try", "/dev/null")
+
+
+def test_wrap_launcher_argv_interpreter_replay_keeps_write_grant_writable(
+    tmp_path: Path,
+) -> None:
+    """
+    Replaying the interpreter binds inside a re-exposed write grant must
+    not mount them read-only over the writable grant.
+    """
+    cwd = tmp_path.resolve(strict=False)
+    grant = cwd / ".cache" / "tool"
+    (grant / "bin").mkdir(parents=True)
+    interp = grant / "bin" / "python"
+    interp.write_text("#!/bin/sh\n")
+    interp.chmod(0o755)
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_roots=[grant])
+    argv = backend.wrap_launcher_argv([str(interp), "-c", "pass"], policy, tmp_path)
+
+    for path in (grant / "state.json", interp):
+        assert _last_covering_mount(argv, path) == ("--bind-try", str(grant)), (
+            f"an interpreter bind was replayed read-only over the write grant. argv: {argv}"
+        )
+
+
+def test_wrap_launcher_argv_reexposed_grant_keeps_framework_paths_intact(
+    tmp_path: Path,
+) -> None:
+    """
+    A framework scratch root nested in a re-exposed grant is not
+    re-masked by the grant's fresh scan (its ``.egress.sock`` must stay
+    reachable), and a denied control socket in the grant stays masked.
+    """
+    from omnigent.inner.sandbox import with_additional_write_roots
+
+    cwd = tmp_path.resolve(strict=False)
+    grant = cwd / ".omnigent" / "bridge"
+    scratch = grant / "runtime" / "scratch"
+    scratch.mkdir(parents=True)
+    (scratch / ".egress.sock").write_text("")
+    (grant / ".env").write_text("SECRET=1")
+    tmux_sock = grant / "tmux.sock"
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_roots=[grant], cwd_hidden_scan_recursive=True)
+    policy = with_additional_write_roots(policy, [scratch])
+    policy = with_denied_unix_sockets(policy, [tmux_sock])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _last_covering_mount(argv, scratch / ".egress.sock") == ("--bind-try", str(scratch)), (
+        "the re-exposed grant's fresh scan masked .egress.sock inside a "
+        f"framework skip root, breaking the egress relay. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, grant / ".env") == ("--bind-try", "/dev/null")
+    assert _last_covering_mount(argv, tmux_sock) == ("--bind-try", "/dev/null"), (
+        f"a denied control socket inside a re-exposed grant became reachable. argv: {argv}"
+    )
+
+
+def test_wrap_launcher_argv_write_grant_survives_overlapping_read_root_reexpose(
+    tmp_path: Path,
+) -> None:
+    """
+    A write grant nested under a re-exposed read root must stay
+    writable: replaying the read root after the write child (reversing
+    the read-before-write emission order of the main bind pass) would
+    mount the read-only parent on top of the writable child.
+    """
+    cwd = tmp_path.resolve(strict=False)
+    read_root = cwd / ".cfg" / "service"
+    write_child = read_root / "child"
+    write_child.mkdir(parents=True)
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, read_roots=[read_root], write_roots=[write_child])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _last_covering_mount(argv, write_child) == ("--bind-try", str(write_child)), (
+        "the explicit write grant nested under an overlapping read root lost "
+        "write access: the read root was replayed after the write child and "
+        f"its read-only mount wins (last-mount-wins). argv: {argv}"
+    )
+    verb, _ = _last_covering_mount(argv, read_root / "settings.ini") or ("", "")
+    assert verb == "--ro-bind-try", (
+        f"the read root outside the write child must stay read-only. argv: {argv}"
+    )
+
+
+def test_wrap_launcher_argv_write_parent_still_wins_nested_read_grant_after_reexpose(
+    tmp_path: Path,
+) -> None:
+    """
+    A read root nested under a re-exposed write root stays writable, as
+    in the main bind pass; a read root behind a mask inside the write
+    root stays read-only, and ungranted dotfiles stay masked.
+    """
+    cwd = tmp_path.resolve(strict=False)
+    write_parent = cwd / ".cfg" / "service"
+    read_child = write_parent / "readonly"
+    read_child.mkdir(parents=True)
+    (read_child / ".env").write_text("SECRET=1")
+    masked_read = write_parent / ".private" / "data"
+    masked_read.mkdir(parents=True)
+
+    backend = _make_backend()
+    policy = _make_policy(
+        tmp_path, write_roots=[write_parent], read_roots=[read_child, masked_read]
+    )
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _last_covering_mount(argv, read_child / "new.txt") == (
+        "--bind-try",
+        str(write_parent),
+    ), (
+        "the read root nested under the write root was replayed read-only on top "
+        f"of its writable parent. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, read_child / ".env") == ("--bind-try", "/dev/null"), (
+        f"an ungranted dotfile inside the nested read root leaked. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, masked_read / "x") == ("--ro-bind-try", str(masked_read)), (
+        f"a read root behind a mask inside the write root must stay read-only. argv: {argv}"
+    )
+
+
+def test_wrap_launcher_argv_operator_mask_denies_reexpose_of_its_subtree(
+    tmp_path: Path,
+) -> None:
+    """
+    An operator ``mask_paths`` entry is an unconditional deny: a grant
+    re-expose above it must not lift it, and a deeper grant under it
+    must not suppress its replay. Everything at/under the operator mask
+    stays hidden, including the deeper granted path itself.
+    """
+    cwd = tmp_path.resolve(strict=False)
+    bridge = cwd / ".omnigent" / "codex-native"
+    private = bridge / "private"
+    cache = private / "cache"
+    cache.mkdir(parents=True)
+    (private / "secret.txt").write_text("secret")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_roots=[bridge, cache], mask_paths=[private])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _last_covering_mount(argv, bridge) == ("--bind-try", str(bridge)), (
+        f"the bridge grant outside the operator mask must stay visible. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, private / "secret.txt") == ("--tmpfs", str(private)), (
+        "re-exposing the bridge grant lifted the operator mask_paths deny on "
+        f"its 'private' subdir, leaking ungranted content. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, cache) == ("--tmpfs", str(private)), (
+        "a grant under an operator mask_paths entry must stay denied "
+        f"(explicit deny outranks explicit allow). argv: {argv}"
+    )
+
+
+def test_wrap_launcher_argv_remask_keeps_ungranted_siblings_hidden(
+    tmp_path: Path,
+) -> None:
+    """
+    A granted file inside a dotdir of a re-exposed grant must win by
+    being re-bound after the dotdir's re-mask — not by dropping the
+    re-mask, which would leak the file's ungranted siblings.
+    """
+    cwd = tmp_path.resolve(strict=False)
+    grant = cwd / ".grant"
+    secret_dir = grant / ".secret"
+    secret_dir.mkdir(parents=True)
+    auth = secret_dir / "auth.json"
+    auth.write_text("{}")
+    (secret_dir / "other.txt").write_text("private")
+
+    backend = _make_backend()
+    policy = _make_policy(tmp_path, write_roots=[grant], write_files=[auth])
+    argv = backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
+
+    assert _last_covering_mount(argv, auth) == ("--bind-try", str(auth)), (
+        f"the granted file inside the re-masked dotdir must stay visible. argv: {argv}"
+    )
+    assert _last_covering_mount(argv, secret_dir / "other.txt") == ("--tmpfs", str(secret_dir)), (
+        "the dotdir re-mask was suppressed because it contains a granted "
+        f"file, leaking the file's ungranted siblings. argv: {argv}"
+    )
+
+
+def test_wrap_launcher_argv_reexposed_grant_scan_overflow_names_grant_root(
+    tmp_path: Path,
+) -> None:
+    """An overflowing scan of a re-exposed grant fails the launch and names the grant."""
+    cwd = tmp_path.resolve(strict=False)
+    grant = cwd / ".omnigent" / "codex-native"
+    grant.mkdir(parents=True)
+    for index in range(5):
+        (grant / f"file{index}.txt").write_text("x")
+
+    backend = _make_backend()
+    policy = _make_policy(
+        tmp_path,
+        write_roots=[grant],
+        cwd_hidden_scan_max_entries=3,
+        cwd_hidden_scan_overflow="error",
+    )
+    with pytest.raises(OSError, match=re.escape(f"re-exposed grant root {grant}")):
+        backend.wrap_launcher_argv([sys.executable, "-c", "pass"], policy, tmp_path)
 
 
 # ---------------------------------------------------------------------------
