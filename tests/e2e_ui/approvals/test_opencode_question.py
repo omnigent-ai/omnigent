@@ -109,3 +109,87 @@ def test_opencode_question_round_trips_through_web(
     if "error" in result:
         raise AssertionError(f"forwarder failed: {result['error']}") from result["error"]
     assert opencode.replies == [("que_e2e", [["Tests", "Lint"]])]
+
+
+@pytest.mark.timeout(90)
+def test_opencode_blank_label_question_round_trips_through_web(
+    page: Page,
+    seeded_session: tuple[str, str],
+) -> None:
+    """A blank-label option still reaches chat and answers with its original label.
+
+    The forwarder used to reject the whole question opencode-side when any
+    option label was blank, so the prompt showed only in opencode's terminal
+    while chat stayed empty. Now the card renders the option under a display
+    label derived from its description, and selecting it replies with the
+    ORIGINAL (blank) label, like answering in the terminal would.
+    """
+    base_url, session_id = seeded_session
+    opencode = _RecordingOpenCodeClient()
+    result: dict[str, object] = {}
+
+    async def _forward_question() -> None:
+        async with httpx.AsyncClient(base_url=base_url, timeout=60.0) as server:
+            forwarder = OpenCodeNativeForwarder(
+                session_id=session_id,
+                opencode_session_id="ses_e2e",
+                opencode_client=opencode,  # type: ignore[arg-type]
+                server_client=server,
+            )
+            await forwarder.handle_event(
+                OpenCodeEvent(
+                    id=None,
+                    type="question.asked",
+                    properties={
+                        "sessionID": "ses_e2e",
+                        "id": "que_blank",
+                        "questions": [
+                            {
+                                "header": "Color",
+                                "question": "Which color?",
+                                "options": [
+                                    {"label": "", "description": "unnamed option"},
+                                    {"label": "Blue", "description": "the color blue"},
+                                ],
+                            }
+                        ],
+                    },
+                    raw={},
+                )
+            )
+            task = forwarder._question_tasks["que_blank"]
+            await task
+
+    def _run_forwarder() -> None:
+        try:
+            asyncio.run(_forward_question())
+        except Exception as exc:
+            result["error"] = exc
+
+    thread = threading.Thread(target=_run_forwarder, daemon=True)
+    thread.start()
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+
+        form = page.locator(_FORM)
+        expect(form).to_be_visible(timeout=15_000)
+        form.get_by_role("radio", name="unnamed option").check()
+        form.locator(_SUBMIT).click()
+    finally:
+        thread.join(timeout=5)
+        if thread.is_alive():
+            with contextlib.suppress(httpx.HTTPError):
+                httpx.post(
+                    f"{base_url}/v1/sessions/{session_id}/events",
+                    json={
+                        "type": "approval",
+                        "data": {"elicitation_id": "que_blank", "action": "decline"},
+                    },
+                    timeout=10.0,
+                ).raise_for_status()
+            thread.join(timeout=30)
+
+    assert not thread.is_alive(), "OpenCode question hook did not receive the web verdict"
+    if "error" in result:
+        raise AssertionError(f"forwarder failed: {result['error']}") from result["error"]
+    assert opencode.replies == [("que_blank", [[""]])]
