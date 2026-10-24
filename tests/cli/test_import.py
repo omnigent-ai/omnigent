@@ -8,13 +8,22 @@ from pathlib import Path
 from unittest.mock import patch
 
 import httpx
+import pytest
 import respx
 from click.testing import CliRunner
 
 from omnigent.cli import _CLICK_SUBCOMMANDS, cli
 from omnigent.session_import.models import SessionImportNotFoundError
+from tests._helpers.codex_rollout import CodexRollout, codex_message
 
 _BASE = "http://localhost:6767"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_harness_homes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The CLI reads harness history under $HOME; ambient overrides must not redirect it."""
+    for name in ("CLAUDE_CONFIG_DIR", "CODEX_HOME", "QWEN_HOME", "PI_CODING_AGENT_DIR"):
+        monkeypatch.delenv(name, raising=False)
 
 
 def _write_claude_transcript(
@@ -76,6 +85,7 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
         "external_session_id": session_id,
         "workspace": "/repo",
         "title": None,
+        "archived": False,
         "force": False,
         "items": [
             {
@@ -88,6 +98,36 @@ def test_import_command_loads_local_session_and_posts_normalized_items(tmp_path:
             }
         ],
     }
+
+
+@respx.mock
+def test_import_command_marks_a_codex_archived_thread_as_archived(tmp_path: Path) -> None:
+    """A thread Codex archived (its rollout under archived_sessions/) posts ``archived: true``."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    rollout = CodexRollout(session_id, cwd="/repo")
+    rollout.append("response_item", codex_message("user", "inspect TODO.md"))
+    rollout.write(
+        tmp_path
+        / ".codex"
+        / "archived_sessions"
+        / f"rollout-2026-10-02T09-00-00-{session_id}.jsonl"
+    )
+    route = respx.post(f"{_BASE}/v1/imports").mock(
+        return_value=httpx.Response(
+            201,
+            json={"session_id": "conv_imported", "status": "imported", "item_count": 1},
+        )
+    )
+
+    with patch("omnigent.cli._resolve_attach_server", return_value=_BASE):
+        result = CliRunner().invoke(
+            cli,
+            ["import", "--harness", "codex", "--session", session_id],
+            env={"HOME": str(tmp_path)},
+        )
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(route.calls.last.request.content)["archived"] is True
 
 
 @respx.mock

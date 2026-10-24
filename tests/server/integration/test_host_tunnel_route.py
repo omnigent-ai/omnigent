@@ -1165,6 +1165,7 @@ async def test_host_tunnel_reassembles_chunked_import_session(
         items=[{"type": "message", "response_id": "r1", "data": {"text": "x" * 400}}],
         title="giant",
         source="claude",
+        archived=True,
     )
     texts = list(encode_import_local_session_frames("req_chunked", 1, session, allow_chunks=True))
     assert len(texts) > 1  # actually exercised the chunk path
@@ -1176,6 +1177,7 @@ async def test_host_tunnel_reassembles_chunked_import_session(
     assert kind == "session"
     assert payload["external_session_id"] == "s_giant"
     assert payload["items"] == session.items
+    assert payload["archived"] is True
     assert payload["total"] == 1
 
 
