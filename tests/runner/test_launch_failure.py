@@ -619,6 +619,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("agent_startup_pending", "still starting"),
         ("codex_thread_not_started", "never ran"),
         ("codex_compaction_model_failed", "previous model"),
+        ("runner_failed_to_start", "runner failed to start on the host"),
     ],
 )
 def test_describe_failure_code_known(code: str, expected_substring: str) -> None:
