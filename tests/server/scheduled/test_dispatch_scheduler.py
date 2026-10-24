@@ -453,6 +453,15 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
     scheduler = PersistentTaskScheduler(
         store, fire, AsyncMock(return_value=None), now=clock.now, renewal_seconds=0.01
     )
+    if interruption == "renewal_timeout":
+        heartbeat_ready = asyncio.Event()
+        original_heartbeat = scheduler._heartbeat
+
+        async def heartbeat(lease):
+            await heartbeat_ready.wait()
+            await original_heartbeat(lease)
+
+        monkeypatch.setattr(scheduler, "_heartbeat", heartbeat)
     try:
         await scheduler.poll_once()
         startups = list(scheduler._startups.values())
@@ -462,6 +471,8 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
         elif interruption == "renewal_timeout":
             monkeypatch.setattr(store, "renew_starting_run", hanging_renewal)
             clock.advance(119)
+            # Capture the heartbeat's real timeout after advancing the fake clock.
+            heartbeat_ready.set()
             await asyncio.wait_for(renewal_blocked.wait(), 10)
             clock.advance(1)
         elif interruption == "stop":

@@ -460,6 +460,8 @@ def test_codex_model_rejection_ignores_unrelated_errors(message: str) -> None:
         "inner executor error: There's an issue with the selected model "
         "(openai/example-model). It may not exist or you may not have access to it.",
         "There's an issue with the selected model. It may not exist.",
+        # Claude Code's StopFailure category when its hook carries no error text.
+        "Claude Code ended the turn with an API error (model_not_found).",
         # Anthropic's not-found body, forwarded verbatim by Pi.
         'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",'
         '"message":"model: anthropic/claude-opus-4-8"}}',
@@ -495,6 +497,7 @@ def test_model_unavailable_explains_how_to_recover(message: str) -> None:
         "API Error: Request rejected (401) · UNAUTHENTICATED",
         "API Error: Request rejected (403) · PERMISSION_DENIED",
         "API Error: 429 rate limit exceeded",
+        "Claude Code ended the turn with an API error (invalid_request).",
         "The AI gateway refused this turn because a spending budget is exhausted.",
         "The 'future-model' model is not supported when using Codex with a ChatGPT account.",
         _CLIENT_UPDATE_OUTPUT,

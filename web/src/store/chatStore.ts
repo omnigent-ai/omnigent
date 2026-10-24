@@ -60,6 +60,7 @@ import { itemsToBlocks } from "@/lib/itemsToBlocks";
 import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import {
   ApiError,
   approve as approveElicitation,
@@ -7916,6 +7917,9 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation({
         pendingUserMessages: [],
       });
+      return;
+    case "ui_open_file":
+      emitUiOpenFile(event, sourceConversationId);
       return;
     case "browser_action_request":
       // Embedded-browser action: fan out to the relay hook (which claims,

@@ -98,7 +98,8 @@ the header menu), and each place is a separate entry point.
   cookies from a local Chrome profile into that same session jar (Site scope
   picks the host or a parent domain); the copy is in-memory and never written
   back to Chrome.
-- `canvas-workspace`: Canvas collapses the shared sidebar on entry; clicking a
+- `canvas-workspace`: Main and project boards show only your sessions, including
+  cached previews and reloads. Canvas collapses the shared sidebar on entry; clicking a
   card opens its session beside the project board. Switching cards keeps
   drafts and board state; resize, focus, and close controls adjust the split.
 - `canvas-mobile`: the board and selected session use the standard top-left
@@ -710,7 +711,8 @@ plain `uv run pytest`, which starts a private server for the test.
   Workspace open/close, independent focus, maximizing, and pane sizing on wide
   and smaller desktops:
   `tests/e2e_ui/sessions/test_canvas_workspace.py::test_canvas_stays_visible_when_workspace_opens`.
-  Grouping, feature gating, drag persistence, and live updates also run in
+  Ownership filtering on desktop/mobile, grouping, feature gating, drag persistence,
+  and live updates also run in
   `tests/e2e_ui/sessions/test_canvas_page.py`, with selection churn in
   `tests/e2e_ui/sessions/test_canvas_selected_highlight_persists.py::test_clicked_card_keeps_selected_highlight_across_live_updates`.
   The selection journey covers duplicate titles and a long list whose nodes

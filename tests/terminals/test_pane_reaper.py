@@ -510,6 +510,45 @@ async def test_runner_reap_releases_sidecars_before_a_recreate_takes_over(
             servers.pop(conv, None)
 
 
+async def test_runner_reap_releases_sidecars_when_the_pane_close_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed pane close still releases the forwarder and helper server, and raises."""
+    conv = "conv_reap_close_fails"
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    registry._by_conversation[conv] = {("opencode", "main"): instance}
+    resource_registry = SessionResourceRegistry(terminal_registry=registry)
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=resource_registry,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    forwarder, server = _start_sidecars(conv, "opencode")
+
+    async def failing_close(*_args: object) -> bool:
+        raise RuntimeError("pane close failed")
+
+    monkeypatch.setattr(resource_registry, "close_terminal", failing_close)
+    pane = PaneRef(
+        conv, terminal_resource_id("opencode", "main"), "opencode", instance.socket_path
+    )
+    try:
+        with pytest.raises(RuntimeError, match="pane close failed"):
+            await reaper._reap(pane)
+
+        assert forwarder.done(), "forwarder still running after a failed pane close"
+        assert server is not None and server.closed
+    finally:
+        forwarder.cancel()
+        await asyncio.gather(forwarder, return_exceptions=True)
+        native_runtime._AUTO_FORWARDER_TASKS.pop(conv, None)
+        native_runtime._AUTO_OPENCODE_SERVERS.pop(conv, None)
+
+
 async def test_runner_reap_leaves_a_pane_replaced_after_the_scan_listed_it(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -21,6 +21,7 @@ from omnigent.harnesses.claude_native import bridge
 from omnigent.native.tool_observer_hook import hook_settings
 from omnigent.runner.session_prs import SessionPrRegistry
 from omnigent.workspace_fs import WorkspaceReader
+from tests._helpers.polling import poll_until_async
 
 
 @pytest.mark.parametrize("harness", ["claude_native", "codex_native"])
@@ -46,6 +47,12 @@ async def test_native_session_tracks_prs_across_repositories(
         "    print(json.dumps({'data': {'createPullRequest': {'pullRequest': "
         "{'url': 'https://github.com/example/six/pull/42', 'number': 42}}}}))\n"
         "    sys.exit(0)\n"
+        "if args[0] == 'api' and '/commits/' in args[-1]:\n"
+        "    repo = '/'.join(args[-1].split('/')[1:3])\n"
+        "    print(json.dumps([{'state': 'open', "
+        "'html_url': f'https://github.com/{repo}/pull/42', "
+        "'head': {'ref': 'topic', 'repo': {'full_name': repo}}}]))\n"
+        "    sys.exit(0)\n"
         "repo = ('/'.join(args[1].strip('/').split('/')[1:3])\n"
         "        if args[0] == 'api' else "
         "args[args.index('-R') + 1].removeprefix('github.com/'))\n"
@@ -61,6 +68,18 @@ async def test_native_session_tracks_prs_across_repositories(
         "else: sys.exit(1)\n"
     )
     gh.chmod(0o755)
+    git = binary / "git"
+    git.write_text(
+        f"#!{sys.executable}\n"
+        "import pathlib, sys\n"
+        "args = sys.argv[1:]\n"
+        "if 'push' not in args: sys.exit(1)\n"
+        "repo = (pathlib.Path(args[args.index('-C') + 1]).name "
+        "if '-C' in args else pathlib.Path.cwd().name)\n"
+        "sys.stderr.write(f'To https://github.com/example/{repo}.git\\n' "
+        "+ '   abc1234..def5678  topic -> topic\\n')\n"
+    )
+    git.chmod(0o755)
     monkeypatch.setenv("PATH", f"{binary}{os.pathsep}{os.environ['PATH']}")
     workspace = tmp_path / "workspace"
     workspace.mkdir()
@@ -128,7 +147,45 @@ async def test_native_session_tracks_prs_across_repositories(
         graphql_output = subprocess.check_output(
             ["/bin/sh", "-c", graphql_command], text=True, cwd=workspace
         )
+        push_payloads = []
+        for repository, push_command in (
+            ("pushed-one", "cd pushed-one && git push origin topic"),
+            ("pushed-two", "git -C pushed-two push origin topic"),
+        ):
+            (workspace / repository).mkdir()
+            pushed = subprocess.run(
+                ["/bin/sh", "-c", push_command],
+                capture_output=True,
+                text=True,
+                check=True,
+                cwd=workspace,
+            )
+            push_payloads.append(
+                {
+                    "cwd": str(workspace),
+                    "tool_name": "Bash" if harness == "claude_native" else "exec_command",
+                    "tool_input": {
+                        "command" if harness == "claude_native" else "cmd": push_command
+                    },
+                    "tool_response": (
+                        {
+                            "stdout": pushed.stdout + pushed.stderr,
+                            "stderr": "",
+                            "interrupted": False,
+                            "isImage": False,
+                            "noOutputExpected": False,
+                        }
+                        if harness == "claude_native"
+                        else {
+                            "stdout": pushed.stdout,
+                            "stderr": pushed.stderr,
+                            "exit_code": pushed.returncode,
+                        }
+                    ),
+                }
+            )
         payloads = [
+            *push_payloads,
             {
                 "tool_name": "exec_command",
                 "tool_input": {"cmd": graphql_command},
@@ -224,8 +281,9 @@ async def test_native_session_tracks_prs_across_repositories(
                 assert completed.returncode == 0, completed.stderr
                 assert completed.stdout == ""
         registry = SessionPrRegistry("conv_owned")
+        await poll_until_async(lambda: len(registry.list()) == 8, timeout_s=10)
         entries = registry.list()
-        assert len(entries) == 6
+        assert len(entries) == 8
         assert {entry.repository: entry.relationship for entry in entries} == {
             "example/one": "created",
             "example/two": "created",
@@ -233,6 +291,8 @@ async def test_native_session_tracks_prs_across_repositories(
             "example/four": "created",
             "example/five": "worked_on",
             "example/six": "created",
+            "example/pushed-one": "worked_on",
+            "example/pushed-two": "worked_on",
         }
         registry.remove("https://github.com/example/five/pull/42")
         # A new observation, as well as hook replay, must respect explicit unlinking.
@@ -255,14 +315,17 @@ async def test_native_session_tracks_prs_across_repositories(
         relay.close()
     # Closing the relay and using a fresh reader models the parked-runner host path.
     entries = SessionPrRegistry("conv_owned").list()
-    assert len(entries) == 5
-    assert all(entry.relationship == "created" for entry in entries)
+    assert len(entries) == 7
+    assert {entry.repository for entry in entries if entry.relationship == "worked_on"} == {
+        "example/pushed-one",
+        "example/pushed-two",
+    }
     assert SessionPrRegistry("provider-session").list() == []
     reader = WorkspaceReader(workspace)
     for entry in entries:
         result = reader.github_info(session_id="conv_owned", pr_url=entry.url)
         assert result["pr"]["title"] == entry.repository
-        assert len(result["prs"]) == 5
+        assert len(result["prs"]) == 7
         assert (
             reader.github_pr_diff(session_id="conv_owned", pr_url=entry.url)["patch"].strip()
             == f"patch for {entry.repository}"

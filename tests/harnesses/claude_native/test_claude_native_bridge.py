@@ -8784,9 +8784,39 @@ def test_ensure_trusted_creates_config_when_missing(
     # Global onboarding gate — without this Claude shows the theme/login
     # flow on a never-onboarded machine.
     assert data["hasCompletedOnboarding"] is True
+    # Declined auto-mode default question — without this Claude asks "Make
+    # auto mode your default permission mode?" when settings pin another mode.
+    assert data["hasSeenAutoDefaultNudge"] is True
     # Per-directory trust gate, keyed by the RESOLVED absolute path —
     # without this Claude shows "Do you trust the files in this folder?".
     assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_trusted_declines_auto_default_question_for_onboarded_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An onboarded, trusted config gains only the auto-mode default answer.
+
+    Claude Code asks "Make auto mode your default permission mode?" at
+    startup until this key is set, and its pre-selected "Yes" rewrites the
+    user's default mode. Declining it writes only ``hasSeenAutoDefaultNudge``,
+    so seeding must leave every other key, including the user's mode, alone.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    existing = {
+        "oauthAccount": {"emailAddress": "user@example.com"},
+        "hasCompletedOnboarding": True,
+        "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+    }
+    config_path.write_text(json.dumps(existing))
+
+    ensure_claude_workspace_trusted(workspace)
+
+    assert json.loads(config_path.read_text()) == {**existing, "hasSeenAutoDefaultNudge": True}
 
 
 def test_ensure_trusted_preserves_existing_state(
@@ -8794,7 +8824,7 @@ def test_ensure_trusted_preserves_existing_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Seeding adds only the two gates; all other config is preserved.
+    Seeding adds only the gates; all other config is preserved.
 
     The file holds the user's OAuth account, MCP config, and per-project
     history. Clobbering any of it would be a regression, so this asserts
@@ -8838,7 +8868,7 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When both gates are already set, the file is left byte-for-byte alone.
+    When every gate is already set, the file is left byte-for-byte alone.
 
     The seed file is written in compact form; the helper's writer uses
     two-space indentation. So if the ``if not changed: return`` short-
@@ -8851,6 +8881,7 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     workspace.mkdir(parents=True)
     already = {
         "hasCompletedOnboarding": True,
+        "hasSeenAutoDefaultNudge": True,
         "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
     }
     # Compact, no indentation — distinct from the helper's indent=2 output.
@@ -11237,11 +11268,17 @@ _BOX_GEOMETRIES = pytest.mark.parametrize(
 
 @_BOX_GEOMETRIES
 @_STALE_DRAFT_CURSORS
+@pytest.mark.parametrize(
+    "draft",
+    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
+    ids=["plain-draft", "draft-with-rule"],
+)
 def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
     visible_rows: int | None,
+    draft: str,
 ) -> None:
     """
     A multi-line draft left in the box is not submitted with the message.
@@ -11253,7 +11290,7 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     clearing burst would likewise leave the hidden lines to be submitted.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=cursor, visible_rows=visible_rows)
+    composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
 
     inject_user_message(bridge_dir, content="hello from the web")
@@ -11263,11 +11300,17 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
 
 @_BOX_GEOMETRIES
 @_STALE_DRAFT_CURSORS
+@pytest.mark.parametrize(
+    "draft",
+    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
+    ids=["plain-draft", "draft-with-rule"],
+)
 def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
     visible_rows: int | None,
+    draft: str,
 ) -> None:
     """
     A multi-line draft left in the box is not submitted with a slash command.
@@ -11278,7 +11321,7 @@ def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     as for a message.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=cursor, visible_rows=visible_rows)
+    composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -11380,16 +11423,38 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
             "scrollback\n──────\n❯ one\n  two\n  three",
             claude_native_bridge._ComposerBox(["❯ one", "  two", "  three"], framed=False),
         ),
+        (
+            "──────\n❯ one\n  ──────\n  four\n──────\n  ? for shortcuts\n",
+            claude_native_bridge._ComposerBox(["❯ one", "  ──────", "  four"], framed=True),
+        ),
+        (
+            "──────\n❯ one\n  ──────",
+            claude_native_bridge._ComposerBox(["❯ one", "  ──────"], framed=False),
+        ),
+        (
+            "──────\nold output\n  ──────\n  ❯ one\n    ──────\n    four\n  ──────\n",
+            claude_native_bridge._ComposerBox(["  ❯ one", "    ──────", "    four"], framed=True),
+        ),
         ("──────\n  Change effort level?\n  ❯ 1. Yes, switch to low\n    2. No, go back\n", None),
         ("plain output, no box\n", None),
     ],
-    ids=["framed-with-blank-row", "closing-rule-off-screen", "dialog-selector", "no-box"],
+    ids=[
+        "framed-with-blank-row",
+        "closing-rule-off-screen",
+        "rule-inside-draft",
+        "rule-inside-clipped-draft",
+        "indented-frame-with-earlier-rule",
+        "dialog-selector",
+        "no-box",
+    ],
 )
 def test_composer_box_reads_every_row_of_the_input_box(
     pane: str, box: claude_native_bridge._ComposerBox | None
 ) -> None:
     """Every row of the live box counts, and a box cut off by the pane says so."""
     assert claude_native_bridge._composer_box(pane) == box
+    if box is not None:
+        assert claude_native_bridge._composer_row(pane) == box.rows[0]
 
 
 def test_a_model_switch_types_the_argument_form_and_confirms(

@@ -47,7 +47,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.entities import Conversation, ResolvedAccess, SessionPermission
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import _globals, set_runner_client, set_runner_router
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -702,6 +702,56 @@ async def test_workspace_reads_allow_view_only_when_shared(
 
     assert resp.status_code == 200, resp.text
     assert len(runner_client.gets) == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("email", "routing_error", "status", "error_code"),
+    [
+        ("viewer@example.com", None, 200, None),
+        ("viewer@example.com", ErrorCode.RUNNER_UNAVAILABLE, 403, ErrorCode.FORBIDDEN),
+        ("owner@example.com", ErrorCode.WRONG_REPLICA, 400, ErrorCode.WRONG_REPLICA),
+    ],
+)
+async def test_shared_download_does_not_wake_without_edit_access_or_on_wrong_replica(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    email: str,
+    routing_error: str | None,
+    status: int,
+    error_code: str | None,
+) -> None:
+    """Shared viewers can download live files; recovery needs edit access and the right replica."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes.sessions import routes_resources
+
+    payload = b"shared file"
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            stream=httpx.ByteStream(payload),
+            headers={"Content-Disposition": 'attachment; filename="report.txt"'},
+        )
+    )
+    wake = AsyncMock()
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as runner:
+        lookup = AsyncMock(return_value=runner)
+        if routing_error is not None:
+            lookup.side_effect = OmnigentError("runner unavailable here", code=routing_error)
+        monkeypatch.setattr(routes_resources, "_get_runner_client_for_resource_access", lookup)
+        response = await client.get(
+            "/v1/sessions/conv_open/resources/environments/default/filesystem/report.txt",
+            params={"download": "true"},
+            headers={"X-Forwarded-Email": email},
+        )
+    assert response.status_code == status, response.text
+    if error_code is None:
+        assert response.content == payload
+    else:
+        assert response.json()["error"]["code"] == error_code
+    wake.assert_not_awaited()
 
 
 @pytest.mark.asyncio

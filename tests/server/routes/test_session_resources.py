@@ -4217,13 +4217,16 @@ async def test_filesystem_write_proxies_to_runner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_wake", [False, True])
-async def test_filesystem_save_reconnects_runner_on_live_host(
+@pytest.mark.parametrize("operation", ["save", "download"])
+async def test_filesystem_operation_reconnects_runner_on_live_host(
     client: httpx.AsyncClient,
     app: FastAPI,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fail_first_wake: bool,
+    operation: str,
 ) -> None:
-    """Save (or Retry after a failed wake) reconnects before forwarding the edit."""
+    """Save and Download reconnect before forwarding, including Retry after a failed wake."""
     from dataclasses import replace
     from types import SimpleNamespace
 
@@ -4244,7 +4247,19 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
         HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="save-host"),
         owner=None,
     )
-    fake_runner = _FakeRunnerClient(payload=_fs_write_payload())
+    payload = bytes(range(256))
+    (tmp_path / "download.bin").write_bytes(payload)
+    runner = FastAPI()
+    runner_calls: list[tuple[str, str]] = []
+
+    @runner.api_route(_FS_ROUTE, methods=["GET", "PUT"], response_model=None)
+    async def _serve(request: Request) -> FileResponse | JSONResponse:
+        runner_calls.append((request.method, request.url.path))
+        if request.method == "GET":
+            assert request.query_params["download"] == "true"
+            return FileResponse(tmp_path / "download.bin", filename="download.bin")
+        return JSONResponse(_fs_write_payload())
+
     connected = False
 
     class _SleepingRouter(_FakeRunnerRouter):
@@ -4256,14 +4271,12 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
             assert conversation is not None and conversation.runner_id == "runner_new"
             return super().client_for_session_resources(session_id, conversation=conversation)
 
-    router = _SleepingRouter(fake_runner)
-    set_runner_router(router)  # type: ignore[arg-type]
     attempts = 0
 
     async def _launch(*_args: Any, **_kwargs: Any) -> Any:
         nonlocal connected, attempts
         attempts += 1
-        assert fake_runner.calls == []
+        assert runner_calls == []
         if fail_first_wake and attempts == 1:
             raise OmnigentError("wake timed out", code=ErrorCode.RUNNER_UNAVAILABLE)
         # Recovery replaces the row: forwarding with the old binding would fail.
@@ -4288,22 +4301,32 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
     url = f"/v1/sessions/{session_id}/resources/environments/default/filesystem/new.txt"
     body = {"content": "edited without a chat message", "encoding": "utf-8"}
 
-    if fail_first_wake:
-        failed = await client.put(url, json=body)
-        assert failed.status_code == 503
-        assert fake_runner.calls == []
+    method = "PUT" if operation == "save" else "GET"
+    request_kwargs = {"json": body} if operation == "save" else {"params": {"download": "true"}}
+    async with _runner_app_client(runner) as fake_runner:
+        set_runner_router(_SleepingRouter(fake_runner))  # type: ignore[arg-type]
+        if fail_first_wake:
+            failed = await client.request(method, url, **request_kwargs)
+            assert failed.status_code == 503
+            assert failed.json()["error"]["message"] == "wake timed out"
+            assert runner_calls == []
 
-    response = await client.put(url, json=body)
-    assert response.status_code == 200
-    assert fake_runner.calls == [("PUT", url)]
+        response = await client.request(method, url, **request_kwargs)
+    assert response.status_code == 200, response.text
+    if operation == "download":
+        assert response.content == payload
+        assert response.headers["content-disposition"] == 'attachment; filename="download.bin"'
+    assert runner_calls == [(method, url)]
     assert attempts == (2 if fail_first_wake else 1)
     assert store.appended_items == []
 
 
 @pytest.mark.asyncio
-async def test_filesystem_save_authorizes_before_reconnecting(
+@pytest.mark.parametrize("operation", ["save", "download"])
+async def test_filesystem_operation_authorizes_before_reconnecting(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ) -> None:
     """An invalid session must not trigger runner recovery."""
     from unittest.mock import AsyncMock
@@ -4312,9 +4335,11 @@ async def test_filesystem_save_authorizes_before_reconnecting(
 
     wake = AsyncMock()
     monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
-    response = await client.put(
-        "/v1/sessions/missing/resources/environments/default/filesystem/new.txt",
-        json={"content": "hello", "encoding": "utf-8"},
+    url = "/v1/sessions/missing/resources/environments/default/filesystem/new.txt"
+    response = (
+        await client.put(url, json={"content": "hello", "encoding": "utf-8"})
+        if operation == "save"
+        else await client.get(url, params={"download": "true"})
     )
     assert response.status_code == 404
     wake.assert_not_awaited()
