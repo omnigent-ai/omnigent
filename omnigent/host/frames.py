@@ -74,6 +74,8 @@ CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_MCP_REGISTRY = "mcp_registry"
+# The host honors ``skip_external_session_ids`` on ``host.import_local``:
+CAP_IMPORT_SKIP_KNOWN = "import_skip_known"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -87,7 +89,12 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
     CAP_REFRESH_HARNESSES,
+    CAP_IMPORT_SKIP_KNOWN,
 ]
+
+# Most external ids a server sends in one ``skip_external_session_ids`` list;
+# a longer list on the wire is cut to this (a batch reads at most 100 sessions).
+MAX_IMPORT_SKIP_IDS = 200
 
 
 def workspace_missing_message(workspace: str | PathLike[str] | None) -> str:
@@ -189,6 +196,8 @@ class HostFrameKind(str, Enum):
     IMPORT_LOCAL_SESSION = "host.import_local_session"
     IMPORT_LOCAL_SESSION_CHUNK = "host.import_local_session_chunk"
     IMPORT_LOCAL_DONE = "host.import_local_done"
+    IMPORT_LOCAL_PROGRESS = "host.import_local_progress"
+    IMPORT_LOCAL_CANCEL = "host.import_local_cancel"
 
 
 # ── Frame dataclasses ────────────────────────────────────
@@ -1207,6 +1216,8 @@ class HostImportedLocalSession:
         server synthesize one from the first user message.
     :param source: Harness this session came from, e.g. ``"claude"``. Carried
         per session so an "all harnesses" request can mix sources in one batch.
+    :param archived: Whether the harness had archived this session; the server
+        archives the imported conversation too. Absent from older hosts.
     """
 
     external_session_id: str
@@ -1214,6 +1225,7 @@ class HostImportedLocalSession:
     items: list[_JsonObject]
     title: str | None = None
     source: str = ""
+    archived: bool = False
 
 
 @dataclass
@@ -1230,12 +1242,20 @@ class HostImportLocalFrame:
     :param allow_session_chunks: Whether the requesting server understands
         ``host.import_local_session_chunk``. Missing from older servers, so the
         safe default is legacy whole-session framing.
+    :param progress: Whether the requesting server understands
+        :class:`HostImportLocalProgressFrame`. A host only sends heartbeats when
+        this is set, so an older server never sees an unknown frame kind.
+    :param skip_external_session_ids: Sessions the server already has, so a
+        host with :data:`CAP_IMPORT_SKIP_KNOWN` counts them as skipped without
+        reading them (re-running an interrupted batch). Empty from older servers.
     """
 
     request_id: str
     source: str
     limit: int = 10
     allow_session_chunks: bool = False
+    progress: bool = False
+    skip_external_session_ids: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1247,12 +1267,14 @@ class HostImportLocalByIdFrame:
     :param session_id: Exact harness-native session id to load.
     :param allow_session_chunks: Whether the requesting server understands
         ``host.import_local_session_chunk``. Missing from older servers.
+    :param progress: As on :class:`HostImportLocalFrame`.
     """
 
     request_id: str
     source: str
     session_id: str
     allow_session_chunks: bool = False
+    progress: bool = False
 
 
 @dataclass
@@ -1310,6 +1332,8 @@ class HostImportLocalDoneFrame:
     :param failures: Per-session detail for the sessions counted in ``failed``,
         each ``{"external_session_id", "source", "reason"}``, so the UI can name
         each failed session and why. Empty from older hosts (only ``failed``).
+    :param skipped: Sessions skipped unread because the request listed them in
+        ``skip_external_session_ids``. ``0`` from older hosts.
     """
 
     request_id: str
@@ -1317,6 +1341,43 @@ class HostImportLocalDoneFrame:
     error: str | None = None
     failed: int = 0
     failures: list[_JsonObject] = field(default_factory=list)
+    skipped: int = 0
+
+
+@dataclass
+class HostImportLocalProgressFrame:
+    """Host → server: import heartbeat with the sessions processed so far.
+
+    Sent roughly every 10 s while the host enumerates or reads a slow transcript,
+    and after each session, only when the request set ``progress``. It tells the
+    server the host is alive (so a silent host is caught quickly) and lets the
+    UI show "Importing 7 of 20".
+
+    :param request_id: Correlates to the :class:`HostImportLocalFrame`.
+    :param done: Sessions finished so far (sent, failed, or skipped on the host).
+    :param total: Sessions the host will process, or ``None`` while still
+        enumerating.
+    :param skipped: How many of ``done`` were skipped unread (see
+        :attr:`HostImportLocalFrame.skip_external_session_ids`).
+    """
+
+    request_id: str
+    done: int
+    total: int | None = None
+    skipped: int = 0
+
+
+@dataclass
+class HostImportLocalCancelFrame:
+    """Server → host: stop an in-flight import (deadline hit or client left).
+
+    Hosts that predate it drop the unknown kind and finish the import; the
+    server has already stopped reading, so their frames are ignored.
+
+    :param request_id: The import to stop.
+    """
+
+    request_id: str
 
 
 HostFrame = (
@@ -1372,6 +1433,8 @@ HostFrame = (
     | HostImportLocalSessionFrame
     | HostImportLocalSessionChunkFrame
     | HostImportLocalDoneFrame
+    | HostImportLocalProgressFrame
+    | HostImportLocalCancelFrame
 )
 
 
@@ -1887,15 +1950,19 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostImportLocalFrame):
-        return _encode_payload(
-            {
-                "kind": HostFrameKind.IMPORT_LOCAL.value,
-                "request_id": frame.request_id,
-                "source": frame.source,
-                "limit": frame.limit,
-                "allow_session_chunks": frame.allow_session_chunks,
-            }
-        )
+        request: _JsonObject = {
+            "kind": HostFrameKind.IMPORT_LOCAL.value,
+            "request_id": frame.request_id,
+            "source": frame.source,
+            "limit": frame.limit,
+            "allow_session_chunks": frame.allow_session_chunks,
+            "progress": frame.progress,
+        }
+        if frame.skip_external_session_ids:
+            request["skip_external_session_ids"] = list(
+                frame.skip_external_session_ids[:MAX_IMPORT_SKIP_IDS]
+            )
+        return _encode_payload(request)
     if isinstance(frame, HostImportLocalByIdFrame):
         return _encode_payload(
             {
@@ -1904,6 +1971,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "source": frame.source,
                 "session_id": frame.session_id,
                 "allow_session_chunks": frame.allow_session_chunks,
+                "progress": frame.progress,
             }
         )
     if isinstance(frame, HostImportLocalSessionFrame):
@@ -1927,14 +1995,33 @@ def encode_host_frame(frame: HostFrame) -> str:
             }
         )
     if isinstance(frame, HostImportLocalDoneFrame):
+        done_payload: _JsonObject = {
+            "kind": HostFrameKind.IMPORT_LOCAL_DONE.value,
+            "request_id": frame.request_id,
+            "status": frame.status,
+            "error": frame.error,
+            "failed": frame.failed,
+            "failures": frame.failures,
+        }
+        # Only a server that sent a skip list gets skips back.
+        if frame.skipped:
+            done_payload["skipped"] = frame.skipped
+        return _encode_payload(done_payload)
+    if isinstance(frame, HostImportLocalProgressFrame):
+        progress_payload: _JsonObject = {
+            "kind": HostFrameKind.IMPORT_LOCAL_PROGRESS.value,
+            "request_id": frame.request_id,
+            "done": frame.done,
+            "total": frame.total,
+        }
+        if frame.skipped:
+            progress_payload["skipped"] = frame.skipped
+        return _encode_payload(progress_payload)
+    if isinstance(frame, HostImportLocalCancelFrame):
         return _encode_payload(
             {
-                "kind": HostFrameKind.IMPORT_LOCAL_DONE.value,
+                "kind": HostFrameKind.IMPORT_LOCAL_CANCEL.value,
                 "request_id": frame.request_id,
-                "status": frame.status,
-                "error": frame.error,
-                "failed": frame.failed,
-                "failures": frame.failures,
             }
         )
     raise TypeError(f"unknown host frame type: {type(frame).__name__}")
@@ -1948,6 +2035,7 @@ def _imported_local_session_payload(session: HostImportedLocalSession) -> _JsonO
         "items": session.items,
         "title": session.title,
         "source": session.source,
+        "archived": session.archived,
     }
 
 
@@ -2081,6 +2169,21 @@ class ImportLocalSessionChunkAssembler:
             the slices do not reassemble into a valid session object. The
             caller counts one failed session and keeps the stream alive.
         """
+        text = self.add_text(frame, budget=budget)
+        return None if text is None else decode_imported_local_session_json(text)
+
+    def add_text(
+        self,
+        frame: HostImportLocalSessionChunkFrame,
+        *,
+        budget: int | None = None,
+    ) -> str | None:
+        """Like :meth:`add`, but return the reassembled session JSON undecoded.
+
+        For a caller that queues the session and decodes it later with
+        :func:`decode_imported_local_session_json`. Raises like :meth:`add`
+        except for an invalid session object, which only decoding finds.
+        """
         if frame.seq == 0:
             self._reset()
         elif self._skipping:
@@ -2103,11 +2206,19 @@ class ImportLocalSessionChunkAssembler:
             return None
         parts = self._parts
         self._reset()
-        try:
-            raw = json.loads("".join(parts))
-        except (json.JSONDecodeError, RecursionError) as exc:
-            raise ValueError(f"chunked session is not valid JSON: {exc}") from exc
-        return _decode_imported_local_session(raw)
+        return "".join(parts)
+
+
+def decode_imported_local_session_json(text: str) -> HostImportedLocalSession:
+    """Decode a reassembled chunked session's JSON.
+
+    :raises ValueError: If it is not valid JSON or not a valid session object.
+    """
+    try:
+        raw = json.loads(text)
+    except (json.JSONDecodeError, RecursionError) as exc:
+        raise ValueError(f"chunked session is not valid JSON: {exc}") from exc
+    return _decode_imported_local_session(raw)
 
 
 def decode_host_frame(text: str) -> HostFrame:
@@ -2311,6 +2422,21 @@ def _decode_known_host_frame(
             return _decode_import_local_session_chunk(msg)
         case HostFrameKind.IMPORT_LOCAL_DONE:
             return _decode_import_local_done(msg)
+        case HostFrameKind.IMPORT_LOCAL_PROGRESS:
+            return HostImportLocalProgressFrame(
+                request_id=_required_str(msg, "request_id"),
+                done=_required_int(msg, "done"),
+                total=(
+                    total
+                    if isinstance(total := msg.get("total"), int)
+                    and not isinstance(total, bool)
+                    and total >= 0
+                    else None
+                ),
+                skipped=_optional_count(msg, "skipped"),
+            )
+        case HostFrameKind.IMPORT_LOCAL_CANCEL:
+            return HostImportLocalCancelFrame(request_id=_required_str(msg, "request_id"))
     raise ValueError(f"unhandled host frame kind: {kind.value!r}")  # pragma: no cover
 
 
@@ -3072,8 +3198,21 @@ def _decode_mcp_tools_result(msg: _JsonObject) -> HostMcpToolsResultFrame:
         )
 
 
+def _optional_count(msg: _JsonObject, key: str) -> int:
+    """A non-negative count that older peers omit; anything malformed reads as 0."""
+    value = msg.get(key)
+    return value if isinstance(value, int) and not isinstance(value, bool) and value > 0 else 0
+
+
 def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
     """Decode a host.import_local frame."""
+    raw_skip = msg.get("skip_external_session_ids")
+    # Optional and advisory: a malformed list just means "skip nothing".
+    skip = (
+        [sid for sid in raw_skip if isinstance(sid, str) and sid][:MAX_IMPORT_SKIP_IDS]
+        if isinstance(raw_skip, list)
+        else []
+    )
     return HostImportLocalFrame(
         request_id=_required_str(msg, "request_id"),
         source=_required_str(msg, "source"),
@@ -3081,6 +3220,8 @@ def _decode_import_local(msg: _JsonObject) -> HostImportLocalFrame:
         allow_session_chunks=(
             _required_bool(msg, "allow_session_chunks") if "allow_session_chunks" in msg else False
         ),
+        progress=_required_bool(msg, "progress") if "progress" in msg else False,
+        skip_external_session_ids=skip,
     )
 
 
@@ -3093,6 +3234,7 @@ def _decode_import_local_by_id(msg: _JsonObject) -> HostImportLocalByIdFrame:
         allow_session_chunks=(
             _required_bool(msg, "allow_session_chunks") if "allow_session_chunks" in msg else False
         ),
+        progress=_required_bool(msg, "progress") if "progress" in msg else False,
     )
 
 
@@ -3112,12 +3254,16 @@ def _decode_imported_local_session(raw: object) -> HostImportedLocalSession:
     source = raw.get("source", "")
     if not isinstance(source, str):
         raise ValueError("session 'source' must be a string")
+    archived = raw.get("archived", False)
+    if not isinstance(archived, bool):
+        raise ValueError("session 'archived' must be a boolean")
     return HostImportedLocalSession(
         external_session_id=_required_str(raw, "external_session_id"),
         workspace=workspace,
         items=items,
         title=title,
         source=source,
+        archived=archived,
     )
 
 
@@ -3156,6 +3302,7 @@ def _decode_import_local_done(msg: _JsonObject) -> HostImportLocalDoneFrame:
         # Absent on older hosts; default to 0 so decode stays backward-compatible.
         failed=raw_failed if isinstance(raw_failed := msg.get("failed"), int) else 0,
         failures=failures,
+        skipped=_optional_count(msg, "skipped"),
     )
 
 

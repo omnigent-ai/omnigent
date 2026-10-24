@@ -65,6 +65,13 @@ async def test_import_checks_host_ownership_before_persisting(
         ),
         prefix="/v1",
     )
+
+    @app.exception_handler(OmnigentError)
+    async def _handle(_request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.http_status, content={"error": {"message": exc.message}}
+        )
+
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as import_client:
@@ -401,6 +408,13 @@ async def test_rejected_force_import_preserves_existing_session(
         ),
         prefix="/v1",
     )
+
+    @app.exception_handler(OmnigentError)
+    async def _handle(_request: Request, exc: OmnigentError) -> JSONResponse:
+        return JSONResponse(
+            status_code=exc.http_status, content={"error": {"message": exc.message}}
+        )
+
     payload = {
         "source": "claude",
         "external_session_id": "claude-force-rejected",
@@ -745,7 +759,9 @@ async def test_local_import_stream_emits_ndjson_session_then_done(
     """The streaming endpoint emits one ``session`` line per import, then ``done``.
 
     Same import as the buffered ``/imports/local`` but wire-framed as NDJSON so
-    the caller can list sessions as they land.
+    the caller can list sessions as they land. Sessions save concurrently, so a
+    ``session`` line comes when its save finishes and the lines may be in any
+    order.
     """
     from fastapi import FastAPI
 
@@ -807,14 +823,19 @@ async def test_local_import_stream_emits_ndjson_session_then_done(
     assert resp.headers["content-type"].startswith("application/x-ndjson")
     events = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
     session_events = [e for e in events if e["event"] == "session"]
-    assert [e["title"] for e in session_events] == ["Streamed 1", "Streamed 2"]
-    # The terminal line carries the tally plus the (here empty) failures list.
+    assert sorted(e["title"] for e in session_events) == ["Streamed 1", "Streamed 2"]
+    # The terminal line carries the tally plus the (here empty) failures and
+    # skipped lists.
     assert events[-1] == {
         "event": "done",
         "imported": 2,
         "already_imported": 0,
         "failed": 0,
         "failures": [],
+        "skipped": 0,
+        "skipped_sessions": [],
+        "total": None,
+        "complete": True,
     }
     # Each streamed session was actually persisted.
     for e in session_events:

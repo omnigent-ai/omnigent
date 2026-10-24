@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 from pathlib import Path
 
 import pytest
@@ -982,6 +983,18 @@ def _codex_item_texts(imported: LocalSessionImport) -> list[str]:
     ]
 
 
+def _codex_compaction_texts(imported: LocalSessionImport) -> list[str]:
+    """The text of the messages each compaction item carries, in order."""
+    return [
+        block["text"]
+        for item in imported.items
+        if item.type == "compaction"
+        for message in item.data.model_dump().get("compacted_messages") or []
+        for block in message.get("content", [])
+        if isinstance(block, dict) and isinstance(block.get("text"), str)
+    ]
+
+
 def _write_codex_rollout_with_compaction(
     tmp_path: Path, session_id: str, *, extra_pre: list[dict] | None = None
 ) -> Path:
@@ -1085,8 +1098,8 @@ def test_load_codex_session_trims_to_last_compaction_when_large(
     # Pre-compaction records the live agent no longer sees are dropped.
     assert "pre compaction question" not in texts
     assert "pre compaction answer" not in texts
-    # The replacement_history baseline and post-compaction turns are kept.
-    assert "compaction summary baseline" in texts
+    # The replacement_history baseline (on a compaction item) and post-compaction turns are kept.
+    assert _codex_compaction_texts(imported) == ["compaction summary baseline"]
     assert "post compaction question" in texts
     assert "post compaction answer" in texts
 
@@ -1127,9 +1140,8 @@ def test_load_codex_session_trims_to_final_compaction_with_multiple(
     imported = load_codex_session(session_id, codex_home=tmp_path)
 
     texts = _codex_item_texts(imported)
-    assert "first summary baseline" not in texts
     assert "between compactions" not in texts
-    assert "compaction summary baseline" in texts
+    assert _codex_compaction_texts(imported) == ["compaction summary baseline"]
     assert "post compaction question" in texts
 
 
@@ -1193,7 +1205,7 @@ def test_load_codex_session_trims_at_real_two_mb_threshold(tmp_path: Path) -> No
     texts = _codex_item_texts(imported)
     assert not any(text.startswith("pre bulk") for text in texts)
     assert "pre compaction question" not in texts
-    assert "compaction summary baseline" in texts
+    assert _codex_compaction_texts(imported) == ["compaction summary baseline"]
     assert "post compaction question" in texts
 
 
@@ -2191,3 +2203,34 @@ def test_list_recent_sessions_across_harnesses_normalizes_millisecond_recency(
     result = local_import.list_recent_sessions_across_harnesses(limit=1)
 
     assert result == [("claude", "c1")]
+
+
+def test_list_recent_sessions_across_harnesses_skips_only_a_broken_harness(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """One harness whose listing raises unexpectedly hides only its own sessions."""
+
+    def fake_recency(source: str, *, limit: int) -> list[tuple[str, float]]:
+        if source == "codex":
+            raise ModuleNotFoundError("No module named '_sqlite3'")
+        if source == "claude":
+            return [("c1", 2.0), ("c2", 1.0)]
+        return []
+
+    monkeypatch.setattr(local_import, "_recent_local_sessions_with_recency", fake_recency)
+
+    with caplog.at_level("WARNING", logger=local_import.__name__):
+        result = local_import.list_recent_sessions_across_harnesses(limit=5)
+
+    assert result == [("claude", "c1"), ("claude", "c2")]
+    assert "Skipping codex sessions" in caplog.text
+
+
+def test_codex_native_title_falls_back_without_sqlite(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Python without SQLite skips the state-db title lookup instead of failing the import."""
+    (tmp_path / "state_5.sqlite").write_text("")
+    monkeypatch.setitem(sys.modules, "sqlite3", None)
+
+    assert local_import._codex_native_title(tmp_path, "thread-1") is None

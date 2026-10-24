@@ -23,6 +23,7 @@ MAX_PENDING_INPUTS = 100
 
 if TYPE_CHECKING:
     from omnigent.db.account_authority import AccountAuthority
+    from omnigent.session_import.errors import LocalImportError
 
 # Label set on a fork of a session that had a working directory, or a
 # runner-bound native session whose working-directory metadata was lost.
@@ -2128,3 +2129,22 @@ class ConversationStore(ABC):
             ``False`` otherwise.
         """
         ...
+
+    def classify_import_error(
+        self,
+        exc: BaseException,  # noqa: ARG002 — default hook; backends override it
+    ) -> "LocalImportError | None":
+        """
+        Classify a storage failure raised while persisting one imported session.
+
+        The import routes call this for any non-``OmnigentError`` exception
+        from create/append/label writes, so a backend can turn its own errors
+        (e.g. a gRPC ``RESOURCE_EXHAUSTED`` for an oversized item) into an
+        actionable per-session failure instead of a generic internal error.
+
+        :param exc: The exception the store raised.
+        :returns: A :class:`~omnigent.session_import.errors.LocalImportError`
+            carrying the import code and user message, or ``None`` when the
+            backend doesn't recognize the error (reported as ``internal``).
+        """
+        return None
