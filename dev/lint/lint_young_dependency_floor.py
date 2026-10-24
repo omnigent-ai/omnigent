@@ -29,8 +29,8 @@ HINT = (
     "(e.g. a security fix), confirm the mirror serves it with\n"
     "`just check-internal-mirror`, then add above the requirement:\n"
     "  # custom-lint: disable-next=young-dependency-floor -- <why urgent; mirror checked>\n"
-    "A maintainer other than the PR author must then add the `dependency-floor-approved`\n"
-    "label and approve the PR, or the required Maintainer Approval check stays red."
+    "A maintainer, the author included, must then add the `dependency-floor-approved`\n"
+    "label, or the required Maintainer Approval check stays red."
 )
 
 # Specifier operators whose version bounds the admitted releases from below.

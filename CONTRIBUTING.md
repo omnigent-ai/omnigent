@@ -146,8 +146,8 @@ floor needs a release inside the uv cooldown. An urgent bump, such as a security
 fix, may keep that floor once the mirror serves the release: suppress the lint
 on the requirement with a `custom-lint: disable-next` comment that says why.
 Adding or changing that waiver keeps the required Maintainer Approval check red
-until a maintainer other than the author runs `just check-internal-mirror`, adds
-the `dependency-floor-approved` label, and approves a commit carrying the waiver.
+until a maintainer, the author included, runs `just check-internal-mirror` and
+adds the `dependency-floor-approved` label.
 
 Common checks:
 

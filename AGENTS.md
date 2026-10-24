@@ -33,7 +33,7 @@ package mirrors that embargo new releases (see the dependency notes in
 Databricks PyPI proxy. If a mirror lacks the version you need, keep the floor
 below it and pin the newer release only in `uv.lock`; do not work around the
 mirror with a local or temporary index. Never add the `dependency-floor-approved`
-label yourself; a maintainer other than the PR author adds it and approves the PR.
+label yourself; a human maintainer adds it after checking the mirror.
 
 ## Committing
 

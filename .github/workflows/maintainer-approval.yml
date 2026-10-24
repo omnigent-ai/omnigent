@@ -6,8 +6,7 @@ name: Maintainer Approval
 # `Maintainer Approval` status. Before granting a dependency exemption it
 # invalidates Merge Ready; workflow completion triggers fresh evidence checks.
 # A new young-dependency-floor waiver in pyproject.toml also needs the
-# dependency-floor-approved label and approval from a second maintainer, even
-# for maintainer authors (dependency_floor_approval.py).
+# dependency-floor-approved label from a maintainer (dependency_floor_approval.py).
 #
 # Trigger is `pull_request_target`, so it runs from main with the base token
 # even for fork PRs: it isn't held behind the fork-PR-workflow approval gate

@@ -1,8 +1,8 @@
 """Tests for ``.github/scripts/dependency_floor_approval.py``.
 
-A young-dependency-floor waiver is self-attested, so the Maintainer Approval job
-also requires a maintainer other than the PR author to add the approval label
-and approve a commit carrying every waiver the PR newly introduces.
+A young-dependency-floor waiver is a comment anyone can write, so the Maintainer
+Approval job also requires a maintainer, the author included, to add the label
+whenever a PR introduces a waiver its merge base does not have.
 """
 
 from __future__ import annotations
@@ -56,87 +56,38 @@ def _labeled(login: str, label: str = "dependency-floor-approved") -> dict:
     return {"event": "labeled", "actor": {"login": login}, "label": {"name": label}}
 
 
-def _review(login: str, state: str = "APPROVED", sha: str = "head", at: str = "2") -> dict:
-    return {"user": {"login": login}, "state": state, "commit_id": sha, "submitted_at": at}
-
-
 @pytest.mark.parametrize(
-    ("labels", "timeline", "reviews", "approved", "reason"),
+    ("labels", "timeline", "approved", "reason"),
     [
-        (set(), [], [], False, "add the `dependency-floor-approved` label, and approve"),
-        (LABEL, [_labeled("author")], [], False, "added by the author"),
-        (LABEL, [_labeled("outsider")], [], False, "non-maintainer @outsider"),
+        (set(), [], False, "and add the `dependency-floor-approved` label"),
+        (LABEL, [_labeled("author")], True, "approved by maintainer @author"),
+        (LABEL, [_labeled("Reviewer")], True, "approved by maintainer @Reviewer"),
+        (LABEL, [_labeled("outsider")], False, "non-maintainer @outsider"),
         (
             LABEL,
-            [_labeled("reviewer"), _labeled("author"), _labeled("reviewer", "automerge")],
-            [_review("reviewer")],
+            [_labeled("reviewer"), _labeled("outsider"), _labeled("reviewer", "automerge")],
             False,
-            "added by the author",
+            "non-maintainer @outsider",
         ),
-        (LABEL, [_labeled("Reviewer")], [], False, "@Reviewer added"),
-        (
-            LABEL,
-            [_labeled("reviewer")],
-            [_review("reviewer"), _review("reviewer", "CHANGES_REQUESTED", at="3")],
-            False,
-            "has not approved",
-        ),
-        (
-            LABEL,
-            [_labeled("reviewer")],
-            [_review("reviewer"), _review("reviewer", "DISMISSED", at="3")],
-            False,
-            "has not approved",
-        ),
-        (LABEL, [_labeled("reviewer")], [_review("author")], False, "has not approved"),
-        (LABEL, [], [_review("reviewer")], False, "No `dependency-floor-approved` labeled event"),
-        (LABEL, [_labeled("reviewer")], [_review("reviewer", sha="")], False, "names no commit"),
-        (LABEL, [_labeled("Reviewer")], [_review("reviewer")], True, "@Reviewer at head"),
-        (
-            LABEL,
-            [_labeled("reviewer")],
-            [_review("reviewer"), _review("reviewer", "COMMENTED", sha="other", at="3")],
-            True,
-            "@reviewer at head",
-        ),
-        (LABEL, [_labeled("reviewer")], [_review("reviewer", sha="rebased")], True, "at rebased"),
-        (
-            LABEL,
-            [_labeled("reviewer")],
-            [_review("reviewer", sha="before-edit")],
-            False,
-            "approved before-ed, before these waivers",
-        ),
+        (LABEL, [], False, "No `dependency-floor-approved` labeled event"),
     ],
     ids=[
         "no-label",
         "author-labeled",
+        "other-maintainer-labeled",
         "non-maintainer-labeled",
         "latest-labeler-wins",
-        "labeler-never-reviewed",
-        "labeler-requested-changes",
-        "labeler-approval-dismissed",
-        "only-author-approved",
         "label-without-labeled-event",
-        "approval-without-commit",
-        "labeler-approved-head",
-        "comment-after-approval",
-        "labeler-approved-same-waivers-before-rebase",
-        "labeler-approved-before-waiver-edit",
     ],
 )
-def test_new_waiver_needs_label_and_approval_from_another_maintainer(
-    approval, labels, timeline, reviews, approved, reason
+def test_new_waiver_needs_the_label_from_a_maintainer(
+    approval, labels, timeline, approved, reason
 ) -> None:
-    waivers = {"head": {PILLOW}, "rebased": {CERTIFI, PILLOW}, "before-edit": {CERTIFI}}
     decision = approval.floor_decision(
-        author="author",
         labels=labels,
         new_waivers={PILLOW},
         maintainer_logins={"author", "reviewer"},
         timeline=timeline,
-        reviews=reviews,
-        waivers_at=waivers.__getitem__,
     )
     assert (decision.approved, reason in decision.reason) == (approved, True), decision.reason
 
@@ -169,7 +120,7 @@ def _encoded(text: str) -> dict:
     return {"content": base64.b64encode(text.encode()).decode()}
 
 
-def _routes(base: str, head: str, labels=(), timeline=(), reviews=()) -> dict:
+def _routes(base: str, head: str, labels=(), timeline=()) -> dict:
     return {
         f"repos/{REPO}/pulls/7": {
             "head": {"sha": "head"},
@@ -181,7 +132,6 @@ def _routes(base: str, head: str, labels=(), timeline=(), reviews=()) -> dict:
         f"repos/{REPO}/contents/pyproject.toml?ref=head": _encoded(head),
         f"repos/{REPO}/contents/pyproject.toml?ref=fork": _encoded(base),
         f"repos/{REPO}/issues/7/timeline?per_page=100&page=1": list(timeline),
-        f"repos/{REPO}/pulls/7/reviews?per_page=100&page=1": list(reviews),
     }
 
 
@@ -195,19 +145,16 @@ def _evaluate(approval, routes: dict, expected_head: str | None = None):
     )
 
 
-def test_evaluate_approves_through_the_reviewed_commit(approval) -> None:
-    head = _pyproject(WAIVER, f"    {CERTIFI}")
+def test_evaluate_approves_a_labeled_waiver(approval) -> None:
     routes = _routes(
         _pyproject(f"    {CERTIFI}"),
-        head,
+        _pyproject(WAIVER, f"    {CERTIFI}"),
         labels=LABEL,
         timeline=[_labeled("reviewer")],
-        reviews=[_review("reviewer", sha="approved")],
     )
-    routes[f"repos/{REPO}/contents/pyproject.toml?ref=approved"] = _encoded(head)
     decision = _evaluate(approval, routes, expected_head="head")
     assert decision.approved, decision.reason
-    assert "approved by maintainer @reviewer at approved" in decision.reason
+    assert "approved by maintainer @reviewer" in decision.reason
 
 
 def test_evaluate_fails_when_the_head_moved_since_the_event(approval) -> None:
