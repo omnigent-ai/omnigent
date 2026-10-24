@@ -36,6 +36,14 @@ describe("shellCommandStarts", () => {
       [true, false, true, true],
     ],
     ["keywords used as arguments", "echo if for done\nls", [true, true]],
+    ["a shift in arithmetic expansion", "echo $((1<<2))\nls\npwd", [true, true, true]],
+    ["a shift in an arithmetic command", "(( x <<= 1 ))\nls", [true, true]],
+    ["nested parentheses in arithmetic", "echo $(( (1 << 2) * 3 ))\nls", [true, true]],
+    [
+      "an arithmetic for loop",
+      "for ((i = 0; i << 2; i++)); do\n  echo $i\ndone\nls",
+      [true, false, false, true],
+    ],
   ])("splits %s", (_label, script, expected) => {
     expect(shellCommandStarts(script)).toEqual(expected);
   });

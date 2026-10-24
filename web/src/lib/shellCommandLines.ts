@@ -3,11 +3,11 @@
 // tracks quotes, heredocs, blocks and line continuations, not a full parser.
 
 type Quote = "'" | '"' | "`" | "$'";
-type Construct = "paren" | "case" | "block";
+type Construct = "paren" | "arith" | "case" | "block";
 
 interface ScanState {
   quote: Quote | null;
-  /** Open `(`, `case` and `if`/`for`/`while`/`{` constructs. */
+  /** Open `(`, `((`, `case` and `if`/`for`/`while`/`{` constructs. */
   stack: Construct[];
   /** Heredocs whose bodies start on the next line, in order. */
   heredocs: { delimiter: string; stripTabs: boolean }[];
@@ -131,10 +131,11 @@ function scanLine(line: string, state: ScanState): void {
     } else if (char === "$" && line[index + 1] === "(") {
       plain = false;
       finishWord();
-      state.stack.push("paren");
+      const arithmetic = line[index + 2] === "(";
+      state.stack.push(arithmetic ? "arith" : "paren");
       state.commandPosition = true;
       lastToken = "(";
-      index += 2;
+      index += arithmetic ? 3 : 2;
     } else if (!";&|()<>".includes(char)) {
       word = (word ?? "") + char;
       index += 1;
@@ -144,14 +145,19 @@ function scanLine(line: string, state: ScanState): void {
       finishWord();
       lastToken = operator;
       index += operator.length;
-      if (operator === "<<" || operator === "<<-") {
+      // In arithmetic (`$((...))`, `((...))`) `<<` is a shift, not a heredoc.
+      if ((operator === "<<" || operator === "<<-") && !state.stack.includes("arith")) {
         index = readHeredocDelimiter(line, index, operator === "<<-", state);
       } else if (operator === "(") {
-        state.stack.push("paren");
+        const arithmetic = line[index] === "(";
+        state.stack.push(arithmetic ? "arith" : "paren");
+        if (arithmetic) index += 1;
         state.commandPosition = true;
       } else if (operator === ")") {
-        // Inside `case`, `pattern)` closes nothing.
-        if (state.stack.at(-1) === "paren") state.stack.pop();
+        const open = state.stack.at(-1);
+        // `))` closes arithmetic; inside `case`, `pattern)` closes nothing.
+        if (open === "arith" && line[index] === ")") index += 1;
+        if (open === "arith" || open === "paren") state.stack.pop();
         state.commandPosition = true;
       } else if (!/^(?:[<>]|&>)/.test(operator)) {
         state.commandPosition = true;
