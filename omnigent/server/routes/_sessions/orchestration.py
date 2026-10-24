@@ -119,6 +119,7 @@ from omnigent.runtime.policies.approval import (
 from omnigent.runtime.policies.builder import (
     _sum_subtree_usage,
     ancestor_ids_from_tree,
+    any_policies_apply,
     load_session_tree,
     load_session_usage,
 )
@@ -12275,6 +12276,7 @@ async def _handle_mcp_tools_call(
     request: Request | None = None,
     execute_tool: Callable[[dict[str, Any]], Awaitable[dict[str, Any]]] | None = None,
     credential_user: str | None = None,
+    conversation: Conversation | None = None,
 ) -> Response:
     """
     Handle a ``tools/call`` JSON-RPC request for the MCP proxy endpoint.
@@ -12315,6 +12317,8 @@ async def _handle_mcp_tools_call(
         authenticated caller for direct calls, or ``None`` when unknown.
     :param credential_user: Authenticated caller whose registry grant is used;
         independent of the initiating policy actor.
+    :param conversation: The session row the caller already loaded for this
+        request, reused instead of read again; ``None`` reads it here.
     :returns: A JSON-RPC 2.0 response carrying the tool result as MCP
         ``content`` blocks, an ``InputRequiredResult`` on ASK, or an
         error response when the call is denied, the runner is
@@ -12359,7 +12363,11 @@ async def _handle_mcp_tools_call(
     # bundle fetch + spec parse — are blocking IO. Run them off the event
     # loop so an MCP tool call doesn't stall the single-worker server and
     # serialize concurrent requests behind it.
-    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    conv = (
+        conversation
+        if conversation is not None and conversation.id == session_id
+        else await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    )
     if conv is None or conv.agent_id is None:
         return _mcp_error_response(
             rpc_id, -32000, f"Session not found or has no agent: {session_id!r}"
@@ -12368,6 +12376,39 @@ async def _handle_mcp_tools_call(
     spec = await asyncio.to_thread(_load_agent_spec_for_session, conv, agent_store)
     if spec is None:
         return _mcp_error_response(rpc_id, -32000, f"Agent not found: {conv.agent_id!r}")
+    session_conv: Conversation = conv
+    session_spec: AgentSpec = spec
+
+    # Whether a TOOL_CALL engine was built, which can take a while: runner
+    # routing then re-reads the session instead of trusting the early row.
+    tool_call_engine_built = False
+
+    async def _evaluate_phase(
+        ctx: EvaluationContext,
+    ) -> tuple[PolicyEngine | None, PolicyResult]:
+        # Skip the TOOL_CALL engine build (and its reads) when no policy can
+        # fire, as ``/policies/evaluate`` does. This request's access check
+        # just read the session. TOOL_RESULT always builds: its fresh read is
+        # what rejects a session deleted or rebound while the tool ran.
+        nonlocal tool_call_engine_built
+        caps = get_caps()
+        if ctx.phase == Phase.TOOL_CALL and not await asyncio.to_thread(
+            lambda: any_policies_apply(
+                spec=session_spec,
+                conversation_id=session_id,
+                default_policies=caps.default_policies,
+                policy_store=get_policy_store(),
+                phase=ctx.phase,
+                tool_name=ctx.tool_name,
+                conversation=session_conv,
+            )
+        ):
+            return None, PolicyResult(action=PolicyAction.ALLOW, reason=None)
+        if ctx.phase == Phase.TOOL_CALL:
+            tool_call_engine_built = True
+        return await _evaluate_policy_with_fresh_engine(
+            session_id, session_spec, conversation_store, session_conv, ctx
+        )
 
     if is_retry:
         # ── Retry path: user has responded to the elicitation ────────
@@ -12389,9 +12430,7 @@ async def _handle_mcp_tools_call(
             tool_name=namespaced_name,
             actor=actor,
         )
-        engine, retry_result = await _evaluate_policy_with_fresh_engine(
-            session_id, spec, conversation_store, conv, retry_ctx
-        )
+        engine, retry_result = await _evaluate_phase(retry_ctx)
 
         _logger.debug(
             "MCP tools/call retry TOOL_CALL policy: session=%r tool=%r action=%r reason=%r",
@@ -12443,8 +12482,9 @@ async def _handle_mcp_tools_call(
             elif retry_result.data is not None:
                 arguments = cast("dict[str, object]", retry_result.data)
             # Apply the deciding policy's deferred writes now that the user
-            # approved (POLICIES.md §7.2: only on accept).
-            if _pending is not None:
+            # approved (POLICIES.md §7.2: only on accept). An ASK verdict
+            # always comes from a built engine.
+            if _pending is not None and engine is not None:
                 if _pending.set_labels:
                     await asyncio.to_thread(engine.apply_label_writes, _pending.set_labels)
                 if _pending.state_updates:
@@ -12465,9 +12505,7 @@ async def _handle_mcp_tools_call(
             tool_name=namespaced_name,
             actor=actor,
         )
-        engine, call_result = await _evaluate_policy_with_fresh_engine(
-            session_id, spec, conversation_store, conv, call_ctx
-        )
+        engine, call_result = await _evaluate_phase(call_ctx)
 
         _logger.debug(
             "MCP tools/call TOOL_CALL policy: session=%r tool=%r action=%r reason=%r",
@@ -12479,7 +12517,7 @@ async def _handle_mcp_tools_call(
         )
 
         if call_result.action == PolicyAction.DENY:
-            if call_result.set_labels:
+            if engine is not None and call_result.set_labels:
                 await asyncio.to_thread(engine.apply_label_writes, call_result.set_labels)
             return _mcp_error_response(
                 rpc_id,
@@ -12525,7 +12563,7 @@ async def _handle_mcp_tools_call(
                 session_id=session_id,
             )
         # ALLOW — apply labels now that we know the action is not ASK.
-        if call_result.set_labels:
+        if engine is not None and call_result.set_labels:
             await asyncio.to_thread(engine.apply_label_writes, call_result.set_labels)
         # If the policy returned transformed arguments (e.g.
         # PII-redacted args), use them instead of the originals.
@@ -12576,7 +12614,16 @@ async def _handle_mcp_tools_call(
         # The runner owns stdio subprocess spawning (correct machine, cwd,
         # and env). We call its /mcp/execute endpoint through the same WS
         # tunnel the runner already opened to the Omnigent server at startup.
-        runner_client = await _get_runner_client(session_id, runner_router)
+        routing_conv = (
+            await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if tool_call_engine_built
+            else conv
+        )
+        if routing_conv is None:
+            return _mcp_error_response(rpc_id, -32000, f"Session not found: {session_id!r}")
+        runner_client = await _get_runner_client(
+            session_id, runner_router, conversation=routing_conv
+        )
         if runner_client is None:
             from omnigent.runtime import get_runner_client
 
@@ -12721,11 +12768,13 @@ async def _handle_mcp_tools_call(
         request_data={"name": namespaced_name, "arguments": arguments},
         actor=actor,
     )
-    engine, result_policy = await _evaluate_policy_with_fresh_engine(
-        session_id, spec, conversation_store, conv, result_ctx
-    )
+    engine, result_policy = await _evaluate_phase(result_ctx)
 
-    if result_policy.set_labels and result_policy.action != PolicyAction.ASK:
+    if (
+        engine is not None
+        and result_policy.set_labels
+        and result_policy.action != PolicyAction.ASK
+    ):
         await asyncio.to_thread(engine.apply_label_writes, result_policy.set_labels)
 
     _logger.debug(

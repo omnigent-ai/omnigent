@@ -108,6 +108,7 @@ async def test_registry_tools_are_attached_discovered_and_executed_on_server(
     # A normal call must still stop at the existing policy gate.
     from omnigent.policies.types import PolicyResult
     from omnigent.server.routes import sessions as sessions_mod
+    from omnigent.server.routes._sessions import orchestration
     from omnigent.spec.types import PolicyAction
     from tests.server.routes.test_sessions_mcp_proxy_policy_retry import (
         _engine_factory_expecting_preload,
@@ -118,6 +119,8 @@ async def test_registry_tools_are_attached_discovered_and_executed_on_server(
     monkeypatch.setattr(
         sessions_mod, "_build_policy_engine_from_spec", _engine_factory_expecting_preload(engine)
     )
+    # The stub engine stands in for a session that has policies.
+    monkeypatch.setattr(orchestration, "any_policies_apply", lambda **_: True)
     execute.reset_mock()
     denied = await client.post(
         f"/v1/sessions/{session_id}/mcp",

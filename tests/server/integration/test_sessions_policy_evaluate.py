@@ -1477,7 +1477,13 @@ async def auth_client(auth_app: FastAPI, mock_llm: Any, tmp_path: Path):
     await pm.shutdown()
 
 
-async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: str) -> str:
+async def _seed_authenticated_session(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    *,
+    with_policy: bool = True,
+    policy_function: str = "omnigent.policies.builtins.safety.ask_on_os_tools",
+) -> str:
     """Create a real agent-bound session and grant it to the test user.
 
     Uses the real create path (a genuine uploaded bundle) so the agent
@@ -1506,15 +1512,19 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
                 # preload path at all (it silently didn't, first time round).
                 build_agent_bundle(
                     name="budget-agent",
-                    guardrails={
-                        "policies": {
-                            "allow_all": {
-                                "type": "function",
-                                "on": ["tool_call"],
-                                "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
+                    guardrails=(
+                        {
+                            "policies": {
+                                "allow_all": {
+                                    "type": "function",
+                                    "on": ["tool_call"],
+                                    "function": policy_function,
+                                }
                             }
                         }
-                    },
+                        if with_policy
+                        else None
+                    ),
                 ),
                 "application/gzip",
             )
@@ -1603,3 +1613,105 @@ async def test_authenticated_evaluate_route_sql_budget(
     assert len(statements) == _EVALUATE_ROUTE_SQL_BUDGET, [
         s.split("\n")[0][:80] for s in statements
     ]
+
+
+def _count_statements(db_uri: str) -> tuple[list[str], list[str], Any]:
+    """Start recording executed SQL; returns (all, on-loop, detach callback)."""
+    import threading
+
+    from sqlalchemy import event as sa_event
+
+    from omnigent.db.utils import _engine_cache
+
+    engine = _engine_cache[db_uri]
+    statements: list[str] = []
+    on_loop: list[str] = []
+    loop_thread = threading.current_thread()
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        if statement.lstrip().upper().startswith("PRAGMA"):
+            return
+        statements.append(statement)
+        if threading.current_thread() is loop_thread:
+            on_loop.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", _on_exec)
+    return statements, on_loop, lambda: sa_event.remove(engine, "before_cursor_execute", _on_exec)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("with_policy", [False, True])
+async def test_authenticated_mcp_tools_call_sql_budget(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    with_policy: bool,
+) -> None:
+    """
+    Pin the SQL issued by ``POST /mcp`` tools/call before the runner hop.
+
+    No runner is bound, so the call stops right after TOOL_CALL. With no
+    policy the TOOL_CALL engine build is skipped, and the conversation the
+    access check read is reused for the actor, the handler and runner
+    routing, so nothing runs on the event loop.
+    """
+    session_id = await _seed_authenticated_session(auth_client, db_uri, with_policy=with_policy)
+    headers = {"X-Forwarded-Email": _EVALUATE_USER}
+    body = {
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": "tools/call",
+        "params": {"name": "echo__echo", "arguments": {"message": "x"}},
+    }
+    await auth_client.post(f"/v1/sessions/{session_id}/mcp", json=body, headers=headers)
+
+    statements, on_loop, detach = _count_statements(db_uri)
+    try:
+        resp = await auth_client.post(f"/v1/sessions/{session_id}/mcp", json=body, headers=headers)
+    finally:
+        detach()
+
+    assert resp.status_code == 200, resp.text
+    assert "No runner bound" in resp.json()["error"]["message"]
+    summary = [st.split("\n")[0][:80] for st in statements]
+    # The access check's conversation read (3) plus the agent row and its
+    # session lookup. A policy adds the engine build (3) and a fresh read for
+    # runner routing after it (3). Before the reuse this was 19 either way,
+    # 3 of them on the event loop.
+    assert len(statements) == (11 if with_policy else 5), summary
+    assert on_loop == [], summary
+
+
+@pytest.mark.asyncio
+async def test_mcp_tools_call_enforces_bundle_policy_without_stubs(
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A real agent guardrail still denies through ``/mcp`` with the no-policy skip in place."""
+    from omnigent.policies import registry
+
+    deny_handler = f"{__name__}._deny_bash_tool"
+    # Uploaded bundles may only use registered handlers; an operator would add
+    # this one through ``policy_modules``.
+    is_registered = registry.is_registered_handler
+    monkeypatch.setattr(
+        registry,
+        "is_registered_handler",
+        lambda handler: handler == deny_handler or is_registered(handler),
+    )
+    session_id = await _seed_authenticated_session(
+        auth_client, db_uri, policy_function=deny_handler
+    )
+    resp = await auth_client.post(
+        f"/v1/sessions/{session_id}/mcp",
+        json={
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": "Bash", "arguments": {"command": "ls"}},
+        },
+        headers={"X-Forwarded-Email": _EVALUATE_USER},
+    )
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["error"]["message"] == "Denied by policy: Bash is blocked by admin policy."
