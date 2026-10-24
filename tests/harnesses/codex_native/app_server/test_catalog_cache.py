@@ -377,6 +377,57 @@ def test_mark_launch_default_prefers_omnigent_default_over_codex_default() -> No
     ]
 
 
+@pytest.mark.parametrize(
+    ("config", "file_profile", "expected"),
+    [
+        pytest.param('model = "gpt-6.1-sol"\n', None, "gpt-6.1-sol", id="top-level"),
+        pytest.param(
+            'model = "gpt-5.4"\nprofile = "work"\n[profiles.work]\nmodel = "gpt-6.1-sol"\n',
+            None,
+            "gpt-6.1-sol",
+            id="inline-profile",
+        ),
+        pytest.param(
+            'model = "gpt-5.4"\nprofile = "work"\n[profiles.work]\nmodel = "gpt-5.5"\n',
+            'model = "gpt-6.1-sol"\n',
+            "gpt-5.5",
+            id="root-profile-ignores-file-profile",
+        ),
+        pytest.param(
+            'model = "gpt-6.1-sol"\nprofile = "work"\n[profiles.work]\nmodel_provider = "x"\n',
+            None,
+            "gpt-6.1-sol",
+            id="profile-without-model",
+        ),
+        pytest.param("", None, None, id="nothing-configured"),
+        pytest.param(None, None, None, id="no-config"),
+        pytest.param('model = "unterminated\n', None, None, id="unreadable-config"),
+    ],
+)
+def test_codex_configured_launch_model_follows_the_active_profile(
+    config: str | None,
+    file_profile: str | None,
+    expected: str | None,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The root ``profile``'s inline ``model`` wins, else the top-level one.
+
+    A ``<name>.config.toml`` file profile only applies to an explicit ``--profile``.
+    """
+    from omnigent.harnesses.codex_native import app_server
+
+    source = tmp_path / "codex-home"
+    source.mkdir()
+    if config is not None:
+        (source / "config.toml").write_text(config)
+    if file_profile is not None:
+        (source / "work.config.toml").write_text(file_profile)
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source)
+
+    assert app_server.codex_configured_launch_model() == expected
+
+
 @pytest.mark.parametrize("reprobe", [False, True])
 async def test_codex_launch_catalog_unresolvable_launch_returns_none(
     monkeypatch: pytest.MonkeyPatch, reprobe: bool
