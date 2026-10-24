@@ -8687,6 +8687,7 @@ async def _auto_create_claude_terminal(
     from omnigent.harnesses.claude_native.bridge import (
         BRIDGE_ID_LABEL_KEY,
         augment_claude_args,
+        drop_startup_fatal_claude_args,
         ensure_claude_workspace_trusted,
         prepare_bridge_dir,
         validate_claude_hook_interpreter_compatibility,
@@ -8832,6 +8833,10 @@ async def _auto_create_claude_terminal(
     session_effort = launch_metadata.reasoning_effort
     session_model_override = launch_metadata.model_override
     session_launch_args = launch_metadata.terminal_launch_args
+    if session_launch_args:
+        session_launch_args = drop_startup_fatal_claude_args(
+            session_launch_args, workspace=Path(workspace)
+        )
     session_external_id = launch_metadata.external_session_id
     fork_source_external_id = launch_metadata.fork_source_external_id
     fork_carry_history = launch_metadata.fork_carry_history

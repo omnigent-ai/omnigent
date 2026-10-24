@@ -3086,6 +3086,97 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_drops_stored_args_claude_cannot_start_with(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Stored print mode and deleted MCP config files never reach the launch.
+
+    Either one makes Claude exit at startup, and the session replays its stored
+    launch args on every relaunch, so it could never start again.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(workspace))
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    stored_args = ["--print", "--mcp-config", str(tmp_path / "gone.json"), "--model", "opus"]
+
+    async def _ignore_forwarder(**kwargs: Any) -> None:
+        """Skip the forwarder; this test only inspects the launch."""
+        del kwargs
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _ignore_forwarder,
+    )
+
+    class _SnapshotServerClient(NullServerClient):
+        """Server client whose session snapshot carries the stored launch args."""
+
+        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+            """Return the session snapshot, or empty labels."""
+            del kwargs
+            payload: dict[str, Any] = (
+                {"labels": {}}
+                if url.endswith("/labels")
+                else {"terminal_launch_args": stored_args}
+            )
+
+            class _Response(NullServerClient._Response):
+                """Canned JSON response."""
+
+                def json(self) -> dict[str, Any]:
+                    """Return the canned payload."""
+                    return payload
+
+            return _Response()
+
+    launched_args: list[str] = []
+
+    class _FakeResourceRegistry:
+        """Resource registry that records the launch without spawning a TTY."""
+
+        terminal_registry = None
+
+        async def launch_required_terminal(
+            self,
+            *,
+            session_id: str,
+            terminal_name: str,
+            session_key: str,
+            spec: Any,
+            resource_role: str | None = None,
+            parent_os_env: Any = None,
+        ) -> SessionResourceView:
+            """Return a terminal resource view without spawning a TTY."""
+            del terminal_name, session_key, resource_role, parent_os_env
+            launched_args.extend(spec.args)
+            return SessionResourceView(
+                id="terminal_claude_main",
+                type="terminal",
+                session_id=session_id,
+                name="claude:main",
+                metadata={"terminal_name": "claude", "session_key": "main", "running": True},
+            )
+
+    await _auto_create_claude_terminal(
+        "5cdbea97a2fb0c659bc09605401e2bb2",
+        _FakeResourceRegistry(),
+        lambda _sid, _evt: None,
+        server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+    )
+
+    assert "--print" not in launched_args
+    assert str(tmp_path / "gone.json") not in launched_args
+    model_index = launched_args.index("--model")
+    assert launched_args[model_index + 1] == "opus"
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source_transcript", ["missing", "unreadable", "available"])
 async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
     source_transcript: str,
