@@ -92,4 +92,20 @@ describe("oneLineShellCommand", () => {
   it("keeps a comment-only script", () => {
     expect(oneLineShellCommand("# nothing to run\n")).toBe("# nothing to run");
   });
+
+  it("drops trailing comments so they cannot swallow the next command", () => {
+    expect(oneLineShellCommand("git status # see what changed\nls")).toBe("git status; ls");
+  });
+
+  it.each([
+    ["an if block", "if [ -f x ]; then\n  rm x\nfi\nls", "if [ -f x ]; then rm x; fi; ls"],
+    ["a for loop", "for f in *.py\ndo\n  echo $f\ndone", "for f in *.py; do echo $f; done"],
+    ["a case statement", "case $x in\n  a) echo a ;;\nesac", "case $x in a) echo a ;; esac"],
+    ["a brace group", "{\n  echo a\n} > out", "{ echo a; } > out"],
+    ["a comment inside a block", "if x; then\n  # why\n  rm x\nfi", "if x; then rm x; fi"],
+    ["a heredoc", "cat > f <<'EOF'\nhello\nEOF\nls", "cat > f <<'EOF' hello EOF; ls"],
+    ["a heredoc before &&", "cat <<EOF &&\nhi\nEOF\n  ls", "cat <<EOF && hi EOF ls"],
+  ])("ends each command inside %s", (_label, script, expected) => {
+    expect(oneLineShellCommand(script)).toBe(expected);
+  });
 });
