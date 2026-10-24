@@ -23,6 +23,7 @@ class Feature(StrEnum):
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
+    WEBFONTS = "webfonts"
     ARCA_SHUTDOWN_WARNINGS = "arca_shutdown_warnings"
     IMPORT_REVIEW = "import_review"
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
@@ -84,6 +85,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Web Canvas page: sessions as draggable cards grouped by project",
         owner="web",
         review_by_release="0.15.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.WEBFONTS,
+        description="Downloadable web font catalogs in Settings",
+        owner="web",
+        review_by_release="0.20.0",
     ),
     FeatureDefinition(
         feature=Feature.ARCA_SHUTDOWN_WARNINGS,
