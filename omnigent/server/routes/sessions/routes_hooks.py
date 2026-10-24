@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
-from typing import Any, NamedTuple
+from typing import TYPE_CHECKING, Any, NamedTuple
 
 from fastapi import (
     APIRouter,
@@ -105,6 +105,9 @@ from omnigent.spec.types import (
 )
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
+
+if TYPE_CHECKING:
+    import httpx
 
 #: Policy-name vendor for a native agent key, where the two differ. Mirrors
 #: ``POLICY_NAME_VENDORS`` in ``web/src/lib/nativeCodingAgents.ts``, which resolves
@@ -1651,30 +1654,35 @@ def register_hooks_routes(
             media_type="application/json",
         )
 
-    async def _route_subagent_catalog(session_id: str) -> dict[str, list[str]] | None:
+    async def _route_subagent_catalog(
+        session_id: str,
+    ) -> tuple[dict[str, list[str]] | None, httpx.AsyncClient | None]:
         """
         Fetch the session's live model catalog for subagent routing.
 
         :param session_id: Parent session/conversation id.
-        :returns: Worker → servable model ids, or ``None`` when the runner
-            is unreachable (callers fall back to the static table).
+        :returns: ``(catalog, runner_client)``. The catalog maps worker →
+            servable model ids, or is ``None`` when the runner is unreachable
+            (callers fall back to the static table); the client is kept so a
+            host judge can be answered by the same runner.
         """
         from omnigent.server.smart_routing import fetch_runner_models
 
+        runner_client = None
         try:
             runner_client = await _get_runner_client(
                 session_id, runner_router or get_server_runner_router()
             )
             if runner_client is None:
-                return None
-            return await fetch_runner_models(session_id, runner_client)
+                return None, None
+            return await fetch_runner_models(session_id, runner_client), runner_client
         except Exception:
             _logger.debug(
                 "route-subagent: live catalog unavailable for session=%s",
                 session_id,
                 exc_info=True,
             )
-            return None
+            return None, runner_client
 
     @router.post(
         "/sessions/{session_id}/hooks/route-subagent",
@@ -1720,7 +1728,7 @@ def register_hooks_routes(
             store_persister,
             subagent_routing_enabled,
         )
-        from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES
+        from omnigent.server.smart_routing import AUTO_NATIVE_ROUTING_HARNESSES, judge_runner
 
         user_id = _get_user_id(request, auth_provider)
         # LEVEL_EDIT, like POST /events: a routed verdict mutates the session
@@ -1794,17 +1802,18 @@ def register_hooks_routes(
         # Offer the live catalog: the static table lags model generations, and
         # a pick the workspace serves must not look unservable and get
         # substituted down a tier.
-        catalog = await _route_subagent_catalog(session_id)
-        decision = await resolve_subagent_route(
-            session_id,
-            route_request,
-            caps=get_caps(),
-            catalog=catalog,
-            cross_harness=cross_harness,
-            gateway_backed=gateway_backed,
-            allow_static_fallback=gateway_backed,
-            persist=store_persister(session_id, conversation_store),
-        )
+        catalog, runner_client = await _route_subagent_catalog(session_id)
+        with judge_runner(session_id, runner_client):
+            decision = await resolve_subagent_route(
+                session_id,
+                route_request,
+                caps=get_caps(),
+                catalog=catalog,
+                cross_harness=cross_harness,
+                gateway_backed=gateway_backed,
+                allow_static_fallback=gateway_backed,
+                persist=store_persister(session_id, conversation_store),
+            )
         return Response(
             content=json.dumps(decision.to_payload()),
             media_type="application/json",

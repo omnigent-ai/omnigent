@@ -413,6 +413,10 @@ def _build_routing_backends(
 
     * ``external`` — call an external ``routes:select`` service.
     * ``none`` — opt out of routing entirely; neither backend.
+    * ``host`` — no external side; the built-in judge runs on each session's
+      HOST, on the harness CLI login already there (Claude Code or Codex, on
+      its economy model), so the server needs no ``llm:`` block or API key for
+      routing. ``llm:`` still configures LLM-backed policies.
     * anything else — no external side, the built-in judge only.
 
     With no ``routing:`` block at all, a Databricks-backed deployment gets its
@@ -430,6 +434,10 @@ def _build_routing_backends(
     provider = routing_cfg.get("provider") if isinstance(routing_cfg, dict) else None
     if provider == "none":
         return RoutingBackends()
+    if provider == "host":
+        from omnigent.server.smart_routing import HostRoutingClient
+
+        return RoutingBackends(local=HostRoutingClient())
     external: Any = None  # type: ignore[explicit-any]
     if provider == "external":
         external = _build_external_routing_client(routing_cfg, settings, cfg)

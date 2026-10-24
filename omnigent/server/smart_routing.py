@@ -13,6 +13,8 @@ swap in a different implementation via ``RuntimeCaps``.
 from __future__ import annotations
 
 import asyncio
+import contextlib
+import contextvars
 import json
 import logging
 import time
@@ -35,7 +37,7 @@ from omnigent.models.model_fallbacks import (
 from omnigent.models.model_metadata import ModelCostTier, ModelIntent, ModelWireAPI
 
 if TYPE_CHECKING:
-    from collections.abc import Callable, Iterable, Mapping, Sequence
+    from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 
     import httpx  # used in type annotations only; runtime import is lazy in fetch_runner_models
     from databricks.sdk.config import Config
@@ -553,6 +555,64 @@ _VERDICT_SCHEMA: dict[str, object] = {
 }
 
 
+def _result_from_verdict(
+    verdict: Any,  # type: ignore[explicit-any]  # parsed judge JSON
+    available_models: dict[str, list[str]],
+) -> tuple[RoutingResult | None, str | None]:
+    """Turn a judge's parsed verdict into a :class:`RoutingResult`.
+
+    Shared by every client that asks an LLM the :func:`_build_rubric` question,
+    so a hallucinated model or harness is clamped the same way wherever the
+    judge runs.
+
+    :param verdict: The judge's JSON object.
+    :param available_models: The harness → models map the judge was offered.
+    :returns: ``(result, None)``, or ``(None, reason)`` when nothing usable came back.
+    """
+    if not isinstance(verdict, dict):
+        return None, "routing judge returned no model"
+    flat = _flatten_models(available_models)
+    model = verdict.get("model")
+    rationale = verdict.get("rationale", "")
+    if not model or not isinstance(model, str):
+        return None, "routing judge returned no model"
+
+    # Clamp hallucinated models to the cheapest available.
+    if model not in flat:
+        if flat:
+            _logger.info(
+                "routing judge: clamping unknown model %r to %s",
+                model,
+                flat[0],
+            )
+            model = flat[0]
+        else:
+            return None, "no candidate models were available"
+
+    # Resolve the harness: use the judge's pick only when it is both a
+    # known harness key AND actually contains the chosen model.  If
+    # either check fails, fall back to the first harness that owns the
+    # (possibly clamped) model.
+    chosen_harness = verdict.get("harness")
+    if (
+        not isinstance(chosen_harness, str)
+        or chosen_harness not in available_models
+        or model not in available_models[chosen_harness]
+    ):
+        if isinstance(chosen_harness, str) and chosen_harness in available_models:
+            _logger.info(
+                "routing judge: harness %r does not contain model %r; re-resolving",
+                chosen_harness,
+                model,
+            )
+        chosen_harness = next(
+            (h for h, models in available_models.items() if model in models),
+            None,
+        )
+
+    return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness), None
+
+
 class LLMRoutingClient:
     """Default routing client using the server-level PolicyLLMClient.
 
@@ -576,7 +636,6 @@ class LLMRoutingClient:
     ) -> RoutingResult | None:
         import asyncio
 
-        flat = _flatten_models(available_models)
         rubric = _build_rubric(available_models)
         _logger.info(
             "LLMRoutingClient: available_models=%s prompt_chars=%d",
@@ -619,47 +678,116 @@ class LLMRoutingClient:
             self.last_error = f"routing judge call failed: {failure_detail(exc)}"
             return None
 
-        model = verdict.get("model")
-        rationale = verdict.get("rationale", "")
-        if not model or not isinstance(model, str):
-            self.last_error = "routing judge returned no model"
+        result, self.last_error = _result_from_verdict(verdict, available_models)
+        return result
+
+
+#: The session whose runner answers a :class:`HostRoutingClient` call, set by
+#: the routing entry points that hold that runner (see :func:`judge_runner`).
+_JUDGE_RUNNER: contextvars.ContextVar[tuple[str, httpx.AsyncClient] | None] = (
+    contextvars.ContextVar("smart_routing_judge_runner", default=None)
+)
+
+
+@contextlib.contextmanager
+def judge_runner(
+    session_id: str | None, runner_client: httpx.AsyncClient | None
+) -> Iterator[None]:
+    """Make *session_id*'s runner the host judge for routing calls in this block.
+
+    A no-op when either is missing: the host judge then declines with a reason
+    and the prompt runs unrouted, like any other routing failure.
+
+    :param session_id: The session whose host should answer, e.g. ``"conv_ab12"``.
+    :param runner_client: HTTP client pointed at that session's runner.
+    """
+    if not session_id or runner_client is None:
+        yield
+        return
+    token = _JUDGE_RUNNER.set((session_id, runner_client))
+    try:
+        yield
+    finally:
+        _JUDGE_RUNNER.reset(token)
+
+
+def _verdict_json(text: str) -> Any:  # type: ignore[explicit-any]  # parsed judge JSON
+    """Parse a CLI judge's reply, tolerating a markdown fence around the object."""
+    start, end = text.find("{"), text.rfind("}")
+    if start < 0 or end < start:
+        raise ValueError("judge reply carried no JSON object")
+    return json.loads(text[start : end + 1])
+
+
+#: Why the host judge declines a create: no runner exists yet to run the CLI.
+#: Not a failure, so the create path shows no "unavailable" card for it; the
+#: first-turn hook routes the same prompt once the runner is up.
+HOST_JUDGE_DEFERRED = "the host judge routes the first turn once the runner is up"
+
+
+class HostRoutingClient:
+    """Built-in judge answered by the session's HOST, on its own CLI login.
+
+    The same rubric as :class:`LLMRoutingClient`, but the server needs no
+    ``llm:`` block or API key: the runner asks its own logged-in harness CLI
+    (Claude Code for a claude session, Codex for a codex one, each on its
+    economy model) through ``POST /v1/sessions/{id}/routing-judge``. Host
+    credentials never leave the host; only the verdict text comes back.
+
+    Needs a live runner, so it serves routing calls made inside
+    :func:`judge_runner` (the first-turn hook, subagent spawns, turns on a
+    running session) and declines elsewhere, e.g. a create routed before its
+    runner exists. Every failure fails open within
+    :data:`ROUTING_REQUEST_TIMEOUT_S`.
+    """
+
+    def __init__(self) -> None:
+        # Reason the most recent route() returned None; see RoutingClient.
+        self.last_error: str | None = None
+
+    async def route(
+        self,
+        message: str,
+        available_models: dict[str, list[str]],
+    ) -> RoutingResult | None:
+        self.last_error = None
+        bound = _JUDGE_RUNNER.get()
+        if bound is None:
+            # A create routes before its runner exists; the first-turn hook
+            # routes the same prompt once the runner is up.
+            self.last_error = HOST_JUDGE_DEFERRED
+            return None
+        session_id, runner_client = bound
+        try:
+            # ``wait_for`` covers connection setup and the tunnel hop, which
+            # the per-request timeout alone does not bound.
+            response = await asyncio.wait_for(
+                runner_client.post(
+                    f"/v1/sessions/{session_id}/routing-judge",
+                    json={
+                        "message": message[:4000],
+                        "instructions": _build_rubric(available_models),
+                        "timeout_s": ROUTING_REQUEST_TIMEOUT_S,
+                    },
+                    timeout=ROUTING_REQUEST_TIMEOUT_S,
+                ),
+                timeout=ROUTING_REQUEST_TIMEOUT_S,
+            )
+            response.raise_for_status()
+            payload = response.json()
+            if payload.get("status") != "judged":
+                self.last_error = "this session's harness has no host judge"
+                return None
+            text = str(payload.get("text") or "")
+            _logger.debug("HostRoutingClient: raw response: %s", text[:500])
+            verdict = _verdict_json(text)
+        except Exception as exc:  # noqa: BLE001  # fail-open
+            _logger.warning("HostRoutingClient: host judge call failed", exc_info=True)
+            self.last_error = f"host routing judge failed: {failure_detail(exc)}"
             return None
 
-        # Clamp hallucinated models to the cheapest available.
-        if model not in flat:
-            if flat:
-                _logger.info(
-                    "LLMRoutingClient: clamping unknown model %r to %s",
-                    model,
-                    flat[0],
-                )
-                model = flat[0]
-            else:
-                self.last_error = "no candidate models were available"
-                return None
-
-        # Resolve the harness: use the judge's pick only when it is both a
-        # known harness key AND actually contains the chosen model.  If
-        # either check fails, fall back to the first harness that owns the
-        # (possibly clamped) model.
-        chosen_harness = verdict.get("harness")
-        if (
-            not isinstance(chosen_harness, str)
-            or chosen_harness not in available_models
-            or model not in available_models[chosen_harness]
-        ):
-            if isinstance(chosen_harness, str) and chosen_harness in available_models:
-                _logger.info(
-                    "LLMRoutingClient: harness %r does not contain model %r; re-resolving",
-                    chosen_harness,
-                    model,
-                )
-            chosen_harness = next(
-                (h for h, models in available_models.items() if model in models),
-                None,
-            )
-
-        return RoutingResult(model=model, rationale=str(rationale), harness=chosen_harness)
+        result, self.last_error = _result_from_verdict(verdict, available_models)
+        return result
 
 
 def _bearer_auth(token: str) -> httpx.Auth:
@@ -2153,9 +2281,10 @@ async def route_session_harness(
         return None, None, None, "No routable harnesses are available on this runner."
 
     try:
-        call = await route_with_fallback(
-            backends, user_message, harness_models, gateway_backed=gateway_backed
-        )
+        with judge_runner(_catalog_sid, runner_client):
+            call = await route_with_fallback(
+                backends, user_message, harness_models, gateway_backed=gateway_backed
+            )
     except Exception as exc:  # routing failures must not block session creation
         _logger.exception("smart_routing: route_session_harness failed")
         return None, None, None, f"Routing call failed: {failure_detail(exc)}"
@@ -2167,6 +2296,8 @@ async def route_session_harness(
         # Surface the client's specific failure reason (e.g. HTTP 401 with the
         # gateway's message) when it exposes one; otherwise a generic note.
         detail = routing_last_error(call.client)
+        if detail == HOST_JUDGE_DEFERRED:
+            return None, None, None, HOST_JUDGE_DEFERRED
         reason = (
             f"Routing unavailable: {detail}"
             if detail
@@ -2373,9 +2504,10 @@ async def route_turn(
 
     _prep_s = time.monotonic() - _prep_started
     _route_started = time.monotonic()
-    call = await route_with_fallback(
-        backends, user_message, available, gateway_backed=gateway_backed
-    )
+    with judge_runner(session_id, runner_client):
+        call = await route_with_fallback(
+            backends, user_message, available, gateway_backed=gateway_backed
+        )
     _logger.info(
         "smart_routing: session=%s prep=%.3fs router=%.3fs catalog_fetch=%s candidates=%d",
         session_id,

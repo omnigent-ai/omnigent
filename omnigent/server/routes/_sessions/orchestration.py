@@ -11893,6 +11893,8 @@ async def _create_session_from_existing_agent(
     )
     telemetry.set_session_id(conv.id)
 
+    from omnigent.server.smart_routing import HOST_JUDGE_DEFERRED
+
     if _native_smart_routing:
         # Surface the create-time pick as a transcript card, so the user sees
         # which native harness + model was chosen (or why it fell back).
@@ -11914,7 +11916,7 @@ async def _create_session_from_existing_agent(
             conv = await _record_create_route_prompt(
                 conv, conversation_store, body.smart_routing_message
             )
-        elif _native_routing_error is not None:
+        elif _native_routing_error is not None and _native_routing_error != HOST_JUDGE_DEFERRED:
             await _emit_server_routing_decision(
                 conv.id,
                 conversation_store,
@@ -11937,7 +11939,7 @@ async def _create_session_from_existing_agent(
             await _stamp_routing_decision_label(conv.id, conversation_store, _fixed_decision_id)
             if _fixed_decision_id is not None:
                 conv.labels[ROUTING_DECISION_LABEL_KEY] = _fixed_decision_id
-        elif _fixed_routing_error is not None:
+        elif _fixed_routing_error is not None and _fixed_routing_error != HOST_JUDGE_DEFERRED:
             await _emit_server_routing_decision(
                 conv.id,
                 conversation_store,

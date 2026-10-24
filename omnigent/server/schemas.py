@@ -2643,6 +2643,23 @@ class BackgroundSessionTitleResponse(BaseModel):
     title: str | None = None
 
 
+class RoutingJudgeRequest(BaseModel):
+    """Private runner request: answer a Smart Routing rubric with the host's own CLI."""
+
+    message: str = Field(min_length=1, max_length=20_000)
+    instructions: str = Field(min_length=1, max_length=20_000)
+    timeout_s: float = Field(default=9.0, gt=0, le=60)
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class RoutingJudgeResponse(BaseModel):
+    """Private runner result: the judge's raw verdict text."""
+
+    status: Literal["judged", "unsupported"]
+    text: str | None = None
+
+
 class CodexGoalObject(BaseModel):
     """
     Current Codex goal state for a Codex-native session.
