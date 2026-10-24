@@ -223,4 +223,80 @@ describe("useComposerConfigCycleHotkeys", () => {
     unmount();
     expect(vi.getTimerCount()).toBe(0);
   });
+
+  it("defers application until the last shortcut settles and cancels on dismissal", () => {
+    vi.useFakeTimers();
+    const apply = vi.fn();
+    const cancel = vi.fn();
+    const select = vi.fn();
+    const { result, rerender } = renderHook(
+      ({ drafted }) =>
+        useComposerConfigCycleHotkeys(
+          [choice("next", { onSelect: select })],
+          [choice("high", { onSelect: select })],
+          true,
+          false,
+          drafted ? { apply, cancel } : undefined,
+        ),
+      { initialProps: { drafted: true } },
+    );
+    act(() => window.dispatchEvent(event()));
+    act(() => vi.advanceTimersByTime(1_500));
+    act(() => window.dispatchEvent(event({ code: "KeyE" })));
+    act(() => vi.advanceTimersByTime(1_999));
+    expect(apply).not.toHaveBeenCalled();
+    act(() => vi.advanceTimersByTime(1));
+    expect(apply).toHaveBeenCalledOnce();
+    expect(cancel).not.toHaveBeenCalled();
+    rerender({ drafted: false });
+    act(() => vi.advanceTimersByTime(2_000));
+    expect(apply).toHaveBeenCalledOnce();
+
+    rerender({ drafted: true });
+    act(() => window.dispatchEvent(event()));
+    act(() => result.current.dismissPreview());
+    act(() => vi.advanceTimersByTime(3_000));
+    expect(cancel).toHaveBeenCalledOnce();
+    expect(apply).toHaveBeenCalledOnce();
+    expect(result.current.preview).toBeNull();
+  });
+
+  it.each([
+    { composerFocused: true, modifier: {} },
+    { composerFocused: true, modifier: { ctrlKey: true } },
+    { composerFocused: true, modifier: { metaKey: true } },
+    { composerFocused: false, modifier: {} },
+  ])("only consumes Enter to apply from a composer (%j)", ({ composerFocused, modifier }) => {
+    const apply = vi.fn();
+    const submit = vi.fn();
+    renderHook(() =>
+      useComposerConfigCycleHotkeys(
+        [choice("next", { onSelect: vi.fn() })],
+        undefined,
+        true,
+        false,
+        { apply, cancel: vi.fn() },
+      ),
+    );
+    const composer = document.createElement("div");
+    if (composerFocused) composer.setAttribute("data-composer-card", "");
+    const input = document.createElement("textarea");
+    input.addEventListener("keydown", submit);
+    composer.appendChild(input);
+    document.body.appendChild(composer);
+    input.focus();
+    act(() => input.dispatchEvent(event()));
+    submit.mockClear();
+    const enter = event({
+      code: "Enter",
+      key: "Enter",
+      ctrlKey: false,
+      altKey: false,
+      ...modifier,
+    });
+    act(() => input.dispatchEvent(enter));
+    expect(enter.defaultPrevented).toBe(composerFocused);
+    expect(apply).toHaveBeenCalledTimes(composerFocused ? 1 : 0);
+    expect(submit).toHaveBeenCalledTimes(composerFocused ? 0 : 1);
+  });
 });

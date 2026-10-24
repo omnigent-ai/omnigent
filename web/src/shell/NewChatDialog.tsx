@@ -3984,36 +3984,25 @@ export function NewChatLandingScreen() {
                   },
                 ]
               : []),
-            ...pickerModelOptions
-              .filter((option) =>
-                pickerModelSearch
-                  .toLowerCase()
-                  .trim()
-                  .split(/\s+/)
-                  .every((term) =>
-                    `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
-                  ),
-              )
-              .map((option) => ({
-                key: option.id,
-                label: visibleModelLabel(nativeModelLabel(option)),
-                checked:
-                  !routingOn &&
-                  (option.fusion !== undefined
-                    ? isFusionModelUid(pickedModel) ||
-                      (pickedModel === "" && option.isDefault === true)
-                    : pickedModel === option.id ||
-                      (pickedModel === "" && option.isDefault === true)),
-                // The Fusion row always opens its Lead/Sidekick selectors,
-                // even when Fusion is the catalog default (routing it
-                // through MODEL_SELECT_DEFAULT would hide them).
-                onSelect: option.fusion
-                  ? () => selectFusionModel(option.fusion!.default)
-                  : () => selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
-                testId: `new-chat-landing-agent-model-${option.id}`,
-                title: nativeModelTooltip(option),
-                className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
-              })),
+            ...pickerModelOptions.map((option) => ({
+              key: option.id,
+              label: visibleModelLabel(nativeModelLabel(option)),
+              checked:
+                !routingOn &&
+                (option.fusion !== undefined
+                  ? isFusionModelUid(pickedModel) ||
+                    (pickedModel === "" && option.isDefault === true)
+                  : pickedModel === option.id || (pickedModel === "" && option.isDefault === true)),
+              // The Fusion row always opens its Lead/Sidekick selectors,
+              // even when Fusion is the catalog default (routing it
+              // through MODEL_SELECT_DEFAULT would hide them).
+              onSelect: option.fusion
+                ? () => selectFusionModel(option.fusion!.default)
+                : () => selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+              testId: `new-chat-landing-agent-model-${option.id}`,
+              title: nativeModelTooltip(option),
+              className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
+            })),
           ],
         }
       : undefined;
@@ -4119,7 +4108,20 @@ export function NewChatLandingScreen() {
                 }
               : undefined
           }
-          models={modelSection}
+          models={
+            modelSection && {
+              ...modelSection,
+              choices: modelSection.choices.filter(
+                (choice) =>
+                  choice.key === "__default__" ||
+                  pickerModelSearch
+                    .toLowerCase()
+                    .trim()
+                    .split(/\s+/)
+                    .every((term) => `${choice.key} ${choice.label}`.toLowerCase().includes(term)),
+              ),
+            }
+          }
           efforts={effortSection}
           extra={fusionSections}
         />
