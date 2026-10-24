@@ -108,6 +108,21 @@ storybook-build: _ensure-web
 generate-theme-palettes: _ensure-web
     cd web && node --experimental-strip-types scripts/generate-theme-palettes.mjs
 
+# --- RPG office (separate local app for an already running Omnigent) ---
+
+_ensure-office:
+    cd office && test -d node_modules || pnpm install --filter @omnigent/rpg-office
+
+# Build and serve the office on http://127.0.0.1:6780 (set OMNIGENT_URL to target another instance).
+[group('office')]
+office: _ensure-office
+    pnpm --filter @omnigent/rpg-office run start
+
+# Office service plus Vite dev server with hot reload on http://127.0.0.1:6781.
+[group('office')]
+office-dev: _ensure-office
+    pnpm --filter @omnigent/rpg-office exec sh -c 'node server/main.ts & trap "kill $!" EXIT; vite'
+
 # --- Electron desktop app ---
 
 _ensure-electron:

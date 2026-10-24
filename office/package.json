@@ -1,0 +1,28 @@
+{
+  "name": "@omnigent/rpg-office",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Local pixel-art office that visualizes an already running Omnigent instance.",
+  "scripts": {
+    "service": "node server/main.ts",
+    "dev": "vite",
+    "build": "vite build",
+    "start": "vite build && node server/main.ts",
+    "type-check": "tsc -p tsconfig.json --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "react": "catalog:",
+    "react-dom": "catalog:"
+  },
+  "devDependencies": {
+    "@types/node": "^24.12.2",
+    "@types/react": "^19.2.14",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "typescript": "~6.0.2",
+    "vite": "catalog:",
+    "vitest": "catalog:"
+  }
+}

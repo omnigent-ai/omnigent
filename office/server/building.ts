@@ -1,0 +1,209 @@
+// Assembles building snapshots from Omnigent projects and sessions, and
+// mediates the session actions the office exposes.
+
+import type { BuildingSnapshot, Priority, RoomSettingsPatch, RoomSummary } from "../shared/types.ts";
+import { mergeScan, scanSession } from "./activity.ts";
+import { OmnigentError, type OmnigentClient, type OmnigentSessionListItem } from "./omnigentClient.ts";
+import type { ApprovalDecision, StateStore } from "./stateStore.ts";
+
+const PRIORITIES: readonly Priority[] = ["normal", "high", "critical"];
+const MIN_REFRESH_INTERVAL_MS = 4_000;
+
+export class OfficeRequestError extends Error {
+  readonly status: number;
+  readonly code: string;
+
+  constructor(status: number, code: string, message: string) {
+    super(message);
+    this.status = status;
+    this.code = code;
+  }
+}
+
+export type Clock = () => number;
+
+const systemClock: Clock = () => Math.floor(Date.now() / 1000);
+
+export class BuildingService {
+  private readonly client: OmnigentClient;
+  private readonly store: StateStore;
+  private readonly clock: Clock;
+  private sessions: OmnigentSessionListItem[] = [];
+  private snapshot: BuildingSnapshot | null = null;
+  private lastRefreshMs = 0;
+  private inFlight: Promise<BuildingSnapshot> | null = null;
+
+  constructor(client: OmnigentClient, store: StateStore, clock: Clock = systemClock) {
+    this.client = client;
+    this.store = store;
+    this.clock = clock;
+  }
+
+  /** Return a recent snapshot, refreshing from Omnigent when it is stale. */
+  async getSnapshot(force = false): Promise<BuildingSnapshot> {
+    const fresh = Date.now() - this.lastRefreshMs < MIN_REFRESH_INTERVAL_MS;
+    if (this.snapshot && fresh && !force) return this.snapshot;
+    this.inFlight ??= this.refresh().finally(() => {
+      this.inFlight = null;
+    });
+    return this.inFlight;
+  }
+
+  private async refresh(): Promise<BuildingSnapshot> {
+    const now = this.clock();
+    try {
+      const [projects, sessions] = await Promise.all([this.client.listProjects(), this.client.listSessions()]);
+      this.sessions = sessions.filter((session) => !session.archived);
+      await this.scanChangedSessions();
+      const rooms = projects.map((project) => this.summarize(project, now));
+      this.store.save();
+      this.snapshot = { serverNow: now, rooms, connection: { omnigentUrl: this.client.baseUrl, ok: true } };
+    } catch (error) {
+      // Keep showing the last known building, flagged as disconnected.
+      this.snapshot = {
+        serverNow: now,
+        rooms: this.snapshot?.rooms ?? [],
+        connection: { omnigentUrl: this.client.baseUrl, ok: false, error: (error as Error).message },
+      };
+    }
+    this.lastRefreshMs = Date.now();
+    return this.snapshot;
+  }
+
+  private async scanChangedSessions(): Promise<void> {
+    const changed = this.sessions.filter(
+      (session) =>
+        session.project_id !== null &&
+        this.store.state.sessions[session.id]?.scannedUpdatedAt !== session.updated_at,
+    );
+    // Scan a few at a time to avoid flooding the server on first sync.
+    const concurrency = 4;
+    for (let index = 0; index < changed.length; index += concurrency) {
+      await Promise.all(
+        changed.slice(index, index + concurrency).map(async (session) => {
+          try {
+            const scan = await scanSession(session.id, session.updated_at, (sessionId, after) =>
+              this.client.listItems(sessionId, { after }),
+            );
+            this.store.state.sessions[session.id] = mergeScan(this.store.state.sessions[session.id], scan);
+          } catch {
+            // Leave the previous scan in place; an unscanned session marks history incomplete.
+          }
+        }),
+      );
+    }
+  }
+
+  private summarize(project: { id: string; name: string; created_at?: number; config?: { icon?: string } }, now: number): RoomSummary {
+    const roomState = this.store.ensureRoom(project.id, now);
+    const sessions = this.sessions.filter((session) => session.project_id === project.id);
+    let latestInteractionAt: number | null = null;
+    let historyComplete = true;
+    for (const session of sessions) {
+      const scan = this.store.state.sessions[session.id];
+      if (!scan || !scan.complete) historyComplete = false;
+      if (scan?.latestHumanAt != null) latestInteractionAt = Math.max(latestInteractionAt ?? 0, scan.latestHumanAt);
+    }
+    for (const decision of Object.values(this.store.state.decisions)) {
+      if (decision.projectId === project.id) {
+        latestInteractionAt = Math.max(latestInteractionAt ?? 0, decision.decidedAt);
+      }
+    }
+    return {
+      projectId: project.id,
+      name: project.name,
+      icon: project.config?.icon,
+      createdAt: project.created_at ?? roomState.firstSyncAt,
+      priority: roomState.priority,
+      keepUpstairs: roomState.keepUpstairs,
+      latestInteractionAt,
+      firstSyncAt: roomState.firstSyncAt,
+      historyComplete,
+      pendingRequestCount: sessions.reduce((total, session) => total + session.pending_elicitations_count, 0),
+      workerCount: sessions.length,
+      activeWorkerCount: sessions.filter((session) => session.status === "running" || session.status === "launching").length,
+    };
+  }
+
+  async updateRoom(projectId: string, patch: RoomSettingsPatch): Promise<BuildingSnapshot> {
+    if (patch.priority !== undefined && !PRIORITIES.includes(patch.priority)) {
+      throw new OfficeRequestError(400, "invalid_priority", `priority must be one of ${PRIORITIES.join(", ")}`);
+    }
+    if (patch.keepUpstairs !== undefined && typeof patch.keepUpstairs !== "boolean") {
+      throw new OfficeRequestError(400, "invalid_keep_upstairs", "keepUpstairs must be a boolean");
+    }
+    const snapshot = await this.getSnapshot();
+    if (!snapshot.rooms.some((room) => room.projectId === projectId)) {
+      throw new OfficeRequestError(404, "room_not_found", "No such project");
+    }
+    const room = this.store.ensureRoom(projectId, this.clock());
+    if (patch.priority !== undefined) room.priority = patch.priority;
+    if (patch.keepUpstairs !== undefined) room.keepUpstairs = patch.keepUpstairs;
+    this.store.save();
+    return this.getSnapshot(true);
+  }
+
+  async listWorkers(projectId: string): Promise<OmnigentSessionListItem[]> {
+    await this.getSnapshot();
+    return this.sessions.filter((session) => session.project_id === projectId);
+  }
+
+  private projectOf(sessionId: string): string | null {
+    return this.sessions.find((session) => session.id === sessionId)?.project_id ?? null;
+  }
+
+  async sendMessage(sessionId: string, text: string): Promise<{ queued: boolean; denied?: boolean }> {
+    if (!text.trim()) throw new OfficeRequestError(400, "empty_message", "Message text is required");
+    const result = await this.client.sendMessage(sessionId, text);
+    this.lastRefreshMs = 0;
+    return result;
+  }
+
+  /**
+   * Resolve an approval request. The decision is bound to the elicitation id,
+   * rejected when that request is no longer pending, and idempotent on retry.
+   */
+  async decide(
+    sessionId: string,
+    elicitationId: string,
+    action: "accept" | "decline",
+    feedback?: string,
+  ): Promise<{ decision: ApprovalDecision; replayed: boolean }> {
+    if (action !== "accept" && action !== "decline") {
+      throw new OfficeRequestError(400, "invalid_action", "action must be accept or decline");
+    }
+    const decisionId = `${sessionId}:${elicitationId}`;
+    const existing = this.store.state.decisions[decisionId];
+    if (existing) {
+      if (existing.action !== action) {
+        throw new OfficeRequestError(409, "already_decided", `This request was already answered (${existing.action}).`);
+      }
+      return { decision: existing, replayed: true };
+    }
+    const session = await this.client.getSession(sessionId);
+    const pending = (session.pending_elicitations as { elicitation_id?: string }[] | undefined) ?? [];
+    if (!pending.some((request) => request.elicitation_id === elicitationId)) {
+      throw new OfficeRequestError(409, "stale_request", "This request is no longer pending; it was answered, cancelled, or superseded.");
+    }
+    await this.client.resolveElicitation(sessionId, elicitationId, action);
+    const decision: ApprovalDecision = {
+      projectId: (session.project_id as string | null | undefined) ?? this.projectOf(sessionId),
+      sessionId,
+      elicitationId,
+      action,
+      decidedAt: this.clock(),
+    };
+    this.store.state.decisions[decisionId] = decision;
+    this.store.save();
+    if (feedback?.trim()) {
+      try {
+        await this.client.sendMessage(sessionId, feedback.trim());
+      } catch (error) {
+        if (!(error instanceof OmnigentError)) throw error;
+        throw new OfficeRequestError(502, "feedback_not_sent", `Decision recorded, but feedback was not delivered: ${error.message}`);
+      }
+    }
+    this.lastRefreshMs = 0;
+    return { decision, replayed: false };
+  }
+}

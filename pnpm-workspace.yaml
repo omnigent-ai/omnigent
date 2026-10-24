@@ -6,6 +6,7 @@ packages:
   - 'deploy/cloudflare'
   - 'sdks/web-extension'
   - 'examples/extensions/hello-page/web'
+  - 'office'
 
 # 7-day dependency cooldown, mirroring the Python-side exclude-newer = "P7D" in uv.toml.
 minimumReleaseAge: 10080
