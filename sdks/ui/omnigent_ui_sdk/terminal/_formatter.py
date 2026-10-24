@@ -830,12 +830,14 @@ class RichBlockFormatter:
     # ── Internal builders ────────────────────────────────
 
     def _tool_call_line(self, ex: ToolExecution) -> FormattedItem:
-        color = self.accent
-        prefix = ""
+        # Tool names and args are model/user content: append them as styled plain
+        # segments so brackets and backslashes are never parsed as markup.
+        line = Text("   ")
         if "." in ex.agent_name:
-            prefix = f"[{self.muted}]{ex.agent_name} → [/{self.muted}]"
-        args = ex.args_summary
-        return Text.from_markup(f"   {prefix}[{color}]⏵ {ex.name}[/{color}][dim]({args})[/dim]")
+            line.append(f"{ex.agent_name} → ", style=self.muted)
+        line.append(f"⏵ {ex.name}", style=self.accent)
+        line.append(f"({ex.args_summary})", style="dim")
+        return line
 
     def _tool_result_panel(self, ex: ToolExecution) -> FormattedItem:
         raw = ex.output or ""
