@@ -4787,6 +4787,31 @@ def create_app(
                     auth_provider, permission_store
                 )
 
+        # JWT bearer grant (RFC 7523): exchanges a trusted identity provider's
+        # client token for a delegated token, another branch of the same
+        # /oauth/token. Default-off. See designs/JWT_BEARER_GRANT.md.
+        handle_jwt_bearer = None
+        if isinstance(auth_provider, UnifiedAuthProvider) and auth_provider._source in (
+            "oidc",
+            "accounts",
+        ):
+            from omnigent.server.routes.jwt_bearer import (
+                JwtBearerConfig,
+                create_jwt_bearer_handler,
+            )
+
+            if device_grant_store is None:
+                if JwtBearerConfig.from_env() is not None:
+                    _logger.warning(
+                        "jwt-bearer: the grant is configured, but this deploy has no "
+                        "permission store, so /oauth/token is not mounted and the grant "
+                        "cannot answer. Configure a permission store."
+                    )
+            else:
+                handle_jwt_bearer = create_jwt_bearer_handler(
+                    auth_provider, permission_store, admin_list=admin_list
+                )
+
         # Device Authorization Grant (RFC 8628): opt-in, default-off via
         # OMNIGENT_DEVICE_GRANT_ENABLED. Supported in accounts and oidc
         # modes (both own a server-minted session cookie). Header mode has
@@ -4814,6 +4839,7 @@ def create_app(
                     auth_provider,
                     device_grant_store,
                     handle_client_credentials=handle_client_credentials,
+                    handle_jwt_bearer=handle_jwt_bearer,
                 ),
                 tags=["oauth"],
             )
@@ -4853,6 +4879,7 @@ def create_app(
                     auth_provider,
                     device_grant_store,
                     handle_client_credentials=handle_client_credentials,
+                    handle_jwt_bearer=handle_jwt_bearer,
                 ),
                 tags=["oauth"],
             )
