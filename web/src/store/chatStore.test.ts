@@ -6652,6 +6652,102 @@ describe("chatStore — stop", () => {
     useChatStore.getState().stop();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  describe("dropPendingUserMessages", () => {
+    const posted = (tempId: string): PendingUserMessage => ({
+      tempId,
+      content: [{ type: "input_text", text: `message ${tempId}` }],
+      posted: true,
+    });
+    // A send whose POST has not settled yet carries no `posted` flag.
+    const inFlight = (tempId: string): PendingUserMessage => ({
+      tempId,
+      content: [{ type: "input_text", text: `message ${tempId}` }],
+    });
+    const idsOf = (id: string) =>
+      conversationRegistry
+        .peek(id)!
+        .getState()
+        .pendingUserMessages.map((p) => p.tempId);
+
+    it.each([
+      { which: "active", target: "conv_fg", other: "conv_bg" },
+      { which: "background", target: "conv_bg", other: "conv_fg" },
+    ])(
+      "drops only the named $which bubbles, posted or in flight, keeping a later send and no other's",
+      ({ target, other }) => {
+        // `_1` and `_2` were present when Stop began; `_live` arrived while it was in flight.
+        const bubbles = (id: string) => [
+          posted(`${id}_1`),
+          inFlight(`${id}_2`),
+          inFlight(`${id}_live`),
+        ];
+        // `conv_fg` is bound last, so it is the one on screen.
+        bindConversationForTest("conv_bg", { pendingUserMessages: bubbles("conv_bg") });
+        bindConversationForTest("conv_fg", { pendingUserMessages: bubbles("conv_fg") });
+
+        useChatStore.getState().dropPendingUserMessages(target, [`${target}_1`, `${target}_2`]);
+
+        // The pre-stop bubbles go; the in-flight send stays, and the other conversation is untouched.
+        expect(idsOf(target)).toEqual([`${target}_live`]);
+        expect(idsOf(other)).toEqual([`${other}_1`, `${other}_2`, `${other}_live`]);
+        // The root store keeps projecting whichever entry is on screen.
+        expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(
+          idsOf("conv_fg"),
+        );
+      },
+    );
+
+    it("keeps an unsent initialDraft bubble even when its id is named", () => {
+      const draft = { text: "waiting for the model", files: [] };
+      bindConversationForTest("conv_abc", {
+        pendingUserMessages: [
+          posted("pend_1"),
+          { ...inFlight("pend_draft"), initialDraft: draft },
+          inFlight("pend_2"),
+        ],
+      });
+
+      useChatStore
+        .getState()
+        .dropPendingUserMessages("conv_abc", ["pend_1", "pend_draft", "pend_2"]);
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([
+        { ...inFlight("pend_draft"), initialDraft: draft },
+      ]);
+    });
+
+    it("leaves the send queue, a failed-send draft and the turn state alone", () => {
+      const queued = [{ queueId: "q_1", text: "later", conversationId: "conv_abc" }];
+      const failedSendDraft = { conversationId: "conv_abc", text: "retry me", files: [] };
+      bindConversationForTest("conv_abc", {
+        pendingUserMessages: [posted("pend_1")],
+        failedSendDraft,
+        status: "streaming",
+        sessionStatus: "running",
+      });
+      useChatStore.setState({ queuedMessages: queued });
+
+      useChatStore.getState().dropPendingUserMessages("conv_abc", ["pend_1"]);
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.queuedMessages).toEqual(queued);
+      expect(state.failedSendDraft).toEqual(failedSendDraft);
+      expect(state.status).toBe("streaming");
+      expect(state.sessionStatus).toBe("running");
+    });
+
+    it("does nothing for a conversation that is not live", () => {
+      bindConversationForTest("conv_abc", { pendingUserMessages: [posted("pend_1")] });
+
+      useChatStore.getState().dropPendingUserMessages("conv_gone", ["pend_1"]);
+
+      // No entry is created for it, and the live conversation keeps its bubble.
+      expect(conversationRegistry.has("conv_gone")).toBe(false);
+      expect(idsOf("conv_abc")).toEqual(["pend_1"]);
+    });
+  });
 });
 
 describe("chatStore — handleSessionEvent (session.* events)", () => {
