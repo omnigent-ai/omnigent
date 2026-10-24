@@ -645,8 +645,8 @@ def _paste_payload_bytes(text: str) -> bytes:
     return bytes(body)
 
 
-def _session_alive(socket_path: str, tmux_target: str) -> bool:
-    """Return whether the tmux session/pane still exists (the TUI is running)."""
+def _probe_session(socket_path: str, tmux_target: str) -> bool | None:
+    """Whether the tmux session/pane exists; ``None`` when the probe itself failed."""
     try:
         proc = subprocess.run(
             ["tmux", "-S", socket_path, "has-session", "-t", tmux_target],
@@ -656,8 +656,13 @@ def _session_alive(socket_path: str, tmux_target: str) -> bool:
             timeout=_TMUX_SEND_TIMEOUT_S,
         )
     except (subprocess.TimeoutExpired, OSError):
-        return False
+        return None
     return proc.returncode == 0
+
+
+def _session_alive(socket_path: str, tmux_target: str) -> bool:
+    """Return whether the tmux session/pane still exists (the TUI is running)."""
+    return _probe_session(socket_path, tmux_target) is True
 
 
 def capture_cursor_pane(bridge_dir: Path) -> str | None:
@@ -680,6 +685,24 @@ def capture_cursor_pane(bridge_dir: Path) -> str | None:
     if not _session_alive(socket_path, tmux_target):
         return None
     return _capture_pane(socket_path, tmux_target)
+
+
+def cursor_pane_gone(bridge_dir: Path) -> bool | None:
+    """
+    Return whether the Cursor pane is confirmed gone.
+
+    ``True`` when no tmux target is advertised or tmux reports the target
+    missing, ``False`` when the pane is alive, and ``None`` when the probe
+    itself failed (a timeout or spawn error), so callers can keep an
+    indeterminate state apart from a confirmed exit.
+
+    :param bridge_dir: The cursor-native bridge dir holding ``tmux.json``.
+    """
+    info = read_tmux_info(bridge_dir)
+    if info is None:
+        return True
+    alive = _probe_session(info["socket_path"], info["tmux_target"])
+    return None if alive is None else not alive
 
 
 def send_cursor_pane_keys(bridge_dir: Path, *keys: str) -> None:
