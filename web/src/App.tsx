@@ -3,9 +3,11 @@ import { Navigate, Route, Routes } from "react-router-dom";
 import { ChatPage as ChatPageImpl } from "@/pages/ChatPage";
 import { NotFoundPage as NotFoundPageImpl } from "@/pages/NotFoundPage";
 import { useOmnigentPageView } from "@/lib/analytics";
+import { useLocation } from "@/lib/routing";
 import { PageLoading } from "@/components/PageLoading";
 import { Spinner } from "@/components/ui/spinner";
 import { ChunkLoadErrorBoundary } from "@/components/ChunkLoadErrorBoundary";
+import { MermaidFullscreenProvider } from "@/components/ai-elements/MermaidBlock";
 import { isFeatureEnabled, type FeatureKey } from "@/lib/capabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { AppShell } from "@/shell/AppShell";
@@ -236,10 +238,17 @@ function AppRoutes({ basename }: AppProps) {
   );
 }
 
+function RouteMermaidFullscreen({ children }: { children: ReactNode }) {
+  const { pathname } = useLocation();
+  return <MermaidFullscreenProvider resetKey={pathname}>{children}</MermaidFullscreenProvider>;
+}
+
 export default function App(props: AppProps = {}) {
   return (
     <ChunkLoadErrorBoundary>
-      <AppRoutes {...props} />
+      <RouteMermaidFullscreen>
+        <AppRoutes {...props} />
+      </RouteMermaidFullscreen>
     </ChunkLoadErrorBoundary>
   );
 }
