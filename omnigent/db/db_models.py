@@ -1324,6 +1324,8 @@ class SqlHost(OmnigentBase):
     # in this schema.
     user_id: Mapped[str] = mapped_column(String(128), nullable=False)
     name: Mapped[str] = mapped_column(String(64), nullable=False)
+    # Owner-assigned label; host.hello continues to update only the registration name.
+    display_name: Mapped[str | None] = mapped_column(String(64), nullable=True)
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
     # HOST_STATUS: online=1, offline=2).
     status: Mapped[int] = mapped_column(SmallInteger)
@@ -1333,6 +1335,10 @@ class SqlHost(OmnigentBase):
     token_expires_at: Mapped[int | None] = mapped_column(Integer, nullable=True)
     sandbox_provider: Mapped[str | None] = mapped_column(String(32), nullable=True)
     sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
+    # Attached sandboxes are reusable and owned outside Omnigent's lifecycle.
+    sandbox_attached: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False, server_default=false()
+    )
     terminating_sandbox_id: Mapped[str | None] = mapped_column(String(256), nullable=True)
     deleted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Opaque; never SQL-filtered — stored compressed (CompressedText).
