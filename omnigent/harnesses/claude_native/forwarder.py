@@ -86,6 +86,12 @@ _DELTA_STATE_FILE = "message_deltas_forwarder.json"
 _COMPACTION_STATE_FILE = "compaction_forwarder.json"
 _HOOKS_FILE = "hooks.jsonl"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
+# Shown when a StopFailure for an authentication error carries no explicit API error text.
+_CLAUDE_AUTH_FALLBACK_DETAIL = (
+    "Claude Code could not authenticate with the model provider (authentication_failed). "
+    "Check the sign-in for Claude Code in this session's terminal or the credential it uses, "
+    "then send your message again."
+)
 
 # Keep child-history requests below the server's 10 MiB API ceiling to bound
 # per-request latency and retry cost while still accommodating large events.
@@ -3734,6 +3740,9 @@ def _stop_failure_detail(
         record.failure_category,
         extra={"session_id": session_id},
     )
+    if record.failure_category == "authentication_failed":
+        # No explicit error text came with it, so name the next step, not only the category.
+        return _CLAUDE_AUTH_FALLBACK_DETAIL
     if record.failure_category is not None:
         return f"Claude Code ended the turn with an API error ({record.failure_category})."
     return None
