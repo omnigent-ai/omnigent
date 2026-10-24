@@ -13,6 +13,7 @@ from unittest.mock import patch
 import pytest
 
 from omnigent.errors import OmnigentError
+from omnigent.spec.framework_skills import FRAMEWORK_SKILL_NAMES
 from omnigent.spec.types import (
     AgentSpec,
     BuiltinToolConfig,
@@ -287,6 +288,20 @@ def test_schemas_include_load_skill_when_skills_exist(
     # The bundled skill ("summarize") is named in the tool description so a
     # loaderless harness can discover and load it.
     assert "summarize" in by_name["load_skill"]["function"]["description"]
+
+
+def test_load_skill_schema_lists_framework_skills_without_bundled_skills() -> None:
+    """
+    The framework skills are named even when the agent bundles none.
+
+    Relay-only native harnesses learn which skills exist from this
+    description alone, so a framework skill missing here is invisible to them.
+    """
+    mgr = ToolManager(_make_spec())
+    by_name = {s["function"]["name"]: s for s in mgr.get_tool_schemas()}
+    description = by_name["load_skill"]["function"]["description"]
+    for skill_name in FRAMEWORK_SKILL_NAMES:
+        assert skill_name in description
 
 
 def test_schemas_include_read_skill_file_with_resources(

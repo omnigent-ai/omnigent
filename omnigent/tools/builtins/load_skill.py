@@ -60,6 +60,7 @@ class LoadSkillTool(Tool):
                 all_skills.append(hs)
         self._skills = all_skills
         self._skills_by_name: dict[str, SkillSpec] = {s.name: s for s in all_skills}
+        self._bundled_names = frozenset(bundled_names)
 
     @property
     def skills(self) -> list[SkillSpec]:
@@ -84,21 +85,32 @@ class LoadSkillTool(Tool):
         """
         Return the OpenAI-format schema for ``load_skill``.
 
-        The description includes the list of available skill
-        names so the LLM knows what it can load.
+        The description names every available skill so the LLM
+        knows what it can load. Bundled skills (framework skills
+        included) also carry a short summary: a harness without
+        native skill support decides when to load a skill from
+        this text alone. Host skills stay names-only, since a
+        machine can have many.
 
         :returns: A tool schema dict.
         """
-        skill_names = [s.name for s in self._skills]
+        summarized = [
+            s for s in self._skills if s.name in self._bundled_names and s.description.strip()
+        ]
+        summarized_names = {s.name for s in summarized}
+        others = [s.name for s in self._skills if s.name not in summarized_names]
+        lines = ["Load a skill's full instructions by name."]
+        if summarized:
+            lines.append("Load one first when the task matches its summary:")
+            lines.extend(f"- {s.name}: {_summary(s.description)}" for s in summarized)
+        if others:
+            label = "Other skills" if summarized else "Available skills"
+            lines.append(f"{label}: {', '.join(others)}")
         return {
             "type": "function",
             "function": {
                 "name": "load_skill",
-                "description": (
-                    "Load a skill's full instructions by "
-                    "name. Available skills: "
-                    f"{', '.join(skill_names)}"
-                ),
+                "description": "\n".join(lines),
                 "parameters": {
                     "type": "object",
                     "properties": {
@@ -142,6 +154,12 @@ class LoadSkillTool(Tool):
             return f"Error: skill {skill_name!r} not found. Available skills: {available}"
         resources = list_skill_resources(skill)
         return format_skill_content(skill, resources)
+
+
+def _summary(description: str, limit: int = 300) -> str:
+    """One-line skill summary for the ``load_skill`` schema, cut at *limit* characters."""
+    text = " ".join(description.split())
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
 
 
 def list_skill_resources(skill: SkillSpec) -> list[str]:
