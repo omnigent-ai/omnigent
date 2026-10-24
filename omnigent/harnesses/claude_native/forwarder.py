@@ -1555,6 +1555,13 @@ async def forward_claude_transcript_to_session(
                         # the same poll would lose the boundary. Cursor-keyed, so
                         # the main hook phase below does not re-mint.
                         await _prescan_precompact_edges(bridge_dir, hook_state)
+                        # Claude writes a turn's reply before firing Stop, so hooks
+                        # visible before this transcript read never outrun the items
+                        # they end; later hooks wait for the next poll.
+                        hooks_file = bridge_dir / _HOOKS_FILE
+                        hooks_cutoff_byte_offset = (
+                            hooks_file.stat().st_size if hooks_file.is_file() else None
+                        )
                         state = await _forward_available_items(
                             client=client,
                             session_id=current_session_id,
@@ -1585,6 +1592,7 @@ async def forward_claude_transcript_to_session(
                             # turn's id.
                             response_id=state.current_response_id,
                             diagnostic_health=diagnostic_health,
+                            hooks_cutoff_byte_offset=hooks_cutoff_byte_offset,
                         )
                         # Deferred ``/compact``-refusal dismissal: runs AFTER
                         # the hook phase so the ``failed`` post always follows
@@ -4139,6 +4147,7 @@ async def _forward_available_status_events(
     compaction_retry_tracker: _PostRetryTracker | None = None,
     response_id: str | None = None,
     diagnostic_health: Callable[[], FailureContext] | None = None,
+    hooks_cutoff_byte_offset: int | None = None,
 ) -> HookForwardState:
     """
     Forward currently available hook events as ``session.status``.
@@ -4184,6 +4193,10 @@ async def _forward_available_status_events(
         turn-start ``running`` edge. ``None`` when no turn id is known
         (the status still posts, just without a turn association).
     :param diagnostic_health: Latest metadata-only diagnostic follower snapshot.
+    :param hooks_cutoff_byte_offset: Hooks-file size taken before this poll's
+        transcript read; only records ending at or before it are forwarded, so a
+        ``Stop`` written mid-poll waits until its reply is mirrored. ``None``
+        forwards every available record.
     :returns: Updated state. On post failure, returns the last
         durable state so successfully-posted statuses are not
         retried and the failing event is retried later.
@@ -4195,6 +4208,13 @@ async def _forward_available_status_events(
     # (batch spans the old id's StopFailure and the new SessionStart)
     # does not drop the parent's own failure as a subagent event.
     parent_claude_session_ids = read_seen_claude_session_ids(bridge_dir)
+    # Hold records written after the transcript read for the next poll.
+    if hooks_cutoff_byte_offset is not None:
+        filtered = [r for r in result.records if (r.byte_offset or 0) <= hooks_cutoff_byte_offset]
+        if filtered != result.records:
+            cursor = filtered[-1].event_cursor if filtered else state.event_cursor
+            offset = filtered[-1].byte_offset if filtered else (state.byte_offset or 0)
+            result = replace(result, records=filtered, event_cursor=cursor, byte_offset=offset)
     if not result.records:
         if result.event_cursor == state.event_cursor and result.byte_offset == (
             state.byte_offset or 0
