@@ -19437,6 +19437,64 @@ describe("chatStore — compaction spinner follows its turn", () => {
     });
     expect(spinnerIds()).toEqual([]);
   });
+
+  const nativeAgentStatus = (status: string) =>
+    sse("session.status", { conversation_id: "conv_native_compact", status });
+
+  function messageDuringNativeCompaction(agentStatus: string) {
+    // A native runner wraps each delivered message in a short response; the
+    // native CLI compacts outside those wrappers.
+    const pump = startPump("conv_native_compact");
+    useChatStore.setState({ isNativeTerminalSession: true });
+    pump.sink.push(turnEvent("response.in_progress", "resp_compact_input"));
+    pump.sink.push(turnEvent("response.completed", "resp_compact_input"));
+    pump.sink.push(nativeAgentStatus("running"));
+    pump.sink.push(sse("response.compaction.in_progress", {}));
+    pump.sink.push(nativeAgentStatus(agentStatus));
+    pump.sink.push(turnEvent("response.in_progress", "resp_next_input"));
+    pump.sink.push(turnEvent("response.completed", "resp_next_input"));
+    return pump;
+  }
+
+  it.each([
+    {
+      outcome: "keeps",
+      agentStatus: "running",
+      remaining: ["resp_compact_input"],
+    },
+    { outcome: "clears", agentStatus: "idle", remaining: [] },
+  ])(
+    "$outcome a native compaction spinner when a message reaches the $agentStatus agent",
+    async ({ agentStatus, remaining }) => {
+      const { controller } = messageDuringNativeCompaction(agentStatus);
+      await tick();
+
+      expect(spinnerIds()).toEqual(remaining);
+
+      controller.abort();
+    },
+  );
+
+  it("clears every compaction spinner when the busy native agent is stopped", async () => {
+    const { sink, controller } = messageDuringNativeCompaction("running");
+    sink.push(turnEvent("response.in_progress", "resp_stopped"));
+    sink.push(sse("response.compaction.in_progress", {}));
+    await tick();
+    expect(spinnerIds()).toEqual(["resp_compact_input", "resp_stopped"]);
+
+    sink.push(
+      sse("session.interrupted", {
+        type: "session.interrupted",
+        data: { requested_at: 1704067200 },
+      }),
+    );
+    sink.push(nativeAgentStatus("idle"));
+    await tick();
+
+    expect(spinnerIds()).toEqual([]);
+
+    controller.abort();
+  });
 });
 
 describe("chatStore — origin-wide stream slots", () => {
