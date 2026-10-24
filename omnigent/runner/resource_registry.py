@@ -41,7 +41,7 @@ from omnigent.entities.session_resources import (
     terminal_resource_view,
 )
 from omnigent.inner.async_utils import run_sync_cleanup
-from omnigent.inner.sandbox import contained_realpath, containment_prefix
+from omnigent.inner.sandbox import contained_realpath, containment_prefix, resolve_sandbox
 from omnigent.inner.terminal_lifecycle import lifecycle_log_attributes
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
 from omnigent.native.native_dispatch import resolve_hook_for_key
@@ -52,6 +52,7 @@ if TYPE_CHECKING:
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
     from omnigent.inner.os_env import OSEnvironment
+    from omnigent.inner.sandbox import SandboxPolicy
     from omnigent.inner.terminal import TerminalInstance
     from omnigent.spec.types import AgentSpec
     from omnigent.terminals.registry import TerminalRegistry
@@ -200,6 +201,34 @@ class TerminalExitEvent:
     session_was_idle: bool = False
     terminal_instance_id: str | None = None
     lifecycle_context: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass(eq=False)
+class ToolEnvironmentLease:
+    """A session's reusable ``sys_os_*`` environment, leased to one call at a time.
+
+    :param registry: Registry that owns the environment.
+    :param session_id: Owning session/conversation identifier.
+    :param spec: Effective spec the environment was built from.
+    :param sandbox: Sandbox policy resolved from *spec* when it was built.
+    :param environment: The live environment; its helper stays warm between calls.
+    :param leased: Whether a call currently holds the environment.
+    """
+
+    registry: SessionResourceRegistry
+    session_id: str
+    spec: OSEnvSpec
+    sandbox: SandboxPolicy
+    environment: OSEnvironment
+    leased: bool = False
+
+    async def release(self, *, reusable: bool) -> None:
+        """End the call's hold; close the environment unless it stays reusable.
+
+        :param reusable: ``False`` after a failed or cancelled call, whose
+            helper may still be running the abandoned request.
+        """
+        await self.registry._release_tool_environment(self, reusable=reusable)
 
 
 def _terminal_lifecycle_context(
@@ -444,7 +473,8 @@ class SessionResourceRegistry:
     manages the primary :class:`OSEnvironment` per session.  The
     primary environment is lazily materialized on first
     :meth:`resolve_environment` call with
-    ``DEFAULT_ENVIRONMENT_ID``.
+    ``DEFAULT_ENVIRONMENT_ID``. Runner-local ``sys_os_*`` calls lease a
+    separate per-session environment keyed by their effective spec.
 
     :param terminal_registry: Existing terminal registry.
         ``None`` in test setups without terminals.
@@ -476,6 +506,7 @@ class SessionResourceRegistry:
         self._per_session_workspace = per_session_workspace
         self._primary_envs: dict[str, OSEnvironment] = {}
         self._primary_env_specs: dict[str, OSEnvSpec | None] = {}
+        self._tool_envs: dict[str, ToolEnvironmentLease] = {}
         self._codex_skills_dirs: dict[str, tempfile.TemporaryDirectory[str]] = {}
         self._terminal_roles: dict[tuple[str, str], str] = {}
         self._terminal_lifecycles: dict[tuple[str, str], TerminalLifecycle] = {}
@@ -958,6 +989,81 @@ class SessionResourceRegistry:
                     return entry.instance.os_env
 
         raise ValueError(f"Environment {environment_id!r} not found for session {session_id!r}")
+
+    async def lease_tool_environment(
+        self, session_id: str, spec: OSEnvSpec
+    ) -> ToolEnvironmentLease | None:
+        """Lease the session's reusable ``sys_os_*`` environment for one call.
+
+        Reuse keeps the helper process warm across calls; a changed spec
+        replaces the environment.
+
+        :param session_id: Session/conversation identifier.
+        :param spec: Effective spec for this call, with a concrete cwd.
+        :returns: The lease, or ``None`` while another call holds it so
+            concurrent calls fall back to their own environment.
+        """
+        from omnigent.inner.os_env import create_os_environment
+
+        replaced: OSEnvironment | None = None
+        # Resolution follows symlinks in the spec's paths, so compare a fresh one.
+        cwd = Path(spec.cwd or ".").resolve(strict=False)
+        sandbox = resolve_sandbox(spec, cwd)
+        with self._lock:
+            lease = self._tool_envs.get(session_id)
+            if (
+                lease is None
+                or lease.spec != spec
+                or lease.environment.cwd != cwd
+                or lease.sandbox != sandbox
+            ):
+                environment = create_os_environment(
+                    spec,
+                    sandbox_policy=sandbox,
+                    additional_read_roots=[self._codex_skills_dir_locked(session_id)],
+                    relaunch_when_stale=True,
+                )
+                if environment is None:
+                    raise RuntimeError(f"Failed to create OS environment for {session_id!r}")
+                # A leased environment is closed by its holder on release.
+                if lease is not None and not lease.leased:
+                    replaced = lease.environment
+                lease = ToolEnvironmentLease(
+                    self, session_id, deepcopy(spec), deepcopy(sandbox), environment
+                )
+                self._tool_envs[session_id] = lease
+            elif lease.leased:
+                lease = None
+            if lease is not None:
+                lease.leased = True
+        if replaced is not None:
+            try:
+                await run_sync_cleanup(
+                    replaced.close, component="runner_tool_os_env", session_id=session_id
+                )
+            except BaseException:
+                # The caller never receives the lease, so hand it back.
+                if lease is not None:
+                    with self._lock:
+                        lease.leased = False
+                raise
+        return lease
+
+    async def _release_tool_environment(
+        self, lease: ToolEnvironmentLease, *, reusable: bool
+    ) -> None:
+        """Return *lease*; close its environment if stale or not reusable."""
+        with self._lock:
+            lease.leased = False
+            current = self._tool_envs.get(lease.session_id) is lease
+            if current and not reusable:
+                del self._tool_envs[lease.session_id]
+        if not (current and reusable):
+            await run_sync_cleanup(
+                lease.environment.close,
+                component="runner_tool_os_env",
+                session_id=lease.session_id,
+            )
 
     def uses_copy_on_write(self, session_id: str) -> bool:
         """Preserve disposable semantics if a later spec lookup is unavailable."""
@@ -2057,6 +2163,9 @@ class SessionResourceRegistry:
             self._session_activity_epoch.pop(session_id, None)
             primary = self._primary_envs.pop(session_id, None)
             self._primary_env_specs.pop(session_id, None)
+            tool_lease = self._tool_envs.pop(session_id, None)
+            # A leased environment is closed by its holder on release.
+            tool_env = tool_lease.environment if tool_lease and not tool_lease.leased else None
             skills_directory = self._codex_skills_dirs.pop(session_id, None)
             stale_role_keys = [key for key in self._terminal_roles if key[0] == session_id]
             for key in stale_role_keys:
@@ -2087,6 +2196,18 @@ class SessionResourceRegistry:
             except Exception:
                 _logger.exception(
                     "Error closing primary env for session=%s",
+                    session_id,
+                )
+        if tool_env is not None:
+            try:
+                await run_sync_cleanup(
+                    tool_env.close,
+                    component="runner_tool_os_env",
+                    session_id=session_id,
+                )
+            except Exception:
+                _logger.exception(
+                    "Error closing sys_os_* env for session=%s",
                     session_id,
                 )
         if skills_directory is not None:

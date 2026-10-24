@@ -42,7 +42,7 @@ if TYPE_CHECKING:
     from omnigent.inner.datamodel import OSEnvSpec
     from omnigent.inner.os_env import OSEnvironment
     from omnigent.runner.mcp_manager import RunnerMcpManager
-    from omnigent.runner.resource_registry import SessionResourceRegistry
+    from omnigent.runner.resource_registry import SessionResourceRegistry, ToolEnvironmentLease
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
     from omnigent.spec.types import AgentSpec, SkillSpec
     from omnigent.terminals.registry import TerminalRegistry
@@ -7234,12 +7234,16 @@ async def _execute_os_env_tool(
         ``GET …/changes`` endpoint can surface them. ``sys_os_shell``
         is not tracked — shell side-effects cannot be attributed to a
         session.
+    :param resource_registry: Owner of the session's reusable environment;
+        without it (or a session id) each call starts its own helper.
     :returns: Serialized tool result string.
     """
     from omnigent.inner.os_env import _DEFAULT_READ_LIMIT, create_os_environment
 
     os_env = None
     owns_environment = True
+    tool_lease: ToolEnvironmentLease | None = None
+    completed = False
     try:
         effective_spec = _effective_runner_os_env_spec(
             agent_spec, conversation_id, runner_workspace
@@ -7257,14 +7261,27 @@ async def _execute_os_env_tool(
             )
             owns_environment = False
         else:
-            additional_read_roots = (
-                [resource_registry.codex_skills_dir(conversation_id)]
-                if resource_registry is not None and conversation_id is not None
-                else []
-            )
-            os_env = create_os_environment(
-                effective_spec, additional_read_roots=additional_read_roots
-            )
+            if (
+                resource_registry is not None
+                and conversation_id is not None
+                and not effective_spec.fork
+            ):
+                # Reuse the session's warm helper; a busy one leaves this call its own.
+                tool_lease = await resource_registry.lease_tool_environment(
+                    conversation_id, effective_spec
+                )
+            if tool_lease is not None:
+                os_env = tool_lease.environment
+                owns_environment = False
+            else:
+                additional_read_roots = (
+                    [resource_registry.codex_skills_dir(conversation_id)]
+                    if resource_registry is not None and conversation_id is not None
+                    else []
+                )
+                os_env = create_os_environment(
+                    effective_spec, additional_read_roots=additional_read_roots
+                )
         if os_env is None:
             return "Error: unable to create OSEnvironment"
 
@@ -7315,6 +7332,8 @@ async def _execute_os_env_tool(
             )
         else:
             return f"Error: {tool_name} not implemented"
+        # A timed-out command's descendants may outlive it; retire their helper.
+        completed = not (isinstance(result, dict) and result.get("timed_out"))
     except Exception as exc:
         _logger.exception(
             "runner OSEnvironment dispatch failed for %s",
@@ -7323,7 +7342,9 @@ async def _execute_os_env_tool(
         )
         return json_dumps_transport_safe({"error": str(exc)})
     finally:
-        if os_env is not None and owns_environment:
+        if tool_lease is not None:
+            await tool_lease.release(reusable=completed)
+        elif os_env is not None and owns_environment:
             await run_sync_cleanup(
                 os_env.close,
                 component="runner_os_env_tool",

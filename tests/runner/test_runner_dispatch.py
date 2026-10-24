@@ -89,6 +89,7 @@ from omnigent.runner.app import (
 from omnigent.runner.policy_proxy import (
     _evaluate_policy_via_omnigent,
 )
+from omnigent.runner.resource_registry import SessionResourceRegistry
 from omnigent.runtime.harnesses import _HARNESS_MODULES
 from omnigent.runtime.harnesses._executor_adapter import (
     _ORPHAN_RESYNC_THRESHOLD,
@@ -2613,12 +2614,52 @@ async def test_runner_publishes_terminal_failed_when_harness_stream_fails(
 # ── Runner-local OS env dispatch ────────────────────────
 
 
+async def _os_env_helper_pid(
+    registry: SessionResourceRegistry, spec: AgentSpec, session_id: str
+) -> int:
+    """Return the pid of the helper that ran a ``sys_os_shell`` call."""
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    shell = await _execute_os_env_tool(
+        "sys_os_shell",
+        {"command": "echo $PPID"},
+        agent_spec=spec,
+        conversation_id=session_id,
+        resource_registry=registry,
+    )
+    return int(json.loads(shell)["stdout"])
+
+
+def _process_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+async def _wait_until_dead(pid: int, timeout: float = 5.0) -> None:
+    """Wait until *pid* has exited (a zombie counts), so the next call sees it dead."""
+    import subprocess
+
+    deadline = asyncio.get_running_loop().time() + timeout
+    while asyncio.get_running_loop().time() < deadline:
+        state = subprocess.run(
+            ["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True, check=False
+        ).stdout.strip()
+        if not state or state.startswith("Z"):
+            return
+        await asyncio.sleep(0.02)
+    raise AssertionError(f"process {pid} still running after {timeout}s")
+
+
 @pytest.mark.asyncio
 async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
     from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
     from omnigent.runner.tool_dispatch import _execute_os_env_tool
     from omnigent.spec.types import AgentSpec
 
+    registry = SessionResourceRegistry()
     with tempfile.TemporaryDirectory() as td:
         root = Path(td)
         spec = AgentSpec(
@@ -2629,12 +2670,14 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
                 sandbox=OSEnvSandboxSpec(type="none"),
             ),
         )
+        helper_pid = await _os_env_helper_pid(registry, spec, "conv_runner_os_env_test")
 
         write = await _execute_os_env_tool(
             "sys_os_write",
             {"path": "note.txt", "content": "Привет 世界\nplanet\n"},
             agent_spec=spec,
             conversation_id="conv_runner_os_env_test",
+            resource_registry=registry,
         )
         assert json.loads(write)["created"] is True
         assert root.joinpath("note.txt").read_text() == "Привет 世界\nplanet\n"
@@ -2644,6 +2687,7 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             {"path": "note.txt", "oldText": "planet", "newText": "world"},
             agent_spec=spec,
             conversation_id="conv_runner_os_env_test",
+            resource_registry=registry,
         )
         assert json.loads(edit)["replacements"] == 1
 
@@ -2652,19 +2696,145 @@ async def test_runner_os_env_tools_use_agent_spec_cwd() -> None:
             {"path": "note.txt"},
             agent_spec=spec,
             conversation_id="conv_runner_os_env_test",
+            resource_registry=registry,
         )
         assert "Привет 世界" in read
         assert json.loads(read)["content"] == "Привет 世界\nworld\n"
 
         shell = await _execute_os_env_tool(
             "sys_os_shell",
-            {"command": "pwd"},
+            {"command": "pwd; echo $PPID"},
             agent_spec=spec,
             conversation_id="conv_runner_os_env_test",
+            resource_registry=registry,
         )
         shell_result = json.loads(shell)
         assert shell_result["exit_code"] == 0
-        assert Path(shell_result["stdout"].strip()).resolve() == root.resolve()
+        cwd, pid = shell_result["stdout"].split()
+        assert Path(cwd).resolve() == root.resolve()
+        # Every call in the session ran in the one helper process.
+        assert int(pid) == helper_pid
+
+        await registry.cleanup_session("conv_runner_os_env_test")
+        assert not _process_exists(helper_pid)
+
+
+@pytest.mark.asyncio
+async def test_runner_os_env_helper_restarts_and_keys_on_spec(tmp_path: Path) -> None:
+    """A crashed helper restarts; a changed spec, another session or a timeout gets a new one."""
+    import signal
+
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    def agent(cwd: Path) -> AgentSpec:
+        cwd.mkdir(exist_ok=True)
+        return AgentSpec(
+            spec_version=1,
+            os_env=OSEnvSpec(
+                type="caller_process", cwd=str(cwd), sandbox=OSEnvSandboxSpec(type="none")
+            ),
+        )
+
+    registry = SessionResourceRegistry()
+    spec = agent(tmp_path / "a")
+    crashed = await _os_env_helper_pid(registry, spec, "conv_a")
+    os.kill(crashed, signal.SIGKILL)
+    # Once the death is visible the next call restarts the helper before sending;
+    # a request already in flight to it is not replayed.
+    await _wait_until_dead(crashed)
+    restarted = await _os_env_helper_pid(registry, spec, "conv_a")
+    assert restarted != crashed
+    assert await _os_env_helper_pid(registry, spec, "conv_a") == restarted
+
+    other_session = await _os_env_helper_pid(registry, spec, "conv_b")
+    assert other_session != restarted
+
+    moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+    assert moved != restarted
+    assert not _process_exists(restarted)
+
+    # The same spec whose cwd symlink now points elsewhere is a different workspace.
+    (tmp_path / "c").mkdir()
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "b")
+    linked = await _os_env_helper_pid(registry, agent(link), "conv_a")
+    link.unlink()
+    link.symlink_to(tmp_path / "c")
+    retargeted = await _os_env_helper_pid(registry, agent(link), "conv_a")
+    assert retargeted != linked
+    moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+
+    # A timed-out command's descendants may outlive it, so its helper is retired.
+    timed_out = await _execute_os_env_tool(
+        "sys_os_shell",
+        {"command": "sleep 30", "timeout": 1},
+        agent_spec=agent(tmp_path / "b"),
+        conversation_id="conv_a",
+        resource_registry=registry,
+    )
+    assert json.loads(timed_out)["timed_out"] is True
+    assert not _process_exists(moved)
+    moved = await _os_env_helper_pid(registry, agent(tmp_path / "b"), "conv_a")
+
+    await registry.cleanup_session("conv_a")
+    await registry.cleanup_session("conv_b")
+    assert not _process_exists(moved)
+    assert not _process_exists(other_session)
+
+
+@pytest.mark.asyncio
+async def test_runner_os_env_busy_helper_serves_concurrent_calls_and_cancellation_retires_it(
+    tmp_path: Path,
+) -> None:
+    """Concurrent calls bypass a busy session helper; a cancelled call's helper is closed."""
+    from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec
+    from omnigent.runner.tool_dispatch import _execute_os_env_tool
+
+    spec = AgentSpec(
+        spec_version=1,
+        os_env=OSEnvSpec(
+            type="caller_process", cwd=str(tmp_path), sandbox=OSEnvSandboxSpec(type="none")
+        ),
+    )
+    registry = SessionResourceRegistry()
+    session_helper = await _os_env_helper_pid(registry, spec, "conv_busy")
+    fifo = tmp_path / "gate"
+    os.mkfifo(fifo)
+    (tmp_path / "note.txt").write_text("hi\n")
+
+    blocked = asyncio.create_task(
+        _execute_os_env_tool(
+            "sys_os_shell",
+            {"command": "read line < gate; echo $PPID $line"},
+            agent_spec=spec,
+            conversation_id="conv_busy",
+            resource_registry=registry,
+        )
+    )
+    # Opening the write end returns once the shell is reading the gate.
+    gate = await asyncio.wait_for(asyncio.to_thread(open, fifo, "w"), timeout=10)
+    try:
+        read = await _execute_os_env_tool(
+            "sys_os_read",
+            {"path": "note.txt"},
+            agent_spec=spec,
+            conversation_id="conv_busy",
+            resource_registry=registry,
+        )
+        assert json.loads(read)["content"] == "hi\n"
+        assert not blocked.done()
+        blocked.cancel()
+        gate.write("open\n")
+    finally:
+        gate.close()
+    with pytest.raises(asyncio.CancelledError):
+        await blocked
+    assert not _process_exists(session_helper)
+    replacement = await _os_env_helper_pid(registry, spec, "conv_busy")
+    assert replacement != session_helper
+    await registry.cleanup_session("conv_busy")
+    assert not _process_exists(replacement)
 
 
 @pytest.mark.asyncio

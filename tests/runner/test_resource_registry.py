@@ -10,7 +10,7 @@ import shutil
 import sys
 import threading
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import Mock
@@ -2470,3 +2470,115 @@ async def test_non_claude_terminal_never_acknowledges_billing_notice(
         on_tick()
 
     acknowledge.assert_not_called()
+
+
+async def test_cancelled_tool_environment_replacement_returns_the_new_lease(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Cancelling while a spec change closes the old environment keeps the new one leasable."""
+    import omnigent.inner.os_env as os_env_module
+
+    close_started = threading.Event()
+    release_close = threading.Event()
+
+    class _SlowCloseEnvironment(_FakeOSEnvironment):
+        def close(self) -> None:
+            close_started.set()
+            assert release_close.wait(timeout=5)
+            super().close()
+
+    created: list[_SlowCloseEnvironment] = []
+
+    def _create(spec: OSEnvSpec, **kwargs: object) -> _SlowCloseEnvironment:
+        del kwargs
+        created.append(_SlowCloseEnvironment(spec=spec, cwd=Path(spec.cwd or ".")))
+        return created[-1]
+
+    monkeypatch.setattr(os_env_module, "create_os_environment", _create)
+    registry = SessionResourceRegistry()
+    old_spec = _agent_spec_with_sandbox_none(tmp_path / "old").os_env
+    new_spec = _agent_spec_with_sandbox_none(tmp_path / "new").os_env
+
+    first = await registry.lease_tool_environment("conv", old_spec)
+    assert first is not None
+    await first.release(reusable=True)
+
+    replacing = asyncio.create_task(registry.lease_tool_environment("conv", new_spec))
+    await asyncio.to_thread(close_started.wait, 5)
+    replacing.cancel()
+    release_close.set()
+    with pytest.raises(asyncio.CancelledError):
+        await replacing
+
+    lease = await registry.lease_tool_environment("conv", new_spec)
+    assert lease is not None
+    assert lease.environment is created[1]
+    await lease.release(reusable=True)
+    await registry.cleanup_session("conv")
+    assert created[0]._closed and created[1]._closed
+
+
+async def test_failed_tool_environment_replacement_keeps_the_old_one_owned(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A spec change whose environment cannot be built leaves the old one for cleanup."""
+    import omnigent.inner.os_env as os_env_module
+
+    def _create(spec: OSEnvSpec, **kwargs: object) -> _FakeOSEnvironment:
+        del kwargs
+        if spec.start_in_scratch:
+            raise ValueError("os_env.start_in_scratch requires an active sandbox")
+        return _FakeOSEnvironment(spec=spec, cwd=Path(spec.cwd or "."))
+
+    monkeypatch.setattr(os_env_module, "create_os_environment", _create)
+    registry = SessionResourceRegistry()
+    spec = _agent_spec_with_sandbox_none(tmp_path).os_env
+    first = await registry.lease_tool_environment("conv", spec)
+    assert first is not None
+    await first.release(reusable=True)
+
+    with pytest.raises(ValueError, match="start_in_scratch"):
+        await registry.lease_tool_environment("conv", replace(spec, start_in_scratch=True))
+
+    environment = first.environment
+    assert isinstance(environment, _FakeOSEnvironment)
+    assert not environment._closed
+    await registry.cleanup_session("conv")
+    assert environment._closed
+
+
+async def test_tool_environment_is_rebuilt_when_its_sandbox_resolves_differently(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged spec whose paths now resolve elsewhere gets a new environment."""
+    import omnigent.inner.os_env as os_env_module
+    import omnigent.runner.resource_registry as registry_module
+    from omnigent.inner.sandbox import resolve_sandbox
+
+    monkeypatch.setattr(
+        os_env_module,
+        "create_os_environment",
+        lambda spec, **kwargs: _FakeOSEnvironment(spec=spec, cwd=Path(spec.cwd or ".")),
+    )
+    masked = [tmp_path / "first"]
+    monkeypatch.setattr(
+        registry_module,
+        "resolve_sandbox",
+        lambda spec, cwd: replace(resolve_sandbox(spec, cwd), mask_paths=list(masked)),
+    )
+    registry = SessionResourceRegistry()
+    spec = _agent_spec_with_sandbox_none(tmp_path).os_env
+
+    first = await registry.lease_tool_environment("conv", spec)
+    assert first is not None
+    await first.release(reusable=True)
+    again = await registry.lease_tool_environment("conv", spec)
+    assert again is first
+    await again.release(reusable=True)
+
+    masked[0] = tmp_path / "retargeted"
+    rebuilt = await registry.lease_tool_environment("conv", spec)
+    assert rebuilt is not None and rebuilt is not first
+    assert isinstance(first.environment, _FakeOSEnvironment) and first.environment._closed
+    await rebuilt.release(reusable=True)
+    await registry.cleanup_session("conv")

@@ -569,6 +569,56 @@ def test_sandbox_hides_user_dotfiles_in_cwd(
     assert venv_read["stdout"] == "venv-allowed"
 
 
+def test_sandbox_helper_survives_sequential_requests(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+) -> None:
+    """Requests run on short-lived threads; the helper must outlive the one that spawned it."""
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", cwd=str(tmp_path), sandbox=active_sandbox_spec_factory()),
+        relaunch_when_stale=True,
+    )
+    # Each launch gets a fresh private scratch dir; PIDs are namespace-local under bwrap.
+    try:
+        scratch_dirs = {
+            run_async(os_env.shell("echo $TMPDIR"))["stdout"].strip() for _ in range(5)
+        }
+    finally:
+        os_env.close()
+
+    assert len(scratch_dirs) == 1
+
+
+def test_sandbox_hides_dotfiles_created_after_helper_start(
+    tmp_path: Path,
+    active_sandbox_spec_factory: Callable[..., OSEnvSandboxSpec],
+    sandbox_pythonpath_env: None,
+) -> None:
+    """A reused helper relaunches once a new dotfile needs masking."""
+    os_env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path),
+            sandbox=active_sandbox_spec_factory(),
+        ),
+        relaunch_when_stale=True,
+    )
+    # Each launch gets a fresh private scratch dir; PIDs are namespace-local under bwrap.
+    try:
+        first = run_async(os_env.shell("echo $TMPDIR"))
+        (tmp_path / ".env").write_text("OMNI_TEST_SECRET=late-secret-value-67890")
+        late_read = run_async(os_env.shell("cat .env 2>&1; echo $TMPDIR"))
+        settled = run_async(os_env.shell("echo $TMPDIR"))
+    finally:
+        os_env.close()
+
+    assert "late-secret-value-67890" not in late_read.get("stdout", "")
+    assert "late-secret-value-67890" not in late_read.get("stderr", "")
+    assert late_read["stdout"].split()[-1] != first["stdout"].strip()
+    assert settled["stdout"].strip() == late_read["stdout"].split()[-1]
+
+
 # ---------------------------------------------------------------------------
 # Network deny
 # ---------------------------------------------------------------------------
