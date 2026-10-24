@@ -234,4 +234,34 @@ async function runOrch(canned, opts) {
   assert("cap: labels capped to match", s.labels.length === MAX, String(s.labels.length));
   assert("load spread: second reviewer rotates across all 3 inner owners (not dogpiled on one)",
     new Set(s.requested.map((u) => u.toLowerCase())).size === 3, JSON.stringify([...new Set(s.requested)]));
+
+  // ---- orchestration: the cap is spent on the longest-waiting items ----
+  // The list endpoints return newest-first, so iterating them as given spends the
+  // per-run cap on the freshest breaches and never reaches the tail: with a steady
+  // inflow, the PRs that have waited longest are the ones that never get nudged.
+  // Feed them newest-first (as the API does) and expect the oldest to be served.
+  // `number` ascending == newest last; `created_at` makes 5000+0 the freshest.
+  const newestFirst = (base, start) => Array.from({ length: MAX + 5 }, (_, i) => ({
+    ...base, number: start + i, created_at: daysAgoIso(10 + i),
+  }));
+  const oldestServed = (items, served) => {
+    const want = items.slice().sort((a, b) => new Date(a.created_at) - new Date(b.created_at)).slice(0, MAX);
+    const got = new Set(served);
+    return want.every((x) => got.has(x.number)) && got.size === MAX;
+  };
+
+  const prsNewestFirst = newestFirst(stalePR, 4000);
+  s = await runOrch({
+    openPRs: prsNewestFirst, openIssues: [], timeline: [], comments: [], reviews: [], reviewComments: [],
+    files: [{ filename: "omnigent/inner/foo.py" }],
+  });
+  assert("cap is spent on the oldest PRs, not the newest",
+    oldestServed(prsNewestFirst, s.comments.map((c) => c.issue_number)),
+    `escalated ${JSON.stringify(s.comments.map((c) => c.issue_number))}`);
+
+  const issuesNewestFirst = newestFirst(staleIssue, 5000);
+  s = await runOrch({ openPRs: [], openIssues: issuesNewestFirst, timeline: [], comments: [] });
+  assert("cap is spent on the oldest issues, not the newest",
+    oldestServed(issuesNewestFirst, s.comments.map((c) => c.issue_number)),
+    `escalated ${JSON.stringify(s.comments.map((c) => c.issue_number))}`);
 })();

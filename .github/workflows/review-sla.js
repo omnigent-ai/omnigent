@@ -1,9 +1,9 @@
 // Reviewer SLA sweep: nudge + escalate open PRs and issues that a MAINTAINER has
 // been sitting on for more than SLA_DAYS *working* days without replying.
 //
-// Runs on a schedule from the trusted default branch (see review-sla.yml), so it
-// reads no PR-authored code and just talks to the issues/PRs API. For each open,
-// non-draft item:
+// Runs on manual dispatch only, from the trusted default branch (see
+// review-sla.yml -- there is no `schedule:` trigger), so it reads no PR-authored
+// code and just talks to the issues/PRs API. For each open, non-draft item:
 //   - PRs: the "assigned person" is any maintainer in requested_reviewers (GitHub
 //     drops them from that list the moment they submit a review, so being in it
 //     means "still owes a review"). The clock starts at their latest
@@ -43,9 +43,11 @@ const SLA_DAYS = 5; // working days
 const LABEL = "review-sla-escalated";
 const MARKER = "<!-- review-sla-bot -->"; // idempotency fallback if the label write fails
 const CANONICAL_REPO = "omnigent-ai/omnigent";
-// Max escalations per sweep. Bounds the day-one blast against an existing stale
-// backlog (and any future surge): the backlog drains a chunk per weekday instead
-// of nudging everything at once. PRs are processed before issues.
+// Max escalations per sweep. Bounds the blast against an existing stale backlog
+// (and any future surge): one dispatch drains a chunk instead of nudging
+// everything at once, so draining it fully takes several runs. Both sweeps are
+// ordered oldest-first so those runs serve the longest-waiting items. PRs are
+// processed before issues.
 // ponytail: single global cap; split into per-kind caps if issue nudges starving
 // behind a large PR backlog ever matters.
 const MAX_ESCALATIONS_PER_RUN = 30;
@@ -243,6 +245,12 @@ async function run({ github, context, core }) {
 
   // ----- PRs: awaiting a maintainer's review -----
   const openPRs = await github.paginate(github.rest.pulls.list, { owner, repo, state: "open", per_page: 100 });
+  // Oldest first. The cap means one sweep serves only part of the backlog, so it
+  // has to be spent on the longest-waiting PRs; the endpoint returns newest first,
+  // which spends it on the freshest breaches and never reaches the tail at all.
+  // Sorted here rather than asked of the API so the order holds whatever the
+  // endpoint's default direction is.
+  openPRs.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
   const load = buildLoad(openPRs);
   // Count each second reviewer/assignee we add during THIS sweep against the load
   // map, so successive picks rotate instead of dogpiling the current lowest-load
@@ -291,6 +299,8 @@ async function run({ github, context, core }) {
 
   // ----- Issues: awaiting a maintainer assignee -----
   const openIssues = await github.paginate(github.rest.issues.listForRepo, { owner, repo, state: "open", per_page: 100 });
+  // Oldest first, for the same reason as the PR sweep above.
+  openIssues.sort((a, b) => new Date(a.created_at) - new Date(b.created_at));
   for (const issue of openIssues) {
     if (capReached()) break;
     if (issue.pull_request || hasLabel(issue)) continue; // listForRepo also returns PRs
