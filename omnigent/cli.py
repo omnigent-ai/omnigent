@@ -692,6 +692,8 @@ _LOCAL_DAEMON_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "ANTHROPIC_AUTH_TOKEN",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_BEDROCK_BASE_URL",
+        # Gateway virtual keys ride here; the host forwards them to runners.
+        "ANTHROPIC_CUSTOM_HEADERS",
         "AWS_BEARER_TOKEN_BEDROCK",
         # M8 (security 2026-07-15): CLAUDE_CODE_OAUTH_TOKEN is listed in
         # HARNESS_CREDENTIAL_ENV_VARS (connect.py) for forwarding host->runner,
