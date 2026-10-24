@@ -250,6 +250,32 @@ def test_label_collapse_preserves_submit_geometry(
     assert_same_vertical_center(box(leading), box(_submit(page, surface)))
 
 
+def test_landing_without_a_host_keeps_submit_inside_the_card(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """The no-host placeholder collapses alongside the other labels on a phone."""
+    chat = chat_session_contract
+    chat.contract.json("/v1/hosts", {"hosts": []})
+    open_landing(page, chat, {"width": 393, "height": PHONE["height"]})
+    row = page.get_by_test_id("new-chat-landing-actions")
+    picker = page.get_by_test_id("new-chat-landing-agent-select")
+    label = page.get_by_test_id("new-chat-landing-agent-config-value")
+    expect(picker).to_have_accessible_name("No host selected")
+    expect(row).to_have_attribute("data-labels", "collapsed")
+    expect(label).to_be_hidden()
+    card = box(page.locator("[data-composer-card]"))
+    submit = box(_submit(page, "landing"))
+    assert_within_viewport(submit, 393)
+    assert right_inset(card, submit) == pytest.approx(13, abs=TOLERANCE)
+    assert_same_vertical_center(box(page.get_by_test_id("new-chat-landing-attach")), submit)
+
+    page.set_viewport_size(DESKTOP)
+    expect(row).not_to_have_attribute("data-labels", "collapsed")
+    expect(label).to_be_visible()
+    expect(label).to_have_text("No host selected")
+
+
 @pytest.mark.parametrize("surface", ["landing", "live"])
 def test_attachment_chips_follow_the_row_grid(
     page: Page,

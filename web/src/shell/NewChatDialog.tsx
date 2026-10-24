@@ -1891,7 +1891,9 @@ export function AgentHarnessPicker({
             ? (visibleCachedPreview?.effort ?? triggerSecondaryText)
             : undefined,
         icon:
-          disabledLabel !== undefined ? undefined : selectedUnavailable ? (
+          disabledLabel !== undefined ? (
+            <CircleHelpIcon className="size-4 shrink-0" aria-hidden="true" />
+          ) : selectedUnavailable ? (
             <span
               className="flex size-4 shrink-0 items-center justify-center text-amber-700 dark:text-amber-300"
               data-testid="new-chat-landing-agent-warning"
