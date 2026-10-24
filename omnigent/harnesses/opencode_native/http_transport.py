@@ -23,7 +23,7 @@ from omnigent.harnesses.opencode_native.app_server import (
     client_for_state,
     opencode_terminal_env,
 )
-from omnigent.harnesses.opencode_native.bridge import read_bridge_state
+from omnigent.harnesses.opencode_native.bridge import read_bridge_state, split_model_variant
 from omnigent.harnesses.opencode_native.client import OpenCodeClient
 from omnigent.native.native_server_transport import (
     NativeEvent,
@@ -53,7 +53,10 @@ def build_prompt_payload(prompt: NativePrompt) -> _JsonObject:
 
     :param prompt: The normalized prompt.
     :returns: A ``{"parts": [...], ...}`` body for ``POST
-        /session/{id}/message`` or ``/prompt_async``.
+        /session/{id}/message`` or ``/prompt_async``. Carries a top-level
+        ``variant`` when the prompt pins one — explicitly via
+        :attr:`NativePrompt.variant` or through a ``model#variant`` suffix
+        (the explicit pin wins on conflict).
     """
     parts: list[_JsonObject] = []
     if prompt.text:
@@ -65,9 +68,23 @@ def build_prompt_payload(prompt: NativePrompt) -> _JsonObject:
     payload: _JsonObject = {"parts": parts}
     if prompt.system_prompt:
         payload["system"] = prompt.system_prompt
-    model = _split_model(prompt.model)
+    model_id: str | None = prompt.model
+    suffix_variant: str | None = None
+    if model_id:
+        model_id, suffix_variant = split_model_variant(model_id)
+    model = _split_model(model_id)
     if model is not None:
         payload["model"] = model
+    variant = prompt.variant or suffix_variant
+    if variant:
+        if prompt.variant and suffix_variant and prompt.variant != suffix_variant:
+            _logger.warning(
+                "opencode prompt pins variant %r explicitly and %r via the model id; using %r",
+                prompt.variant,
+                suffix_variant,
+                prompt.variant,
+            )
+        payload["variant"] = variant
     return payload
 
 

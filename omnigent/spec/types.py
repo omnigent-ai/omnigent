@@ -566,6 +566,13 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
         key. Used by harness spawn-env builders, context-window
         auto-detection, telemetry, and tool-provider inference.
         ``None`` only when no model is declared anywhere in the spec.
+    :param variant: Optional model-variant pin, e.g. ``"max"`` or
+        ``"xhigh"``. Populated by the parser from the
+        ``executor.variant`` YAML key. Consumed by harnesses whose
+        serve accepts a per-prompt variant (opencode-native sends it
+        as the top-level ``variant`` key alongside ``model``); wins
+        over a ``provider/model#variant`` suffix on the model id when
+        both are declared. ``None`` = no variant pin.
     :param reasoning_effort: Default reasoning level for this agent,
         e.g. ``"high"``. Populated by the parser from either the
         ``executor.reasoning_effort`` YAML key or (for backward
@@ -619,6 +626,10 @@ class ExecutorSpec:  # type: ignore[explicit-any]  # config: dict[str, Any] fiel
     # Primary model identifier for all executor types. Populated by
     # the parser from executor.model or (backward compat) llm.model.
     model: str | None = None
+    # Model-variant pin for harnesses that accept one (opencode-native's
+    # top-level prompt ``variant`` key). Populated from executor.variant;
+    # wins over a ``model#variant`` suffix when both are declared.
+    variant: str | None = None
     # Spec-level default reasoning effort, applied when no per-dispatch
     # value asks for one. Populated from executor.reasoning_effort or
     # (backward compat) llm.reasoning_effort.
