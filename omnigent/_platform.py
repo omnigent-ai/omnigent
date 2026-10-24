@@ -116,7 +116,9 @@ def resolve_cli_binary(
         return on_path
     for directory in _cli_fallback_dirs():
         candidate = directory / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
+        # os.path.isfile reads an unsearchable dir (EACCES) as "not there";
+        # Path.is_file raises PermissionError there on Python 3.12/3.13.
+        if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return str(candidate)
     return None
 
