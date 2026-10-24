@@ -991,6 +991,8 @@ class SqlConversationItem(ConversationBase):
 # (and the session-status error-label path) can clamp values to fit instead
 # of letting an over-length write raise ``DataError`` on PostgreSQL.
 LABEL_VALUE_MAX_LEN = 256
+# Width of the ``conversation_labels.key`` column.
+LABEL_KEY_MAX_LEN = 128
 
 
 class SqlConversationLabel(ConversationBase):
@@ -1037,7 +1039,7 @@ class SqlConversationLabel(ConversationBase):
         Uuid16(),
         primary_key=True,
     )
-    key: Mapped[str] = mapped_column(String(128), primary_key=True)
+    key: Mapped[str] = mapped_column(String(LABEL_KEY_MAX_LEN), primary_key=True)
     value: Mapped[str] = mapped_column(String(LABEL_VALUE_MAX_LEN))
     updated_at: Mapped[int] = mapped_column(Integer)
 

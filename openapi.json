@@ -9871,7 +9871,14 @@
             "anyOf": [
               {
                 "additionalProperties": {
-                  "type": "string"
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
                 },
                 "type": "object"
               },
@@ -9879,7 +9886,7 @@
                 "type": "null"
               }
             ],
-            "description": "Guardrails labels to upsert. Merges with existing labels; keys not present are left untouched.",
+            "description": "Guardrails labels to upsert. Merges with existing labels; keys not present are left untouched. A `null` value deletes that label. Server-internal keys stay rejected whether set or deleted.",
             "title": "Labels"
           },
           "model_override": {
