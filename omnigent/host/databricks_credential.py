@@ -39,11 +39,15 @@ import logging
 import os
 import shlex
 import sys
+import time
+import uuid
+from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING
 
 import httpx
 
+from omnigent.debug_logging import debug_event
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
 
 if TYPE_CHECKING:
@@ -52,6 +56,9 @@ if TYPE_CHECKING:
 _logger = logging.getLogger(__name__)
 
 _TIMEOUT_S = 15.0
+_token_helper_attempt: ContextVar[str | None] = ContextVar(
+    "broker_token_helper_attempt", default=None
+)
 
 # The profile our host section is written under. Distinct from any ambient
 # profile so merging never clobbers an operator's existing sections.
@@ -70,21 +77,90 @@ def _credential_url(server: str, host_id: str) -> str:
 
 
 def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
-    """Fetch the broker JSON, or ``None`` on any failure."""
+    """Fetch and validate the broker reply; ``None`` on any failure or malformed body.
+
+    A connected reply must be a JSON object with a boolean ``connected`` and
+    non-empty string ``workspace_host`` and ``token``; a not-connected object is
+    returned as-is. Each attempt is logged with bounded outcome and latency
+    metadata: the host logger records every outcome (DEBUG for a fast success),
+    while the auth command echoes only INFO-and-above outcomes as one stderr
+    JSON line so a fast success stays silent.
+    """
+    started = time.monotonic()
+    helper_attempt = _token_helper_attempt.get()
+    attempt_id = helper_attempt or uuid.uuid4().hex
+    outcome = "unexpected_error"
+    status = None
+    error_type = None
     try:
-        resp = httpx.get(
-            _credential_url(server, host_id),
-            headers={MANAGED_HOST_TOKEN_HEADER: host_token},
-            timeout=_TIMEOUT_S,
-        )
-    except httpx.HTTPError:
-        return None
-    if resp.status_code != 200:
-        return None
-    try:
-        return resp.json()
-    except ValueError:
-        return None
+        try:
+            resp = httpx.get(
+                _credential_url(server, host_id),
+                headers={MANAGED_HOST_TOKEN_HEADER: host_token},
+                timeout=_TIMEOUT_S,
+            )
+        except (httpx.HTTPError, httpx.InvalidURL) as exc:
+            outcome = "transport_error"
+            error_type = type(exc).__name__
+            return None
+        status = resp.status_code
+        if status != 200:
+            outcome = "http_error"
+            return None
+        try:
+            data = resp.json()
+        except ValueError:
+            outcome = "invalid_json"
+            return None
+        if not isinstance(data, dict) or type(data.get("connected")) is not bool:
+            outcome = "invalid_response"
+            return None
+        if not data["connected"]:
+            outcome = "not_connected"
+            return data
+        if any(
+            not isinstance(data.get(key), str) or not data[key].strip()
+            for key in ("workspace_host", "token")
+        ):
+            outcome = "invalid_credentials"
+            return None
+        outcome = "success"
+        return data
+    finally:
+        elapsed_ms = round((time.monotonic() - started) * 1000)
+        level = logging.DEBUG if outcome == "success" else logging.INFO
+        if outcome not in {"success", "not_connected"}:
+            level = logging.WARNING
+        elif elapsed_ms >= 1000:
+            level = logging.INFO
+        # A diagnostic sink must not interrupt credential delivery.
+        with contextlib.suppress(Exception):
+            attrs = {
+                "host_id": host_id,
+                "credential_scope": "host_inference_broker",
+                "broker_attempt_id": attempt_id,
+                "outcome": outcome,
+                "http_status": status,
+                "error_type": error_type,
+                "elapsed_ms": elapsed_ms,
+                "timeout_s": _TIMEOUT_S,
+            }
+            if helper_attempt is not None:
+                # Auth-command stdout is a token protocol, even with console logging enabled.
+                if level >= logging.INFO:
+                    print(
+                        json.dumps({"event_name": "databricks_broker_request", **attrs}),
+                        file=sys.stderr,
+                    )
+            else:
+                _logger.log(
+                    level,
+                    "Databricks broker request finished: outcome=%s status=%s elapsed_ms=%d",
+                    outcome,
+                    status,
+                    elapsed_ms,
+                    extra=debug_event("databricks_broker_request", **attrs),
+                )
 
 
 def fetch_broker_bearer(server: str, host_id: str, host_token: str) -> tuple[str, str] | None:
@@ -97,8 +173,8 @@ def fetch_broker_bearer(server: str, host_id: str, host_token: str) -> tuple[str
     data = _fetch(server, host_id, host_token)
     if not data or not data.get("connected"):
         return None
-    workspace_host = str(data.get("workspace_host") or "").rstrip("/")
-    bearer = str(data.get("token") or "")
+    workspace_host = data["workspace_host"].rstrip("/")
+    bearer = data["token"]
     if not workspace_host or not bearer:
         return None
     return workspace_host, bearer
@@ -327,7 +403,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.workspace and coords["workspace_host"].rstrip("/") != args.workspace.rstrip("/"):
         return 1
-    resolved = fetch_broker_bearer(coords["server"], coords["host_id"], coords["host_token"])
+    helper_token = _token_helper_attempt.set(uuid.uuid4().hex)
+    try:
+        resolved = fetch_broker_bearer(coords["server"], coords["host_id"], coords["host_token"])
+    finally:
+        _token_helper_attempt.reset(helper_token)
     if resolved is None:
         return 0
     refreshed_host, bearer = resolved
