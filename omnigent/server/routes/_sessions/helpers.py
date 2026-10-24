@@ -6076,6 +6076,44 @@ _RELAUNCH_MEMO_MAX = 512
 _detached_supersede_stops: set[asyncio.Task[None]] = set()
 
 
+async def _ancestor_shares_runner(
+    session_id: str,
+    runner_id: str,
+    conversation_store: ConversationStore,
+) -> bool:
+    """Whether any ancestor of ``session_id`` runs on ``runner_id``.
+
+    A sub-agent inherits its parent's runner at creation, and carries a
+    ``host_id`` too when its create named one, so ``host_id`` alone doesn't
+    say whose runner it is. The ancestor owns it: stopping it on the child's
+    behalf takes the parent and every sibling down.
+
+    :param session_id: Session/conversation identifier.
+    :param runner_id: The runner the session is bound to.
+    :param conversation_store: Store for the session and ancestor rows.
+    :returns: ``True`` when an ancestor is bound to the same runner.
+    """
+    conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+    if conv is None:
+        return False
+    # Walk the whole parent chain; the root still counts if a link is missing.
+    seen = {session_id}
+    ancestor_id = conv.parent_conversation_id
+    root_id = conv.root_conversation_id
+    while ancestor_id and ancestor_id not in seen:
+        seen.add(ancestor_id)
+        ancestor = await asyncio.to_thread(conversation_store.get_conversation, ancestor_id)
+        if ancestor is None:
+            break
+        if ancestor.runner_id == runner_id:
+            return True
+        ancestor_id = ancestor.parent_conversation_id
+    if root_id and root_id not in seen:
+        root = await asyncio.to_thread(conversation_store.get_conversation, root_id)
+        return root is not None and root.runner_id == runner_id
+    return False
+
+
 def _spawn_superseded_runner_stop(
     session_id: str,
     host_id: str,
@@ -6227,10 +6265,16 @@ async def _launch_runner_on_host_locked(
         ),
     )
     with runner_log_scope(conv.id, new_runner_id):
-        if superseded_runner_id and conv.host_id is not None:
+        if (
+            superseded_runner_id
+            and conv.host_id is not None
+            and not await _ancestor_shares_runner(
+                conv.id, superseded_runner_id, conversation_store
+            )
+        ):
             # The old runner is unbound as of the replace above; reap it so it
-            # doesn't idle on the host forever (tunnel still authenticating,
-            # forwarder still tailing this session).
+            # doesn't idle on the host forever. A runner the parent still uses
+            # isn't this session's to stop.
             _spawn_superseded_runner_stop(
                 conv.id, conv.host_id, superseded_runner_id, host_registry
             )

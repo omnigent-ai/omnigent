@@ -248,6 +248,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
 # primitives) live in _sessions.helpers.
 from omnigent.server.routes._sessions.helpers import (
     SessionLiveness,
+    _ancestor_shares_runner,
     _antigravity_subagent_labels_from_body,
     _antigravity_subagent_title,
     _await_settled_managed_launch,
@@ -819,8 +820,13 @@ async def _stop_host_runner_intentionally(
     Relays consume their own markers; the disconnect sweep settles sessions
     without a relay. Definitive rejection removes newly added markers, while
     an unacknowledged dispatch retains intent through timeout or cancellation.
+    A runner an ancestor shares is left running and reported stopped: the
+    session's own turn was already stopped through it.
     """
     from omnigent.server.routes import sessions as _facade
+
+    if await _ancestor_shares_runner(session_id, runner_id, conversation_store):
+        return True
 
     # An unsuccessful concurrent stop must not roll back a delivered stop's intent.
     lock = _intentional_runner_stop_locks.setdefault(runner_id, asyncio.Lock())
@@ -940,6 +946,9 @@ async def _archive_stop(
     "working" against a dead pane — the failure
     :func:`_stop_session_host_runner` exists to prevent.
 
+    A sub-agent on its ancestor's runner doesn't own it: archive releases
+    only the sub-agent's session on that runner, and the ancestor keeps it.
+
     Every step is best-effort: a wedged, offline, or already-stopped
     runner must not leave the session un-archived.
 
@@ -996,7 +1005,23 @@ async def _archive_stop(
     _pending_archive_stops.pop(session_id, None)
 
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
-    if conv.host_id and conv.runner_id:
+    if conv.runner_id and await _ancestor_shares_runner(
+        session_id, conv.runner_id, conversation_store
+    ):
+        # The ancestor keeps the runner; release only this session's harness on it.
+        try:
+            runner_client = await _get_runner_client(session_id, runner_router)
+            if runner_client is not None:
+                resp = await runner_client.delete(f"/v1/sessions/{session_id}", timeout=60.0)
+                resp.raise_for_status()
+        except (httpx.HTTPError, ConnectionError):
+            _logger.warning(
+                "Archive couldn't release %s on its ancestor's runner",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+    elif conv.host_id and conv.runner_id:
         try:
             await _stop_host_runner_intentionally(
                 session_id,

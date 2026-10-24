@@ -1773,8 +1773,9 @@ def register_events_routes(
                         "Couldn't release the side chat's resources. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     ) from exc
-            # Only the host-bound parent owns the shared runner. Stopping
-            # that process disconnects all its chats; child bindings keep it alive.
+            # Only the session that owns the runner stops it. Stopping that
+            # process disconnects all its chats; a sub-agent on its ancestor's
+            # runner leaves it running (_stop_host_runner_intentionally).
             stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
             if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
                 stop_host_registry = getattr(request.app.state, "host_registry", None)
