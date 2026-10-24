@@ -36,7 +36,6 @@ import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { dropTrailingPartialEscape, showControlCharacters, stripAnsi } from "@/lib/ansi";
-import { shellCommandPreview, shellCommandStarts } from "@/lib/shellCommandLines";
 import { type ShellOutputFormat, parseShellToolOutput } from "@/lib/shellToolOutput";
 import { terminalSurfaceStyle } from "@/lib/terminalPalette";
 import { iconForTool } from "@/lib/toolIcon";
@@ -45,6 +44,7 @@ import {
   type ToolTitle,
   formatToolRunLabel,
   formatToolTitle,
+  shellCommandPreview,
   shellToolCall,
   splitEnvPrefix,
 } from "@/lib/toolTitle";
@@ -435,13 +435,6 @@ function ShellTerminalPanel({
   // just this block then, and otherwise keep the app's own palette.
   let pinnedScheme: CodeColorScheme | undefined;
   if (terminalIsDark !== appIsDark) pinnedScheme = terminalIsDark ? "dark" : "light";
-  const commandLineClasses = useMemo(
-    () =>
-      shellCommandStarts(command).map((starts) =>
-        starts ? SHELL_PROMPT_LINE_CLASS : SHELL_CONTINUATION_LINE_CLASS,
-      ),
-    [command],
-  );
   const parsed = useMemo(
     () => (output === null ? null : parseShellToolOutput(output, outputFormat)),
     [output, outputFormat],
@@ -499,14 +492,13 @@ function ShellTerminalPanel({
             {actions}
           </div>
         )}
-        {/* The `$` prompts are pseudo-elements so selecting or copying the command skips them. */}
-        <div style={SHELL_PROMPT_STYLE}>
+        {/* The `$` prompt is a pseudo-element so selecting or copying the command skips it. */}
+        <div className={SHELL_COMMAND_LINES_CLASS} style={SHELL_PROMPT_STYLE}>
           <CodeBlockContent
             code={command}
             language="bash"
             wrap={wrap}
             colorScheme={pinnedScheme}
-            lineClassNames={commandLineClasses}
             className={cn(
               TERMINAL_PRE_CLASS,
               actionsBesideCommand && wrap ? "pt-2 pb-1 @max-[480px]/shell:pt-1" : "pt-1 pb-1",
@@ -573,11 +565,10 @@ function ShellTerminalPanel({
 // A non-breaking space keeps the prompt on the same line as the first word.
 const SHELL_PROMPT_STYLE = { "--shell-prompt": '"$\u00a0"' } as CSSProperties;
 
-// Each command gets a prompt; its continuation lines and wrapped text indent
-// past the prompt so they don't read as separate commands.
-const SHELL_PROMPT_LINE_CLASS =
-  "pl-[2ch] -indent-[2ch] before:font-semibold before:text-muted-foreground before:content-[var(--shell-prompt)]";
-const SHELL_CONTINUATION_LINE_CLASS = "pl-[2ch]";
+// One prompt for the whole script, like a pasted block in a terminal. Wrapped
+// text indents past it so it doesn't read as a new line.
+const SHELL_COMMAND_LINES_CLASS =
+  "[&_code>span]:pl-[2ch] [&_code>span]:-indent-[2ch] [&_code>span:first-child]:before:font-semibold [&_code>span:first-child]:before:text-muted-foreground [&_code>span:first-child]:before:content-[var(--shell-prompt)]";
 
 // Command and output share the panel's own background so the block reads as
 // one continuous terminal surface instead of stacked code panels.

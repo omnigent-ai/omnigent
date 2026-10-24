@@ -112,14 +112,12 @@ const LineSpan = ({
   keyedLine,
   showLineNumbers,
   colorScheme,
-  className,
 }: {
   keyedLine: KeyedLine;
   showLineNumbers: boolean;
   colorScheme: CodeColorScheme | undefined;
-  className: string | undefined;
 }) => (
-  <span className={cn(showLineNumbers ? LINE_NUMBER_CLASSES : "block", className)}>
+  <span className={showLineNumbers ? LINE_NUMBER_CLASSES : "block"}>
     {keyedLine.tokens.length === 0
       ? "\n"
       : keyedLine.tokens.map(({ token, key }) => (
@@ -283,13 +281,11 @@ const CodeBlockBody = memo(
     showLineNumbers,
     className,
     colorScheme,
-    lineClassNames,
   }: {
     tokenized: TokenizedCode;
     showLineNumbers: boolean;
     className?: string;
     colorScheme?: CodeColorScheme;
-    lineClassNames?: readonly (string | undefined)[];
   }) => {
     const preStyle = useMemo(
       () => ({
@@ -316,13 +312,12 @@ const CodeBlockBody = memo(
             showLineNumbers && "[counter-increment:line_0] [counter-reset:line]",
           )}
         >
-          {keyedLines.map((keyedLine, lineIndex) => (
+          {keyedLines.map((keyedLine) => (
             <LineSpan
               key={keyedLine.key}
               keyedLine={keyedLine}
               showLineNumbers={showLineNumbers}
               colorScheme={colorScheme}
-              className={lineClassNames?.[lineIndex]}
             />
           ))}
         </code>
@@ -333,8 +328,7 @@ const CodeBlockBody = memo(
     prevProps.tokenized === nextProps.tokenized &&
     prevProps.showLineNumbers === nextProps.showLineNumbers &&
     prevProps.className === nextProps.className &&
-    prevProps.colorScheme === nextProps.colorScheme &&
-    prevProps.lineClassNames === nextProps.lineClassNames,
+    prevProps.colorScheme === nextProps.colorScheme,
 );
 
 CodeBlockBody.displayName = "CodeBlockBody";
@@ -410,7 +404,6 @@ export const CodeBlockContent = ({
   className,
   leading,
   colorScheme,
-  lineClassNames,
 }: {
   code: string;
   language: CodeLanguage;
@@ -423,8 +416,6 @@ export const CodeBlockContent = ({
   leading?: ReactNode;
   /** Pin token colors to one scheme; by default they follow the app's. */
   colorScheme?: CodeColorScheme;
-  /** Classes for each line by index; keep the array stable across renders. */
-  lineClassNames?: readonly (string | undefined)[];
 }) => {
   // Memoized raw tokens for immediate display
   // Raw ANSI escapes would flash on screen until the highlighter loads.
@@ -476,7 +467,6 @@ export const CodeBlockContent = ({
         showLineNumbers={showLineNumbers}
         tokenized={tokenized}
         colorScheme={colorScheme}
-        lineClassNames={lineClassNames}
       />
     </div>
   );

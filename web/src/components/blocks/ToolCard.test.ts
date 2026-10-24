@@ -405,9 +405,8 @@ describe("ToolCard shell terminal panel", () => {
     expect(dimmed?.textContent).toBe('PATH="/opt/bin:$PATH" ');
   });
 
-  it("prompts each command of a multi-line script", () => {
-    // WHY: newlines collapsed into spaces made separate commands read as one,
-    // and wrapped or continued lines looked like commands of their own.
+  it("shows a multi-line script's first line and line count in the row", () => {
+    // WHY: newlines collapsed into spaces made separate commands read as one.
     const { container } = renderCard({
       name: "Bash",
       arguments: { command: "git diff --check\ngit add a \\\n  b\ngit status" },
@@ -416,11 +415,6 @@ describe("ToolCard shell terminal panel", () => {
     });
     const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
     expect(trigger.textContent).toBe("git diff --check +3 lines");
-
-    expand(container);
-    const lines = screen.getByTestId("shell-tool-terminal").querySelectorAll("pre code > span");
-    const prompted = [...lines].map((line) => line.className.includes("--shell-prompt"));
-    expect(prompted.slice(0, 4)).toEqual([true, true, false, true]);
   });
 });
 

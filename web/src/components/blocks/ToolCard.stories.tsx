@@ -231,7 +231,7 @@ export const ShellAnsiColors: Story = {
 const multiLineScript = [
   "git diff --check",
   "git status --short",
-  "git add web/src/lib/shellCommandLines.ts web/src/lib/shellCommandLines.test.ts " +
+  "git add web/src/lib/format.ts web/src/lib/format.test.ts " +
     "web/src/components/blocks/ToolCard.tsx web/src/components/blocks/ToolCard.test.ts",
   "cat > /tmp/commit-message.txt <<'EOF'",
   "fix(web): prompt each shell command",
@@ -240,13 +240,13 @@ const multiLineScript = [
   "  -F /tmp/commit-message.txt > /tmp/commit.log 2>&1",
 ].join("\n");
 
-// Every command gets a prompt; heredoc bodies, `\` continuations and wrapped
-// text indent under it instead.
+// The row shows the first line and a line count; the panel keeps one prompt,
+// and wrapped text indents under it.
 export const ShellMultiLineScript: Story = {
   args: {
     name: "Bash",
     arguments: { command: multiLineScript },
-    output: " M web/src/components/blocks/ToolCard.tsx\n?? web/src/lib/shellCommandLines.ts",
+    output: " M web/src/components/blocks/ToolCard.tsx\n?? web/src/lib/format.ts",
     state: "output-available",
     startedAt: null,
     duration: 0.31,

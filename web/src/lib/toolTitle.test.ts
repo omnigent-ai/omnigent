@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import { formatToolRunLabel, formatToolTitle, shellToolCall, splitEnvPrefix } from "./toolTitle";
+import {
+  formatToolRunLabel,
+  formatToolTitle,
+  shellCommandPreview,
+  shellToolCall,
+  splitEnvPrefix,
+} from "./toolTitle";
 
 describe("formatToolTitle", () => {
   it("strips sys_os_shell down to the command string with no bold verb", () => {
@@ -388,5 +394,39 @@ describe("splitEnvPrefix", () => {
     ["FOO=a|b cmd", { env: "", rest: "FOO=a|b cmd" }],
   ])("splits %s", (command, expected) => {
     expect(splitEnvPrefix(command)).toEqual(expected);
+  });
+});
+
+describe("shellCommandPreview", () => {
+  it("shows a one-line command as it is", () => {
+    expect(shellCommandPreview("ls -la")).toEqual({ firstLine: "ls -la", moreLines: 0 });
+  });
+
+  it("counts the non-blank lines after the first", () => {
+    expect(shellCommandPreview("git diff --check\n\ngit status --short\nls\n")).toEqual({
+      firstLine: "git diff --check",
+      moreLines: 2,
+    });
+  });
+
+  it("drops a trailing backslash from the first line", () => {
+    expect(shellCommandPreview("pnpm test \\\n  --filter web")).toEqual({
+      firstLine: "pnpm test",
+      moreLines: 1,
+    });
+  });
+
+  it("skips leading comment lines", () => {
+    expect(shellCommandPreview("# Inspect the tree\ngit status")).toEqual({
+      firstLine: "git status",
+      moreLines: 1,
+    });
+  });
+
+  it("keeps a comment-only script", () => {
+    expect(shellCommandPreview("# nothing to run\n")).toEqual({
+      firstLine: "# nothing to run",
+      moreLines: 0,
+    });
   });
 });
