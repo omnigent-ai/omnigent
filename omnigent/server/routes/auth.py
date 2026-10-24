@@ -69,6 +69,9 @@ _logger = logging.getLogger(__name__)
 _AUTH_STATE_COOKIE_SECURE = "__Host-ap_auth_state"
 _AUTH_STATE_COOKIE_PLAIN = "ap_auth_state"
 _AUTH_STATE_TTL_SECONDS = 300  # 5 minutes
+# Entra caps a max_age=0 id_token's exp at auth_time + 1, so it has expired by the
+# callback; tolerate expiry for as long as the login's auth state remains valid.
+_ID_TOKEN_LEEWAY_SECONDS = _AUTH_STATE_TTL_SECONDS
 _CLI_TICKET_TTL_SECONDS = 300  # 5 minutes
 # An upgrade notice, never a key in the login-ticket store.
 _CLI_UPGRADE_TICKET = "upgrade-required"
@@ -1504,6 +1507,7 @@ def _validate_id_token(
             algorithms=["RS256", "RS384", "RS512", "PS256", "ES256", "ES384", "ES512"],
             audience=config.client_id,
             issuer=config.issuer,
+            leeway=_ID_TOKEN_LEEWAY_SECONDS,
         )
     except jwt.InvalidTokenError as exc:
         _logger.warning("id_token validation failed: %s", exc)
