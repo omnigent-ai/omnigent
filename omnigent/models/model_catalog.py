@@ -665,6 +665,10 @@ def _resolve_model_provider_unsafe(spec: object, harness: str | None) -> Resolve
                 base_url=base_url,
                 detail="Claude Code managed settings",
             )
+    if provider.kind == NONE_KIND and canonical_harness == "antigravity-native":
+        # The native agy TUI runs on its own login (~/.gemini OAuth or GEMINI_API_KEY)
+        # when Omnigent resolves no credential, so it is a CLI login, not a dead worker.
+        return ResolvedModelProvider(kind=SUBSCRIPTION_KIND, cli="agy", detail="agy CLI login")
     return provider
 
 
