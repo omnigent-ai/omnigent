@@ -11,6 +11,10 @@ Also covers DB-stored default policies (``session_id IS NULL``) and the
 
 from __future__ import annotations
 
+import logging
+from typing import Any
+
+import cachetools
 import pytest
 
 from omnigent.entities import Policy as StoredPolicy
@@ -183,6 +187,54 @@ def test_invalidate_session_policy_specs_cache(db_uri: str) -> None:
 
     second = _load_session_policy_specs(conv.id, store)
     assert len(second) == 2
+
+
+class _CorruptedTTLCache(cachetools.TTLCache[Any, Any]):
+    """TTLCache whose expiry links are broken, as after unlocked writes."""
+
+    def __init__(self) -> None:
+        super().__init__(maxsize=64, ttl=30)
+
+    def expire(self, time: Any = None) -> Any:
+        raise KeyError((0, "conv_corrupted"))
+
+
+def test_corrupted_session_cache_falls_back_to_db_and_resets(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A raising session-policy cache never fails the engine build.
+
+    The DB specs are still enforced, a warning is logged, and the
+    corrupted backing is replaced so later builds cache normally again.
+
+    :param db_uri: Per-test SQLite URI from the root conftest.
+    """
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.create_conversation()
+    policy_store = SqlAlchemyPolicyStore(db_uri)
+    policy_store.create(
+        policy_id="3f0c2b8e6a9d4e1f8b7a6c5d4e3f2a1b",
+        session_id=conv.id,
+        name="survives_corruption",
+        type="python",
+        handler="tests.resources.examples._shared.tool_functions.block_long_sleep",
+    )
+    corrupted = _CorruptedTTLCache()
+    monkeypatch.setattr(_SESSION_POLICY_SPECS_CACHE, "_backing", corrupted)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.db.workspace_cache"):
+        engine = build_policy_engine(
+            spec=_make_minimal_spec(),
+            conversation_id=conv.id,
+            conversation_store=conv_store,
+            policy_store=policy_store,
+        )
+
+    assert engine.policies[0].spec.name == "survives_corruption"
+    assert "Resetting workspace-scoped cache" in caplog.text
+    assert _SESSION_POLICY_SPECS_CACHE._backing is not corrupted
+    first = _load_session_policy_specs(conv.id, policy_store)
+    assert _load_session_policy_specs(conv.id, policy_store) is first
 
 
 def test_load_session_policy_specs_filters_disabled(db_uri: str) -> None:
