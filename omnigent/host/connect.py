@@ -5465,15 +5465,6 @@ def _serve_host_until_exit(
     :returns: Whether the daemon exited because it lost its registry record.
     """
     from omnigent.host import crash_reporting
-
-    # Initialize tracing so the host daemon exports its own spans
-    # (e.g. handling launch_runner / stat / list_dir frames) into the
-    # same distributed trace as the server that requested them. The
-    # daemon inherits OTEL_*/MLFLOW_* config from the launching CLI.
-    from omnigent.runtime import telemetry
-
-    telemetry.init("omni-host")
-
     from omnigent.host.identity import export_configured_slice_key, host_config_path
 
     path = host_config_path(config_path)
@@ -5491,6 +5482,19 @@ def _serve_host_until_exit(
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from None
     crash_reporting.set_host_exit_context(host_id=identity.host_id)
+
+    # Initialize tracing so the host daemon exports its own spans
+    # (e.g. handling launch_runner / stat / list_dir frames) into the
+    # same distributed trace as the server that requested them. The
+    # daemon inherits OTEL_*/MLFLOW_* config from the launching CLI.
+    from omnigent.runtime import telemetry
+
+    # Stamp the host id first: the daemon's spans and the runners and
+    # harnesses it spawns (OTEL_* is inherited) all carry omnigent.host.id.
+    if telemetry.telemetry_enabled():
+        telemetry.set_resource_attribute(os.environ, "omnigent.host.id", identity.host_id)
+    telemetry.init("omni-host")
+
     crash_reporting.log_host_started()
     if not path.exists():
         print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")

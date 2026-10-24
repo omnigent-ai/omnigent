@@ -37,6 +37,7 @@ from omnigent.debug_logging import (
     add_audit_attrs,
     audit_event_logger,
     current_request_audit_attrs,
+    current_user_id,
     debug_event,
     debug_sink_enabled,
     reset_request_audit_attrs,
@@ -2344,6 +2345,7 @@ def create_app(
             )
         except Exception:  # noqa: BLE001 — attribution is best-effort
             set_current_user_id(None)
+        telemetry.set_request_user(current_user_id())
 
         # Resolve the operation + session id from the matched route up front so
         # the audit ``start`` event is named and records emitted while handling a

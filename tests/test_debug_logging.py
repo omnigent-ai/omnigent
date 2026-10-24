@@ -1391,6 +1391,26 @@ def test_runner_defaults_and_explicit_child_attribution(monkeypatch: pytest.Monk
         assert dl.record_to_row(record, "runner")["attributes"]["runner_id"] == "explicit_runner"
 
 
+def test_current_runner_id_env_fallback_only_for_runner_owned_sources(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(dl.RUNNER_ID_ENV_VAR, "runner_env")
+    monkeypatch.setattr(dl, "_process_source", None)
+    with dl.runner_log_scope(None, None):
+        assert dl.current_runner_id() is None
+        for source in ("runner", "harness"):
+            assert dl.current_runner_id(source) == "runner_env"
+        for source in ("server", "host", "cli"):
+            assert dl.current_runner_id(source) is None
+        # The span processor passes no source: this process's own kind decides.
+        monkeypatch.setattr(dl, "_process_source", "harness")
+        assert dl.current_runner_id() == "runner_env"
+        monkeypatch.setattr(dl, "_process_source", "server")
+        assert dl.current_runner_id() is None
+        with dl.runner_log_scope(None, "runner_bound"):
+            assert dl.current_runner_id("server") == "runner_bound"
+
+
 def _sink_logger(name: str, sink: dl.DebugLogHandler) -> logging.Logger:
     """Return an isolated logger that writes only to *sink*.
 
