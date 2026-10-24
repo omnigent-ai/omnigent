@@ -40,6 +40,11 @@ the header menu), and each place is a separate entry point.
 - `unarchive`: offered on archived rows, in bulk selection, and in the header
   menu of an archived session.
 - `delete`: confirmed, then removed from the list and the server.
+- `slow-load-retry`: a sidebar session list still loading after 10 seconds shows
+  "Sessions are taking longer than usual." with **Retry** in its status footer
+  (the Shared section or last group when sections are grouped). Retry replaces the
+  pending request. Rows already shown, such as Pinned, stay visible. Expanded
+  project folders keep their plain "Loading…" footer.
 - `export`: Export in the header menu saves the transcript as a local file.
 - `unread`: Mark as unread flags a session to revisit and survives a reload,
   including for the session being viewed. Its dot appears once the turn is
@@ -230,6 +235,10 @@ choice only when the server supports cleanup.
 
 **Archived view:** choose Display → Archived sessions in the sidebar filter
 menu, then filter by project.
+
+**Slow session list:** open the app or switch Display or Ordering while the
+server is slow to answer the session list; after 10 seconds the Sessions
+section offers **Retry**.
 
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
 Projects header holds Grouping, Display, Ordering and Show. In
@@ -780,6 +789,12 @@ plain `uv run pytest`, which starts a private server for the test.
   (enable the flag by patching `GET /v1/info`). Unit tests in
   `web/src/shell/Sidebar.test.tsx` ("sidebar_grouping_ui release flag") check
   that the flag-off sidebar ignores stored view options.
+- **`slow-load-retry`:**
+  `tests/e2e_ui/sessions/test_sidebar_fetch_cleanup.py::test_unanswered_session_list_offers_retry_instead_of_loading_forever`
+  holds the list request, then answers the request sent by Retry. Unit tests in
+  `web/src/shell/Sidebar.test.tsx` cover the Display views and ordering changes;
+  `web/src/hooks/useScopeCache.test.tsx` and `web/src/hooks/useArchivedSessions.test.tsx`
+  check that Retry replaces the pending first load.
 
 ## Gotchas
 

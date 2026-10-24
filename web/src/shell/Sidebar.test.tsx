@@ -181,7 +181,7 @@ vi.mock("@/lib/serverOrigin", () => ({
 
 import { useConversations } from "@/hooks/useConversations";
 import { useChatStore } from "@/store/chatStore";
-import { Sidebar } from "./Sidebar";
+import { SESSION_LIST_SLOW_LOAD_MS, Sidebar } from "./Sidebar";
 import { useSessionImportStore } from "@/store/sessionImport";
 import * as identity from "@/lib/identity";
 
@@ -583,6 +583,102 @@ describe("Sidebar session list", () => {
     selectSessionFilter("mine");
     expect(screen.getByText("pinned-session")).toBe(pinned);
     expect(screen.getByText("filed-session")).toBe(filed);
+  });
+
+  it.each([
+    ["mine", "mine"],
+    ["all", "mine"],
+    ["shared", "shared"],
+    ["archived", "archived"],
+  ] as const)("offers Retry when the %s list's first %s load stays pending", (view, scope) => {
+    vi.useFakeTimers();
+    try {
+      mockConversations([conv("pinned-session", "Claude Code")]);
+      seedPins(["pinned-session"]);
+      const original = useConvMock.getMockImplementation()!;
+      const retry = vi.fn();
+      useConvMock.mockImplementation((...args) => {
+        const query = original(...args);
+        if (args[4] !== scope) return { ...query, refetch: vi.fn() };
+        return {
+          ...query,
+          data: undefined,
+          isLoading: true,
+          refetch: retry,
+        } as ReturnType<typeof useConversations>;
+      });
+      renderSidebar();
+      selectSessionFilter(view);
+      const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+      const status = () => within(sessions).getByRole("status");
+
+      act(() => vi.advanceTimersByTime(SESSION_LIST_SLOW_LOAD_MS - 1));
+      expect(status()).toHaveTextContent("Loading…");
+      act(() => vi.advanceTimersByTime(1));
+      expect(status()).toHaveTextContent("Sessions are taking longer than usual.");
+      expect(screen.getByText("pinned-session")).toBeInTheDocument();
+
+      fireEvent.click(within(status()).getByRole("button", { name: "Retry" }));
+      expect(retry).toHaveBeenCalledOnce();
+      expect(status()).toHaveTextContent("Loading…");
+      act(() => vi.advanceTimersByTime(SESSION_LIST_SLOW_LOAD_MS));
+      expect(within(status()).getByRole("button", { name: "Retry" })).toBeInTheDocument();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the error Retry ahead of the slow-load message", () => {
+    vi.useFakeTimers();
+    try {
+      mockConversations([]);
+      const original = useConvMock.getMockImplementation()!;
+      useConvMock.mockImplementation((...args) => {
+        const query = original(...args);
+        const states = {
+          mine: { data: undefined, isLoading: true },
+          shared: { isError: true, error: new Error("unavailable") },
+        };
+        const state = args[4] === "mine" || args[4] === "shared" ? states[args[4]] : {};
+        return { ...query, ...state } as ReturnType<typeof useConversations>;
+      });
+      renderSidebar();
+      selectSessionFilter("all");
+      const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+
+      act(() => vi.advanceTimersByTime(SESSION_LIST_SLOW_LOAD_MS));
+      expect(within(sessions).getByRole("status")).toHaveTextContent("Failed to load: unavailable");
+      expect(screen.queryByText("Sessions are taking longer than usual.")).toBeNull();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("restarts the slow-load wait when the Display view changes", () => {
+    vi.useFakeTimers();
+    try {
+      mockConversations([]);
+      const original = useConvMock.getMockImplementation()!;
+      useConvMock.mockImplementation(
+        (...args) =>
+          ({ ...original(...args), data: undefined, isLoading: true }) as ReturnType<
+            typeof useConversations
+          >,
+      );
+      renderSidebar();
+      selectSessionFilter("mine");
+      const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+      const status = () => within(sessions).getByRole("status");
+
+      act(() => vi.advanceTimersByTime(SESSION_LIST_SLOW_LOAD_MS - 1));
+      selectSessionFilter("shared");
+      act(() => vi.advanceTimersByTime(SESSION_LIST_SLOW_LOAD_MS - 1));
+      expect(status()).toHaveTextContent("Loading…");
+      act(() => vi.advanceTimersByTime(1));
+      expect(status()).toHaveTextContent("Sessions are taking longer than usual.");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it("reveals a thin, theme-aware scrollbar only while scrolling", () => {
@@ -3447,6 +3543,44 @@ describe("Sidebar view options", () => {
         .getAllByRole("link", { name: /^conv_/ })
         .map((link) => link.textContent),
     ).toEqual(["conv_done_new", "conv_done_old", "conv_running"]);
+  });
+
+  it("restarts the slow-load wait when the ordering changes", () => {
+    vi.useFakeTimers();
+    try {
+      mockConversations([]);
+      const original = useConvMock.getMockImplementation()!;
+      useConvMock.mockImplementation(
+        (...args) =>
+          ({
+            ...original(...args),
+            data: undefined,
+            isLoading: true,
+          }) as ReturnType<typeof useConversations>,
+      );
+      renderGroupingSidebar();
+      const status = () => within(groupSection("Sessions")).getByRole("status");
+
+      act(() => vi.advanceTimersByTime(SESSION_LIST_SLOW_LOAD_MS - 1));
+      openViewSubmenu("session-ordering-menu");
+      const created = screen.getByRole("menuitemradio", { name: "Created" });
+      fireEvent.mouseOver(created);
+      fireEvent.click(created);
+      act(() => vi.advanceTimersByTime(SESSION_LIST_SLOW_LOAD_MS - 1));
+      expect(status()).toHaveTextContent("Loading…");
+      act(() => vi.advanceTimersByTime(1));
+      expect(status()).toHaveTextContent("Sessions are taking longer than usual.");
+
+      openViewSubmenu("session-ordering-menu");
+      const updated = screen.getByRole("menuitemradio", { name: "Updated" });
+      fireEvent.mouseOver(updated);
+      fireEvent.click(updated);
+      expect(status()).toHaveTextContent("Loading…");
+      act(() => vi.advanceTimersByTime(SESSION_LIST_SLOW_LOAD_MS));
+      expect(status()).toHaveTextContent("Sessions are taking longer than usual.");
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it.each(["default", "status", "created", "updated"])(

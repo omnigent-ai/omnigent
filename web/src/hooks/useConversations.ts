@@ -611,15 +611,23 @@ export async function timeInitialConversationLoad(
   pageParam: unknown,
   visibility: "mine" | "shared" | "archived" | undefined,
   fetchPage: () => Promise<ConversationsPage>,
+  signal?: AbortSignal,
 ): Promise<ConversationsPage> {
   if (
     initialListLoadTimed ||
+    signal?.aborted ||
     pageParam !== undefined ||
     (visibility !== undefined && visibility !== "mine")
   )
     return fetchPage();
   initialListLoadTimed = true;
   const interaction = startTimedInteraction("list_sessions");
+  // Release the latch on abort, before a retry's replacement fetch starts.
+  const cancel = () => {
+    interaction.complete("cancelled");
+    initialListLoadTimed = false;
+  };
+  signal?.addEventListener("abort", cancel, { once: true });
   try {
     const page = await fetchPage();
     interaction.complete();
@@ -627,7 +635,29 @@ export async function timeInitialConversationLoad(
   } catch (error) {
     interaction.fail();
     throw error;
+  } finally {
+    signal?.removeEventListener("abort", cancel);
   }
+}
+
+/** The {@link useConversations} cache key for one list. */
+export function conversationsQueryKey(
+  searchQuery: string,
+  includeArchived: boolean,
+  project: string | undefined,
+  visibility: "mine" | "shared" | "archived" | undefined,
+  sortBy: SessionSortBy,
+): unknown[] {
+  // The base three-element key is shared with other callers; only filtered lists get
+  // longer keys, and created_at lists always use the full six-element key.
+  if (sortBy === "created_at") {
+    return ["conversations", searchQuery, includeArchived, project ?? null, visibility, sortBy];
+  }
+  if (visibility) {
+    return ["conversations", searchQuery, includeArchived, project ?? null, visibility];
+  }
+  if (project) return ["conversations", searchQuery, includeArchived, project];
+  return ["conversations", searchQuery, includeArchived];
 }
 
 export function useConversations(
@@ -647,23 +677,11 @@ export function useConversations(
   const streamConnected = useSessionUpdatesConnected();
   const queryClient = useQueryClient();
   const { sessionPageSize } = useContext(SidebarConfigContext);
-  // Keep the base three-element key for the unfiltered callers (byte-for-byte
-  // unchanged, so the sidebar / rename / push-delta paths are untouched); only
-  // append `project` for a concrete name; append `visibility` only when set so
-  // the "mine"/"shared" tab queries get their own cache entries without
-  // disturbing the existing all-sessions key used by every other caller.
   const sortBy = options.sortBy ?? "updated_at";
-  const queryKey =
-    sortBy === "created_at"
-      ? ["conversations", searchQuery, includeArchived, project ?? null, visibility, sortBy]
-      : visibility
-        ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
-        : project
-          ? ["conversations", searchQuery, includeArchived, project]
-          : ["conversations", searchQuery, includeArchived];
+  const queryKey = conversationsQueryKey(searchQuery, includeArchived, project, visibility, sortBy);
   const query = useInfiniteQuery({
     queryKey,
-    queryFn: async ({ pageParam }) => {
+    queryFn: async ({ pageParam, signal }) => {
       const fetchPage = () =>
         fetchConversationsPage({
           after: pageParam as string | undefined,
@@ -672,10 +690,11 @@ export function useConversations(
           project,
           visibility,
           queryClient,
+          signal,
           limit: sessionPageSize,
           sortBy,
         });
-      return timeInitialConversationLoad(pageParam, visibility, fetchPage);
+      return timeInitialConversationLoad(pageParam, visibility, fetchPage, signal);
     },
 
     initialPageParam: undefined as string | undefined,
