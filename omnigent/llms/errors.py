@@ -121,6 +121,55 @@ def detect_request_size_overflow(message: str) -> RequestSizeOverflow | None:
         return None
 
 
+# Anthropic's token-window rejection, e.g.
+# "prompt is too long: 1070450 tokens > 1000000 maximum".
+_PROMPT_TOKEN_OVERFLOW = re.compile(
+    r"prompt is too long:\s*(\d+)\s*tokens\s*>\s*(\d+)\s*maximum", re.IGNORECASE
+)
+
+
+# Guidance the Claude-native bridge shows in place of Claude's "prompt is too
+# long"; a failed turn carrying it is a context-window overflow.
+CONTEXT_OVERFLOW_GUIDANCE = (
+    "Context limit reached — the conversation has grown too long for "
+    "the model’s context window. Use /compact to summarize and free up "
+    "space, or /clear to start a new conversation."
+)
+
+
+@dataclass(frozen=True)
+class PromptTokenOverflow:
+    """
+    A prompt the model rejected for exceeding its token context window.
+
+    :param actual_tokens: Tokens the provider counted, e.g. ``1070450``.
+    :param limit_tokens: The model's context window, e.g. ``1000000``.
+    """
+
+    actual_tokens: int
+    limit_tokens: int
+
+
+def detect_prompt_token_overflow(message: str) -> PromptTokenOverflow | None:
+    """Parse Anthropic's prompt-too-long rejection from an error *message*.
+
+    :param message: Error text that may embed the rejection, e.g.
+        ``'400 {"message":"prompt is too long: 1070450 tokens > 1000000 maximum"}'``.
+    :returns: The parsed token counts, or ``None`` when *message* does not match.
+    """
+    match = _PROMPT_TOKEN_OVERFLOW.search(message)
+    if match is None:
+        return None
+    try:
+        return PromptTokenOverflow(
+            actual_tokens=int(match.group(1)),
+            limit_tokens=int(match.group(2)),
+        )
+    except ValueError:
+        # Python caps int(str) at 4300 digits; treat a malformed count as unrecognized.
+        return None
+
+
 def llm_error_category(code: str) -> ErrorCategory:
     """Fault attribution for an LLM adapter error code.
 

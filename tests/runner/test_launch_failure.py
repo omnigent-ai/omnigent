@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 
 from omnigent.errors import ErrorCategory
+from omnigent.llms.errors import CONTEXT_OVERFLOW_GUIDANCE
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
     classify_native_turn_error,
@@ -228,6 +229,37 @@ def test_classifies_content_length_cap_rejection_as_context_overflow(
     assert classify_native_turn_error(code, message) == "context_length_exceeded"
 
 
+# Claude Code's StopFailure detail after its own compaction still overflows the window.
+_PROMPT_TOO_LONG_OUTPUT = '400 {"message":"prompt is too long: 1070450 tokens > 1000000 maximum"}'
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize(
+    "message",
+    [
+        _PROMPT_TOO_LONG_OUTPUT,
+        (
+            'API Error: 400 {"type":"error","error":{"type":"invalid_request_error",'
+            '"message":"prompt is too long: 250000 tokens > 200000 maximum"}}'
+        ),
+        # The bridge shows its own guidance in place of Claude's text.
+        CONTEXT_OVERFLOW_GUIDANCE,
+    ],
+)
+def test_classifies_prompt_too_long_as_context_overflow(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "context_length_exceeded"
+
+
+def test_prompt_too_long_prose_without_token_counts_stays_generic() -> None:
+    message = "The prompt is too long to summarize in one reply."
+    assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
+
+
+@pytest.mark.parametrize("code", ["codex_reauth_required", "workspace_missing"])
+def test_prompt_too_long_does_not_override_specific_failure_codes(code: str) -> None:
+    assert classify_native_turn_error(code, _PROMPT_TOO_LONG_OUTPUT) == code
+
+
 def test_content_length_text_without_sizes_stays_generic() -> None:
     message = "Server received a request which exceeds maximum allowed content length."
     assert classify_native_turn_error("native_turn_error", message) == "native_turn_error"
@@ -340,7 +372,6 @@ def test_gateway_499_does_not_override_specific_failure_codes(code: str) -> None
     "message",
     [
         # Deterministic failures must keep the generic, non-retryable code.
-        "prompt is too long: 250000 tokens > 200000 maximum",
         "API Error: 400 · context_length_exceeded: maximum context window reached",
         "There's an issue with the selected model. It may not exist.",
         "API Error: Request rejected (404) · model not found",
