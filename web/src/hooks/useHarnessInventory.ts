@@ -316,7 +316,7 @@ export function useHarnessInventory(
     if (!online) return EMPTY_CONTEXT;
     const skillsByHarness: Partial<Record<BrandHarness, SkillSummary[]>> = {};
     harnesses.forEach((harness, index) => {
-      skillsByHarness[harness] = skillData[index];
+      skillsByHarness[harness] = skillData[index]?.skills;
     });
     const servers = (mcpData ?? []).filter((server) => isBrandHarness(server.harness));
     const assembled = buildInventoryContext(host, harnesses, skillsByHarness, servers);

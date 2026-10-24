@@ -185,6 +185,7 @@ async def fs_setup(
                                 skills=reply.get("skills", []),
                                 error=reply.get("error"),
                                 error_code=reply.get("error_code"),
+                                warnings=reply.get("warnings", []),
                             )
                         ),
                     }
@@ -282,15 +283,32 @@ async def test_list_filesystem_survives_idle_mock_host(
                         "description": "Review changes",
                         "display_name": None,
                     }
-                ]
+                ],
+                "warnings": [],
             },
         ),
         (
             {"skills": [{"name": "ste", "description": "STE", "display_name": "Simplified STE"}]},
             200,
-            {"skills": [{"name": "ste", "description": "STE", "display_name": "Simplified STE"}]},
+            {
+                "skills": [
+                    {"name": "ste", "description": "STE", "display_name": "Simplified STE"}
+                ],
+                "warnings": [],
+            },
         ),
-        ({"skills": []}, 200, {"skills": []}),
+        ({"skills": []}, 200, {"skills": [], "warnings": []}),
+        (
+            {
+                "skills": [],
+                "warnings": ["Codex plugin skills unavailable: `codex plugin list` exited 1"],
+            },
+            200,
+            {
+                "skills": [],
+                "warnings": ["Codex plugin skills unavailable: `codex plugin list` exited 1"],
+            },
+        ),
         (
             {"status": "failed", "error_code": "not_directory", "error": "directory missing"},
             404,

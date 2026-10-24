@@ -1100,6 +1100,8 @@ class HostSkillsResultFrame:
     error_code: str | None = None
     session_id: str | None = None
     agent_id: str | None = None
+    # Sources the host could not read; non-empty means ``skills`` is incomplete.
+    warnings: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -1797,6 +1799,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "error_code": frame.error_code,
                 "session_id": frame.session_id,
                 "agent_id": frame.agent_id,
+                "warnings": frame.warnings,
             }
         )
     if isinstance(frame, HostPluginsFrame):
@@ -2911,6 +2914,8 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
         error_code=_optional_nullable_str(msg, "error_code"),
         session_id=_optional_nullable_str(msg, "session_id"),
         agent_id=_optional_nullable_str(msg, "agent_id"),
+        # Absent from older hosts, which never reported partial catalogs.
+        warnings=_optional_str_list(msg, "warnings"),
     )
 
 

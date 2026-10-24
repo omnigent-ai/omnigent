@@ -3365,12 +3365,15 @@ class HostProcess:
             )
 
         try:
+            warnings: list[str] = []
+            skills = self._skill_discovery.discover(frame, root, warnings=warnings)
             return HostSkillsResultFrame(
                 request_id=frame.request_id,
                 status="ok",
-                skills=self._skill_discovery.discover(frame, root),
+                skills=skills,
                 session_id=frame.session_id,
                 agent_id=frame.agent_id,
+                warnings=warnings,
             )
         except Exception:
             _logger.exception("Skill discovery failed for %r", frame.harness)

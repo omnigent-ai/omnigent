@@ -1229,6 +1229,7 @@ function setupLandingMocks() {
           useAvailableAgentsMock().data?.find(
             (agent: AvailableAgent) => agent.id === target?.agentId,
           )?.skills ?? [],
+        skillsWarnings: [],
         skillsStatus: target && enabled ? "ready" : starting ? "loading" : "unavailable",
         refetch: vi.fn(),
       }) as ReturnType<typeof useSkills>,
@@ -8433,6 +8434,7 @@ describe("NewChatLandingScreen skills menu", () => {
       ({ target, enabled = true, starting = false }) =>
         ({
           skills: [],
+          skillsWarnings: [],
           skillsStatus: "ready",
           refetch: vi.fn(),
           ...state,
@@ -8517,6 +8519,23 @@ describe("NewChatLandingScreen skills menu", () => {
     expect(screen.getByText("No matching skills")).toBeInTheDocument();
     typeMessage("/");
     expect(screen.getByText("No skills available")).toBeInTheDocument();
+  });
+
+  it("explains an incomplete catalog with Retry while listing the skills it read", () => {
+    const retry = vi.fn();
+    const warning = "Codex plugin skills unavailable: `codex plugin list` exited 1";
+    mockSkills({
+      skills: [{ name: "host-review", description: "Host-only skill" }],
+      skillsWarnings: [warning],
+      refetch: retry,
+    });
+    renderLanding();
+    typeMessage("/");
+    expect(screen.getByText(warning)).toBeInTheDocument();
+    expect(screen.getByTestId("slash-menu-item-host-review")).toBeInTheDocument();
+    expect(screen.queryByText("No skills available")).not.toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(retry).toHaveBeenCalledOnce();
   });
 
   it("dismisses a loading-only menu with Escape", () => {
