@@ -287,7 +287,7 @@ function PendingHeaderActions({ isMobile }: { isMobile: boolean }) {
         aria-label="Share session"
         title={PENDING_ACTION_TITLE}
         disabled
-        className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white md:inline-flex"
+        className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-ui font-normal md:inline-flex"
       >
         <span className="flex size-4 shrink-0 items-center justify-center">
           <UserPlusIcon />
@@ -759,9 +759,9 @@ export function ChatHeader({
                   aria-label="Share session"
                   disabled
                   title={shareDisabledReason}
-                  // share-button-glassy (index.css) paints the pink gradient,
-                  // shadow, and white text in both light and dark mode.
-                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white"
+                  // share-button-glassy (index.css) paints the Omnigent pink, or the
+                  // palette's primary button colors, in both light and dark mode.
+                  className="share-button-glassy h-6 gap-1 rounded-[6px] px-2 text-ui font-normal"
                 >
                   <span className="flex size-4 shrink-0 items-center justify-center">
                     <UserPlusIcon />
@@ -778,9 +778,9 @@ export function ChatHeader({
             aria-label="Share session"
             onClick={onShare}
             componentId="chat.header.share"
-            // share-button-glassy (index.css) paints the pink gradient,
-            // shadow, and white text in both light and dark mode.
-            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-ui font-normal text-white md:inline-flex"
+            // share-button-glassy (index.css) paints the Omnigent pink, or the
+            // palette's primary button colors, in both light and dark mode.
+            className="share-button-glassy hidden h-6 gap-1 rounded-[6px] px-2 text-ui font-normal md:inline-flex"
           >
             <span className="flex size-4 shrink-0 items-center justify-center">
               <UserPlusIcon />

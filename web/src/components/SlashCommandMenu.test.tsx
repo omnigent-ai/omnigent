@@ -123,6 +123,15 @@ describe("skill discovery state", () => {
   });
 });
 
+describe("skill row icon", () => {
+  it("tints the skill wand with the palette's brand accent, like the skill card", () => {
+    render(<SlashCommandMenu {...props} commands={{ "/review": "Review a change" }} />);
+    const wand = screen.getByTestId("slash-menu-item-review").querySelector("svg");
+    expect(wand).toHaveClass("text-brand-accent");
+    expect(wand?.getAttribute("class")).not.toMatch(/text-pink-/);
+  });
+});
+
 describe("skill display names", () => {
   it("types the directory name and labels the row with the frontmatter name", () => {
     const skill = {

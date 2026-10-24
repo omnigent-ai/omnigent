@@ -523,3 +523,90 @@ def test_omnigent_selection_keeps_the_brand_tint(
             }"""
         )
         assert selection == colors, mode
+
+
+def _brand_surface_paint(page: Page) -> dict[str, object]:
+    """Probe Share and a tag tile as painted over white, beside the palette tokens."""
+    return page.evaluate(
+        """() => {
+            const share = document.createElement('button');
+            share.className = 'share-button-glassy';
+            const tag = document.createElement('span');
+            tag.className = 'bg-tag-pink';
+            const reference = document.createElement('span');
+            document.body.append(share, tag, reference);
+            const canvas = document.createElement('canvas');
+            canvas.width = canvas.height = 1;
+            const context = canvas.getContext('2d', { willReadFrequently: true });
+            const paint = (fill, alpha = 1) => {
+                context.globalAlpha = 1;
+                context.fillStyle = '#ffffff';
+                context.fillRect(0, 0, 1, 1);
+                context.globalAlpha = alpha;
+                context.fillStyle = fill;
+                context.fillRect(0, 0, 1, 1);
+                return Array.from(context.getImageData(0, 0, 1, 1).data.slice(0, 3));
+            };
+            const token = (name) => {
+                reference.style.color = `var(--${name})`;
+                return getComputedStyle(reference).color;
+            };
+            const shareStyle = getComputedStyle(share);
+            const tagStyle = getComputedStyle(tag);
+            const result = {
+                shareImage: shareStyle.backgroundImage,
+                shareBackground: paint(shareStyle.backgroundColor),
+                shareText: paint(shareStyle.color),
+                tagRaw: tagStyle.backgroundColor,
+                tag: paint(tagStyle.backgroundColor),
+                primary: paint(token('primary')),
+                primaryForeground: paint(token('primary-foreground')),
+                accentWashLight: paint(token('brand-accent'), 0.06),
+                accentWashDark: paint(token('brand-accent'), 0.15),
+            };
+            share.remove();
+            tag.remove();
+            reference.remove();
+            return result;
+        }"""
+    )
+
+
+def _assert_close(actual: object, expected: object, label: str) -> None:
+    assert isinstance(actual, list) and isinstance(expected, list), label
+    assert all(abs(a - b) <= 2 for a, b in zip(actual, expected, strict=True)), (
+        f"{label}: {actual} != {expected}"
+    )
+
+
+def test_brand_surfaces_follow_the_palette(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """Share and tag washes keep the Omnigent pink by default and follow other palettes.
+
+    The default palette keeps Share's pink gradient and the pink tag wash. GitHub
+    paints Share with its primary button pair and washes tags with its brand
+    accent at the same 6% (light) and 15% (dark) strengths.
+    """
+    page.emulate_media(color_scheme="light")
+    base_url = chat_session_contract.base_url
+    default_pink = {
+        "Light": ("rgb(250, 61, 153)", "rgba(240, 1, 150, 0.06)", "accentWashLight"),
+        "Dark": ("rgb(255, 77, 166)", "rgba(240, 1, 150, 0.15)", "accentWashDark"),
+    }
+    for mode, (gradient_stop, tag_wash, accent_wash) in default_pink.items():
+        _open_appearance(page, base_url)
+        _pick_palette(page, "Omnigent")
+        _theme_radiogroup(page).get_by_role("radio", name=mode).click()
+        omnigent = _brand_surface_paint(page)
+        assert gradient_stop in str(omnigent["shareImage"]), mode
+        assert omnigent["shareText"] == [255, 255, 255], mode
+        assert omnigent["tagRaw"] == tag_wash, mode
+
+        _pick_palette(page, "GitHub")
+        assert _data_theme(page) == "github"
+        github = _brand_surface_paint(page)
+        assert "rgb(250, 61, 153)" not in str(github["shareImage"]), mode
+        _assert_close(github["shareBackground"], github["primary"], f"{mode} Share background")
+        _assert_close(github["shareText"], github["primaryForeground"], f"{mode} Share text")
+        _assert_close(github["tag"], github[accent_wash], f"{mode} tag wash")

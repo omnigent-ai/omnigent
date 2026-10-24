@@ -939,6 +939,43 @@ describe("index.css text selection colors", () => {
   });
 });
 
+describe("index.css brand surfaces under a palette", () => {
+  const blocks = cssBlocks.map(([block]) => block);
+  const ruleFor = (selector: string) =>
+    blocks.find((block) => selectorOf(block).replace(/\s+/g, " ") === selector);
+
+  it("keeps the Omnigent gradient on the default Share button", () => {
+    expect(ruleFor(".share-button-glassy")).toContain("#fa3d99");
+    expect(ruleFor(".dark .share-button-glassy")).toContain("#ff4da6");
+    // The rule owns the white label; the button carries no text-white utility.
+    expect(ruleFor(".share-button-glassy")).toContain("color: #ffffff");
+    expect(ruleFor(".dark .share-button-glassy")).toContain("color: #ffffff");
+  });
+
+  it("paints Share from the palette's primary pair, hovered or not", () => {
+    for (const selector of [
+      "[data-theme] .share-button-glassy",
+      "[data-theme] .share-button-glassy:hover",
+    ]) {
+      const rule = ruleFor(selector);
+      expect(rule, selector).toContain("background-color: var(--primary)");
+      expect(rule, selector).toContain("background-image:");
+    }
+    expect(ruleFor("[data-theme] .share-button-glassy")).toContain(
+      "color: var(--primary-foreground)",
+    );
+  });
+
+  it("washes tag surfaces with the palette's brand accent", () => {
+    expect(ruleFor(":root:not(.dark)[data-theme]")).toContain(
+      "--tag-pink: color-mix(in oklch, var(--brand-accent) 6%, transparent)",
+    );
+    expect(ruleFor(".dark[data-theme]")).toContain(
+      "--tag-pink: color-mix(in oklch, var(--brand-accent) 15%, transparent)",
+    );
+  });
+});
+
 describe("index.css mobile settings title", () => {
   const titleRule = cssSource.match(/\.settings-page-title \{[^}]*\}/)?.[0];
   const headerFadeRule = cssSource.match(/\.settings-mobile-header::before \{[^}]*\}/)?.[0];

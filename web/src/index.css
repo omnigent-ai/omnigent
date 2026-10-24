@@ -296,6 +296,16 @@
   --tooltip-bg: #2a2440;
 }
 
+/* Other palettes wash tag surfaces with their own brand accent, at the same
+ * strengths as the Omnigent pink above. */
+:root:not(.dark)[data-theme] {
+  --tag-pink: color-mix(in oklch, var(--brand-accent) 6%, transparent);
+}
+
+.dark[data-theme] {
+  --tag-pink: color-mix(in oklch, var(--brand-accent) 15%, transparent);
+}
+
 /* Main-sidebar item labels use the same text-ui semantic step as Appearance
  * content. Both read the desktop typography tokens derived from the size
  * selected in Settings. */
@@ -1200,6 +1210,29 @@ html[data-electron-mac] .breadcrumb-folder {
 
 .dark .share-button-glassy:hover {
   background: linear-gradient(150deg, #f0408f 0%, #e51b7d 40%, #a51455 100%);
+}
+
+/* Other palettes paint Share with their primary button pair; a translucent
+ * overlay keeps the same light-catch and hover darkening. */
+[data-theme] .share-button-glassy {
+  background-color: var(--primary);
+  background-image: linear-gradient(
+    to bottom,
+    rgb(255 255 255 / 8%),
+    transparent 40%,
+    rgb(0 0 0 / 8%)
+  );
+  color: var(--primary-foreground);
+}
+
+[data-theme] .share-button-glassy:hover {
+  background-color: var(--primary);
+  background-image: linear-gradient(
+    to bottom,
+    rgb(0 0 0 / 4%),
+    rgb(0 0 0 / 8%) 40%,
+    rgb(0 0 0 / 12%)
+  );
 }
 
 @layer base {
