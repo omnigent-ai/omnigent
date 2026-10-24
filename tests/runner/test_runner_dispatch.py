@@ -13438,7 +13438,9 @@ async def test_shared_agent_selections_are_isolated_and_revision_recovers_missed
 
     async def schemas(self, spec):
         schemas_seen.append([s.name for s in spec.mcp_servers])
-        return SimpleNamespace(schemas=[], tool_names=set(), failures={})
+        return SimpleNamespace(
+            schemas=[], tool_names=set(), failures={}, server_instructions={}, server_labels={}
+        )
 
     class SnapshotClient(NullServerClient):
         async def get(self, url, **kwargs):
@@ -13500,7 +13502,9 @@ async def test_eager_mcp_cache_keeps_named_child_scope_after_revision_change(mon
         return spec
 
     async def schemas(self, spec):
-        return SimpleNamespace(schemas=[], tool_names=set(), failures={})
+        return SimpleNamespace(
+            schemas=[], tool_names=set(), failures={}, server_instructions={}, server_labels={}
+        )
 
     monkeypatch.setattr(ProxyMcpManager, "schemas_for", schemas)
     recording = _RecordingHarnessClient(_INSTRUCTION_WARN_CHUNKS)

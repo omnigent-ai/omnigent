@@ -43,6 +43,27 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
 
+
+def _string_map(value: object) -> dict[str, str]:
+    """Keep non-blank string entries from a JSON object; drop everything else."""
+    if not isinstance(value, dict):
+        return {}
+    out: dict[str, str] = {}
+    for key, raw in value.items():
+        if isinstance(key, str) and isinstance(raw, str) and raw.strip():
+            out[key] = raw.strip()
+    return out
+
+
+def _extension_map(result: _JsonObject, *keys: str) -> dict[str, str]:
+    """Read an Omnigent tools/list extension, accepting snake_case or camelCase."""
+    for key in keys:
+        parsed = _string_map(result.get(key))
+        if parsed:
+            return parsed
+    return {}
+
+
 _EventPublisher = Callable[[str, _JsonObject], None]
 _SERVER_RECONNECT_WAIT_S = 120.0
 
@@ -191,6 +212,8 @@ class ProxyMcpManager:
         schemas: list[_JsonObject] = []
         names: set[str] = set()
         failures: dict[str, str] = {}
+        server_instructions: dict[str, str] = {}
+        server_labels: dict[str, str] = {}
         routes: list[str | None] = []
         routes.extend(sorted(self._registry_services))
         if any(c.transport != "registry" for c in spec.mcp_servers):
@@ -206,7 +229,15 @@ class ProxyMcpManager:
                 schemas.append(schema)
                 names.add(name)
             failures.update(result.failures)
-        return McpSchemasResult(schemas=schemas, tool_names=names, failures=failures)
+            server_instructions.update(result.server_instructions)
+            server_labels.update(result.server_labels)
+        return McpSchemasResult(
+            schemas=schemas,
+            tool_names=names,
+            failures=failures,
+            server_instructions=server_instructions,
+            server_labels=server_labels,
+        )
 
     async def _schemas_at(self, service: str | None) -> McpSchemasResult:
         """Discover one service, adding its namespace for the harness.
@@ -301,7 +332,16 @@ class ProxyMcpManager:
             schemas.append(schema)
             tool_names.add(name)
 
-        return McpSchemasResult(schemas=schemas, tool_names=tool_names, failures={})
+        raw_instructions = _extension_map(result, "serverInstructions", "server_instructions")
+        raw_labels = _extension_map(result, "serverLabels", "server_labels")
+
+        return McpSchemasResult(
+            schemas=schemas,
+            tool_names=tool_names,
+            failures={},
+            server_instructions=raw_instructions,
+            server_labels=raw_labels,
+        )
 
     async def call_tool(
         self,
