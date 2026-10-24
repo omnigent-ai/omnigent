@@ -4798,6 +4798,85 @@ def _codex_exit_watch_decision(
     return instance, None
 
 
+@dataclasses.dataclass(frozen=True)
+class _CodexTerminalCli:
+    """
+    Configured launch of a runner-owned Codex TUI.
+
+    :param command: Configured ``harness.codex-native.command`` wrapper, e.g.
+        ``"isaac"``, or ``None`` to run the app-server's Codex binary.
+    :param wrapper_args: Configured args that prefix *command* verbatim, e.g.
+        ``("codex", "--")``. Empty without a configured command.
+    :param codex_args: Configured args passed to Codex itself when there is
+        no wrapper, e.g. ``("--sandbox", "danger-full-access")``.
+    :param codex_cli_version: Probed wrapper Codex version on a wrapped resume,
+        otherwise the app-server's, e.g. ``(0, 154, 0)``; ``None`` when unknown.
+    """
+
+    command: str | None
+    wrapper_args: tuple[str, ...]
+    codex_args: tuple[str, ...]
+    codex_cli_version: tuple[int, int, int] | None
+
+
+async def _resolve_codex_terminal_cli(
+    *,
+    workspace: str,
+    app_server: CodexNativeAppServer,
+    resume: bool,
+) -> _CodexTerminalCli:
+    """
+    Read the configured Codex TUI launch for a session workspace.
+
+    A configured wrapper can run a different Codex than the app-server, so a
+    resume probes the wrapper itself to decide which resume args it accepts.
+
+    :param workspace: Session workspace whose project config applies, e.g.
+        ``"/Users/me/repo"``.
+    :param app_server: App-server the TUI attaches to.
+    :param resume: ``True`` when the TUI resumes an existing thread.
+    :returns: The configured command, its args, and the TUI's Codex version.
+    """
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import (
+        resolve_harness_args,
+        resolve_harness_config,
+    )
+    from omnigent.inner.codex_executor import _codex_cli_version
+
+    # Read project config from the session workspace; the runner's cwd may be gone.
+    cfg = load_effective_config(workspace=workspace)
+    # Honor configured wrappers while keeping the host-provisioned binary
+    # immune to ambient OMNIGENT_CODEX_PATH overrides.
+    _, overrides = resolve_harness_config(cfg)
+    raw_command = (overrides.get("codex-native") or {}).get("command")
+    command = raw_command.strip() if isinstance(raw_command, str) and raw_command.strip() else None
+    configured_args = tuple(resolve_harness_args("codex-native", (), cfg=cfg))
+    if command is None:
+        return _CodexTerminalCli(
+            command=None,
+            wrapper_args=(),
+            codex_args=configured_args,
+            codex_cli_version=app_server.codex_cli_version,
+        )
+    if not resume:
+        codex_cli_version = app_server.codex_cli_version
+    else:
+        codex_cli_version = await _codex_cli_version(command, *configured_args)
+        if codex_cli_version is None:
+            _logger.info(
+                "Codex resume: configured command %r reported no Codex version; "
+                "applying permissions through thread/resume",
+                command,
+            )
+    return _CodexTerminalCli(
+        command=command,
+        wrapper_args=configured_args,
+        codex_args=(),
+        codex_cli_version=codex_cli_version,
+    )
+
+
 async def _launch_codex_native_tui(
     session_id: str,
     resource_registry: SessionResourceRegistry,
@@ -4809,6 +4888,7 @@ async def _launch_codex_native_tui(
     thread_id: str | None,
     agent_spec: AgentSpec | ResolvedSpec | None,
     login_required: bool = False,
+    terminal_cli: _CodexTerminalCli | None = None,
 ) -> _CodexNativeTuiLaunch:
     """Attach a terminal to an app-server without owning its lifecycle."""
     from omnigent.harnesses.codex_native.app_server import (
@@ -4828,6 +4908,13 @@ async def _launch_codex_native_tui(
     assert codex_ws_url is not None
     workspace = str(launch_config.workspace)
     agent_os_env = _agent_os_env_from_spec(agent_spec)
+    # Apply configured wrappers to both cold start and recovery.
+    if terminal_cli is None:
+        terminal_cli = await _resolve_codex_terminal_cli(
+            workspace=workspace, app_server=app_server, resume=thread_id is not None
+        )
+    # A wrapper whose version probe failed keeps the app-server's hook-trust decision.
+    hook_trust_version = terminal_cli.codex_cli_version or app_server.codex_cli_version
     codex_remote_args = build_codex_remote_args(
         codex_args=tuple(launch_config.terminal_launch_args or ()),
         thread_id=thread_id,
@@ -4838,32 +4925,16 @@ async def _launch_codex_native_tui(
             *app_server.config_overrides,
             "check_for_update_on_startup=false",
         ),
-        codex_cli_version=app_server.codex_cli_version,
+        codex_cli_version=terminal_cli.codex_cli_version,
         # The runner provisions and trusts these hooks. An unknown CLI version
         # must not strand a headless session behind an interactive trust prompt.
         bypass_hook_trust=(
-            app_server.codex_cli_version is None
-            or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
+            hook_trust_version is None
+            or hook_trust_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
         ),
+        configured_codex_args=terminal_cli.codex_args,
     )
-    # Apply configured wrappers to both cold start and recovery.
-    from omnigent.config import load_effective_config
-    from omnigent.harness_startup_config import (
-        resolve_harness_args,
-        resolve_harness_config,
-    )
-
-    # Read project config from the session workspace; the runner's cwd may be gone.
-    _codex_harness_cfg = load_effective_config(workspace=workspace)
-    # Honor configured wrappers while keeping the host-provisioned binary
-    # immune to ambient OMNIGENT_CODEX_PATH overrides.
-    _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
-    _codex_cmd_override = (_codex_overrides.get("codex-native") or {}).get("command")
-    configured_codex_command = (
-        _codex_cmd_override.strip()
-        if isinstance(_codex_cmd_override, str) and _codex_cmd_override.strip()
-        else None
-    )
+    configured_codex_command = terminal_cli.command
     codex_command = configured_codex_command or app_server.codex_path
     thread_start_timeout_seconds = (
         CODEX_NATIVE_CONFIGURED_COMMAND_STARTUP_TIMEOUT_SECONDS
@@ -4894,22 +4965,20 @@ async def _launch_codex_native_tui(
                 thread_start_timeout_seconds,
                 session_id,
             )
-    codex_launch_args = resolve_harness_args(
-        "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
-    )
+    codex_launch_args = [*terminal_cli.wrapper_args, *codex_remote_args]
     loggable_launch_args = shlex.join(redact_codex_launch_args(codex_launch_args))
     _logger.info(
         "Codex terminal launch: session=%s command=%s codex_cli_version=%s resume=%s args=%s",
         session_id,
         codex_command,
-        _format_codex_version(app_server.codex_cli_version),
+        _format_codex_version(terminal_cli.codex_cli_version),
         thread_id is not None,
         loggable_launch_args,
         extra=debug_event(
             "codex_terminal_launch",
             session_id=session_id,
             command=codex_command,
-            codex_cli_version=_format_codex_version(app_server.codex_cli_version),
+            codex_cli_version=_format_codex_version(terminal_cli.codex_cli_version),
             resume=thread_id is not None,
             args=loggable_launch_args,
         ),
@@ -5665,8 +5734,12 @@ async def _auto_create_codex_terminal(
         client_name="omnigent-codex-native-auto",
     )
     retained_resume_client: CodexAppServerClient | None = None
+    terminal_cli: _CodexTerminalCli | None = None
     if launch_config.external_session_id is not None:
         try:
+            terminal_cli = await _resolve_codex_terminal_cli(
+                workspace=workspace, app_server=app_server, resume=True
+            )
             # The rollout was written above, so a missing one is codex still
             # indexing it or skipping a file it cannot read: retry, then reset.
             for retry_delay_s in (*_CODEX_MISSING_ROLLOUT_RETRY_DELAYS_S, None):
@@ -5674,7 +5747,10 @@ async def _auto_create_codex_terminal(
                     retained_resume_client = await preload_codex_thread_for_resume(
                         codex_ws_url,
                         launch_config.external_session_id,
-                        terminal_launch_args=launch_config.terminal_launch_args,
+                        terminal_launch_args=[
+                            *terminal_cli.codex_args,
+                            *(launch_config.terminal_launch_args or ()),
+                        ],
                         cwd=Path(workspace),
                         model_provider=(
                             _session_meta_provider
@@ -5682,7 +5758,7 @@ async def _auto_create_codex_terminal(
                             else None
                         ),
                         retain_client=codex_remote_resume_omits_permission_args(
-                            app_server.codex_cli_version
+                            terminal_cli.codex_cli_version
                         ),
                     )
                     break
@@ -5803,6 +5879,7 @@ async def _auto_create_codex_terminal(
             thread_id=launch_config.external_session_id,
             agent_spec=agent_spec,
             login_required=_codex_launch.login_required,
+            terminal_cli=terminal_cli,
         )
         terminal_view = launched.view
         terminal_instance = launched.terminal_instance

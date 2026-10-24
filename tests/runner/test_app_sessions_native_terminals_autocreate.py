@@ -5343,17 +5343,57 @@ class _RecordingCodexRegistry:
         )
 
 
+async def _launch_recorded_codex_tui(
+    tmp_path: Path,
+    *,
+    workspace: Path,
+    thread_id: str | None,
+    codex_cli_version: tuple[int, int, int] | None,
+    terminal_launch_args: list[str] | None = None,
+) -> Any:
+    from omnigent.runner.native.orchestration import (
+        _CodexNativeLaunchConfig,
+        _launch_codex_native_tui,
+    )
+
+    captured: dict[str, Any] = {}
+    app_server = SimpleNamespace(
+        listen_url="ws://127.0.0.1:9876",
+        config_overrides=[],
+        codex_cli_version=codex_cli_version,
+        codex_path="/opt/codex/bin/codex",
+        codex_home=tmp_path / "codex-home",
+        env={},
+    )
+    await _launch_codex_native_tui(
+        "conv_codex_launch",
+        _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
+        lambda _sid, _evt: None,
+        app_server=app_server,  # type: ignore[arg-type]
+        launch_config=_CodexNativeLaunchConfig(
+            workspace=workspace,
+            policy_server_url="http://127.0.0.1:8000",
+            terminal_launch_args=terminal_launch_args,
+            model_override=None,
+            external_session_id=None,
+            fork_source_id=None,
+            fork_source_external_id=None,
+            fork_carry_history=False,
+            bypass_sandbox=False,
+        ),
+        bridge_dir=tmp_path / "bridge",
+        thread_id=thread_id,
+        agent_spec=None,
+    )
+    return captured["spec"]
+
+
 @pytest.mark.asyncio
 async def test_codex_tui_launch_keeps_user_config_when_process_cwd_is_gone(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A Codex TUI relaunch retains user launch settings after the runner cwd is gone."""
-    from omnigent.runner.native.orchestration import (
-        _CodexNativeLaunchConfig,
-        _launch_codex_native_tui,
-    )
-
     workspace = tmp_path / "workspace"
     (workspace / ".omnigent").mkdir(parents=True)
     (workspace / ".omnigent" / "config.yaml").write_text(
@@ -5371,40 +5411,159 @@ async def test_codex_tui_launch_keeps_user_config_when_process_cwd_is_gone(
 
     monkeypatch.setattr(Path, "cwd", missing_cwd)
 
-    captured: dict[str, Any] = {}
-    app_server = SimpleNamespace(
-        listen_url="ws://127.0.0.1:9876",
-        config_overrides=[],
-        codex_cli_version=None,
-        codex_path="/opt/codex/bin/codex",
-        codex_home=tmp_path / "codex-home",
-        env={},
-    )
-    await _launch_codex_native_tui(
-        "conv_codex_cwd_gone",
-        _RecordingCodexRegistry(captured),  # type: ignore[arg-type]
-        lambda _sid, _evt: None,
-        app_server=app_server,  # type: ignore[arg-type]
-        launch_config=_CodexNativeLaunchConfig(
-            workspace=workspace,
-            policy_server_url="http://127.0.0.1:8000",
-            terminal_launch_args=None,
-            model_override=None,
-            external_session_id=None,
-            fork_source_id=None,
-            fork_source_external_id=None,
-            fork_carry_history=False,
-            bypass_sandbox=False,
-        ),
-        bridge_dir=tmp_path / "bridge",
-        thread_id=None,
-        agent_spec=None,
+    spec = await _launch_recorded_codex_tui(
+        tmp_path, workspace=workspace, thread_id=None, codex_cli_version=None
     )
 
-    spec = captured["spec"]
     assert spec.command == "user-codex"
     assert spec.args[0] == "--user-arg"
     assert spec.os_env.cwd == str(workspace)
+
+
+_FULL_ACCESS_ARGS = ["--sandbox", "danger-full-access", "--ask-for-approval", "never"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("permission_source", ["configured_args", "preset_with_newer_wrapper"])
+async def test_codex_tui_resume_omits_permission_overrides_for_configured_launch(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    permission_source: str,
+) -> None:
+    """Resuming through a configured Codex launch sends no flags Codex 0.154+ rejects."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    if permission_source == "configured_args":
+        (config_home / "config.yaml").write_text(
+            "harness:\n  codex-native:\n    args: [" + ", ".join(_FULL_ACCESS_ARGS) + "]\n"
+        )
+        terminal_launch_args = None
+        probed_version = (0, 154, 0)
+    else:
+        # The wrapper runs a newer Codex than the PATH binary the app-server probed.
+        wrapper = tmp_path / "codex-wrapper"
+        wrapper.write_text('#!/bin/sh\necho "codex-cli 0.154.0"\n')
+        wrapper.chmod(0o755)
+        (config_home / "config.yaml").write_text(
+            f"harness:\n  codex-native:\n    command: {wrapper}\n"
+        )
+        terminal_launch_args = list(_FULL_ACCESS_ARGS)
+        probed_version = (0, 153, 4)
+
+    spec = await _launch_recorded_codex_tui(
+        tmp_path,
+        workspace=workspace,
+        thread_id="thread-resume",
+        codex_cli_version=probed_version,
+        terminal_launch_args=terminal_launch_args,
+    )
+
+    assert spec.args[-4:] == ["resume", "--remote", "ws://127.0.0.1:9876", "thread-resume"]
+    assert not {"--sandbox", "--ask-for-approval"} & set(spec.args), spec.args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("wrapper_version_output", "app_server_version", "bypasses_hook_trust"),
+    [
+        ("codex-cli 0.130.0", (0, 153, 4), False),
+        ("codex-cli 0.154.0", (0, 130, 0), True),
+        ("my-wrapper 1.0", (0, 130, 0), False),
+    ],
+    ids=["older-wrapper", "newer-wrapper", "failed-probe-uses-app-server"],
+)
+async def test_codex_tui_resume_gates_hook_trust_on_wrapper_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper_version_output: str,
+    app_server_version: tuple[int, int, int],
+    bypasses_hook_trust: bool,
+) -> None:
+    """A wrapped resume gates hook trust on the wrapper's Codex, or the app-server's if unknown."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    wrapper = tmp_path / "codex-wrapper"
+    wrapper.write_text(f'#!/bin/sh\necho "{wrapper_version_output}"\n')
+    wrapper.chmod(0o755)
+    (config_home / "config.yaml").write_text(
+        f"harness:\n  codex-native:\n    command: {wrapper}\n"
+    )
+
+    spec = await _launch_recorded_codex_tui(
+        tmp_path,
+        workspace=workspace,
+        thread_id="thread-resume",
+        codex_cli_version=app_server_version,
+    )
+
+    assert ("--dangerously-bypass-hook-trust" in spec.args) is bypasses_hook_trust, spec.args
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness_config", "resume", "expected"),
+    [
+        pytest.param(
+            "args: [--sandbox, danger-full-access]",
+            True,
+            (None, (), ("--sandbox", "danger-full-access"), (0, 153, 4)),
+            id="codex-args",
+        ),
+        pytest.param(
+            "command: isaac\n    args: [codex, --]",
+            True,
+            ("isaac", ("codex", "--"), (), (0, 154, 0)),
+            id="wrapper-resume",
+        ),
+        pytest.param(
+            "command: isaac\n    args: [codex, --]",
+            False,
+            ("isaac", ("codex", "--"), (), (0, 153, 4)),
+            id="wrapper-fresh",
+        ),
+    ],
+)
+async def test_resolve_codex_terminal_cli_probes_wrapper_only_on_resume(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    harness_config: str,
+    resume: bool,
+    expected: tuple[object, ...],
+) -> None:
+    """A resume probes a configured wrapper; configured args alone are Codex args."""
+    from omnigent.runner.native.orchestration import _resolve_codex_terminal_cli
+
+    config_home = tmp_path / "config-home"
+    config_home.mkdir()
+    (config_home / "config.yaml").write_text(f"harness:\n  codex-native:\n    {harness_config}\n")
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(config_home))
+    probes: list[tuple[str, ...]] = []
+
+    async def _probe(*argv: str) -> tuple[int, int, int]:
+        probes.append(argv)
+        return (0, 154, 0)
+
+    monkeypatch.setattr("omnigent.inner.codex_executor._codex_cli_version", _probe)
+
+    terminal_cli = await _resolve_codex_terminal_cli(
+        workspace=str(tmp_path),
+        app_server=SimpleNamespace(codex_cli_version=(0, 153, 4)),  # type: ignore[arg-type]
+        resume=resume,
+    )
+
+    assert (
+        terminal_cli.command,
+        terminal_cli.wrapper_args,
+        terminal_cli.codex_args,
+        terminal_cli.codex_cli_version,
+    ) == expected
+    assert probes == ([("isaac", "codex", "--")] if terminal_cli.command and resume else [])
 
 
 @pytest.mark.asyncio
