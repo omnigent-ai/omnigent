@@ -235,6 +235,10 @@ and steers messages while the agent is busy.
   `tests/e2e_ui/start_session/test_sandbox_gateway_models_without_binding.py`,
   `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_optional_gateway_preview_without_a_host`
   and `tests/e2e_ui/start_session/test_sandbox_model_selection.py::test_sandbox_harness_without_reachable_models_blocks_launch`.
+  With no sandbox catalog for the harness (no model capability, or discovery
+  reports it `unconfigured`), Codex, Devin and Pi offer one "Default" row that
+  launches the harness's own default, while Claude Code lists its built-in
+  models.
 - Attach files or type `/` before the first send.
 - For a managed sandbox, submit a prompt and close the browser once the session
   URL appears, while provisioning is still in progress. Reopen that URL after

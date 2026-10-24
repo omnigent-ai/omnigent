@@ -3360,6 +3360,12 @@ export function NewChatLandingScreen() {
       sandboxModels.data,
     ],
   );
+  // With no sandbox catalog for the harness, a bare launch runs the harness's own default.
+  const sandboxUsesHarnessDefault =
+    sandboxSelected &&
+    info !== "loading" &&
+    !sandboxCatalogError &&
+    (!sandboxPreviewEnabled || sandboxModels.data?.status === "unconfigured");
   const claudeModelOptions = useMemo(
     () =>
       sandboxSelected
@@ -3650,6 +3656,7 @@ export function NewChatLandingScreen() {
   const [pickerModelSearch, setPickerModelSearch] = useState("");
   const pickerModelsLoading =
     sandboxCatalogPending ||
+    (sandboxSelected && info === "loading") ||
     (!sandboxSelected &&
       selectedHostId !== null &&
       (selectedNativeHarness === "claude-native"
@@ -4012,18 +4019,20 @@ export function NewChatLandingScreen() {
                           Loading models…
                         </div>
                       )}
-                      {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-                        <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
-                          {pickerModelsError?.message ?? "Models unavailable"}
-                        </div>
-                      )}
+                      {!pickerModelsLoading &&
+                        pickerModelOptions.length === 0 &&
+                        !sandboxUsesHarnessDefault && (
+                          <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
+                            {pickerModelsError?.message ?? "Models unavailable"}
+                          </div>
+                        )}
                     </>
                   ),
                   choices: [
                     // Default can't launch once the provider rules the harness out.
                     ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
                     (!sandboxInferenceConfigured &&
-                      pickerModelOptions.length > 0 &&
+                      (pickerModelOptions.length > 0 || sandboxUsesHarnessDefault) &&
                       !pickerModelOptions.some((option) => option.isDefault))
                       ? [
                           {
