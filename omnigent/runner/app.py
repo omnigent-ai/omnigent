@@ -5527,6 +5527,21 @@ def create_runner_app(
                 optional_labels=startup_labels,
             )
 
+        native_reference_present = canonicalize_harness(
+            harness_name
+        ) == "acp" or "HARNESS_ACP_COMMAND" in (spawn_env or {})
+        native_session_id: str | None = None
+        if native_reference_present:
+            from omnigent.runtime.harnesses.native_session import read_native_session_reference
+
+            try:
+                native_session_id = await read_native_session_reference(server_client, conv_id)
+            except (httpx.HTTPError, ValueError):
+                return JSONResponse(
+                    status_code=503,
+                    content={"error": "native_session_reference_unavailable"},
+                )
+
         agent_version = (
             dispatch.agent_version if dispatch else cast(int | None, body.get("agent_version"))
         )
@@ -5786,6 +5801,8 @@ def create_runner_app(
             if _ds_sa and _session_sub_agent_resolved.get(conv_id) is False:
                 _warn_unresolved_sub_agent(conv_id, _ds_sa)
             event_body = _wrap_as_message_event(_instr_body)
+            if native_reference_present:
+                event_body["native_session_id"] = native_session_id
             _inject_mcp_schemas(event_body, _mcp_schemas)
             _response_id: str | None = None
             try:
@@ -5892,6 +5909,19 @@ def create_runner_app(
                                     )
 
                                 _evt_type = event.get("type")
+                                if _evt_type == "native_session.checkpoint_requested":
+                                    from omnigent.runtime.harnesses.native_session import (
+                                        NativeSessionCheckpointRequest,
+                                        checkpoint_native_session,
+                                    )
+
+                                    checkpoint = NativeSessionCheckpointRequest.model_validate(
+                                        event
+                                    )
+                                    await checkpoint_native_session(
+                                        server_client, client, conv_id, checkpoint
+                                    )
+                                    continue
                                 if (
                                     _evt_type == "response.compaction.in_progress"
                                     and conv_id in _sdk_compact_inprogress
