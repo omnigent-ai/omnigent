@@ -672,6 +672,43 @@ def test_workflows_connect_selection_to_jobs():
         assert validate["run"] == f"python3 .github/scripts/ci/require_results.py {suite}"
 
 
+@pytest.mark.parametrize(
+    "path",
+    [
+        "workflows/ci.yml",
+        "workflows/e2e-ui.yml",
+        "workflows/web-tests.yml",
+        "actions/e2e-run/action.yml",
+        "actions/integration-run/action.yml",
+    ],
+)
+def test_ci_artifacts_can_be_uploaded_again_on_reruns(path):
+    document = yaml.safe_load((ROOT / ".github" / path).read_text())
+    jobs = document.get("jobs", {"action": document.get("runs")})
+    for job in jobs.values():
+        for step in job.get("steps", []):
+            if step.get("uses", "").startswith("actions/upload-artifact@"):
+                options = step["with"]
+                assert (
+                    options.get("overwrite") is True
+                    or "${{ github.run_attempt }}" in options["name"]
+                ), f"{path}: {options['name']} collides with an earlier run attempt"
+
+
+def test_ui_shards_can_download_the_sidecar_when_only_failed_jobs_rerun():
+    jobs = yaml.safe_load((ROOT / ".github/workflows/e2e-ui.yml").read_text())["jobs"]
+    upload = next(
+        step
+        for step in jobs["build-sidecar"]["steps"]
+        if "upload-artifact@" in step.get("uses", "")
+    )
+    download = next(
+        step for step in jobs["e2e-ui"]["steps"] if "download-artifact@" in step.get("uses", "")
+    )
+    assert upload["with"]["name"] == download["with"]["name"]
+    assert "${{ github.run_attempt }}" not in download["with"]["name"]
+
+
 def _run_merge_gate(
     tmp_path: Path, snapshots: list[dict[str, Any]]
 ) -> subprocess.CompletedProcess[str]:

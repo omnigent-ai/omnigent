@@ -177,7 +177,7 @@ runs:
       if: ${{ failure() || cancelled() }}
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
-        name: integration-server-logs-${{ inputs.harness }}-${{ github.run_id }}${{ inputs.artifact_suffix }}
+        name: integration-server-logs-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.artifact_suffix }}
         path: |
           /tmp/omnigent-integration-${{ github.run_id }}-${{ inputs.harness }}/**/server.log
           /tmp/omnigent-integration-${{ github.run_id }}-${{ inputs.harness }}/**/runner.log
@@ -188,7 +188,7 @@ runs:
       if: ${{ always() }}
       uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
       with:
-        name: integration-${{ inputs.harness }}-${{ github.run_id }}${{ inputs.artifact_suffix }}
+        name: integration-${{ inputs.harness }}-${{ github.run_id }}-${{ github.run_attempt }}${{ inputs.artifact_suffix }}
         path: artifacts/
         retention-days: 14
         if-no-files-found: ignore
