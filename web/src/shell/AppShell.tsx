@@ -83,7 +83,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
-import { browserViewOwnerId, openAgentBrowserTab } from "@/hooks/useBrowserTabs";
+import { browserViewConversationId, openAgentBrowserTab } from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   isAgentTerminalKey,
@@ -975,14 +975,9 @@ function AppShellImpl() {
     resyncBrowserSuppression();
   }, []);
 
-  // Design-mode submit routing. Lives here (with the hoisted relay) because the
-  // in-page popup posts back via preload IPC delivered to the always-mounted
-  // shell, not BrowserPane. On submit: build the `[Design Mode — …]` message,
-  // attach the cropped screenshot, send via the NORMAL chat path (no backend
-  // route), then signal the result back for green/red. Dismiss is a no-op.
-  // Routes to the conversation's own bound agent (the picked element belongs to
-  // the page it drives). The screenshot arrives on the earlier element-selected
-  // event, so we stash the latest per conversation and pair it at submit time.
+  // Design-mode submit routing lives in the always-mounted shell: the in-page
+  // popup posts back via preload IPC, not BrowserPane. Screenshots arrive on
+  // element-selected, so we stash the latest per browser view and pair at submit.
   const designShotRef = useRef<Map<string, string>>(new Map());
   const boundAgentId = boundAgent?.id ?? null;
   useEffect(() => {
@@ -1042,8 +1037,8 @@ function AppShellImpl() {
         const file = dataUrlToFile(shot, `design-element-${submitId}.png`);
         const chat = useChatStore.getState();
         // `cid` is the browser view ID; user-opened tabs encode their owning session.
-        const ownerId = browserViewOwnerId(cid);
-        if (ownerId !== chat.conversationId) {
+        const ownerConversationId = browserViewConversationId(cid);
+        if (ownerConversationId !== chat.conversationId) {
           designShotRef.current.delete(cid);
           signal(false, "Return to this session before sending.");
           return;
@@ -1051,7 +1046,7 @@ function AppShellImpl() {
         const files = file ? [file] : undefined;
         if (
           shouldQueueSend(
-            ownerId,
+            ownerConversationId,
             chat.status,
             chat.sessionStatus,
             chat.queuedMessages,
