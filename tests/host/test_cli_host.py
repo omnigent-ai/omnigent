@@ -432,6 +432,127 @@ def test_host_rejects_positional_and_server_option_together(
     assert runs == [], "run_host_process must not run when the args are rejected"
 
 
+_MANAGED_SERVER = "https://managed.example.databricksapps.com"
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        pytest.param(
+            ["host", "status", "--all", "--server", _MANAGED_SERVER],
+            id="subcommand-server",
+        ),
+        pytest.param(["host", "--server", _MANAGED_SERVER, "status", "--all"], id="group-server"),
+    ],
+)
+def test_host_status_all_lists_targets_despite_wrapper_injected_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    argv: list[str],
+) -> None:
+    """
+    Verify ``host status --all`` still lists every target when a CLI wrapper
+    appends its managed ``--server``.
+
+    A wrapper such as ``isaac omni`` rewrites every invocation to add the managed
+    server, so ``isaac omni host status --all`` reaches Omnigent as
+    ``host status --all --server <managed>``. The user asked for all targets; the
+    injected selector must not turn that into a usage error.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setenv("OMNIGENT_REQUIRE_WRAPPER", "1")
+    monkeypatch.setenv("OMNIGENT_WRAPPER_BYPASS", "1")
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._list_daemon_records", list)
+
+    result = CliRunner().invoke(cli, argv)
+
+    assert result.exit_code == 0, (
+        f"Expected the all-targets listing, got exit {result.exit_code}. Output: {result.output}"
+    )
+    assert "No host daemons found." in result.output, result.output
+    assert "not both" not in result.output, result.output
+    assert "Ignoring --server: --all selects every known target." in result.output, (
+        f"Expected a notice that the injected --server was overridden, got: {result.output}"
+    )
+
+
+def test_host_status_all_notice_omits_server_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The override notice must not echo basic-auth userinfo from the injected URL."""
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setenv("OMNIGENT_REQUIRE_WRAPPER", "1")
+    monkeypatch.setenv("OMNIGENT_WRAPPER_BYPASS", "1")
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    monkeypatch.setattr("omnigent.cli._list_daemon_records", list)
+    credentialed = "https://svc-user:secret-token@managed.example.databricksapps.com"
+
+    result = CliRunner().invoke(cli, ["host", "status", "--all", "--server", credentialed])
+
+    assert result.exit_code == 0, (
+        f"Expected the listing, got exit {result.exit_code}. Output: {result.output}"
+    )
+    assert "Ignoring --server: --all selects every known target." in result.output, result.output
+    assert "secret-token" not in result.output, f"credentials leaked into output: {result.output}"
+    assert "svc-user" not in result.output, f"userinfo leaked into output: {result.output}"
+
+
+def test_host_stop_all_stops_every_target_despite_wrapper_injected_server(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Verify ``host stop --all`` under a wrapper stops every registered daemon even
+    though the wrapper also injected its managed ``--server``.
+
+    The selector is shared with ``host status``, so the same precedence applies
+    to the destructive command: the user asked for all targets.
+    """
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setenv("OMNIGENT_REQUIRE_WRAPPER", "1")
+    monkeypatch.setenv("OMNIGENT_WRAPPER_BYPASS", "1")
+    monkeypatch.setattr("omnigent.cli._HOST_PID_PATH", tmp_path / "host.pid")
+    records = [
+        cli_module._HostDaemonRecord(
+            pid=pid,
+            target=target,
+            mode="server",
+            server_url=target,
+            log_path=None,
+            started_at=int(time.time()),
+            config_sig="sig",
+        )
+        for pid, target in ((4242, "https://a.example.com"), (4243, "https://b.example.com"))
+    ]
+    terminated: list[cli_module._HostDaemonRecord] = []
+
+    def _fake_terminate(record: cli_module._HostDaemonRecord, *, force: bool) -> str:
+        terminated.append(record)
+        return cli_module._STOP_TERMINATED
+
+    with (
+        patch("omnigent.cli._list_daemon_records", lambda: list(records)),
+        patch("omnigent.cli._terminate_daemon", _fake_terminate),
+    ):
+        result = CliRunner().invoke(
+            cli,
+            ["host", "stop", "--all", "--daemon-only", "--server", _MANAGED_SERVER],
+        )
+
+    assert result.exit_code == 0, (
+        f"Expected every target stopped, got exit {result.exit_code}. Output: {result.output}"
+    )
+    assert terminated == records, f"--all must stop every registered daemon, stopped: {terminated}"
+    assert "Stopped https://a.example.com daemon pid=4242" in result.output, result.output
+    assert "Stopped https://b.example.com daemon pid=4243" in result.output, result.output
+    assert "Ignoring --server: --all selects every known target." in result.output, result.output
+
+
 def test_host_daemon_alive_returns_false_when_no_pid_file(
     tmp_path: Path,
 ) -> None:
