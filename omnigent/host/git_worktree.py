@@ -380,7 +380,34 @@ def _ensure_base_resolvable(repo_root: str, base_branch: str) -> None:
         ).returncode
         != 0
     ):
-        raise WorktreeError(f"base branch does not exist: {base_branch}")
+        message = f"base branch {base_branch!r} does not exist in {repo_root}"
+        suggestion = _default_branch(repo_root)
+        if suggestion is not None and suggestion != base_branch:
+            message += f" (its default branch is {suggestion!r})"
+        raise WorktreeError(
+            f"{message}; update the base branch for this session or its project and try again"
+        )
+
+
+def _default_branch(repo_root: str) -> str | None:
+    """Best-effort guess of the repo's default branch for error hints.
+
+    Prefers the remote's ``origin/HEAD`` (as a local branch name when one
+    exists), else the main work tree's checked-out branch.
+
+    :param repo_root: Absolute repo work-tree root, e.g.
+        ``"/Users/alice/myrepo"``.
+    :returns: A resolvable branch name, e.g. ``"master"`` or
+        ``"origin/master"``, or ``None`` if none can be determined.
+    """
+    remote_head = _run_git(
+        ["symbolic-ref", "--quiet", "--short", "refs/remotes/origin/HEAD"], cwd=repo_root
+    )
+    if remote_head.returncode == 0 and (remote_ref := remote_head.stdout.strip()):
+        local_name = remote_ref.removeprefix("origin/")
+        return local_name if _local_branch_exists(repo_root, local_name) else remote_ref
+    head = _run_git(["symbolic-ref", "--quiet", "--short", "HEAD"], cwd=repo_root)
+    return (head.stdout.strip() or None) if head.returncode == 0 else None
 
 
 @dataclass

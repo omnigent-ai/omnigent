@@ -269,7 +269,28 @@ def test_create_worktree_unknown_base_branch_fails(git_repo: Path) -> None:
         create_worktree(repo_path=str(git_repo), branch_name="x", base_branch="nope-not-a-branch")
     # Proves _ensure_base_resolvable rejects rather than silently
     # branching from HEAD when the requested base is missing.
-    assert "base branch does not exist" in exc.value.message
+    assert "base branch 'nope-not-a-branch' does not exist" in exc.value.message
+    assert "default branch is 'main'" in exc.value.message
+
+
+def test_unknown_base_branch_error_names_remote_default_branch(tmp_path: Path) -> None:
+    """A project default of ``main`` on a ``master`` repo points the user at ``master``."""
+    source = (tmp_path / "source").resolve()
+    source.mkdir()
+    _git(source, "init", "-q", "-b", "master")
+    _git(source, "commit", "-q", "--allow-empty", "-m", "init")
+    clone = (tmp_path / "clone").resolve()
+    _git(tmp_path, "clone", "-q", str(source), str(clone))
+    # Check out another branch so the hint must come from origin/HEAD, not HEAD.
+    _git(clone, "checkout", "-q", "-b", "topic")
+
+    with pytest.raises(WorktreeError) as exc:
+        create_worktree(repo_path=str(clone), branch_name="x", base_branch="main")
+
+    assert exc.value.message == (
+        f"base branch 'main' does not exist in {clone} (its default branch is 'master'); "
+        "update the base branch for this session or its project and try again"
+    )
 
 
 @pytest.mark.parametrize("option_like", ["-f", "--exec-path"])
