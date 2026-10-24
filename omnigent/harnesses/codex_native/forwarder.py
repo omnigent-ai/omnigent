@@ -3072,6 +3072,11 @@ async def _handle_event(
     :returns: None.
     """
     method = event.get("method")
+    if method == "skills/changed":
+        from omnigent.harnesses.skill_refresh import refresh_host_skills
+
+        await refresh_host_skills(client, session_id)
+        return
     params = event.get("params")
     if not isinstance(method, str) or not isinstance(params, dict):
         return

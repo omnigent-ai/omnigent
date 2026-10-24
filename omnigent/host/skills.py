@@ -63,6 +63,9 @@ class HostSkillDiscovery:
             else frame.skills_filter,
         )
         with self._lock:
+            if frame.refresh:
+                # User and plugin roots may be shared by several cached targets.
+                self._cache.clear()
             cached = self._cache.get(key)
             if cached is not None and cached[0] > time.monotonic():
                 self._cache.move_to_end(key)

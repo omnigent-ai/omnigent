@@ -601,3 +601,24 @@ def test_codex_permission_settings_fall_back_to_legacy_policy_args() -> None:
         "-c",
         'approvals_reviewer="user"',
     ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("params", [None, {}])
+async def test_skill_change_refreshes_host_without_thread_id(tmp_path: Path, params) -> None:
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient
+
+    client = _RecordingClient()
+    event = {"method": "skills/changed"}
+    if params is not None:
+        event["params"] = params
+    await fwd._handle_event(
+        client,
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event=event,
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_1",
+    )
+    assert client.posts == [("/v1/skills?session_id=conv_x", {})]

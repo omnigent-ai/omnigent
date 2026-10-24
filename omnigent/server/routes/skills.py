@@ -44,6 +44,7 @@ def create_skills_router(
     """Build the discovery route, mounted under ``/v1``."""
     router = APIRouter()
 
+    @router.post("/skills")
     @router.get("/skills")
     async def get_skills(
         request: Request,
@@ -60,7 +61,7 @@ def create_skills_router(
         Otherwise, supply ``host_id``, ``harness``, and ``path``; host ownership
         is required. Optional ``agent_id`` applies the selected agent's filter
         and bundled skills, with the same access check as session creation.
-        The two forms cannot be combined.
+        The two forms cannot be combined. POST refreshes the host cache before discovery.
         """
         user_id = require_user(request, auth_provider)
         agent_version = sub_agent_name = None
@@ -141,6 +142,7 @@ def create_skills_router(
             agent_version=agent_version,
             sub_agent_name=sub_agent_name,
             skills_filter=spec.skills_filter if spec is not None else "all",
+            refresh=request.method == "POST",
         )
         if result.status != "ok":
             raise HTTPException(
@@ -182,6 +184,7 @@ async def request_host_skills(
     agent_version: str | None = None,
     sub_agent_name: str | None = None,
     skills_filter: str | list[str] = "all",
+    refresh: bool = False,
 ) -> HostSkillsResultFrame:
     """Request skill metadata over the host tunnel, with bounded waiting and cleanup."""
     request_id = secrets.token_hex(8)
@@ -200,6 +203,7 @@ async def request_host_skills(
                     agent_version=agent_version,
                     sub_agent_name=sub_agent_name,
                     skills_filter=skills_filter,
+                    refresh=refresh,
                 )
             ),
         )

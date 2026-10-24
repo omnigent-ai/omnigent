@@ -228,3 +228,44 @@ async def test_forwarder_posts_raw_todos_on_todo_write(tmp_path: Path) -> None:
 
     # The raw list is forwarded verbatim — no accumulation or transformation.
     assert data["todos"] == raw_todos
+
+
+@pytest.mark.asyncio
+async def test_skill_config_change_refreshes_host(tmp_path: Path) -> None:
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("")
+    _record_session_start(bridge_dir, transcript_path)
+    record_hook_event(
+        bridge_dir,
+        {
+            "hook_event_name": "ConfigChange",
+            "source": "skills",
+            "session_id": "claude-session",
+        },
+    )
+    server, thread, base_url = _start_recording_server()
+    task = asyncio.create_task(
+        forward_claude_transcript_to_session(
+            base_url=base_url,
+            headers={},
+            session_id="conv_abc",
+            bridge_dir=bridge_dir,
+            agent_name="claude-native-ui",
+            start_at_end=False,
+            poll_interval_s=0.01,
+        )
+    )
+    try:
+        async with asyncio.timeout(5):
+            while True:
+                request = await _get_recorded_request(server)
+                if request["path"] == "/v1/skills?session_id=conv_abc":
+                    break
+    finally:
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

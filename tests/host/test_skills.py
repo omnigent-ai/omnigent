@@ -234,3 +234,23 @@ def test_directory_catalog_never_downloads_a_session_bundle(tmp_path: Path) -> N
         HostSkillsFrame("request", "claude-native", str(tmp_path)), tmp_path
     ) == [{"name": "local", "description": "local description"}]
     fetch.assert_not_called()
+
+
+def test_refresh_updates_catalog_and_invalidates_other_targets(tmp_path: Path) -> None:
+    discovery = HostSkillDiscovery(Mock())
+    frame = HostSkillsFrame("request", "claude-native", str(tmp_path))
+    other = replace(frame, agent_id="other")
+    assert discovery.discover(frame, tmp_path) == []
+    assert discovery.discover(other, tmp_path) == []
+    directory = tmp_path / ".claude" / "skills" / "added"
+    directory.mkdir(parents=True)
+    path = directory / "SKILL.md"
+    path.write_text(_skill("added"))
+    assert discovery.discover(frame, tmp_path) == []
+    expected = [{"name": "added", "description": "added description"}]
+    assert discovery.discover(replace(frame, refresh=True), tmp_path) == expected
+    assert discovery.discover(other, tmp_path) == expected
+    path.unlink()
+    assert discovery.discover(frame, tmp_path) == expected
+    assert discovery.discover(replace(frame, refresh=True), tmp_path) == []
+    assert discovery.discover(other, tmp_path) == []
