@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -781,6 +782,250 @@ async def test_ensure_local_codex_resume_rollout_empty_server_history_wins(
     records = [json.loads(line) for line in existing.read_text().splitlines()]
     assert [record["type"] for record in records] == ["session_meta"]
     assert "/local/only" not in json.dumps(records)
+
+
+_THREAD_ID = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+
+
+def _write_rollout_with_turns(
+    codex_home: Path, thread_id: str, turns: list[tuple[str, str]]
+) -> Path:
+    """Write a Codex rollout whose turns carry the given ``(prompt, reply)`` pairs."""
+    rollout_dir = codex_home / "sessions" / "2026" / "10" / "14"
+    rollout_dir.mkdir(parents=True, exist_ok=True)
+    rollout = rollout_dir / f"rollout-2026-10-14T17-49-09-{thread_id}.jsonl"
+    records: list[dict[str, Any]] = [
+        {
+            "type": "session_meta",
+            "payload": {"id": thread_id, "cwd": "/local/workspace", "originator": "codex"},
+        },
+        # Codex's injected context is a user-role message with no server counterpart.
+        {
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "<environment_context>/local</environment_context>",
+                    }
+                ],
+            },
+        },
+    ]
+    for index, (prompt, reply) in enumerate(turns, start=1):
+        records += [
+            {
+                "type": "turn_context",
+                "payload": {"turn_id": f"turn_{index}", "cwd": "/local/workspace"},
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+            },
+            {
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": reply}],
+                },
+            },
+        ]
+    rollout.write_text("".join(json.dumps(record) + "\n" for record in records), encoding="utf-8")
+    return rollout
+
+
+def _server_message(
+    role: str, text: str, *, turn: int, interrupted: bool = False
+) -> dict[str, Any]:
+    """One committed Omnigent message item as the items API returns it."""
+    item: dict[str, Any] = {
+        "id": f"msg_{role}_{turn}",
+        "response_id": f"codex_turn_{turn}",
+        "type": "message",
+        "role": role,
+        "content": [{"type": "input_text" if role == "user" else "output_text", "text": text}],
+    }
+    if interrupted:
+        item["interrupted"] = True
+    return item
+
+
+async def _cold_resume_rollout(
+    tmp_path: Path, codex_home: Path, items: list[dict[str, Any]]
+) -> Path:
+    """Refresh the cold-resume rollout against a server whose history is *items*."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/v1/sessions/conv_codex/items"
+        return httpx.Response(200, json={"data": items, "has_more": False})
+
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        return await codex_native._ensure_local_codex_resume_rollout(
+            client,
+            session_id="conv_codex",
+            external_session_id=_THREAD_ID,
+            codex_home=codex_home,
+            workspace=(tmp_path / "workspace").resolve(),
+            model_provider="omnigent_databricks",
+            codex_path=None,
+        )
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_keeps_local_replies_the_server_lacks(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    A local rollout with assistant replies the server never received is kept.
+
+    Omnigent never deletes committed items, so a server transcript that is
+    behind the native rollout means the transcript forwarder failed to mirror
+    those turns; rebuilding from it would erase the conversation on reconnect.
+    """
+    codex_home = tmp_path / "codex-home"
+    existing = _write_rollout_with_turns(
+        codex_home, _THREAD_ID, [("prompt 1", "reply 1"), ("prompt 2", "reply 2")]
+    )
+    before = existing.read_bytes()
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.codex_native.main"):
+        rollout = await _cold_resume_rollout(
+            tmp_path, codex_home, [_server_message("user", "prompt 1", turn=1)]
+        )
+
+    assert rollout == existing
+    assert existing.read_bytes() == before
+    assert "keeping the local rollout" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_keeps_local_rollout_ahead_of_partial_history(
+    tmp_path: Path,
+) -> None:
+    """
+    Replies the server did mirror, and an interrupted partial, are not divergence.
+
+    The server holds the first turn and the interrupted partial of the
+    second; the local rollout carries both replies plus a third turn.
+    """
+    codex_home = tmp_path / "codex-home"
+    existing = _write_rollout_with_turns(
+        codex_home,
+        _THREAD_ID,
+        [("prompt 1", "reply 1"), ("prompt 2", "reply 2"), ("prompt 3", "reply 3")],
+    )
+    before = existing.read_bytes()
+
+    rollout = await _cold_resume_rollout(
+        tmp_path,
+        codex_home,
+        [
+            _server_message("user", "prompt 1", turn=1),
+            _server_message("assistant", "reply 1", turn=1),
+            _server_message("user", "prompt 2", turn=2),
+            _server_message("assistant", "reply", turn=2, interrupted=True),
+        ],
+    )
+
+    assert rollout == existing
+    assert existing.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_rebuilds_when_server_history_diverges(
+    tmp_path: Path,
+) -> None:
+    """A server reply the local rollout lacks is divergent history: the server wins."""
+    codex_home = tmp_path / "codex-home"
+    existing = _write_rollout_with_turns(
+        codex_home, _THREAD_ID, [("prompt 1", "reply 1"), ("prompt 2", "reply 2")]
+    )
+
+    rollout = await _cold_resume_rollout(
+        tmp_path,
+        codex_home,
+        [
+            _server_message("user", "prompt 1", turn=1),
+            _server_message("assistant", "reply 1", turn=1),
+            _server_message("user", "prompt 3", turn=3),
+            _server_message("assistant", "reply 3", turn=3),
+        ],
+    )
+
+    assert rollout == existing
+    rebuilt = existing.read_text(encoding="utf-8")
+    assert "reply 3" in rebuilt
+    assert "reply 2" not in rebuilt
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_keeps_a_rollout_with_a_truncated_last_record(
+    tmp_path: Path,
+) -> None:
+    """A record cut short mid-append does not forfeit the replies before it."""
+    codex_home = tmp_path / "codex-home"
+    existing = _write_rollout_with_turns(
+        codex_home, _THREAD_ID, [("prompt 1", "reply 1"), ("prompt 2", "reply 2")]
+    )
+    with existing.open("a", encoding="utf-8") as handle:
+        handle.write('{"type": "event_msg", "payload": {"type": "task_comp')
+    before = existing.read_bytes()
+
+    rollout = await _cold_resume_rollout(tmp_path, codex_home, [])
+
+    assert rollout == existing
+    assert existing.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_guard_ignores_malformed_tool_history(
+    tmp_path: Path,
+) -> None:
+    """A malformed tool item in server history does not abort the keep-local check."""
+    codex_home = tmp_path / "codex-home"
+    existing = _write_rollout_with_turns(codex_home, _THREAD_ID, [("prompt 1", "reply 1")])
+    before = existing.read_bytes()
+
+    rollout = await _cold_resume_rollout(
+        tmp_path,
+        codex_home,
+        [
+            _server_message("user", "prompt 1", turn=1),
+            {"id": "fc_broken", "response_id": "codex_turn_1", "type": "function_call"},
+        ],
+    )
+
+    assert rollout == existing
+    assert existing.read_bytes() == before
+
+
+@pytest.mark.asyncio
+async def test_ensure_local_codex_resume_rollout_rebuilds_from_an_unusable_local_rollout(
+    tmp_path: Path,
+) -> None:
+    """Only a rollout Codex can resume may be kept over the server transcript."""
+    codex_home = tmp_path / "codex-home"
+    existing = _write_rollout_with_turns(codex_home, _THREAD_ID, [("prompt 1", "reply 1")])
+    lines = existing.read_text(encoding="utf-8").splitlines()
+    meta = json.loads(lines[0])
+    meta["payload"]["id"] = "019e96aa-0be2-7343-8d3b-000000000000"
+    existing.write_text("\n".join([json.dumps(meta), *lines[1:]]) + "\n", encoding="utf-8")
+
+    rollout = await _cold_resume_rollout(tmp_path, codex_home, [])
+
+    assert rollout == existing
+    records = [json.loads(line) for line in existing.read_text().splitlines()]
+    assert [record["type"] for record in records] == ["session_meta"]
+    assert records[0]["payload"]["id"] == _THREAD_ID
 
 
 @pytest.mark.asyncio

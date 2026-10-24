@@ -4,12 +4,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import enum
 import hashlib
 import json
 import logging
 import re
 import urllib.error
 import urllib.request
+from collections import Counter
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -2229,6 +2231,9 @@ async def supervise_forwarder(
         # subscribe task park instead of blind-polling ``thread/resume``
         # for a fresh, still-empty thread. Recreated per thread on rotation.
         thread_active = asyncio.Event()
+        # Pulsed on every status edge of the thread, so a subscription Codex
+        # refused re-reads the thread after each turn until it succeeds.
+        thread_status = asyncio.Event()
         subscribe_task = asyncio.create_task(
             _subscribe_until_ready(
                 client,
@@ -2240,6 +2245,7 @@ async def supervise_forwarder(
                 elicitation_tracker=target.elicitation_tracker,
                 forwarder_state=forwarder_state,
                 ready_signal=thread_active,
+                status_signal=thread_status,
             ),
             name="codex-native-forwarder-subscribe",
         )
@@ -2269,6 +2275,7 @@ async def supervise_forwarder(
                         # own active signal so the new subscription parks
                         # until the rotated thread's first turn.
                         thread_active = asyncio.Event()
+                        thread_status = asyncio.Event()
                         subscribe_task = asyncio.create_task(
                             _subscribe_until_ready(
                                 client,
@@ -2280,6 +2287,7 @@ async def supervise_forwarder(
                                 elicitation_tracker=target.elicitation_tracker,
                                 forwarder_state=forwarder_state,
                                 ready_signal=thread_active,
+                                status_signal=thread_status,
                             ),
                             name="codex-native-forwarder-subscribe",
                         )
@@ -2289,6 +2297,8 @@ async def supervise_forwarder(
                     # waiting forever on an idle fresh thread.
                     if not thread_active.is_set() and _event_indicates_thread_active(event):
                         thread_active.set()
+                    if _event_is_thread_status_edge(event, target.thread_id):
+                        thread_status.set()
                     # Surface a /side ephemeral fork as its own sub-agent (rail)
                     # child. No-op unless this event is a fork of the active
                     # thread; once mapped, the fork's events route to the child.
@@ -2651,20 +2661,43 @@ async def _subscribe_until_ready(
     elicitation_tracker: _CodexElicitationTaskTracker,
     forwarder_state: _CodexForwarderState | None = None,
     ready_signal: asyncio.Event | None = None,
+    status_signal: asyncio.Event | None = None,
 ) -> None:
-    """Reserve authoritative delivery order while subscribing and replaying."""
-    async with _conversation_item_delivery_scope(session_id):
-        await _subscribe_until_ready_inner(
-            client,
-            ap_client,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            thread_id=thread_id,
-            usage_coalescer=usage_coalescer,
-            elicitation_tracker=elicitation_tracker,
-            forwarder_state=forwarder_state,
-            ready_signal=ready_signal,
-        )
+    """
+    Reserve authoritative delivery order while subscribing and replaying.
+
+    A refused or failed attempt is retried after each thread status edge
+    reported on *status_signal* (``None``: one attempt), with the order lock
+    released while waiting so live posts for the session are not held up.
+    """
+    history_owed = False
+    refused_before = False
+    history = _CommittedHistory()
+    while True:
+        async with _conversation_item_delivery_scope(session_id):
+            attempt = await _subscribe_until_ready_inner(
+                client,
+                ap_client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                thread_id=thread_id,
+                usage_coalescer=usage_coalescer,
+                elicitation_tracker=elicitation_tracker,
+                forwarder_state=forwarder_state,
+                ready_signal=ready_signal,
+                history_owed=history_owed,
+                refused_before=refused_before,
+                history=history,
+            )
+        if attempt is _SubscribeAttempt.SUBSCRIBED or status_signal is None:
+            return
+        # The retry is woken by a status edge, so a turn ran while this
+        # connection was unsubscribed: every failed attempt owes history.
+        history_owed = True
+        if attempt is not _SubscribeAttempt.UNAVAILABLE:
+            refused_before = True
+        await status_signal.wait()
+        status_signal.clear()
 
 
 async def _subscribe_until_ready_inner(
@@ -2678,7 +2711,10 @@ async def _subscribe_until_ready_inner(
     elicitation_tracker: _CodexElicitationTaskTracker,
     forwarder_state: _CodexForwarderState | None = None,
     ready_signal: asyncio.Event | None = None,
-) -> None:
+    history_owed: bool = False,
+    refused_before: bool = False,
+    history: _CommittedHistory | None = None,
+) -> _SubscribeAttempt:
     """
     Subscribe this app-server connection to a Codex thread.
 
@@ -2699,6 +2735,11 @@ async def _subscribe_until_ready_inner(
     detect activity and set the signal. A short poll still covers the
     brief window between "thread active" and the rollout being flushed.
 
+    Any other refusal (such as ``-32601 list_turns is not supported yet``)
+    falls back to ``thread/read``: Codex only routes turn/item notifications
+    to subscribed connections, so this is how the thread's completed turns
+    still reach the transcript until a later ``thread/resume`` succeeds.
+
     :param client: Codex app-server client.
     :param ap_client: Omnigent HTTP client used for replayed items.
     :param session_id: Omnigent conversation id.
@@ -2714,7 +2755,15 @@ async def _subscribe_until_ready_inner(
         thread parks here instead of polling. ``None`` falls back to the
         fixed-interval retry (used where no live event stream drives the
         signal).
-    :returns: None.
+    :param history_owed: Whether an earlier attempt failed. Turns are then
+        requested from ``thread/resume`` and checked against committed history
+        so items completed while unsubscribed are replayed exactly once.
+    :param refused_before: Whether Codex already refused this subscription;
+        later refusals log quietly and a success is reported as a recovery.
+    :param history: Committed messages cached across attempts; fetched
+        incrementally before a replay that may repeat committed turns.
+    :returns: How the attempt ended; only ``SUBSCRIBED`` finishes the
+        subscription.
     """
     bridge_state = read_bridge_state(bridge_dir)
     replay_from_turn_id = (
@@ -2724,9 +2773,10 @@ async def _subscribe_until_ready_inner(
     )
     saw_not_ready = False
     while True:
+        subscribed = True
         try:
             params: _JsonObject = {"threadId": thread_id}
-            if not saw_not_ready and replay_from_turn_id is None:
+            if not saw_not_ready and not history_owed and replay_from_turn_id is None:
                 params["excludeTurns"] = True
             response = await client.request("thread/resume", params)
         except asyncio.CancelledError:
@@ -2751,8 +2801,17 @@ async def _subscribe_until_ready_inner(
                     # poll covers that window.
                     await _sleep(_SUBSCRIBE_RETRY_DELAY_SECONDS)
                 continue
-            _logger.warning("failed to subscribe to Codex thread %s", thread_id, exc_info=True)
-            return
+            if not isinstance(exc, CodexAppServerResponseError):
+                # A transport failure (dropped websocket) cannot be read around.
+                _logger.warning("failed to subscribe to Codex thread %s", thread_id, exc_info=True)
+                return _SubscribeAttempt.UNAVAILABLE
+            read = await _read_thread_after_refused_resume(
+                client, thread_id=thread_id, refusal=exc, first_refusal=not refused_before
+            )
+            if read is None:
+                return _SubscribeAttempt.REFUSED
+            response = read
+            subscribed = False
         if forwarder_state is not None:
             forwarder_state.note_resume_response(response)
             # Source of truth for the cost policy is config.toml's model (what
@@ -2781,6 +2840,24 @@ async def _subscribe_until_ready_inner(
             await _sync_codex_approval_mode_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
+        # History fetched because of a refusal may include turns Omnigent already
+        # committed. A cold-resume rollout rebuild gives Codex's turns and items
+        # new ids, so committed messages are recognised by text, not identity.
+        replay_items = True
+        committed: Counter[tuple[str, str]] | None = None
+        if not subscribed or history_owed:
+            if history is None:
+                history = _CommittedHistory()
+            if await history.refresh(ap_client, session_id=session_id):
+                committed = history.snapshot()
+            else:
+                _logger.warning(
+                    "Could not read the committed history of %s; Codex thread %s items "
+                    "are replayed after the next status edge instead",
+                    session_id,
+                    thread_id,
+                )
+                replay_items = False
         await _replay_resume_response(
             ap_client,
             session_id=session_id,
@@ -2790,8 +2867,215 @@ async def _subscribe_until_ready_inner(
             elicitation_tracker=elicitation_tracker,
             forwarder_state=forwarder_state,
             replay_from_turn_id=replay_from_turn_id,
+            replay_items=replay_items,
+            committed=committed,
         )
-        return
+        if not replay_items:
+            # Still owed even if this connection is now subscribed.
+            return _SubscribeAttempt.PENDING
+        if not subscribed:
+            return _SubscribeAttempt.REFUSED
+        if refused_before:
+            _logger.info("Codex thread %s subscription succeeded after a refusal", thread_id)
+        return _SubscribeAttempt.SUBSCRIBED
+
+
+async def _read_thread_after_refused_resume(
+    client: CodexAppServerClient,
+    *,
+    thread_id: str,
+    refusal: Exception,
+    first_refusal: bool,
+) -> CodexMessage | None:
+    """
+    Read a thread Codex refused to resume; same ``{"thread": Thread}`` shape.
+
+    :param client: Codex app-server client.
+    :param thread_id: Codex thread id.
+    :param refusal: Exception ``thread/resume`` raised; logged in full once.
+    :param first_refusal: Whether this is the subscription's first refusal.
+    :returns: JSON-RPC response envelope, or ``None`` when the read failed too.
+    """
+    if first_refusal:
+        _logger.warning(
+            "failed to subscribe to Codex thread %s; mirroring its history through "
+            "thread/read until thread/resume succeeds",
+            thread_id,
+            exc_info=refusal,
+        )
+    else:
+        _logger.info("Codex thread %s still refuses thread/resume; reading it instead", thread_id)
+    try:
+        return await client.request("thread/read", {"threadId": thread_id, "includeTurns": True})
+    except asyncio.CancelledError:
+        raise
+    except Exception:  # noqa: BLE001 - app-server error envelopes are surfaced as RuntimeError.
+        _logger.log(
+            logging.WARNING if first_refusal else logging.INFO,
+            "failed to read Codex thread %s after its subscription was refused",
+            thread_id,
+            exc_info=True,
+        )
+        return None
+
+
+def _normalized_message_text(value: object) -> str:
+    """Collapse a message text (a string or Codex/Omnigent content blocks) for comparison."""
+    if isinstance(value, list):
+        # Blocks are joined with newlines when a user message is mirrored.
+        value = "\n".join(
+            block["text"]
+            for block in value
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        )
+    return " ".join(value.split()) if isinstance(value, str) else ""
+
+
+_CODEX_MESSAGE_ROLES = {"userMessage": "user", "agentMessage": "assistant"}
+
+
+def _consume_committed_turn(items: list[object], committed: Counter[tuple[str, str]]) -> bool:
+    """
+    Return whether every message of a turn is already committed, consuming them.
+
+    Prompts and replies are matched together, so a reply text shared by two
+    turns cannot stand in for the other turn, and a reply-less turn
+    (interrupted, or commands only) is judged by its prompts so its tool items
+    are not posted again under fresh ids.
+
+    :param items: Codex turn items from ``thread/read``/``thread/resume``.
+    :param committed: Remaining committed ``(role, text)`` messages; a skipped
+        turn's messages are removed so a repeated identical message counts once.
+    :returns: ``True`` when the turn can be skipped; ``False`` when it has no
+        message to compare or one is missing from Omnigent.
+    """
+    messages: Counter[tuple[str, str]] = Counter()
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        item_type = item.get("type")
+        role = _CODEX_MESSAGE_ROLES.get(item_type) if isinstance(item_type, str) else None
+        if role is None:
+            continue
+        text = _normalized_message_text(item.get("text", item.get("content")))
+        if text:
+            messages[(role, text)] += 1
+    if not messages or any(committed[key] < count for key, count in messages.items()):
+        return False
+    committed.subtract(messages)
+    return True
+
+
+class _SubscribeAttempt(enum.Enum):
+    """How one ``_subscribe_until_ready_inner`` attempt ended."""
+
+    SUBSCRIBED = "subscribed"
+    REFUSED = "refused"
+    UNAVAILABLE = "unavailable"
+    PENDING = "pending"
+
+
+class _CommittedHistory:
+    """
+    User and assistant messages Omnigent has committed, fetched incrementally.
+
+    The items API is paged with an ``after`` cursor, so each refresh only reads
+    what was committed since the previous one; a refused subscription that
+    re-reads its thread on every status edge does not reload the transcript.
+    """
+
+    def __init__(self) -> None:
+        self.messages: Counter[tuple[str, str]] = Counter()
+        self.cursor: str | None = None
+
+    def snapshot(self) -> Counter[tuple[str, str]]:
+        """Return a copy that a replay can consume without altering the cache."""
+        return Counter(self.messages)
+
+    async def refresh(self, client: httpx.AsyncClient, *, session_id: str) -> bool:
+        """
+        Add the messages committed since the last refresh.
+
+        :param client: HTTP client for Omnigent reads.
+        :param session_id: Omnigent conversation id.
+        :returns: ``False`` when the history could not be read; pages already
+            read stay cached.
+        """
+        while True:
+            params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+            if self.cursor is not None:
+                params["after"] = self.cursor
+            try:
+                response = await client.get(
+                    f"/v1/sessions/{url_component(session_id)}/items", params=params
+                )
+            except httpx.HTTPError:
+                _logger.warning(
+                    "Failed to fetch committed history for %s", session_id, exc_info=True
+                )
+                return False
+            if response.status_code >= 400:
+                _logger.warning(
+                    "Failed to fetch committed history for %s: HTTP %s",
+                    session_id,
+                    response.status_code,
+                )
+                return False
+            try:
+                payload = response.json()
+            except ValueError:
+                _logger.warning("Committed history of %s is not JSON", session_id)
+                return False
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list):
+                _logger.warning("Committed history of %s has no item list", session_id)
+                return False
+            last_id: object = None
+            for item in data:
+                if not isinstance(item, dict):
+                    continue
+                last_id = item.get("id", last_id)
+                if item.get("type") != "message":
+                    continue
+                # An interrupted partial is not a committed reply (the rollout
+                # rebuild drops it too) and must not hide a later identical reply.
+                if item.get("interrupted") is True:
+                    continue
+                role = item.get("role")
+                text = _normalized_message_text(item.get("content"))
+                if role in {"user", "assistant"} and text:
+                    self.messages[(role, text)] += 1
+            if payload.get("has_more"):
+                last_id = payload.get("last_id")
+                if not isinstance(last_id, str) or not last_id:
+                    _logger.warning(
+                        "Committed history of %s set has_more without last_id", session_id
+                    )
+                    return False
+            if isinstance(last_id, str) and last_id:
+                if payload.get("has_more") and last_id == self.cursor:
+                    _logger.warning(
+                        "Committed history of %s repeated cursor %s", session_id, last_id
+                    )
+                    return False
+                self.cursor = last_id
+            if not payload.get("has_more"):
+                return True
+
+
+def _event_is_thread_status_edge(event: CodexMessage, thread_id: str) -> bool:
+    """
+    Return whether *event* is a ``thread/status/changed`` for *thread_id*.
+
+    Codex broadcasts these to unsubscribed connections too, so they wake a
+    refused subscription for its next ``thread/read``.
+    """
+    if event.get("method") != _CODEX_THREAD_STATUS_CHANGED_METHOD:
+        return False
+    params = event.get("params")
+    if not isinstance(params, dict):
+        return False
+    return _thread_id_from_params(params) in {None, thread_id}
 
 
 def _event_indicates_thread_active(event: CodexMessage) -> bool:
@@ -2852,6 +3136,8 @@ async def _replay_resume_response(
     elicitation_tracker: _CodexElicitationTaskTracker,
     forwarder_state: _CodexForwarderState | None = None,
     replay_from_turn_id: str | None = None,
+    replay_items: bool = True,
+    committed: Counter[tuple[str, str]] | None = None,
 ) -> None:
     """
     Mirror message items returned by ``thread/resume``.
@@ -2871,6 +3157,10 @@ async def _replay_resume_response(
         sub-agent registration.
     :param replay_from_turn_id: Optional first turn to replay after an
         interrupted forwarder. Earlier acknowledged turns are skipped.
+    :param replay_items: Whether to mirror items at all; the terminal status
+        edge is published either way.
+    :param committed: ``(role, text)`` messages Omnigent already holds; a turn
+        already among them is skipped (see :func:`_consume_committed_turn`).
     :returns: None.
     """
     result = response.get("result")
@@ -2884,7 +3174,7 @@ async def _replay_resume_response(
         return
     thread_id = thread.get("id")
     thread_id = thread_id if isinstance(thread_id, str) and thread_id else None
-    replay_turns = _resume_turns_from(turns, replay_from_turn_id)
+    replay_turns = _resume_turns_from(turns, replay_from_turn_id) if replay_items else []
     async with _conversation_item_delivery_scope(session_id):
         for turn in replay_turns:
             if not isinstance(turn, dict):
@@ -2892,6 +3182,8 @@ async def _replay_resume_response(
             turn_id = _turn_id_from_payload(turn)
             items = turn.get("items")
             if not turn_id or not isinstance(items, list):
+                continue
+            if committed is not None and _consume_committed_turn(items, committed):
                 continue
             for item in items:
                 if not isinstance(item, dict):
