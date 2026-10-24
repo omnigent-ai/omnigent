@@ -9,6 +9,7 @@ import mimetypes
 import os
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
+from contextlib import AsyncExitStack
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Protocol, cast
 
@@ -673,7 +674,9 @@ def register_resource_routes(
             ):
                 return
             resource = await resource_registry.get_terminal_resource(conv_id, terminal_id)
-            if resource is None or _is_runner_owned_codex_terminal(resource_registry, resource):
+            if resource is not None and _is_runner_owned_codex_terminal(
+                resource_registry, resource
+            ):
                 return
             # The terminal ensure rechecks ownership under its launch lock.
         elif instance is not None:
@@ -683,10 +686,7 @@ def register_resource_routes(
                 harness_name,
                 extra={"session_id": conv_id},
             )
-            # Re-check the registry before closing: a concurrent ensure/recreate
-            # path may have already replaced this entry with a live pane between
-            # our get() and now.  Only close if the registry still points at the
-            # same dead instance we just probed.
+            # Only retire the dead instance we probed, preserving a replacement.
             current = terminal_registry.get(conv_id, terminal_name, "main")
             if current is instance:
                 try:
@@ -707,7 +707,7 @@ def register_resource_routes(
                     extra={"session_id": conv_id},
                 )
         _logger.info(
-            "native pane missing for conv=%s harness=%s; re-ensuring before turn (#1349)",
+            "native runtime unavailable for conv=%s harness=%s; re-ensuring before turn",
             conv_id,
             harness_name,
             extra={"session_id": conv_id},
@@ -830,11 +830,41 @@ def register_resource_routes(
                 },
             )
         try:
-            resource = await resource_registry.transfer_terminal(
-                source_session_id=session_id,
-                target_session_id=target_session_id,
-                terminal_id=terminal_id,
-            )
+            async with AsyncExitStack() as transfer_locks:
+                bridge_dir = None
+                source_instance = None
+                registry = resource_registry.terminal_registry
+                if terminal_id == terminal_resource_id("codex", "main"):
+                    for owner in sorted({session_id, target_session_id}):
+                        lock = _codex_terminal_ensure_locks.setdefault(owner, asyncio.Lock())
+                        await transfer_locks.enter_async_context(lock)
+                    if (
+                        registry is not None
+                        and resource_registry.terminal_resource_role(session_id, terminal_id)
+                        == CODEX_NATIVE_TERMINAL_ROLE
+                    ):
+                        from omnigent.runner.native.orchestration import codex_native_bridge_dir
+
+                        bridge_dir = codex_native_bridge_dir(session_id)
+                        source_instance = registry.get(session_id, "codex", "main")
+                try:
+                    resource = await resource_registry.transfer_terminal(
+                        source_session_id=session_id,
+                        target_session_id=target_session_id,
+                        terminal_id=terminal_id,
+                    )
+                finally:
+                    # The registry move precedes the awaited link update, which can be cancelled.
+                    if (
+                        bridge_dir is not None
+                        and source_instance is not None
+                        and registry is not None
+                        and registry.get(session_id, "codex", "main") is not source_instance
+                        and registry.get(target_session_id, "codex", "main") is source_instance
+                    ):
+                        from omnigent.runner.native.orchestration import _AUTO_CODEX_BRIDGE_DIRS
+
+                        _AUTO_CODEX_BRIDGE_DIRS[target_session_id] = bridge_dir
         except RuntimeError as exc:
             return JSONResponse(
                 status_code=409,
