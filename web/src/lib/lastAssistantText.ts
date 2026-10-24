@@ -76,21 +76,25 @@ export function extractErrorText(item: unknown): string | undefined {
 }
 
 /**
- * Preview of a session's latest output for the Inbox: the newest assistant
- * text or error headline, whichever comes last, condensed via
- * {@link previewText}.
+ * A session's latest output for the Inbox: the newest assistant text or error
+ * headline, whichever comes last, condensed via {@link previewText}, plus a
+ * key naming that item so a caller can tell a new reply from the one it
+ * already showed even when both land in the same `updated_at` second.
  *
  * :param items: Raw session items, oldest-to-newest.
  * :param maxChars: Preview character budget (default 160).
- * :returns: The preview, or `undefined` when no item carries output text.
+ * :returns: The preview and its item key (the item id, else the text), or
+ *     `undefined` when no item carries output text.
  */
-export function latestOutputPreview(
+export function latestOutput(
   items: readonly unknown[],
   maxChars: number = DEFAULT_MAX_CHARS,
-): string | undefined {
+): { key: string; preview: string } | undefined {
   for (let i = items.length - 1; i >= 0; i--) {
     const text = extractAssistantText(items[i]) ?? extractErrorText(items[i]);
-    if (text !== undefined) return previewText(text, maxChars);
+    if (text === undefined) continue;
+    const id = (items[i] as Record<string, unknown>).id;
+    return { key: typeof id === "string" ? id : text, preview: previewText(text, maxChars) };
   }
   return undefined;
 }
