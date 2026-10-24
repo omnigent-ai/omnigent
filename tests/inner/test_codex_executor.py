@@ -2677,6 +2677,83 @@ async def test_run_turn_method_error_emits_retryable_executor_error() -> None:
     assert "shell command crashed" in error_events[0].message
 
 
+_LAUNCH_PATH_ALIAS_WARNING = (
+    "WARNING: proceeding, even though we could not create PATH aliases: "
+    'Refusing to create helper binaries under temporary dir "/tmp/omnigent-osenv-x"'
+)
+_RATE_LIMIT_ERROR_FRAME = {
+    "method": "error",
+    "params": {
+        "turnId": "turn-1",
+        "message": "exceeded retry limit, last status: 429 Too Many Requests",
+        "willRetry": False,
+    },
+}
+
+
+def _turn_ready_session() -> _CodexAppServerSession:
+    """A started session on an existing thread whose ``turn/start`` succeeds."""
+    session = _CodexAppServerSession(
+        codex_path="/bin/echo",
+        cwd="/tmp/workspace",
+        env={},
+        tool_executor=None,
+    )
+    session.start = AsyncMock()
+    session._proc = _FakeProcess()
+    session.thread_id = "thread-1"
+    session._request = AsyncMock(return_value={"result": {"turn": {"id": "turn-1"}}})
+    return session
+
+
+async def _run_rate_limited_turn(session: _CodexAppServerSession) -> ExecutorError:
+    await session._events.put(_RATE_LIMIT_ERROR_FRAME)
+    events = [
+        event
+        async for event in session.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+            model="gpt-5.4-mini",
+            cwd=".",
+            sandbox="workspace-write",
+        )
+    ]
+    (error,) = [event for event in events if isinstance(event, ExecutorError)]
+    return error
+
+
+async def test_run_turn_method_error_omits_launch_time_stderr() -> None:
+    """Stderr read before ``turn/start``, such as a launch warning, is not blamed on the turn."""
+    session = _turn_ready_session()
+    session._record_stderr(_LAUNCH_PATH_ALIAS_WARNING)
+
+    error = await _run_rate_limited_turn(session)
+
+    assert error.message.startswith("exceeded retry limit, last status: 429 Too Many Requests")
+    assert "stderr:" not in error.message
+    assert error.retryable is True
+    assert session._recent_stderr == [_LAUNCH_PATH_ALIAS_WARNING]
+
+
+async def test_run_turn_method_error_appends_stderr_from_this_turn() -> None:
+    """Stderr read after ``turn/start`` still travels with the turn's error."""
+    session = _turn_ready_session()
+    session._record_stderr(_LAUNCH_PATH_ALIAS_WARNING)
+
+    async def _start_turn(method: str, *_args: object) -> dict[str, object]:
+        if method == "turn/start":
+            session._record_stderr("ERROR codex_core: provider returned 429")
+        return {"result": {"turn": {"id": "turn-1"}}}
+
+    session._request = AsyncMock(side_effect=_start_turn)
+
+    error = await _run_rate_limited_turn(session)
+
+    assert error.message.endswith("; stderr: ERROR codex_core: provider returned 429")
+    assert _LAUNCH_PATH_ALIAS_WARNING not in error.message
+
+
 async def test_run_turn_emits_correlated_codex_builtin_tool_events() -> None:
     """Expose built-in shell and file items without re-executing either tool."""
 

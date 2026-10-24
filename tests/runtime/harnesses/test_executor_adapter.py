@@ -785,6 +785,74 @@ def test_old_cli_refusal_text_does_not_override_other_classifications() -> None:
     assert unrelated.remediation is None
 
 
+# A codex app-server 429 as it reaches the adapter: a code-less ExecutorError,
+# re-raised as a bare RuntimeError, whose text carries the rate-limit status
+# plus the stderr tail codex appended, so classification is text-only here.
+_CODEX_TRANSIENT_429 = (
+    "inner executor error: exceeded retry limit, last status: 429 Too Many Requests; "
+    "stderr: WARNING: proceeding, even though we could not create PATH aliases: "
+    'Refusing to create helper binaries under temporary dir "/tmp/omnigent-osenv-iqumwj6n" '
+    '(codex_home: AbsolutePathBuf("/tmp/omnigent-osenv-iqumwj6n/omnigent-codex-homes-1001/'
+    'omnigent-codex-home-cwb4liqm")) | ERROR codex_app_server: Codex is ignoring 1 '
+    "unrecognized configuration setting. | ERROR codex_models_manager::manager: failed to "
+    "refresh available models: stream disconnected before completion"
+)
+
+
+def test_codex_transient_429_classifies_as_rate_limit_exceeded() -> None:
+    """A codex turn that fails on a 429 must code ``rate_limit_exceeded`` so the
+    web offers Retry, even though an unrelated ``/tmp`` launch warning is appended."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    detail = adapter._build_error_detail(RuntimeError(_CODEX_TRANSIENT_429))
+
+    assert detail.code == "rate_limit_exceeded"
+    assert "429" in detail.message
+
+
+def test_rate_limit_text_keeps_undelivered_evidence() -> None:
+    """An uncoded executor error naming a 429 keeps its delivery evidence with the code."""
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    detail = adapter._build_error_detail(
+        InnerExecutorError(_CODEX_TRANSIENT_429, code=None, undelivered=True)
+    )
+
+    assert detail.code == "rate_limit_exceeded"
+    assert detail.undelivered is True
+
+
+def test_rate_limit_text_does_not_override_other_classifications() -> None:
+    """Executor-named codes and SDK-typed failures win; an auth rejection stays generic."""
+    from omnigent.runtime.harnesses._executor_adapter import (
+        ExecutorAdapter,
+        InnerExecutorError,
+    )
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+
+    named = adapter._build_error_detail(
+        InnerExecutorError(_CODEX_TRANSIENT_429, code="databricks_sign_in_pending")
+    )
+    assert named.code == "databricks_sign_in_pending"
+
+    typed = adapter._build_error_detail(httpx.ConnectError(_CODEX_TRANSIENT_429))
+    assert typed.code == "connection_error"
+
+    auth = adapter._build_error_detail(
+        RuntimeError(
+            "inner executor error: API Error: Request rejected (403) · PERMISSION_DENIED: "
+            "See rate_limit_error troubleshooting"
+        )
+    )
+    assert auth.code == "RuntimeError"
+
+
 # The provider's model-not-found text as it reaches the adapter from the SDK.
 _MODEL_NOT_FOUND = (
     "There's an issue with the selected model (anthropic/claude-opus-4-8). "

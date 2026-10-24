@@ -176,6 +176,7 @@ _WORKER_PREPARE_CLEANUP_TIMEOUT_SECONDS = 12.0
 _WORKER_SPAWN_CLEANUP_TIMEOUT_SECONDS = 5.0
 _WORKER_LAUNCH_CLEANUP_TIMEOUT_SECONDS = 7.0
 _STDERR_CHUNK_LIMIT = 65536
+_STDERR_RING_LINES = 20
 _STREAM_READ_CHUNK_SIZE = 65536
 # Files symlinked from the real CODEX_HOME into the per-session temp home.
 # Symlinks (not copies) so credential refreshes in the real home propagate
@@ -2822,6 +2823,9 @@ class _CodexAppServerSession:
         self._default_effort: str | None = None
         self._thread_model: str | None = None
         self._recent_stderr: list[str] = []
+        # Stderr since the current turn/start; ``_recent_stderr`` outlives turns
+        # and keeps launch-time warnings, which must not be blamed on a turn.
+        self._turn_stderr: list[str] = []
         # Auth-class gateway rejection tracking, read off the CLI's stderr so a
         # turn that emits no events fails fast with the real cause instead of
         # stalling to the idle watchdog. ``_pending`` holds a parsed fatal
@@ -3750,6 +3754,9 @@ class _CodexAppServerSession:
         if effort_via_turn_start:
             turn_params["effort"] = effort
             turn_params["summary"] = "detailed"
+        # Best-effort scope: the stderr reader is asynchronous, so a late line
+        # from the previous turn can still land after this clear.
+        self._turn_stderr.clear()
         start_response = await self._request(
             "turn/start",
             turn_params,
@@ -4194,8 +4201,8 @@ class _CodexAppServerSession:
                     # codex harness, an invalid profile) gets a full
                     # diagnostic trail.
                     detail = _format_codex_error_params(params)
-                    if self._recent_stderr:
-                        detail = f"{detail}; stderr: {' | '.join(self._recent_stderr[-5:])}"
+                    if self._turn_stderr:
+                        detail = f"{detail}; stderr: {' | '.join(self._turn_stderr[-5:])}"
                     # method==error from the app server is a runtime
                     # failure (often a tool-execution or provider issue,
                     # e.g. a bash printf failure); treat as retryable.
@@ -4442,13 +4449,17 @@ class _CodexAppServerSession:
                     continue
                 if len(text) >= _STDERR_CHUNK_LIMIT:
                     text = text[:_STDERR_CHUNK_LIMIT] + "...[truncated]"
-                self._recent_stderr.append(text)
-                if len(self._recent_stderr) > 20:
-                    self._recent_stderr.pop(0)
+                self._record_stderr(text)
                 logger.debug("codex app-server stderr: %s", text)
                 self._note_stderr_gateway_error(text)
         except asyncio.CancelledError:
             raise
+
+    def _record_stderr(self, text: str) -> None:
+        for lines in (self._recent_stderr, self._turn_stderr):
+            lines.append(text)
+            if len(lines) > _STDERR_RING_LINES:
+                lines.pop(0)
 
     def _note_stderr_gateway_error(self, text: str) -> None:
         """Attribute (and, when fatal, arm fast-fail for) a gateway rejection.
