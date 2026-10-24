@@ -1635,16 +1635,23 @@ def test_claude_native_lists_personal_and_project_commands(
 def test_claude_command_directory_with_skill_md_is_one_command(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """``commands/<dir>/SKILL.md`` is the command ``<dir>``; siblings are not, subdirs are."""
+    """``commands/<dir>/SKILL.md`` is the command ``<dir>``; siblings are not, subdirs are.
+
+    A ``SKILL.md`` at the root itself names the root, ``/commands``, as in Claude Code.
+    """
     home, workspace = _claude_workspace(tmp_path)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
-    review = workspace / ".claude" / "commands" / "review"
+    commands = workspace / ".claude" / "commands"
+    _write_plugin_command(commands, "SKILL", "---\ndescription: Root skill\n---\nbody\n")
+    _write_plugin_command(commands, "standup", "A root-level sibling.\n")
+    review = commands / "review"
     _write_plugin_command(review, "SKILL", "---\ndescription: Review a PR\n---\nbody\n")
     _write_plugin_command(review, "checklist", "Reference the skill reads.\n")
     _write_plugin_command(review / "deep", "security", "Security pass.\n")
 
     out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
     assert sorted((s.name, s.description) for s in out) == [
+        ("commands", "Root skill"),
         ("review", "Review a PR"),
         ("review:deep:security", "Security pass."),
     ]
@@ -1670,14 +1677,22 @@ def test_claude_skill_and_personal_command_win_name_collisions(
     ]
 
 
+@pytest.mark.parametrize("git_entry", ["directory", "file"])
 def test_claude_project_commands_stop_at_the_repository_root(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, git_entry: str
 ) -> None:
-    """Project commands come from the workspace up to its repository root, not above it."""
+    """Project commands come from the workspace up to its repository root, not above it.
+
+    A linked worktree marks its root with a ``.git`` file rather than a directory.
+    """
     home = tmp_path / "home"
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
     repo = home / "code" / "repo"
-    (repo / ".git").mkdir(parents=True)
+    repo.mkdir(parents=True)
+    if git_entry == "directory":
+        (repo / ".git").mkdir()
+    else:
+        (repo / ".git").write_text("gitdir: /elsewhere/.git/worktrees/repo\n")
     workspace = repo / "service"
     _write_plugin_command(workspace / ".claude" / "commands", "service-cmd", "Workspace.\n")
     _write_plugin_command(repo / ".claude" / "commands", "repo-cmd", "Repository root.\n")
@@ -1685,6 +1700,22 @@ def test_claude_project_commands_stop_at_the_repository_root(
 
     names = {s.name for s in resolve_harness_skills(_ctx(workspace, home), "claude-native")}
     assert names == {"service-cmd", "repo-cmd"}
+
+
+def test_claude_project_commands_outside_home_and_any_repository_read_every_ancestor(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With neither a repository root nor home above it, the walk reads each ancestor."""
+    home = tmp_path / "home"
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    scratch = tmp_path / "scratch"
+    workspace = scratch / "project"
+    _write_plugin_command(workspace / ".claude" / "commands", "here-cmd", "Workspace.\n")
+    _write_plugin_command(scratch / ".claude" / "commands", "above-cmd", "An ancestor.\n")
+
+    names = {s.name for s in resolve_harness_skills(_ctx(workspace, home), "claude-native")}
+    # Directories above tmp_path are the test machine's own, so check only these two.
+    assert {"here-cmd", "above-cmd"} <= names
 
 
 def test_claude_personal_commands_follow_config_dir_and_skip_home(

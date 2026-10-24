@@ -450,9 +450,7 @@ def _plugin_install_paths(
     return out
 
 
-# Claude Code's command loaders stop at these bounds; so does the menu. Its
-# ``.claude/commands`` scan is time-bounded rather than depth-bounded, so the
-# menu's walk of it applies the plugin walk's depth and directory bounds as a safety net.
+# Claude Code's command-loader bounds; the ``.claude/commands`` walk reuses them as a safety net.
 _MAX_COMMAND_BYTES = 1024 * 1024
 _MAX_COMMAND_DEPTH = 32
 _MAX_COMMAND_DIRS = 4096
@@ -712,6 +710,7 @@ def _discover_claude_commands(
                 markdown.append((name, file_info))
         skill_md = next((entry for entry in markdown if entry[0].lower() == "skill.md"), None)
         if skill_md is not None:
+            # As in Claude Code, a skill.md at the root names the root itself (``/commands``).
             name, file_info = skill_md
             entries = [(name, file_info, relative or (commands_dir.name,))]
         else:
