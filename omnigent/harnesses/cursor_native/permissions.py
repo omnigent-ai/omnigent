@@ -27,8 +27,8 @@ detection ever fails. Sessions launched with ``--yolo`` / ``--force`` / ``-f``
 auto-accept lingering tool gates in-pane (no web card) because cursor's Run
 Everything mode still sometimes leaves a pending marker long enough to stall a
 piloted parent. The accept only fires while the pane shows cursor's accept
-hint, with bounded retries before a still-visible gate falls back to a web
-card. Stale markers without a visible gate never produce a yolo approval. See
+hint, with bounded retries before an unrecoverable gate fails the turn. Stale
+markers without a visible gate never produce a yolo approval. See
 ``docs/cursor-native-elicitation.md`` (and the
 superseded ``docs/cursor-native-tui-mirror-plan.md`` for the original pane-scrape
 design and why the transcript channel replaced it).
@@ -54,6 +54,7 @@ from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cu
 # (one chat per workspace) and reads the live ``-wal`` state correctly.
 from omnigent.harnesses.cursor_native.forwarder import (
     _discover_store,
+    _post_external_session_status,
     _read_blob_rows,
     _read_state,
 )
@@ -705,9 +706,6 @@ class _YoloAccept(enum.Enum):
     """Nothing to do this pass — pacing, no prompt rendered yet, or another
     call was already answered (cursor shows one prompt at a time)."""
 
-    SURFACE_CARD = "surface_card"
-    """Auto-accept is not clearing this gate; fall back to the web card."""
-
 
 @dataclass
 class _YoloAcceptRetry:
@@ -715,6 +713,44 @@ class _YoloAcceptRetry:
     last_attempt_at: float
     retry_s: float
     attempts: int
+    reason: str
+
+
+class _YoloAutoAcceptError(RuntimeError):
+    """Raised when a YOLO tool gate cannot be accepted within its deadline."""
+
+
+def _defer_yolo_auto_accept(
+    call: CursorPendingToolCall,
+    *,
+    bridge_dir: Path,
+    now: float,
+    attempts_by_call: dict[str, _YoloAcceptRetry],
+    reason: str,
+    backoff: bool = True,
+) -> _YoloAccept:
+    retry = attempts_by_call.get(call.tool_call_id)
+    if retry is not None and now - retry.started_at >= _YOLO_ACCEPT_TIMEOUT_S:
+        raise _YoloAutoAcceptError(
+            f"Cursor YOLO could not accept {call.tool_name} after "
+            f"{now - retry.started_at:.1f}s and {retry.attempts} attempts: "
+            f"{retry.reason}; "
+            f"bridge_dir={bridge_dir}"
+        )
+    attempts_by_call[call.tool_call_id] = _YoloAcceptRetry(
+        started_at=retry.started_at if retry is not None else now,
+        last_attempt_at=now,
+        retry_s=(
+            min(retry.retry_s * 2, _YOLO_ACCEPT_MAX_RETRY_S)
+            if retry is not None
+            else _YOLO_ACCEPT_RETRY_S
+        )
+        if backoff
+        else 0.0,
+        attempts=retry.attempts + 1 if retry is not None else 1,
+        reason=reason,
+    )
+    return _YoloAccept.SKIP
 
 
 async def _yolo_auto_accept(
@@ -726,12 +762,13 @@ async def _yolo_auto_accept(
     attempts_by_call: dict[str, _YoloAcceptRetry],
     allow_send: bool,
 ) -> _YoloAccept:
-    """Try to answer one gated call in-pane, or hand it back to the card path.
+    """Try to answer one gated call in-pane or fail after bounded retries.
 
     Retry visible prompts with backoff for ``_YOLO_ACCEPT_TIMEOUT_S`` after
     the first send, allowing the final send its full backoff interval. A pending
-    checkpoint without an on-screen prompt can be stale or still rendering;
-    it neither consumes retries nor surfaces a card.
+    checkpoint without an on-screen prompt can be stale or still rendering, so
+    it is retried without sending a key. A persistent failure terminates the
+    turn through the caller's external-status path instead of surfacing a card.
 
     :param attempts_by_call: In-memory retry state, keyed by tool_call_id.
     :param allow_send: Whether the pane is available for another approval.
@@ -743,34 +780,37 @@ async def _yolo_auto_accept(
         return _YoloAccept.SKIP
     pane = await asyncio.to_thread(capture_cursor_pane, bridge_dir)
     if pane is None:
-        # No advertised tmux target, or the pane exited: a keystroke cannot
-        # land, and recording it as delivered would spin here forever.
-        _logger.warning(
-            "cursor elicitation: no live cursor pane to auto-accept %s; surfacing a card; "
-            "session=%s tool_call_id=%s",
-            call.tool_name,
-            session_id,
-            call.tool_call_id.splitlines()[0],
+        return _defer_yolo_auto_accept(
+            call,
+            bridge_dir=bridge_dir,
+            now=now,
+            attempts_by_call=attempts_by_call,
+            reason="tmux target was not advertised or the Cursor pane exited",
         )
-        return _YoloAccept.SURFACE_CARD
     if not pane.strip():
-        # Capture failures return an empty frame; only a usable capture can
-        # confirm that the prompt disappeared and reset its retry deadline.
-        return _YoloAccept.SKIP
-    if not _pane_shows_accept_prompt(pane):
-        attempts_by_call.pop(call.tool_call_id, None)
-        return _YoloAccept.SKIP
-    if retry is not None and now - retry.started_at >= _YOLO_ACCEPT_TIMEOUT_S:
-        _logger.warning(
-            "cursor elicitation: yolo auto-accept did not clear visible %s after %.1fs "
-            "and %d attempts; surfacing a card; session=%s tool_call_id=%s",
-            call.tool_name,
-            now - retry.started_at,
-            retry.attempts,
-            session_id,
-            call.tool_call_id.splitlines()[0],
+        return _defer_yolo_auto_accept(
+            call,
+            bridge_dir=bridge_dir,
+            now=now,
+            attempts_by_call=attempts_by_call,
+            reason="tmux pane capture remained unavailable",
         )
-        return _YoloAccept.SURFACE_CARD
+    if not _pane_shows_accept_prompt(pane):
+        return _defer_yolo_auto_accept(
+            call,
+            bridge_dir=bridge_dir,
+            now=now,
+            attempts_by_call=attempts_by_call,
+            reason="the pending tool gate did not show Cursor's accept hint",
+            backoff=False,
+        )
+    if retry is not None and now - retry.started_at >= _YOLO_ACCEPT_TIMEOUT_S:
+        raise _YoloAutoAcceptError(
+            f"Cursor YOLO accept did not clear {call.tool_name} after "
+            f"{now - retry.started_at:.1f}s and {retry.attempts} attempts: "
+            f"{retry.reason}; "
+            f"bridge_dir={bridge_dir}"
+        )
     # A call nobody ever sees needs its arguments in the record, or an operator
     # has no way to tell an auto-approved ``ls`` from an auto-approved ``rm``.
     _logger.info(
@@ -783,7 +823,13 @@ async def _yolo_auto_accept(
         _preview_for_args(call.args),
     )
     if not await _send_cursor_keys(bridge_dir, session_id, _TRANSCRIPT_ACCEPT_KEY):
-        return _YoloAccept.SURFACE_CARD
+        return _defer_yolo_auto_accept(
+            call,
+            bridge_dir=bridge_dir,
+            now=now,
+            attempts_by_call=attempts_by_call,
+            reason="tmux rejected the accept keystroke",
+        )
     attempts_by_call[call.tool_call_id] = _YoloAcceptRetry(
         started_at=retry.started_at if retry is not None else now,
         last_attempt_at=now,
@@ -791,6 +837,7 @@ async def _yolo_auto_accept(
         if retry is not None
         else _YOLO_ACCEPT_RETRY_S,
         attempts=retry.attempts + 1 if retry is not None else 1,
+        reason="accept prompt remained visible after the keystroke",
     )
     return _YoloAccept.SENT
 
@@ -842,9 +889,9 @@ async def supervise_cursor_transcript_elicitations(
     ``--force`` / ``-f``), tool-approval gates are accepted in-pane without a
     web card. Cursor's Run Everything mode still sometimes leaves a pending
     marker long enough to otherwise stall a piloted parent on mirrored
-    ApprovalCards. ``AskQuestion`` still surfaces — that is intentional human
-    input, not a tool gate. A visible gate that survives bounded retries falls
-    back to the usual card; stale markers without a prompt remain silent.
+    ApprovalCards. ``AskQuestion`` still surfaces because it requires human
+    input. A tool gate that cannot be accepted after bounded retries fails the
+    turn through the native status path instead of parking an unattended card.
 
     Store discovery reuses the forwarder's logic, so this binds to the same chat
     the forwarder mirrors. Detection is keyed by ``toolCallId`` (stable across
@@ -955,8 +1002,7 @@ async def supervise_cursor_transcript_elicitations(
                             next_auto_accept_at = (
                                 loop.time() + auto_accept_attempts[call.tool_call_id].retry_s
                             )
-                        if outcome is not _YoloAccept.SURFACE_CARD:
-                            continue
+                        continue
                     elicitation_id = cursor_tool_call_elicitation_id(session_id, call.tool_call_id)
                     _logger.debug(
                         "cursor elicitation: surfacing %s; session=%s tool_call_id=%s",
@@ -989,6 +1035,21 @@ async def supervise_cursor_transcript_elicitations(
                     first_seen.pop(call.tool_call_id, None)
             except asyncio.CancelledError:
                 raise
+            except _YoloAutoAcceptError as exc:
+                message = f"Error: {exc}"
+                _logger.error(
+                    "cursor elicitation: %s; failing YOLO turn; session=%s",
+                    exc,
+                    session_id,
+                )
+                await _post_external_session_status(
+                    client,
+                    session_id=session_id,
+                    status="failed",
+                    turn_outcome="failed",
+                    output=message,
+                )
+                return
             except Exception:
                 _logger.exception(
                     "cursor transcript elicitation poll failed; session=%s bridge_dir=%s",
