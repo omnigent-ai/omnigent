@@ -224,6 +224,222 @@ def test_run_write_transaction_retries_rolled_back_concurrency_failures(
     assert retry_metrics[-1] == ("omnigent.test.exhausted", "exhausted")
 
 
+@pytest.mark.parametrize("errno", [2013, 2006])
+def test_run_write_transaction_retries_transient_disconnect(
+    monkeypatch: pytest.MonkeyPatch,
+    errno: int,
+) -> None:
+    """A mid-statement MySQL disconnect invalidates the connection; the write
+    transaction must replay like a deadlock victim so the item persists,
+    instead of propagating the OperationalError and losing the write."""
+    from sqlalchemy.exc import DBAPIError
+
+    maker = _make_write_maker("mysql")
+    monkeypatch.setattr(
+        "omnigent.db.utils.record_transaction_retry",
+        lambda operation, outcome: None,
+    )
+
+    attempts = 0
+
+    def write(_session: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            # Only connection_invalidated/statement are read, not the error type.
+            orig = Exception(f"({errno}, 'Lost connection to MySQL server during query')")
+            raise DBAPIError(
+                "UPDATE conversations SET next_position=%(next_position)s",
+                {},
+                orig,
+                connection_invalidated=True,
+            )
+        return "committed"
+
+    result = run_write_transaction(
+        maker,
+        "append_conversation_items",
+        write,
+        sleep=lambda _delay: None,
+        random_value=lambda: 1.0,
+    )
+
+    assert result == "committed"
+    assert attempts == 2
+    assert [session.rollback.call_count for session in maker.sessions] == [1, 0]
+    assert [session.commit.call_count for session in maker.sessions] == [0, 1]
+
+
+def _make_write_maker(dialect_name: str, commit_side_effect: Exception | None = None) -> Any:
+    """A fake named managed session maker that commits/rolls back like the real one.
+
+    ``commit_side_effect`` makes each session's ``commit()`` raise, modelling a
+    disconnect during the maker's commit at context-manager exit.
+    """
+    from collections.abc import Iterator
+    from contextlib import contextmanager
+
+    class NamedMaker:
+        def __init__(self) -> None:
+            self.engine = MagicMock()
+            self.engine.dialect.name = dialect_name
+            self.query_name_prefix = "omnigent.test"
+            self.sessions: list[MagicMock] = []
+
+        @contextmanager
+        def __call__(self, query_name: str) -> Iterator[MagicMock]:
+            session = MagicMock()
+            if commit_side_effect is not None:
+                session.commit.side_effect = commit_side_effect
+            self.sessions.append(session)
+            try:
+                yield session
+                session.commit()
+            except Exception:
+                session.rollback()
+                raise
+
+    return NamedMaker()
+
+
+def _statement_disconnect_error() -> Any:
+    """A statement-phase connection-loss error, as the MySQL dialect raises it.
+
+    ``connection_invalidated=True`` is how SQLAlchemy marks an error its
+    dialect classified as a disconnect (e.g. 2006 "server has gone away" /
+    2013 "lost connection during query"): the dead pooled connection is
+    already discarded, so a replay runs on a fresh one.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    return DBAPIError(
+        "UPDATE conversations SET next_position=2",
+        {},
+        Exception("(2013, 'Lost connection to MySQL server during query')"),
+        connection_invalidated=True,
+    )
+
+
+def test_run_write_transaction_replays_transient_connection_loss(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mid-statement disconnect is replayed and the write persists.
+
+    Regression guard for lost session writes on remote databases: a
+    connection that drops once mid-statement, then recovers, must not
+    surface as an uncaught ``OperationalError`` (a generic 500 to the user).
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    maker = _make_write_maker("mysql")
+    retry_metrics: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "omnigent.db.utils.record_transaction_retry",
+        lambda operation, outcome: retry_metrics.append((operation, outcome)),
+    )
+
+    attempts = 0
+
+    def write(_session: object) -> str:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise _statement_disconnect_error()
+        return "committed"
+
+    sleeps: list[float] = []
+    result = run_write_transaction(
+        maker,
+        "write",
+        write,
+        sleep=sleeps.append,
+        random_value=lambda: 1.0,
+    )
+
+    assert result == "committed"
+    assert attempts == 2
+    assert sleeps == [0.025]
+    assert retry_metrics == [("omnigent.test.write", "scheduled")]
+    # The failed attempt rolled back; the replay ran in a fresh session.
+    assert [session.rollback.call_count for session in maker.sessions] == [1, 0]
+    assert [session.commit.call_count for session in maker.sessions] == [0, 1]
+
+    # A connection that never comes back surfaces the error once the bounded
+    # retries are exhausted, and records the exhausted outcome.
+    def always_disconnected(_session: object) -> None:
+        raise _statement_disconnect_error()
+
+    with pytest.raises(DBAPIError):
+        run_write_transaction(
+            maker,
+            "exhausted",
+            always_disconnected,
+            max_retries=1,
+            sleep=sleeps.append,
+            random_value=lambda: 1.0,
+        )
+    assert retry_metrics[-1] == ("omnigent.test.exhausted", "exhausted")
+
+
+def test_run_write_transaction_does_not_replay_ambiguous_or_plain_failures() -> None:
+    """Only unambiguous statement-phase disconnects are replayed.
+
+    A disconnect raised outside a statement (``statement is None``, e.g. a
+    failed COMMIT) may have landed on the server, so a replay could
+    double-apply the write. A statement failure that did not invalidate the
+    connection is not a disconnect at all. Both surface immediately, as does
+    a disconnect on an autocommit dialect (Cloudflare D1), where statements
+    issued before the drop have already landed.
+    """
+    from sqlalchemy.exc import DBAPIError
+
+    # A disconnect raised while the maker commits surfaces through context-manager
+    # exit with ``statement is None``; it must propagate rather than replay, since
+    # the commit may already have landed.
+    commit_disconnect = DBAPIError(
+        None,
+        None,
+        Exception('(2006, "MySQL server has gone away")'),
+        connection_invalidated=True,
+    )
+    commit_maker = _make_write_maker("mysql", commit_side_effect=commit_disconnect)
+    attempts = 0
+
+    def succeeding_write(_session: object) -> None:
+        nonlocal attempts
+        attempts += 1
+
+    with pytest.raises(DBAPIError):
+        run_write_transaction(commit_maker, "write", succeeding_write)
+    assert attempts == 1
+    assert [session.commit.call_count for session in commit_maker.sessions] == [1]
+
+    maker = _make_write_maker("mysql")
+    attempts = 0
+
+    def plain_statement_failure(_session: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise DBAPIError("UPDATE conversations SET x=1", {}, Exception("boom"))
+
+    with pytest.raises(DBAPIError):
+        run_write_transaction(maker, "write", plain_statement_failure)
+    assert attempts == 1
+
+    attempts = 0
+    d1_maker = _make_write_maker("cloudflare_d1")
+
+    def autocommit_dialect_disconnect(_session: object) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise _statement_disconnect_error()
+
+    with pytest.raises(DBAPIError):
+        run_write_transaction(d1_maker, "write", autocommit_dialect_disconnect)
+    assert attempts == 1
+    assert [session.commit.call_count for session in d1_maker.sessions] == [0]
+
+
 def test_missing_psycopg_translates_to_actionable_error(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
