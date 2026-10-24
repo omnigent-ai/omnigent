@@ -186,6 +186,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _validate_session_model_selection,
     ensure_runner_connected,
 )
+from omnigent.server.sandbox_profile_launch import prepare_profile, record_profile
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -560,6 +561,17 @@ def register_core_routes(
             parse_repo_workspace,
         )
 
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+        if profile_catalog is not None:
+            try:
+                profile = await asyncio.to_thread(profile_catalog.get_session_snapshot, session_id)
+                if profile is not None:
+                    await asyncio.to_thread(profile_catalog.validate_snapshot, profile)
+                    sandbox_provider = profile["provider"]
+            except Exception:
+                await conversation_store.delete_conversation(session_id)
+                raise
+
         # Reject an unconfigured provider on the POST rather than in the
         # background launch.
         if sandbox_provider is not None and sandbox_config.for_provider(sandbox_provider) is None:
@@ -633,6 +645,7 @@ def register_core_routes(
             agent_store=agent_store,
             agent_id=agent_id,
             host_id=requested_host_id,
+            sandbox_profiles=profile_catalog,
         )
         _start_managed_launch_task(
             session_id,
@@ -753,6 +766,7 @@ def register_core_routes(
                 conversation_store=conversation_store,
                 permission_store=permission_store,
                 conversation=conversation,
+                sandbox_profiles=getattr(request.app.state, "sandbox_profiles", None),
             )
         conn = target.conn
         await host_registry.admit_launch(conn, session_id)
@@ -769,6 +783,13 @@ def register_core_routes(
                 f"Session {session_id!r} already has a runner bound",
                 code=ErrorCode.CONFLICT,
             )
+        profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+        if profile_catalog is not None:
+            try:
+                await asyncio.to_thread(profile_catalog.require_session_host, session_id, host_id)
+            except Exception:
+                await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+                raise
         set_current_runner_id(runner_id)
         add_audit_attrs(runner_id=runner_id)
         _logger.info(
@@ -1191,6 +1212,14 @@ def register_core_routes(
                 runner_router=runner_router,
             )
 
+        sandbox_profile = await prepare_profile(
+            request, parsed_metadata, inherited_session_id=parsed_metadata.parent_session_id
+        )
+        if sandbox_profile is not None and parsed_metadata.host_type == "managed":
+            parsed_metadata = parsed_metadata.model_copy(
+                update={"sandbox_provider": sandbox_profile["provider"]}
+            )
+
         bundle_bytes = await bundle.read()
         # Validate the bundle BEFORE any row exists: the external-host
         # branch below needs the spec's os_env.cwd for workspace
@@ -1286,6 +1315,7 @@ def register_core_routes(
                 created_by=user_id,
                 agent_store=agent_store,
             )
+        await record_profile(request, result.session_id, sandbox_profile, conversation_store)
         session_created(
             result.session_id,
             inherited_runner_id,
@@ -2859,6 +2889,33 @@ def register_core_routes(
                         runner_router.require_mcp_registry_support,
                         dataclasses.replace(conv, runner_id=runner_id),
                     )
+                profile_catalog = getattr(request.app.state, "sandbox_profiles", None)
+                if profile_catalog is not None and runner_id != conv.runner_id:
+                    profile = await asyncio.to_thread(
+                        profile_catalog.get_session_snapshot, session_id
+                    )
+                    if profile is not None:
+                        # Only a side chat may reuse its source's authoritative runner.
+                        source_id = conv.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+                        source = (
+                            await asyncio.to_thread(conversation_store.get_conversation, source_id)
+                            if conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1" and source_id
+                            else None
+                        )
+                        host_id = (
+                            await asyncio.to_thread(routing_host_id, source, conversation_store)
+                            if source is not None and source.runner_id == runner_id
+                            else None
+                        )
+                        if host_id is None:
+                            raise OmnigentError(
+                                "Launch this session on a managed host with its saved sandbox "
+                                "profile instead of assigning a runner directly",
+                                code=ErrorCode.INVALID_INPUT,
+                            )
+                        await asyncio.to_thread(
+                            profile_catalog.require_session_host, session_id, host_id, bind=False
+                        )
                 try:
                     await asyncio.to_thread(
                         conversation_store.replace_runner_id, session_id, runner_id
@@ -3517,6 +3574,10 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        sandbox_profile = await prepare_profile(request, body, inherited_session_id=source_id)
+        if sandbox_profile is not None and body.host_type == "managed":
+            body = body.model_copy(update={"sandbox_provider": sandbox_profile["provider"]})
+
         from omnigent.server.routes.sandbox_inference import (
             actual_harness,
             configured_snapshot,
@@ -3965,6 +4026,8 @@ def register_core_routes(
         except Exception:
             await drop_unused_copy()
             raise
+
+        await record_profile(request, new_conv.id, sandbox_profile, conversation_store)
 
         # Create the fork-owned rows the rewritten items now reference —
         # before the fork is announced or returned, so no reader sees the ids

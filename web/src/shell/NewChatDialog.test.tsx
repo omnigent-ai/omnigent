@@ -1,4 +1,11 @@
 import { testAgent } from "@/test/agentFixtures";
+import { fetchSandboxProfiles } from "@/lib/sandboxProfilesApi";
+import type * as SandboxProfilesModule from "@/lib/sandboxProfilesApi";
+
+vi.mock("@/lib/sandboxProfilesApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SandboxProfilesModule>()),
+  fetchSandboxProfiles: vi.fn(),
+}));
 import type * as SandboxModelOptionsModule from "@/hooks/useSandboxModelOptions";
 
 vi.mock("@/hooks/useSandboxModelOptions", async (importOriginal) => ({
@@ -1193,6 +1200,12 @@ function mockModelQueries(
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
   authenticatedFetchMock.mockReset();
+  vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+    profiles: [],
+    providers: [],
+    can_manage: false,
+    next_cursor: null,
+  });
   getCurrentUserIdMock.mockReset();
   getCurrentUserIdMock.mockReturnValue(null);
   resolveIdentityMock.mockReset();
@@ -8279,6 +8292,51 @@ describe("NewChatLandingScreen", () => {
     // No selections carried over → an empty workspaces list (empty server-created
     // workspace), not Alpha's repo.
     expect(body.workspaces).toEqual([]);
+  });
+
+  it("launches with the selected profile revision and only offers enabled profiles for the provider", async () => {
+    const profile = {
+      id: "large",
+      name: "Large workspace",
+      description: "For builds",
+      provider: "agent_sandbox",
+      config: {},
+      revision: "revision-1",
+      enabled: true,
+    };
+    vi.mocked(fetchSandboxProfiles).mockResolvedValue({
+      profiles: [
+        profile,
+        { ...profile, id: "disabled", name: "Disabled profile", enabled: false },
+        { ...profile, id: "other", name: "Other provider", provider: "modal" },
+      ],
+      providers: ["agent_sandbox", "modal"],
+      can_manage: false,
+      next_cursor: null,
+    });
+    authenticatedFetchMock.mockResolvedValue(new Response(JSON.stringify({ id: "conv_profile" })));
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_providers: ["agent_sandbox"],
+    });
+    fireEvent.pointerDown(await screen.findByRole("button", { name: "Sandbox profile: Default" }), {
+      button: 0,
+    });
+    expect(screen.queryByText("Disabled profile")).toBeNull();
+    expect(screen.queryByText("Other provider")).toBeNull();
+    fireEvent.click(screen.getByText("Large workspace"));
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "build the project" },
+    });
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    await waitFor(() => expect(authenticatedFetchMock).toHaveBeenCalledTimes(1));
+    const body = JSON.parse(authenticatedFetchMock.mock.calls[0][1]?.body as string);
+    expect(body).toMatchObject({
+      host_type: "managed",
+      sandbox_profile_id: "large",
+      sandbox_profile_revision: "revision-1",
+    });
   });
 
   it("carries the picked provider in the managed create when several are offered", async () => {

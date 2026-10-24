@@ -928,6 +928,10 @@ class SandboxHostLauncher(SandboxLifecycle):
     transport.
     """
 
+    def apply_profile(self, config: dict[str, object]) -> None:
+        """Reject selected profiles unless the provider can enforce their settings."""
+        raise click.ClickException(f"Sandbox profiles are not supported by {self.provider!r}.")
+
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.
 

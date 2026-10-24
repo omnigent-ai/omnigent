@@ -169,6 +169,15 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
         super().__init__(**kwargs)
         self._warm_pool = warm_pool
         self._agent_name: str | None = None
+        self._profile_selected = False
+
+    def apply_profile(self, config: dict[str, object]) -> None:
+        if self._warm_pool is not None:
+            raise click.ClickException(
+                "Sandbox profiles require direct provisioning; warm pools are not supported."
+            )
+        super().apply_profile(config)
+        self._profile_selected = True
 
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         self._agent_name = agent_name
@@ -458,6 +467,8 @@ class AgentSandboxWarmPoolLauncher(AgentSandboxLauncher):
             )
 
     def _allocation(self, handle: WarmPoolHandle) -> dict[str, Any]:
+        if self._profile_selected:
+            raise click.ClickException("Sandbox profiles cannot resume warm-pool allocations.")
         from kubernetes.client.rest import ApiException
 
         try:
