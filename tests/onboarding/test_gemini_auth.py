@@ -4,21 +4,23 @@ Covers both real ``agy`` token formats — macOS ``oauth_creds.json``
 (``access_token`` / ``refresh_token``) and Linux
 ``antigravity-cli/antigravity-oauth-token`` (``{auth_method, token}``) — the
 dual-path default that recognizes a logged-in user on either platform, and the
-macOS-only ``agy models`` fallback that covers agy 1.1.7+, which keeps OAuth in
-the Keychain and writes no token file. The Linux shape was confirmed live
-against agy 1.0.10 on k3s.
+cross-platform ``agy models`` fallback for credentials stored in the OS keyring.
+The Linux shape was confirmed live against agy 1.0.10 on k3s.
 """
 
 from __future__ import annotations
 
 import json
 import subprocess
+import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
 from omnigent.onboarding import gemini_auth as ga
 from omnigent.onboarding import harness_install
+from omnigent.onboarding.harness_install import harness_cli_logged_in
 
 
 def _write(path: Path, payload: object) -> Path:
@@ -32,21 +34,22 @@ def _isolate_detection(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     """Keep detection off the developer's real machine.
 
     Points the default credential paths at an empty tmp home and neutralizes the
-    macOS CLI fallback, so no test reads a real ``~/.gemini`` or shells out to a
-    real ``agy models`` — which on a signed-in Mac would flip the not-logged-in
+    CLI fallback, so no test reads a real ``~/.gemini`` or shells out to a
+    real ``agy models`` — which on a signed-in machine would flip the not-logged-in
     assertions. Tests opt back in to exactly the signal they exercise.
 
     :param monkeypatch: pytest's env/attr patching fixture.
     :param tmp_path: pytest's per-test temporary directory fixture.
     :returns: None.
     """
+    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
     home = tmp_path / "gemini-home"
     monkeypatch.setattr(
         ga,
         "GEMINI_OAUTH_CRED_PATHS",
         (home / "oauth_creds.json", home / "antigravity-cli" / "antigravity-oauth-token"),
     )
-    monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key: False)
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key, **kwargs: False)
 
 
 def test_macos_oauth_creds_format_detected(tmp_path: Path) -> None:
@@ -171,23 +174,15 @@ def test_default_checks_both_platform_paths(
 
 
 # ---------------------------------------------------------------------------
-# macOS Keychain fallback (agy 1.1.7+)
+# OS keyring fallback
 # ---------------------------------------------------------------------------
 
 
-def test_macos_keychain_login_detected_via_cli(monkeypatch: pytest.MonkeyPatch) -> None:
-    """On macOS with no token file, a signed-in CLI counts as logged in.
-
-    agy 1.1.7+ puts the OAuth credential in the Keychain and writes neither
-    ``oauth_creds.json`` nor ``antigravity-oauth-token``, so a file-only check
-    reported ``antigravity-native`` as unconfigured and refused to launch it for
-    a user who was in fact signed in. ``agy models`` reads the Keychain, so it
-    sees the login the files cannot.
-    """
-    monkeypatch.setattr(ga.sys, "platform", "darwin")
+def test_keyring_login_detected_via_cli(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A signed-in CLI detects a keyring login even when no token file exists."""
     seen_keys: list[str] = []
 
-    def _fake_logged_in(key: str) -> bool:
+    def _fake_logged_in(key: str, *, timeout: float) -> bool:
         seen_keys.append(key)
         return True
 
@@ -208,48 +203,87 @@ def test_omnigent_written_settings_json_is_not_a_login(
     credential would leave the launch gate permanently satisfied for a user who
     never signed in. Only the CLI verdict may decide.
     """
-    monkeypatch.setattr(ga.sys, "platform", "darwin")
     _write(
         tmp_path / "gemini-home" / "antigravity-cli" / "settings.json",
         {"showFeedbackSurvey": False},
     )
-    monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key: False)
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", lambda key, **kwargs: False)
     assert ga.gemini_login_detected() is False
 
 
-def test_non_darwin_never_runs_cli_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Off macOS the fallback never runs — detection stays file-only.
-
-    Linux writes a real token file, so its absence is a true negative. Running
-    the fallback there would only add a subprocess and weaken a signal that
-    already works. The stub raises if called, so any non-darwin invocation fails.
-    """
-    monkeypatch.setattr(ga.sys, "platform", "linux")
-
-    def _must_not_call(key: str) -> bool:
-        raise AssertionError(f"CLI fallback must not run off macOS (key={key!r})")
-
-    monkeypatch.setattr(harness_install, "harness_cli_logged_in", _must_not_call)
-    assert ga.gemini_login_detected() is False
-
-
-def test_token_file_short_circuits_cli_fallback(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+@pytest.mark.parametrize("outcome", ["success", "failure", "timeout", "missing"])
+def test_keyring_login_uses_bounded_cli_probe(
+    monkeypatch: pytest.MonkeyPatch, platform: str, outcome: str
 ) -> None:
-    """A usable token file wins on macOS without paying for a subprocess."""
-    monkeypatch.setattr(ga.sys, "platform", "darwin")
+    """Keyring-only logins use the non-interactive status command on every OS."""
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", harness_cli_logged_in)
+    monkeypatch.setattr(harness_install, "_LOGIN_PROBE_CACHE", {})
+    monkeypatch.setattr(harness_install, "resolve_cli_binary", lambda name: "/mock/bin/agy")
+    run = Mock(return_value=subprocess.CompletedProcess([], 0 if outcome == "success" else 1))
+    if outcome == "timeout":
+        run.side_effect = subprocess.TimeoutExpired(
+            cmd="agy models", timeout=harness_install.READINESS_CLI_PROBE_TIMEOUT_S
+        )
+    elif outcome == "missing":
+        run.side_effect = FileNotFoundError("agy unavailable")
+    monkeypatch.setattr(harness_install.subprocess, "run", run)
+
+    assert ga.gemini_login_detected() is (outcome == "success")
+    run.assert_called_once_with(
+        ["/mock/bin/agy", "models"],
+        check=False,
+        timeout=harness_install.READINESS_CLI_PROBE_TIMEOUT_S,
+        stdin=subprocess.DEVNULL,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_unresolved_cli_does_not_start_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    """An unavailable agy binary reads as not ready without spawning a process."""
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", harness_cli_logged_in)
+    monkeypatch.setattr(harness_install, "resolve_cli_binary", lambda name: None)
+    run = Mock(side_effect=AssertionError("unresolved CLI must not start a subprocess"))
+    monkeypatch.setattr(harness_install.subprocess, "run", run)
+
+    assert ga.gemini_login_detected() is False
+    run.assert_not_called()
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+def test_api_key_short_circuits_cli_fallback(
+    monkeypatch: pytest.MonkeyPatch, platform: str
+) -> None:
+    """An API key avoids the CLI probe even when no token file exists."""
+    monkeypatch.setattr(sys, "platform", platform)
+    monkeypatch.setenv("GEMINI_API_KEY", "gemini-key")
+    probe = Mock(side_effect=AssertionError("API key must bypass the CLI"))
+    monkeypatch.setattr(harness_install, "harness_cli_logged_in", probe)
+    assert ga.gemini_login_detected() is True
+    probe.assert_not_called()
+
+
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
+def test_token_file_short_circuits_cli_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, platform: str
+) -> None:
+    """A usable token file wins without paying for a subprocess."""
+    monkeypatch.setattr(sys, "platform", platform)
     macos = _write(tmp_path / "oauth_creds.json", {"access_token": "ya29.macos"})
     monkeypatch.setattr(ga, "GEMINI_OAUTH_CRED_PATHS", (macos,))
 
-    def _must_not_call(key: str) -> bool:
+    def _must_not_call(key: str, *, timeout: float) -> bool:
         raise AssertionError(f"file-present path must not invoke the CLI (key={key!r})")
 
     monkeypatch.setattr(harness_install, "harness_cli_logged_in", _must_not_call)
     assert ga.gemini_login_detected() is True
 
 
+@pytest.mark.parametrize("platform", ["linux", "darwin", "win32"])
 def test_explicit_creds_path_skips_cli_fallback(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, platform: str
 ) -> None:
     """An explicit *creds_path* checks only that file — the fallback stays off.
 
@@ -257,9 +291,9 @@ def test_explicit_creds_path_skips_cli_fallback(
     file it explicitly asked about. Pinned because the carve-out is load-bearing
     for the documented semantics and for test isolation.
     """
-    monkeypatch.setattr(ga.sys, "platform", "darwin")
+    monkeypatch.setattr(sys, "platform", platform)
 
-    def _must_not_call(key: str) -> bool:
+    def _must_not_call(key: str, *, timeout: float) -> bool:
         raise AssertionError(f"explicit creds_path must not invoke the CLI (key={key!r})")
 
     monkeypatch.setattr(harness_install, "harness_cli_logged_in", _must_not_call)
@@ -297,7 +331,9 @@ def test_unreadable_home_reads_as_no_credential(
     "error",
     [
         OSError("spawn failed"),
-        subprocess.TimeoutExpired(cmd="agy models", timeout=30),
+        subprocess.TimeoutExpired(
+            cmd="agy models", timeout=harness_install.READINESS_CLI_PROBE_TIMEOUT_S
+        ),
         subprocess.SubprocessError("boom"),
         ValueError("bad args"),
     ],
@@ -311,9 +347,8 @@ def test_cli_fallback_failure_reads_as_no_credential(
     and a timeout; this pins the outer contract so a future change there cannot
     turn a probe failure into a crashed readiness poll.
     """
-    monkeypatch.setattr(ga.sys, "platform", "darwin")
 
-    def _raise(key: str) -> bool:
+    def _raise(key: str, *, timeout: float) -> bool:
         raise error
 
     monkeypatch.setattr(harness_install, "harness_cli_logged_in", _raise)
