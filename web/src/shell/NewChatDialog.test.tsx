@@ -1463,6 +1463,37 @@ function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
 describe("model picker hotkey", () => {
   beforeEach(setupLandingMocks);
 
+  it("cycles the full Pi catalog after searching the model menu", () => {
+    mockAgents([testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" })]);
+    mockModelQueries(() => ({
+      ...SUCCESS_QUERY_STATE,
+      data: [
+        { id: "model-a", model: "model-a", displayName: "Model A", isDefault: true },
+        { id: "model-b", model: "model-b", displayName: "Model B" },
+        { id: "model-c", model: "model-c", displayName: "Model C" },
+      ],
+    }));
+    renderLanding();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    fireEvent.change(screen.getByRole("textbox", { name: "Search models" }), {
+      target: { value: "model-a" },
+    });
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Model B" })).toBeNull();
+    closeMenu();
+    const input = screen.getByTestId("new-chat-landing-input");
+    act(() => input.focus());
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(screen.getByRole("menuitemcheckbox", { name: "Model B" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(screen.getByRole("menuitemcheckbox", { name: "Model C" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
   it("previews the cycled launch model and its effort ladder with the draft focused", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,

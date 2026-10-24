@@ -151,7 +151,7 @@ export function HarnessPickerSubContent({
   return <DropdownMenuSubContent {...props} {...interactionProps} ref={setContent} />;
 }
 
-function CyclePreview({ section }: { section: ComposerConfigSection }) {
+function CyclePreview({ section, hint }: { section: ComposerConfigSection; hint?: string }) {
   const content = useRef<HTMLDivElement>(null);
   const selected = section.choices.find((choice) => choice.checked);
   useEffect(() => {
@@ -163,6 +163,7 @@ function CyclePreview({ section }: { section: ComposerConfigSection }) {
         {section.header}: {selected?.label}
       </span>
       <ComposerConfigSections models={section} />
+      {hint && <div className="px-2 py-1.5 text-xs text-muted-foreground">{hint}</div>}
     </div>
   );
 }
@@ -183,6 +184,7 @@ export function HarnessPicker({
   configOpen = false,
   onInitialSelectionFocus,
   cyclePreview,
+  cyclePreviewHint,
   onDismissCyclePreview,
   children,
 }: {
@@ -201,12 +203,15 @@ export function HarnessPicker({
   configOpen?: boolean;
   onInitialSelectionFocus?: () => void;
   cyclePreview?: ComposerConfigSection;
+  cyclePreviewHint?: string;
   onDismissCyclePreview?: () => void;
   children: ReactNode;
 }) {
   const previewOnly = cyclePreview !== undefined && !open;
   const menuOpen = open || previewOnly;
   const previewFocus = useRef<HTMLElement | null>(null);
+  const previewActive = useRef(previewOnly);
+  previewActive.current = previewOnly;
   // Programmatic focus can retain :focus-visible during pointer-only interaction.
   const [pointerInteraction, setPointerInteraction] = useState(false);
   const [hasMenuInteraction, setHasMenuInteraction] = useState(false);
@@ -248,6 +253,11 @@ export function HarnessPicker({
         onPointerDownCapture={(event) => {
           setPointerInteraction(true);
           trigger.onPointerDownCapture?.(event);
+          if (previewOnly && !trigger.disabled && event.button === 0 && !event.ctrlKey) {
+            event.preventDefault();
+            onDismissCyclePreview?.();
+            onOpenChange(true);
+          }
         }}
         onPointerMoveCapture={(event) => {
           if (open) setPointerInteraction(true);
@@ -256,6 +266,11 @@ export function HarnessPicker({
         onKeyDownCapture={(event) => {
           setPointerInteraction(false);
           trigger.onKeyDownCapture?.(event);
+          if (previewOnly && !trigger.disabled && ["Enter", " ", "ArrowDown"].includes(event.key)) {
+            event.preventDefault();
+            onDismissCyclePreview?.();
+            onOpenChange(true);
+          }
         }}
         onBlur={(event) => {
           if (!open) setPointerInteraction(false);
@@ -309,7 +324,11 @@ export function HarnessPicker({
             event.preventDefault();
           }}
           onCloseAutoFocus={(event) => {
-            if (!previewOnly) return;
+            // A previous menu's delayed cleanup must not steal preview focus.
+            if (!previewOnly) {
+              if (previewActive.current) event.preventDefault();
+              return;
+            }
             event.preventDefault();
             if (
               document.activeElement === document.body ||
@@ -324,7 +343,7 @@ export function HarnessPicker({
             onDismissCyclePreview?.();
           }}
         >
-          {previewOnly ? <CyclePreview section={cyclePreview} /> : children}
+          {previewOnly ? <CyclePreview section={cyclePreview} hint={cyclePreviewHint} /> : children}
         </HarnessPickerContent>
       </DropdownMenu>
     </PickerInteractionContext.Provider>

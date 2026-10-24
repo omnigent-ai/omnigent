@@ -49,10 +49,13 @@ and steers messages while the agent is busy.
   agent chosen.
 - `config-cycle-hotkeys`: Ctrl+Alt+M cycles models and Ctrl+Alt+E cycles effort
   in both composers (Ctrl on every platform). The relevant menu briefly opens
-  with the applied choice highlighted, preserving draft and input focus. Each
-  press extends the preview; pending changes finish before its two-second timer
-  starts. Choices follow menu order and wrap, skipping unavailable options.
-  States: default, model-specific effort, pending/refused changes, read-only,
+  with the selected choice highlighted, preserving draft and input focus. In an
+  existing session, cycling stages choices locally and applies only the final
+  choice after two seconds without another press. Enter applies immediately
+  without sending the draft; Escape cancels. Wrapping back to the applied choice
+  sends no change. Before launch, choices update the local launch configuration.
+  Choices follow menu order and wrap, skipping unavailable options.
+  States: default, model-specific effort, staged/pending/refused changes, read-only,
   unreachable, smart-routing effort disabled, terminal/editor focus untouched.
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
@@ -540,10 +543,13 @@ Other connection providers alone do not enable the managed MCP picker.
   `web/src/pages/ChatPage.composer.test.tsx`, and
   `web/src/shell/NewChatDialog.test.tsx`. Manually: enter a draft, press
   Ctrl+Alt+M several times and observe the model preview advance and wrap;
-  press Ctrl+Alt+E and observe effort change. Wait two seconds after the last
-  applied change and expect the preview to close without moving focus or
-  changing the draft. Repeat before launch and in a session; reload the session
-  to check persistence. The fork dialog has no composer cycle shortcuts; mobile
+  press Ctrl+Alt+E and observe effort change. In a session, press either shortcut
+  three times quickly: no change request should occur during the burst, then
+  only the final choice applies two seconds after the last press. Repeat with
+  Enter to apply immediately, Escape to cancel, and a full wrap to send no change.
+  Verify model then effort cycling applies both final choices. Wait for the
+  preview to close without moving focus or changing the draft. Repeat before
+  launch; reload the session to check persistence. The fork dialog has no composer cycle shortcuts; mobile
   without a physical keyboard continues to use the pickers.
 - **`queue-and-steer`:**
   `tests/e2e_ui/chat/test_queue_steer.py::test_steer_sends_queued_message_while_busy`,
