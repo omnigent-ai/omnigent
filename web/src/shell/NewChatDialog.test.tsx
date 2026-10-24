@@ -3472,10 +3472,33 @@ describe("Run on Arca (Databricks-internal, MDM-gated)", () => {
     fireEvent.click(chip);
   }
 
-  it("offers the Arca option only when the desktop shell reports the MDM flag", async () => {
+  it("offers Arca under My machines without an empty Cloud section", async () => {
     renderLanding();
     await openHostMenu();
-    expect(await screen.findByTestId("new-chat-landing-run-on-arca")).toBeTruthy();
+    const arca = await screen.findByTestId("new-chat-landing-run-on-arca");
+    const menu = screen.getByTestId("new-chat-landing-host-menu");
+    expect(menu).not.toHaveTextContent("Cloud");
+    expect(menu).not.toHaveTextContent("No hosts connected yet.");
+    expect(screen.getByText("My machines").compareDocumentPosition(arca)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+  });
+
+  it("places Run on Arca before connected machines, not alongside cloud hosts", async () => {
+    mockHosts([
+      { host_id: "cloud-1", name: "team-cloud-box", owner: "me", status: "online" },
+      { host_id: "local-1", name: "my-laptop", owner: "me", status: "online" },
+    ]);
+    renderLanding();
+    await openHostMenu();
+    const arca = await screen.findByTestId("new-chat-landing-run-on-arca");
+    const cloud = screen.getByTestId("new-chat-landing-host-cloud-1");
+    const local = screen.getByTestId("new-chat-landing-host-local-1");
+    expect(screen.getByText("Cloud").compareDocumentPosition(cloud)).toBe(
+      Node.DOCUMENT_POSITION_FOLLOWING,
+    );
+    expect(cloud.compareDocumentPosition(arca)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
+    expect(arca.compareDocumentPosition(local)).toBe(Node.DOCUMENT_POSITION_FOLLOWING);
   });
 
   it("hides the Arca option when the flag is off or unknown (old shell)", async () => {
