@@ -146,6 +146,57 @@ def test_filtered_server_env_drops_global_opencode_config(
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
 
 
+@pytest.mark.parametrize("host_layout", ["home_config", "xdg_config_home", "gh_config_dir"])
+def test_filtered_server_env_keeps_host_gh_login_visible(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, host_layout: str
+) -> None:
+    """The agent shell must still see the host's `gh auth login`, wherever the
+    host keeps it, despite the per-session XDG isolation."""
+    host_home = tmp_path / "host-home"
+    monkeypatch.setenv("HOME", str(host_home))
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+    if host_layout == "home_config":
+        gh_config = host_home / ".config" / "gh"
+    elif host_layout == "xdg_config_home":
+        monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "host-xdg"))
+        gh_config = tmp_path / "host-xdg" / "gh"
+    else:
+        gh_config = tmp_path / "host-gh"
+        monkeypatch.setenv("GH_CONFIG_DIR", str(gh_config))
+    gh_config.mkdir(parents=True)
+    (gh_config / "hosts.yml").write_text("github.com:\n    user: octocat\n")
+
+    env = filtered_server_env(bridge_dir=tmp_path / "bridge", auth_secret="pw")
+
+    # gh reads its config from GH_CONFIG_DIR, so pinning it at the host's gh
+    # dir keeps the host login reachable from the agent shell...
+    assert env["GH_CONFIG_DIR"] == str(gh_config)
+    assert (Path(env["GH_CONFIG_DIR"]) / "hosts.yml").is_file()
+    # ...while OpenCode's own config stays isolated in the per-session dir.
+    assert env["XDG_CONFIG_HOME"] == str(tmp_path / "bridge" / "xdg-config")
+
+
+def test_filtered_server_env_without_host_gh_dir_stays_isolated(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """With no resolvable host gh dir, env construction still succeeds and omits
+    GH_CONFIG_DIR rather than raising, keeping the XDG isolation intact."""
+    monkeypatch.delenv("GH_CONFIG_DIR", raising=False)
+    monkeypatch.delenv("OMNIGENT_RUNNER_ENV_PASSTHROUGH", raising=False)
+
+    def _no_host_dir() -> str:
+        raise RuntimeError("host gh config dir unknown")
+
+    monkeypatch.setattr(appsrv, "gh_config_dir", _no_host_dir)
+
+    env = filtered_server_env(bridge_dir=tmp_path / "bridge", auth_secret="pw")
+
+    assert "GH_CONFIG_DIR" not in env
+    assert env["XDG_CONFIG_HOME"] == str(tmp_path / "bridge" / "xdg-config")
+
+
 def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeServer:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     return OpenCodeNativeServer(
