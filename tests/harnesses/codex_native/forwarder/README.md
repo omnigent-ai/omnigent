@@ -14,11 +14,11 @@ parameterization produces additional collected cases.
 | [test_health.py](test_health.py) | Health | 4 |
 | [test_instructions.py](test_instructions.py) | Instructions | 20 |
 | [test_mcp_startup.py](test_mcp_startup.py) | Mcp startup | 14 |
-| [test_replay_order.py](test_replay_order.py) | Replay order | 4 |
+| [test_replay_order.py](test_replay_order.py) | Replay order | 5 |
 | [test_settings.py](test_settings.py) | Settings | 20 |
 | [test_side_chat.py](test_side_chat.py) | Side chat | 1 |
 | [test_subagents.py](test_subagents.py) | Subagents | 16 |
-| [test_turn_errors.py](test_turn_errors.py) | Turn errors | 21 |
+| [test_turn_errors.py](test_turn_errors.py) | Turn errors | 39 |
 | [test_usage.py](test_usage.py) | Usage | 2 |
 | [test_user_messages.py](test_user_messages.py) | User messages | 4 |
 

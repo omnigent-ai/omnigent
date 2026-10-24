@@ -2,6 +2,7 @@
 
 Failed turns surface their reason; authentication errors include a re-auth hint.
 Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
+A turn whose start was missed reports running from its first item.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_certificate_failure,
     record_certificate_failure,
+    update_active_turn_id,
     write_bridge_state,
 )
 from tests.harnesses.codex_native.forwarder._support import (
@@ -694,6 +696,160 @@ async def test_correlated_error_recovers_a_missed_turn_start(tmp_path: Path) -> 
     assert len(client.posts) == 1
     assert client.posts[0][1]["data"]["status"] == "failed"
     assert client.posts[0][1]["data"]["response_id"] == "codex_missed_start_turn"
+
+
+def _turn_event(
+    method: str, turn_id: str, item_type: str | None = None, *, thread_id: str = "thread_123"
+) -> dict:
+    if item_type is None:
+        return {"method": method, "params": {"threadId": thread_id, "turn": {"id": turn_id}}}
+    item = {"type": item_type, "id": f"{turn_id}_{item_type}"}
+    if item_type == "userMessage":
+        item["content"] = [{"type": "text", "text": "Review the change."}]
+    else:
+        item["text"] = "Reviewed."
+    return {
+        "method": method,
+        "params": {"threadId": thread_id, "turnId": turn_id, "item": item},
+    }
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "events", "expected_running_turns"),
+    [
+        pytest.param(
+            "turn_123",
+            [
+                _turn_event("item/started", "turn_123", "userMessage"),
+                _turn_event("item/completed", "turn_123", "userMessage"),
+                _turn_event("item/completed", "turn_123", "agentMessage"),
+            ],
+            ["turn_123"],
+            id="missed-start",
+        ),
+        pytest.param(
+            "turn_123",
+            [
+                _turn_event("turn/started", "turn_123"),
+                _turn_event("item/completed", "turn_123", "userMessage"),
+            ],
+            ["turn_123"],
+            id="observed-start",
+        ),
+        pytest.param(
+            None,
+            [_turn_event("item/completed", "turn_old", "userMessage")],
+            [],
+            id="no-active-turn",
+        ),
+        pytest.param(
+            None,
+            [
+                _turn_event("item/started", "turn_123", "userMessage"),
+                {"active_turn_id": "turn_123"},
+                _turn_event("item/completed", "turn_123", "userMessage"),
+                _turn_event("item/completed", "turn_123", "agentMessage"),
+            ],
+            ["turn_123"],
+            id="turn-id-written-after-first-item",
+        ),
+        pytest.param(
+            None,
+            [
+                {
+                    "method": "item/agentMessage/delta",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "itemId": "turn_123_agentMessage",
+                        "delta": "Rev",
+                    },
+                },
+                _turn_event("item/completed", "turn_123", "agentMessage"),
+            ],
+            ["turn_123"],
+            id="start-recovered-from-delta",
+        ),
+        pytest.param(
+            "turn_124",
+            [_turn_event("item/completed", "turn_123", "agentMessage")],
+            [],
+            id="other-turn",
+        ),
+        pytest.param(
+            "turn_123",
+            [_turn_event("item/completed", "turn_123", "userMessage", thread_id="thread_side")],
+            [],
+            id="other-thread",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_first_item_reports_running_for_a_turn_whose_start_was_missed(
+    tmp_path: Path,
+    active_turn_id: str | None,
+    events: list[dict],
+    expected_running_turns: list[str],
+) -> None:
+    """A fresh thread subscribes after its first turn started; its first item reports running."""
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id=active_turn_id,
+        ),
+    )
+    client = _RecordingClient()
+    forwarder_state = fwd._CodexForwarderState()
+    delta_coalescer = fwd._OutputTextDeltaCoalescer(
+        client,  # type: ignore[arg-type]
+        "conv_x",
+        flush_interval_seconds=60.0,
+        flush_char_threshold=100_000,
+    )
+    for event in events:
+        if "active_turn_id" in event:
+            active_turn_id = event["active_turn_id"]
+            update_active_turn_id(tmp_path, active_turn_id)
+            continue
+        await fwd._post_missed_turn_start(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            thread_id="thread_123",
+            event=event,
+            forwarder_state=forwarder_state,
+        )
+        await fwd._handle_event(
+            client,  # type: ignore[arg-type]
+            session_id="conv_x",
+            bridge_dir=tmp_path,
+            event=event,
+            usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+            elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+            delta_coalescer=delta_coalescer,
+            expected_thread_id="thread_123",
+            forwarder_state=forwarder_state,
+        )
+    await delta_coalescer.close()
+
+    statuses = [body for _, body in client.posts if body["type"] == "external_session_status"]
+    assert [body["data"]["status"] for body in statuses] == ["running"] * len(
+        expected_running_turns
+    )
+    assert [body["data"]["response_id"] for body in statuses] == [
+        f"codex_{turn_id}" for turn_id in expected_running_turns
+    ]
+    if expected_running_turns:
+        assert client.posts[0][1]["type"] == "external_session_status"
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == (
+        expected_running_turns[-1] if expected_running_turns else active_turn_id
+    )
 
 
 @pytest.mark.asyncio

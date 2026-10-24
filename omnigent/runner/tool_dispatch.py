@@ -1690,6 +1690,8 @@ async def _send_to_in_flight_child(
                 work_id=work_id,
             )
             fresh.status = "running"
+            # The turn was already in flight, so its start report predates this entry.
+            fresh.child_start_reported = True
             # Best-effort dispatch-id stamp for restart recovery only; the
             # in-memory entry above already makes the completion deliverable, so
             # a stamp failure degrades recovery but never live delivery.

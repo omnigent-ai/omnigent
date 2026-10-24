@@ -246,12 +246,21 @@ async def test_wedged_launching_dispatch_fails_loudly_to_parent() -> None:
 
 
 @pytest.mark.asyncio
-async def test_started_dispatch_is_not_reaped_by_launch_liveness() -> None:
+@pytest.mark.parametrize(
+    "start_reported_before_prompt_accepted",
+    [False, True],
+    ids=["running-edge", "codex-start-reported-before-prompt-accepted"],
+)
+async def test_started_dispatch_is_not_reaped_by_launch_liveness(
+    start_reported_before_prompt_accepted: bool,
+) -> None:
     """
     A dispatch that produced a real edge must never be launch-reaped.
 
     Once the child has reported ``running`` (the launch proof), the liveness
     budget no longer applies — a long-running healthy child is not a wedge.
+    A codex child's start report can also beat the runner's own note that
+    Codex accepted the prompt; the later note must not re-arm the bound.
     """
 
     parent_id = uuid.uuid4().hex
@@ -266,7 +275,11 @@ async def test_started_dispatch_is_not_reaped_by_launch_liveness() -> None:
     )
 
     try:
+        if start_reported_before_prompt_accepted:
+            subagent_work.note_subagent_child_start_reported(child_id)
         subagent_work.mark_subagent_work_started(child_id)
+        if start_reported_before_prompt_accepted:
+            subagent_work.arm_subagent_child_start_timeout(child_id)
         assert entry.status == "running"
         reaped = subagent_work.reap_stalled_subagent_launches(
             now=entry.created_at + 10_000.0, timeout_s=180.0
@@ -367,7 +380,12 @@ def test_launch_timeout_resolver_rejects_non_finite(
 
 
 @pytest.mark.asyncio
-async def test_real_completion_replaces_a_launch_timeout_failure() -> None:
+@pytest.mark.parametrize(
+    "cancel_before_result", [False, True], ids=["direct", "after-unconfirmed-cancel"]
+)
+async def test_real_completion_replaces_a_launch_timeout_failure(
+    cancel_before_result: bool,
+) -> None:
     """
     A child's own terminal edge overrides the reaper's "no start acknowledgment".
 
@@ -377,7 +395,8 @@ async def test_real_completion_replaces_a_launch_timeout_failure() -> None:
     genuinely finishes and its ``idle`` edge arrives as ``completed``. That
     completion must be delivered — the reaper's failure was a guess made
     without a single edge from the child — or the parent waits forever on a
-    report that is sitting in the child's transcript.
+    report that is sitting in the child's transcript. An interrupt's
+    unconfirmed ``cancelled`` in between must not spend that guess.
     """
     parent_id = uuid.uuid4().hex
     child_id = uuid.uuid4().hex
@@ -393,6 +412,11 @@ async def test_real_completion_replaces_a_launch_timeout_failure() -> None:
         subagent_work.reap_stalled_subagent_launches(now=entry.created_at + 200.0, timeout_s=180.0)
         assert entry.status == "failed" and entry.delivered
         assert inbox.get_nowait()["status"] == "failed"
+        if cancel_before_result:
+            cancel = subagent_work.mark_subagent_work_terminal(
+                child_id, status="cancelled", output=None
+            )
+            assert not cancel.delivered_now and entry.launch_timed_out
 
         ack = subagent_work.mark_subagent_work_terminal(
             child_id, status="completed", output="Both assessments are in. Full report: ..."

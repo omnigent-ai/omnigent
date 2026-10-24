@@ -357,3 +357,87 @@ async def test_turn_started_waits_for_replay_before_replacing_active_turn(tmp_pa
         await tracker.close()
 
     assert read_bridge_state(tmp_path).active_turn_id == "turn_2"  # type: ignore[union-attr]
+
+
+@pytest.mark.asyncio
+async def test_recovered_running_waits_for_replay_that_ended_the_turn(tmp_path: Path) -> None:
+    """A live item's recovered running cannot land after resume replay ended its turn."""
+
+    class _SlowRunningClient(_RecordingClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.release_running = asyncio.Event()
+
+        async def post(
+            self,
+            url: str,
+            *,
+            json: dict,
+            timeout: float | None = None,
+        ) -> httpx.Response:
+            if json["type"] == "external_session_status" and json["data"]["status"] == "running":
+                await self.release_running.wait()
+            return await super().post(url, json=json, timeout=timeout)
+
+    write_bridge_state(
+        tmp_path,
+        CodexNativeBridgeState(
+            session_id="conv_x",
+            socket_path=str(tmp_path / "app-server.sock"),
+            thread_id="thread_1",
+            codex_home=str(tmp_path / "codex-home"),
+            active_turn_id="turn_1",
+        ),
+    )
+    client = _SlowRunningClient()
+    lock_entered = asyncio.Event()
+    release_lock = asyncio.Event()
+
+    async def replay_ends_turn() -> None:
+        async with fwd._conversation_item_delivery_scope("conv_x"):
+            lock_entered.set()
+            await release_lock.wait()
+            await fwd._post_resume_terminal_status(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                turns=[{"id": "turn_1", "status": "completed"}],
+            )
+
+    locks_token = fwd._conversation_item_locks.set({})
+    try:
+        replay = asyncio.create_task(replay_ends_turn())
+        await asyncio.wait_for(lock_entered.wait(), timeout=5.0)
+        recovered = asyncio.create_task(
+            fwd._post_missed_turn_start(
+                client,  # type: ignore[arg-type]
+                session_id="conv_x",
+                bridge_dir=tmp_path,
+                thread_id="thread_1",
+                event={
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_1",
+                        "turnId": "turn_1",
+                        "item": {"type": "agentMessage", "id": "item_1", "text": "Done."},
+                    },
+                },
+                forwarder_state=fwd._CodexForwarderState(),
+            )
+        )
+        await asyncio.sleep(0)
+        release_lock.set()
+        await replay
+        client.release_running.set()
+        await asyncio.wait_for(recovered, timeout=5.0)
+    finally:
+        fwd._conversation_item_locks.reset(locks_token)
+
+    statuses = [
+        body["data"]["status"]
+        for _, body in client.posts
+        if body["type"] == "external_session_status"
+    ]
+    assert statuses == ["idle"]
+    assert read_bridge_state(tmp_path).active_turn_id is None  # type: ignore[union-attr]

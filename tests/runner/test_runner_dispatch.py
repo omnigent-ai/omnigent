@@ -12790,6 +12790,12 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
     try:
         output = await _run_named_continuation(parent_id, handler)
         work = subagent_work.get_subagent_work(child_id)
+        assert work is not None
+        # A codex child reported its in-flight turn's start before this entry existed.
+        subagent_work.arm_subagent_child_start_timeout(child_id)
+        reaped = subagent_work.reap_stalled_subagent_launches(
+            now=work.created_at + 7200.0, timeout_s=180.0
+        )
     finally:
         subagent_work.unregister_subagent_work(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)
@@ -12803,7 +12809,8 @@ async def test_named_send_adopts_busy_child_as_running_not_launching(
     assert len(stamped) == 1, "an untracked server-busy turn must be adopted with one stamp"
     # Adopted directly as running (not launching) so it is safe from the reaper,
     # and the entry carries the freshly stamped id so its completion delivers.
-    assert work is not None and work.work_id == stamped[0]
+    assert work.work_id == stamped[0]
+    assert reaped == []
     assert work.status == "running"
     assert len(event_posts) == 1
 

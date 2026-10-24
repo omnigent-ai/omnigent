@@ -11,6 +11,7 @@ inbox, wakes the parent, and only then finalizes the dispatch's cleanup.
 from __future__ import annotations
 
 import asyncio
+import time
 import uuid
 from collections.abc import Callable
 from typing import Any
@@ -225,8 +226,15 @@ async def test_reaped_native_launch_must_not_discard_childs_real_completion() ->
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness_name", "reported_status"),
+    [("claude-native", None), ("codex-native", "running"), ("codex-native", "waiting")],
+    ids=["claude-native-steer", "codex-native-reported-start", "codex-native-reported-approval"],
+)
 async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
     monkeypatch: pytest.MonkeyPatch,
+    harness_name: str,
+    reported_status: str | None,
 ) -> None:
     """The runner's own verified prompt delivery is the launch acknowledgment.
 
@@ -234,7 +242,9 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
     by a runner-driven turn, and claude-native relays no ``running`` edge for
     it, so that turn ending cleanly is the only proof the child took the
     message. The dispatch must leave ``launching`` there, or the launch-liveness
-    reaper fails a working child.
+    reaper fails a working child. A codex-native child whose forwarder reports
+    the turn start, or an approval wait, after Codex accepted the prompt is
+    working too.
     """
     from omnigent.runner import app as runner_app
 
@@ -271,7 +281,7 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
                     "role": "user",
                     "agent_id": uuid.uuid4().hex,
                     "model": "test-agent",
-                    "harness_override": "claude-native",
+                    "harness_override": harness_name,
                     "content": [{"type": "input_text", "text": "status check"}],
                 },
             )
@@ -281,13 +291,19 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
                 lambda: child_id not in app.state.active_turns,
                 "the steered native turn never ended",
             )
+            if reported_status is not None:
+                resp = await client.post(
+                    f"/v1/sessions/{child_id}/events",
+                    json={"type": "external_session_status", "data": {"status": reported_status}},
+                )
+                assert resp.status_code == 204, resp.text
 
         assert harness.posted_bodies, "the follow-up never reached the native harness"
         assert entry.status == "running", (
             f"work entry is {entry.status!r} after the runner delivered the "
-            f"follow-up into the child's pane: that verified delivery is first-hand "
-            f"proof the child is working, so the dispatch must leave 'launching' "
-            f"even though claude-native relays no running edge for a steered turn."
+            f"follow-up to the {harness_name} child: that verified delivery is "
+            f"first-hand proof the child took its prompt, so the dispatch must "
+            f"leave 'launching'."
         )
         assert (
             subagent_work.reap_stalled_subagent_launches(
@@ -297,6 +313,219 @@ async def test_native_prompt_delivery_takes_dispatch_out_of_launching(
         ), "the launch-liveness reaper failed a child that had already taken its prompt"
         assert entry.status == "running"
         assert inbox.empty()
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(child_id, None)
+
+
+@pytest.mark.asyncio
+async def test_codex_native_child_silent_after_turn_start_fails_and_wakes_parent() -> None:
+    """A codex-native dispatch that goes silent once its turn starts is still bounded.
+
+    Codex accepting ``turn/start`` ends the runner's delivery turn cleanly, which
+    moves the dispatch out of ``launching``. If the child then emits nothing,
+    the runner's sweep must eventually fail it and wake the parent.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    turn_streamed = asyncio.Event()
+    harness = _ScriptedHarnessClient(_turn_frames("resp_codex"), stream_finished=turn_streamed)
+    server_client = _WakeRecordingServerClient(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="review-two",
+    )
+
+    try:
+        async with _runner_client(app) as client:
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": uuid.uuid4().hex,
+                    "model": "test-agent",
+                    "harness_override": "codex-native",
+                    "content": [{"type": "input_text", "text": "Double-check the change."}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+            await asyncio.wait_for(turn_streamed.wait(), timeout=5.0)
+            await _wait_until(
+                lambda: child_id not in app.state.active_turns,
+                "the codex-native delivery turn never ended",
+            )
+            assert harness.posted_bodies, "the brief never reached the codex-native harness"
+            assert entry.status == "running"
+
+            # Two hours of silence: past the launch budget, its sweep interval and
+            # the one-hour harness turn watchdog.
+            subagent_work.reap_stalled_subagent_launches(
+                now=entry.created_at + 7200.0,
+                mark_terminal=app.state.mark_subagent_terminal_and_wake,
+            )
+            assert entry.status == "failed", (
+                f"work entry is still {entry.status!r} two hours after a codex-native "
+                "child went silent following turn/start: nothing bounds a running "
+                "dispatch, so the child hangs and its parent is never woken."
+            )
+            await _wait_until(
+                lambda: any("finished (failed)" in notice for notice in server_client.wakes()),
+                "the silent codex-native child's failure never woke the parent",
+            )
+            assert not inbox.empty()
+    finally:
+        subagent_work.unregister_subagent_work(child_id)
+        subagent_work._session_inboxes_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(parent_id, None)
+        runner_app._session_event_queues_ref.pop(child_id, None)
+
+
+@pytest.mark.asyncio
+async def test_codex_native_silent_child_failure_yields_to_its_real_result() -> None:
+    """Failing a codex-native child that reported no turn start is only a guess.
+
+    The bound starts when Codex accepts the prompt. Once it fires, the parent
+    reads the failure, but the child may simply have been slow to report: its
+    eventual result must replace the guess and wake the parent again.
+    """
+    from omnigent.runner import app as runner_app
+
+    parent_id = uuid.uuid4().hex
+    child_id = uuid.uuid4().hex
+    inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
+    turn_streamed = asyncio.Event()
+    harness = _ScriptedHarnessClient(_turn_frames("resp_codex"), stream_finished=turn_streamed)
+    server_client = _WakeRecordingServerClient(parent_id)
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
+        server_client=server_client,  # type: ignore[arg-type]
+    )
+    subagent_work._session_inboxes_ref[parent_id] = inbox
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent="worker",
+        title="review-two",
+    )
+
+    try:
+        async with _runner_client(app) as client:
+            sent_at = time.time()
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": uuid.uuid4().hex,
+                    "model": "test-agent",
+                    "harness_override": "codex-native",
+                    "content": [{"type": "input_text", "text": "Double-check the change."}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+            await asyncio.wait_for(turn_streamed.wait(), timeout=5.0)
+            await _wait_until(
+                lambda: child_id not in app.state.active_turns,
+                "the codex-native delivery turn never ended",
+            )
+            accepted_by = time.time()
+            assert entry.status == "running"
+            # A dispatch registered long before acceptance must still get the full budget.
+            entry.created_at -= 600.0
+
+            assert (
+                subagent_work.reap_stalled_subagent_launches(
+                    now=sent_at + 179.0,
+                    timeout_s=180.0,
+                    mark_terminal=app.state.mark_subagent_terminal_and_wake,
+                )
+                == []
+            ), "the bound fired before its budget elapsed after Codex accepted the prompt"
+            assert subagent_work.reap_stalled_subagent_launches(
+                now=accepted_by + 180.0,
+                timeout_s=180.0,
+                mark_terminal=app.state.mark_subagent_terminal_and_wake,
+            ) == [entry], (
+                f"work entry is {entry.status!r} past the budget after Codex accepted "
+                "the prompt and the child reported no turn start"
+            )
+            assert entry.status == "failed" and entry.launch_timed_out
+            await _wait_until(
+                lambda: any("finished (failed)" in n for n in server_client.wakes()),
+                "the silent codex-native child's failure never woke the parent",
+            )
+            notice = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,  # type: ignore[arg-type]
+                conversation_id=parent_id,
+                session_inbox=inbox,
+            )
+            assert "reported no turn start" in notice, notice
+            assert subagent_work.get_subagent_work(child_id) is entry
+            resp = await client.post(
+                f"/v1/sessions/{parent_id}/events",
+                json={
+                    "type": "message",
+                    "role": "user",
+                    "agent_id": uuid.uuid4().hex,
+                    "model": "test-agent",
+                    "harness": "openai-agents",
+                    "content": [{"type": "input_text", "text": "sub-agent finished (failed)"}],
+                },
+            )
+            assert resp.status_code == 202, resp.text
+            await _wait_until(
+                lambda: parent_id not in app.state.active_turns,
+                "the parent's wake turn never ended",
+            )
+            wakes_before = len(server_client.wakes())
+
+            # The child was only slow: it reports its turn, then its result.
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={"type": "external_session_status", "data": {"status": "running"}},
+            )
+            assert resp.status_code == 204, resp.text
+            final_report = "FINAL REPORT: the change is correct"
+            resp = await client.post(
+                f"/v1/sessions/{child_id}/events",
+                json={
+                    "type": "external_session_status",
+                    "data": {"status": "idle", "output": final_report},
+                },
+            )
+            assert resp.status_code == 204, resp.text
+            assert entry.status == "completed" and entry.output == final_report, (
+                f"work entry is {entry.status!r} with output {entry.output!r}: the "
+                "child's real result did not supersede the no-turn-start guess"
+            )
+            await _wait_until(
+                lambda: len(server_client.wakes()) > wakes_before,
+                "the parent was never woken for the real result",
+            )
+            report = await execute_tool(
+                tool_name="sys_read_inbox",
+                arguments="{}",
+                server_client=server_client,  # type: ignore[arg-type]
+                conversation_id=parent_id,
+                session_inbox=inbox,
+            )
+            assert final_report in report, report
+            assert subagent_work.get_subagent_work(child_id) is None
     finally:
         subagent_work.unregister_subagent_work(child_id)
         subagent_work._session_inboxes_ref.pop(parent_id, None)

@@ -18,6 +18,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
 )
 from tests.harnesses.codex_native.session._support import (
+    _capture_handler,
     _elicitation_tracker,
     _expected_status_data,
     _FakeCodexAppServerClient,
@@ -771,6 +772,43 @@ def test_supervise_forwarder_continues_after_event_handler_failure(
 
     assert handled == ["turn_after"]
     assert "Codex forwarder event handling failed" in caplog.text
+
+
+def test_supervise_forwarder_reports_running_from_first_live_item_of_missed_turn(
+    tmp_path: Path,
+) -> None:
+    """A fresh thread subscribes after its first turn started; its first live item reports it."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_1")
+    user_message = {
+        "type": "userMessage",
+        "id": "item_1",
+        "content": [{"type": "text", "text": "Review the change."}],
+    }
+    item_params = {"threadId": "thread_123", "turnId": "turn_1", "item": user_message}
+    fake_client = _FakeCodexAppServerClient(
+        events=[
+            {"method": "item/started", "params": item_params},
+            {"method": "item/completed", "params": item_params},
+        ]
+    )
+    posted: list[dict[str, Any]] = []
+
+    asyncio.run(
+        codex_native_forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:1",
+            headers={},
+            session_id="conv_123",
+            bridge_dir=tmp_path,
+            app_server_url=str(tmp_path / "app-server.sock"),
+            thread_id="thread_123",
+            client=fake_client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(_capture_handler(posted)),
+        )
+    )
+
+    assert [body["data"] for body in posted if body["type"] == "external_session_status"] == [
+        _expected_status_data("running", "turn_1")
+    ]
 
 
 def test_codex_discover_thread_and_forward_writes_routing_summary_on_timeout(

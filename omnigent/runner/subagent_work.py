@@ -137,6 +137,12 @@ class _SubagentWorkEntry:
         launch-liveness reaper rather than from the child itself. Such a
         failure is a guess ("no start acknowledgment"), so a genuine
         terminal edge from the child afterwards must replace it.
+    :param child_start_reported: Whether the child itself reported a
+        running/waiting edge for this dispatch, or the dispatch joined a turn
+        already in flight.
+    :param awaiting_child_start_since: Unix timestamp when a harness that
+        reports its own turn start accepted the prompt, or ``None`` when no
+        such report is awaited.
     """
 
     parent_session_id: str
@@ -153,6 +159,8 @@ class _SubagentWorkEntry:
     delivered: bool = False
     cancellation_confirmed: bool = False
     launch_timed_out: bool = False
+    child_start_reported: bool = False
+    awaiting_child_start_since: float | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -332,6 +340,42 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     if entry.status in {"launching", "waiting"}:
         entry.status = "running"
     return entry
+
+
+def note_subagent_child_start_reported(child_session_id: str) -> None:
+    """
+    Record that the child itself reported its turn running or waiting.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :returns: None.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if entry is None:
+        return
+    entry.child_start_reported = True
+    entry.awaiting_child_start_since = None
+
+
+def arm_subagent_child_start_timeout(child_session_id: str, *, now: float | None = None) -> None:
+    """
+    Start the launch timeout for a running dispatch whose child has not reported a turn start.
+
+    Codex-native delivery ends once ``turn/start`` is accepted, so only the
+    child's own status edges settle the dispatch afterwards.
+
+    :param child_session_id: Child session id, e.g. ``"conv_child456"``.
+    :param now: Clock override for tests, e.g. ``time.time()``.
+    :returns: None.
+    """
+    entry = _subagent_work_by_child.get(child_session_id)
+    if (
+        entry is None
+        or entry.status != "running"
+        or entry.child_start_reported
+        or entry.awaiting_child_start_since is not None
+    ):
+        return
+    entry.awaiting_child_start_since = time.time() if now is None else now
 
 
 def unregister_subagent_work(
@@ -634,6 +678,7 @@ async def _recover_subagent_results_from_server(
         if interrupted:
             # This dispatch already existed; a local launch timeout cannot judge it.
             entry.status = "waiting"
+            entry.child_start_reported = True
             continue
         ack = mark_subagent_work_terminal(child_id, status=status, output=output)
         if ack.delivered_now:
@@ -815,7 +860,9 @@ def reap_stalled_subagent_launches(
     Fail sub-agent dispatches stuck in ``launching`` beyond the liveness budget.
 
     A dispatch with no running/waiting/terminal status acknowledgment can
-    otherwise remain pending forever. Missing acknowledgment does not prove
+    otherwise remain pending forever. The same budget bounds a ``running``
+    dispatch armed by :func:`arm_subagent_child_start_timeout` whose child
+    has not reported a start. Missing acknowledgment does not prove
     that the child process never started. Each reaped entry is
     marked ``failed`` and its failure is delivered to the parent inbox through
     ``mark_terminal``.
@@ -837,24 +884,38 @@ def reap_stalled_subagent_launches(
     current = time.time() if now is None else now
     reaped: list[_SubagentWorkEntry] = []
     for entry in list(_subagent_work_by_child.values()):
-        if entry.status != "launching":
+        if entry.status == "launching":
+            waited = current - entry.created_at
+            stall = "stuck in launching"
+            failure = (
+                f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
+                f"title {entry.title!r} within {budget:.0f}s of dispatch."
+            )
+        elif entry.status == "running" and entry.awaiting_child_start_since is not None:
+            waited = current - entry.awaiting_child_start_since
+            stall = "accepted its prompt but reported no turn start"
+            failure = (
+                f"Error: sub-agent {entry.agent!r} title {entry.title!r} accepted its "
+                f"prompt but reported no turn start within {budget:.0f}s."
+            )
+        else:
             continue
-        if current - entry.created_at < budget:
+        if waited < budget:
             continue
         _logger.warning(
-            "Sub-agent dispatch stuck in launching for %.0fs; failing it: parent=%s child=%s",
-            current - entry.created_at,
+            "Sub-agent dispatch %s for %.0fs; failing it: parent=%s child=%s",
+            stall,
+            waited,
             entry.parent_session_id,
             entry.child_session_id,
         )
         entry.launch_timed_out = True
+        entry.awaiting_child_start_since = None
         deliver(
             entry.child_session_id,
             status="failed",
             output=(
-                f"Error: no start acknowledgment for sub-agent {entry.agent!r} "
-                f"title {entry.title!r} within {budget:.0f}s of dispatch. "
-                "The child may still be running; inspect its session before retrying."
+                f"{failure} The child may still be running; inspect its session before retrying."
             ),
         )
         reaped.append(entry)
@@ -868,7 +929,7 @@ async def run_subagent_launch_reaper(
     reconcile_pending: Callable[[], Awaitable[None]] | None = None,
 ) -> None:
     """
-    Periodically sweep for sub-agent dispatches wedged in ``launching``.
+    Periodically fail stalled sub-agent dispatches via :func:`reap_stalled_subagent_launches`.
 
     Runs until cancelled; started by the runner entrypoint alongside the
     process manager. Sweep errors are logged and never end the loop.
