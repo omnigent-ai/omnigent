@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, TypeAlias, cast
 
 import tomlkit
+import tomllib
 import websockets
 from cachetools import TTLCache
 from websockets.asyncio.client import ClientConnection
@@ -55,6 +56,7 @@ from omnigent.harnesses.codex_native.launch_args import (
     absolute_codex_path,
     canonical_codex_launch_args,
     codex_config_profile,
+    codex_launch_selects_model,
     codex_workspace_roots,
     materialize_codex_config_profile,
     read_codex_mcp_servers,
@@ -4926,6 +4928,22 @@ def codex_remote_resume_omits_permission_args(
     )
 
 
+def _codex_override_model(config_overrides: Sequence[str]) -> str | None:
+    """Return the model selected by the last ``model=`` config override, if any."""
+    model: str | None = None
+    for override in config_overrides:
+        key, separator, value = override.partition("=")
+        if not separator or key.strip() != "model":
+            continue
+        try:
+            parsed: object = tomllib.loads(f"value = {value}")["value"]
+        except tomllib.TOMLDecodeError:
+            # Codex reads an unparseable ``-c`` value as a literal string.
+            parsed = value.strip()
+        model = parsed if isinstance(parsed, str) and parsed else None
+    return model
+
+
 def build_codex_remote_args(
     *,
     codex_args: tuple[str, ...],
@@ -4935,6 +4953,7 @@ def build_codex_remote_args(
     codex_cli_version: tuple[int, int, int] | None = None,
     bypass_sandbox: bool = False,
     bypass_hook_trust: bool = False,
+    base_args: tuple[str, ...] = (),
 ) -> list[str]:
     """
     Build Codex CLI args for an app-server-backed TUI session.
@@ -4960,7 +4979,9 @@ def build_codex_remote_args(
     through makes the TUI resolve the Omnigent provider
     (``requires_openai_auth = false``), skip onboarding, and start the
     thread immediately. Codex global ``-c`` flags must precede the
-    ``resume`` subcommand, so they are emitted first.
+    ``resume`` subcommand, so they are emitted first. Fresh threads also
+    get the override model as ``--model``, which outranks a managed config;
+    resumes and caller-chosen models are left alone.
 
     :param codex_args: Raw Codex CLI args that precede the attach flags,
         e.g. ``("--model", "gpt-5.4-mini")``. Empty when the thread's own
@@ -5000,6 +5021,8 @@ def build_codex_remote_args(
         user to answer the prompt. Default ``False`` for interactive
         ``omnigent codex`` sessions where the user faces the terminal and
         can accept hooks normally.
+    :param base_args: Configured launch args emitted unchanged before all
+        others, e.g. the runner's ``harness.codex-native.args``.
     :returns: Codex argv tail after the executable.
     """
     # The runner owns the app-server and the TUI ``--remote`` attach it appends
@@ -5027,16 +5050,40 @@ def build_codex_remote_args(
     if bypass_hook_trust:
         passthrough = [_CODEX_BYPASS_HOOK_TRUST_FLAG, *passthrough]
     if thread_id is None:
+        # A system managed_config.toml outranks ``-c model=``; ``--model`` outranks both.
+        model = _codex_override_model(config_overrides)
+        # Codex rejects a repeated ``--model``; keep a caller-chosen model authoritative.
+        # Configured args may wrap Codex as ``wrapper -- <codex args>``; only the tail is Codex's.
+        configured = base_args[base_args.index("--") + 1 :] if "--" in base_args else base_args
+        caller_model = codex_launch_selects_model(passthrough) or codex_launch_selects_model(
+            configured, include_config=False
+        )
+        model_args = ["--model", model] if model and not caller_model else []
         # Codex refuses --add-dir with --remote; app-server startup writes
         # those roots into the private config (see CodexNativeAppServer.start).
-        return [*override_args, *without_codex_add_dirs(passthrough), "--remote", remote_url]
+        return [
+            *base_args,
+            *override_args,
+            *model_args,
+            *without_codex_add_dirs(passthrough),
+            "--remote",
+            remote_url,
+        ]
     if not codex_remote_resume_omits_permission_args(codex_cli_version):
-        return [*override_args, *passthrough, "resume", "--remote", remote_url, thread_id]
+        return [
+            *base_args,
+            *override_args,
+            *passthrough,
+            "resume",
+            "--remote",
+            remote_url,
+            thread_id,
+        ]
     # Codex rejects explicit permission overrides on remote resume, even
     # when they match the app-server policy. config_overrides went to server
     # startup; codex_args went to preload's thread/resume call.
     resume_args = _strip_codex_resume_permission_args((*override_args, *passthrough))
-    return [*resume_args, "resume", "--remote", remote_url, thread_id]
+    return [*base_args, *resume_args, "resume", "--remote", remote_url, thread_id]
 
 
 def _terminate_process_tree(process: asyncio.subprocess.Process) -> None:

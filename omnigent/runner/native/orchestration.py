@@ -4828,7 +4828,17 @@ async def _launch_codex_native_tui(
     assert codex_ws_url is not None
     workspace = str(launch_config.workspace)
     agent_os_env = _agent_os_env_from_spec(agent_spec)
-    codex_remote_args = build_codex_remote_args(
+    # Apply configured wrappers to both cold start and recovery.
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import (
+        resolve_harness_args,
+        resolve_harness_config,
+    )
+
+    # Read project config from the session workspace; the runner's cwd may be gone.
+    _codex_harness_cfg = load_effective_config(workspace=workspace)
+    codex_launch_args = build_codex_remote_args(
+        base_args=tuple(resolve_harness_args("codex-native", (), cfg=_codex_harness_cfg)),
         codex_args=tuple(launch_config.terminal_launch_args or ()),
         thread_id=thread_id,
         remote_url=codex_ws_url,
@@ -4846,15 +4856,6 @@ async def _launch_codex_native_tui(
             or app_server.codex_cli_version >= _MIN_BYPASS_HOOK_TRUST_CODEX_VERSION
         ),
     )
-    # Apply configured wrappers to both cold start and recovery.
-    from omnigent.config import load_effective_config
-    from omnigent.harness_startup_config import (
-        resolve_harness_args,
-        resolve_harness_config,
-    )
-
-    # Read project config from the session workspace; the runner's cwd may be gone.
-    _codex_harness_cfg = load_effective_config(workspace=workspace)
     # Honor configured wrappers while keeping the host-provisioned binary
     # immune to ambient OMNIGENT_CODEX_PATH overrides.
     _, _codex_overrides = resolve_harness_config(_codex_harness_cfg)
@@ -4894,9 +4895,6 @@ async def _launch_codex_native_tui(
                 thread_start_timeout_seconds,
                 session_id,
             )
-    codex_launch_args = resolve_harness_args(
-        "codex-native", tuple(codex_remote_args), cfg=_codex_harness_cfg
-    )
     loggable_launch_args = shlex.join(redact_codex_launch_args(codex_launch_args))
     _logger.info(
         "Codex terminal launch: session=%s command=%s codex_cli_version=%s resume=%s args=%s",

@@ -295,6 +295,29 @@ def without_codex_add_dirs(args: Sequence[str]) -> list[str]:
     return stripped
 
 
+def codex_launch_selects_model(args: Sequence[str], *, include_config: bool = True) -> bool:
+    """Whether *args* choose the model via ``--model``/``-m`` or, optionally, ``-c model=``."""
+    canonical = canonical_codex_launch_args(args)
+    index = 0
+    while index < len(canonical):
+        arg = canonical[index]
+        if arg == "--":
+            break
+        if arg == "--model" or arg.startswith(("-m", "--model=")):
+            return True
+        if include_config:
+            if arg in {"-c", "--config"}:
+                override = canonical[index + 1] if index + 1 < len(canonical) else ""
+            else:
+                override = arg.partition("=")[2] if arg.startswith(("-c=", "--config=")) else ""
+            if override.partition("=")[0].strip() == "model":
+                return True
+        if arg in _CODEX_VALUE_FLAGS:
+            index += 1
+        index += 1
+    return False
+
+
 def without_codex_positional_prompt(args: Sequence[str]) -> list[str]:
     """Drop the ``[PROMPT]`` positional and any ``--`` tail; options keep their values."""
     canonical = canonical_codex_launch_args(args)

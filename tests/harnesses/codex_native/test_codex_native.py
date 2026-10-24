@@ -1695,6 +1695,8 @@ def test_build_codex_remote_args_passes_transport_verbatim(
                 'model="catalog-databricks-openai-default"',
                 "-c",
                 'model_provider="omnigent_databricks"',
+                "--model",
+                "catalog-databricks-openai-default",
                 *_AUTO_REVIEW_ARGS,
                 "--remote",
                 "ws://127.0.0.1:9876",
