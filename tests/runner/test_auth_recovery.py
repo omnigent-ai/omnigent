@@ -72,6 +72,28 @@ def test_bootstrap_factory_retries_missing_credentials_after_long_outage(
         assert len(attempts) == count
 
 
+def test_bootstrap_factory_block_reason_names_relogin_step(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """With no credential to renew the bootstrap bearer, callbacks fail closed naming the fix."""
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *a, **k: {})
+    factory = _entry._InitialAuthTokenFactory("expired", "https://example.invalid")
+    assert factory.invalidate()
+    with (
+        httpx.Client(
+            auth=_entry._RunnerDatabricksAuth(factory, server_url="https://example.invalid"),
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200)),
+        ) as client,
+        pytest.raises(httpx.RequestError) as blocked,
+    ):
+        client.get("https://example.invalid/v1/me")
+    assert str(blocked.value).startswith(
+        "Databricks token refresh returned no token: host bootstrap bearer expired"
+    )
+    assert str(blocked.value).endswith("login https://example.invalid` to re-authenticate")
+
+
 def test_bootstrap_factory_invalidates_fallback_credential(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
