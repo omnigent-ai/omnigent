@@ -144,6 +144,9 @@ class _CliTicket:
         fulfillment when a grant store is wired. ``None`` while pending
         or when grants are unavailable. Handed to the CLI exactly once
         by the poll response.
+    :param refresh_expires_at: Absolute epoch seconds when the refresh
+        grant can no longer be renewed, paired with ``refresh_token``.
+        ``None`` when no grant was issued.
     :param code_challenge: PKCE S256 challenge supplied by the CLI.
     :param user_code: Human-readable code shown on the browser consent page.
     :param denied: Whether the browser denied this login request.
@@ -153,6 +156,7 @@ class _CliTicket:
     token: str | None = None
     user_id: str | None = None
     refresh_token: str | None = None
+    refresh_expires_at: int | None = None
     code_challenge: str = ""
     user_code: str = ""
     denied: bool = False
@@ -906,11 +910,13 @@ def create_auth_router(
         ticket.user_id = user_id
         if device_grant_store is not None:
             try:
-                ticket.refresh_token = issue_login_grant(
+                login_grant = issue_login_grant(
                     device_grant_store,
                     user_id=user_id,
                     cookie_secret=config.cookie_secret,
                 )
+                ticket.refresh_token = login_grant.refresh_token
+                ticket.refresh_expires_at = login_grant.refresh_expires_at
             except Exception:
                 _logger.exception("cli-login: refresh grant issuance failed")
         _logger.info("cli-approve: %s approved CLI login", user_id)
@@ -1032,6 +1038,7 @@ def create_auth_router(
         token = ticket.token
         user_id = ticket.user_id
         refresh_token = ticket.refresh_token
+        refresh_expires_at = ticket.refresh_expires_at
         del _cli_tickets[ticket_id]
         content: dict[str, object] = {
             "token": token,
@@ -1042,6 +1049,8 @@ def create_auth_router(
         # extra key, new CLIs against old servers see it absent.
         if refresh_token is not None:
             content["refresh_token"] = refresh_token
+        if refresh_expires_at is not None:
+            content["refresh_expires_at"] = refresh_expires_at
         return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
 
     # ── Native sign-in ──────────────────────────────────────────────────────
@@ -1100,7 +1109,7 @@ def create_auth_router(
                     device_grant_store,
                     user_id=pending.user_id,
                     cookie_secret=config.cookie_secret,
-                )
+                ).refresh_token
             except Exception:
                 _logger.exception("native sign-in: refresh grant issuance failed")
         return JSONResponse(status_code=200, content=content, headers=NO_STORE_HEADERS)
