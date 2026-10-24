@@ -1678,6 +1678,97 @@ async def test_relay_completion_idle_clears_only_a_disconnect_failure(
         session_stream.close(session_id)
 
 
+@pytest.mark.asyncio
+async def test_relay_completion_idle_recovery_updates_parent_child_summary(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Completion-idle recovery of a disconnected sub-agent reaches the parent's stream.
+
+    The recovery publisher bypasses ``_publish_status`` and its parent fan-out, so
+    the parent must still receive a child summary without the cleared failure.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server import session_live_state
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(
+        "omnigent.server.routes._sessions.orchestration.RUNNER_DISCONNECT_GRACE_S",
+        0.0,
+    )
+    sessions_module._runner_relay_tasks.clear()
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation()
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=parent.id, title="impl:task-1"
+    )
+    disconnect_labels = {
+        sessions_module._LAST_TASK_ERROR_CODE_LABEL_KEY: "runner_disconnected",
+        sessions_module._LAST_TASK_ERROR_MESSAGE_LABEL_KEY: "Runner disconnected unexpectedly.",
+    }
+    store.set_labels(child.id, disconnect_labels)
+    store.set_session_live_status(child.id, "failed")
+    sessions_module._session_status_cache[child.id] = "failed"
+    session_live_state.configure(store)
+    gate = asyncio.Event()
+    fake_runner = _ScriptedThenDropRunnerClient(
+        ['data: {"type": "session.status", "status": "idle"}\n\n'], gate
+    )
+
+    parent_events = None
+    try:
+        handle = await sessions_module._ensure_runner_relay_ready(
+            child.id,
+            "runner_child_recovery",
+            fake_runner,  # type: ignore[arg-type]
+            conversation_store=store,
+        )
+        assert handle is not None
+        parent_events = await start_session_stream_collector(parent.id)
+        gate.set()
+        await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        flushed = threading.Event()
+        session_live_state.submit("test_barrier", flushed.set)
+        assert await asyncio.to_thread(flushed.wait, 10)
+        await asyncio.sleep(0)
+
+        assert sessions_module._session_status_cache.get(child.id) == "idle"
+        refreshed = store.get_conversation(child.id)
+        assert refreshed is not None
+        assert sessions_module._last_task_error_from_labels(refreshed.labels) is None
+
+        updates = []
+        while not parent_events.queue.empty():
+            event = await parent_events.queue.get()
+            if (
+                event.get("type") == "session.child_session.updated"
+                and event.get("child_session_id") == child.id
+            ):
+                updates.append(event["child"])
+        assert updates, (
+            "the parent stream received no child summary after the child's "
+            "runner_disconnected failure cleared on completion"
+        )
+        latest = updates[-1]
+        assert latest["last_task_error"] is None, latest
+        assert latest["current_task_status"] != "failed", latest
+        assert latest["busy"] is False, latest
+    finally:
+        gate.set()
+        if parent_events is not None:
+            await parent_events.stop()
+        handle = sessions_module._runner_relay_tasks.get(child.id)
+        if handle is not None and not handle.task.done():
+            handle.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+                await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
+        sessions_module._runner_relay_tasks.clear()
+        sessions_module._session_status_cache.pop(child.id, None)
+        session_live_state.configure(None)
+        session_stream.close(child.id)
+        session_stream.close(parent.id)
+
+
 class _RegisteredRunnerHttpErrorClient:
     """Fake runner client whose transport says the runner is present but every stream open fails.
 
