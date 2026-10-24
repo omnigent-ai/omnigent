@@ -2563,6 +2563,7 @@ async def test_runner_shutdown_closes_terminal_registry(
     sync_clients: list[_TrackingSyncClient] = []
     terminal_sweeps: list[int] = []
     bridge_sweeps: list[int] = []
+    opencode_reconciles: list[int] = []
     watching = False
     watchdog_roles: list[str] = []
     stall_records: queue.Queue[logging.LogRecord] = queue.Queue()
@@ -2643,6 +2644,11 @@ async def test_runner_shutdown_closes_terminal_registry(
         lambda: bridge_sweeps.append(1) or 0,
     )
     monkeypatch.setattr(
+        "omnigent.harnesses.opencode_native.process_registry."
+        "reconcile_opencode_native_process_registry",
+        lambda: opencode_reconciles.append(1),
+    )
+    monkeypatch.setattr(
         "omnigent.runtime.harnesses.process_manager.HarnessProcessManager",
         _FakeProcessManager,
     )
@@ -2680,6 +2686,7 @@ async def test_runner_shutdown_closes_terminal_registry(
     assert process_managers[0].shutdown_called
     assert terminal_sweeps == ([] if host_owns_global_cleanup else [1])
     assert bridge_sweeps == ([] if host_owns_global_cleanup else [1])
+    assert opencode_reconciles == ([] if host_owns_global_cleanup else [1])
     assert terminal_registries and terminal_registries[0].shutdown_called
     assert terminal_registries[0].conversation_link_base_url == "http://runner.test"
     # In Omnigent mode (P1) the entry point passes mcp_manager=None; MCP calls are

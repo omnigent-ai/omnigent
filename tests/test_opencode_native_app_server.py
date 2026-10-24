@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
+import sys
 from pathlib import Path
 
 import pytest
 
 from omnigent.harnesses.opencode_native import app_server as appsrv
+from omnigent.harnesses.opencode_native import process_registry
 from omnigent.harnesses.opencode_native.app_server import (
     OpenCodeCliNotFoundError,
     OpenCodeNativeServer,
@@ -20,6 +24,8 @@ from omnigent.harnesses.opencode_native.app_server import (
     opencode_terminal_env,
     parse_opencode_version,
 )
+from omnigent.inner import _proc
+from tests._helpers.polling import poll_until_async
 
 
 def test_parse_opencode_version() -> None:
@@ -146,6 +152,46 @@ def test_filtered_server_env_drops_global_opencode_config(
     assert env["XDG_CONFIG_HOME"] == str(tmp_path / "xdg-config")
 
 
+class _FakeRegistration:
+    """Registry entry stand-in that keeps fake PIDs out of the shared registry."""
+
+    def __init__(self, pid: int) -> None:
+        self.pid = pid
+        self.released = False
+
+    def release(self) -> None:
+        self.released = True
+
+
+@pytest.fixture
+def registrations(monkeypatch: pytest.MonkeyPatch) -> list[_FakeRegistration]:
+    """
+    Record server registrations instead of writing the crash-safe registry.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: Registrations made by ``OpenCodeNativeServer.start``.
+    """
+    recorded: list[_FakeRegistration] = []
+
+    def _register(pid: int) -> _FakeRegistration:
+        recorded.append(_FakeRegistration(pid))
+        return recorded[-1]
+
+    monkeypatch.setattr(appsrv, "register_opencode_native_server", _register)
+    return recorded
+
+
+@pytest.fixture
+def fake_tree_signals(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Route process-tree signals to the fake process so its fake PID is never signalled.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(appsrv._proc, "terminate_tree", lambda process: process.terminate())
+    monkeypatch.setattr(appsrv._proc, "kill_tree", lambda process: process.kill())
+
+
 def _server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> OpenCodeNativeServer:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     return OpenCodeNativeServer(
@@ -177,7 +223,11 @@ def test_terminal_env(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     assert env["XDG_DATA_HOME"] == str(server.xdg_data_home)
 
 
-async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+async def test_start_polls_until_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registrations: list[_FakeRegistration],
+) -> None:
     server = _server(monkeypatch, tmp_path)
     started: dict[str, object] = {}
 
@@ -189,7 +239,7 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
 
     def fake_popen(argv, **kwargs):  # type: ignore[no-untyped-def]
         started["argv"] = argv
-        started["env"] = kwargs.get("env")
+        started["kwargs"] = kwargs
         return _FakeProc()
 
     async def fake_wait(self: OpenCodeNativeServer) -> None:
@@ -202,15 +252,22 @@ async def test_start_polls_until_ready(monkeypatch: pytest.MonkeyPatch, tmp_path
     assert started["argv"][1] == "serve"
     assert server.process is not None
     assert server.process.pid == 4242
+    # Its own process group lets crash cleanup signal the server and its children.
+    assert _proc.spawn_kwargs().items() <= started["kwargs"].items()
+    assert [(item.pid, item.released) for item in registrations] == [(4242, False)]
 
 
 async def test_start_closes_process_when_readiness_is_cancelled(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registrations: list[_FakeRegistration],
+    fake_tree_signals: None,
 ) -> None:
     """Cancelling the readiness wait must reap the OpenCode server."""
     server = _server(monkeypatch, tmp_path)
 
     class _FakeProc:
+        pid = 4242
         returncode: int | None = None
         terminated = False
 
@@ -246,15 +303,20 @@ async def test_start_closes_process_when_readiness_is_cancelled(
 
     assert process.terminated is True
     assert server.process is None
+    assert [(item.pid, item.released) for item in registrations] == [(4242, True)]
 
 
 async def test_start_closes_process_when_readiness_fails(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registrations: list[_FakeRegistration],
+    fake_tree_signals: None,
 ) -> None:
     """A readiness probe that gives up must not leave ``opencode serve`` running."""
     server = _server(monkeypatch, tmp_path)
 
     class _FakeProc:
+        pid = 4242
         returncode: int | None = None
         terminated = False
 
@@ -285,6 +347,7 @@ async def test_start_closes_process_when_readiness_fails(
 
     assert process.terminated is True
     assert server.process is None
+    assert [(item.pid, item.released) for item in registrations] == [(4242, True)]
 
 
 async def test_start_raises_on_unsupported_version_without_env(
@@ -316,7 +379,9 @@ async def test_start_raises_on_unsupported_version_without_env(
 
 
 async def test_start_skips_version_gate_when_env_set(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    registrations: list[_FakeRegistration],
 ) -> None:
     monkeypatch.setattr(appsrv.shutil, "which", lambda name: f"/usr/bin/{name}")
     monkeypatch.setattr(appsrv, "resolve_opencode_version", lambda _path: "1.19.0")
@@ -342,6 +407,69 @@ async def test_start_skips_version_gate_when_env_set(
     await server.start()
     assert server.version == "1.19.0"
     assert server.process is not None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="uses POSIX process groups")
+async def test_close_stops_server_group_and_releases_registration(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The registry holds a live server's group until close stops and releases it."""
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    opencode = tmp_path / "opencode"
+    opencode.write_text("#!/bin/sh\nsleep 300 &\necho $! > child.pid\nwait\n", encoding="utf-8")
+    opencode.chmod(0o755)
+
+    async def _ready(self: OpenCodeNativeServer) -> None:
+        return None
+
+    monkeypatch.setattr(OpenCodeNativeServer, "_wait_until_ready", _ready)
+    server = OpenCodeNativeServer(
+        bridge_dir=tmp_path / "bridge",
+        workspace=tmp_path,
+        opencode_path=str(opencode),
+        port=1,
+        verify_version=False,
+    )
+    registry_path = process_registry.opencode_native_process_registry_path()
+
+    await server.start()
+    try:
+        assert server.process is not None
+        process = server.process
+        assert os.getpgid(process.pid) == process.pid
+        [entry] = json.loads(registry_path.read_text(encoding="utf-8"))
+        assert (entry["pid"], entry["pgid"]) == (process.pid, process.pid)
+        child_pid_file = tmp_path / "child.pid"
+        await poll_until_async(
+            lambda: child_pid_file.read_text().strip() if child_pid_file.exists() else "",
+            timeout_s=10.0,
+        )
+        child_pid = int(child_pid_file.read_text())
+    finally:
+        await server.close()
+
+    assert process.poll() is not None
+    await poll_until_async(lambda: not _proc.process_alive(child_pid), timeout_s=10.0)
+    assert json.loads(registry_path.read_text(encoding="utf-8")) == []
+    assert server.process_registration is None
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="owner locks need fcntl")
+def test_failed_registration_releases_owner_lock(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+
+    def _fail(**_kwargs: object) -> None:
+        raise OSError("registry write failed")
+
+    monkeypatch.setattr(process_registry, "register_codex_native_process", _fail)
+
+    with pytest.raises(OSError, match="registry write failed"):
+        process_registry.register_opencode_native_server(4242)
+
+    owner_locks = process_registry.opencode_native_process_state_root() / "process-owners"
+    assert list(owner_locks.iterdir()) == []
 
 
 def test_find_opencode_cli_absolute_executable(tmp_path: Path) -> None:

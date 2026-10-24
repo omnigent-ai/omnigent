@@ -1664,9 +1664,14 @@ def create_app(
             from omnigent.harnesses.codex_native.process_registry import (
                 reconcile_codex_native_process_registry,
             )
+            from omnigent.harnesses.opencode_native.process_registry import (
+                reconcile_opencode_native_process_registry,
+            )
 
             with contextlib.suppress(Exception):
                 await asyncio.to_thread(reconcile_codex_native_process_registry)
+            with contextlib.suppress(Exception):
+                await asyncio.to_thread(reconcile_opencode_native_process_registry)
         # Liveness backstop for sub-agent dispatches wedged in ``launching``:
         # a child that never emits any edge would otherwise hold the parent's
         # work handle open forever with no error surfaced. The app's
