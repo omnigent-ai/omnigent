@@ -2920,10 +2920,18 @@ class SqlAlchemyConversationStore(ConversationStore):
         pinned: bool = False,
         pinned_owner: str | None = None,
         title: str | None = None,
+        updated_at_min: int | None = None,
+        updated_at_max: int | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
 
+        :param updated_at_min: When set, only return conversations whose
+            ``updated_at`` is at or after this UTC epoch second. ``None``
+            disables the lower bound.
+        :param updated_at_max: When set, only return conversations whose
+            ``updated_at`` is at or before this UTC epoch second. ``None``
+            disables the upper bound.
         :param limit: Maximum number of conversations to return.
         :param after: Cursor conversation ID; return
             conversations appearing after this one in sort
@@ -3178,6 +3186,10 @@ class SqlAlchemyConversationStore(ConversationStore):
                 stmt = stmt.where(SqlConversation.agent_id == agent_id)
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
+            if updated_at_min is not None:
+                stmt = stmt.where(SqlConversation.updated_at >= updated_at_min)
+            if updated_at_max is not None:
+                stmt = stmt.where(SqlConversation.updated_at <= updated_at_max)
             if search_query:
                 pattern = f"%{search_query.lower()}%"
                 title_match = func.lower(SqlConversation.title).like(pattern)
