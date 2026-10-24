@@ -514,6 +514,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "LOGNAME",
         "SHELL",
         "TMPDIR",
+        # Windows temp-dir names. Without them the daemon, runner and every
+        # harness under it resolve GetTempPath to the user profile folder.
+        "TMP",
+        "TEMP",
         # The daemon and runner resolve OS-keyring credentials in the user's session.
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_RUNTIME_DIR",
