@@ -1,0 +1,4 @@
+<level-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item android:maxLevel="0" android:drawable="@drawable/ic_status_chevron_down" />
+    <item android:maxLevel="1" android:drawable="@drawable/ic_status_chevron_up" />
+</level-list>

@@ -3,9 +3,12 @@ package ai.omnigent.android
 import android.content.Intent
 import android.graphics.Bitmap
 import android.net.Uri
+import android.net.http.SslError
 import android.os.Handler
 import android.os.Looper
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
+import android.webkit.WebResourceError
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
@@ -39,6 +42,9 @@ internal class OmnigentWebViewClient(
     private val onRendererGone: (view: WebView, didCrash: Boolean) -> Unit,
     private val onNavigationStarted: () -> Unit = {},
     private val onMainFrameHttpError: (statusCode: Int) -> Unit = {},
+    private val onMainFrameCommitted: (WebView) -> Unit = {},
+    private val onMainFrameUnreachable: (WebView, Int, String) -> Unit = { _, _, _ -> },
+    private val onMainFrameSslError: (WebView, String) -> Unit = { _, _ -> },
     private val workspaceSession: () -> DatabricksWebSession? = { null },
     private val onWorkspaceSessionInvalid: (status: Int?) -> Unit = {},
     private val onWorkspaceSignOut: () -> Unit = {},
@@ -51,8 +57,29 @@ internal class OmnigentWebViewClient(
     // Bare-root -> /omnigent bounces since the last app page loaded; see
     // workspaceRootTarget for why they're capped.
     private var rootBounces = 0
+    private var activeMainFrameUrl: String? = null
+    private var shellStoppedUrl: String? = null
+    private var failedNavigation = false
 
     private val mainHandler = Handler(Looper.getMainLooper())
+
+    fun beginShellLoad(url: String?) {
+        activeMainFrameUrl =
+            url?.let { requested ->
+                val parsed = Uri.parse(requested)
+                if (isHttpScheme(parsed.scheme) && parsed.path.isNullOrEmpty()) {
+                    parsed
+                        .buildUpon()
+                        .path("/")
+                        .build()
+                        .toString()
+                } else {
+                    requested
+                }
+            }
+        shellStoppedUrl = null
+        failedNavigation = false
+    }
 
     override fun onPageStarted(
         view: WebView,
@@ -65,15 +92,18 @@ internal class OmnigentWebViewClient(
         val scheme = url?.let { Uri.parse(it).scheme?.lowercase() }
         val pinned = pinnedOrigin()
         val session = workspaceSession()
+        beginShellLoad(url)
         if (session != null && isHttpScheme(scheme)) {
             val parsed = runCatching { url?.let(::URI) }.getOrNull()
             if (parsed != null && session.isSignOutUri(parsed)) {
+                shellStoppedUrl = url
                 view.stopLoading()
                 onWorkspaceSignOut()
                 return
             }
             val accepted = runCatching { parsed?.let(session::navigationUri) }.getOrNull()
             if (accepted == null) {
+                shellStoppedUrl = url
                 view.stopLoading()
                 onWorkspaceSessionInvalid(null)
                 return
@@ -83,6 +113,7 @@ internal class OmnigentWebViewClient(
         // A native OIDC session handles its own auth routes; loads the shell starts
         // itself skip shouldOverrideUrlLoading, so they are caught here too.
         if (isHttpScheme(scheme) && origin == pinned && handlesNavigation(url)) {
+            shellStoppedUrl = url
             view.stopLoading()
             return
         }
@@ -107,6 +138,7 @@ internal class OmnigentWebViewClient(
         ) {
             // Log origin only, never the full URL (carries OAuth state/PKCE).
             authLog("off-origin landing $origin -> login")
+            shellStoppedUrl = url
             view.stopLoading()
             onLoginRequired()
             return
@@ -121,6 +153,7 @@ internal class OmnigentWebViewClient(
         // the workspace root). onPageStarted sees every main-frame load.
         if (origin == pinned) {
             val target = workspaceRootTarget(url) ?: return
+            shellStoppedUrl = url
             view.stopLoading()
             bounce(view, target)
         }
@@ -174,6 +207,106 @@ internal class OmnigentWebViewClient(
             return
         }
         onPageReady(url)
+    }
+
+    override fun onPageCommitVisible(
+        view: WebView,
+        url: String?,
+    ) {
+        super.onPageCommitVisible(view, url)
+        if (sameMainFrameUrl(url, activeMainFrameUrl) &&
+            !sameMainFrameUrl(url, shellStoppedUrl) &&
+            !failedNavigation &&
+            (acceptedMainFrame(url) || isForeignInWebViewAuthPage(url))
+        ) {
+            onMainFrameCommitted(view)
+        }
+    }
+
+    override fun onReceivedError(
+        view: WebView,
+        request: WebResourceRequest,
+        error: WebResourceError,
+    ) {
+        super.onReceivedError(view, request, error)
+        val url = request.url.toString()
+        if (request.isForMainFrame && sameMainFrameUrl(url, activeMainFrameUrl) &&
+            isForeignInWebViewAuthPage(url)
+        ) {
+            failedNavigation = true
+            return
+        }
+        if (!request.isForMainFrame || !sameMainFrameUrl(url, activeMainFrameUrl) ||
+            sameMainFrameUrl(url, shellStoppedUrl) ||
+            failedNavigation || !acceptedMainFrame(url) ||
+            !isConnectionError(error.errorCode, error.description.toString())
+        ) {
+            return
+        }
+        failedNavigation = true
+        onMainFrameUnreachable(view, error.errorCode, error.description.toString())
+    }
+
+    override fun onReceivedSslError(
+        view: WebView,
+        handler: SslErrorHandler,
+        error: SslError,
+    ) {
+        handler.cancel()
+        val url = error.url
+        val mainFrameUrl = activeMainFrameUrl ?: view.url
+        if (sameMainFrameUrl(url, mainFrameUrl) && isForeignInWebViewAuthPage(url)) {
+            failedNavigation = true
+            return
+        }
+        if (!sameMainFrameUrl(url, mainFrameUrl) || sameMainFrameUrl(url, shellStoppedUrl) ||
+            failedNavigation ||
+            !acceptedMainFrame(url)
+        ) {
+            return
+        }
+        failedNavigation = true
+        val reason =
+            when (error.primaryError) {
+                SslError.SSL_NOTYETVALID -> "SSL_NOTYETVALID"
+                SslError.SSL_EXPIRED -> "SSL_EXPIRED"
+                SslError.SSL_IDMISMATCH -> "SSL_IDMISMATCH"
+                SslError.SSL_UNTRUSTED -> "SSL_UNTRUSTED"
+                SslError.SSL_DATE_INVALID -> "SSL_DATE_INVALID"
+                else -> "SSL_INVALID"
+            }
+        onMainFrameSslError(view, reason)
+    }
+
+    private fun sameMainFrameUrl(
+        first: String?,
+        second: String?,
+    ): Boolean {
+        val firstUrl = first ?: return false
+        val secondUrl = second ?: return false
+        val origin = originOf(firstUrl) ?: return false
+        if (origin != originOf(secondUrl)) return false
+        val firstUri = Uri.parse(firstUrl)
+        val secondUri = Uri.parse(secondUrl)
+        val firstPath = firstUri.encodedPath.orEmpty().ifEmpty { "/" }
+        val secondPath = secondUri.encodedPath.orEmpty().ifEmpty { "/" }
+        return firstPath == secondPath && firstUri.encodedQuery == secondUri.encodedQuery
+    }
+
+    private fun isForeignInWebViewAuthPage(url: String?): Boolean {
+        val pageUrl = url ?: return false
+        val origin = originOf(pageUrl) ?: return false
+        val pinned = pinnedOrigin() ?: return false
+        return origin != pinned && isHttpScheme(Uri.parse(pageUrl).scheme) &&
+            serverAuthentication(pinned).usesInWebViewAuth
+    }
+
+    private fun acceptedMainFrame(url: String?): Boolean {
+        val parsed = runCatching { url?.let(::URI) }.getOrNull() ?: return false
+        if (!isHttpScheme(parsed.scheme)) return false
+        if (originOf(url) == pinnedOrigin()) return true
+        return workspaceSession()?.let { runCatching { it.navigationUri(parsed) }.getOrNull() } !=
+            null
     }
 
     override fun shouldOverrideUrlLoading(
@@ -317,7 +450,10 @@ internal class OmnigentWebViewClient(
         view: WebView,
         target: String,
     ) {
-        mainHandler.post { view.loadUrl(target) }
+        mainHandler.post {
+            beginShellLoad(target)
+            view.loadUrl(target)
+        }
     }
 
     private companion object {

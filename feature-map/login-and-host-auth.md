@@ -81,6 +81,11 @@ be able to write resources without a separate Omnigent account.
   (silent), an expired or revoked sign-in ("Sign in again" with the reason), and
   sign-out. Accounts, header, older OIDC servers (ticket sign-in), and
   Databricks hosts keep their previous sign-in.
+- `android-connection-status`: the Android shell shows branded native progress and
+  recovery while connecting to an OIDC server or Databricks workspace. States:
+  connecting, slow connection, sign-in handoff, sign-in required, unreachable
+  (offline/TLS/generic), workspace failure, repeated display crash, and update
+  required. Retry runs a new connection attempt; Change server opens setup.
 
 ## How to get to it (user POV)
 
@@ -111,6 +116,10 @@ the native server menu or the sidebar server picker; relaunching the app and
 notification taps on a signed-in server; **Sign In** on the "Sign in to <host>"
 prompt; and sign-out from the app's settings, **Sign Out** in the native server
 menu, and **Sign out of <server>** in the sidebar server picker.
+Cold start on a saved server also enters the native status screen. A failed
+connection offers **Retry** and **Change server**; a slow connection adds
+**Change server** after about ten seconds. A legacy ticket server can request
+an app update, which offers **How to update** and **Change server**.
 
 **Embedded API:** construct `create_app(auth_provider=...)` with the embedding
 application's provider and stores, then use its authenticated REST client to
@@ -252,6 +261,18 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   tests: `OidcSessionControllerTest.kt`, `OidcCredentialsTest.kt`, and
   `ServerManifestTest.kt` in `web/android/app/src/test/java/ai/omnigent/android/`;
   server flow: `tests/server/integration/test_oidc_native_login.py`.
+- **`android-connection-status` (Android app, own emulator):** build with
+  `./gradlew assembleDebug`; the upstream debug APK installs as
+  `ai.omnigent.android`, so use an isolated emulator. Follow the connection/status manual
+  verification in `web/android/README.md`. Start a saved server and observe
+  Connecting until its page commits; stop the server, relaunch and use Retry,
+  then Change server. Hold a connection open past ten seconds, and repeat in
+  dark mode. Serve the reserved `upgrade-required` ticket locally to reach the
+  update screen. `ConnectionStatusTest.kt`, `MainActivityTest.kt`,
+  `OmnigentWebViewClientTest.kt`, `OidcLoginManagerTest.kt`,
+  `OidcSessionControllerTest.kt`, and `ThemeTest.kt` cover the model and shell
+  transitions. The header-mode repro instance cannot exercise native OIDC or
+  Databricks authentication.
 - **Desktop sign-out (Server menu and sidebar picker):** connect the desktop to an
   OIDC server or a Databricks workspace, choose **Server → Sign Out of Server**,
   and confirm every window on it returns to the server selector without a message
@@ -268,6 +289,11 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   changing forwarded credentials. `host enable` saves explicitly forwarded values
   in plaintext in the per-user service definition, readable only by its owner
   (0600), so the service can retain them across logins.
+- The floating server pill and its six-second watchdog still run independently
+  of the connection/status screen. They are not the native recovery actions.
+- A subframe or foreign identity-provider failure must not replace a healthy
+  app page. Check the failed main-frame origin when reproducing a report.
+
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one

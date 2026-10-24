@@ -2,8 +2,12 @@ package ai.omnigent.android
 
 import android.content.Context
 import android.net.Uri
+import android.net.http.SslCertificate
+import android.net.http.SslError
 import android.os.Looper
+import android.webkit.FakeWebResourceError
 import android.webkit.RenderProcessGoneDetail
+import android.webkit.SslErrorHandler
 import android.webkit.ValueCallback
 import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
@@ -17,9 +21,232 @@ import org.junit.Test
 import org.junit.runner.RunWith
 import org.robolectric.RobolectricTestRunner
 import org.robolectric.Shadows.shadowOf
+import org.robolectric.shadow.api.Shadow
+import org.robolectric.shadows.ShadowSslErrorHandler
 
 @RunWith(RobolectricTestRunner::class)
 class OmnigentWebViewClientTest {
+    @Test
+    fun `a pinned main frame transport failure is reported once until a new load`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reported = mutableListOf<Int>()
+        var committed = 0
+        val client =
+            client(
+                onMainFrameUnreachable = { _, code, _ -> reported += code },
+                onMainFrameCommitted = { committed++ },
+            )
+
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onReceivedError(webView, request(PINNED_URL), transportError(-6))
+        client.onReceivedError(webView, request(PINNED_URL), transportError(-6))
+        client.onPageCommitVisible(webView, PINNED_URL)
+        assertEquals(listOf(-6), reported)
+        assertEquals(0, committed)
+
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onPageCommitVisible(webView, PINNED_URL)
+        assertEquals(1, committed)
+    }
+
+    @Test
+    fun `subframe foreign and aborted loads never raise the status screen`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reported = mutableListOf<Int>()
+        val client = client(onMainFrameUnreachable = { _, code, _ -> reported += code })
+
+        client.onPageStarted(webView, PINNED_URL, null)
+        client.onReceivedError(
+            webView,
+            request(PINNED_URL, isForMainFrame = false),
+            transportError(-6),
+        )
+        client.onReceivedError(webView, request(IDP_URL), transportError(-6))
+        client.onReceivedError(webView, request(PINNED_URL), transportError(-6, "net::ERR_ABORTED"))
+
+        assertTrue(reported.isEmpty())
+    }
+
+    @Test
+    fun `transport error canonicalizes host and rejects other origins or paths`() {
+        val savedUrl = "https://Omnigent.example.com/route"
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reported = mutableListOf<Int>()
+        val client =
+            client(
+                pinnedOrigin = originOf(savedUrl)!!,
+                onMainFrameUnreachable = { _, code, _ -> reported += code },
+            )
+        client.beginShellLoad(savedUrl)
+
+        client.onReceivedError(
+            webView,
+            request("https://foreign.example.com/route"),
+            transportError(-6),
+        )
+        client.onReceivedError(
+            webView,
+            request("https://omnigent.example.com/other"),
+            transportError(-6),
+        )
+        assertTrue(reported.isEmpty())
+        client.onReceivedError(
+            webView,
+            request("https://omnigent.example.com/route"),
+            transportError(-6),
+        )
+
+        assertEquals(listOf(-6), reported)
+    }
+
+    @Test
+    fun `transport error matches a saved explicit default port before page start`() {
+        val savedUrl = "https://example.com:443/route%2Fone?next=%2F"
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reported = mutableListOf<Int>()
+        val client = client(onMainFrameUnreachable = { _, code, _ -> reported += code })
+        client.beginShellLoad(savedUrl)
+
+        client.onReceivedError(
+            webView,
+            request("https://example.com/route%2Fone?next=%2F"),
+            transportError(-6),
+        )
+
+        assertEquals(listOf(-6), reported)
+    }
+
+    @Test
+    fun `certificate failure is cancelled and reported as TLS`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var tls = 0
+        val client = client(onMainFrameSslError = { _, _ -> tls++ })
+        client.onPageStarted(webView, PINNED_URL, null)
+        val handler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+
+        client.onReceivedSslError(
+            webView,
+            handler,
+            SslError(
+                SslError.SSL_UNTRUSTED,
+                SslCertificate("host", "issuer", java.util.Date(), java.util.Date()),
+                PINNED_URL,
+            ),
+        )
+
+        val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+        assertTrue(shadow.wasCancelCalled())
+        assertFalse(shadow.wasProceedCalled())
+        assertEquals(1, tls)
+    }
+
+    @Test
+    fun `certificate failure before page start uses the pending WebView URL`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        webView.currentUrl = PINNED_URL
+        var tls = 0
+        var committed = 0
+        val client =
+            client(
+                onMainFrameSslError = { _, _ -> tls++ },
+                onMainFrameCommitted = { committed++ },
+            )
+        val handler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+
+        client.onReceivedSslError(
+            webView,
+            handler,
+            SslError(
+                SslError.SSL_UNTRUSTED,
+                SslCertificate("host", "issuer", java.util.Date(), java.util.Date()),
+                PINNED_URL,
+            ),
+        )
+        client.onPageCommitVisible(webView, PINNED_URL)
+
+        val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+        assertTrue(shadow.wasCancelCalled())
+        assertFalse(shadow.wasProceedCalled())
+        assertEquals(1, tls)
+        assertEquals(0, committed)
+    }
+
+    @Test
+    fun `certificate error matches a saved mixed-case host before page start`() {
+        val savedUrl = "https://Omnigent.example.com"
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reasons = mutableListOf<String>()
+        val client =
+            client(
+                pinnedOrigin = originOf(savedUrl)!!,
+                onMainFrameSslError = { _, reason -> reasons += reason },
+            )
+        client.beginShellLoad(savedUrl)
+        val handler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+
+        client.onReceivedSslError(webView, handler, sslError("https://omnigent.example.com/"))
+
+        val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+        assertTrue(shadow.wasCancelCalled())
+        assertFalse(shadow.wasProceedCalled())
+        assertEquals(listOf("SSL_UNTRUSTED"), reasons)
+    }
+
+    @Test
+    fun `certificate error matches a saved default port with encoded route`() {
+        val savedUrl = "https://example.com:443/route%2Fone?next=%2F"
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reasons = mutableListOf<String>()
+        val client = client(onMainFrameSslError = { _, reason -> reasons += reason })
+        client.beginShellLoad(savedUrl)
+        val handler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+
+        client.onReceivedSslError(
+            webView,
+            handler,
+            sslError("https://example.com/route%2Fone?next=%2F"),
+        )
+
+        val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+        assertTrue(shadow.wasCancelCalled())
+        assertFalse(shadow.wasProceedCalled())
+        assertEquals(listOf("SSL_UNTRUSTED"), reasons)
+    }
+
+    @Test
+    fun `foreign subframe different route query and stale certificate errors stay ignored`() {
+        val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val reasons = mutableListOf<String>()
+        val client = client(onMainFrameSslError = { _, reason -> reasons += reason })
+        client.beginShellLoad("$PINNED_ORIGIN/route?next=one")
+        val rejected =
+            listOf(
+                "https://foreign.example.test/route?next=one",
+                "$PINNED_ORIGIN/subframe?next=one",
+                "$PINNED_ORIGIN/other?next=one",
+                "$PINNED_ORIGIN/route?next=two",
+            )
+        rejected.forEach { url ->
+            val handler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+            client.onReceivedSslError(webView, handler, sslError(url))
+            val shadow = Shadow.extract<ShadowSslErrorHandler>(handler)
+            assertTrue(shadow.wasCancelCalled())
+            assertFalse(shadow.wasProceedCalled())
+        }
+        client.beginShellLoad("$PINNED_ORIGIN/new-route?next=one")
+        val staleHandler = Shadow.newInstanceOf(SslErrorHandler::class.java)
+        client.onReceivedSslError(
+            webView,
+            staleHandler,
+            sslError("$PINNED_ORIGIN/route?next=one"),
+        )
+
+        val staleShadow = Shadow.extract<ShadowSslErrorHandler>(staleHandler)
+        assertTrue(staleShadow.wasCancelCalled())
+        assertFalse(staleShadow.wasProceedCalled())
+        assertTrue(reasons.isEmpty())
+    }
+
     @Test
     fun `pinned main-frame client and server errors report their status to the shell`() {
         val webView = RecordingWebView(ApplicationProvider.getApplicationContext())
@@ -146,6 +373,28 @@ class OmnigentWebViewClientTest {
 
         assertFalse(handled) // false = let the WebView load the IdP page
         assertEquals(0, logins)
+    }
+
+    @Test
+    fun `foreign main-frame commit clears only an in-WebView-auth server`() {
+        val appView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        val oidcView = RecordingWebView(ApplicationProvider.getApplicationContext())
+        var appCommits = 0
+        var oidcCommits = 0
+        val appClient =
+            client(
+                pinnedOrigin = DATABRICKS_APP_ORIGIN,
+                onMainFrameCommitted = { appCommits++ },
+            )
+        val oidcClient = client(onMainFrameCommitted = { oidcCommits++ })
+
+        appClient.onPageStarted(appView, IDP_URL, null)
+        appClient.onPageCommitVisible(appView, IDP_URL)
+        oidcClient.onPageStarted(oidcView, IDP_URL, null)
+        oidcClient.onPageCommitVisible(oidcView, IDP_URL)
+
+        assertEquals(1, appCommits)
+        assertEquals(0, oidcCommits)
     }
 
     @Test
@@ -527,6 +776,13 @@ class OmnigentWebViewClientTest {
     /** Run posted bounces (see the client's mainHandler) before asserting. */
     private fun idleMainLooper() = shadowOf(Looper.getMainLooper()).idle()
 
+    private fun sslError(url: String) =
+        SslError(
+            SslError.SSL_UNTRUSTED,
+            SslCertificate("host", "issuer", java.util.Date(), java.util.Date()),
+            url,
+        )
+
     private fun client(
         shouldInjectBridgeAtPageReady: Boolean = false,
         pinnedOrigin: String = PINNED_ORIGIN,
@@ -535,6 +791,9 @@ class OmnigentWebViewClientTest {
         onPageReady: (String?) -> Unit = {},
         onNavigationStarted: () -> Unit = {},
         onMainFrameHttpError: (Int) -> Unit = {},
+        onMainFrameCommitted: (WebView) -> Unit = {},
+        onMainFrameUnreachable: (WebView, Int, String) -> Unit = { _, _, _ -> },
+        onMainFrameSslError: (WebView, String) -> Unit = { _, _ -> },
         workspaceSession: () -> DatabricksWebSession? = { null },
         onWorkspaceSessionInvalid: (Int?) -> Unit = {},
         onWorkspaceSignOut: () -> Unit = {},
@@ -548,6 +807,9 @@ class OmnigentWebViewClientTest {
         onLoginRequired = onLoginRequired,
         onRendererGone = onRendererGone,
         onMainFrameHttpError = onMainFrameHttpError,
+        onMainFrameCommitted = onMainFrameCommitted,
+        onMainFrameUnreachable = onMainFrameUnreachable,
+        onMainFrameSslError = onMainFrameSslError,
         workspaceSession = workspaceSession,
         onWorkspaceSessionInvalid = onWorkspaceSessionInvalid,
         onWorkspaceSignOut = onWorkspaceSignOut,
@@ -597,6 +859,11 @@ class OmnigentWebViewClientTest {
             emptyMap(),
             null,
         )
+
+    private fun transportError(
+        code: Int,
+        description: String = "net::ERR_CONNECTION_FAILED",
+    ) = FakeWebResourceError(code, description)
 
     private class RecordingWebView(
         context: Context,

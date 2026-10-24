@@ -159,7 +159,7 @@ class OidcSessionControllerTest {
         controller.connect(SERVER, interactive = true)
 
         assertEquals(
-            "setup:Couldn't reach omni.example. Check your connection and try again.",
+            "unreachable:Couldn't reach omni.example. Check your connection and try again.",
             host.events.last(),
         )
         assertTrue(host.launches.isEmpty())
@@ -766,6 +766,10 @@ class OidcSessionControllerTest {
 
         override fun showSignInRequired(message: String) {
             events += "ask:$message"
+        }
+
+        override fun showServerUnreachable(error: Throwable) {
+            events += "unreachable:${error.message}"
         }
 
         override fun loadWithoutNativeSignIn(url: String) {
