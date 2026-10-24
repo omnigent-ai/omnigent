@@ -222,6 +222,37 @@ def test_spawn_env_mirrors_row_omnigent_mcp(monkeypatch: pytest.MonkeyPatch) -> 
     assert env["HARNESS_ACP_OMNIGENT_MCP"] == "1"
 
 
+def test_spawn_env_names_a_row_auth_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A row's own auth variable must be named for the deny-by-default spawn env.
+
+    The wrap forwards only passthrough-named vars, so a vendor CLI that
+    authenticates from its own key starts unauthenticated when the row's
+    variable is left out, even though the setup hint told the user to set it.
+    """
+    keyed_row = dataclasses.replace(_FAKE_ROW, env_passthrough=("FAKE_API_KEY",))
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", keyed_row)
+    env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
+    assert env["HARNESS_ACP_ENV_PASSTHROUGH"] == "FAKE_API_KEY"
+
+    # A row declaring none leaves the var unset rather than naming an empty
+    # list, so the wrap keeps its own default.
+    monkeypatch.setitem(ACP_CLI_HARNESSES, "fakecli", _FAKE_ROW)
+    env = _build_acp_cli_spawn_env(_spec("fakecli"), harness="fakecli")
+    assert "HARNESS_ACP_ENV_PASSTHROUGH" not in env
+
+
+def test_grok_row_passes_through_its_api_key() -> None:
+    """The real Grok row must forward the key its auth hint advertises.
+
+    ``XAI_API_KEY`` is the documented API-key path for Grok Build, and an
+    API-key-only user has no OAuth login to fall back on.
+    """
+    row = ACP_CLI_HARNESSES["grok"]
+    assert "XAI_API_KEY" in row.install.auth_hint
+    env = _build_acp_cli_spawn_env(_spec("grok"), harness="grok")
+    assert "XAI_API_KEY" in env["HARNESS_ACP_ENV_PASSTHROUGH"].split(",")
+
+
 # ---------------------------------------------------------------------------
 # Per-row registration (parametrized over the real catalog)
 # ---------------------------------------------------------------------------
