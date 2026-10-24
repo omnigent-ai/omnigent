@@ -141,7 +141,10 @@ vi.mock("@/hooks/useComments", () => ({
 }));
 
 vi.mock("@/hooks/useFileContent", () => ({
-  useFileContent: vi.fn(() => ({ data: { content: "", path: "file1.py" } })),
+  useFileContent: vi.fn((_conversationId: string, path: string | null) => ({
+    data: path ? { content: "", path: "file1.py" } : undefined,
+  })),
+  downloadWorkspaceFile: vi.fn(async () => {}),
 }));
 
 vi.mock("@/hooks/useFileDiff", () => ({
@@ -194,9 +197,9 @@ import { useOptionalCommentSender } from "@/hooks/CommentSenderContext";
 import { useFileDiff } from "@/hooks/useFileDiff";
 import { prepareDiffEditor } from "./MonacoDiffViewer";
 import { MAX_RICH_MARKDOWN_BYTES } from "./codeViewerHelpers";
-import { useFileContent } from "@/hooks/useFileContent";
 import { getSeenCommentIds } from "@/hooks/useSeenComments";
 import { useWorkspaceChangedFiles } from "@/hooks/useWorkspaceChangedFiles";
+import { downloadWorkspaceFile, useFileContent } from "@/hooks/useFileContent";
 import { classifyAndRemapComments, FileViewer } from "./FileViewer";
 import { FileViewerContext, type FileNavigationGuard } from "./FileViewerContext";
 import { encodePdfAnchor } from "./pdfCommentHelpers";
@@ -204,6 +207,79 @@ import { DEFAULT_FILE_VIEW_PREFERENCES, writeFileViewPreferences } from "@/lib/f
 import type { ChangedSort } from "./FlatFileList";
 
 const useCommentsMock = vi.mocked(useComments);
+
+describe("FileViewer video and download toolbar", () => {
+  beforeEach(() => {
+    useCommentsMock.mockReturnValue(makeCommentsQuery([]));
+  });
+
+  it.each(["file1.py", "clip.mp4", "photo.png", "document.pdf", "part.stl", "data.bin"])(
+    "offers a working visible Download for %s",
+    (path) => {
+      renderViewer({ open: true, path });
+      fireEvent.click(screen.getByRole("button", { name: "Download file" }));
+      expect(downloadWorkspaceFile).toHaveBeenCalledWith("conv_1", path);
+    },
+  );
+  it.each([
+    [180, true],
+    [220, false],
+  ])("includes Download when measuring toolbar overflow at %ipx", (width, collapsed) => {
+    installCollapsedToolbar();
+    vi.spyOn(HTMLElement.prototype, "clientWidth", "get").mockReturnValue(width);
+    vi.spyOn(HTMLElement.prototype, "scrollWidth", "get").mockImplementation(function (
+      this: HTMLElement,
+    ) {
+      // Model 28px icon buttons with the toolbar's 4px gap.
+      const count = this.querySelectorAll("button").length;
+      return count * 28 + Math.max(0, count - 1) * 4;
+    });
+    renderViewer({ open: true, frameless: true, path: "clip.mp4" });
+    expect(!!screen.queryByRole("button", { name: "More actions" })).toBe(collapsed);
+    expect(screen.getByRole("button", { name: "Download file" })).toBeVisible();
+  });
+
+  it("skips JSON and suppresses diff and edit for video", async () => {
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () =>
+        ({ data: { data: [{ path: "clip.mov", status: "modified" }] } }) as ReturnType<
+          typeof useWorkspaceChangedFiles
+        >,
+      async () => {
+        renderViewer({ open: true, path: "clip.mov", initialSearch: "diff=1" });
+        expect(useFileContent).toHaveBeenCalledWith("conv_1", null);
+        expect(screen.queryByRole("button", { name: "Show diff" })).toBeNull();
+        expect(screen.queryByRole("button", { name: "Exit diff view" })).toBeNull();
+        expect(screen.queryByTestId("diff-viewer")).toBeNull();
+        expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+        expect(screen.queryByRole("textbox", { name: "Draft text" })).toBeNull();
+      },
+    );
+  });
+  it("does not offer Download for a deleted file", async () => {
+    await vi.mocked(useWorkspaceChangedFiles).withImplementation(
+      () =>
+        ({ data: { data: [{ path: "gone.mp4", status: "deleted" }] } }) as ReturnType<
+          typeof useWorkspaceChangedFiles
+        >,
+      async () => {
+        renderViewer({ open: true, path: "gone.mp4" });
+        expect(screen.queryByRole("button", { name: "Download file" })).toBeNull();
+      },
+    );
+  });
+  it("does not offer edit mode for MIME-identified video with a Markdown extension", async () => {
+    await vi.mocked(useFileContent).withImplementation(
+      () =>
+        ({ data: { content: "", content_type: "video/mp4" } }) as ReturnType<typeof useFileContent>,
+      async () => {
+        renderViewer({ open: true, path: "clip.md" });
+        expect(screen.getByTestId("code-viewer")).toHaveAttribute("data-view-mode", "source");
+        expect(screen.queryByRole("button", { name: /View mode/ })).toBeNull();
+      },
+    );
+  });
+});
 const useOptionalCommentSenderMock = vi.mocked(useOptionalCommentSender);
 
 function makeCommentsQuery(data: Comment[] | undefined) {
@@ -1644,10 +1720,8 @@ describe("FileViewer split-toggle width gating", () => {
 
 // ── View settings "⋯" menu ──────────────────────────────────────────────────
 //
-// Find, Download, and the diff-only toggles (wrap lines, hide whitespace) are
-// folded into one "View settings" overflow menu to save toolbar width. The
-// toggles keep the menu open and drive props on the diff viewer; the diff-only
-// items are hidden outside diff view. Radix menus open on pointerdown.
+// Find and diff toggles live in settings; Download stays visible.
+// Toggles keep the menu open. Radix menus open on pointerdown.
 
 describe("FileViewer view-settings menu", () => {
   beforeEach(() => {
@@ -1657,11 +1731,12 @@ describe("FileViewer view-settings menu", () => {
   const openSettingsMenu = () =>
     fireEvent.pointerDown(screen.getByRole("button", { name: "View settings" }), { button: 0 });
 
-  it("offers Find and Download but no diff toggles outside diff view", () => {
+  it("offers Find but no Download or diff toggles in settings outside diff view", () => {
     render(viewerTree({ open: true }));
+    expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
     openSettingsMenu();
     expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Download file" })).toBeNull();
     // Wrap / whitespace are diff-only — absent when the source view is showing.
     expect(screen.queryByRole("menuitem", { name: "Wrap lines" })).toBeNull();
     expect(screen.queryByRole("menuitem", { name: "Hide whitespace changes" })).toBeNull();
@@ -1754,10 +1829,11 @@ describe("FileViewer collapsed-toolbar overflow menu", () => {
 
   it("flattens the settings items into the overflow menu (no '⋯'-in-'⋯' submenu)", () => {
     render(viewerTree({ open: true }));
+    expect(screen.getByRole("button", { name: "Download file" })).toBeInTheDocument();
     openOverflowMenu();
     // The settings items appear as flat rows in the overflow menu…
     expect(screen.getByRole("menuitem", { name: "Find in file" })).toBeInTheDocument();
-    expect(screen.getByRole("menuitem", { name: "Download file" })).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "Download file" })).toBeNull();
     // …and there is no nested "View settings" submenu trigger wrapping them.
     expect(screen.queryByRole("menuitem", { name: "View settings" })).toBeNull();
   });

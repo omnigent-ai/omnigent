@@ -132,6 +132,20 @@ function clickDownloadLink(href: string, filename: string): void {
 }
 
 /**
+ * Build the uncapped download URL for a workspace-relative or host-absolute file.
+ */
+export function workspaceFileDownloadUrl(conversationId: string, path: string): string {
+  return workspaceFileUrl(conversationId, path, { download: "true" });
+}
+
+/**
+ * Use direct downloads where navigation can authenticate without a blob fetch.
+ */
+export function usesDirectFileDownload(): boolean {
+  return !isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell();
+}
+
+/**
  * Download a workspace file's complete bytes.
  *
  * Asks the filesystem endpoint for the raw file (`download=true`), which the

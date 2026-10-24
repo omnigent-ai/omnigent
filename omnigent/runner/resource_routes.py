@@ -7,6 +7,7 @@ import dataclasses
 import logging
 import mimetypes
 import os
+import re
 import urllib.parse
 from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Mapping
 from pathlib import Path
@@ -77,6 +78,32 @@ if TYPE_CHECKING:
     from omnigent.runtime.filesystem_registry import FilesystemRegistry
 
 _logger = logging.getLogger("omnigent.runner.app")
+
+
+def _parse_byte_range(value: str | None, size: int) -> tuple[int, int] | None:
+    """Return inclusive ``(start, end)``; ``None`` ignores the header (200).
+
+    :raises ValueError: If the range is unsatisfiable (416)."""
+    if value is None:
+        return None
+    match = re.fullmatch(r"bytes=([0-9]*)-([0-9]*)", value)
+    if match is None or not any(match.groups()):
+        return None
+    first, last = match.groups()
+    try:
+        start = int(first) if first else None
+        end = int(last) if last else None
+    except ValueError:
+        return None
+    if start is None:
+        if end == 0 or size == 0:
+            raise ValueError("unsatisfiable byte range")
+        return max(0, size - (end or 0)), size - 1
+    if end is not None and end < start:
+        return None
+    if start >= size:
+        raise ValueError("unsatisfiable byte range")
+    return start, min(end, size - 1) if end is not None else size - 1
 
 
 class _EnsureCommentRelayStartedFn(Protocol):
@@ -1510,6 +1537,7 @@ def register_resource_routes(
         "/{environment_id}/filesystem/{relative_path:path}"
     )
     async def read_or_list_environment_path(
+        request: Request,
         session_id: str,
         environment_id: str,
         relative_path: str,
@@ -1530,6 +1558,8 @@ def register_resource_routes(
                 session_id,
                 environment_id,
                 relative_path,
+                range_header=request.headers.get("range"),
+                if_range_header=request.headers.get("if-range"),
                 follow_outward_links=follow_outward_links,
             )
         return await _fs_list_or_read(
@@ -1688,8 +1718,10 @@ def register_resource_routes(
         environment_id: str,
         path: str,
         *,
+        range_header: str | None = None,
+        if_range_header: str | None = None,
         follow_outward_links: bool = False,
-    ) -> StreamingResponse:
+    ) -> Response:
         """Serve a file's complete bytes as an attachment.
 
         The read path inlines content in a JSON envelope, so it caps at
@@ -1700,6 +1732,8 @@ def register_resource_routes(
         :param session_id: Session identifier.
         :param environment_id: Environment resource id.
         :param path: Path within the environment, or an absolute path.
+        :param range_header: Optional HTTP Range header value for partial content requests.
+        :param if_range_header: Optional validator required to serve partial content.
         :param follow_outward_links: Admit a workspace symlink whose target
             lies outside the workspace but within the environment's reach.
         :returns: The file streamed with ``Content-Disposition: attachment``.
@@ -1714,12 +1748,25 @@ def register_resource_routes(
         env = resource_registry.resolve_environment(session_id, environment_id, agent_spec)
         fs = CallerProcessFilesystem(env, follow_outward_links=follow_outward_links)
         fobj, resolved, size = await fs.open_download(path)
+        try:
+            # No ETag or Last-Modified is emitted, so If-Range cannot match.
+            byte_range = _parse_byte_range(range_header, size) if if_range_header is None else None
+        except ValueError:
+            fobj.close()
+            return Response(
+                status_code=416,
+                headers={"Content-Range": f"bytes */{size}", "Accept-Ranges": "bytes"},
+            )
+        start, end = byte_range if byte_range is not None else (0, size - 1)
+        length = end - start + 1
 
         async def _chunks() -> AsyncIterator[bytes]:
             # Stop at the size announced in Content-Length so a file growing
             # underneath the download cannot overrun the response.
-            remaining = size
+            remaining = length
             try:
+                if start:
+                    await asyncio.to_thread(fobj.seek, start)
                 while remaining > 0:
                     chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
                     if not chunk:
@@ -1749,9 +1796,16 @@ def register_resource_routes(
         )
         return StreamingResponse(
             _chunks(),
+            status_code=206 if byte_range is not None else 200,
             media_type=mimetypes.guess_type(resolved.name)[0] or "application/octet-stream",
             headers={
-                "Content-Length": str(size),
+                "Content-Length": str(length),
+                "Accept-Ranges": "bytes",
+                **(
+                    {"Content-Range": f"bytes {start}-{end}/{size}"}
+                    if byte_range is not None
+                    else {}
+                ),
                 "Content-Disposition": disposition,
                 "Cache-Control": "no-store",
                 "X-Content-Type-Options": "nosniff",
