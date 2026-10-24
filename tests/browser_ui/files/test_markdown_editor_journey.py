@@ -31,6 +31,15 @@ pytestmark = pytest.mark.browser_context_args(
 
 _CONTENT = Path(__file__).with_name("markdown_editor_journey.md").read_text()
 _PATH = "src/markdown-editor-journey.md"
+_WIDE_TABLE_PATH = "src/pr-tracker.md"
+_WIDE_TABLE = (
+    "# PR tracker\n\n| PR | Title | Owner | Status | Checks | Notes |\n" + "|---" * 6 + "|\n"
+)
+_WIDE_TABLE += "".join(
+    f"| #{100 + row} | Tracking_entry_with_a_long_unbroken_title_{row} | owner_{row} | open "
+    f"| passing_all_required_checks | note_text_{row}_without_any_spaces |\n"
+    for row in range(5)
+)
 
 
 def test_markdown_editor_review_journey(page: Page, seeded_session: BrowserSession) -> None:
@@ -182,3 +191,50 @@ def test_markdown_editor_load_journey(
     target = Path(output_path) / "markdown-load.json"
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(json.dumps(metrics, indent=2) + "\n")
+
+
+def test_wide_table_handles_stay_beside_the_visible_table(
+    page: Page, seeded_session: BrowserSession
+) -> None:
+    """A wide table scrolled inside the side panel keeps its grips in the panel."""
+    _mock_markdown_files(page, seeded_session, {_WIDE_TABLE_PATH: _WIDE_TABLE})
+    viewer = _open_viewer(
+        page,
+        seeded_session,
+        _WIDE_TABLE_PATH,
+        {"diffActive": False, "previewableViewMode": "editor"},
+    )
+    wrapper = viewer.locator(".tiptap .tableWrapper")
+    expect(wrapper).to_contain_text("Tracking_entry_with_a_long_unbroken_title_1")
+    row_grip = page.get_by_role("button", name="Row options")
+    col_grip = page.get_by_role("button", name="Column options")
+    wrapper.locator("tr").nth(2).locator("td").nth(1).hover()
+    expect(row_grip).to_be_visible()
+
+    box = wrapper.bounding_box()
+    assert box is not None
+    middle_y = box["y"] + box["height"] / 2
+    page.mouse.move(box["x"] + box["width"] / 2, middle_y)
+    page.mouse.wheel(400, 0)
+    page.wait_for_function("el => el.scrollLeft >= 300", arg=wrapper.element_handle())
+    page.mouse.move(box["x"] + 60, middle_y)
+    page.mouse.move(box["x"] + 70, middle_y)
+    expect(row_grip).to_be_visible()
+    expect(col_grip).to_be_visible()
+
+    viewer_box = viewer.bounding_box()
+    row_box = row_grip.bounding_box()
+    col_box = col_grip.bounding_box()
+    assert viewer_box and row_box and col_box
+    assert viewer_box["x"] <= row_box["x"]
+    assert box["x"] - 4 <= row_box["x"] + row_box["width"] <= box["x"]
+    assert box["x"] <= col_box["x"]
+    assert col_box["x"] + col_box["width"] <= box["x"] + box["width"]
+
+    row_grip.hover()
+    selection = page.locator(".pointer-events-none.fixed.border-primary")
+    expect(selection).to_have_count(1)
+    selection_box = selection.bounding_box()
+    assert selection_box is not None
+    assert selection_box["x"] >= box["x"]
+    assert selection_box["x"] + selection_box["width"] <= box["x"] + box["width"]

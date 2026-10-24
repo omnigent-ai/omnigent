@@ -16,9 +16,11 @@ import { Markdown } from "@tiptap/markdown";
 import { TextSelection } from "@tiptap/pm/state";
 import { StarterKit } from "@tiptap/starter-kit";
 import {
+  clipRect,
   freshCellPos,
   moveRowToIndex,
   moveColumnToIndex,
+  placeTableHandles,
   rowIndexAtY,
   colIndexAtX,
 } from "./TableBubbleMenu";
@@ -672,6 +674,136 @@ describe("colIndexAtX", () => {
     ];
     expect(colIndexAtX(sparse, 50)).toBe(2);
     expect(colIndexAtX(sparse, 150)).toBe(0);
+  });
+});
+
+describe("clipRect", () => {
+  const bounds = { top: 0, left: 0, width: 100, height: 100 };
+
+  it("returns the overlapping part of the rect", () => {
+    expect(clipRect({ top: 80, left: -20, width: 50, height: 50 }, bounds)).toEqual({
+      top: 80,
+      left: 0,
+      width: 30,
+      height: 20,
+    });
+  });
+
+  it("returns null when the rect only touches or misses the bounds", () => {
+    expect(clipRect({ top: 100, left: 0, width: 10, height: 10 }, bounds)).toBeNull();
+    expect(clipRect({ top: 0, left: -30, width: 20, height: 10 }, bounds)).toBeNull();
+  });
+});
+
+describe("placeTableHandles", () => {
+  // A 600×400 editor viewport with a table wrapper inset by its 32px padding.
+  const viewport = { top: 0, left: 0, width: 600, height: 400 };
+  const wrapper = { top: 50, left: 32, width: 536, height: 120 };
+  const fittingTable = { top: 50, left: 32, width: 536, height: 120 };
+  const fittingRow = { top: 80, left: 32, width: 536, height: 30 };
+  // The same table at 1400px wide, scrolled 400px inside its wrapper.
+  const scrolledTable = { ...fittingTable, left: -368, width: 1400 };
+  const scrolledRow = { ...fittingRow, left: -368, width: 1400 };
+  const cell = { top: 80, left: 132, width: 100, height: 30 };
+
+  it("keeps the grips beside a table that fits", () => {
+    const placement = placeTableHandles({
+      row: fittingRow,
+      cell,
+      table: fittingTable,
+      wrapper,
+      viewport,
+    });
+    expect(placement).toEqual({
+      visible: { top: 0, left: 32, width: 536, height: 400 },
+      rowGrip: { top: 82, left: 10, width: 20, height: 26 },
+      colGrip: { top: 26, left: 134, width: 96, height: 18 },
+    });
+  });
+
+  it("keeps the row grip beside the visible table when a wide table is scrolled", () => {
+    // WHY: the row's left edge is scrolled 400px past the wrapper; a grip
+    // placed from it would render outside the editor, over the next pane.
+    const placement = placeTableHandles({
+      row: scrolledRow,
+      cell,
+      table: scrolledTable,
+      wrapper,
+      viewport,
+    });
+    expect(placement?.rowGrip).toEqual({ top: 82, left: 10, width: 20, height: 26 });
+    expect(placement?.colGrip).toEqual({ top: 26, left: 134, width: 96, height: 18 });
+  });
+
+  it("keeps the row grip inside the editor when the table starts at its edge", () => {
+    // WHY: without room left of the table, the grip overlaps the first column
+    // rather than disappearing.
+    const placement = placeTableHandles({
+      row: { ...fittingRow, left: 0 },
+      cell,
+      table: { ...fittingTable, left: 0 },
+      wrapper: { ...wrapper, left: 0 },
+      viewport,
+    });
+    expect(placement?.rowGrip).toEqual({ top: 82, left: 0, width: 20, height: 26 });
+  });
+
+  it("clips the column grip to the part of a cell still in view", () => {
+    const placement = placeTableHandles({
+      row: scrolledRow,
+      cell: { ...cell, left: 0 },
+      table: scrolledTable,
+      wrapper,
+      viewport,
+    });
+    expect(placement?.colGrip).toEqual({ top: 26, left: 32, width: 66, height: 18 });
+  });
+
+  it("hides the column grip of a cell scrolled out of view", () => {
+    const placement = placeTableHandles({
+      row: scrolledRow,
+      cell: { ...cell, left: 600 },
+      table: scrolledTable,
+      wrapper,
+      viewport,
+    });
+    expect(placement?.colGrip).toBeNull();
+    expect(placement?.rowGrip).not.toBeNull();
+  });
+
+  it("hides the column grip when the header is scrolled above the editor", () => {
+    const placement = placeTableHandles({
+      row: { ...fittingRow, top: 10 },
+      cell: { ...cell, top: 10 },
+      table: { ...fittingTable, top: -50 },
+      wrapper: { ...wrapper, top: -50 },
+      viewport,
+    });
+    expect(placement?.colGrip).toBeNull();
+    expect(placement?.rowGrip).toEqual({ top: 12, left: 10, width: 20, height: 26 });
+  });
+
+  it("shortens the row grip of a row partly above the editor", () => {
+    const placement = placeTableHandles({
+      row: { ...fittingRow, top: -10 },
+      cell: { ...cell, top: -10 },
+      table: { ...fittingTable, top: -40 },
+      wrapper: { ...wrapper, top: -40 },
+      viewport,
+    });
+    expect(placement?.rowGrip).toEqual({ top: 0, left: 10, width: 20, height: 18 });
+  });
+
+  it("returns null when the table is outside the editor viewport", () => {
+    expect(
+      placeTableHandles({
+        row: fittingRow,
+        cell,
+        table: fittingTable,
+        wrapper: { ...wrapper, left: 700 },
+        viewport,
+      }),
+    ).toBeNull();
   });
 });
 
