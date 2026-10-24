@@ -10395,6 +10395,68 @@ async def test_interrupt_forward_failure_lifts_stop_fence(
         await fake_runner.aclose()
 
 
+@pytest.mark.asyncio
+async def test_interrupt_refused_by_the_agent_is_a_conflict_and_not_published(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A runner 409 means the agent is still busy: the route says so and does
+    not tell clients the session was interrupted.
+
+    A 5xx or an unreachable runner keeps the older best-effort contract (see
+    ``test_interrupt_forward_failure_lifts_stop_fence``); only the explicit
+    refusal is surfaced.
+    """
+    from omnigent.runtime import session_stream
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import _interrupt_fenced_sessions
+
+    def _handler(request: httpx.Request) -> httpx.Response:
+        """Refuse the interrupt the way the runner does for a busy agent."""
+        if request.method == "POST" and request.url.path.endswith("/events"):
+            return httpx.Response(409, json={"error": "interrupt_not_delivered"})
+        return httpx.Response(204)
+
+    fake_runner = httpx.AsyncClient(
+        transport=httpx.MockTransport(_handler), base_url="http://runner"
+    )
+
+    async def _fake_get_runner_client(
+        session_id: str, runner_router: object, *, conversation: Any = None
+    ) -> httpx.AsyncClient | None:
+        del session_id, runner_router, conversation
+        return fake_runner
+
+    published: list[dict[str, Any]] = []
+    real_publish = session_stream.publish
+
+    def _capture_publish(conversation_id: str, event: dict[str, Any]) -> None:
+        published.append({"conversation_id": conversation_id, **event})
+        real_publish(conversation_id, event)
+
+    monkeypatch.setattr(sessions_module, "_get_runner_client", _fake_get_runner_client)
+    monkeypatch.setattr(session_stream, "publish", _capture_publish)
+    session_id: str | None = None
+    try:
+        agent = await create_test_agent(client)
+        session = await _create_session(client, agent["id"])
+        session_id = session["id"]
+
+        resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={"type": "interrupt", "data": {}},
+        )
+
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["error"]["code"] == "conflict"
+        assert session_id not in _interrupt_fenced_sessions
+        assert not [e for e in published if e.get("type") == "session.interrupted"], published
+    finally:
+        if session_id is not None:
+            _interrupt_fenced_sessions.discard(session_id)
+        await fake_runner.aclose()
+
+
 @pytest.mark.parametrize(
     "case", ["request", "request_idle", "cache", "idle", "missing", "invalid", "failure"]
 )

@@ -5688,3 +5688,159 @@ async def test_events_codex_side_chat_message_failure_is_structured(
     if detail is not None:
         assert response.json()["detail"] == detail
     assert fake_client.closed
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pane_status", "should_forward"),
+    [("running", True), ("waiting", True), ("idle", False)],
+)
+async def test_interrupt_reaches_a_native_agent_that_outlived_the_runner_turn(
+    pane_status: str,
+    should_forward: bool,
+) -> None:
+    """Pause with no runner turn still reaches a native agent whose session status says
+    it is busy; an idle session is left alone."""
+    conv_id = f"conv_{uuid.uuid4().hex}"
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the antigravity-native spec for any agent_id."""
+        del agent_id, session_id
+        return spec
+
+    harness_client = _ScriptedHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+
+        # The runner's turn is gone; only the vendor's own reported status says
+        # whether agy is still working.
+        app.state.native_pane_status[conv_id] = pane_status
+
+        int_resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "interrupt"},
+        )
+
+    assert int_resp.status_code == 204, (
+        f"interrupt must return 204; got {int_resp.status_code}: {int_resp.text}"
+    )
+    forwarded = [body for body in harness_client.patched_events if body.get("type") == "interrupt"]
+    if should_forward:
+        assert forwarded, (
+            f"interrupt on a native session reporting {pane_status!r} must be forwarded "
+            f"to the harness; harness saw {harness_client.patched_events!r}"
+        )
+    else:
+        assert not forwarded, (
+            f"interrupt on an idle native session must not be forwarded; got {forwarded!r}"
+        )
+
+
+class _RejectingHarnessClient(_ScriptedHarnessClient):
+    """Scripted client whose harness answers the interrupt POST with ``status_code``.
+
+    409 models the adapter refusing a Pause its inner session could not confirm;
+    404 models an older scaffold with neither a turn nor an inner session.
+    """
+
+    status_code = 409
+
+    async def post(self, url: str, *, json: dict[str, Any], timeout: Any = None) -> Any:
+        """Record the body and reject it the way the harness scaffold would."""
+        del url, timeout
+        self.patched_events.append(json)
+
+        class _Response:
+            status_code = _RejectingHarnessClient.status_code
+            headers: dict[str, str] = {}
+            content = b""
+
+            def raise_for_status(self) -> None:
+                """httpx only raises on an explicit call, which the runner never makes."""
+
+        return _Response()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("harness_status", "expected_status", "expected_log"),
+    [
+        (409, 409, "rejected by the harness"),
+        # A harness older than the contract answers 404 for "no turn"; that is
+        # idle, not a refusal, so mixed versions keep their 204.
+        (404, 204, "reports no turn"),
+    ],
+    ids=["refused", "no-turn"],
+)
+async def test_interrupt_rejected_by_the_harness_is_not_reported_as_delivered(
+    caplog: pytest.LogCaptureFixture,
+    harness_status: int,
+    expected_status: int,
+    expected_log: str,
+) -> None:
+    """A busy vendor whose harness refuses the interrupt is a failed stop.
+
+    The runner answers the server with the harness's own 409, logs the
+    refusal, and does not claim the session was idle.
+    """
+    conv_id = f"conv_{uuid.uuid4().hex}"
+    _RejectingHarnessClient.status_code = harness_status
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="t",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "antigravity-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        """Return the antigravity-native spec for any agent_id."""
+        del agent_id, session_id
+        return spec
+
+    harness_client = _RejectingHarnessClient([])
+    pm = _FakeProcessManager(harness_client)
+    app = create_runner_app(
+        process_manager=pm,  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        app.state.native_pane_status[conv_id] = "running"
+
+        with caplog.at_level("INFO"):
+            int_resp = await client.post(
+                f"/v1/sessions/{conv_id}/events",
+                json={"type": "interrupt"},
+            )
+
+    assert int_resp.status_code == expected_status, int_resp.text
+    if expected_status == 409:
+        assert int_resp.json()["error"] == "interrupt_not_delivered"
+    forwarded = [body for body in harness_client.patched_events if body.get("type") == "interrupt"]
+    assert forwarded, "the interrupt must still be attempted against the busy vendor"
+    messages = " | ".join(record.getMessage() for record in caplog.records)
+    assert expected_log in messages, f"log was: {messages}"
+    assert ("found no turn running" in messages) == (expected_status == 204), messages

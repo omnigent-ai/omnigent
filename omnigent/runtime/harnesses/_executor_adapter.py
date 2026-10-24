@@ -19,12 +19,13 @@ import time
 import uuid
 from collections import deque
 from collections.abc import Callable, Sequence
+from enum import Enum
 from typing import Any
 
-from fastapi import Response
+from fastapi import Response, status
 
 from omnigent.debug_logging import phase_scope
-from omnigent.errors import ElicitationDeclinedError, ErrorPhase
+from omnigent.errors import ElicitationDeclinedError, ErrorCode, ErrorPhase, OmnigentError
 from omnigent.inner.executor import (
     CompactionComplete,
     CompactionStarted,
@@ -33,6 +34,7 @@ from omnigent.inner.executor import (
     ExecutorError,
     ExecutorEvent,
     InjectionDeliveryAmbiguous,
+    InterruptOutcome,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -85,6 +87,27 @@ _MCP_TOOL_NAME_PREFIX = "mcp__"
 # slice never fires first and inject a CancelledError that bypasses the SIGKILL fallback.
 INTERRUPT_TIMEOUT_S = 3.0
 _INTERRUPT_SLICE_S = 3.0
+# Below the runner's interrupt POST timeout; the reap continues in the background.
+_INTERRUPT_EVENT_SLICE_S = 2.5
+
+
+class _InnerStop(Enum):
+    """What the inner session told the Pause handler, kept apart from "still reaping"."""
+
+    STOPPED = "stopped"
+    NOTHING_TO_STOP = "nothing_to_stop"
+    UNCONFIRMED = "unconfirmed"
+    PENDING = "pending"  # no answer within the slice; the work continues in the background
+    FAILED = "failed"  # the executor raised
+    ABSENT = "absent"  # no executor to stop
+
+
+_INNER_STOP_BY_OUTCOME: dict[InterruptOutcome, _InnerStop] = {
+    InterruptOutcome.STOPPED: _InnerStop.STOPPED,
+    InterruptOutcome.NOTHING_TO_STOP: _InnerStop.NOTHING_TO_STOP,
+    InterruptOutcome.UNCONFIRMED: _InnerStop.UNCONFIRMED,
+}
+
 
 # Interrupting an executor abandoned by an abnormal exit usually fails because the
 # harness is already gone -- that absence is what abandoned it. Its socket refuses or
@@ -215,8 +238,10 @@ class ExecutorAdapter(HarnessApp):
         self._tracing_ctx: TracingContext | None = None
         # Detached bounded background tasks (abnormal-exit _safe_interrupt). Strongly referenced
         # until completion; drained before recovery and on shutdown.
-        self._bg_tasks: set[asyncio.Task[bool]] = set()
+        self._bg_tasks: set[asyncio.Task[Any]] = set()
         self._abandoned_executor_cleanup: asyncio.Task[bool] | None = None
+        # Pause teardowns that outran their response slice; all awaited before the next turn.
+        self._pending_inner_interrupts: set[asyncio.Task[Any]] = set()
         # Consecutive orphaned-callback counter and reset guard for the Tier-1 SDK watchdog.
         self._orphan_callback_count = 0
         self._resyncing = False
@@ -240,6 +265,7 @@ class ExecutorAdapter(HarnessApp):
         Lazily constructs the executor on the first call; subsequent calls reuse the cached
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
+        await self._await_pending_inner_interrupt()
         executor = self._ensure_executor()
         messages = _translate_input_to_messages(request.input)
         # Stamp session_key on every message so the inner executor keys its client consistently,
@@ -592,15 +618,124 @@ class ExecutorAdapter(HarnessApp):
                 interrupt_task.add_done_callback(self._bg_tasks.discard)
 
     async def _handle_interrupt_event(self) -> Response:
-        """Cancel the turn and drop the inner executor session synchronously.
+        """Cancel the turn and interrupt the inner executor session.
 
-        Extends the base handler to also call ``interrupt_session`` — ensuring the in-flight
-        generation stops even when the run loop is blocked awaiting the first token.
+        Extends the base handler to also interrupt the inner session, so the in-flight
+        generation stops even when the run loop is blocked awaiting the first token. The
+        base 404 is absorbed when an executor exists: the inner agent can outlive the
+        harness turn, and the executor is then the only thing left to stop.
+
+        :returns: 204 when a harness turn was cancelled or the inner session stopped (or
+            is still being reaped past the response budget).
+        :raises OmnigentError: 404 when neither a harness turn nor a running inner
+            session exists; 409 when there was no harness turn and the inner session
+            could not confirm its stop.
         """
-        response = await super()._handle_interrupt_event()
-        if self._executor is not None:
-            await self._executor.interrupt_session(self._session_key)
+        interrupted_turn = True
+        try:
+            response = await super()._handle_interrupt_event()
+        except OmnigentError as exc:
+            if exc.code is not ErrorCode.NOT_FOUND or self._executor is None:
+                raise
+            interrupted_turn = False
+            response = Response(status_code=status.HTTP_204_NO_CONTENT)
+        stop = await self._interrupt_inner_session()
+        if interrupted_turn:
+            if stop in (_InnerStop.UNCONFIRMED, _InnerStop.FAILED):
+                _logger.warning(
+                    "inner session %s did not confirm its stop; the harness turn is torn down",
+                    self._session_key,
+                )
+            return response
+        if stop is _InnerStop.NOTHING_TO_STOP:
+            raise OmnigentError("no turn in flight to interrupt", code=ErrorCode.NOT_FOUND)
+        if stop in (_InnerStop.UNCONFIRMED, _InnerStop.FAILED):
+            raise OmnigentError(
+                "the inner session did not confirm its stop", code=ErrorCode.CONFLICT
+            )
         return response
+
+    async def _interrupt_inner_session(self) -> _InnerStop:
+        """Interrupt the inner session without holding the Pause response past its budget.
+
+        The executor's report carries the outcome apart from its reap, so the answer
+        arrives as soon as the stop is confirmed or refused; the reap keeps running as a
+        tracked task and :meth:`run_turn` waits for it before the executor serves again.
+        A Pause that lands while an earlier reap is still running waits for that reap
+        (within the same budget) instead of interrupting the executor a second time.
+
+        :returns: The inner outcome, ``PENDING`` when nothing is known within
+            :data:`_INTERRUPT_EVENT_SLICE_S`, ``FAILED`` when the executor raised, or
+            ``ABSENT`` with no executor to stop.
+        """
+        executor = self._executor
+        if executor is None:
+            return _InnerStop.ABSENT
+        if not await self._wait_pending_inner_interrupts(_INTERRUPT_EVENT_SLICE_S):
+            return _InnerStop.PENDING
+        task = asyncio.ensure_future(self._report_inner_interrupt(executor))
+        self._bg_tasks.add(task)
+        task.add_done_callback(self._bg_tasks.discard)
+        try:
+            outcome = await asyncio.wait_for(
+                asyncio.shield(task), timeout=_INTERRUPT_EVENT_SLICE_S
+            )
+        except TimeoutError:
+            _logger.warning(
+                "interrupt of inner session %s did not answer within %.1fs; "
+                "completing it in the background",
+                self._session_key,
+                _INTERRUPT_EVENT_SLICE_S,
+            )
+            self._track_pending_teardown(task)
+            return _InnerStop.PENDING
+        except Exception:  # best-effort: the runner floor does not depend on it
+            _logger.exception("interrupt of inner session %s failed", self._session_key)
+            return _InnerStop.FAILED
+        return _INNER_STOP_BY_OUTCOME[outcome]
+
+    async def _report_inner_interrupt(self, executor: Executor) -> InterruptOutcome:
+        """Interrupt the inner session and start tracking the reap it hands back.
+
+        The reap is scheduled here, by whichever task receives the report, so it runs
+        even when the Pause response has already given up waiting for the outcome.
+        """
+        report = await executor.interrupt_session_report(self._session_key)
+        if report.teardown is not None:
+            self._track_pending_teardown(asyncio.ensure_future(report.teardown))
+        return report.outcome
+
+    async def _wait_pending_inner_interrupts(self, timeout: float) -> bool:
+        """Wait up to *timeout* for every tracked reap, including ones a report spawns.
+
+        :returns: ``True`` when nothing is left running.
+        """
+        deadline = asyncio.get_running_loop().time() + timeout
+        while True:
+            pending = [task for task in self._pending_inner_interrupts if not task.done()]
+            if not pending:
+                return True
+            remaining = deadline - asyncio.get_running_loop().time()
+            if remaining <= 0:
+                return False
+            await asyncio.wait(pending, timeout=remaining)
+
+    def _track_pending_teardown(self, task: asyncio.Task[Any]) -> None:
+        """Keep a reap alive and visible until it finishes; its failure is only logged."""
+        self._bg_tasks.add(task)
+        self._pending_inner_interrupts.add(task)
+
+        def _done(done_task: asyncio.Task[Any]) -> None:
+            self._bg_tasks.discard(done_task)
+            self._pending_inner_interrupts.discard(done_task)
+            if not done_task.cancelled() and done_task.exception() is not None:
+                _logger.warning(
+                    "inner session %s teardown failed: %r",
+                    self._session_key,
+                    done_task.exception(),
+                )
+
+        task.add_done_callback(_done)
 
     async def _prepare_turn_retry(self) -> bool:
         """Wait for confirmed teardown without cancelling the background reap."""
@@ -992,6 +1127,21 @@ class ExecutorAdapter(HarnessApp):
         if self._executor is None:
             self._executor = self._executor_factory()
         return self._executor
+
+    async def _await_pending_inner_interrupt(self) -> None:
+        """Let every Pause teardown that outran its response slice finish before the next turn.
+
+        Otherwise the executor could start generating again while a previous session is
+        still being interrupted and reaped underneath it. The wait is bounded so a reap
+        that never finishes cannot wedge the session; the next turn then starts over it.
+        """
+        if not await self._wait_pending_inner_interrupts(_INTERRUPT_SLICE_S):
+            _logger.warning(
+                "inner session %s teardown still running after %.1fs; "
+                "starting the next turn without it",
+                self._session_key,
+                _INTERRUPT_SLICE_S,
+            )
 
     def _translate_event(self, event: ExecutorEvent, ctx: TurnContext) -> None:
         """Translate one inner ExecutorEvent into Omnigent SSE events via ``ctx.emit``."""

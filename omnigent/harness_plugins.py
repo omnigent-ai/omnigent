@@ -41,6 +41,7 @@ from omnigent.harness_capabilities import (
     InstructionDelivery,
     IntegrationMode,
     ModelFamily,
+    PauseResume,
     Resume,
 )
 from omnigent.harness_install_spec import HarnessInstallSpec
@@ -341,6 +342,7 @@ _MF = ModelFamily
 _AU = AuthModel
 _FH = ForkHistory
 _ID = InstructionDelivery
+_PR = PauseResume
 
 # Bench shell-tool provocation prompts (moved off the bench's hardcoded
 # _NATIVE_TOOL_PROVOCATION table): the generic variant, and a Bash-specific one
@@ -626,6 +628,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
     "cursor": _C(
@@ -703,6 +706,9 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        # The interrupt kills the CLI process but keeps the cached ``-S`` id,
+        # so the next turn resumes the same kimi session.
+        resume_after_pause=_PR.SAME_THREAD,
         instruction_delivery=_ID.NOT_DELIVERED,
     ),
     "hermes": _C(
@@ -715,6 +721,8 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        # The interrupt kills the CLI process but keeps the session map entry.
+        resume_after_pause=_PR.SAME_THREAD,
         instruction_delivery=_ID.FIRST_USER_PREFIX,
     ),
     "copilot": _C(
@@ -744,6 +752,7 @@ _BUILTIN_CAPABILITIES: dict[str, HarnessCapabilities] = {
         subagents=False,
         interrupt=True,
         streaming=True,
+        resume_after_pause=_PR.SAME_THREAD,
         instruction_delivery=_ID.COMPOSED_PER_TURN,
     ),
 }

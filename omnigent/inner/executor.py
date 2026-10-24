@@ -11,7 +11,7 @@ import contextlib
 import enum
 import json
 import threading
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import AsyncIterator, Awaitable, Iterator
 from dataclasses import dataclass, field
 from typing import Any, Protocol, TypeAlias, runtime_checkable
 
@@ -193,6 +193,28 @@ class TurnComplete(ExecutorEvent):
     modified_by_policy: bool = False
     continue_turn: bool = False
     usage: ExecutorUsage | None = None
+
+
+class InterruptOutcome(str, enum.Enum):
+    """What :meth:`Executor.interrupt_session_report` achieved."""
+
+    STOPPED = "stopped"  # told to stop and, where the executor can observe it, seen stopping
+    NOTHING_TO_STOP = "nothing_to_stop"  # no turn was running
+    UNCONFIRMED = "unconfirmed"  # told to stop, but the agent was not seen stopping
+
+
+@dataclass
+class InterruptReport:
+    """An interrupt's outcome plus the session reap it may have left running.
+
+    :param outcome: What the interrupt achieved.
+    :param teardown: A still-running reap of the inner session (close, process
+        exit), or ``None`` when nothing is left to wait for. Callers answer on
+        ``outcome`` and track ``teardown`` so a slow reap never masks the result.
+    """
+
+    outcome: InterruptOutcome
+    teardown: Awaitable[None] | None = None
 
 
 class ToolCallStatus(str, enum.Enum):
@@ -701,8 +723,25 @@ class Executor:
         return
 
     async def interrupt_session(self, session_key: str) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support interruption
-        """Ask the executor to interrupt a currently running turn, if supported."""
+        """Ask the executor to interrupt a currently running turn, if supported.
+
+        :returns: ``True`` when something was running and was told to stop;
+            ``False`` when there was nothing to stop or the executor cannot interrupt.
+        """
         return False
+
+    async def interrupt_session_report(self, session_key: str) -> InterruptReport:
+        """Interrupt the running turn and say what happened, apart from "nothing ran".
+
+        The default derives the report from :meth:`interrupt_session`, whose ``False``
+        means "nothing to stop". Executors that can observe the agent stopping override
+        this to report ``UNCONFIRMED`` separately, and may hand back the session reap as
+        ``teardown`` so the caller can answer before the reap finishes.
+        """
+        stopped = await self.interrupt_session(session_key)
+        return InterruptReport(
+            InterruptOutcome.STOPPED if stopped else InterruptOutcome.NOTHING_TO_STOP
+        )
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
         """Send a new user message to a live session without interrupting it, if supported.

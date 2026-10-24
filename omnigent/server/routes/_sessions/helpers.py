@@ -7330,6 +7330,13 @@ async def _stop_session_via_runner_impl(
             f"Could not reach the runner to stop session {session_id!r}: {exc}",
             code=ErrorCode.RUNNER_UNAVAILABLE,
         ) from exc
+    if resp.status_code == 409:
+        # The runner reached the agent, and the agent did not accept the stop.
+        raise OmnigentError(
+            f"The agent in session {session_id!r} did not accept the stop and may "
+            "still be running. Try again.",
+            code=ErrorCode.CONFLICT,
+        )
     if resp.status_code >= 400:
         raise OmnigentError(
             f"Runner failed to stop session {session_id!r} "

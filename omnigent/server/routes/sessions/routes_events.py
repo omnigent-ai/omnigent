@@ -1689,7 +1689,6 @@ def register_events_routes(
                     codex_side_turn_id=response_id.removeprefix("codex_"),
                 )
             else:
-                _publish_interrupted(session_id)
                 # Fence the cancelled turn (see _interrupt_fenced_sessions).
                 _interrupt_fenced_sessions.add(session_id)
                 # Read before the forward so a message sent after Stop stays live;
@@ -1700,6 +1699,9 @@ def register_events_routes(
                 runner_router,
             )
             interrupt_delivered = False
+            # A 409 is the runner saying the agent is still busy and refused the
+            # interrupt; any other failure is the runner or its transport.
+            agent_refused = False
             if runner_client is not None:
                 try:
                     interrupt_resp = await runner_client.post(
@@ -1708,6 +1710,7 @@ def register_events_routes(
                         timeout=5.0,
                     )
                     interrupt_delivered = interrupt_resp.status_code < 400
+                    agent_refused = interrupt_resp.status_code == 409
                 except (httpx.HTTPError, ConnectionError):
                     # WSTunnelTransport raises bare ConnectionError on tunnel close.
                     _logger.exception(
@@ -1723,8 +1726,21 @@ def register_events_routes(
                 # The turn keeps running and nothing else lifts the fence —
                 # remove it so the turn's remaining output isn't dropped.
                 _interrupt_fenced_sessions.discard(session_id)
+                if agent_refused:
+                    # The agent is still generating: do not tell clients the
+                    # session was interrupted when it was not.
+                    raise OmnigentError(
+                        "The agent did not accept the interrupt and may still be "
+                        "running. Try again.",
+                        code=ErrorCode.CONFLICT,
+                    )
             elif not codex_child:
                 pending_inputs.mark_interrupted(session_id, queued_pending_ids)
+            if not codex_child:
+                # Published after the forward so a refused interrupt never
+                # reaches clients as ``session.interrupted``; a runner that is
+                # unreachable or failed is reported interrupted as before.
+                _publish_interrupted(session_id)
             if stop_codex_side_chat:
                 await asyncio.to_thread(
                     conversation_store.set_labels,
