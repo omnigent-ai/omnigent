@@ -427,6 +427,416 @@ async def test_call_tool_raises_without_connect() -> None:
         await conn.call_tool("test_tool", {"query": "hi"})
 
 
+@pytest.mark.asyncio()
+async def test_call_tool_after_failed_initial_connect_raises_without_reconnect() -> None:
+    """
+    A connection whose first ``connect()`` failed is never-connected:
+    ``call_tool`` raises the no-live-session error and does not try
+    to rebuild a session that never existed.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        mock_session.initialize = AsyncMock(side_effect=httpx.ConnectError("refused"))
+        conn = McpServerConnection(config=config)
+        with pytest.raises(httpx.ConnectError):
+            await conn.connect()
+        assert conn._connected is False
+
+        with patch.object(conn, "_reconnect", new_callable=AsyncMock) as mock_reconnect:
+            with pytest.raises(RuntimeError, match="has no live session"):
+                await conn.call_tool("test_tool", {"query": "hi"})
+        mock_reconnect.assert_not_awaited()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_reconnects_when_session_died_after_connect() -> None:
+    """
+    A previously established connection rebuilds its session after
+    the lifecycle task cleared it, instead of raising the
+    never-connected guard on every later call.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        assert conn._connected is True
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        mock_session.call_tool.return_value = ok_result
+
+        # Simulate the lifecycle task's death clearing the session
+        # (exactly what _run_lifecycle's finally does on a
+        # steady-state transport fault).
+        conn._session = None
+
+        async def _restore_session(**_: object) -> None:
+            conn._session = mock_session
+
+        with patch.object(conn, "_reconnect", side_effect=_restore_session) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                result = await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert result == "recovered"
+        # The reconnect happened before the first invocation, driven
+        # purely by the None session rather than an in-call failure.
+        mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_reconnects_when_session_dies_while_waiting_for_call_lock() -> None:
+    """
+    A caller queued behind ``_call_lock`` reconnects when the
+    lifecycle dies before its turn.
+
+    Pooled callers serialize on ``_call_lock``. If the transport
+    fails while one of them waits, the session it saw at entry is
+    gone once it acquires the lock. That must classify as a
+    reconnectable failure, not an ``AttributeError`` on the ``None``
+    session that aborts the call with retries still available.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        mock_session.call_tool.return_value = ok_result
+
+        async def _restore_session(**_: object) -> None:
+            conn._session = mock_session
+
+        with patch.object(conn, "_reconnect", side_effect=_restore_session) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                # Hold the call lock so the caller passes the entry guard
+                # and queues; the lifecycle then dies before it runs.
+                await conn._call_lock.acquire()
+                call = asyncio.create_task(conn.call_tool("test_tool", {"query": "hi"}))
+                await asyncio.sleep(0)
+                conn._session = None
+                conn._call_lock.release()
+                result = await call
+
+        assert result == "recovered"
+        mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_in_flight_when_lifecycle_exits_fails_over_to_reconnect() -> None:
+    """
+    A call already waiting on the SDK when the lifecycle task exits
+    fails fast and reconnects instead of waiting forever.
+
+    The SDK does not reliably wake a request whose transport died on
+    the lifecycle task, and a session without a read timeout would
+    then hold ``_call_lock`` for good, wedging every later call.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        in_flight = asyncio.Event()
+
+        async def _call_tool(**_: object) -> MagicMock:
+            if not in_flight.is_set():
+                in_flight.set()
+                # The response to this first request never arrives.
+                await asyncio.Event().wait()
+            return ok_result
+
+        mock_session.call_tool = AsyncMock(side_effect=_call_tool)
+
+        with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+            call = asyncio.create_task(conn.call_tool("test_tool", {"query": "hi"}))
+            await asyncio.wait_for(in_flight.wait(), timeout=5)
+            # End the lifecycle task the way a steady-state transport
+            # failure does: it clears the session on its way out.
+            assert conn._close_event is not None
+            conn._close_event.set()
+            result = await asyncio.wait_for(call, timeout=5)
+
+        assert result == "recovered"
+        assert mock_session.call_tool.await_count == 2
+        assert not conn._call_lock.locked()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_marks_dead_the_session_the_attempt_ran_against() -> None:
+    """
+    The dead-session token names the session used under the lock.
+
+    A caller queued behind ``_call_lock`` may run against a session a
+    concurrent caller rebuilt meanwhile. If that session fails, the
+    reconnect must be told about *it*, not the one seen before the
+    lock; otherwise ``_reconnect`` mistakes the broken session for a
+    fresh rebuild and skips it.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as first_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        first_session.call_tool.return_value = ok_result
+        replacement = AsyncMock()
+        replacement.call_tool.side_effect = httpx.ReadError("connection reset")
+
+        async def _rebuild(*, dead_session: object) -> None:
+            assert dead_session is replacement, "reconnect was told about the wrong session"
+            conn._session = first_session
+
+        with patch.object(conn, "_reconnect", side_effect=_rebuild) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                await conn._call_lock.acquire()
+                call = asyncio.create_task(conn.call_tool("test_tool", {"query": "hi"}))
+                await asyncio.sleep(0)
+                # A concurrent caller rebuilt the session while this one queued.
+                conn._session = replacement
+                conn._call_lock.release()
+                result = await call
+
+        assert result == "recovered"
+        mock_reconnect.assert_awaited_once()
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_reconnect_failure_after_session_death_propagates() -> None:
+    """
+    A cleared session still surfaces the real error when auth is
+    genuinely still down.
+
+    Recovering the None-session case must not swallow a persistent
+    fault: if the reconnect keeps failing (the 401 has not cleared),
+    the underlying connection error propagates after the retries are
+    exhausted instead of the generic ``has no live session`` guard.
+    """
+    config = MCPServerConfig(
+        name="still-401",
+        url="http://localhost:9000/mcp",
+        retry=RetryPolicy(max_retries=1, backoff_base_s=0.01, backoff_max_s=0.01, jitter=False),
+    )
+
+    with _mock_mcp_transport():
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        # Session died and reconnect keeps failing with a connection
+        # error (auth still down).
+        conn._session = None
+        boom = httpx.ReadError("connection refused")
+
+        with patch.object(conn, "_reconnect", side_effect=boom) as mock_reconnect:
+            with patch("omnigent.tools.mcp._sleep", new_callable=AsyncMock):
+                with pytest.raises(httpx.ReadError, match="connection refused"):
+                    await conn.call_tool("test_tool", {"query": "hi"})
+
+        # Retried rather than raising the None-session guard once:
+        # one initial rebuild plus max_retries=1.
+        assert mock_reconnect.await_count == 2
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_reconnect_with_stale_token_keeps_the_replacement_session() -> None:
+    """
+    ``_reconnect`` told about a session another caller already
+    replaced returns without tearing the replacement down or
+    starting a new lifecycle.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as old_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        lifecycle_task = conn._lifecycle_task
+
+        # A concurrent caller rebuilt the session while this one was failing.
+        replacement = AsyncMock()
+        conn._session = replacement
+
+        with patch.object(conn, "_run_lifecycle") as mock_lifecycle:
+            await conn._reconnect(dead_session=old_session)
+
+        mock_lifecycle.assert_not_called()
+        assert conn._session is replacement
+        assert conn._lifecycle_task is lifecycle_task
+        assert conn._connected is True
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_call_tool_after_deliberate_close_still_raises() -> None:
+    """
+    A deliberately closed connection must stay closed.
+
+    ``close()`` drops the connected latch, so a later ``call_tool``
+    is caller misuse (hard error) — not a dead session to silently
+    resurrect via the reconnect path, which would leak a fresh
+    lifecycle task after shutdown.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport():
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        await conn.close()
+
+        with pytest.raises(RuntimeError, match="has no live session"):
+            await conn.call_tool("test_tool", {"query": "hi"})
+
+
+@pytest.mark.asyncio()
+async def test_concurrent_calls_after_session_death_reconnect_once() -> None:
+    """
+    Pooled callers that all find the session dead coalesce on one
+    rebuild.
+
+    Without single-flighting, every concurrent ``call_tool`` would
+    run ``_reconnect`` itself — each teardown killing the lifecycle
+    another caller just built. Exactly one rebuild must happen, and
+    every call must complete against it.
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+
+        ok_result = MagicMock()
+        ok_result.content = [TextContent(type="text", text="recovered")]
+        ok_result.isError = False
+        mock_session.call_tool.return_value = ok_result
+
+        # Lifecycle death cleared the session (steady-state fault).
+        conn._session = None
+
+        rebuilds = 0
+        real_lifecycle = conn._run_lifecycle
+
+        async def _counting_lifecycle() -> None:
+            nonlocal rebuilds
+            rebuilds += 1
+            await real_lifecycle()
+
+        with patch.object(conn, "_run_lifecycle", side_effect=_counting_lifecycle):
+            results = await asyncio.gather(
+                *(conn.call_tool("test_tool", {"query": "hi"}) for _ in range(5))
+            )
+
+        assert results == ["recovered"] * 5
+        assert rebuilds == 1
+
+    await conn.close()
+
+
+@pytest.mark.asyncio()
+async def test_close_during_reconnect_backoff_does_not_resurrect_connection() -> None:
+    """
+    A pool that closes the connection while a caller sits between
+    reconnect attempts must win: the pending call fails instead of
+    rebuilding a lifecycle nobody will ever close.
+    """
+    config = MCPServerConfig(
+        name="evicted-mid-retry",
+        url="http://localhost:9000/mcp",
+        retry=RetryPolicy(max_retries=2, backoff_base_s=0.01, backoff_max_s=0.01, jitter=False),
+    )
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        mock_session.call_tool.side_effect = httpx.ReadError("connection reset")
+
+        rebuilds = 0
+        real_lifecycle = conn._run_lifecycle
+
+        async def _counting_lifecycle() -> None:
+            nonlocal rebuilds
+            rebuilds += 1
+            await real_lifecycle()
+
+        # The pool evicts the connection during the retry backoff.
+        async def _close_during_backoff(_seconds: float) -> None:
+            await conn.close()
+
+        with patch.object(conn, "_run_lifecycle", side_effect=_counting_lifecycle):
+            with patch("omnigent.tools.mcp._sleep", side_effect=_close_during_backoff):
+                with pytest.raises(RuntimeError, match="was closed while a tool call"):
+                    await conn.call_tool("test_tool", {"query": "hi"})
+
+        assert rebuilds == 0
+        assert conn._connected is False
+        assert conn._session is None
+        assert conn._lifecycle_task is None
+
+
+@pytest.mark.asyncio()
+async def test_close_waits_for_in_flight_rebuild_and_stays_closed() -> None:
+    """
+    ``close()`` arriving while a rebuild is mid-connect lets that
+    rebuild settle, tears it down, and leaves the connection closed:
+    the rebuilt lifecycle's connected latch must not outlive close().
+    """
+    config = _make_http_config()
+
+    with _mock_mcp_transport() as mock_session:
+        conn = McpServerConnection(config=config)
+        await conn.connect()
+        # Lifecycle death cleared the session (steady-state fault).
+        conn._session = None
+
+        release = asyncio.Event()
+        initializing = asyncio.Event()
+
+        async def _blocking_initialize() -> None:
+            initializing.set()
+            await release.wait()
+
+        mock_session.initialize = AsyncMock(side_effect=_blocking_initialize)
+
+        rebuild = asyncio.create_task(conn._reconnect())
+        await initializing.wait()
+        closer = asyncio.create_task(conn.close())
+        await asyncio.sleep(0.05)
+        assert not closer.done(), "close() must wait for the in-flight rebuild"
+
+        release.set()
+        await rebuild
+        await closer
+
+        assert conn._connected is False
+        assert conn._session is None
+        assert conn._lifecycle_task is None
+        with pytest.raises(RuntimeError, match="has no live session"):
+            await conn.call_tool("test_tool", {"query": "hi"})
+
+
 # ── McpServerConnection.close ────────────────────────────
 
 
@@ -940,6 +1350,16 @@ def _request_timeout_error() -> McpError:
     )
 
 
+def test_is_connection_error_unwraps_exception_group() -> None:
+    """
+    A connect failure raised from the SDK's transport task group is
+    still classified as a connection error.
+    """
+    grouped = ExceptionGroup("transport", [httpx.ConnectError("still refusing")])  # noqa: F821
+    assert _is_connection_error(grouped) is True
+    assert _is_connection_error(ExceptionGroup("tool", [ValueError("bad args")])) is False  # noqa: F821
+
+
 def test_dead_session_timeout_detected_when_session_dead() -> None:
     """
     A request-timeout McpError with no live session means the
@@ -1315,7 +1735,7 @@ async def test_call_tool_reconnects_on_dead_session_timeout() -> None:
 
         mock_session.call_tool.side_effect = _die_mid_call
 
-        async def _restore_session() -> None:
+        async def _restore_session(**_: object) -> None:
             conn._session = mock_session
 
         with patch.object(conn, "_reconnect", side_effect=_restore_session) as mock_reconnect:
@@ -1453,7 +1873,7 @@ async def test_call_tool_retries_when_reconnect_itself_fails() -> None:
             None,
         ]
 
-        async def _flaky_reconnect() -> None:
+        async def _flaky_reconnect(**_: object) -> None:
             outcome = reconnect_results.pop(0)
             if outcome is not None:
                 raise outcome
