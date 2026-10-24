@@ -21,6 +21,7 @@ def test_unset_or_empty_uses_feature_defaults(environ: dict[str, str]) -> None:
 
     assert flags.enabled_features == frozenset({Feature.CLAUDE_OSC_STATUS})
     assert flags.frontend_dict() == {
+        "workspace_upload": False,
         "usage_page": False,
         "harness_install": False,
         "canvas": False,
