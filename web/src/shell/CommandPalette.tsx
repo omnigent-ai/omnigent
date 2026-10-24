@@ -30,7 +30,7 @@ import {
   XIcon,
 } from "lucide-react";
 import { useNavigate } from "@/lib/routing";
-import { useConversations } from "@/hooks/useConversations";
+import { type Conversation, useConversations } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -43,7 +43,11 @@ import {
   CommandItem,
   CommandList,
 } from "@/components/ui/command";
-import { conversationDisplayLabel, getConversationAgentType } from "./sidebarNav";
+import {
+  conversationDisplayLabel,
+  getConversationAgentType,
+  sortConversations,
+} from "./sidebarNav";
 
 export interface CommandPaletteProps {
   sessionsOnly?: boolean;
@@ -218,22 +222,26 @@ export function CommandPalette({
 
   const sessions = useMemo(() => {
     const seen = new Set<string>();
-    const out: { id: string; label: string; agent: string; snippet: string | null }[] = [];
+    const rows: Conversation[] = [];
     for (const page of data?.pages ?? []) {
       for (const c of page.data) {
         if (c.archived) continue;
         if (seen.has(c.id)) continue;
         seen.add(c.id);
-        out.push({
-          id: c.id,
-          label: conversationDisplayLabel(c),
-          agent: getConversationAgentType(c),
-          // Present only when the match was in chat content (not the title);
-          // the server omits it otherwise. Shown as a dimmed second line.
-          snippet: c.search_snippet ?? null,
-        });
+        rows.push(c);
       }
     }
+    // Live updates move rows without a refetch, so order unsearched lists by
+    // recency here; search results keep the server's order.
+    const searched = !sessionsOnly && debouncedQuery !== "";
+    const out = (searched ? rows : sortConversations(rows, null)).map((c) => ({
+      id: c.id,
+      label: conversationDisplayLabel(c),
+      agent: getConversationAgentType(c),
+      // Present only when the match was in chat content (not the title);
+      // the server omits it otherwise. Shown as a dimmed second line.
+      snippet: c.search_snippet ?? null,
+    }));
     // With no query the palette shows the full session page, which pushes the
     // Actions group below the fold. Cap the idle list to the few most-recent
     // sessions so both groups fit without scrolling; once the user types, show
