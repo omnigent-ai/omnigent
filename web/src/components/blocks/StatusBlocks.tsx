@@ -107,6 +107,8 @@ const FAILURE_CODE_DESCRIPTIONS: Record<string, string> = {
     "Codex couldn't compact the conversation on the previous model, so this turn didn't run.",
   client_update_required:
     "The agent CLI on the host is too old for the selected model. Update it on the host, then start a new session.",
+  content_policy_refusal:
+    "The model's safeguards refused this message. Start a new session and rephrase it without the flagged content.",
 };
 
 const COMPACTION_MODEL_FAILED_CODE = "codex_compaction_model_failed";

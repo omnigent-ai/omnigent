@@ -5724,6 +5724,23 @@ _OLD_CLI_CARD = {
     "remediation": "Run `claude update` on the host, then start a new session.",
 }
 
+_CONTENT_POLICY_REFUSAL_DETAIL = (
+    "API Error: Sonnet 4 can't help with this. Start a new session to continue.\n\n"
+    "Send feedback with /feedback or learn more: https://www.anthropic.com/legal/aup"
+)
+_CONTENT_POLICY_REFUSAL_CARD = {
+    "title": "The model's safeguards blocked this message",
+    "cause": (
+        "The model provider's usage-policy safeguards refused this request, which can "
+        "happen with ordinary content. The flagged content stays in this session's "
+        "history, so later turns here may be refused too."
+    ),
+    "remediation": (
+        "Start a new session and rephrase the request without the flagged content, "
+        "or choose a different model with the model picker or /model."
+    ),
+}
+
 
 _CODEX_MODEL_DETAIL = (
     "The 'system.ai.gpt-6-1-sol' model is not supported when using Codex with a ChatGPT account."
@@ -5789,6 +5806,14 @@ _CODEX_LOGIN_EXPIRED_DETAIL = (
             _OLD_CLI_DETAIL,
             "client_update_required",
             _OLD_CLI_CARD,
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (
+            _CONTENT_POLICY_REFUSAL_DETAIL,
+            "content_policy_refusal",
+            _CONTENT_POLICY_REFUSAL_CARD,
             "claude-code-native-ui",
             False,
             {},

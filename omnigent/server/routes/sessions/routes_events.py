@@ -63,6 +63,7 @@ from omnigent.runner.launch_failure import (
     diagnose_client_update_required,
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
+    diagnose_content_policy_refusal,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.transports.ws_tunnel.frames import (
@@ -2237,12 +2238,12 @@ def register_events_routes(
                 else:
                     error_code = "native_turn_error"
                 classified_code = classify_native_turn_error(error_code, output)
-                # The old-CLI refusal carries the versions, so the card can name the fix.
-                diagnosis = (
-                    diagnose_client_update_required(output)
-                    if classified_code == "client_update_required"
-                    else None
-                )
+                # Claude Code's refusal text identifies the cause, so the card can name the fix.
+                diagnosis = None
+                if classified_code == "client_update_required":
+                    diagnosis = diagnose_client_update_required(output)
+                elif classified_code == "content_policy_refusal":
+                    diagnosis = diagnose_content_policy_refusal(output)
                 if harness == "codex-native" and classified_code in {
                     "codex_turn_error",
                     "native_turn_error",

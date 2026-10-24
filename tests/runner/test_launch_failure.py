@@ -13,6 +13,7 @@ from omnigent.runner.launch_failure import (
     diagnose_client_update_required,
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
+    diagnose_content_policy_refusal,
     diagnose_model_unavailable,
 )
 
@@ -30,6 +31,19 @@ _CLIENT_UPDATE_OUTPUT = (
     'API Error: 400 {"message":"Claude Code 2.1.217 does not support this model; '
     "version 2.1.280 or newer is required. Run 'claude update', or update the Claude "
     'desktop app, then try again."}'
+)
+
+# Claude Code's turn error when the model's safeguards refuse a request: two 2.1.283
+# wordings, then the wording older releases print.
+_CONTENT_POLICY_REFUSAL_OUTPUTS = (
+    "API Error: Sonnet 4 can't help with this. Start a new session to continue.\n\n"
+    "Send feedback with /feedback or learn more: https://www.anthropic.com/legal/aup\n\n"
+    "Message ID: msg_43124cd62101",
+    "API Error: Claude Opus 4.7's safeguards flagged this message "
+    "(https://www.anthropic.com/legal/aup). This sometimes happens with safe, normal "
+    "conversations. Claude Code can't respond to this message with Claude Opus 4.7.",
+    "Claude Code is unable to respond to this request, which appears to violate our Usage "
+    "Policy. Please double press esc to edit your last message or start a new session.",
 )
 
 
@@ -387,8 +401,11 @@ def test_other_unsupported_model_errors_are_not_client_update(message: str) -> N
 
 
 @pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
-def test_client_update_text_does_not_override_specific_failure_codes(code: str) -> None:
-    assert classify_native_turn_error(code, _CLIENT_UPDATE_OUTPUT) == code
+@pytest.mark.parametrize("message", [_CLIENT_UPDATE_OUTPUT, _CONTENT_POLICY_REFUSAL_OUTPUTS[0]])
+def test_cli_refusal_text_does_not_override_specific_failure_codes(
+    code: str, message: str
+) -> None:
+    assert classify_native_turn_error(code, message) == code
 
 
 def test_client_update_diagnosis_names_both_versions_and_the_fix() -> None:
@@ -418,6 +435,39 @@ def test_client_update_diagnosis_without_installed_version_still_names_required(
 def test_client_update_diagnosis_ignores_unrelated_errors() -> None:
     assert diagnose_client_update_required(_GATEWAY_499_OUTPUT) is None
     assert diagnose_client_update_required("") is None
+
+
+@pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])
+@pytest.mark.parametrize("message", _CONTENT_POLICY_REFUSAL_OUTPUTS)
+def test_classifies_content_policy_refusal(code: str, message: str) -> None:
+    assert classify_native_turn_error(code, message) == "content_policy_refusal"
+    assert diagnose_content_policy_refusal(message) is not None
+
+
+def test_content_policy_refusal_diagnosis_explains_the_block_and_recovery() -> None:
+    diagnosis = diagnose_content_policy_refusal(_CONTENT_POLICY_REFUSAL_OUTPUTS[0])
+
+    assert diagnosis is not None
+    assert diagnosis.title == "The model's safeguards blocked this message"
+    assert "stays in this session's history" in diagnosis.cause
+    assert diagnosis.remediation is not None
+    assert "Start a new session" in diagnosis.remediation
+    assert diagnosis.category is ErrorCategory.UPSTREAM
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "I can't help with this request right now.",
+        "API Error: 400 Usage policy violation detected in tool schema",
+        "The reply said the prompt appears to violate our Usage Policy, so I rephrased it.",
+        _GATEWAY_499_OUTPUT,
+        "",
+    ],
+)
+def test_other_errors_are_not_content_policy_refusals(message: str) -> None:
+    assert classify_native_turn_error("native_turn_error", message) != "content_policy_refusal"
+    assert diagnose_content_policy_refusal(message) is None
 
 
 @pytest.mark.parametrize(
@@ -614,6 +664,7 @@ def test_compaction_model_failure_code_survives_its_budget_text() -> None:
         ("rate_limit_exceeded", "You can retry this turn"),
         ("transient_upstream_error", "temporary error"),
         ("client_update_required", "too old for the selected model"),
+        ("content_policy_refusal", "safeguards refused this message"),
         ("budget_exhausted", "budget"),
         ("databricks_sign_in_pending", "Databricks sign-in"),
         ("agent_startup_pending", "still starting"),

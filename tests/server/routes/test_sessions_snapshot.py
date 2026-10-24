@@ -793,9 +793,13 @@ async def test_session_snapshot_classifies_preexisting_native_rate_limit_errors(
             'version 2.1.280 or newer is required."}',
             "client_update_required",
         ),
+        (
+            "API Error: Sonnet 4 can't help with this. Start a new session to continue.",
+            "content_policy_refusal",
+        ),
     ],
 )
-async def test_session_snapshot_classifies_preexisting_gateway_cancel_and_old_cli_errors(
+async def test_session_snapshot_classifies_preexisting_generic_native_errors(
     message: str,
     expected_code: str,
 ) -> None:
