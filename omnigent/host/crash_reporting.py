@@ -22,10 +22,11 @@ import threading
 import time
 from collections.abc import Callable
 from dataclasses import dataclass, field
+from pathlib import Path
 from types import FrameType, TracebackType
 from typing import IO, Literal
 
-from omnigent._platform import IS_POSIX
+from omnigent._platform import IS_LINUX, IS_POSIX
 from omnigent.debug_logging import close_debug_log_sink, debug_event
 from omnigent.process_logging import drain_terminal_output, process_log_dir
 
@@ -56,6 +57,15 @@ _SIGNAL_FLUSH_TIMEOUT_S = 2.0
 _SIGNAL_EXIT_DEADLINE_S = 3.0
 # Wait for terminal output on the signal exit path; a stalled terminal gets only this.
 _SIGNAL_TERMINAL_DRAIN_S = 0.5
+
+# Exit-report hints at a stop signal's sender (see _signal_sender_hints).
+_SENDER_CHAIN_DEPTH = 5
+_SENDER_COMMANDS_MAX = 5
+_STOP_PROGRAMS = frozenset(
+    {"shutdown", "reboot", "poweroff", "halt", "kill", "pkill", "killall", "systemctl"}
+)
+_OMNIGENT_PROGRAMS = frozenset({"omnigent", "omni", "isaac"})
+_STOP_WORDS = frozenset({"stop", "restart", "enable", "upgrade", "update", "uninstall"})
 
 FAULTHANDLER_LOG_NAME = "faulthandler.log"
 
@@ -373,7 +383,14 @@ def _exit_on_signal(signum: int) -> None:
         # No deadline without a watchdog: don't risk wedging in logging.
         _die_by_signal(signum)
     try:
-        report_host_exit("signal", exit_code=exit_code, signal=signal.Signals(signum).name)
+        hints = _signal_sender_hints()
+        report_host_exit(
+            "signal",
+            exit_code=exit_code,
+            signal=signal.Signals(signum).name,
+            parent_chain=hints.get("parent_chain"),
+            stop_commands=hints.get("stop_commands"),
+        )
         drain_debug_sink()
         for handler in logging.getLogger().handlers:
             with contextlib.suppress(Exception):
@@ -382,6 +399,82 @@ def _exit_on_signal(signum: int) -> None:
         drain_terminal_output(_SIGNAL_TERMINAL_DRAIN_S)
     finally:
         _die_by_signal(signum)
+
+
+def _proc_argv(pid: int) -> list[str]:
+    """Return a Linux process's argv, or ``[]`` when it can't be read."""
+    try:
+        raw = Path(f"/proc/{pid}/cmdline").read_bytes()
+    except OSError:
+        return []
+    return [arg.decode("utf-8", "replace") for arg in raw.split(b"\0") if arg]
+
+
+def _proc_parent(pid: int) -> int | None:
+    """Return a Linux process's parent pid, or ``None`` when it can't be read."""
+    try:
+        stat = Path(f"/proc/{pid}/stat").read_text()
+    except OSError:
+        return None
+    # The command name sits in parentheses and may itself contain spaces.
+    fields = stat.rpartition(")")[2].split()
+    return int(fields[1]) if len(fields) > 1 and fields[1].isdigit() else None
+
+
+def _program_name(argv: list[str]) -> str:
+    return os.path.basename(argv[0]) if argv else "?"
+
+
+def _stop_command(argv: list[str]) -> str | None:
+    """Name a command that stops processes, e.g. ``"isaac omni host stop"``.
+
+    Only known program names and stop words are kept, so no path, user name
+    or other argument leaves the machine.
+    """
+    words = [os.path.basename(arg) for arg in argv[:6]]
+    if not words:
+        return None
+    if words[0] in _STOP_PROGRAMS:
+        return " ".join([words[0], *(word for word in words[1:] if word in _STOP_WORDS)])
+    programs = [word for word in words if word in _OMNIGENT_PROGRAMS]
+    stops = [word for word in words if word in _STOP_WORDS]
+    if not programs or not stops:
+        return None
+    return " ".join(word for word in words if word in _OMNIGENT_PROGRAMS | _STOP_WORDS)
+
+
+def _signal_sender_hints() -> dict[str, str]:
+    """Hint at who sent a stop signal: the parent chain and stop commands running now.
+
+    A signal handler can't see the sender's pid, so the exit report records the
+    likely ones instead. Linux only; empty elsewhere or when ``/proc`` is
+    unreadable.
+    """
+    if not IS_LINUX:
+        return {}
+    hints: dict[str, str] = {}
+    with contextlib.suppress(Exception):
+        chain: list[str] = []
+        pid = os.getppid()
+        while pid > 0 and len(chain) < _SENDER_CHAIN_DEPTH:
+            chain.append(_program_name(_proc_argv(pid)))
+            parent = _proc_parent(pid)
+            if parent is None or parent == pid:
+                break
+            pid = parent
+        hints["parent_chain"] = " <- ".join(chain)
+        own = os.getpid()
+        commands: list[str] = []
+        for entry in Path("/proc").iterdir():
+            if not entry.name.isdigit() or int(entry.name) == own:
+                continue
+            command = _stop_command(_proc_argv(int(entry.name)))
+            if command is not None and command not in commands:
+                commands.append(command)
+            if len(commands) >= _SENDER_COMMANDS_MAX:
+                break
+        hints["stop_commands"] = ", ".join(commands)
+    return hints
 
 
 def _die_by_signal(signum: int) -> None:
