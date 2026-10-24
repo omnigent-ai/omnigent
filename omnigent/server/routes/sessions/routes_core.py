@@ -44,6 +44,7 @@ from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, O
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     RUNNER_TUNNEL_TOKEN_HEADER,
+    token_bound_runner_id,
 )
 from omnigent.runner.routing import RunnerRouter, routing_host_id
 from omnigent.runner.session_init_protocol import build_runner_session_init_payload
@@ -201,6 +202,7 @@ from omnigent.server.schemas import (
     SessionLabelsResponse,
     SessionList,
     SessionListItem,
+    SessionManagedHostRequest,
     SessionProjectSummary,
     SessionResponse,
     UpdateSessionRequest,
@@ -507,12 +509,13 @@ def register_core_routes(
         requested_host_id: str | None = None,
     ) -> None:
         """
-        Provision a managed sandbox host for a just-created session.
+        Provision a managed sandbox host for a session that has no host.
 
-        Shared by the two create paths and the fork path: the JSON create
-        (an existing ``agent_id``), the multipart bundle create (a
-        freshly-created session-scoped ``agent_id``), and a fork (the
-        clone's own session-scoped ``agent_id``). Validates that managed
+        Shared by the two create paths, the fork path and a move: the JSON
+        create (an existing ``agent_id``), the multipart bundle create (a
+        freshly-created session-scoped ``agent_id``), a fork (the clone's
+        own session-scoped ``agent_id``), and a move of an existing session
+        whose old host binding was just cleared. Validates that managed
         hosts are configured and the provider is offered, records the
         repository workspace for relaunch, seeds the launch-progress
         indicator, and schedules the background ``_run_managed_launch`` —
@@ -673,6 +676,42 @@ def register_core_routes(
             raise OmnigentError(
                 f"host {requested_host_id} or its name {name} is already in use",
                 code=ErrorCode.ALREADY_EXISTS,
+            )
+
+    async def _restore_host_binding(
+        session_id: str,
+        *,
+        host_id: str,
+        workspace: str,
+        git_branch: str | None,
+        labels: dict[str, str],
+    ) -> None:
+        """
+        Put back the binding a refused sandbox move cleared, unless it was rebound.
+
+        Best effort: the caller re-raises the refusal, which is the error to report.
+
+        :param session_id: The session the move unbound, e.g. ``"conv_abc123"``.
+        :param host_id: The host it was bound to before the move.
+        :param workspace: Its working directory on that host.
+        :param git_branch: Its worktree branch there, or ``None``.
+        :param labels: The sandbox labels the move removed.
+        """
+        try:
+            current = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if current is None or current.host_id is not None or current.runner_id is not None:
+                return
+            await asyncio.to_thread(
+                conversation_store.set_host_id, session_id, host_id, workspace, git_branch
+            )
+            if labels:
+                await asyncio.to_thread(conversation_store.set_labels, session_id, labels)
+        except Exception:  # Must not replace the refusal being raised.
+            _logger.warning(
+                "Could not restore session %s's host binding after a refused sandbox move",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
             )
 
     async def _bind_and_launch_on_caller_host(
@@ -4082,6 +4121,169 @@ def register_core_routes(
             permission_level=level,
             last_task_error=None,
             agent_name=base_agent.name,
+        )
+
+    # ── POST /sessions/{session_id}/managed-host ────────────────
+
+    @router.post(
+        "/sessions/{session_id}/managed-host",
+        status_code=202,
+        # Same snapshot shape as PATCH; responses= advertises it to tooling.
+        response_model=None,
+        responses={202: {"model": SessionResponse}},
+    )
+    async def move_session_to_managed_host(
+        request: Request,
+        session_id: str,
+        body: SessionManagedHostRequest,
+    ) -> SessionResponse:
+        """
+        Move an existing session onto a new server-provisioned sandbox.
+
+        The sandbox counterpart of ``POST /v1/hosts/{host_id}/runners``: the
+        caller first releases the session's runner (``PATCH`` with
+        ``runner_id: ""``), then this drops the old host binding and
+        schedules the background launch a managed create does. It returns
+        before the sandbox exists. Until the new host binds, the session
+        looks like an in-flight managed create, so a message sent meanwhile
+        waits for the launch rather than relaunching on the old host.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session to move, e.g. ``"conv_abc123"``.
+        :param body: The validated :class:`SessionManagedHostRequest`.
+        :returns: The session snapshot, with ``host_id`` and ``workspace``
+            null and ``sandbox_status`` reporting the launch.
+        :raises OmnigentError: 403/404 unless the caller owns the session;
+            400 for a sub-agent or side chat, a session with no agent, one
+            already on a sandbox, or a sandbox this server has not configured;
+            409 while a runner is bound, for a session with no host (such as
+            one already moving), if the binding changed during the move, or
+            if ``body.host_id`` is taken.
+        """
+        from omnigent.server.managed_hosts import (
+            MANAGED_REPO_LABEL_KEY,
+            REQUESTED_HOST_ID_LABEL_KEY,
+        )
+
+        user_id = _get_user_id(request, auth_provider)
+        await _require_access(
+            user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
+        )
+        conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if conv is None:
+            raise _session_not_found()
+        if conv.kind == "sub_agent" or conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+            raise OmnigentError(
+                "Sub-agents and side chats run on their parent's runner; "
+                "move the parent session instead.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if conv.agent_id is None:
+            raise OmnigentError(
+                "Session has no agent binding — cannot start it in a sandbox.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        if conv.runner_id is not None:
+            raise OmnigentError(
+                "Session still has a runner bound. Release it first with "
+                'PATCH /v1/sessions/{session_id} and {"runner_id": ""}.',
+                code=ErrorCode.CONFLICT,
+            )
+        if conv.host_id is None or conv.workspace is None:
+            raise OmnigentError(
+                "This session has no host to move from: it is already moving to a "
+                "sandbox, or it needs resuming on a machine.",
+                code=ErrorCode.CONFLICT,
+            )
+        previous_host_id, previous_workspace = conv.host_id, conv.workspace
+        host_store = getattr(request.app.state, "host_store", None)
+        if host_store is not None:
+            current_host = await asyncio.to_thread(host_store.get_host, previous_host_id)
+            # Nothing would tear the old sandbox down once the session leaves it.
+            if current_host is not None and current_host.sandbox_provider is not None:
+                raise OmnigentError(
+                    "This session already runs in a sandbox; "
+                    "moving it to another sandbox is not supported.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+        if body.host_id is not None:
+            await _check_requested_host_id(request, body.host_id, user_id)
+
+        # Claim the session with a runner id no runner holds, through the same
+        # ``WHERE runner_id IS NULL`` bind a host launch uses. A runner bound
+        # since the checks above, or a concurrent move, makes the claim fail.
+        claim = token_bound_runner_id(secrets.token_urlsafe(32))
+        held: Conversation | None = None
+        if await asyncio.to_thread(conversation_store.set_runner_id, session_id, claim):
+            held = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        if held is None or held.runner_id != claim or held.host_id != previous_host_id:
+            # Another move unbound the session first; drop a claim that still stands.
+            if held is not None and held.runner_id == claim:
+                await asyncio.to_thread(conversation_store.clear_runner_id, session_id)
+            raise OmnigentError(
+                "The session's host or runner changed while moving it. Reload and try again.",
+                code=ErrorCode.CONFLICT,
+            )
+
+        # An earlier sandbox's repositories and host id would steer this
+        # launch's relaunches and routing, so they leave with the old binding.
+        stale_labels = {
+            key: value
+            for key, value in held.labels.items()
+            if key in (MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY)
+            or key.startswith(f"{MANAGED_REPO_LABEL_KEY}.")
+        }
+        # Hostless until the sandbox binds, so nothing relaunches on the old host;
+        # clearing the binding also releases the claim.
+        try:
+            await asyncio.to_thread(conversation_store.clear_host_binding, session_id)
+        except ConversationNotFoundError as exc:
+            raise _session_not_found() from exc
+        try:
+            for key in stale_labels:
+                await asyncio.to_thread(conversation_store.delete_label, session_id, key)
+            await _schedule_managed_launch(
+                request,
+                session_id=session_id,
+                agent_id=conv.agent_id,
+                user_id=user_id,
+                sandbox_provider=body.sandbox_provider,
+                workspaces=[body.workspace] if body.workspace is not None else [],
+                requested_host_id=body.host_id,
+            )
+        except Exception as exc:
+            await _restore_host_binding(
+                session_id,
+                host_id=previous_host_id,
+                workspace=previous_workspace,
+                git_branch=conv.git_branch,
+                labels=stale_labels,
+            )
+            if isinstance(exc, ConversationNotFoundError):
+                raise _session_not_found() from exc
+            raise
+        _logger.info(
+            "Session moving to a managed sandbox",
+            extra=debug_event(
+                "session_managed_host_requested",
+                session_id=session_id,
+                previous_host_id=conv.host_id,
+                provider=body.sandbox_provider,
+            ),
+        )
+        level = await _get_permission_level(user_id, session_id, permission_store)
+        return await _get_session_snapshot(
+            conversation_store,
+            session_id,
+            level,
+            agent_store,
+            agent_cache,
+            liveness_lookup=liveness_lookup,
+            include_items=False,
+            include_usage=False,
+            runner_exit_reports=runner_exit_reports,
+            viewer_id=user_id,
+            request=request,
         )
 
     # ── POST /sessions/{session_id}/switch-agent (reserved) ──────

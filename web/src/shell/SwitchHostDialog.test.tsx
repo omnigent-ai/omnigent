@@ -9,7 +9,9 @@ import { SwitchHostDialog } from "./SwitchHostDialog";
 import { useHosts } from "@/hooks/useHosts";
 import { useSession } from "@/hooks/useSession";
 import { useHostFilesystem } from "@/hooks/useHostFilesystem";
-import { launchRunner, updateSession } from "@/lib/sessionsApi";
+import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
+import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { launchManagedHost, launchRunner, updateSession } from "@/lib/sessionsApi";
 import { terminalsQueryKey, type TerminalInfo } from "@/lib/terminals";
 
 // Heavy children have their own suites; stub them so this one stays on the
@@ -63,7 +65,11 @@ vi.mock("@/hooks/useHostFilesystem", () => ({ useHostFilesystem: vi.fn() }));
 vi.mock("@/hooks/useRecentWorkspaces", () => ({
   useRecentWorkspaces: () => ({ recent: ["/Users/alice/repo"], addRecent: vi.fn() }),
 }));
-vi.mock("@/lib/sessionsApi", () => ({ launchRunner: vi.fn(), updateSession: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({
+  launchManagedHost: vi.fn(),
+  launchRunner: vi.fn(),
+  updateSession: vi.fn(),
+}));
 // Radix Select uses a portal + pointer events jsdom can't drive; a native
 // <select> keeps the option list assertable.
 vi.mock("@/components/ui/select", () => ({
@@ -86,6 +92,7 @@ vi.mock("@/components/ui/select", () => ({
   ),
   SelectTrigger: ({ children }: { children: ReactNode }) => children,
   SelectValue: () => null,
+  SelectSeparator: () => null,
   SelectContent: ({ children }: { children: ReactNode }) => children,
   SelectItem: ({
     value,
@@ -105,16 +112,52 @@ vi.mock("@/components/ui/select", () => ({
 const useHostsMock = vi.mocked(useHosts);
 const useHostFilesystemMock = vi.mocked(useHostFilesystem);
 const launchRunnerMock = vi.mocked(launchRunner);
+const launchManagedHostMock = vi.mocked(launchManagedHost);
 const updateSessionMock = vi.mocked(updateSession);
 
-function renderDialog() {
+// A server that provisions Arclet sandboxes, moves sessions onto them, and lets
+// the caller name the new host.
+const ARCLET_SERVER: Partial<ServerInfo> = {
+  managed_sandboxes_enabled: true,
+  move_to_managed_sandbox: true,
+  sandbox_provider: "arclet",
+  sandbox_providers: ["arclet"],
+  request_managed_sandbox_host_id: true,
+};
+
+/**
+ * Render the dialog for a session on ``host_old``.
+ *
+ * @param info - Server capabilities; omitted leaves the context loading, which
+ *   keeps the sandbox rows hidden.
+ */
+function renderDialog(info?: Partial<ServerInfo>) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const dialog = (
+    <SwitchHostDialog open onOpenChange={() => {}} sessionId="conv_1" currentHostId="host_old" />
+  );
   render(
     <QueryClientProvider client={client}>
-      <SwitchHostDialog open onOpenChange={() => {}} sessionId="conv_1" currentHostId="host_old" />
+      {info === undefined ? (
+        dialog
+      ) : (
+        <CapabilitiesProvider info={{ ...FALLBACK_SERVER_INFO, ...info }}>
+          {dialog}
+        </CapabilitiesProvider>
+      )}
     </QueryClientProvider>,
   );
   return client;
+}
+
+/** Leave the session's own laptop as the only online host. */
+function onlyOriginHostOnline(): void {
+  useHostsMock.mockReturnValue({
+    data: [
+      { host_id: "host_old", name: "mac-laptop", owner: "alice", status: "online" },
+      { host_id: "host_new", name: "linux-box", owner: "alice", status: "offline" },
+    ],
+  } as unknown as ReturnType<typeof useHosts>);
 }
 
 beforeEach(() => {
@@ -122,6 +165,7 @@ beforeEach(() => {
   useHostsMock.mockReset();
   useHostFilesystemMock.mockReset();
   launchRunnerMock.mockReset();
+  launchManagedHostMock.mockReset();
   updateSessionMock.mockReset();
   useHostsMock.mockReturnValue({
     data: [
@@ -135,6 +179,7 @@ beforeEach(() => {
   } as unknown as ReturnType<typeof useHostFilesystem>);
   updateSessionMock.mockResolvedValue({} as Awaited<ReturnType<typeof updateSession>>);
   launchRunnerMock.mockResolvedValue({ runnerId: "runner_new" });
+  launchManagedHostMock.mockResolvedValue({} as Awaited<ReturnType<typeof launchManagedHost>>);
 });
 
 afterEach(() => cleanup());
@@ -368,5 +413,126 @@ describe("SwitchHostDialog", () => {
       "conv_1",
       "/Users/alice/git/omnigent",
     );
+  });
+
+  describe("new sandbox target", () => {
+    it("lists a sandbox per provider only on a server that can move a session onto one", () => {
+      renderDialog({ ...ARCLET_SERVER, managed_sandboxes_enabled: false });
+      expect(screen.queryByTestId("switch-host-sandbox-option-arclet")).toBeNull();
+      cleanup();
+
+      // An older server launches sandboxes but lacks the move, which would
+      // fail only after the switch has released the runner.
+      renderDialog({ ...ARCLET_SERVER, move_to_managed_sandbox: false });
+      expect(screen.queryByTestId("switch-host-sandbox-option-arclet")).toBeNull();
+      cleanup();
+
+      renderDialog({ ...ARCLET_SERVER, sandbox_providers: ["arclet", "modal"] });
+      expect(screen.getByTestId("switch-host-sandbox-option-arclet")).toHaveTextContent(
+        "Arclet Sandbox",
+      );
+      expect(screen.getByTestId("switch-host-sandbox-option-modal")).toBeInTheDocument();
+      // A fresh provision is never the default while another host is online.
+      expect(screen.getByTestId("mock-host-select")).toHaveValue("host_new");
+    });
+
+    it("moves the session onto a new sandbox after releasing its runner", async () => {
+      const client = renderDialog(ARCLET_SERVER);
+      client.setQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"), [
+        { id: "terminal_shellA_s1", name: "shellA", session: "s1", running: true },
+      ]);
+
+      fireEvent.change(screen.getByTestId("mock-host-select"), {
+        target: { value: "__sandbox__:arclet" },
+      });
+      // A sandbox doesn't exist yet, so a repository replaces the directory.
+      expect(screen.queryByTestId("mock-workspace-input")).toBeNull();
+      fireEvent.change(screen.getByTestId("switch-host-sandbox-repo-input"), {
+        target: { value: "https://github.com/databricks-eng/universe" },
+      });
+      fireEvent.change(screen.getByTestId("switch-host-sandbox-branch-input"), {
+        target: { value: "feature/login" },
+      });
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      await waitFor(() => expect(launchManagedHostMock).toHaveBeenCalledTimes(1));
+      expect(updateSessionMock).toHaveBeenCalledWith("conv_1", {
+        runnerId: "",
+        modelOverride: null,
+        silent: true,
+      });
+      // The managed-host endpoint refuses a session whose runner is still bound.
+      expect(updateSessionMock.mock.invocationCallOrder[0]).toBeLessThan(
+        launchManagedHostMock.mock.invocationCallOrder[0],
+      );
+      const [sessionId, sandbox] = launchManagedHostMock.mock.calls[0];
+      expect(sessionId).toBe("conv_1");
+      expect(sandbox).toMatchObject({
+        provider: "arclet",
+        workspace: "https://github.com/databricks-eng/universe#feature/login",
+      });
+      expect(sandbox.hostId).toMatch(/^[0-9a-f]{32}$/);
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      await waitFor(() =>
+        expect(client.getQueryData<TerminalInfo[]>(terminalsQueryKey("conv_1"))).toEqual([]),
+      );
+    });
+
+    it("defaults to an empty sandbox when no other host is online", async () => {
+      onlyOriginHostOnline();
+      renderDialog({ ...ARCLET_SERVER, request_managed_sandbox_host_id: false });
+
+      expect(screen.queryByTestId("switch-host-no-targets")).toBeNull();
+      await waitFor(() =>
+        expect(screen.getByTestId("mock-host-select")).toHaveValue("__sandbox__:arclet"),
+      );
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      await waitFor(() => expect(launchManagedHostMock).toHaveBeenCalledTimes(1));
+      expect(launchManagedHostMock).toHaveBeenCalledWith("conv_1", {
+        provider: "arclet",
+        workspace: null,
+      });
+    });
+
+    it("blocks a branch without a repository and a malformed repository URL", () => {
+      onlyOriginHostOnline();
+      renderDialog(ARCLET_SERVER);
+      const button = screen.getByTestId("switch-host-button");
+      const repo = screen.getByTestId("switch-host-sandbox-repo-input");
+
+      fireEvent.change(screen.getByTestId("switch-host-sandbox-branch-input"), {
+        target: { value: "main" },
+      });
+      expect(button).toBeDisabled();
+      expect(screen.getByTestId("switch-host-sandbox-repo-error")).toHaveTextContent(
+        "Add the repository this branch belongs to.",
+      );
+
+      fireEvent.change(repo, { target: { value: "/Users/alice/repo" } });
+      expect(button).toBeDisabled();
+      expect(screen.getByTestId("switch-host-sandbox-repo-error")).toHaveTextContent(
+        "Enter a repository URL",
+      );
+
+      fireEvent.change(repo, { target: { value: "git@github.com:org/repo.git" } });
+      expect(button).toBeEnabled();
+      expect(screen.queryByTestId("switch-host-sandbox-repo-error")).toBeNull();
+    });
+
+    it("offers the origin host again when the sandbox launch is refused", async () => {
+      launchManagedHostMock.mockRejectedValue(
+        new Error("sandbox provider 'arclet' is not configured on this server"),
+      );
+      onlyOriginHostOnline();
+      renderDialog(ARCLET_SERVER);
+
+      fireEvent.click(screen.getByTestId("switch-host-button"));
+
+      const error = await screen.findByTestId("switch-host-error");
+      expect(error).toHaveTextContent("isn't running anywhere");
+      expect(error).toHaveTextContent("is not configured on this server");
+      expect(screen.getByTestId("switch-host-option-host_old")).toBeInTheDocument();
+    });
   });
 });

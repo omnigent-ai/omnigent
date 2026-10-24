@@ -208,6 +208,17 @@ describe("resolveServerInfo request_managed_sandbox_host_id", () => {
   });
 });
 
+describe("resolveServerInfo move_to_managed_sandbox", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ move_to_managed_sandbox: advertised });
+    expect(parsed.move_to_managed_sandbox).toBe(expected);
+  });
+});
+
 describe("resolveServerInfo smart_routing_sources", () => {
   it("reads an explicit field verbatim", async () => {
     const parsed = await probe({

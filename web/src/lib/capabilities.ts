@@ -224,6 +224,13 @@ export interface ServerInfo {
    */
   request_managed_sandbox_host_id?: boolean;
   /**
+   * True when ``POST /v1/sessions/{id}/managed-host`` can move a session onto
+   * a new sandbox. Gates Switch host's sandbox rows: an older server lacks the
+   * route, and the switch releases the runner before calling it. Fails to
+   * ``false``.
+   */
+  move_to_managed_sandbox?: boolean;
+  /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
    * and the Import bundle button. Absent on older servers (off).
@@ -317,6 +324,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   dictation_available: false,
   archive_worktree_cleanup: false,
   request_managed_sandbox_host_id: false,
+  move_to_managed_sandbox: false,
   branding: null,
 };
 
@@ -430,6 +438,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
+          move_to_managed_sandbox: data.move_to_managed_sandbox === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,

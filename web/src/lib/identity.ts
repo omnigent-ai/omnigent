@@ -237,12 +237,16 @@ function beginSessionHostResolve(url: string): Promise<void> | null {
 // {@link hostScopeForUrl} can't see it: the session create (POST /v1/sessions)
 // and the host-mediated local import (POST /v1/imports/local[/stream]).
 const BODY_HOST_KEYED_RE = /\/v1\/(?:sessions(?:\?|$)|imports\/local(?:[/?]|$))/;
-// A managed fork keys like a managed create: its launch must run where its own
-// new host connects, never on the source session's replica.
+// A managed fork, or a move onto a new sandbox, keys like a managed create: its
+// launch must run where its own new host connects, never on the source
+// session's replica.
 const FORK_RE = /\/v1\/sessions\/[^/?#]+\/fork(?:\?|$)/;
+const MANAGED_HOST_MOVE_RE = /\/v1\/sessions\/[^/?#]+\/managed-host(?:\?|$)/;
 
-function isManagedForkRequest(url: string, body: BodyInit | null | undefined): boolean {
-  if (typeof body !== "string" || !FORK_RE.test(url)) return false;
+function isManagedLaunchRequest(url: string, body: BodyInit | null | undefined): boolean {
+  if (typeof body !== "string") return false;
+  if (MANAGED_HOST_MOVE_RE.test(url)) return true;
+  if (!FORK_RE.test(url)) return false;
   try {
     return (JSON.parse(body) as { host_type?: unknown }).host_type === "managed";
   } catch {
@@ -252,8 +256,8 @@ function isManagedForkRequest(url: string, body: BodyInit | null | undefined): b
 
 /**
  * Recover the target host_id from a JSON request body for a body-host-keyed
- * request ({@link isBodyHostKeyedRequest}) or a managed fork, or null when the
- * body names none.
+ * request ({@link isBodyHostKeyedRequest}), a managed fork, or a move onto a
+ * new sandbox, or null when the body names none.
  *
  * These requests carry the host in the body, not the URL, so left unkeyed they
  * round-robin and can miss the replica holding that host's runner tunnel. A
@@ -263,14 +267,16 @@ function isManagedForkRequest(url: string, body: BodyInit | null | undefined): b
  * body host_id pins both to the right replica like every other host-scoped
  * request. A managed-sandbox create's ``host_id`` is the id it chose for its
  * new sandbox host, so the launch runs where that host's tunnel will land.
- * A managed fork's ``host_id`` is the same choice. Bundled (multipart) creates
- * are hostless here (non-string body), as is a managed create or fork without
- * one; all yield null → unkeyed (see
+ * A managed fork's or move's ``host_id`` is the same choice. Bundled (multipart)
+ * creates are hostless here (non-string body), as is a managed create, fork or
+ * move without one; all yield null → unkeyed (see
  * {@link isBodyHostKeyedRequest}).
  */
 function hostIdFromBody(url: string, body: BodyInit | null | undefined): string | null {
   if (typeof body !== "string") return null;
-  if (!BODY_HOST_KEYED_RE.test(url) && !FORK_RE.test(url)) return null;
+  if (!BODY_HOST_KEYED_RE.test(url) && !FORK_RE.test(url) && !MANAGED_HOST_MOVE_RE.test(url)) {
+    return null;
+  }
   try {
     const hostId = (JSON.parse(body) as { host_id?: unknown }).host_id;
     return typeof hostId === "string" && hostId ? hostId : null;
@@ -591,7 +597,7 @@ export async function authenticatedFetch(
     // it is keyable ONLY by that body host_id (a managed create with none stays
     // unkeyed).
     const scope = hostScopeForUrl(url);
-    if (isManagedForkRequest(url, init?.body)) {
+    if (isManagedLaunchRequest(url, init?.body)) {
       derivedHostId = hostIdFromBody(url, init?.body);
     } else if (scope.scoped) {
       derivedHostId = scope.hostId;

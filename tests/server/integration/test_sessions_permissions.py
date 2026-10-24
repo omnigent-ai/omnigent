@@ -784,6 +784,39 @@ async def test_edit_grant_allows_post_but_blocks_permission_management(
     )
 
 
+async def test_move_to_managed_sandbox_requires_owner_access(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Moving a session onto a new sandbox is owner-only, like binding a
+    runner: an editor gets 403 and a user without access 404, and neither
+    changes the session.
+    """
+    agent = await create_test_agent(auth_client, user="bryan")
+    session_id = (await _create_session_as(auth_client, agent["id"], "user-a"))["id"]
+    resp = await _grant_permission(
+        auth_client,
+        session_id,
+        granter="user-a",
+        target_user="user-b",
+        level=LEVEL_EDIT,
+    )
+    assert resp.status_code == 200
+    owner = {"X-Forwarded-Email": "user-a"}
+    before = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+
+    for caller, expected_status in (("user-b", 403), ("user-c", 404)):
+        resp = await auth_client.post(
+            f"/v1/sessions/{session_id}/managed-host",
+            json={},
+            headers={"X-Forwarded-Email": caller},
+        )
+        assert resp.status_code == expected_status, (caller, resp.text)
+
+    after = (await auth_client.get(f"/v1/sessions/{session_id}", headers=owner)).json()
+    for field in ("host_id", "workspace", "runner_id", "labels"):
+        assert after[field] == before[field], field
+
+
 async def test_archive_requires_owner_access(
     auth_client: httpx.AsyncClient,
 ) -> None:

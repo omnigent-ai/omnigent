@@ -970,6 +970,23 @@ export function isValidSandboxRepoUrl(url: string): boolean {
 }
 
 /**
+ * Why a single sandbox repository input can't be submitted, or `null` when it
+ * can. A blank repository is legal (an empty sandbox), but a branch without
+ * one, or a malformed URL, is not.
+ *
+ * @param url Repository URL input, e.g. ``"https://github.com/org/repo"``.
+ * @param branch Branch input, e.g. ``"main"``.
+ * @returns The message to show under the repository field, or `null`.
+ */
+export function sandboxRepoProblem(url: string, branch: string): string | null {
+  if (url.trim() === "") {
+    return branch.trim() === "" ? null : "Add the repository this branch belongs to.";
+  }
+  if (isValidSandboxRepoUrl(url)) return null;
+  return "Enter a repository URL like https://github.com/org/repo.";
+}
+
+/**
  * Compose the managed session's ``workspace`` string from the split
  * repository inputs.
  *
