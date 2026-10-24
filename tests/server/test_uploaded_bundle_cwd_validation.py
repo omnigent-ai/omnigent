@@ -17,6 +17,10 @@ _BAD_CWDS = (
     r"C:\Windows",
     r"\\server\share",
     r"..\outside",
+    r"\Windows",
+    "C:",
+    "C:Windows",
+    r"C:Windows\System32",
 )
 _VALID_CWDS = (".", "./", "subdir", "nested/subdir", r"nested\subdir")
 
