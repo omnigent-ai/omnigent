@@ -760,7 +760,8 @@ def build_agent_bundle(
         Each must have at least a ``"name"`` key, e.g.
         ``[{"name": "researcher", "description": "..."}]``. An optional
         ``"skills"`` list, shaped like ``skills``, is bundled under the
-        sub-agent's directory.
+        sub-agent's directory; an optional ``"skills_filter"`` is written as
+        its ``skills:`` host-skill filter, e.g. ``["repo-skill"]``.
     :param max_iterations: Optional override for
         ``executor.max_iterations`` — useful for tests that want
         to force an ``incomplete`` terminal state after a known
@@ -851,6 +852,8 @@ def build_agent_bundle(
             }
             if "description" in sa:
                 sa_config["description"] = sa["description"]
+            if "skills_filter" in sa:
+                sa_config["skills"] = sa["skills_filter"]
             sa_bytes = yaml.dump(sa_config).encode()
             sa_info = tarfile.TarInfo(
                 name=f"agents/{sa['name']}/config.yaml",

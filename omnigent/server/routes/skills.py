@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 import secrets
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel
 
+from omnigent.entities import Agent
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
 from omnigent.runtime.agent_cache import AgentCache
@@ -16,6 +18,7 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import validate_session_agent
+from omnigent.server.routes._sessions.helpers import _resolve_subagent_spec
 from omnigent.server.schemas import SkillSummary
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
@@ -23,6 +26,7 @@ from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
 
 _SKILLS_TIMEOUT_S = 15.0
+_logger = logging.getLogger(__name__)
 
 
 class SkillsResponse(BaseModel):
@@ -65,7 +69,7 @@ def create_skills_router(
         user_id = require_user(request, auth_provider)
         agent_version = sub_agent_name = None
         spec: AgentSpec | None = None
-        host = None
+        host = session_agent = None
         if session_id is not None:
             if any(value is not None for value in (host_id, harness, path, agent_id)):
                 raise HTTPException(
@@ -95,6 +99,7 @@ def create_skills_router(
                 str(agent.version),
                 conv.sub_agent_name,
             )
+            session_agent = agent
         else:
             if host_id is None or harness is None or path is None:
                 raise HTTPException(
@@ -142,6 +147,34 @@ def create_skills_router(
             sub_agent_name=sub_agent_name,
             skills_filter=spec.skills_filter if spec is not None else "all",
         )
+        requested_session_id = session_id
+        if (
+            session_agent is not None
+            and result.status == "failed"
+            and result.error_code == "discovery_failed"
+        ):
+            spec = await _load_session_spec(agent_cache, session_agent, sub_agent_name)
+            if spec is not None:
+                # Scan only the workspace and merge bundled skills from the server's copy;
+                # skills from the bundle's own .agents/skills and plugins are lost.
+                _logger.warning(
+                    "host %s could not discover skills for session %s (%s); "
+                    "scanning its workspace without the bundle",
+                    host_id,
+                    session_id,
+                    result.error,
+                )
+                harness_kind = spec.executor.harness_kind
+                requested_session_id = None
+                result = await request_host_skills(
+                    host_registry=host_registry,
+                    host_conn=conn,
+                    harness=canonicalize_harness(harness_kind) or harness_kind,
+                    path=path,
+                    agent_id=agent_id,
+                    agent_version=agent_version,
+                    skills_filter=spec.skills_filter,
+                )
         if result.status != "ok":
             raise HTTPException(
                 status_code={"invalid_path": 400, "not_directory": 404}.get(
@@ -149,7 +182,7 @@ def create_skills_router(
                 ),
                 detail=result.error or "host skill discovery failed",
             )
-        if session_id is not None and result.session_id != session_id:
+        if session_id is not None and result.session_id != requested_session_id:
             raise HTTPException(
                 status_code=502, detail="update the host to discover session skills"
             )
@@ -169,6 +202,30 @@ def create_skills_router(
         return SkillsResponse(skills=skills)
 
     return router
+
+
+async def _load_session_spec(
+    agent_cache: AgentCache | None, agent: Agent, sub_agent_name: str | None
+) -> AgentSpec | None:
+    """Resolve a session's effective spec from the server's copy of its bundle."""
+    if agent_cache is None:
+        return None
+    try:
+        if sub_agent_name:
+            return await asyncio.to_thread(
+                _resolve_subagent_spec,
+                agent=agent,
+                sub_agent_name=sub_agent_name,
+                agent_cache=agent_cache,
+            )
+        loaded = await asyncio.to_thread(
+            agent_cache.load, agent.id, agent.bundle_location, expand_env=agent.operator_authored
+        )
+    except Exception:  # noqa: BLE001
+        # The fallback is best effort: any failure keeps the host's error instead of a 500.
+        _logger.warning("could not load agent %s for skill discovery", agent.id, exc_info=True)
+        return None
+    return loaded.spec
 
 
 async def request_host_skills(
