@@ -2094,6 +2094,7 @@ async def test_ping_loop_restamps_runner_liveness(
     monkeypatch.setattr(tunnel_mod, "PING_INTERVAL_S", 0.02)
     # Never trip the ping-timeout path during the test.
     monkeypatch.setattr(tunnel_mod, "PING_MISS_THRESHOLD", 100_000)
+    monkeypatch.setattr(session_live_state, "LIVENESS_REFRESH_WINDOW_S", 0.02)
 
     touches: list[list[str]] = []
 

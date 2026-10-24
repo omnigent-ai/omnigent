@@ -971,7 +971,7 @@ async def _ping_loop(
     """Send pings every PING_INTERVAL_S; declare dead after misses.
 
     Each tick that the runner is still alive also re-stamps
-    ``runner_last_seen`` (``session_live_state.touch_runner_liveness``)
+    ``runner_last_seen`` (``session_live_state.refresh_runner_liveness``)
     so replicas that don't hold this tunnel keep deriving
     ``runner_online`` from a fresh row instead of their own empty
     registry. This runs from the per-connection ping loop — inside the
@@ -1032,9 +1032,8 @@ async def _ping_loop(
             return
         # Still within the liveness window — refresh the row so the
         # freshness gate keeps the runner in the online set cross-replica.
-        # Best-effort and deduplicated inside the chokepoint; the enqueue
-        # inherits this handler's workspace scope via copy_context.
-        session_live_state.touch_runner_liveness([runner_id])
+        # Best-effort and batched with other tunnels' refreshes per workspace.
+        session_live_state.refresh_runner_liveness(runner_id)
         try:
             ping_ts = int(time.time() * 1000)
             await registry.send_text(
