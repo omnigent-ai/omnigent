@@ -75,6 +75,8 @@ stores into ``create_app``):
            image: docker.io/me/omnigent-host:latest    # shared; default: official
            env: [OPENAI_API_KEY, GIT_TOKEN]            # shared; SERVER env var NAMES
            disk_size_gb: 100                           # shared; default: SDK default
+           cpus: 2                                     # shared; default: 2
+           memory_mib: 4096                            # shared; default: 4096
            # exactly one mode (mutually exclusive):
            cloud: {endpoint: https://boxlite.example.com:8100}  # CLOUD; key: BOXLITE_API_KEY env
            # local: {home_dir: /data/boxlite, registry: {...}}  # LOCAL (default if omitted)
@@ -1685,7 +1687,9 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
     elif provider == "boxlite":
         section = _boxlite_section(raw)
         _reject_unknown_keys(
-            section, {"image", "env", "local", "cloud", "disk_size_gb"}, "sandbox.boxlite"
+            section,
+            {"image", "env", "local", "cloud", "disk_size_gb", "cpus", "memory_mib"},
+            "sandbox.boxlite",
         )
         endpoint, home_dir, registry = _parse_boxlite_mode(section)
         launcher_factory = _boxlite_launcher_factory(
@@ -1695,6 +1699,8 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             home_dir,
             registry,
             _parse_provider_positive_int(raw, "boxlite", "disk_size_gb"),
+            _parse_provider_positive_int(raw, "boxlite", "cpus"),
+            _parse_provider_positive_int(raw, "boxlite", "memory_mib"),
         )
         token_ttl_s = BOXLITE_MANAGED_TOKEN_TTL_S
     elif provider == "cwsandbox":
@@ -2159,6 +2165,8 @@ def _boxlite_launcher_factory(
     home_dir: str | None,
     registry: dict[str, object] | None,
     disk_size_gb: int | None,
+    cpus: int | None = None,
+    memory_mib: int | None = None,
 ) -> Callable[[], SandboxHostLauncher]:
     """
     Build the launcher factory for the YAML ``provider: boxlite`` path.
@@ -2178,6 +2186,10 @@ def _boxlite_launcher_factory(
         (``host`` + optional ``transport`` / ``skip_verify`` / ``*_env``
         credential names), or ``None`` for anonymous pulls.
     :param disk_size_gb: Box disk size in GB, or ``None`` for the SDK default.
+    :param cpus: Box vCPU count, or ``None`` for the built-in default.
+    :param memory_mib: Box RAM in MiB, or ``None`` for the built-in default.
+        The built-in is not enough for every workload — a guest-side OOM shows
+        up host-side only as a stalled session — so operators need this knob.
     :returns: A factory producing parameterized boxlite launchers.
     """
 
@@ -2192,6 +2204,8 @@ def _boxlite_launcher_factory(
             home_dir=home_dir,
             registry=registry,
             disk_size_gb=disk_size_gb,
+            cpus=cpus,
+            memory_mib=memory_mib,
         )
 
     return _build
