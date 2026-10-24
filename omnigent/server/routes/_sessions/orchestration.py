@@ -1500,6 +1500,7 @@ def _build_session_response(
         llm_model=llm_model,
         harness=harness,
         model_override=conv.model_override,
+        harness_override=conv.harness_override,
         cost_control_mode_override=conv.cost_control_mode_override,
         subagent_routing_override=conv.subagent_routing_override,
         share_workspace_files=conv.share_workspace_files,

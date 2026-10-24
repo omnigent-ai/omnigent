@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import gzip
 import json
 from pathlib import Path
 from typing import Any
@@ -11,7 +12,8 @@ import httpx
 import respx
 from click.testing import CliRunner
 
-from omnigent.cli import cli
+from omnigent.cli import _read_session_export, cli
+from omnigent.export import CONTENT_FIELDS
 from omnigent.util.server_url import ServerUrl
 
 _BASE = "http://localhost:6767"
@@ -65,7 +67,7 @@ def _patch_server(base_url: str = _BASE) -> Any:
 
 @respx.mock
 def test_session_export_writes_jsonl(tmp_path: Path) -> None:
-    """Export writes one session_meta line then one item line per item."""
+    """Export writes the schema header, then one transcript entry per item."""
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
         return_value=httpx.Response(200, json=_SESSION_META)
     )
@@ -85,17 +87,23 @@ def test_session_export_writes_jsonl(tmp_path: Path) -> None:
     assert out_file.exists()
 
     lines = [json.loads(line) for line in out_file.read_text().splitlines() if line]
-    assert len(lines) == 3  # 1 meta + 2 items
+    assert len(lines) == 3  # 1 header + 2 entries
 
-    meta = lines[0]
-    assert meta["record_type"] == "session_meta"
-    assert meta["id"] == "conv_abc123"
-    assert meta["title"] == "test session"
+    header = lines[0]
+    assert header["schema"] == "omnigent.transcript/1"
+    assert header["session"] == "conv_abc123"
+    assert header["title"] == "test session"
+    assert header["created"] == "2023-11-14T22:13:20Z"
 
-    item_lines = lines[1:]
-    assert all(r["record_type"] == "item" for r in item_lines)
-    assert [r["role"] for r in item_lines] == ["user", "assistant"]
-    assert item_lines[1]["content"] == [{"type": "output_text", "text": "hi there"}]
+    entries = lines[1:]
+    assert [e["kind"] for e in entries] == ["message", "message"]
+    assert [e["role"] for e in entries] == ["user", "assistant"]
+    assert [(e["turn"], e["seq"]) for e in entries] == [(1, 1), (1, 2)]
+    assert entries[1]["text"] == "hi there"
+    # The blocks are carried once, in ``raw``.
+    assert "content" not in entries[1]
+    assert entries[1]["raw"]["content"] == [{"type": "output_text", "text": "hi there"}]
+    assert entries[1]["agent"] == "my-agent"
 
 
 @respx.mock
@@ -133,6 +141,89 @@ def test_session_export_spog_url_sends_workspace_selector(
 
 
 @respx.mock
+def test_session_export_redact_writes_shape_without_content(tmp_path: Path) -> None:
+    """``--redact`` is for handing over what a session did, not what it said."""
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json=_SESSION_META)
+    )
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
+        return_value=httpx.Response(200, json=_ITEMS_PAGE)
+    )
+
+    out_file = tmp_path / "out.jsonl"
+    runner = CliRunner()
+    with _patch_server():
+        result = runner.invoke(
+            cli,
+            ["session", "export", "--id", "conv_abc123", "--output", str(out_file), "--redact"],
+        )
+
+    assert result.exit_code == 0, result.output
+    text = out_file.read_text()
+    lines = [json.loads(line) for line in text.splitlines() if line]
+    header, entries = lines[0], lines[1:]
+
+    assert header["redacted"] is True
+    assert header["session"] == "conv_abc123"
+    # Still a transcript: the same turns, kinds and roles as the full export.
+    assert [e["kind"] for e in entries] == ["message", "message"]
+    assert [(e["turn"], e["seq"]) for e in entries] == [(1, 1), (1, 2)]
+    assert all(not CONTENT_FIELDS & e.keys() for e in entries)
+    assert "hi there" not in text
+
+
+@respx.mock
+def test_session_export_gzip_writes_an_archive_import_can_read(tmp_path: Path) -> None:
+    """``--gzip`` is a smaller file, not a different one."""
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json=_SESSION_META)
+    )
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
+        return_value=httpx.Response(200, json=_ITEMS_PAGE)
+    )
+
+    out_file = tmp_path / "out.jsonl.gz"
+    runner = CliRunner()
+    with _patch_server():
+        result = runner.invoke(
+            cli,
+            ["session", "export", "--id", "conv_abc123", "--output", str(out_file), "--gzip"],
+        )
+
+    assert result.exit_code == 0, result.output
+    assert out_file.read_bytes()[:2] == b"\x1f\x8b"
+    lines = [
+        json.loads(line)
+        for line in gzip.decompress(out_file.read_bytes()).decode().splitlines()
+        if line
+    ]
+    assert lines[0]["session"] == "conv_abc123"
+    assert [e["kind"] for e in lines[1:]] == ["message", "message"]
+
+    # The importer reads it without being told it is compressed.
+    meta, restored = _read_session_export(out_file)
+    assert meta["id"] == "conv_abc123"
+    assert len(restored) == 2
+
+
+@respx.mock
+def test_session_export_gzip_default_filename(tmp_path: Path) -> None:
+    """The default name says what the file is."""
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
+        return_value=httpx.Response(200, json=_SESSION_META)
+    )
+    respx.get(f"{_BASE}/v1/sessions/conv_abc123/items").mock(
+        return_value=httpx.Response(200, json=_ITEMS_PAGE)
+    )
+
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path), _patch_server():
+        result = runner.invoke(cli, ["session", "export", "--id", "conv_abc123", "--gzip"])
+        assert result.exit_code == 0, result.output
+        assert Path("conv_abc123.jsonl.gz").exists()
+
+
+@respx.mock
 def test_session_export_default_filename(tmp_path: Path) -> None:
     """Without --output, the file is named <session_id>.jsonl in cwd."""
     respx.get(f"{_BASE}/v1/sessions/conv_abc123").mock(
@@ -151,8 +242,8 @@ def test_session_export_default_filename(tmp_path: Path) -> None:
         lines = [json.loads(line) for line in default_path.read_text().splitlines() if line]
 
     assert len(lines) == 1
-    assert lines[0]["record_type"] == "session_meta"
-    assert lines[0]["id"] == "conv_abc123"
+    assert lines[0]["schema"] == "omnigent.transcript/1"
+    assert lines[0]["session"] == "conv_abc123"
 
 
 @respx.mock
@@ -200,10 +291,10 @@ def test_session_export_items_ordered_ascending(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
 
     records = [json.loads(line) for line in out_file.read_text().splitlines() if line]
-    item_records = [r for r in records if r["record_type"] == "item"]
-    assert len(item_records) == 2
-    assert item_records[0]["role"] == "user"
-    assert item_records[1]["role"] == "assistant"
+    entries = [r for r in records if "kind" in r]
+    assert len(entries) == 2
+    assert entries[0]["role"] == "user"
+    assert entries[1]["role"] == "assistant"
 
 
 @respx.mock
@@ -260,6 +351,7 @@ def test_session_export_pagination(tmp_path: Path) -> None:
     assert result.exit_code == 0, result.output
 
     records = [json.loads(line) for line in out_file.read_text().splitlines() if line]
-    item_records = [r for r in records if r["record_type"] == "item"]
-    assert len(item_records) == 2
-    assert [r["id"] for r in item_records] == ["msg_1", "msg_2"]
+    entries = [r for r in records if "kind" in r]
+    assert len(entries) == 2
+    assert [r["id"] for r in entries] == ["msg_1", "msg_2"]
+    assert [r["seq"] for r in entries] == [1, 2]

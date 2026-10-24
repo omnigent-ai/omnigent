@@ -1,0 +1,1196 @@
+{
+  "$defs": {
+    "ArtifactRef": {
+      "description": "A file an entry referenced, named well enough to recognize elsewhere.\n\nA transcript records a conversation, not the files around it. An attachment\ntravels inside ``raw`` as a data URI, which a redacted export drops and a\nreader may not want to decode; a file named in the text never travelled at\nall. Either way this says what was involved.\n\n:param kind: ``\"attachment\"`` for a file carried in the message,\n    ``\"path\"`` for one the session only named.\n:param name: File name as the session knew it, e.g. ``\"diagram.png\"``.\n:param path: The path the session named, for ``\"path\"`` references.\n:param media_type: The attachment's media type, e.g. ``\"image/png\"``.\n:param bytes: Size of the attachment in bytes.\n:param sha256: Hex digest of the attachment's bytes, so the same file is\n    recognizable wherever else it turns up.",
+      "properties": {
+        "bytes": {
+          "anyOf": [
+            {
+              "type": "integer"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Bytes"
+        },
+        "kind": {
+          "enum": [
+            "attachment",
+            "path"
+          ],
+          "title": "Kind",
+          "type": "string"
+        },
+        "media_type": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Media Type"
+        },
+        "name": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Name"
+        },
+        "path": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Path"
+        },
+        "sha256": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Sha256"
+        }
+      },
+      "required": [
+        "kind"
+      ],
+      "title": "ArtifactRef",
+      "type": "object"
+    },
+    "entry": {
+      "oneOf": [
+        {
+          "additionalProperties": false,
+          "properties": {
+            "covers_through": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Covers Through"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Id"
+            },
+            "kind": {
+              "const": "compaction"
+            },
+            "model": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Model"
+            },
+            "origin_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Origin Type"
+            },
+            "raw": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Raw"
+            },
+            "role": {
+              "enum": [
+                "user",
+                "assistant",
+                "tool",
+                "system"
+              ],
+              "title": "Role",
+              "type": "string"
+            },
+            "seq": {
+              "title": "Seq",
+              "type": "integer"
+            },
+            "text": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Text"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Time"
+            },
+            "token_count": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Token Count"
+            },
+            "turn": {
+              "title": "Turn",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "seq",
+            "role",
+            "kind"
+          ],
+          "title": "compaction entry",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "code": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Code"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Id"
+            },
+            "kind": {
+              "const": "error"
+            },
+            "level": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Level"
+            },
+            "origin_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Origin Type"
+            },
+            "raw": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Raw"
+            },
+            "role": {
+              "enum": [
+                "user",
+                "assistant",
+                "tool",
+                "system"
+              ],
+              "title": "Role",
+              "type": "string"
+            },
+            "seq": {
+              "title": "Seq",
+              "type": "integer"
+            },
+            "source": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Source"
+            },
+            "text": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Text"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Time"
+            },
+            "turn": {
+              "title": "Turn",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "seq",
+            "role",
+            "kind"
+          ],
+          "title": "error entry",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agent": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Agent"
+            },
+            "artifacts": {
+              "anyOf": [
+                {
+                  "items": {
+                    "$ref": "#/$defs/ArtifactRef"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Artifacts"
+            },
+            "content": {
+              "anyOf": [
+                {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Content"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Id"
+            },
+            "interrupted": {
+              "default": false,
+              "title": "Interrupted",
+              "type": "boolean"
+            },
+            "kind": {
+              "const": "message"
+            },
+            "meta": {
+              "default": false,
+              "title": "Meta",
+              "type": "boolean"
+            },
+            "origin_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Origin Type"
+            },
+            "raw": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Raw"
+            },
+            "role": {
+              "enum": [
+                "user",
+                "assistant",
+                "tool",
+                "system"
+              ],
+              "title": "Role",
+              "type": "string"
+            },
+            "seq": {
+              "title": "Seq",
+              "type": "integer"
+            },
+            "text": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Text"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Time"
+            },
+            "turn": {
+              "title": "Turn",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "seq",
+            "role",
+            "kind"
+          ],
+          "title": "message entry",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Id"
+            },
+            "kind": {
+              "const": "note"
+            },
+            "note_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Note Type"
+            },
+            "origin_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Origin Type"
+            },
+            "raw": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Raw"
+            },
+            "role": {
+              "enum": [
+                "user",
+                "assistant",
+                "tool",
+                "system"
+              ],
+              "title": "Role",
+              "type": "string"
+            },
+            "seq": {
+              "title": "Seq",
+              "type": "integer"
+            },
+            "text": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Text"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Time"
+            },
+            "turn": {
+              "title": "Turn",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "seq",
+            "role",
+            "kind"
+          ],
+          "title": "note entry",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agent": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Agent"
+            },
+            "content": {
+              "anyOf": [
+                {
+                  "items": {
+                    "additionalProperties": true,
+                    "type": "object"
+                  },
+                  "type": "array"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Content"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Id"
+            },
+            "kind": {
+              "const": "reasoning"
+            },
+            "origin_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Origin Type"
+            },
+            "raw": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Raw"
+            },
+            "role": {
+              "enum": [
+                "user",
+                "assistant",
+                "tool",
+                "system"
+              ],
+              "title": "Role",
+              "type": "string"
+            },
+            "sealed": {
+              "default": false,
+              "title": "Sealed",
+              "type": "boolean"
+            },
+            "sealed_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Sealed Reason"
+            },
+            "seq": {
+              "title": "Seq",
+              "type": "integer"
+            },
+            "text": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Text"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Time"
+            },
+            "turn": {
+              "title": "Turn",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "seq",
+            "role",
+            "kind"
+          ],
+          "title": "reasoning entry",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "agent": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Agent"
+            },
+            "call_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Call Id"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Id"
+            },
+            "kind": {
+              "const": "tool_call"
+            },
+            "namespace": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Namespace"
+            },
+            "origin_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Origin Type"
+            },
+            "raw": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Raw"
+            },
+            "role": {
+              "enum": [
+                "user",
+                "assistant",
+                "tool",
+                "system"
+              ],
+              "title": "Role",
+              "type": "string"
+            },
+            "sealed": {
+              "default": false,
+              "title": "Sealed",
+              "type": "boolean"
+            },
+            "sealed_reason": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Sealed Reason"
+            },
+            "seq": {
+              "title": "Seq",
+              "type": "integer"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Time"
+            },
+            "tool": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Tool"
+            },
+            "tool_input": {
+              "anyOf": [
+                {},
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Tool Input"
+            },
+            "tool_input_raw": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Tool Input Raw"
+            },
+            "turn": {
+              "title": "Turn",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "seq",
+            "role",
+            "kind"
+          ],
+          "title": "tool_call entry",
+          "type": "object"
+        },
+        {
+          "additionalProperties": false,
+          "properties": {
+            "call_id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Call Id"
+            },
+            "id": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Id"
+            },
+            "kind": {
+              "const": "tool_result"
+            },
+            "origin_type": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Origin Type"
+            },
+            "raw": {
+              "anyOf": [
+                {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Raw"
+            },
+            "role": {
+              "enum": [
+                "user",
+                "assistant",
+                "tool",
+                "system"
+              ],
+              "title": "Role",
+              "type": "string"
+            },
+            "seq": {
+              "title": "Seq",
+              "type": "integer"
+            },
+            "time": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Time"
+            },
+            "tool": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Tool"
+            },
+            "tool_output": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "default": null,
+              "title": "Tool Output"
+            },
+            "turn": {
+              "title": "Turn",
+              "type": "integer"
+            }
+          },
+          "required": [
+            "turn",
+            "seq",
+            "role",
+            "kind"
+          ],
+          "title": "tool_result entry",
+          "type": "object"
+        }
+      ],
+      "title": "entry"
+    },
+    "header": {
+      "additionalProperties": false,
+      "description": "First line of a transcript: what session this is and how it ran.\n\n:param schema_: The schema identifier, serialized as ``schema``.\n:param session: The exporting server's session id, e.g. ``\"conv_abc123\"``.\n:param created: When the session was created, ISO 8601 UTC.\n:param exported: When this file was written, ISO 8601 UTC.\n:param title: The session title, if any.\n:param agent: The bound agent's display name, if known.\n:param agent_id: The bound agent's id on the exporting server.\n:param harness: Canonical harness the session ran on, e.g. ``\"codex\"``.\n:param model: The model the session last reported running on.\n:param workspace: Absolute workspace path on the runner, if any.\n:param parent_session: Parent session id for a sub-agent session.\n:param root_session: Root of the spawn tree this session belongs to.\n:param redacted: ``True`` when the file was written without content (see\n    :data:`CONTENT_FIELDS`). Such a file describes a session's shape only\n    and cannot be imported back into one.\n:param settings: Per-session overrides worth restoring on import\n    (``model_override``, ``reasoning_effort``, ...). Only set keys appear.",
+      "properties": {
+        "agent": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent"
+        },
+        "agent_id": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Agent Id"
+        },
+        "created": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Created"
+        },
+        "exported": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Exported"
+        },
+        "harness": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Harness"
+        },
+        "model": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Model"
+        },
+        "parent_session": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Parent Session"
+        },
+        "redacted": {
+          "default": false,
+          "title": "Redacted",
+          "type": "boolean"
+        },
+        "root_session": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Root Session"
+        },
+        "schema": {
+          "const": "omnigent.transcript/1",
+          "default": "omnigent.transcript/1",
+          "title": "Schema",
+          "type": "string"
+        },
+        "session": {
+          "title": "Session",
+          "type": "string"
+        },
+        "settings": {
+          "additionalProperties": true,
+          "title": "Settings",
+          "type": "object"
+        },
+        "title": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Title"
+        },
+        "workspace": {
+          "anyOf": [
+            {
+              "type": "string"
+            },
+            {
+              "type": "null"
+            }
+          ],
+          "default": null,
+          "title": "Workspace"
+        }
+      },
+      "required": [
+        "session"
+      ],
+      "title": "TranscriptHeader",
+      "type": "object"
+    }
+  },
+  "$id": "https://omnigent.ai/schemas/omnigent.transcript.v1.schema.json",
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "description": "A session transcript: one JSON object per line, the header first, then one entry per item. See docs/session-export.md.",
+  "oneOf": [
+    {
+      "$ref": "#/$defs/header"
+    },
+    {
+      "$ref": "#/$defs/entry"
+    }
+  ],
+  "title": "omnigent.transcript/1"
+}

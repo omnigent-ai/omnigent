@@ -7,12 +7,19 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import click
 import httpx
 import pytest
 import respx
 from click.testing import CliRunner
 
-from omnigent.cli import _import_item_payload, cli
+from omnigent.cli import (
+    _import_item_payload,
+    _read_session_export,
+    _read_session_exports,
+    cli,
+)
+from omnigent.export import iter_transcript_lines
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
 from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 
@@ -298,3 +305,293 @@ def test_session_import_missing_meta_errors(tmp_path: Path) -> None:
 
     assert result.exit_code != 0
     assert "session_meta" in result.output
+
+
+def _write_transcript(
+    path: Path, *, header: dict[str, Any], entries: list[dict[str, Any]]
+) -> None:
+    """Write an ``omnigent.transcript/1`` file: header line + one line per entry."""
+    lines = [{"schema": "omnigent.transcript/1", **header}, *entries]
+    path.write_text("\n".join(json.dumps(line) for line in lines) + "\n", encoding="utf-8")
+
+
+@respx.mock
+def test_session_import_reads_transcript_schema(tmp_path: Path) -> None:
+    """A schema-headed transcript is rebuilt into typed items and settings reapplied."""
+    src = tmp_path / "t.jsonl"
+    _write_transcript(
+        src,
+        header={
+            "session": "conv_old",
+            "title": "orig",
+            "agent_id": "ag_abc",
+            "harness": "claude-native",
+            "workspace": "/work/churn",
+            "settings": {
+                "reasoning_effort": "high",
+                "harness_override": "claude-native",
+                "subagent_routing_override": "same-harness",
+                "cost_control_mode_override": "strict",
+            },
+        },
+        entries=[
+            {"turn": 1, "seq": 1, "role": "user", "kind": "message", "text": "hello"},
+            {
+                "turn": 1,
+                "seq": 2,
+                "role": "assistant",
+                "kind": "tool_call",
+                "origin_type": "function_call",
+                "agent": "claude-native-ui",
+                "tool": "shell",
+                "tool_input": {"command": ["ls"]},
+                "call_id": "call_1",
+            },
+            {
+                "turn": 1,
+                "seq": 3,
+                "role": "tool",
+                "kind": "tool_result",
+                "call_id": "call_1",
+                "tool_output": "lib.py",
+            },
+            {
+                "turn": 1,
+                "seq": 4,
+                "role": "assistant",
+                "kind": "message",
+                "text": "done",
+                "agent": "claude-native-ui",
+            },
+        ],
+    )
+
+    route = respx.post(f"{_BASE}/v1/sessions").mock(
+        return_value=httpx.Response(200, json={"id": "conv_new", "agent_id": "ag_abc"})
+    )
+
+    runner = CliRunner()
+    with _patch_server():
+        result = runner.invoke(cli, ["session", "import", "-i", str(src)])
+
+    assert result.exit_code == 0, result.output
+    assert "conv_new" in result.output
+    body = json.loads(route.calls.last.request.content)
+    assert body["agent_id"] == "ag_abc"
+    assert body["title"] == "orig"
+    assert body["workspace"] == "/work/churn"
+    # Every exported setting reaches the create request, not an allowlist of them.
+    assert body["reasoning_effort"] == "high"
+    assert body["harness_override"] == "claude-native"
+    assert body["subagent_routing_override"] == "same-harness"
+    assert body["cost_control_mode_override"] == "strict"
+    assert [item["type"] for item in body["initial_items"]] == [
+        "message",
+        "function_call",
+        "function_call_output",
+        "message",
+    ]
+    # Text-only user entry is rebuilt into an input_text block.
+    assert body["initial_items"][0]["data"]["content"] == [{"type": "input_text", "text": "hello"}]
+    call = body["initial_items"][1]["data"]
+    assert call["name"] == "shell"
+    assert json.loads(call["arguments"]) == {"command": ["ls"]}
+    assert call["agent"] == "claude-native-ui"
+    assert body["initial_items"][3]["data"]["agent"] == "claude-native-ui"
+
+
+@respx.mock
+def test_session_import_rebuilds_items_from_raw_payloads(tmp_path: Path) -> None:
+    """An Omnigent-written transcript imports field for field, including what the
+    readable fields only summarize (encrypted reasoning, compacted messages)."""
+    src = tmp_path / "t.jsonl"
+    reasoning_raw = {
+        "model": "codex",
+        "summary": [{"type": "summary_text", "text": "Plan"}],
+        "encrypted_content": "gAAAA",
+    }
+    compaction_raw = {
+        "summary": "User asked for churn; agent loaded data.",
+        "last_item_id": "msg_9",
+        "model": "openai/gpt-4o",
+        "token_count": 42,
+        "compacted_messages": [{"role": "user", "content": "churn"}],
+        "window_id": 2,
+    }
+    _write_transcript(
+        src,
+        header={"session": "conv_old", "agent_id": "ag_abc", "harness": "codex"},
+        entries=[
+            {
+                "turn": 1,
+                "seq": 1,
+                "role": "assistant",
+                "kind": "reasoning",
+                "origin_type": "reasoning",
+                "raw": reasoning_raw,
+                "text": "Plan",
+                "sealed": True,
+            },
+            {
+                "turn": 1,
+                "seq": 2,
+                "role": "system",
+                "kind": "compaction",
+                "origin_type": "compaction",
+                "raw": compaction_raw,
+                "text": compaction_raw["summary"],
+            },
+        ],
+    )
+    route = respx.post(f"{_BASE}/v1/sessions").mock(
+        return_value=httpx.Response(200, json={"id": "conv_new", "agent_id": "ag_abc"})
+    )
+
+    runner = CliRunner()
+    with _patch_server():
+        result = runner.invoke(cli, ["session", "import", "-i", str(src)])
+
+    assert result.exit_code == 0, result.output
+    items = json.loads(route.calls.last.request.content)["initial_items"]
+    # ``model`` on the wire is the entity's ``agent``; everything else is verbatim.
+    expected_reasoning = {k: v for k, v in reasoning_raw.items() if k != "model"}
+    assert items[0] == {"type": "reasoning", "data": {**expected_reasoning, "agent": "codex"}}
+    assert items[1] == {"type": "compaction", "data": compaction_raw}
+
+
+def test_session_import_refuses_unknown_schema(tmp_path: Path) -> None:
+    """A newer schema version is refused rather than misread."""
+    src = tmp_path / "future.jsonl"
+    src.write_text(
+        json.dumps({"schema": "omnigent.transcript/99", "session": "x"}) + "\n", encoding="utf-8"
+    )
+
+    runner = CliRunner()
+    with _patch_server():
+        result = runner.invoke(cli, ["session", "import", "-i", str(src)])
+
+    assert result.exit_code != 0
+    assert "unsupported transcript schema" in result.output
+
+
+def test_import_refuses_a_redacted_transcript(tmp_path: Path) -> None:
+    """A redacted file has no content to restore, so importing it would build an
+    empty session that looks like the real one."""
+    src = tmp_path / "redacted.jsonl"
+    session = {"id": "conv_abc123", "title": "Churn", "created_at": 1_700_000_000}
+    items = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "a secret question"}],
+            "created_at": 1_700_000_000,
+        }
+    ]
+    src.write_text("".join(iter_transcript_lines(session, items, redact=True)))
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _read_session_export(src)
+
+    assert "cannot be imported" in str(excinfo.value)
+    assert "--redact" in str(excinfo.value)
+
+
+def test_import_still_reads_a_full_transcript(tmp_path: Path) -> None:
+    """The refusal keys off the header flag, not off anything a full export carries."""
+    src = tmp_path / "full.jsonl"
+    session = {"id": "conv_abc123", "title": "Churn", "created_at": 1_700_000_000}
+    items = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "a question"}],
+            "created_at": 1_700_000_000,
+        }
+    ]
+    src.write_text("".join(iter_transcript_lines(session, items)))
+
+    meta, restored = _read_session_export(src)
+
+    assert meta["id"] == "conv_abc123"
+    assert len(restored) == 1
+
+
+def test_a_bundle_reads_every_session_root_first(tmp_path: Path) -> None:
+    """A spawn tree is only self-contained if the reader sees all of it."""
+    src = tmp_path / "tree.jsonl"
+    root = {"id": "conv_root", "title": "Root", "created_at": 1_700_000_000}
+    child = {
+        "id": "conv_child",
+        "title": "Research",
+        "created_at": 1_700_000_100,
+        "parent_session_id": "conv_root",
+    }
+
+    def _items(text: str) -> list[dict[str, object]]:
+        return [
+            {
+                "id": "msg_1",
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": text}],
+                "created_at": 1_700_000_000,
+            }
+        ]
+
+    src.write_text(
+        "".join(iter_transcript_lines(root, _items("root work")))
+        + "".join(iter_transcript_lines(child, _items("child work")))
+    )
+
+    sessions = _read_session_exports(src)
+
+    assert [meta["id"] for meta, _ in sessions] == ["conv_root", "conv_child"]
+    assert [meta["parent_session"] for meta, _ in sessions] == [None, "conv_root"]
+    assert len(sessions[1][1]) == 1
+
+
+def test_reading_a_bundle_as_one_session_says_what_it_is(tmp_path: Path) -> None:
+    """The single-session reader refuses rather than importing only the root."""
+    src = tmp_path / "tree.jsonl"
+    root = {"id": "conv_root", "created_at": 1_700_000_000}
+    child = {"id": "conv_child", "created_at": 1_700_000_100, "parent_session_id": "conv_root"}
+    items = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}],
+            "created_at": 1_700_000_000,
+        }
+    ]
+    src.write_text(
+        "".join(iter_transcript_lines(root, items)) + "".join(iter_transcript_lines(child, items))
+    )
+
+    with pytest.raises(click.ClickException, match="2 sessions"):
+        _read_session_export(src)
+
+
+def test_a_redacted_session_anywhere_in_a_bundle_is_refused(tmp_path: Path) -> None:
+    """One redacted session makes the bundle unrestorable, not partly restorable."""
+    src = tmp_path / "tree.jsonl"
+    root = {"id": "conv_root", "created_at": 1_700_000_000}
+    child = {"id": "conv_child", "created_at": 1_700_000_100, "parent_session_id": "conv_root"}
+    items = [
+        {
+            "id": "msg_1",
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hi"}],
+            "created_at": 1_700_000_000,
+        }
+    ]
+    src.write_text(
+        "".join(iter_transcript_lines(root, items))
+        + "".join(iter_transcript_lines(child, items, redact=True))
+    )
+
+    with pytest.raises(click.ClickException, match="cannot be imported"):
+        _read_session_exports(src)

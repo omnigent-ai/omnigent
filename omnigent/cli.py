@@ -26,7 +26,17 @@ from collections.abc import Callable, Iterator, Mapping, Sequence
 from dataclasses import asdict, dataclass, replace
 from importlib import import_module, resources
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, BinaryIO, Literal, NoReturn, TypeAlias, cast, get_args
+from typing import (
+    TYPE_CHECKING,
+    Any,
+    BinaryIO,
+    Literal,
+    NoReturn,
+    TextIO,
+    TypeAlias,
+    cast,
+    get_args,
+)
 
 import click
 import psutil
@@ -125,6 +135,7 @@ from omnigent.util.uuid import normalize_uuid
 if TYPE_CHECKING:
     import httpx
 
+    from omnigent.export import Transcript
     from omnigent.host.daemon_lifecycle import DaemonLifecycleLock
     from omnigent.install_ledger import InstallLedger
     from omnigent.onboarding.acp_auth import AcpAgentEntry
@@ -7359,24 +7370,65 @@ def session(ctx: click.Context) -> None:
         "Defaults to the configured server, or a local server already running."
     ),
 )
-def session_export(session_id: str, output: str | None, server: str | None) -> None:
+@click.option(
+    "--redact",
+    is_flag=True,
+    default=False,
+    help="Write the session's shape without its content. The file cannot be imported.",
+)
+@click.option(
+    "--tree",
+    "include_tree",
+    is_flag=True,
+    default=False,
+    help="Also export this session's sub-agent sessions, as one bundle.",
+)
+@click.option(
+    "--gzip",
+    "gzip_output",
+    is_flag=True,
+    default=False,
+    help="Write a gzipped file. Appends .gz to the default name; import reads it directly.",
+)
+def session_export(
+    session_id: str,
+    output: str | None,
+    server: str | None,
+    redact: bool,
+    include_tree: bool,
+    gzip_output: bool,
+) -> None:
     """Export a session transcript to a portable JSONL file.
 
-    Each line of the output is a JSON object.  The first line carries
-    the session metadata (``"record_type": "session_meta"``); every
-    subsequent line is one conversation item
-    (``"record_type": "item"``).  The file preserves full turn order
-    and is independent of ``omnigent import``, which reads native harness history.
+    Writes an ``omnigent.transcript/1`` file (see ``docs/session-export.md``):
+    the first line is a header naming the schema and the session; every
+    following line is one entry — ``message``, ``reasoning``, ``tool_call``,
+    ``tool_result``, ``error``, ``compaction`` or ``note`` — in turn order.
+    Content the provider withheld (encrypted reasoning, provider-hosted tool
+    results) is marked ``sealed`` rather than silently dropped. Independent of
+    ``omnigent import``, which reads native harness history.
+
+    ``--tree`` writes the session's sub-agent sessions after it, each with its
+    own header line, so a multi-agent run is self-contained in one file.
+
+    ``--redact`` writes the same structure with every content field dropped —
+    no message text, tool arguments, tool output or raw payloads — for sharing
+    what a session did when what it said cannot leave. The header carries
+    ``redacted`` and ``omnigent session import`` refuses such a file.
 
     \b
     Examples:
       omnigent session export --id conv_abc123
       omnigent session export --id conv_abc123 --output my_session.jsonl
+      omnigent session export --id conv_abc123 --redact
+      omnigent session export --id conv_abc123 --gzip
+      omnigent session export --id conv_abc123 --tree
       omnigent session export --id conv_abc123 --server https://myserver.com
     """
     import httpx
 
     from omnigent.chat import _remote_headers
+    from omnigent.export import iter_transcript_lines
 
     cfg = _load_effective_config()
     resolved_server = _resolve_attach_server_url(server, cfg.get("server"))
@@ -7385,7 +7437,8 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
         resolved_server = ServerUrl(startup.url)
 
     base_url = resolved_server.api_base
-    out_path = Path(output) if output else Path(f"{session_id}.jsonl")
+    suffix = ".jsonl.gz" if gzip_output else ".jsonl"
+    out_path = Path(output) if output else Path(f"{session_id}{suffix}")
 
     with httpx.Client(
         base_url=base_url,
@@ -7408,71 +7461,91 @@ def session_export(session_id: str, output: str | None, server: str | None) -> N
         session_data = resp.json()
 
         n_items = 0
-        with out_path.open("w", encoding="utf-8") as fh:
-            # First line: session metadata.
-            meta_record = {"record_type": "session_meta", **session_data}
-            fh.write(json.dumps(meta_record) + "\n")
 
-            # Remaining lines: items in ascending order, paginated.
+        def _items(conv_id: str) -> Iterator[dict[str, Any]]:
+            """Page through one session's items in ascending order."""
+            nonlocal n_items
             after: str | None = None
             while True:
                 params: dict[str, str | int] = {"limit": 500, "order": "asc"}
                 if after:
                     params["after"] = after
-                items_resp = client.get(f"/v1/sessions/{session_id}/items", params=params)
+                items_resp = client.get(f"/v1/sessions/{conv_id}/items", params=params)
                 items_resp.raise_for_status()
                 page = items_resp.json()
                 for item in page["data"]:
-                    item_record = {"record_type": "item", **item}
-                    fh.write(json.dumps(item_record) + "\n")
                     n_items += 1
+                    yield item
                 if not page.get("has_more"):
                     break
                 after = page.get("last_id")
 
+        def _descendants(root_id: str) -> list[str]:
+            """Sub-agent session ids under *root_id*, breadth first.
+
+            A sub-agent can spawn its own, so this walks rather than listing one
+            level; ids already seen are skipped so stored cycles cannot loop.
+            """
+            found: list[str] = []
+            seen = {root_id}
+            queue = [root_id]
+            while queue:
+                parent_id = queue.pop(0)
+                resp = client.get(
+                    f"/v1/sessions/{parent_id}/child_sessions",
+                    params={"limit": 200, "order": "asc"},
+                )
+                resp.raise_for_status()
+                for child in resp.json()["data"]:
+                    child_id = child["id"]
+                    if child_id in seen:
+                        continue
+                    seen.add(child_id)
+                    found.append(child_id)
+                    queue.append(child_id)
+            return found
+
+        def _session_data(conv_id: str) -> dict[str, Any]:
+            """The session snapshot the header is built from."""
+            snapshot = client.get(
+                f"/v1/sessions/{conv_id}",
+                params={"include_items": "false", "include_liveness": "false"},
+            )
+            snapshot.raise_for_status()
+            return cast("dict[str, Any]", snapshot.json())
+
+        def _all_lines() -> Iterator[str]:
+            """The root session, then its spawn tree when asked for."""
+            yield from iter_transcript_lines(session_data, _items(session_id), redact=redact)
+            if not include_tree:
+                return
+            for child_id in _descendants(session_id):
+                yield from iter_transcript_lines(
+                    _session_data(child_id), _items(child_id), redact=redact
+                )
+
+        # Write beside the target and rename, so a failure while paging never
+        # leaves a partial file that reads as a complete transcript.
+        tmp_path = out_path.with_name(f".{out_path.name}.partial")
+        try:
+            with _transcript_writer(tmp_path, gzip_output) as fh:
+                fh.writelines(_all_lines())
+            tmp_path.replace(out_path)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+
     click.echo(f"Exported {n_items} item(s) from {session_id} to {out_path}")
-
-
-# Fields on an exported item that belong to the store/envelope, not the typed
-# ``data`` payload — dropped before rebuilding the item for re-append.
-_IMPORT_ITEM_ENVELOPE_FIELDS = frozenset(
-    {"record_type", "id", "type", "status", "response_id", "created_by"}
-)
-
-
-def _import_agent_aliased_types() -> frozenset[str]:
-    """
-    Return the item types whose ``agent`` field serializes as ``model``.
-
-    ``to_api_dict`` renders items with ``by_alias=True``, so a data model with
-    ``agent: ... = Field(serialization_alias="model")`` exports ``agent`` as
-    ``model``. On import that must be reversed — but ONLY for those types.
-    Other types (``compaction``, ``routing_decision``) carry a genuine ``model``
-    field that must be left alone; ``routing_decision`` even has both ``model``
-    and ``agent``. Derive the set from the field definitions so it can't drift
-    if aliases are added or removed.
-
-    :returns: Item-type strings whose ``model`` export must map back to
-        ``agent`` on import, e.g. ``{"message", "function_call", ...}``.
-    """
-    from omnigent.entities.conversation import ITEM_TYPE_TO_DATA_CLS
-
-    aliased: set[str] = set()
-    for item_type, cls in ITEM_TYPE_TO_DATA_CLS.items():
-        field = cls.model_fields.get("agent")
-        if field is not None and field.serialization_alias == "model":
-            aliased.add(item_type)
-    return frozenset(aliased)
 
 
 def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
     """
-    Rebuild one exported item into a ``{"type", "data"}`` create payload.
+    Rebuild one legacy exported item into a ``{"type", "data"}`` create payload.
 
-    Strips envelope fields the server reassigns, reverses the ``agent``→
-    ``model`` serialization alias (only for the types that carry it), and
-    validates the result with :func:`parse_item_data` so a malformed item
-    fails loud client-side before the create request.
+    Strips the API envelope plus the legacy ``record_type`` marker, reverses
+    the ``agent``→``model`` serialization alias (only for the types that carry
+    it, see :func:`omnigent.export.agent_serializes_as_model`), and validates
+    the result with :func:`parse_item_data` so a malformed item fails loud
+    client-side before the create request.
 
     :param item: One ``record_type == "item"`` object from an export JSONL.
     :returns: A ``SessionEventInput``-shaped dict for ``initial_items``.
@@ -7480,15 +7553,14 @@ def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
         does not validate for that type.
     """
     from omnigent.entities.conversation import parse_item_data
+    from omnigent.export import ITEM_ENVELOPE_KEYS, agent_serializes_as_model
 
     item_type = item.get("type")
     if not isinstance(item_type, str) or not item_type:
         raise click.ClickException(f"Export item is missing a 'type': {item!r}")
-    raw = {key: value for key, value in item.items() if key not in _IMPORT_ITEM_ENVELOPE_FIELDS}
-    # Reverse the agent→model alias only for types that actually use it, so a
-    # genuine ``model`` field on other types (compaction, routing_decision) is
-    # preserved rather than corrupted.
-    if item_type in _import_agent_aliased_types() and "model" in raw:
+    envelope = ITEM_ENVELOPE_KEYS | {"record_type"}
+    raw = {key: value for key, value in item.items() if key not in envelope}
+    if agent_serializes_as_model(item_type) and "model" in raw:
         raw["agent"] = raw.pop("model")
     try:
         parse_item_data(item_type, raw)
@@ -7497,6 +7569,186 @@ def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
             f"Export contains an invalid {item_type!r} item: {exc}"
         ) from exc
     return {"type": item_type, "data": raw}
+
+
+def _transcript_writer(path: Path, compressed: bool) -> TextIO:
+    """Open *path* for writing a transcript, gzipped or plain."""
+    import gzip
+
+    if compressed:
+        return cast("TextIO", gzip.open(path, "wt", encoding="utf-8"))
+    return path.open("w", encoding="utf-8")
+
+
+def _open_transcript(path: Path) -> TextIO:
+    """Open a transcript for reading, decompressing a gzipped one.
+
+    Keyed on the bytes rather than the name, so a ``.gz`` file renamed by a
+    browser or a mail client still reads.
+    """
+    import gzip
+
+    with path.open("rb") as probe:
+        gzipped = probe.read(2) == b"\x1f\x8b"
+    if gzipped:
+        return cast("TextIO", gzip.open(path, "rt", encoding="utf-8"))
+    return path.open("r", encoding="utf-8")
+
+
+def _read_session_export(src_path: Path) -> tuple[_JsonObject, list[dict[str, object]]]:
+    """
+    Read a session export into ``(session meta, initial_items)``.
+
+    Accepts an ``omnigent.transcript/1`` file (header line carries
+    ``schema``) and, for files written before the schema existed, the older
+    ``record_type: session_meta`` / ``item`` JSONL. The meta dict uses the
+    ``GET /v1/sessions/{id}`` key names either way so the caller binds the
+    agent and restores settings the same way.
+
+    :param src_path: The export file.
+    :returns: The session meta and the ``SessionEventInput``-shaped items.
+    :raises click.ClickException: If the file is not an export this version
+        can read, or an item does not validate.
+    """
+    from omnigent.export import TranscriptSchemaError, read_transcript
+
+    with _open_transcript(src_path) as fh:
+        first = next((line for line in fh if line.strip()), "")
+    try:
+        first_record: object = json.loads(first) if first.strip() else None
+    except ValueError as exc:
+        raise click.ClickException(f"{src_path}:1: not valid JSON ({exc}).") from exc
+    # A schema header is authoritative: a file naming one is read as a transcript
+    # (and refused if the version is unknown) even if it also carries a legacy
+    # ``record_type`` key.
+    if (
+        isinstance(first_record, dict)
+        and "schema" not in first_record
+        and "record_type" in first_record
+    ):
+        return _read_legacy_session_export(src_path)
+
+    try:
+        with _open_transcript(src_path) as fh:
+            transcript = read_transcript(fh)
+    except TranscriptSchemaError as exc:
+        raise click.ClickException(f"{src_path}: {exc}") from exc
+
+    if transcript.header.redacted:
+        raise click.ClickException(
+            f"{src_path}: this transcript was exported with --redact, so it carries no "
+            "content and cannot be imported. Export it again without --redact."
+        )
+
+    return _session_from_transcript(src_path, transcript)
+
+
+def _session_from_transcript(
+    src_path: Path, transcript: Transcript
+) -> tuple[_JsonObject, list[dict[str, object]]]:
+    """Turn one parsed session into the meta and items a create request needs."""
+    from omnigent.entities.conversation import parse_item_data
+    from omnigent.export import item_from_entry
+
+    initial_items: list[dict[str, object]] = []
+    for entry in transcript.entries:
+        payload = item_from_entry(entry)
+        try:
+            parse_item_data(str(payload["type"]), payload["data"])
+        except (TypeError, ValueError) as exc:
+            raise click.ClickException(
+                f"{src_path}: entry {entry.seq} is an invalid {payload['type']!r} item: {exc}"
+            ) from exc
+        initial_items.append(payload)
+
+    header = transcript.header
+    meta: _JsonObject = {
+        "id": header.session,
+        "title": header.title,
+        "agent_id": header.agent_id,
+        "harness": header.harness,
+        "workspace": header.workspace,
+        "parent_session": header.parent_session,
+        **header.settings,
+    }
+    return meta, initial_items
+
+
+def _read_session_exports(
+    src_path: Path,
+) -> list[tuple[_JsonObject, list[dict[str, object]]]]:
+    """Read every session in an export, root first.
+
+    A single-session file yields one. A spawn-tree bundle yields the root and
+    its sub-agent sessions, in the order the exporter wrote them, which is
+    parents before children.
+
+    :param src_path: The export file.
+    :returns: One ``(meta, items)`` pair per session.
+    :raises click.ClickException: As :func:`_read_session_export`.
+    """
+    from omnigent.export import TranscriptSchemaError, read_transcripts
+
+    with _open_transcript(src_path) as fh:
+        first = next((line for line in fh if line.strip()), "")
+    try:
+        first_record: object = json.loads(first) if first.strip() else None
+    except ValueError as exc:
+        raise click.ClickException(f"{src_path}:1: not valid JSON ({exc}).") from exc
+    if (
+        isinstance(first_record, dict)
+        and "schema" not in first_record
+        and "record_type" in first_record
+    ):
+        return [_read_legacy_session_export(src_path)]
+
+    try:
+        with _open_transcript(src_path) as fh:
+            transcripts = read_transcripts(fh)
+    except TranscriptSchemaError as exc:
+        raise click.ClickException(f"{src_path}: {exc}") from exc
+
+    for transcript in transcripts:
+        if transcript.header.redacted:
+            raise click.ClickException(
+                f"{src_path}: this transcript was exported with --redact, so it carries no "
+                "content and cannot be imported. Export it again without --redact."
+            )
+    return [_session_from_transcript(src_path, t) for t in transcripts]
+
+
+def _read_legacy_session_export(src_path: Path) -> tuple[_JsonObject, list[dict[str, object]]]:
+    """Read the pre-schema ``session_meta`` / ``item`` JSONL export."""
+    meta: _JsonObject | None = None
+    items: list[_JsonObject] = []
+    with src_path.open("r", encoding="utf-8") as fh:
+        for line_no, line in enumerate(fh, start=1):
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record_value: object = json.loads(line)
+            except ValueError as exc:
+                raise click.ClickException(
+                    f"{src_path}:{line_no}: not valid JSON ({exc})."
+                ) from exc
+            if not isinstance(record_value, dict) or not all(
+                isinstance(key, str) for key in record_value
+            ):
+                raise click.ClickException(f"{src_path}:{line_no}: expected a JSON object.")
+            record = cast(_JsonObject, record_value)
+            kind = record.get("record_type")
+            if kind == "session_meta":
+                meta = record
+            elif kind == "item":
+                items.append(record)
+            # Unknown record_type lines are ignored for forward compatibility.
+
+    if meta is None:
+        raise click.ClickException(
+            f"{src_path}: no 'session_meta' line found — is this a session export?"
+        )
+    return meta, [_import_item_payload(item) for item in items]
 
 
 @session.command("import")
@@ -7524,8 +7776,9 @@ def _import_item_payload(item: Mapping[str, object]) -> dict[str, object]:
 def session_import(input_path: str, title: str | None, server: str | None) -> None:
     """Import a session transcript from a portable JSONL file.
 
-    The inverse of ``omnigent session export``: reads the ``session_meta`` +
-    ``item`` lines and recreates the conversation on the target server as a new
+    The inverse of ``omnigent session export``: reads an
+    ``omnigent.transcript/1`` file (or the older ``session_meta`` / ``item``
+    JSONL) and recreates the conversation on the target server as a new
     session (a fresh conversation id each time). Distinct from ``omnigent
     import``, which reads native harness history rather than an export file.
 
@@ -7561,39 +7814,12 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
     if not src_path.is_file():
         raise click.ClickException(f"Import file not found: {input_path}")
 
-    meta: _JsonObject | None = None
-    items: list[_JsonObject] = []
-    with src_path.open("r", encoding="utf-8") as fh:
-        for line_no, line in enumerate(fh, start=1):
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                record_value: object = json.loads(line)
-            except ValueError as exc:
-                raise click.ClickException(
-                    f"{input_path}:{line_no}: not valid JSON ({exc})."
-                ) from exc
-            if not isinstance(record_value, dict) or not all(
-                isinstance(key, str) for key in record_value
-            ):
-                raise click.ClickException(f"{input_path}:{line_no}: expected a JSON object.")
-            record = cast(_JsonObject, record_value)
-            kind = record.get("record_type")
-            if kind == "session_meta":
-                meta = record
-            elif kind == "item":
-                items.append(record)
-            # Unknown record_type lines are ignored for forward compatibility.
+    from omnigent.export import SETTING_KEYS
 
-    if meta is None:
-        raise click.ClickException(
-            f"{input_path}: no 'session_meta' line found — is this a session export?"
-        )
-    if not items:
-        raise click.ClickException(f"{input_path}: no 'item' lines to import.")
-
-    initial_items = [_import_item_payload(item) for item in items]
+    sessions = _read_session_exports(src_path)
+    meta, initial_items = sessions[0]
+    if not initial_items:
+        raise click.ClickException(f"{input_path}: no items to import.")
 
     # Agent binding: reuse the exported agent_id when it exists on the target
     # server; otherwise fall back to the built-in native agent for the export's
@@ -7629,7 +7855,14 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
         else (exported_title if isinstance(exported_title, str) else None)
     )
 
-    def _create(agent_id: str, client: httpx.Client) -> httpx.Response:
+    def _create(
+        agent_id: str,
+        client: httpx.Client,
+        meta: _JsonObject = meta,
+        initial_items: list[dict[str, object]] = initial_items,
+        parent_id: str | None = None,
+        title_override: str | None = None,
+    ) -> httpx.Response:
         body: dict[str, object] = {
             "agent_id": agent_id,
             "initial_items": initial_items,
@@ -7637,18 +7870,17 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
             # initial_items as history-only and launches no runner.
             "host_type": "external",
         }
-        if resolved_title:
-            body["title"] = resolved_title
+        chosen_title = title_override if parent_id is not None else resolved_title
+        if chosen_title:
+            body["title"] = chosen_title
+        if parent_id is not None:
+            # A parent link is what makes the restored session a sub-agent again.
+            body["parent_session_id"] = parent_id
         if labels:
             body["labels"] = labels
-        for key in (
-            "workspace",
-            "harness_override",
-            "model_override",
-            "reasoning_effort",
-            "cost_control_mode_override",
-            "terminal_launch_args",
-        ):
+        # Every setting the export writes is re-applied; the key list is the
+        # export's so the two cannot drift apart.
+        for key in ("workspace", *SETTING_KEYS):
             value = meta.get(key)
             if value is not None:
                 body[key] = value
@@ -7692,7 +7924,100 @@ def session_import(input_path: str, title: str | None, server: str | None) -> No
         created = cast(_JsonObject, created_value)
 
     new_id = created.get("id") or created.get("session_id")
+    if not isinstance(new_id, str):
+        raise click.ClickException("Session import returned no session id.")
     click.echo(f"Imported {len(initial_items)} item(s) into {new_id}")
+
+    if len(sessions) > 1:
+        _import_sub_sessions(
+            sessions[1:],
+            root_old_id=str(meta.get("id") or ""),
+            root_new_id=new_id,
+            base_url=base_url,
+            fallback_agent_id=fallback_agent_id,
+        )
+
+
+def _import_sub_sessions(
+    sessions: list[tuple[_JsonObject, list[dict[str, object]]]],
+    *,
+    root_old_id: str,
+    root_new_id: str,
+    base_url: str,
+    fallback_agent_id: str | None,
+) -> None:
+    """Recreate a bundle's sub-agent sessions under the session just imported.
+
+    The exporter writes parents before children, so each session's parent has
+    already been created and its new id is known by the time its turn comes.
+    One that cannot be created is reported and skipped: a partial tree beats
+    losing the root that already imported.
+
+    :param sessions: The non-root sessions, in file order.
+    :param root_old_id: The root's id as the export recorded it.
+    :param root_new_id: The root's id on this server.
+    :param base_url: Target server.
+    :param fallback_agent_id: Agent to bind when the exported one is absent.
+    """
+    import httpx
+
+    from omnigent.chat import _remote_headers
+    from omnigent.export import SETTING_KEYS
+
+    new_ids = {root_old_id: root_new_id}
+    imported = 0
+    with httpx.Client(
+        base_url=base_url,
+        headers=_remote_headers(server_url=base_url, host_id=None),
+        timeout=120.0,
+        trust_env=_trust_env_for(base_url),
+    ) as client:
+        for meta, items in sessions:
+            old_id = str(meta.get("id") or "")
+            parent_old = meta.get("parent_session")
+            parent_new = new_ids.get(str(parent_old)) if isinstance(parent_old, str) else None
+            if parent_new is None:
+                click.echo(f"Skipped {old_id}: its parent session is not in this file.")
+                continue
+            agent_value = meta.get("agent_id")
+            candidates = [
+                a
+                for a in (agent_value if isinstance(agent_value, str) else None, fallback_agent_id)
+                if a
+            ]
+            body: dict[str, object] = {
+                "initial_items": items,
+                "host_type": "external",
+                "parent_session_id": parent_new,
+            }
+            title = meta.get("title")
+            if isinstance(title, str) and title:
+                body["title"] = title
+            for key in ("workspace", *SETTING_KEYS):
+                value = meta.get(key)
+                if value is not None:
+                    body[key] = value
+            resp: httpx.Response | None = None
+            for idx, agent_id in enumerate(candidates):
+                resp = client.post("/v1/sessions", json={**body, "agent_id": agent_id})
+                if resp.status_code == 404 and idx + 1 < len(candidates):
+                    continue
+                break
+            if resp is None or resp.status_code >= 400:
+                detail = (
+                    f"({resp.status_code}) {resp.text[:200]}"
+                    if resp is not None
+                    else "(no agent to bind)"
+                )
+                click.echo(f"Skipped sub-session {old_id}: {detail}")
+                continue
+            created = resp.json()
+            child_new = created.get("id") or created.get("session_id")
+            if isinstance(child_new, str):
+                new_ids[old_id] = child_new
+                imported += 1
+    if imported:
+        click.echo(f"Imported {imported} sub-agent session(s) under {root_new_id}")
 
 
 # Shared option help for ``run`` and the harness commands. These are the same

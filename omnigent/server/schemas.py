@@ -2241,6 +2241,8 @@ class SessionResponse(BaseModel):
         ``PATCH /v1/sessions/{id}`` or the REPL's ``/model``
         command; both write the same column so the web UI and
         the TUI stay in sync.
+    :param harness_override: Per-session harness override, e.g. ``"codex"``;
+        ``None`` when the session runs the agent's own harness.
     :param cost_control_mode_override: Per-session cost-control
         switch: ``"on"`` activates the spec's configured cost-control
         mode, ``"off"`` disables cost control for this session.
@@ -2416,6 +2418,7 @@ class SessionResponse(BaseModel):
     llm_model: str | None = None
     harness: str | None = None
     model_override: str | None = None
+    harness_override: str | None = None
     cost_control_mode_override: str | None = None
     subagent_routing_override: str | None = None
     share_workspace_files: bool = False

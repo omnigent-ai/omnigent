@@ -230,7 +230,7 @@ describe("HeaderConversationMenu", () => {
   });
 
   it("downloads the transcript as <session-id>.jsonl from Export", async () => {
-    const jsonl = '{"record_type":"session_meta","id":"conv-1"}\n';
+    const jsonl = '{"schema":"omnigent.transcript/1","session":"conv-1"}\n';
     mocks.exportTranscript.mockResolvedValueOnce(jsonl);
     renderMenu();
     openMenu();

@@ -3,13 +3,21 @@
 from __future__ import annotations
 
 import asyncio
+import zlib
+from collections.abc import AsyncIterator
+from typing import Literal
 
 from fastapi import (
     APIRouter,
     Query,
     Request,
 )
+from fastapi.responses import StreamingResponse
 
+from omnigent.entities import Conversation
+from omnigent.export import EntryNumbering, TranscriptHeader, header_from_conversation
+from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
@@ -37,6 +45,11 @@ from omnigent.server.routes._sessions.common import (
     get_server_runner_router,
     set_server_runner_router,
 )
+from omnigent.server.routes._sessions.helpers import (
+    _attachment_disposition,
+    _resolve_harness,
+    _resolve_llm_model,
+)
 from omnigent.server.routes._sessions.orchestration import (
     _child_session_summaries_from_conversations,
 )
@@ -47,6 +60,29 @@ from omnigent.server.schemas import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
+#: Items per page when streaming an export; one store round trip per page.
+_EXPORT_PAGE_SIZE = 500
+#: Sub-agent sessions read per parent when bundling a spawn tree.
+_EXPORT_TREE_PAGE_SIZE = 200
+#: ``zlib`` with a gzip wrapper, so the bytes are a ``.gz`` file rather than raw deflate.
+_GZIP_WBITS = 16 + zlib.MAX_WBITS
+
+
+async def _gzipped(lines: AsyncIterator[str]) -> AsyncIterator[bytes]:
+    """Compress a line stream as it is produced, so a long session never buffers."""
+    compressor = zlib.compressobj(wbits=_GZIP_WBITS)
+    async for line in lines:
+        chunk = compressor.compress(line.encode("utf-8"))
+        if chunk:
+            yield chunk
+    yield compressor.flush()
+
+
+class _NdjsonResponse(StreamingResponse):
+    """A streamed NDJSON body; declares the media type for the OpenAPI schema too."""
+
+    media_type = "application/x-ndjson"
+
 
 def register_items_routes(
     router: APIRouter,
@@ -55,8 +91,168 @@ def register_items_routes(
     agent_store: AgentStore,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    agent_cache: AgentCache | None = None,
 ) -> None:
     """Register the items routes on router."""
+
+    @router.get(
+        "/sessions/{session_id}/export",
+        # response_model=None: returns a streamed body, not a model.
+        response_model=None,
+        response_class=_NdjsonResponse,
+        responses={
+            200: {
+                "description": (
+                    "The session as an ``omnigent.transcript/1`` file: one JSON "
+                    "object per line, header first, then one entry per item."
+                ),
+                "content": {"application/x-ndjson": {"schema": {"type": "string"}}},
+            },
+        },
+    )
+    async def export_session_transcript(
+        request: Request,
+        session_id: str,
+        content: Literal["full", "none"] = Query(default="full"),
+        compress: Literal["none", "gzip"] = Query(default="none"),
+        include: Literal["session", "tree"] = Query(default="session"),
+    ) -> StreamingResponse:
+        """
+        Stream the session as a portable, versioned transcript.
+
+        Builds the same ``omnigent.transcript/1`` file as ``omnigent session
+        export`` (see ``docs/session-export.md``) server-side, paging the
+        items so a long session never has to fit in memory at once. The
+        header's ``title`` and ``model`` are resolved the way the session
+        snapshot (``GET /v1/sessions/{id}``) resolves them.
+
+        :param request: Inbound HTTP request; carries the caller identity
+            used to authorize READ on the session.
+        :param session_id: Session/conversation identifier,
+            e.g. ``"conv_abc123"``.
+        :param content: ``"full"`` (default) writes the session as it is stored.
+            ``"none"`` writes its shape without content: turns, tool names,
+            call ids, timing and the ``sealed`` markers, with every
+            content field dropped and ``redacted`` set in the header. Such a
+            file is not importable.
+        :param include: ``"tree"`` appends this session's sub-agent sessions,
+            and theirs, each introduced by its own header line. The caller's
+            READ on this session covers them, as it does for
+            ``GET /v1/sessions/{id}/child_sessions``.
+        :param compress: ``"gzip"`` returns the same transcript gzipped, as
+            ``<session_id>.jsonl.gz``. Sent as ``application/gzip`` rather than
+            a content encoding, so the download is the compressed file itself
+            rather than something the browser silently expands.
+        :returns: An ``application/x-ndjson`` download named
+            ``<session_id>.jsonl``.
+        :raises OmnigentError: 404 when no such session exists or the caller
+            has no READ access to it (the two are not distinguished).
+        """
+        user_id = _get_user_id(request, auth_provider)
+        access = await _require_access_and_level(
+            user_id, session_id, LEVEL_READ, permission_store, conversation_store
+        )
+        conv = access.conversation
+        if conv is None:
+            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+            if conv is None:
+                raise _session_not_found()
+
+        def _header(conversation: Conversation) -> TranscriptHeader:
+            """Resolve the agent-derived header fields the way the snapshot does."""
+            agent = agent_store.get(conversation.agent_id) if conversation.agent_id else None
+            return header_from_conversation(
+                conversation,
+                agent_name=agent.name if agent is not None else None,
+                harness=_resolve_harness(
+                    conversation, agent_store=agent_store, agent_cache=agent_cache
+                ),
+                # The harness's own report supersedes the spec-derived model.
+                llm_model=concrete_reported_model(conversation.reported_model)
+                or _resolve_llm_model(
+                    conversation, agent_store=agent_store, agent_cache=agent_cache
+                ),
+            )
+
+        def _descendants(root_id: str) -> list[Conversation]:
+            """The sub-agent sessions under *root_id*, breadth first.
+
+            A sub-agent can spawn its own, so this walks rather than lists one
+            level. Ids already seen are skipped, so a cycle in stored data
+            cannot make the download run forever.
+            """
+            out: list[Conversation] = []
+            seen = {root_id}
+            queue = [root_id]
+            while queue:
+                parent_id = queue.pop(0)
+                children = conversation_store.list_conversations(
+                    limit=_EXPORT_TREE_PAGE_SIZE,
+                    kind="sub_agent",
+                    parent_conversation_id=parent_id,
+                    order="asc",
+                    sort_by="created_at",
+                ).data
+                for child in children:
+                    if child.id in seen:
+                        continue
+                    seen.add(child.id)
+                    out.append(child)
+                    queue.append(child.id)
+            return out
+
+        redact = content == "none"
+
+        async def _session_lines(conversation: Conversation) -> AsyncIterator[str]:
+            """Yield one session: its header, then its items a page at a time."""
+            header = await asyncio.to_thread(_header, conversation)
+            if redact:
+                header = header.model_copy(update={"redacted": True})
+            yield header.to_line() + "\n"
+            numbering = EntryNumbering()
+            after: str | None = None
+            while True:
+                page = await asyncio.to_thread(
+                    conversation_store.list_items,
+                    conversation.id,
+                    limit=_EXPORT_PAGE_SIZE,
+                    after=after,
+                    order="asc",
+                )
+                for item in page.data:
+                    entry = numbering.entry(item.to_api_dict())
+                    yield (entry.redacted() if redact else entry).to_line() + "\n"
+                if not page.has_more:
+                    break
+                if page.last_id is None:
+                    # Cannot be followed; aborting the stream beats a file that
+                    # silently ends early and reads as complete.
+                    raise RuntimeError(
+                        f"session {conversation.id} item page reported more results "
+                        "without a cursor"
+                    )
+                after = page.last_id
+
+        async def _lines() -> AsyncIterator[str]:
+            """Yield the session, and its spawn tree when asked for."""
+            async for line in _session_lines(conv):
+                yield line
+            if include != "tree":
+                return
+            for descendant in await asyncio.to_thread(_descendants, conv.id):
+                async for line in _session_lines(descendant):
+                    yield line
+
+        if compress == "gzip":
+            return StreamingResponse(
+                _gzipped(_lines()),
+                media_type="application/gzip",
+                headers={"Content-Disposition": _attachment_disposition(f"{conv.id}.jsonl.gz")},
+            )
+        return _NdjsonResponse(
+            _lines(),
+            headers={"Content-Disposition": _attachment_disposition(f"{conv.id}.jsonl")},
+        )
 
     @router.get(
         "/sessions/{session_id}/items",

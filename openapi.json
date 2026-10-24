@@ -7939,6 +7939,18 @@
             "description": "The bound agent's canonical harness, e.g. `\"claude-sdk\"` or `\"openai-agents\"`. Lets the client render the active credential for the correct provider family instead of inferring it from the model string (which is wrong when the agent declares no model). `None` when the agent cannot be looked up.",
             "title": "Harness"
           },
+          "harness_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Per-session harness override, e.g. `\"codex\"`; `None` when the session runs the agent's own harness.",
+            "title": "Harness Override"
+          },
           "host_id": {
             "anyOf": [
               {
@@ -14639,6 +14651,95 @@
         "summary": "Update Comment",
         "tags": [
           "comments"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/export": {
+      "get": {
+        "description": "Stream the session as a portable, versioned transcript.\n\nBuilds the same `omnigent.transcript/1` file as `omnigent session export` (see `docs/session-export.md`) server-side, paging the\nitems so a long session never has to fit in memory at once. The\nheader's `title` and `model` are resolved the way the session\nsnapshot (`GET /v1/sessions/{id}`) resolves them.\n\n**Returns:** An `application/x-ndjson` download named `<session_id>.jsonl`.\n\n**Raises**\n\n- `OmnigentError` \u2014 404 when no such session exists or the caller has no READ access to it (the two are not distinguished).",
+        "operationId": "export_session_transcript_v1_sessions__session_id__export_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier, e.g. `\"conv_abc123\"`.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "`\"full\"` (default) writes the session as it is stored. `\"none\"` writes its shape without content: turns, tool names, call ids, timing and the `sealed` markers, with every content field dropped and `redacted` set in the header. Such a file is not importable.",
+            "in": "query",
+            "name": "content",
+            "required": false,
+            "schema": {
+              "default": "full",
+              "enum": [
+                "full",
+                "none"
+              ],
+              "title": "Content",
+              "type": "string"
+            }
+          },
+          {
+            "description": "`\"gzip\"` returns the same transcript gzipped, as `<session_id>.jsonl.gz`. Sent as `application/gzip` rather than a content encoding, so the download is the compressed file itself rather than something the browser silently expands.",
+            "in": "query",
+            "name": "compress",
+            "required": false,
+            "schema": {
+              "default": "none",
+              "enum": [
+                "none",
+                "gzip"
+              ],
+              "title": "Compress",
+              "type": "string"
+            }
+          },
+          {
+            "description": "`\"tree\"` appends this session's sub-agent sessions, and theirs, each introduced by its own header line. The caller's READ on this session covers them, as it does for `GET /v1/sessions/{id}/child_sessions`.",
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "default": "session",
+              "enum": [
+                "session",
+                "tree"
+              ],
+              "title": "Include",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/x-ndjson": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "description": "The session as an `omnigent.transcript/1` file: one JSON object per line, header first, then one entry per item."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Export Session Transcript",
+        "tags": [
+          "sessions"
         ]
       }
     },
