@@ -4876,6 +4876,13 @@ def create_runner_app(
         # Capture our own task so the finally floor can identity-compare before
         # clearing the slot (see below).
         _own_task = asyncio.current_task()
+
+        def _superseded() -> bool:
+            # Only a different task in the slot means a newer turn took over;
+            # ``delete_session`` pops the slot before cancelling, so empty still settles.
+            _slot = _active_turns.get(conv)
+            return _slot is not None and _slot is not _own_task
+
         # A fresh turn is binding: whatever desync the previous turn ended on is
         # resolved now. Also clear a stale publish-once token (e.g. left set by a
         # wedged stream that never reached its own _on_proxy_stream_end) so it
@@ -4893,16 +4900,31 @@ def create_runner_app(
                 # error event) is never shadowed by the generic except below.
                 raise
             except asyncio.CancelledError as exc:
-                _logger.error(
-                    "turn cancelled for %s: %s",
-                    conv,
-                    exc,
-                    exc_info=True,
-                    extra={"session_id": conv},
-                )
-                _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
+                if _superseded():
+                    _logger.debug(
+                        "Ignoring cancellation of a superseded background turn for %s",
+                        conv,
+                        extra={"session_id": conv},
+                    )
+                else:
+                    _logger.error(
+                        "turn cancelled for %s: %s",
+                        conv,
+                        exc,
+                        exc_info=True,
+                        extra={"session_id": conv},
+                    )
+                    _on_proxy_stream_end(conv, error={"message": f"turn setup failed: {exc}"})
                 raise
             except Exception as exc:
+                if _superseded():
+                    _logger.warning(
+                        "Ignoring failure from a superseded background turn for %s",
+                        conv,
+                        exc_info=True,
+                        extra={"session_id": conv},
+                    )
+                    return
                 _logger.error(
                     "turn setup failed for %s: %s",
                     conv,
