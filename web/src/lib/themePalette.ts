@@ -187,6 +187,8 @@ function paletteTokens(tokens: PaletteTokenInput): PaletteTokens {
     sidebarAccentForeground: tokens.accentForeground,
     sidebarBorder: tokens.border,
     sidebarRing: tokens.ring,
+    // Keep palette-token references as plain `var(--token)` without a fallback
+    // value: pinTokenRefsToMode() rewrites only that form.
     sidebarActive: "color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar))",
     sidebarActiveForeground: "var(--sidebar-foreground)",
     sidebarBackground: "var(--sidebar)",
