@@ -12,9 +12,10 @@ add/set-default/remove write paths surfaces here rather than silently.
 harness on a single compact row — the name on the left, then an aligned
 ``✓``/``✗`` status column — in 0.3 priority order: ``1=Claude``,
 ``2=Codex``, ``3=Cursor``, ``4=OpenCode``, ``5=Hermes``, ``6=Pi``,
-``7=Antigravity``, ``8=Qwen Code``, ``9=Goose``, ``10=Copilot``, ``11=Kiro``,
-``12=Kimi Code``, ``13=Import from OpenClaw``, ``14=Custom ACP agent``,
-``15=Quit``. There is no "More" folding — every harness is visible at once —
+``7=Omp``, ``8=Antigravity``, ``9=Qwen Code``, ``10=Goose``, ``11=Devin``,
+``12=Grok Build``, ``13=Jcode``, ``14=Copilot``, ``15=Kiro``,
+``16=Kimi Code``, ``17=Import from OpenClaw``, ``18=Custom ACP agent``,
+``19=Quit``. There is no "More" folding — every harness is visible at once —
 and the actionable hint (install command / next step)
 renders only for the highlighted row, as the selector's description line.
 Selecting a harness drills into level 2 — its configured credentials, then ``+ Add a
@@ -981,7 +982,7 @@ def test_remove_databricks_gemini_preserves_other_harness_wiring(isolated_config
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "3", "1", "2", "q", "q", "q"]) + "\n",
+        input="\n".join(["8", "3", "1", "2", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
     assert "agy-db" not in _config_yaml(isolated_config).get("providers", {})
@@ -1784,6 +1785,7 @@ def test_overview_lists_all_harnesses_in_priority_order(isolated_config, monkeyp
         "OpenCode",
         "Hermes",
         "Pi",
+        "Omp",
         "Antigravity",
         "Qwen Code",
         "Goose",
@@ -1964,9 +1966,9 @@ def test_setup_imports_openclaw_agents(isolated_config) -> None:
         encoding="utf-8",
     )
 
-    # 16 is the OpenClaw import row: hiding Devin's builtin ACP row moved every
-    # row after it one lower (see the dispatch table's note).
-    stdin = "\n".join(["16", "", "", "q"]) + "\n"
+    # 17 is the OpenClaw import row: hiding Devin's builtin ACP row and landing
+    # the Omp row moved every row after them (see the dispatch table's note).
+    stdin = "\n".join(["17", "", "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -1988,7 +1990,7 @@ def test_setup_imports_openclaw_agents_from_user_selected_path(isolated_config) 
         encoding="utf-8",
     )
 
-    stdin = "\n".join(["16", "", str(selected), "", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2005,7 +2007,7 @@ def test_setup_rejects_user_selected_unrelated_file(isolated_config) -> None:
     selected = isolated_config / "package.json"
     selected.write_text('{"name": "unrelated"}', encoding="utf-8")
 
-    stdin = "\n".join(["16", "", str(selected), "2", "q"]) + "\n"
+    stdin = "\n".join(["17", "", str(selected), "2", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
 
     assert result.exit_code == 0, result.output
@@ -2194,19 +2196,24 @@ def test_overview_truncates_long_status_for_narrow_terminal(isolated_config, mon
     [
         ("4", "_manage_opencode_harness"),
         ("5", "_manage_hermes_harness"),
-        ("8", "_manage_qwen_harness"),
-        ("9", "_manage_goose_harness"),
-        # 10 is Devin's NATIVE row (devin-native), in the slot its builtin ACP
-        # row used to hold. The ACP path is deprecated (not offered), so 11-12
-        # are the remaining builtin ACP CLI rows (Grok Build, Jcode; sorted by
-        # id); every row after them sits one lower.
-        ("10", "_manage_devin_harness"),
-        ("11", "_show_acp_cli_harness"),
+        # 7 is the Omp surface row (after Pi); family surfaces share the
+        # providers drill-in — this pins Omp's position→sentinel→manager.
+        ("7", "_manage_harness_providers"),
+        ("8", "_manage_antigravity_harness"),
+        ("9", "_manage_qwen_harness"),
+        ("10", "_manage_goose_harness"),
+        # 11 is Devin's NATIVE row (devin-native), in the slot its builtin ACP
+        # row used to hold. The ACP path is deprecated (not offered), so 12-13
+        # are the two remaining builtin ACP CLI rows (Grok Build, Jcode; sorted
+        # by id); every row after them sits one lower.
+        ("11", "_manage_devin_harness"),
         ("12", "_show_acp_cli_harness"),
-        ("13", "_manage_copilot_harness"),
-        ("14", "_manage_kiro_harness"),
-        ("15", "_manage_kimi_harness"),
-        ("17", "_add_acp_agent"),
+        ("13", "_show_acp_cli_harness"),
+        ("14", "_manage_copilot_harness"),
+        ("15", "_manage_kiro_harness"),
+        ("16", "_manage_kimi_harness"),
+        # 17 imports from OpenClaw/acpx, 18 adds a custom ACP agent.
+        ("18", "_add_acp_agent"),
     ],
 )
 def test_overview_dispatches_to_correct_manager(
@@ -3021,8 +3028,8 @@ def test_cursor_install_now_invokes_runner_without_index(
 
 
 # ── Antigravity auth flow ───────────────────────────────────────────────────
-# Antigravity (Gemini-native, no provider family) is row 7 on the overview (it
-# follows Pi) and stores its key in the secret store + the ``antigravity:``
+# Antigravity (Gemini-native, no provider family) is row 8 on the overview (it
+# follows Omp) and stores its key in the secret store + the ``antigravity:``
 # config block. The same drill-in also exposes native ``agy`` sign-in;
 # ``isolated_config`` clears ambient GEMINI_API_KEY / ANTIGRAVITY_API_KEY.
 
@@ -3054,9 +3061,9 @@ def test_antigravity_set_api_key_paste_writes_block_and_secret(
     Proves the api-key path: the secret lands in the store (never plaintext in
     config) and the config references it via ``keychain:antigravity``.
     """
-    # L1 7=Antigravity → antigravity menu 1=Set API key →
+    # L1 8=Antigravity → antigravity menu 1=Set API key →
     # paste key (AIza → no warn) → antigravity menu q=back → L1 q=quit.
-    stdin = "\n".join(["7", "1", "AIza_test_key_123", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "1", "AIza_test_key_123", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3076,9 +3083,9 @@ def test_antigravity_adopt_env_api_key_writes_env_ref(
     at the live environment variable so the key never leaves the user's shell.
     """
     monkeypatch.setenv("GEMINI_API_KEY", "AIza_env_key_456")
-    # L1 7=Antigravity → 1=Set API key →
+    # L1 8=Antigravity → 1=Set API key →
     # "y" adopt detected $GEMINI_API_KEY → q back → q quit.
-    stdin = "\n".join(["7", "1", "y", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "1", "y", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3094,11 +3101,11 @@ def test_antigravity_sign_in_runs_agy_auth_service(
     login = Mock(return_value=True)
     monkeypatch.setattr("omnigent.onboarding.harness_install.harness_login", login)
 
-    # L1 7=Antigravity → 2=Sign in → q back → q quit.
+    # L1 8=Antigravity → 2=Sign in → q back → q quit.
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "2", "q", "q"]) + "\n",
+        input="\n".join(["8", "2", "q", "q"]) + "\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -3119,7 +3126,7 @@ def test_antigravity_sign_in_skips_sdk_install_prompt(isolated_config, monkeypat
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "2", "q", "q"]) + "\n",
+        input="\n".join(["8", "2", "q", "q"]) + "\n",
     )
 
     assert result.exit_code == 0, result.output
@@ -3137,9 +3144,9 @@ def test_antigravity_remove_api_key_drops_block_and_secret(
     with open(config_path, "w") as f:
         yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:antigravity"}}, f)
 
-    # L1 7=Antigravity → antigravity menu (key set:
+    # L1 8=Antigravity → antigravity menu (key set:
     # 1=Replace 2=Remove 3=Back) → 2=Remove → q back → q quit.
-    stdin = "\n".join(["7", "2", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "2", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3164,9 +3171,9 @@ def test_antigravity_remove_does_not_delete_foreign_keychain_secret(
     with open(config_path, "w") as f:
         yaml.safe_dump({"antigravity": {"api_key_ref": "keychain:shared-gemini"}}, f)
 
-    # L1 7=Antigravity → antigravity menu 2=Remove →
+    # L1 8=Antigravity → antigravity menu 2=Remove →
     # q back → q quit.
-    stdin = "\n".join(["7", "2", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "2", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3184,9 +3191,9 @@ def test_antigravity_set_api_key_non_aiza_declined_is_not_stored(
     The soft prefix check warns and asks to store anyway; declining must leave
     both the secret store and the config untouched.
     """
-    # L1 7=Antigravity → 1=Set API key →
+    # L1 8=Antigravity → 1=Set API key →
     # paste non-AIza key → "n" decline warning → q back → q quit.
-    stdin = "\n".join(["7", "1", "sk-not-a-gemini-key", "n", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "1", "sk-not-a-gemini-key", "n", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3286,12 +3293,12 @@ def test_copilot_overview_install_command_is_selection_only(
             "Cursor — no API key yet",
         ),
         (
-            "7",
+            "8",
             "omnigent.onboarding.antigravity_auth.antigravity_sdk_installed",
             "Antigravity — no Gemini API key yet",
         ),
         (
-            "10",
+            "14",
             "omnigent.onboarding.copilot_auth.copilot_sdk_installed",
             "Copilot — no GitHub token yet",
         ),
@@ -3323,9 +3330,9 @@ def test_antigravity_drillin_offers_install_when_sdk_missing(
     The user picks "show the command" (choice 3), which prints the command and falls
     through to the key menu, then backs out.
     """
-    # L1 7=Antigravity → install offer 3=show command →
+    # L1 8=Antigravity → install offer 3=show command →
     # key menu q=back → L1 q.
-    stdin = "\n".join(["7", "3", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "3", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
     out = result.output
@@ -3342,9 +3349,9 @@ def test_antigravity_key_settable_when_sdk_missing(
     gate key management on it. The user declines ("set the key anyway" = choice 2),
     then sets the key, which must persist as it does with the SDK present.
     """
-    # L1 7=Antigravity → install offer 2=set key anyway →
+    # L1 8=Antigravity → install offer 2=set key anyway →
     # key menu 1=Set → paste AIza key → key menu q=back → L1 q=quit.
-    stdin = "\n".join(["7", "2", "1", "AIza_key_no_sdk", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "2", "1", "AIza_key_no_sdk", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3373,9 +3380,9 @@ def test_antigravity_install_now_invokes_runner_without_index(
     monkeypatch.setattr("omnigent.onboarding.extra_install.shutil.which", lambda name: None)
     monkeypatch.setattr("omnigent.onboarding.antigravity_auth.subprocess.run", _run)
 
-    # L1 7=Antigravity → install offer 1=install now →
+    # L1 8=Antigravity → install offer 1=install now →
     # key menu q=back → L1 q.
-    stdin = "\n".join(["7", "1", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "1", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
 
@@ -3753,7 +3760,7 @@ def test_antigravity_gateway_setup_persists_native_provider(isolated_config, mon
     stdin = (
         "\n".join(
             [
-                "7",
+                "8",
                 "3",
                 "1",
                 "2",
@@ -3786,7 +3793,7 @@ def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None
     from omnigent.harnesses.antigravity_native.credentials import resolve_antigravity_credentials
     from omnigent.onboarding.gemini_gateway import GEMINI_API_BASE_URL
 
-    stdin = "\n".join(["7", "3", "1", "1", "gemini-fake-key", "", "q", "q", "q"]) + "\n"
+    stdin = "\n".join(["8", "3", "1", "1", "gemini-fake-key", "", "q", "q", "q"]) + "\n"
     result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input=stdin)
     assert result.exit_code == 0, result.output
     credentials = resolve_antigravity_credentials()
@@ -3798,7 +3805,7 @@ def test_native_gemini_key_setup_uses_agy_model_default(isolated_config) -> None
 
 @pytest.mark.parametrize("correct_url", [True, False], ids=["correct", "go-back"])
 def test_gemini_gateway_setup_recovers_from_invalid_url(isolated_config, correct_url) -> None:
-    inputs = ["7", "3", "1", "2", "demo-gemini", "https://gateway.example/v1/responses"]
+    inputs = ["8", "3", "1", "2", "demo-gemini", "https://gateway.example/v1/responses"]
     if correct_url:
         inputs += ["https://gateway.example/gemini", "gateway-fake-key", ""]
     else:
@@ -3843,7 +3850,7 @@ def test_gemini_databricks_setup_recovers_from_auth_failure(
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "3", "1", "3", "work", "q", "q", "q"]) + "\n",
+        input="\n".join(["8", "3", "1", "3", "work", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
     source.assert_called_once_with("work")
@@ -3891,7 +3898,7 @@ def test_detected_gemini_key_invalid_endpoint_returns_to_setup(isolated_config, 
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "4", "1", "1", "y", "", "q", "q", "q"]) + "\n",
+        input="\n".join(["8", "4", "1", "1", "y", "", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
     assert "OpenAI Responses" in result.output, result.output
@@ -3964,7 +3971,7 @@ def test_databricks_setup_recovers_from_malformed_profile(
     result = CliRunner().invoke(
         cli,
         ["setup", "--no-internal-beta"],
-        input="\n".join(["7", "3", "1", "3", "broken", "q", "q", "q"]) + "\n",
+        input="\n".join(["8", "3", "1", "3", "broken", "q", "q", "q"]) + "\n",
     )
     assert result.exit_code == 0, result.output
     assert "profile configuration" in " ".join(result.output.split())

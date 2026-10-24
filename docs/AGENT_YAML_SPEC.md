@@ -56,7 +56,7 @@ of the agent YAML.
 
 ```yaml
 executor:
-  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, devin-native, kiro-native, pi, antigravity, qwen, kimi, copilot, hermes, ...
+  harness: claude-sdk        # claude-sdk, openai-agents, codex, cursor, devin-native, kiro-native, pi, omp, antigravity, qwen, kimi, copilot, hermes, ...
   model: databricks-claude-opus-4-7
   reasoning_effort: high     # optional spec default: low | medium | high | xhigh (harness-dependent)
   auth:
@@ -233,6 +233,21 @@ tool summaries and coding guidelines; tool schemas and execution still work.
 directory footer, and extension hooks remain active; extensions can modify the
 final prompt. This setting supports `pi` and `pi-native` only. Native settings
 apply on the next terminal launch; explicit native CLI arguments remain available.
+
+### Oh My Pi
+
+`harness: omp` runs the agent through [Oh My Pi](https://omp.sh)
+(`npm install -g @oh-my-pi/pi-coding-agent`), spawning `omp --mode rpc` and
+bridging Omnigent's tools into it. `oh-my-pi` is an alias. It routes the same
+Databricks gateway models as `pi` — a generated `models.yml` under
+`PI_CODING_AGENT_DIR` carries the provider config — so `model`,
+`reasoning_effort`, and Databricks auth behave as they do for `pi`.
+
+The `pi`-only knobs above do **not** apply: omp always appends Omnigent's
+instructions (`system_prompt_mode` is ignored), and it has no equivalent of
+`context_files`, so omp's own `AGENTS.md`/`CLAUDE.md` discovery always runs.
+Bundled skill directories are not loadable either — omp's `--skills` flag is a
+glob filter over skills it discovers itself.
 
 ### GitHub Copilot
 

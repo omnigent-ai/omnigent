@@ -50,6 +50,14 @@ const conv = (id: string): Conversation =>
 
 const convs = (...ids: string[]) => ids.map(conv);
 
+// Sonner's TIME_BEFORE_UNMOUNT: how long a dismissed toast stays mounted
+// while it animates out, and the delay of the timer that removes it.
+const SONNER_TIME_BEFORE_UNMOUNT_MS = 200;
+
+// Captured before any test installs fake timers, so the drain below always
+// waits on the real clock even when a case left `vi.useFakeTimers()` active.
+const realSetTimeout = globalThis.setTimeout;
+
 let navigate: ReturnType<typeof vi.fn>;
 
 function mountToaster() {
@@ -85,8 +93,13 @@ beforeEach(() => {
 afterEach(async () => {
   resetArchiveUndoBatchForTests();
   act(() => toast.dismiss());
-  // Sonner queues removal callbacks during its exit animation.
-  await waitFor(() => expect(document.querySelector("[data-sonner-toast]")).toBeNull());
+  // Sonner's exit-animation timer is not canceled by unmount. Drain it before
+  // jsdom teardown so its callback cannot touch `window` afterwards.
+  await act(async () => {
+    await new Promise<void>((resolve) => {
+      realSetTimeout(resolve, SONNER_TIME_BEFORE_UNMOUNT_MS + 50);
+    });
+  });
   cleanup();
   vi.useRealTimers();
 });

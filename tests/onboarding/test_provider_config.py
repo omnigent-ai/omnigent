@@ -10,6 +10,7 @@ from omnigent.errors import OmnigentError
 from omnigent.onboarding.provider_config import (
     ANTHROPIC_FAMILY,
     GEMINI_FAMILY,
+    OMP_SURFACE,
     OPENAI_FAMILY,
     PI_SURFACE,
     FamilyConfig,
@@ -389,10 +390,17 @@ def test_gemini_key_cannot_claim_pi_scope_at_parse() -> None:
 
 
 def test_databricks_does_not_serve_gemini_surface() -> None:
-    """Existing Databricks providers require an explicit native Gemini opt-in."""
+    """Databricks routes anthropic/openai + pi/omp, not Gemini by default.
+
+    Native Gemini needs an explicit profile opt-in because the antigravity
+    harness uses Google credentials; connection-backed Databricks providers
+    cannot provide that surface.
+    """
     config = {"providers": {"dbx": {"kind": "databricks", "profile": "ws", "default": True}}}
     entry = load_providers(config)["dbx"]
-    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
+    assert provider_families(entry) == frozenset(
+        {ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE}
+    )
     assert GEMINI_FAMILY not in provider_families(entry)
     # A default databricks profile does NOT become the gemini-surface default.
     assert default_provider_for_harness(config, "antigravity-native") is None
@@ -423,7 +431,9 @@ def test_managed_databricks_connection_native_gemini_support(native_gemini: bool
         entry = load_providers(config)["dbx"]
         assert entry.connection == "databricks"
         assert entry.profile is None
-        assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE})
+        assert provider_families(entry) == frozenset(
+            {ANTHROPIC_FAMILY, OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE}
+        )
 
 
 @pytest.mark.parametrize("kind", ["gateway", "local"])
@@ -436,10 +446,13 @@ def test_gateway_local_serves_declared_gemini_surface(kind: str) -> None:
     }
     config = {"providers": {"gw": raw}}
     entry = load_providers(config)["gw"]
-    assert provider_families(entry) == frozenset({ANTHROPIC_FAMILY, GEMINI_FAMILY, PI_SURFACE})
+    assert provider_families(entry) == frozenset(
+        {ANTHROPIC_FAMILY, GEMINI_FAMILY, PI_SURFACE, OMP_SURFACE}
+    )
     assert default_provider_for_harness(config, "antigravity-native") == entry
     assert default_provider_for_harness(config, "claude-native") is None
     assert default_provider_for_harness(config, "pi") is None
+    assert default_provider_for_harness(config, "omp") is None
     for legacy_default in (True, "true"):
         raw["default"] = legacy_default
         assert default_provider_for_harness(config, "antigravity-native") is None
@@ -522,7 +535,9 @@ def test_key_with_gemini_block_still_serves_gemini() -> None:
         "gemini": {"base_url": "https://y/v1beta", "api_key_ref": "env:G"},
     }
     multi_entry = load_providers({"providers": {"multi": multi}})["multi"]
-    assert provider_families(multi_entry) == frozenset({OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE})
+    assert provider_families(multi_entry) == frozenset(
+        {OPENAI_FAMILY, GEMINI_FAMILY, PI_SURFACE, OMP_SURFACE}
+    )
 
 
 def test_subscription_cannot_claim_pi_scope() -> None:
@@ -715,7 +730,7 @@ def test_parse_cli_config_entry() -> None:
     # surface), so it can claim the pi scope. (``default: true`` deliberately
     # never expands to pi — only an explicit ``pi`` does — so default_families
     # stays openai-only here.)
-    assert provider_families(entry) == frozenset({OPENAI_FAMILY, PI_SURFACE})
+    assert provider_families(entry) == frozenset({OPENAI_FAMILY, PI_SURFACE, OMP_SURFACE})
     assert entry.default_families == frozenset({OPENAI_FAMILY})
 
 
