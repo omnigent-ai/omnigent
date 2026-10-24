@@ -10,6 +10,7 @@ import os
 import sys
 from collections.abc import Iterator
 from pathlib import Path
+from unittest.mock import Mock
 
 import httpx
 import pytest
@@ -465,8 +466,9 @@ def _host_with_lock(lock: DaemonLifecycleLock) -> HostProcess:
     )
 
 
+@pytest.mark.parametrize("runtime_gone", [False, True], ids=["runtime_ok", "runtime_gone"])
 async def test_monitor_terminates_after_record_delete(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, runtime_gone: bool
 ) -> None:
     monkeypatch.setattr(connect, "_LIFECYCLE_POLL_INTERVAL_S", 0.01)
     pid = os.getpid()
@@ -475,6 +477,10 @@ async def test_monitor_terminates_after_record_delete(
     _write_record(record, pid)
 
     host = _host_with_lock(lock)
+    if runtime_gone:
+        # The runtime vanished while a runner still ran, so the host hadn't retired.
+        host._runners["runner_live"] = Mock()
+        host._note_runtime_gone()
 
     monitor = asyncio.create_task(host._lifecycle_monitor_loop())
     try:
@@ -489,6 +495,9 @@ async def test_monitor_terminates_after_record_delete(
     finally:
         if not monitor.done():
             monitor.cancel()
+    # A lost record keeps its own exit even when the runtime is also gone.
+    assert host.lifecycle_lost
+    assert not host.runtime_gone
 
 
 async def test_monitor_startup_grace_before_first_ownership(
