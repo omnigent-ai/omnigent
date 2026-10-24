@@ -122,3 +122,50 @@ def test_an_unusable_config_leaves_routing_off() -> None:
             {"routing": {"provider": "judge"}}, None, RoutingSettings()
         )
     assert (backends.external, backends.local) == (None, None)
+
+
+# ── provider: decision-model ────────────────────────────────────────────────
+
+
+def _decision_cfg(**overrides: Any) -> dict[str, Any]:
+    block = {
+        "provider": "decision-model",
+        "base_url": "https://api.typesafe.ai",
+        "model": "jev-1.13.0",
+        **overrides,
+    }
+    return {"routing": {k: v for k, v in block.items() if v is not None}}
+
+
+def test_a_decision_model_provider_routes_in_front_of_the_judge(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.decision_routing import DecisionModelRoutingClient
+
+    monkeypatch.setenv("DM_TEST_KEY", "secret")
+    cfg = _decision_cfg(api_key="${DM_TEST_KEY}", confidence_threshold=0.7)
+    with _policy_client():
+        backends = _build_routing_backends(cfg, _server_llm(), RoutingSettings())
+    assert backends.external is None
+    assert isinstance(backends.local, DecisionModelRoutingClient)
+    assert isinstance(backends.local._fallback, LLMRoutingClient)
+    assert backends.local._api_key == "secret"
+    assert backends.local._threshold == 0.7
+
+
+def test_a_decision_model_provider_without_a_model_keeps_the_judge() -> None:
+    with _policy_client():
+        backends = _build_routing_backends(
+            _decision_cfg(model=None), _server_llm(), RoutingSettings()
+        )
+    assert isinstance(backends.local, LLMRoutingClient)
+
+
+@pytest.mark.parametrize("threshold", [1.5, -0.1, "high", True])
+def test_a_bad_confidence_threshold_is_rejected(threshold: object) -> None:
+    import click
+
+    with _policy_client(), pytest.raises(click.ClickException, match="confidence_threshold"):
+        _build_routing_backends(
+            _decision_cfg(confidence_threshold=threshold), _server_llm(), RoutingSettings()
+        )
