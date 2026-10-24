@@ -6,6 +6,7 @@ import asyncio
 import json
 import sys
 from pathlib import Path
+from typing import Any
 from unittest.mock import AsyncMock
 
 import pytest
@@ -324,7 +325,7 @@ async def test_probe_codex_model_options_uses_launch_config_and_marks_default(
 
 @pytest.mark.parametrize("reader", ["probe", "catalog", "reprobe"])
 @pytest.mark.parametrize("supplied", [False, True], ids=["ambient", "supplied-provider"])
-@pytest.mark.parametrize("config_model", [None, "gpt-5.5"])
+@pytest.mark.parametrize("config_model", [None, "gpt-5.5", "gpt-5.4-retired"])
 async def test_probe_codex_model_options_probes_every_launch_shape(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -336,13 +337,16 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
 
     The plain Codex-login shape carries no ``DATABRICKS_HOST`` and no
     provider overrides beyond what the launch resolved (here the dismissal
-    pin). With no launch-pinned model, Omnigent's Sol default wins when it is
-    visible; otherwise Codex's own default marker stands.
+    pin). With no launch-pinned model, the configured model ``config/read``
+    reports wins when listed; an unlisted one falls back to Omnigent's Sol
+    default when visible, otherwise to Codex's own default marker.
     """
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
     from omnigent.models import model_catalog_store
 
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    # The configured preference is read from the source home; own it here.
+    monkeypatch.delenv("CODEX_HOME", raising=False)
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     ambient = NativeCodexLaunch(
         config_overrides=['model_provider="openai"'], model=None, profile=None
@@ -436,7 +440,10 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
     rows = await read(codex_path="/test/codex", launch=spec_launch if supplied else None)
 
     expected_rows = [{"id": "gpt-5.6-sol"}, {"id": "gpt-5.5"}]
-    expected_rows[0 if config_model is None else 1]["isDefault"] = True
+    if config_model == "gpt-5.4-retired":
+        expected_rows[0]["isDefault"] = True
+    else:
+        expected_rows[0 if config_model is None else 1]["isDefault"] = True
     assert rows == expected_rows
     expected_launch = spec_launch if supplied else ambient
     assert captured["config_overrides"] == expected_launch.config_overrides
@@ -456,6 +463,79 @@ async def test_probe_codex_model_options_probes_every_launch_shape(
         )
         assert ambient_fingerprint != fingerprint
         assert model_catalog_store.read_catalog("codex-native", ambient_fingerprint) is None
+
+
+async def test_probe_codex_model_options_lists_the_selected_profiles_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A ``--profile`` with its own model catalog is probed the way start-up runs it.
+
+    The root config names one catalog and the ``work`` profile another; the
+    probe home must list the profile's catalog so its model is not rejected.
+    Editing the profile's catalog must change the catalog fingerprint.
+    """
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
+    source = tmp_path / "source"
+    source.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(source))
+    root_catalog = tmp_path / "root.json"
+    work_catalog = tmp_path / "work.json"
+    root_catalog.write_text(json.dumps({"models": [{"slug": "gpt-5.6-sol"}]}))
+    work_catalog.write_text(json.dumps({"models": [{"slug": "gpt-6.1-sol"}]}))
+    (source / "config.toml").write_text(
+        f'model = "gpt-5.6-sol"\nmodel_catalog_json = {json.dumps(str(root_catalog))}\n'
+    )
+    profile = source / "work.config.toml"
+    profile.write_text(
+        f'model = "gpt-6.1-sol"\nmodel_catalog_json = {json.dumps(str(work_catalog))}\n'
+    )
+    homes: list[Path] = []
+
+    async def _fake_start(**kwargs: Any) -> object:
+        homes.append(Path(kwargs["env"]["CODEX_HOME"]))
+        return object()
+
+    async def _catalog_rows(client: object) -> list[dict[str, object]]:
+        """Answer with the catalog the probe home's config selects, as Codex would."""
+        del client
+        config = tomllib.loads((homes[-1] / "config.toml").read_text())
+        catalog = json.loads(Path(config["model_catalog_json"]).read_text())
+        return [{"id": row["slug"], "isDefault": True} for row in catalog["models"]]
+
+    async def _version(codex_path: str) -> tuple[int, int, int]:
+        del codex_path
+        return (0, 145, 0)
+
+    monkeypatch.setattr(codex_native_app_server, "_codex_cli_version", _version)
+    monkeypatch.setattr(
+        codex_native_app_server, "_start_codex_model_discovery_process", _fake_start
+    )
+    monkeypatch.setattr(codex_native_app_server, "_wait_for_discovery_listener", AsyncMock())
+    monkeypatch.setattr(
+        codex_native_app_server, "_stop_codex_model_discovery_process", AsyncMock()
+    )
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", lambda **_: AsyncMock())
+    monkeypatch.setattr(codex_native_app_server, "list_codex_model_options", _catalog_rows)
+    work = NativeCodexLaunch([], None, None, config_profile="work")
+    root = NativeCodexLaunch([], None, None)
+
+    rows = await codex_native_app_server.probe_codex_model_options(
+        codex_path="/test/codex", launch=work
+    )
+    root_rows = await codex_native_app_server.probe_codex_model_options(
+        codex_path="/test/codex", launch=root
+    )
+
+    assert rows == [{"id": "gpt-6.1-sol", "isDefault": True}]
+    assert root_rows == [{"id": "gpt-5.6-sol", "isDefault": True}]
+    assert homes[0] != homes[1], "profile probes must not share a probe home"
+    before = codex_native_app_server.codex_catalog_fingerprint(work, codex_path="/test/codex")
+    profile.write_text(profile.read_text().replace(str(work_catalog), str(root_catalog)))
+    after = codex_native_app_server.codex_catalog_fingerprint(work, codex_path="/test/codex")
+    assert before != after
 
 
 def test_probe_codex_home_bridges_provider_tables_and_credential(
@@ -811,7 +891,8 @@ async def test_codex_without_custom_catalog_keeps_models_and_default(
         codex_path="/test/codex", launch=NativeCodexLaunch([], None, None)
     )
     expected = [{"id": "first"}, {"id": "second"}]
-    expected[0]["isDefault"] = True
+    # Without config/read, the user's configured model still decides the default.
+    expected[1 if config_text and "second" in config_text else 0]["isDefault"] = True
     assert rows == expected
     config_path = source / "config.toml"
     config = tomllib.loads(config_path.read_text()) if config_path.exists() else {}

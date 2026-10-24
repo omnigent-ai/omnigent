@@ -377,6 +377,58 @@ def test_mark_launch_default_prefers_omnigent_default_over_codex_default() -> No
     ]
 
 
+@pytest.mark.parametrize(
+    ("config", "config_profile", "expected"),
+    [
+        ('model = "gpt-6.1-sol"\n', None, "gpt-6.1-sol"),
+        (
+            'model = "gpt-5.4"\nprofile = "p"\n[profiles.p]\nmodel = "gpt-6-astra"\n',
+            None,
+            "gpt-6-astra",
+        ),
+        (
+            'model = "gpt-5.4"\nprofile = "p"\n[profiles.p]\nmodel = "gpt-6-astra"\n',
+            "w",
+            "gpt-6.1-sol",
+        ),
+        ('model = "gpt-5.4-retired"\n', None, "gpt-5.6-sol"),
+        ("", None, "gpt-5.6-sol"),
+    ],
+)
+def test_mark_launch_default_prefers_the_users_configured_model(
+    config: str,
+    config_profile: str | None,
+    expected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unpinned catalog marks the configured Codex model when a row names it.
+
+    ``--profile`` beats the root ``profile``; the ``w`` profile lives in its own
+    ``w.config.toml``. An unlisted model falls back instead of hiding the default.
+    """
+    from omnigent.harnesses.codex_native.app_server import (
+        codex_configured_model,
+        mark_launch_default,
+    )
+
+    (tmp_path / "config.toml").write_text(config)
+    (tmp_path / "w.config.toml").write_text('model = "gpt-6.1-sol"\n')
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path))
+    rows = [
+        {"id": "gpt-6-astra"},
+        {"id": "gpt-5.6-sol", "isDefault": True},
+        {"id": "gpt-6.1-sol"},
+    ]
+    preferred = codex_configured_model(config_profile)
+
+    marked = mark_launch_default(rows, None, preferred_model=preferred)
+
+    assert [row["id"] for row in marked if row.get("isDefault")] == [expected]
+    pinned = mark_launch_default(rows, "gpt-6-astra", preferred_model=preferred)
+    assert [row["id"] for row in pinned if row.get("isDefault")] == ["gpt-6-astra"]
+
+
 @pytest.mark.parametrize("reprobe", [False, True])
 async def test_codex_launch_catalog_unresolvable_launch_returns_none(
     monkeypatch: pytest.MonkeyPatch, reprobe: bool

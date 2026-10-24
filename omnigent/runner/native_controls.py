@@ -966,6 +966,7 @@ def build_native_controls(
         try:
             from omnigent.harnesses.codex_native.app_server import (
                 codex_catalog_fingerprint,
+                codex_configured_model,
                 mark_launch_default,
                 resolve_native_codex_launch,
             )
@@ -982,7 +983,9 @@ def build_native_controls(
                 None,
             )
             shaped = mark_launch_default(
-                rows, stored_default if isinstance(stored_default, str) else None
+                rows,
+                stored_default if isinstance(stored_default, str) else None,
+                preferred_model=codex_configured_model(launch.config_profile),
             )
             await asyncio.to_thread(
                 model_catalog_store.write_catalog, "codex-native", fingerprint, shaped

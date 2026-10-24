@@ -5144,6 +5144,7 @@ async def _auto_create_codex_terminal(
         spec=_launch_spec,
         terminal_launch_args=_codex_terminal_args,
     )
+    _codex_model_source = "explicit" if default_model else "launch provider"
     from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
 
     codex_binding = binding_for_harness(load_runtime_inference_config(), "codex-native")
@@ -5172,19 +5173,22 @@ async def _auto_create_codex_terminal(
         )
     pick_to_reset: str | None = None
     # Explicit launches (model-flows design §4): validate an explicit request
-    # against the shared catalog, and give a Default launch on codex's own
-    # login the ACCOUNT's real default — so the ``model =`` line copied from
-    # the user's shared config can never govern a session (the stale-gpt-5.4
-    # 400 class). Profile-backed shapes already resolve their default at
-    # materialization time and are left alone.
+    # against the shared catalog. A Default launch on codex's own login runs
+    # the user's configured model when the catalog offers it, else the
+    # catalog default, so a retired ``model =`` line cannot 400 the session.
+    # Profile-backed shapes already resolve their default at materialization
+    # time and are left alone.
     if codex_binding is None and (
         launch_config.model_override
         or (_codex_launch.model is None and _codex_launch.profile is None)
     ):
         from omnigent.harnesses.codex_native.app_server import (
+            codex_configured_model,
             codex_launch_catalog,
             codex_launch_catalog_is_stale,
+            codex_launch_config_profile,
             codex_reprobed_launch_catalog,
+            mark_launch_default,
         )
         from omnigent.models.codex_model_vocabulary import codex_reachable_model_slug
         from omnigent.models.model_catalog_store import default_row
@@ -5244,6 +5248,7 @@ async def _auto_create_codex_terminal(
                     spec=_launch_spec,
                     terminal_launch_args=_codex_terminal_args,
                 )
+                _codex_model_source = "explicit" if unpinned_model else "launch provider"
                 pick_to_reset = pick if fresh_rows else None
                 outcome = (
                     "resetting the pick to Default after terminal launch"
@@ -5263,16 +5268,38 @@ async def _auto_create_codex_terminal(
                     extra={"session_id": session_id},
                 )
         if _codex_launch.model is None and _codex_launch.profile is None and _codex_catalog:
+            _configured = codex_configured_model(codex_launch_config_profile(_codex_terminal_args))
+            _configured_id = (
+                codex_reachable_model_slug(_configured, _codex_catalog) if _configured else None
+            )
+            if _configured and not _configured_id and _codex_catalog_was_stale:
+                # Unpinned, the copied config line would govern the session, so an
+                # unlisted configured model needs a fallback pin from fresh rows.
+                _refreshed = await codex_reprobed_launch_catalog(
+                    codex_path=_codex_cli_path, launch=_catalog_launch
+                )
+                if _refreshed:
+                    _codex_catalog = _refreshed
+                    _codex_catalog_was_stale = False
+                    _configured_id = codex_reachable_model_slug(_configured, _refreshed)
             # Same staleness rule as the claude branch: never convert a stale
-            # entry's default into an explicit model pin.
-            if _codex_catalog_was_stale:
+            # entry's default into an explicit model pin. The user's configured
+            # model is read fresh, so a stale catalog listing it still pins it.
+            if _configured_id:
+                _codex_launch = dataclasses.replace(_codex_launch, model=_configured_id)
+                _codex_model_source = "user config"
+            elif _codex_catalog_was_stale and not _configured:
                 _logger.info(
                     "codex catalog for session=%s is stale; deferring the Default "
                     "launch to codex's own default model",
                     session_id,
                 )
             else:
-                _catalog_default = default_row(_codex_catalog)
+                # A fresh catalog, or a stale one whose refresh failed while the
+                # configured model is unlisted: that model must not govern.
+                _catalog_default = default_row(_codex_catalog) or default_row(
+                    mark_launch_default(_codex_catalog, None)
+                )
                 _default_id = (
                     str(_catalog_default.get("id") or _catalog_default.get("model") or "") or None
                     if _catalog_default is not None
@@ -5280,8 +5307,16 @@ async def _auto_create_codex_terminal(
                 )
                 if _default_id:
                     _codex_launch = dataclasses.replace(_codex_launch, model=_default_id)
+                    _codex_model_source = "catalog default"
         if _codex_catalog and not _codex_catalog_was_stale:
             _fresh_codex_catalog = _codex_catalog
+    _logger.info(
+        "codex-native launch model for session=%s: %s (source=%s)",
+        session_id,
+        _codex_launch.model or "codex's own default",
+        _codex_model_source if _codex_launch.model else "codex",
+        extra={"session_id": session_id},
+    )
     _session_meta_provider = codex_session_meta_model_provider(_codex_launch)
     # Cancel any surviving forwarder first so its teardown closes the OLD app-server,
     # not the one registered below — and so it can't mirror alongside the new one.
