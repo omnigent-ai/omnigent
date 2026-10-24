@@ -10,7 +10,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { withBasePath } from "@/lib/basePath";
 import { isDatabricksWorkspace } from "@/lib/host";
 import { authenticatedFetch } from "@/lib/identity";
-import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
+import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
 import { isTempConvId } from "@/lib/tempConversationId";
 import {
   browseLocationBase,
@@ -144,7 +144,9 @@ function clickDownloadLink(href: string, filename: string): void {
  * managed embed owns the transport (auth headers, replica routing) and the
  * mobile shells save http(s) downloads outside the WebView's session, so those
  * fetch the bytes through `authenticatedFetch` and hand them over as a Blob,
- * which only surfaces once the whole file has arrived.
+ * which only surfaces once the whole file has arrived. The desktop shell loads
+ * the standalone SPA, so its anchors would also lack the identity and
+ * host-routing headers the SPA stamps; it takes the fetch path as well.
  *
  * :param conversationId: The session/conversation ID, e.g. ``"sess_abc123"``.
  * :param path: Workspace-relative file path, e.g. ``"src/main.py"``.
@@ -152,7 +154,7 @@ function clickDownloadLink(href: string, filename: string): void {
 export async function downloadWorkspaceFile(conversationId: string, path: string): Promise<void> {
   const url = workspaceFileUrl(conversationId, path, { download: "true" });
   const filename = path.split("/").pop() ?? path;
-  if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell()) {
+  if (!isDatabricksWorkspace() && !isIOSShell() && !isAndroidShell() && !isElectronShell()) {
     // A direct anchor navigation, so it must carry the deployment subpath the
     // fetch paths get for free via hostFetch/authenticatedFetch. Without it a
     // stripping proxy (`/proxy/<port>/`) sends it to the origin root and misses
