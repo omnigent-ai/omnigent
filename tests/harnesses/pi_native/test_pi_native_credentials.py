@@ -1033,24 +1033,39 @@ def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
     assert written["providers"]["omnigent"]["apiKey"] == "sk-secret"
 
 
+def _fails_first(first_attempt: str) -> str:
+    return f"[ -e failed-once ] || {{ : > failed-once; {first_attempt}; }}; "
+
+
 @pytest.mark.parametrize(
-    ("command", "kind", "token"),
+    ("command", "kind", "token", "attempts"),
     [
-        ("printf 'private-token' | tr a-z A-Z", "ok", "PRIVATE-TOKEN"),
-        ("printf private-token; echo private-error >&2; exit 7", "failed_exit", ""),
-        ("printf '  '", "empty", ""),
-        ("printf '\\377'", "invalid_output", ""),
-        ("sleep 20", "timeout", ""),
-        ("", "invalid_command", ""),
+        ("printf 'private-token' | tr a-z A-Z", "ok", "PRIVATE-TOKEN", 1),
+        ("printf private-token; echo private-error >&2; exit 7", "failed_exit", "", 3),
+        ("printf '  '", "empty", "", 3),
+        ("printf '\\377'", "invalid_output", "", 1),
+        ("head -c 1048577 /dev/zero | tr '\\0' x", "output_limit", "", 1),
+        ("sleep 20", "timeout", "", 1),
+        ("", "invalid_command", "", 0),
+        (_fails_first("printf stale; exit 7") + "printf private-token", "ok", "private-token", 2),
+        (_fails_first("exit 0") + "printf private-token", "ok", "private-token", 2),
+        (_fails_first("exit 7") + "sleep 20", "timeout", "", 2),
+        (_fails_first("exit 7") + "true", "empty", "", 3),
     ],
 )
 def test_generated_token_command_reports_only_safe_results(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, kind: str, token: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    command: str,
+    kind: str,
+    token: str,
+    attempts: int,
 ) -> None:
     if os.name != "posix" or shutil.which("node") is None:
         pytest.skip("the native Pi token wrapper requires POSIX and Node")
     if kind == "timeout":
-        monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 500)
+        monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 2_000)
+    command = command and "printf x >> attempts; " + command
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="http://localhost/v1",
@@ -1071,19 +1086,77 @@ def test_generated_token_command_reports_only_safe_results(
         capture_output=True,
         text=True,
         timeout=12,
+        cwd=tmp_path,
         env={**os.environ, "OMNIGENT_PI_NATIVE_PID": "123"},
     )
     assert result.returncode == (0 if kind == "ok" else 1)
     assert result.stdout == token
     assert result.stderr == ""
+    attempt_log = tmp_path / "attempts"
+    assert (attempt_log.read_text() if attempt_log.exists() else "") == "x" * attempts
     auth_dir = agent / auth_command.AUTH_DIR_NAME
     status = next(auth_dir.glob("*.result.json"))
     payload = json.loads(status.read_text())
     assert payload["kind"] == kind
+    if attempts > 1:
+        assert payload["elapsedMs"] >= sum(auth_command.AUTH_RETRY_DELAYS_MS[: attempts - 1]) - 5
     assert payload["piPid"] == 123
     assert "private-" not in status.read_text()
     for file in auth_dir.iterdir():
         assert stat.S_IMODE(file.stat().st_mode) == 0o600
+
+
+def test_generated_token_command_without_retry_delays_runs_once(tmp_path: Path) -> None:
+    if os.name != "posix" or shutil.which("node") is None:
+        pytest.skip("the native Pi token wrapper requires POSIX and Node")
+    wrapped = auth_command.wrap_auth_command(tmp_path, "omnigent", "printf x >> attempts; exit 7")
+    config = next((tmp_path / auth_command.AUTH_DIR_NAME).glob("auth-*.json"))
+    # The wrapper is rewritten before its config, so it can briefly read an older config.
+    settings = json.loads(config.read_text())
+    del settings["retryDelaysMs"]
+    config.write_text(json.dumps(settings))
+    result = subprocess.run(
+        shlex.split(wrapped[1:]), capture_output=True, timeout=12, cwd=tmp_path, check=False
+    )
+    assert result.returncode == 1
+    assert (tmp_path / "attempts").read_text() == "x"
+    status = config.with_name(config.name + ".result.json")
+    assert json.loads(status.read_text())["kind"] == "failed_exit"
+
+
+def test_generated_token_command_cancelled_between_attempts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    if os.name != "posix" or shutil.which("node") is None:
+        pytest.skip("the native Pi token wrapper requires POSIX and Node")
+    monkeypatch.setattr(auth_command, "AUTH_RETRY_DELAYS_MS", (2_000,))
+    wrapped = auth_command.wrap_auth_command(
+        tmp_path, "omnigent", "printf x >> attempts; printf $$ > attempt.pid; exit 7"
+    )
+    attempt_log = tmp_path / "attempts"
+    pid_file = tmp_path / "attempt.pid"
+    process = subprocess.Popen(shlex.split(wrapped[1:]), cwd=tmp_path, stdout=subprocess.PIPE)
+    try:
+        deadline = time.monotonic() + 4
+        while not (pid_file.exists() and pid_file.read_text()) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        pid = int(pid_file.read_text())
+        while process_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not process_alive(pid)
+        # Leave time for the wrapper to see the exit and start waiting to retry.
+        time.sleep(0.2)
+        process.terminate()
+        stdout, _ = process.communicate(timeout=12)
+    finally:
+        if process.poll() is None:
+            process.kill()
+            process.wait(timeout=4)
+    assert process.returncode == 1
+    assert stdout == b""
+    assert attempt_log.read_text() == "x"
+    status = next((tmp_path / auth_command.AUTH_DIR_NAME).glob("*.result.json"))
+    assert json.loads(status.read_text())["kind"] == "cancelled"
 
 
 def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
