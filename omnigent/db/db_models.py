@@ -661,9 +661,13 @@ class SqlConversationMetadata(OmnigentBase):
     # Epoch seconds the bound runner's tunnel was last seen alive;
     # runner_online is derived from freshness (like host_is_live).
     runner_last_seen: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    # Last heartbeat retained across a tunnel disconnect; reset on runner rebind.
+    runner_last_connected: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # Last relay-observed turn status (enum_codecs.SESSION_LIVE_STATUS);
     # NULL means no relay has ever reported on this session.
     live_status: Mapped[int | None] = mapped_column(SmallInteger, nullable=True)
+    # Epoch milliseconds at which the writer observed the status transition.
+    live_status_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     # Outstanding elicitation (approval-prompt) count; NULL = never written.
     pending_elicitation_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     # First-class project membership. Relates to projects.id; no DB FK
