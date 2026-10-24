@@ -1281,12 +1281,17 @@ export function useLeaveSession() {
  * header merges snapshot fields over the list row (snapshot winning),
  * so a snapshot left stale at the pre-stop state would clobber the
  * now-stopped state and the header's Stop gate would lag.
+ *
+ * Also drops the bubbles of the web messages the stop settled, which get no
+ * `session.input.consumed` receipt. Only the ones the server names go: a
+ * message sent during the stop stays live, and an older server names none.
  */
 export function useStopSession() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => stopSession(id),
-    onSuccess: (_data, id) => {
+    onSuccess: (data, id) => {
+      useChatStore.getState().dropPendingUserMessages(id, data.settledPendingIds ?? []);
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["session", id] });
     },
@@ -1533,7 +1538,8 @@ export function useBulkDeleteConversations() {
  * Stop multiple live sessions in parallel.
  *
  * Each session is stopped independently — individual failures don't
- * block the rest. Returns arrays of succeeded/failed IDs.
+ * block the rest. Returns arrays of succeeded/failed IDs. Each stop drops
+ * the bubbles of the web messages it settled, as `useStopSession` does.
  */
 export function useBulkStopSessions() {
   const queryClient = useQueryClient();
@@ -1543,8 +1549,13 @@ export function useBulkStopSessions() {
       const succeeded: string[] = [];
       const failed: string[] = [];
       for (let i = 0; i < results.length; i++) {
-        if (results[i].status === "fulfilled") succeeded.push(ids[i]);
-        else failed.push(ids[i]);
+        const result = results[i];
+        if (result.status === "fulfilled") {
+          succeeded.push(ids[i]);
+          useChatStore
+            .getState()
+            .dropPendingUserMessages(ids[i], result.value.settledPendingIds ?? []);
+        } else failed.push(ids[i]);
       }
       if (failed.length > 0) {
         throw new BulkConversationMutationError("stop", {
