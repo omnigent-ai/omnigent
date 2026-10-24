@@ -12,8 +12,10 @@ import json
 import os
 import shlex
 import shutil
+import socketserver
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 import uuid
@@ -55,6 +57,8 @@ _NOTICE = "We're changing auto mode to no longer charge for classifier requests 
 _UNCHANGED_BILLING = (
     "Nothing breaks: auto mode keeps working, and its classifier requests are billed as before."
 )
+_GATEWAY_REMEDY = "which isn't compatible with this update"
+_NO_HOST_REMEDY = "If this keeps happening, contact support or your company's admin"
 
 
 class _Gateway:
@@ -122,7 +126,7 @@ class _Gateway:
 
 
 @contextmanager
-def _local_gateway(gateway: _Gateway) -> Iterator[str]:
+def _local_gateway(gateway: _Gateway, unix_socket: Path | None = None) -> Iterator[str]:
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args: object) -> None:
             pass
@@ -139,11 +143,17 @@ def _local_gateway(gateway: _Gateway) -> Iterator[str]:
             self.end_headers()
             self.wfile.write(payload)
 
-    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    server: socketserver.BaseServer
+    if unix_socket is None:
+        server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        base_url = f"http://127.0.0.1:{server.server_port}"
+    else:
+        server = socketserver.ThreadingUnixStreamServer(str(unix_socket), Handler)
+        base_url = "http://127.0.0.1:9"
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
-        yield f"http://127.0.0.1:{server.server_port}"
+        yield base_url
     finally:
         server.shutdown()
         server.server_close()
@@ -169,8 +179,13 @@ async def _wait_for_pane(
 
 
 @pytest.mark.parametrize("recovery", ["runner_watcher", "permission_mode"])
+@pytest.mark.parametrize("routing", ["gateway_host", "unix_socket"])
 async def test_real_claude_billing_notice_unblocks_pending_tool(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, recovery: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    request: pytest.FixtureRequest,
+    recovery: str,
+    routing: str,
 ) -> None:
     """A real blocked Bash call must resume without user input to the dialog."""
     config_dir = tmp_path / "claude-config"
@@ -214,7 +229,13 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
         lambda _session, status, blocked_on: statuses.append((status, blocked_on))
     )
     gateway = _Gateway(command)
-    with _local_gateway(gateway) as base_url:
+    # Claude omits the gateway host from its notice when it reaches the API over a unix socket.
+    unix_socket: Path | None = None
+    if routing == "unix_socket":
+        socket_dir = Path(tempfile.mkdtemp(prefix="omni-gw-", dir="/tmp"))
+        request.addfinalizer(lambda: shutil.rmtree(socket_dir, ignore_errors=True))
+        unix_socket = socket_dir / "gw.sock"
+    with _local_gateway(gateway, unix_socket) as base_url:
         env = {
             name: os.environ[name]
             for name in ("PATH", "HOME", "USER", "LANG", "TMPDIR")
@@ -233,6 +254,8 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
             DISABLE_ERROR_REPORTING="1",
             TERM="xterm-256color",
         )
+        if unix_socket is not None:
+            env["ANTHROPIC_UNIX_SOCKET"] = str(unix_socket)
         try:
             terminal = await terminals.launch(
                 session_id,
@@ -297,8 +320,11 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
             )
             (tmp_path / "native-billing-notice.txt").write_text(notice)
             assert _UNCHANGED_BILLING in notice
-            assert base_url.removeprefix("http://") in notice
-            assert "which isn't compatible with this update" in notice
+            if unix_socket is None:
+                assert base_url.removeprefix("http://") in notice
+                assert _GATEWAY_REMEDY in notice
+            else:
+                assert _NO_HOST_REMEDY in notice
             assert not marker.exists(), "The tool must be parked behind the real dialog"
             assert gateway.classifier_requests == 0
             assert not gateway.tool_results
@@ -333,14 +359,15 @@ async def test_real_claude_billing_notice_unblocks_pending_tool(
             assert gateway.classifier_requests > 0
             assert all(not result.get("is_error") for result in gateway.tool_results)
             assert "billing-notice-tool-completed" in json.dumps(gateway.tool_results)
-            # Claude persists config asynchronously after the tool can resume.
-            await poll_until_async(
-                lambda: (
-                    json.loads((config_dir / ".claude.json").read_text()).get(
-                        "autoModeClassifierBillingNoticeAcknowledgedAt", 0
-                    )
-                    > 0
-                ),
-            )
+            if unix_socket is None:
+                # Claude persists the gateway-wording acknowledgement asynchronously.
+                await poll_until_async(
+                    lambda: (
+                        json.loads((config_dir / ".claude.json").read_text()).get(
+                            "autoModeClassifierBillingNoticeAcknowledgedAt", 0
+                        )
+                        > 0
+                    ),
+                )
         finally:
             await terminals.shutdown()

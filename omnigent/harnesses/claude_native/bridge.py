@@ -447,9 +447,10 @@ _ESCAPE_QUITS_DIALOG_HEADLINES = (
 SWITCH_MODEL_DIALOG_HINT = "Switch model?"
 EFFORT_DIALOG_HINT = "Change effort level?"
 _CONFIRM_DIALOG_HINTS = (SWITCH_MODEL_DIALOG_HINT, EFFORT_DIALOG_HINT)
-# Only this informational notice is acknowledged automatically. The gateway
-# varies; all decision text and the continuation footer must match exactly.
-_AUTO_MODE_BILLING_BODY_PATTERN = (
+# Only this informational notice is acknowledged automatically. Claude names the
+# gateway when it can (the host varies) and otherwise points to support; all
+# decision text and the continuation footer must match one wording exactly.
+_AUTO_MODE_BILLING_GATEWAY_BODY = (
     re.escape(
         (
             "We're changing auto mode to no longer charge for classifier requests "
@@ -467,6 +468,18 @@ _AUTO_MODE_BILLING_BODY_PATTERN = (
             "https://code.claude.com/docs/en/auto-mode-classifier-billing "
         ).replace(" ", "")
     )
+)
+_AUTO_MODE_BILLING_NO_HOST_BODY = re.escape(
+    (
+        "We're changing auto mode to no longer charge for classifier requests "
+        "in Claude Code. However, this session isn't eligible. "
+        "Nothing breaks: auto mode keeps working, and its classifier requests "
+        "are billed as before. If this keeps happening, contact support or your "
+        "company's admin: https://code.claude.com/docs/en/auto-mode-classifier-billing "
+    ).replace(" ", "")
+)
+_AUTO_MODE_BILLING_BODY_PATTERN = (
+    f"(?:{_AUTO_MODE_BILLING_GATEWAY_BODY}|{_AUTO_MODE_BILLING_NO_HOST_BODY})"
 )
 _AUTO_MODE_BILLING_NOTICE = re.compile(
     _AUTO_MODE_BILLING_BODY_PATTERN + re.escape("Entertocontinue·Esctocancel")

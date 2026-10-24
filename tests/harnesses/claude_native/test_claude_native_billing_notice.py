@@ -28,8 +28,24 @@ To fix it and access the new version of auto mode, ask your gateway to implement
 https://code.claude.com/docs/en/auto-mode-classifier-billing
 Enter to continue · Esc to cancel
 """
+_NO_HOST_BODY = """\
+We're changing auto mode to no longer charge for classifier requests in Claude Code.
+However, this session isn't eligible.
+Nothing breaks: auto mode keeps working, and its classifier requests are billed as before.
+If this keeps happening, contact support or your company's admin:
+https://code.claude.com/docs/en/auto-mode-classifier-billing
+Enter to continue · Esc to cancel
+"""
 _NOTICE = f"Earlier tool output\n{_RULE}\n{_BODY}"
+_NO_HOST_NOTICE = f"Earlier tool output\n{_RULE}\n{_NO_HOST_BODY}"
 _CONSENT = _NOTICE.replace("Enter to continue · Esc to cancel", "y to continue · n to cancel")
+_NO_HOST_CONSENT = _NO_HOST_NOTICE.replace(
+    "Enter to continue · Esc to cancel", "y to continue · n to cancel"
+)
+_GATEWAY_REMEDY = (
+    "To fix it and access the new version of auto mode, ask your gateway to implement:"
+)
+_NO_HOST_REMEDY = "If this keeps happening, contact support or your company's admin:"
 _COMPOSER = f"{_RULE}\n❯ draft message\n{_RULE}\n? for shortcuts\n"
 _PERMISSION = f"{_RULE}\nDo you want to run this command?\nEnter to select · Esc to cancel\n"
 
@@ -91,6 +107,13 @@ def test_notice_matches_wrapped_text_and_gateway(width: int, gateway: str) -> No
     assert bridge.auto_mode_billing_notice_visible(pane)
 
 
+@pytest.mark.parametrize("width", [25, 80, 160])
+def test_notice_without_a_gateway_host_matches_wrapped_text(width: int) -> None:
+    pane = f"{_RULE}\n{textwrap.fill(_NO_HOST_BODY, width=width)}\n"
+    assert bridge.auto_mode_billing_notice_visible(pane)
+    assert not bridge._user_prompt_visible(pane)
+
+
 @pytest.mark.parametrize(
     "pane",
     [
@@ -105,15 +128,23 @@ def test_notice_matches_wrapped_text_and_gateway(width: int, gateway: str) -> No
         _NOTICE + _PERMISSION,
         _PERMISSION,
         f"{_RULE}\nSwitch model?\nEnter to continue · Esc to cancel",
+        _NO_HOST_NOTICE.replace("billed as before", "billed at a new rate"),
+        _NO_HOST_NOTICE.replace("isn't eligible.", "isn't eligible yet."),
+        _NO_HOST_NOTICE.replace(_NO_HOST_REMEDY, _GATEWAY_REMEDY),
+        _NOTICE.replace(_GATEWAY_REMEDY, _NO_HOST_REMEDY),
+        _NO_HOST_NOTICE + _COMPOSER,
     ],
 )
 def test_other_surfaces_and_transcript_quotes_do_not_match(pane: str) -> None:
     assert not bridge.auto_mode_billing_notice_visible(pane)
 
 
+@pytest.mark.parametrize("consent", [_CONSENT, _NO_HOST_CONSENT], ids=["gateway", "no-host"])
 @pytest.mark.parametrize("width", [25, 80, 160])
-def test_billing_consent_is_pending_instead_of_an_informational_notice(width: int) -> None:
-    pane = f"{_RULE}\n{textwrap.fill(_CONSENT.split(_RULE, 1)[1], width=width)}\n"
+def test_billing_consent_is_pending_instead_of_an_informational_notice(
+    width: int, consent: str
+) -> None:
+    pane = f"{_RULE}\n{textwrap.fill(consent.split(_RULE, 1)[1], width=width)}\n"
     assert bridge._user_prompt_visible(pane)
     assert not bridge.auto_mode_billing_notice_visible(pane)
 
@@ -128,6 +159,8 @@ def test_billing_consent_is_pending_instead_of_an_informational_notice(width: in
         _CONSENT.replace("y to continue · n to cancel", "y to approve · n to cancel"),
         _CONSENT + _COMPOSER,
         f"{_RULE}\nAn unrelated choice\ny to continue · n to cancel\n",
+        _NO_HOST_CONSENT.replace(_NO_HOST_REMEDY, _GATEWAY_REMEDY),
+        _NO_HOST_CONSENT + _COMPOSER,
     ],
 )
 def test_billing_consent_requires_the_exact_live_prompt(pane: str) -> None:
@@ -157,10 +190,11 @@ def test_billing_consent_refuses_input_without_answering(
     assert clock.now < 1
 
 
+@pytest.mark.parametrize("notice", [_NOTICE, _NO_HOST_NOTICE], ids=["gateway", "no-host"])
 def test_acknowledges_notice_once_then_leaves_draft_untouched(
-    monkeypatch: pytest.MonkeyPatch, bridge_dir: Path, clock: _Clock
+    monkeypatch: pytest.MonkeyPatch, bridge_dir: Path, clock: _Clock, notice: str
 ) -> None:
-    sends = _terminal(monkeypatch, [_NOTICE, _NOTICE, _COMPOSER])
+    sends = _terminal(monkeypatch, [notice, notice, _COMPOSER])
     assert bridge.acknowledge_auto_mode_billing_notice(bridge_dir)
     sends.assert_called_once_with("/tmp/test.sock", "send-keys", "-t", "claude:0.0", "Enter")
     assert clock.now >= bridge._CLAUDE_READY_POLL_INTERVAL_S
