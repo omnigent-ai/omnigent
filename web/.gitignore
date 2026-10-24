@@ -13,6 +13,7 @@ dist-embed
 dist-ssr
 coverage
 *.local
+.dev-certs
 
 # Editor directories and files
 .vscode/*

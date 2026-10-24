@@ -293,6 +293,12 @@ export default defineConfig(({ command }) => ({
   },
   server: {
     proxy: createProxyConfig(OMNIGENT_URL, useAuth),
+    // HTTPS serves over HTTP/2, so the hundreds of dev module requests share one
+    // multiplexed connection instead of queueing on six HTTP/1.1 sockets.
+    https:
+      process.env.OMNIGENT_DEV_HTTPS_CERT && process.env.OMNIGENT_DEV_HTTPS_KEY
+        ? { cert: process.env.OMNIGENT_DEV_HTTPS_CERT, key: process.env.OMNIGENT_DEV_HTTPS_KEY }
+        : undefined,
   },
   build: {
     // default baseline is Safari 16.4+; iPadOS 15 can't parse dep regex lookbehinds (#1978)
