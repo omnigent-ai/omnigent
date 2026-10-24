@@ -4926,19 +4926,9 @@ def server(
 
             databricks_store = DatabricksConnectionStore(db_uri, dbx_cipher)
 
-    from omnigent.server.mcp_registry import McpRegistry, McpRegistryConfig
+    from omnigent.server.mcp_registry import build_mcp_registry_from_env
 
-    mcp_registry = None
-    registry_config = McpRegistryConfig.from_env()
-    if registry_config is not None:
-        from omnigent.stores.credential_store import build_secret_cipher
-        from omnigent.stores.credential_store.sqlalchemy_store import CredentialStore
-
-        registry_cipher = build_secret_cipher()
-        mcp_registry = McpRegistry(
-            registry_config,
-            CredentialStore(db_uri, registry_cipher) if registry_cipher else None,
-        )
+    mcp_registry = build_mcp_registry_from_env(db_uri)
 
     # Accounts mode ergonomics: when accounts mode is selected
     # (OMNIGENT_AUTH_ENABLED=1 without OIDC config, or an explicit
