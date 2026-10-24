@@ -30,7 +30,8 @@ and steers messages while the agent is busy.
   selected sandbox and connecting.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. Ctrl+Shift+M opens it in both composers.
-  States: catalog loading, delayed catalog,
+  Hovering a row shows the model ID it launches, except when the label already
+  shows it and on the Fusion row. States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model).
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
@@ -104,7 +105,11 @@ and steers messages while the agent is busy.
   opens and focuses the new-session composer in browsers. Native shells retain
   ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
-  can be steered into the running turn.
+  can be steered into the running turn. A message sent mid-turn to a native
+  session says the agent will read it after its current step until it does.
+- `host-offline-hold`: a message sent to a native session whose host is offline
+  waits in the queue as "Waiting for host", ahead of other queued messages, and
+  sends once the host reconnects; no failed turn is recorded.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
   and always-steer preference, keeping their element screenshots.
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
@@ -113,7 +118,9 @@ and steers messages while the agent is busy.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
-  untouched draft; user edits remain.
+  untouched draft; user edits remain. A reload while the server still holds a
+  main-composer send (for example during a sandbox wake) gives its text back
+  to the sender unless the session already has that message.
 - `managed-first-input`: submitting a new managed session saves its first input
   and attachments before provisioning. Follow-ups sent during startup are saved
   in order too. They run even if the creating browser closes; reopening shows
@@ -171,6 +178,8 @@ and steers messages while the agent is busy.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
   message box; press Enter to keep the text or Escape to discard it.
 - Send while the agent is working to queue a message, then steer it.
+- With a native session's host offline, send a message; it waits in the queue
+  as "Waiting for host" until the host reconnects.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
 
@@ -328,6 +337,9 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_updates_after_delayed_catalog`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_highlights_the_reported_model`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_alias_selection_persists`
+- **`model-picker`, row hover (both composers):** no browser-level coverage;
+  `web/src/lib/composerModelLabel.test.ts`. Manually: hover a row labeled with
+  a family name and expect its full model ID; the Fusion row shows none.
 - **`model-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_model_flows_prelaunch.py::test_claude_default_entry_names_the_true_default`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
@@ -495,7 +507,17 @@ Other connection providers alone do not enable the managed MCP picker.
   Ctrl+Shift+M does nothing.
 - **`queue-and-steer`:**
   `tests/e2e_ui/chat/test_queue_steer.py::test_steer_sends_queued_message_while_busy`,
-  `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`
+  `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`.
+  The native mid-turn notice has component coverage in
+  `web/src/pages/ChatPage.userBubble.test.tsx`.
+- **`host-offline-hold`:** no browser-level coverage.
+  `tests/server/integration/test_session_host_launch.py::test_offline_host_send_held_by_client_records_nothing`
+  (plain `uv run pytest`) checks that a held send is refused with nothing
+  recorded; the queue and release have component coverage in
+  `web/src/store/chatStore.test.ts` and
+  `web/src/hooks/useReleaseHostHeldSends.test.tsx`. Manually: stop a native
+  session's host, send, and expect a "Waiting for host" queue row with no
+  failed turn; restart the host and expect the message to be sent once.
 - **`browser-pointer-queue`, desktop:** manually hold an agent turn open, then
   send a normal composer follow-up and two pointer instructions (Send and Enter).
   With Always steer off, all three stay queued and the popup says "Queued for
@@ -515,7 +537,8 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
   for the desktop entry point. The restore/delivery ordering and preservation of
-  user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`.
+  user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`; a send
+  cut off by a reload is covered in `web/src/store/chatStore.test.ts`.
 - **`managed-first-input`, new-session composer (own environments):**
   `tests/e2e_ui/start_session/test_managed_first_input_tab_close.py::test_managed_first_input_runs_after_browser_closes`
   closes the entire browser during provisioning, on both the creating replica
