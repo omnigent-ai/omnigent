@@ -2765,6 +2765,17 @@ def _record_launch_for_fresh_session(session_id: str) -> None:
         )
 
 
+def without_claude_launch_prompt(args: Sequence[str]) -> tuple[str, ...]:
+    """Drop the one-time leading positional prompt from a cold-resume launch.
+
+    The wrapper puts its prompt first, before pass-through options. Only inspect
+    that position: later bare tokens may be values of Claude's variadic options.
+    """
+    if args and not args[0].startswith("-"):
+        return tuple(args[1:])
+    return tuple(args)
+
+
 def _strip_resume_from_claude_args(args: tuple[str, ...]) -> tuple[str, ...]:
     """
     Strip any stray ``--resume`` / ``-r`` (and value) from raw args.
