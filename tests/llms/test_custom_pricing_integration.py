@@ -17,22 +17,29 @@ from omnigent.onboarding.provider_config import (
 )
 
 
-def test_parse_family_with_custom_pricing():
-    """Test that _parse_family correctly parses custom pricing."""
+@pytest.mark.parametrize(
+    ("endpoint", "api_key", "model"),
+    [
+        ("http://localhost:11434/v1", "ollama", "llama3.2:latest"),
+        ("http://localhost:8080/v1", "llama-server", "llama-3.2-8b"),
+    ],
+)
+def test_parse_family_with_custom_pricing(endpoint: str, api_key: str, model: str) -> None:
+    """Local Ollama and llama-server endpoints preserve custom pricing."""
     raw = {
-        "base_url": "http://localhost:11434/v1",
-        "api_key": "ollama",
+        "base_url": endpoint,
+        "api_key": api_key,
         "pricing": {
             "input_per_million": 0.0,
             "output_per_million": 0.0,
         },
-        "models": {"default": "llama3.2:latest"},
+        "models": {"default": model},
     }
 
     family = _parse_family("test-provider", "openai", raw)
 
-    assert family.base_url == "http://localhost:11434/v1"
-    assert family.api_key == "ollama"
+    assert family.base_url == endpoint
+    assert family.api_key == api_key
     assert family.pricing is not None
     assert family.pricing.input_per_million == 0.0
     assert family.pricing.output_per_million == 0.0
