@@ -61,6 +61,11 @@ class FakeClient {
     this.messages.push({ sessionId, text });
     return { queued: true };
   }
+  async createProject(name: string, config: OmnigentProject["config"]) {
+    const project = { id: `proj_${this.projects.length}`, name, created_at: NOW, config };
+    this.projects.push(project);
+    return project;
+  }
 }
 
 describe("BuildingService", () => {
@@ -133,6 +138,14 @@ describe("BuildingService", () => {
     expect(client.resolved[0].action).toBe("decline");
     expect(client.messages).toEqual([{ sessionId: "conv_a", text: "Please split the migration." }]);
     expect((await service.getSnapshot(true)).rooms[0].latestInteractionAt).toBe(NOW);
+  });
+
+  it("creates a room whose project config carries its host and folder", async () => {
+    const { projectId } = await service.createRoom({ name: " Shop ", icon: "🛒", hostId: "host_1", workspace: "/repo/shop" });
+    expect(client.projects.at(-1)?.config).toEqual({ icon: "🛒", host_id: "host_1", workspace: "/repo/shop" });
+    const room = (await service.getSnapshot(true)).rooms.find((entry) => entry.projectId === projectId);
+    expect(room).toMatchObject({ name: "Shop", hostId: "host_1", workspace: "/repo/shop" });
+    await expect(service.createRoom({ name: "No host", workspace: "/repo" })).rejects.toMatchObject({ code: "invalid_workspace" });
   });
 
   it("keeps the last known building when Omnigent is unreachable", async () => {

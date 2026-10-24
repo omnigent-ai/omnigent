@@ -10,7 +10,7 @@ import { OfficeRequestError, type BuildingService } from "./building.ts";
 import { proxyDictation } from "./dictationProxy.ts";
 import { handleMcpMessage, officeTools } from "./mcp.ts";
 import { OmnigentError, type OmnigentClient } from "./omnigentClient.ts";
-import { WorkflowError, type WorkflowService } from "./workflow.ts";
+import { WorkflowError, normalizeRuntime, type WorkflowService } from "./workflow.ts";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
 const MAX_BODY_BYTES = 64 * 1024;
@@ -117,7 +117,25 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
       pattern: /^\/office\/api\/rooms$/,
       handle: async (_params, request) => {
         const body = await readJsonBody(request);
-        return building.createRoom(body.name, body.icon);
+        const theme = body.theme as { runtime?: Record<string, unknown>; gates?: unknown } | null | undefined;
+        const runtime = theme ? { ...theme.runtime, hostId: body.hostId, workspace: body.workspace } : null;
+        // Refuse a bad runtime before the project exists, so a failed request leaves no half-made room.
+        if (runtime) normalizeRuntime(runtime);
+        const { projectId } = await building.createRoom(body);
+        if (runtime) await workflow.assignTheme(projectId, { runtime: runtime as never, gates: theme?.gates as never });
+        return { projectId, snapshot: await building.getSnapshot(true) };
+      },
+    },
+    {
+      method: "GET",
+      pattern: /^\/office\/api\/hosts\/([^/]+)\/directories$/,
+      handle: async ([hostId], request) => {
+        const path = new URL(request.url ?? "/", "http://localhost").searchParams.get("path") ?? "~";
+        const listing = await client.listHostDirectory(hostId, path);
+        return {
+          directories: listing.data.filter((entry) => entry.type === "directory").map(({ name, path: entryPath }) => ({ name, path: entryPath })),
+          hasMore: listing.has_more,
+        };
       },
     },
     {

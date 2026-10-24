@@ -68,6 +68,30 @@ describe("office MCP endpoint", () => {
   });
 });
 
+describe("room creation", () => {
+  it("refuses an SDLC room with no host or runner before creating the project", async () => {
+    let created = 0;
+    const building = { createRoom: async () => ((created += 1), { projectId: "p" }), invalidate: () => undefined } as unknown as BuildingService;
+    const ports: number[] = [];
+    const handler = createOfficeHandler({ building, workflow: {} as WorkflowService, client: {} as OmnigentClient, allowedPorts: ports, staticDir: null });
+    const server = createServer((request, response) => void handler(request, response));
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    const port = (server.address() as AddressInfo).port;
+    ports.push(port);
+    try {
+      const response = await fetch(`http://127.0.0.1:${port}/office/api/rooms`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Origin: `http://127.0.0.1:${port}` },
+        body: JSON.stringify({ name: "Shop", theme: { runtime: { harness: "claude-sdk" }, gates: {} } }),
+      });
+      expect(response.status).toBe(400);
+      expect(created).toBe(0);
+    } finally {
+      server.close();
+    }
+  });
+});
+
 describe("buildUpstreamUpgrade", () => {
   it("forwards the WebSocket handshake with server-side credentials and Omnigent's own origin", () => {
     const request = {

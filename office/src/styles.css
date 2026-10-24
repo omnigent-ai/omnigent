@@ -352,6 +352,8 @@ select {
   border: 3px solid var(--warn);
   max-width: 560px;
   width: calc(100% - 32px);
+  max-height: calc(100vh - 32px);
+  overflow: auto;
 }
 
 .approval-dialog::backdrop {
@@ -394,9 +396,10 @@ select {
 .workflow-section { border: 2px solid var(--line, #3a3f55); padding: 8px 12px; background: rgba(0, 0, 0, 0.15); }
 .workflow-section h3 { margin: 0 0 6px; }
 .workflow-section label { display: block; margin: 4px 0; }
-.workflow-section input, .workflow-section textarea, .theme-setup input, .theme-setup select, .approval-dialog input { width: 100%; box-sizing: border-box; }
+.workflow-section input:not([type="checkbox"]), .workflow-section textarea, .theme-setup input:not([type="checkbox"]), .theme-setup select,
+.approval-dialog input:not([type="checkbox"]), .approval-dialog select { width: 100%; box-sizing: border-box; }
 .theme-setup { border: 2px dashed var(--line, #3a3f55); padding: 12px; margin-top: 12px; }
-.theme-setup label, .theme-setup fieldset { display: block; margin: 6px 0; }
+.theme-setup label, .theme-setup fieldset, .approval-dialog label, .approval-dialog fieldset { display: block; margin: 6px 0; }
 .capability-table { border-collapse: collapse; margin: 8px 0; font-size: 0.85em; }
 .capability-table th, .capability-table td { border: 1px solid var(--line, #3a3f55); padding: 2px 6px; text-align: left; }
 .task-list, .requirements-list, .event-feed { padding-left: 18px; }
@@ -406,3 +409,16 @@ select {
 .request-facts dd { margin: 0 0 0 8px; word-break: break-all; }
 .dictation { display: inline-flex; align-items: center; gap: 4px; }
 .activity-office .activity-kind { color: #9fb7ff; }
+
+.folder-browser {
+  border: 1px solid currentColor;
+  padding: 0.5rem;
+  max-height: 16rem;
+  overflow: auto;
+}
+
+.folder-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}

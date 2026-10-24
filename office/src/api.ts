@@ -101,6 +101,15 @@ async function call<T>(path: string, init?: { method?: string; body?: unknown })
   return body as T;
 }
 
+export interface NewRoomRequest {
+  name: string;
+  icon: string;
+  hostId?: string;
+  workspace?: string;
+  /** SDLC runtime and gates; host and folder come from the room itself. */
+  theme?: { runtime: Omit<BranchRuntime, "hostId" | "workspace">; gates: Partial<Record<GateType, boolean>> } | null;
+}
+
 export const officeApi = {
   building: () => call<BuildingSnapshot>("/building"),
   refreshBuilding: () => call<BuildingSnapshot>("/building/refresh", { method: "POST" }),
@@ -122,7 +131,11 @@ export const officeApi = {
       `/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}/decision`,
       { method: "POST", body: { action, feedback } },
     ),
-  createRoom: (name: string, icon: string) => call<BuildingSnapshot>("/rooms", { method: "POST", body: { name, icon } }),
+  createRoom: (room: NewRoomRequest) => call<{ projectId: string; snapshot: BuildingSnapshot }>("/rooms", { method: "POST", body: room }),
+  hostDirectories: (hostId: string, path: string) =>
+    call<{ directories: { name: string; path: string }[]; hasMore: boolean }>(
+      `/hosts/${encodeURIComponent(hostId)}/directories?path=${encodeURIComponent(path)}`,
+    ),
   runtimeOptions: () => call<RuntimeOptions>("/runtime-options"),
   branch: async (projectId: string) =>
     (await call<{ branch: BranchView | null }>(`/rooms/${encodeURIComponent(projectId)}/branch`)).branch,

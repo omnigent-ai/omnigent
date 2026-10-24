@@ -7,6 +7,9 @@ export interface RoomSummary {
   projectId: string;
   name: string;
   icon?: string;
+  /** Project's default host and folder (Omnigent project config). */
+  hostId?: string;
+  workspace?: string;
   /** Theme of the active branch, or null for an unthemed project. */
   theme: "sdlc" | null;
   /** Unix epoch seconds. */

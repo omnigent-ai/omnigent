@@ -127,7 +127,7 @@ export class BuildingService {
     }
   }
 
-  private summarize(project: { id: string; name: string; created_at?: number; config?: { icon?: string } }, now: number): RoomSummary {
+  private summarize(project: { id: string; name: string; created_at?: number; config?: { icon?: string; host_id?: string; workspace?: string } }, now: number): RoomSummary {
     const roomState = this.store.ensureRoom(project.id, now);
     const sessions = this.sessions.filter((session) => session.project_id === project.id);
     let latestInteractionAt: number | null = null;
@@ -150,6 +150,8 @@ export class BuildingService {
       name: project.name,
       theme: branch?.theme ?? null,
       icon: project.config?.icon,
+      hostId: project.config?.host_id,
+      workspace: project.config?.workspace,
       createdAt: project.created_at ?? roomState.firstSyncAt,
       priority: roomState.priority,
       keepUpstairs: roomState.keepUpstairs,
@@ -182,12 +184,21 @@ export class BuildingService {
     return this.getSnapshot(true);
   }
 
-  async createRoom(nameInput: unknown, iconInput: unknown): Promise<BuildingSnapshot> {
-    const name = typeof nameInput === "string" ? nameInput.trim() : "";
-    if (!name || name.length > 200) throw new OfficeRequestError(400, "invalid_name", "Give the room a name (up to 200 characters).");
-    const icon = typeof iconInput === "string" && iconInput.trim() ? [...iconInput.trim()].slice(0, 2).join("") : undefined;
-    await this.client.createProject(name, icon ? { icon } : {});
-    return this.getSnapshot(true);
+  /** Create a project whose config carries its default host and folder, as Omnigent's own UI stores them. */
+  async createRoom(input: { name?: unknown; icon?: unknown; hostId?: unknown; workspace?: unknown }): Promise<{ projectId: string }> {
+    const name = typeof input.name === "string" ? input.name.trim() : "";
+    if (!name || name.length > 100) throw new OfficeRequestError(400, "invalid_name", "Give the room a name (up to 100 characters).");
+    const config: Record<string, string> = {};
+    const icon = typeof input.icon === "string" ? [...input.icon.trim()].slice(0, 2).join("") : "";
+    if (icon) config.icon = icon;
+    const hostId = typeof input.hostId === "string" ? input.hostId.trim() : "";
+    const workspace = typeof input.workspace === "string" ? input.workspace.trim() : "";
+    if (workspace && !hostId) throw new OfficeRequestError(400, "invalid_workspace", "Choose the host the folder is on.");
+    if (hostId) config.host_id = hostId;
+    if (workspace) config.workspace = workspace;
+    const project = await this.client.createProject(name, config);
+    this.invalidate();
+    return { projectId: project.id };
   }
 
   /** Mark the snapshot stale so the next read refreshes from Omnigent. */

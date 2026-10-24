@@ -211,7 +211,7 @@ export function RoomView({ room, allRooms, serverNow, placementWaiting, onExit, 
         {branchView ? (
           <WorkflowPanel view={branchView} onChanged={() => void load()} />
         ) : branchLoaded ? (
-          <ThemeSetup projectId={room.projectId} onAssigned={() => void load()} />
+          <ThemeSetup room={room} onAssigned={() => void load()} />
         ) : null}
       </div>
       <aside className="side-panel">

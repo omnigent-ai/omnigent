@@ -46,7 +46,11 @@ The office never starts Omnigent. Configure it with environment variables:
 
 ### SDLC workflow
 
-Assigning SDLC in a room creates a theme branch and starts the PM. Other roles
+Choose the SDLC theme and its agent harness in the New room dialog, or assign
+it later from inside an unthemed room. The room's host and folder (picked by
+browsing the host) are stored in the Omnigent project config (`host_id`,
+`workspace`) and are where role sessions run. Assigning SDLC creates a theme
+branch and starts the PM. Other roles
 (Architect, Developer, Reviewing Developer, QA, DevOps) start when the PM first
 dispatches work to them, or as temporary workers for parallel tasks. Each role
 session is a bundled Omnigent session labelled `office.branch`, `office.role`,
@@ -86,7 +90,8 @@ and survives a service restart.
 
 | Need | Supported by | Gap / fallback |
 | --- | --- | --- |
-| Rooms | `GET /v1/projects` | — |
+| Rooms | `GET/POST /v1/projects` (config `icon`, `host_id`, `workspace`) | — |
+| Folder selection | `GET /v1/hosts/{id}/filesystem/{path}`, proxied by the office | Needs an online host |
 | Workers and liveness | `GET /v1/sessions` (`status`, `host_online`, `pending_elicitations_count`) | Polled every 3–5 s; no cross-session event stream with stable IDs |
 | Meaningful interactions | `GET /v1/sessions/{id}/items` human `message` items (stable item IDs and timestamps) | Scan is capped at 5 pages; deeper history is marked incomplete, so the first-sync grace rule applies |
 | Message a worker | `POST /v1/sessions/{id}/events` (`message`) | — |

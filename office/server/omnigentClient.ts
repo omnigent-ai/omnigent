@@ -7,7 +7,14 @@ export interface OmnigentProject {
   id: string;
   name: string;
   created_at?: number;
-  config?: { icon?: string };
+  /** Session defaults shared with Omnigent's own UI (`host_id`, `workspace`). */
+  config?: { icon?: string; host_id?: string; workspace?: string };
+}
+
+export interface HostDirectoryEntry {
+  name: string;
+  path: string;
+  type: "directory" | "file" | "other";
 }
 
 export interface OmnigentSessionListItem {
@@ -182,6 +189,13 @@ export class OmnigentClient {
 
   async listHosts(): Promise<unknown> {
     return this.request("/v1/hosts");
+  }
+
+  /** One page of a host directory; `path` may be absolute or `~`-prefixed. */
+  async listHostDirectory(hostId: string, path: string): Promise<{ data: HostDirectoryEntry[]; has_more: boolean }> {
+    const trimmed = path.trim() || "~";
+    const suffix = trimmed === "~" ? "" : `/${trimmed.replace(/^\/+/, "").split("/").map(encodeURIComponent).join("/")}`;
+    return this.request(`/v1/hosts/${encodeURIComponent(hostId)}/filesystem${suffix}?limit=500`);
   }
 
   async listHarnesses(): Promise<unknown> {

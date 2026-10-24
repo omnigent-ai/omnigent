@@ -26,9 +26,10 @@ export function App() {
   const [creatingRoom, setCreatingRoom] = useState(false);
   const [runtimeOptions, setRuntimeOptions] = useState<RuntimeOptions | null>(null);
 
+  // Refetched when a room or the new-room dialog opens, so newly connected hosts appear.
   useEffect(() => {
     officeApi.runtimeOptions().then(setRuntimeOptions).catch(() => undefined);
-  }, []);
+  }, [creatingRoom, openRoomId]);
 
   const latest = useMemo(
     () => (snapshot ? computePlacement(snapshot.rooms, snapshot.serverNow) : null),
@@ -185,6 +186,7 @@ export function App() {
         </aside>
       </div>
       {creatingRoom ? (
+        <RuntimeOptionsContext.Provider value={runtimeOptions}>
         <NewRoomDialog
           onClose={() => setCreatingRoom(false)}
           onCreated={(next) => {
@@ -193,6 +195,7 @@ export function App() {
             applyPlacement(next);
           }}
         />
+        </RuntimeOptionsContext.Provider>
       ) : null}
     </div>
   );
