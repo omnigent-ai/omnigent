@@ -5815,6 +5815,30 @@ describe("Composer failed-send attachment restore", () => {
     expect(useChatStore.getState().failedSendDraft).toBeNull();
   });
 
+  it("appends the messages an Interrupt deleted unsent to the in-progress draft", () => {
+    render(<Composer {...composerProps()} />);
+    fireEvent.change(textarea(), { target: { value: "a newer note" } });
+    fireEvent.change(document.querySelector('input[type="file"]') as HTMLInputElement, {
+      target: { files: [new File(["mine"], "mine.txt", { type: "text/plain" })] },
+    });
+
+    act(() =>
+      useChatStore.setState({
+        failedSendDraft: {
+          conversationId: "conv_test",
+          text: "first task",
+          files: [new File(["hello"], "notes.txt", { type: "text/plain" })],
+          appendToDraft: true,
+        },
+      }),
+    );
+
+    expect(textarea()).toHaveValue("a newer note\n\nfirst task");
+    expect(screen.getByText("mine.txt")).toBeTruthy();
+    expect(screen.getByText("notes.txt")).toBeTruthy();
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
   it("clears the failed-send rejection notice once the user types", () => {
     render(<Composer {...composerProps()} />);
     act(() =>

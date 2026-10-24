@@ -3506,13 +3506,14 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
 
   it("binds an accepted managed first input without posting or retaining an unsent draft", async () => {
     seedSession("conv_real");
-    const { tempConvId, pendingMsgTempId } = beginLocalConversation("saved on server", undefined)!;
+    const file = new File(["saved"], "saved.txt", { type: "text/plain" });
+    const { tempConvId, pendingMsgTempId } = beginLocalConversation("saved on server", [file])!;
     hydrateLocalConversation(
       tempConvId,
       "conv_real",
       "agent_xyz",
       "saved on server",
-      undefined,
+      [file],
       pendingMsgTempId,
       null,
       noopNavigate,
@@ -3528,7 +3529,7 @@ describe("chatStore — navigate-first first send (B1/B2 regressions)", () => {
     expect(posts).toHaveLength(0);
     expect(fetchMock.mock.calls.some(([u]) => String(u).endsWith("/conv_real/stream"))).toBe(true);
     expect(useChatStore.getState().pendingUserMessages).toEqual([
-      expect.objectContaining({ posted: true, initialDraft: undefined }),
+      expect.objectContaining({ posted: true, initialDraft: undefined, files: [file] }),
     ]);
   });
 
@@ -5867,6 +5868,7 @@ describe("chatStore — send (file attachments)", () => {
       { type: "input_image", file_id: "file_real_bg", filename: "bg.png" },
       { type: "input_text", text: "with a picture" },
     ]);
+    expect(sender.pendingUserMessages[0]!.files).toEqual([file]);
     // ...and the conversation the user is looking at was never touched.
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
@@ -6652,6 +6654,146 @@ describe("chatStore — stop", () => {
     useChatStore.getState().stop();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  const launchNotes = new File(["notes"], "notes.txt", { type: "text/plain" });
+  const launchChart = new File(["chart"], "chart.png", { type: "image/png" });
+  const waitingSend = {
+    conversationId: "conv_launch",
+    text: "retry me",
+    files: [],
+    stableId: "s".repeat(32),
+  };
+  const handoff = (text: string, files: File[]) => ({
+    conversationId: "conv_launch",
+    text,
+    files,
+    appendToDraft: true,
+  });
+  const restoreCase = {
+    interruptOk: true,
+    draft: null,
+    waiting: null,
+    switchAway: false,
+    sessionDraft: undefined,
+  };
+  it.each([
+    {
+      ...restoreCase,
+      scenario: "all unsent",
+      discarded: ["p1", "p2", "p3"],
+      failedSendDraft: handoff("first\n\nsecond\n\nthird", [launchNotes, launchChart]),
+    },
+    {
+      ...restoreCase,
+      scenario: "head delivered",
+      discarded: ["p2", "p3"],
+      failedSendDraft: handoff("second\n\nthird", [launchChart]),
+    },
+    { ...restoreCase, scenario: "all delivered", discarded: [], failedSendDraft: null },
+    {
+      ...restoreCase,
+      scenario: "interrupt failed",
+      discarded: ["p1"],
+      interruptOk: false,
+      failedSendDraft: null,
+    },
+    {
+      ...restoreCase,
+      scenario: "newer draft",
+      discarded: ["p1"],
+      draft: "edited",
+      failedSendDraft: handoff("first", [launchNotes]),
+      sessionDraft: { text: "edited", files: [] },
+    },
+    {
+      ...restoreCase,
+      scenario: "switched away",
+      discarded: ["p1"],
+      switchAway: true,
+      failedSendDraft: handoff("first", [launchNotes]),
+    },
+    {
+      ...restoreCase,
+      scenario: "failed send waiting",
+      discarded: ["p1"],
+      draft: "edited",
+      waiting: waitingSend,
+      failedSendDraft: waitingSend,
+      sessionDraft: { text: "edited\n\nfirst", files: [launchNotes] },
+    },
+  ] as const)(
+    "restores the startup messages an Interrupt deleted unsent: $scenario",
+    async ({
+      discarded,
+      interruptOk,
+      draft,
+      waiting,
+      switchAway,
+      failedSendDraft,
+      sessionDraft,
+    }) => {
+      clearSessionDrafts();
+      if (draft) setSessionDraft("conv_launch", { text: draft, files: [] });
+      const wire = {
+        p1: {
+          pending_id: "pending_initial",
+          content: [{ type: "input_text", text: "first" }],
+          initial: true,
+        },
+        p2: { pending_id: "pending_p2", content: [{ type: "input_text", text: "second" }] },
+        p3: { pending_id: "pending_p3", content: [{ type: "input_text", text: "third" }] },
+      };
+      fetchMock.mockImplementation(async () => {
+        await Promise.resolve();
+        if (switchAway) useChatStore.setState({ conversationId: "conv_other" });
+        return interruptOk
+          ? mockResponse(
+              { queued: false, discarded_inputs: discarded.map((key) => wire[key]) },
+              { status: 202 },
+            )
+          : mockResponse({}, { ok: false, status: 500 });
+      });
+      useChatStore.setState({
+        conversationId: "conv_launch",
+        startupPending: true,
+        sandboxStatus: { stage: "starting", error: null },
+        failedSendDraft: waiting,
+        pendingUserMessages: [
+          {
+            tempId: "p1",
+            content: [{ type: "input_text", text: "first" }],
+            files: [launchNotes],
+            posted: true,
+            initialInput: true,
+          },
+          // Replayed from the snapshot, which names it by its pending id.
+          { tempId: "pending_p2", content: [{ type: "input_text", text: "second" }] },
+          {
+            tempId: "p3",
+            content: [{ type: "input_text", text: "third" }],
+            files: [launchChart],
+            posted: true,
+            pendingId: "pending_p3",
+            createdAtS: 2,
+          },
+        ],
+      });
+
+      useChatStore.getState().stop();
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+      await vi.waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      await tick();
+
+      const body = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body));
+      expect(body).toMatchObject({ type: "interrupt" });
+      expect(conversationRegistry.peek("conv_launch")!.getState().failedSendDraft).toEqual(
+        failedSendDraft,
+      );
+      if (switchAway) expect(useChatStore.getState().failedSendDraft).toBeNull();
+      expect(getSessionDraft("conv_launch")).toEqual(sessionDraft);
+      clearSessionDrafts();
+    },
+  );
 });
 
 describe("chatStore — handleSessionEvent (session.* events)", () => {

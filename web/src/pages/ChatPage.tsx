@@ -129,7 +129,12 @@ import {
   rankMentionEntries,
 } from "@/lib/composerMentions";
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
-import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import {
+  getSessionDraft,
+  joinDraftText,
+  promoteSessionDraft,
+  setSessionDraft,
+} from "@/lib/sessionDrafts";
 import {
   appendReplyQuote,
   restoreReplyDraft,
@@ -2743,8 +2748,8 @@ function ComposerImpl(
   // The restore effects below key off conversation state and reach the
   // attachment actions through a ref rather than widening their dependency
   // lists.
-  const attachmentsRef = useRef({ restoreFiles, replaceFiles });
-  attachmentsRef.current = { restoreFiles, replaceFiles };
+  const attachmentsRef = useRef({ addFiles, restoreFiles, replaceFiles });
+  attachmentsRef.current = { addFiles, restoreFiles, replaceFiles };
 
   useEffect(() => {
     const previousConversationId = draftConversationIdRef.current;
@@ -2998,7 +3003,8 @@ function ComposerImpl(
   // Restore the text (and attachments) of a send that failed, so the user can
   // fix and resend instead of retyping. The composer is empty in the normal
   // case — `submit` clears it optimistically — so only fill it when the user
-  // hasn't already started something new; their in-progress text wins. Files
+  // hasn't already started something new; their in-progress text wins, except
+  // that messages an Interrupt deleted unsent are appended after it. Files
   // are re-validated on the way in: when the upload itself was what failed
   // (a 415 on an unsupported type), re-arming the same file would only fail
   // again, so it's dropped with the same inline reason a fresh attach gives.
@@ -3019,12 +3025,17 @@ function ComposerImpl(
     pendingFailedSendRestore.current = failed.stableId
       ? { stableId: failed.stableId, draft }
       : null;
-    replaceText(failed.text, failed.replyDraft);
+    if (failed.appendToDraft) {
+      editText(null, (text) => joinDraftText(text, failed.text));
+      if (failed.files.length > 0) attachmentsRef.current.addFiles(failed.files);
+    } else {
+      replaceText(failed.text, failed.replyDraft);
+      if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
+    }
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
-    if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
     if (!isMobileRef.current) textareaRef.current?.focus();
-  }, [failedSendDraft, conversationId, settledConversationId, replaceText, draft]);
+  }, [failedSendDraft, conversationId, settledConversationId, replaceText, editText, draft]);
 
   // Retract a restored failed-send draft once its send proves delivered (its
   // committed item arrived over the stream or a reconnect snapshot). Edits win:

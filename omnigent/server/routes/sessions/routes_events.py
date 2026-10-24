@@ -989,7 +989,7 @@ def register_events_routes(
         session_id: str,
         body: SessionEventInput,
         in_flight: contextlib.ExitStack | None = None,
-    ) -> dict[str, bool | str]:
+    ) -> dict[str, Any]:
         """
         Submit a session event (input message, tool output,
         approval, or interrupt).
@@ -1049,10 +1049,11 @@ def register_events_routes(
           deleting the conversation (owner-only). Forwarded
           harness-agnostically to the runner, which hard-kills the
           external process for harnesses that have one (claude-native
-          kills its tmux pane) and 204s otherwise. Stop is non-sticky:
-          it writes no persistent marker, so the next message
-          auto-relaunches the session on its (still-online) host via
-          the normal message-dispatch relaunch path.
+          kills its tmux pane) and 204s otherwise. Stopping a bound
+          runner is non-sticky: the next message auto-relaunches the
+          session on its (still-online) host via the normal
+          message-dispatch relaunch path. A stop during a managed first
+          launch, before its runner is recorded, abandons the sandbox.
         - ``"retry_session"`` reconnects or relaunches the existing runner
           and retries a failed saved startup input, if one is present.
         - ``"message"`` on an ``omnigent claude`` terminal session
@@ -1633,10 +1634,13 @@ def register_events_routes(
             await _require_access(
                 user_id, session_id, LEVEL_OWNER, permission_store, conversation_store
             )
+        discarded_inputs: list[dict[str, Any]] = []
         if body.type in (_INTERRUPT_TYPE, _STOP_SESSION_TYPE):
             startup = getattr(request.app.state, "startup_inputs", None)
             if startup is not None:
-                await startup.cancel(session_id)
+                discarded_inputs = await startup.cancel(
+                    session_id, stop_launch=body.type == _STOP_SESSION_TYPE
+                )
         stop_codex_side_chat = (
             body.type == _STOP_SESSION_TYPE
             and _is_codex_native_subagent(conv)
@@ -1731,6 +1735,8 @@ def register_events_routes(
                     session_id,
                     {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
                 )
+            if discarded_inputs and body.type == _INTERRUPT_TYPE:
+                return {"queued": False, "discarded_inputs": discarded_inputs}
             return {"queued": False}
         if body.type == _STOP_SESSION_TYPE:
             # Fence the cancelled turn, same as interrupt.
@@ -1844,11 +1850,10 @@ def register_events_routes(
                         conversation_store,
                         int(time.time()) - RUNNER_LIVENESS_TTL_S,
                     )
-            # Stop is non-sticky: no persistent marker is written. The
-            # runner tunnel dropping above flips ``runner_online`` to false
-            # honestly, and the next message auto-relaunches the session on
-            # its (still-online) host via the normal message-dispatch
-            # relaunch path below.
+            # Stopping a bound runner is non-sticky: the runner tunnel dropping
+            # above flips ``runner_online`` to false honestly, and the next
+            # message auto-relaunches the session on its (still-online) host
+            # via the normal message-dispatch relaunch path below.
             try:
                 _srv_id = _get_installation_id()
                 _anon = _tel_anon_user_id(user_id, _srv_id)

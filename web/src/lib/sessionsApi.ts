@@ -23,6 +23,7 @@ import type {
   ModelUsage,
   NativeModelOption,
   NestedSessionItem,
+  PendingInput,
   SandboxStatus,
   Session,
   SessionEventInput,
@@ -80,6 +81,11 @@ export interface PostEventResponse {
   recovered?: boolean;
   /** Machine-readable recovery outcome for retry_session control events. */
   recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
+  /**
+   * Startup messages an interrupt cancelled before the agent received them.
+   * `initial` marks the message the session create accepted.
+   */
+  discardedInputs?: (PendingInput & { initial?: boolean })[];
 }
 
 /**
@@ -452,6 +458,7 @@ function postEventResponseFromWire(wire: {
   pending_id?: string;
   recovered?: boolean;
   recovery?: PostEventResponse["recovery"];
+  discarded_inputs?: { pending_id: string; content: MessageContentBlock[]; initial?: boolean }[];
 }): PostEventResponse {
   return {
     queued: wire.queued,
@@ -460,6 +467,11 @@ function postEventResponseFromWire(wire: {
     pendingId: wire.pending_id,
     recovered: wire.recovered,
     recovery: wire.recovery,
+    discardedInputs: wire.discarded_inputs?.map((input) => ({
+      pendingId: input.pending_id,
+      content: input.content,
+      ...(input.initial === true ? { initial: true } : {}),
+    })),
   };
 }
 
@@ -1411,14 +1423,7 @@ export async function postEvent(
   // for the 503 the server returns when a host-bound runner never connects.
   if (!res.ok) throw await apiErrorFromResponse(res);
   return postEventResponseFromWire(
-    (await res.json()) as {
-      queued: boolean;
-      item_id?: string;
-      denied?: boolean;
-      pending_id?: string;
-      recovered?: boolean;
-      recovery?: PostEventResponse["recovery"];
-    },
+    (await res.json()) as Parameters<typeof postEventResponseFromWire>[0],
   );
 }
 

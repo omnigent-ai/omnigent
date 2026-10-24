@@ -4348,8 +4348,8 @@ async def _run_managed_launch(
     Every exit path settles the tracker entry — success via
     ``finish`` (the session then looks like any host-bound session),
     failure via ``fail`` with the reason a waiting message POST
-    reports. A session deleted mid-provision is detected at the bind
-    step and the fresh sandbox is torn down.
+    reports. A session deleted or stopped mid-provision is detected at
+    the bind step and the fresh sandbox is torn down.
 
     Server shutdown cancels this task (the lifespan teardown calls
     :func:`cancel_managed_launch_tasks`); an already-provisioned
@@ -4467,8 +4467,9 @@ async def _bind_and_launch_managed_runner(
     The bind step doubles as the delete-race detector: a session
     deleted while its sandbox provisioned surfaces here as
     ``ConversationNotFoundError``, and the fresh sandbox is torn down
-    (the delete route could not see the host binding yet). Settles
-    the tracker on every path.
+    (the delete route could not see the host binding yet). A first
+    launch stopped before its runner launch returns is torn down too;
+    a later stop only stops the runner. Settles the tracker on every path.
 
     A launch failure after the host is online also tears the sandbox
     down — UNLESS *relaunch_host* is set: that means ``managed.host_id``
@@ -4495,6 +4496,31 @@ async def _bind_and_launch_managed_runner(
     """
     from omnigent.server.managed_hosts import terminate_managed_host
 
+    async def abandon_fresh_sandbox(reason: str) -> None:
+        _logger.info(
+            "Terminating fresh sandbox on host %s for session %s: %s",
+            managed.host_id,
+            session_id,
+            reason,
+            extra={"session_id": session_id},
+        )
+        try:
+            host = await asyncio.to_thread(host_store.get_host, managed.host_id)
+            if host is not None:
+                await terminate_managed_host(host, host_store, sandbox_config)
+        finally:
+            tracker.fail(session_id, reason)
+            _publish_sandbox_status(session_id, "failed", reason)
+
+    async def stopped_first_launch() -> bool:
+        if relaunch_host is not None:
+            return False
+        saved = await asyncio.to_thread(conversation_store.get_conversation, session_id)
+        return saved is not None and saved.labels.get(STARTUP_LABEL) == "stopped"
+
+    if await stopped_first_launch():
+        await abandon_fresh_sandbox("session was stopped while its sandbox was provisioning")
+        return
     bind = asyncio.ensure_future(
         asyncio.to_thread(
             conversation_store.set_host_id,
@@ -4517,20 +4543,7 @@ async def _bind_and_launch_managed_runner(
         # delete route couldn't see the host binding yet, so tear the
         # fresh sandbox down here (deleting the host row also revokes
         # its launch token).
-        _logger.info(
-            "Session %s was deleted during managed provisioning; "
-            "terminating fresh sandbox on host %s",
-            session_id,
-            managed.host_id,
-            extra={"session_id": session_id},
-        )
-        host = await asyncio.to_thread(host_store.get_host, managed.host_id)
-        if host is not None:
-            await terminate_managed_host(host, host_store, sandbox_config)
-        tracker.fail(session_id, "session was deleted while its sandbox was provisioning")
-        _publish_sandbox_status(
-            session_id, "failed", "session was deleted while its sandbox was provisioning"
-        )
+        await abandon_fresh_sandbox("session was deleted while its sandbox was provisioning")
         return
     # From here a shutdown may cancel the launch: the host's replica finishes it.
     if (launch_task := asyncio.current_task()) is not None:
@@ -4575,6 +4588,12 @@ async def _bind_and_launch_managed_runner(
                 tracker.fail(session_id, reason)
                 _publish_sandbox_status(session_id, "failed", reason)
                 return
+    # A stop accepted before the runner_id write found no runner to stop.
+    if await stopped_first_launch():
+        with contextlib.suppress(ConversationNotFoundError):
+            await asyncio.to_thread(conversation_store.clear_host_binding, session_id)
+        await abandon_fresh_sandbox("session was stopped while its sandbox was launching")
+        return
     if runner_id is not None and tunnel_registry is not None:
         connected = await _wait_for_managed_runner_tunnel(
             session_id,

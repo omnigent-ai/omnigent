@@ -37,6 +37,8 @@ from omnigent.stores.host_store import host_is_live
 
 _logger = logging.getLogger(__name__)
 STARTUP_LABEL = "omnigent.startup"
+# A stopped startup is a cancelled one whose unbound managed launch is also abandoned.
+_CANCELLED_STATES = ("cancelled", "stopped")
 
 
 def initial_input_id(session_id: str) -> str:
@@ -74,7 +76,7 @@ async def restore_pending_inputs(store: ConversationStore, session_id: str) -> N
                 background_titles_enabled=bool(options and options.background_titles_enabled),
             )
             conv = await asyncio.to_thread(store.get_conversation, session_id)
-            if conv is not None and conv.labels.get(STARTUP_LABEL) == "cancelled":
+            if conv is not None and conv.labels.get(STARTUP_LABEL) in _CANCELLED_STATES:
                 pending_inputs.mark_interrupted(session_id, [pending_id])
 
 
@@ -260,7 +262,7 @@ class ManagedStartupInputs:
 
     async def pending_snapshot(self, session_id: str) -> list[dict[str, Any]]:
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
-        if conv is None or conv.labels.get(STARTUP_LABEL) == "cancelled":
+        if conv is None or conv.labels.get(STARTUP_LABEL) in _CANCELLED_STATES:
             return []
         return [
             {
@@ -328,8 +330,10 @@ class ManagedStartupInputs:
         if state == "failed":
             return False
         items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
-        if state == "cancelled":
-            if not items:
+        if state in _CANCELLED_STATES:
+            # Keep the label until a runner is recorded so a later stop can still abandon
+            # the launch, and keep a stop for the launch's check after it records one.
+            if not items and state == "cancelled" and conv.runner_id is not None:
                 await self._finish(session_id)
             return False
         # A refused input waits for an explicit retry without holding back the
@@ -391,7 +395,7 @@ class ManagedStartupInputs:
             current = await asyncio.to_thread(self.conversations.get_item, session_id, item.id)
             if (
                 conv is None
-                or conv.labels.get(STARTUP_LABEL) == "cancelled"
+                or conv.labels.get(STARTUP_LABEL) in _CANCELLED_STATES
                 or current is None
                 or current.response_id != PENDING_INPUT_RESPONSE_ID
                 or current.status != "in_progress"
@@ -486,32 +490,48 @@ class ManagedStartupInputs:
                 )
         return changed
 
-    async def cancel(self, session_id: str) -> None:
+    async def cancel(self, session_id: str, *, stop_launch: bool = False) -> list[dict[str, Any]]:
+        """
+        Drop the saved startup inputs; *stop_launch* also abandons an unbound managed launch.
+
+        :returns: The inputs dropped before any delivery, each ``{"pending_id", "content"}``,
+            with ``"initial": True`` on the session's first input.
+        """
         items = await asyncio.to_thread(self.conversations.list_pending_inputs, session_id)
         conv = await asyncio.to_thread(self.conversations.get_conversation, session_id)
-        if not items and (conv is None or conv.labels.get(STARTUP_LABEL) != "pending"):
-            return
+        state = conv.labels.get(STARTUP_LABEL) if conv is not None else None
+        if not items and state != "pending" and not (stop_launch and state == "cancelled"):
+            return []
         await asyncio.to_thread(
-            self.conversations.set_labels, session_id, {STARTUP_LABEL: "cancelled"}
+            self.conversations.set_labels,
+            session_id,
+            {STARTUP_LABEL: "stopped" if stop_launch or state == "stopped" else "cancelled"},
         )
         key = (current_workspace_id(), session_id)
         task = self._deliveries.get(key)
         if task is not None:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
+        discarded: list[dict[str, Any]] = []
         for item in items:
+            pending_id = pending_inputs.make_pending_id(session_id, item.id)
             if item.status == "incomplete":
-                pending_inputs.mark_interrupted(
-                    session_id, [pending_inputs.make_pending_id(session_id, item.id)]
+                pending_inputs.mark_interrupted(session_id, [pending_id])
+            elif await asyncio.to_thread(
+                self.conversations.transition_pending_input,
+                session_id,
+                item.id,
+                expected=item.status,
+                status=None,
+            ):
+                discarded.append(
+                    {
+                        "pending_id": pending_id,
+                        "content": input_content(item),
+                        **({"initial": True} if item.id == initial_input_id(session_id) else {}),
+                    }
                 )
-            else:
-                await asyncio.to_thread(
-                    self.conversations.transition_pending_input,
-                    session_id,
-                    item.id,
-                    expected=item.status,
-                    status=None,
-                )
+        return discarded
 
     async def _report_failure(self, session_id: str, failure_id: str, message: str) -> None:
         """Record a startup failure in the transcript and the session's status."""

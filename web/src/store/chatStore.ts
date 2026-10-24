@@ -74,6 +74,7 @@ import {
   interrupt as interruptSession,
   openSessionStream,
   postEvent,
+  type PostEventResponse,
   type SessionItemsPage,
   updateSession,
 } from "@/lib/sessionsApi";
@@ -110,7 +111,7 @@ import {
   type ConversationsInfiniteData,
 } from "@/lib/sessionListCache";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
-import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
+import { getSessionDraft, joinDraftText, setSessionDraft } from "@/lib/sessionDrafts";
 import { forgetUnsentSend, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
 import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
@@ -476,7 +477,13 @@ export function hydrateLocalConversation(
         startupPending: true,
         pendingUserMessages: state.pendingUserMessages.map((message) =>
           message.tempId === pendingMsgTempId
-            ? { ...message, posted: true, initialDraft: undefined }
+            ? {
+                ...message,
+                posted: true,
+                initialInput: true,
+                initialDraft: undefined,
+                files: message.initialDraft?.files ?? message.files,
+              }
             : message,
         ),
       }));
@@ -563,6 +570,10 @@ export interface PendingUserMessage {
   content: MessageContentBlock[];
   /** Unsent draft awaiting session/model readiness, including unuploaded files. */
   initialDraft?: { text: string; files: File[] };
+  /** The send's attachments, handed back if an Interrupt deletes the server's copy. */
+  files?: File[];
+  /** Accepted by the session create as its initial input, so it has no `pendingId`. */
+  initialInput?: boolean;
   /** Client epoch seconds stamped ONCE at send time — the optimistic
    *  bubble's display timestamp. Stamping here (not at render or
    *  promotion) keeps the shown time pinned to when the user hit send.
@@ -894,6 +905,8 @@ export interface ConversationState {
      * settles it (see `committedItemProvesDelivery`).
      */
     unsettled?: boolean;
+    /** Add to the composer's input instead of yielding to it: the server deleted these messages. */
+    appendToDraft?: boolean;
   } | null;
   /**
    * Stable id set by the failedSendDraft restore path so the next send()
@@ -1471,6 +1484,29 @@ function nativeSandboxLaunching(state: ConversationState): boolean {
     state.sandboxStatus !== null &&
     state.sandboxStatus.stage !== "failed"
   );
+}
+
+/** The text and files of the messages an Interrupt cancelled before the agent received them. */
+function discardedDraft(
+  pending: PendingUserMessage[],
+  discarded: PostEventResponse["discardedInputs"],
+): { text: string; files: File[] } | null {
+  if (!discarded?.length) return null;
+  const text = joinDraftText(
+    ...discarded.map((input) =>
+      input.content.flatMap((block) => (block.type === "input_text" ? [block.text] : [])).join(""),
+    ),
+  );
+  // Snapshot-replayed bubbles carry their pending id as `tempId`.
+  const files = discarded.flatMap(
+    (input) =>
+      pending.find(
+        (message) =>
+          (message.pendingId ?? message.tempId) === input.pendingId ||
+          (input.initial === true && message.initialInput === true),
+      )?.files ?? [],
+  );
+  return text || files.length > 0 ? { text, files } : null;
 }
 
 // Restores a draft held through a launch whose end never reaches this tab; well
@@ -2625,6 +2661,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
                 tempId,
                 content,
                 ...(initialDraft ? { initialDraft } : {}),
+                ...(files && files.length > 0 ? { files } : {}),
                 createdAtS: Math.floor(Date.now() / 1000),
                 ...(selfAuthor !== null ? { author: selfAuthor } : {}),
                 ...(sentMidTurn ? { sentMidTurn } : {}),
@@ -3107,17 +3144,45 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         return;
     }
     if (isTempConvId(sessionId)) return;
+    const pendingMessages = state.pendingUserMessages;
     // Fire-and-forget interrupt; the server emits session.interrupted
     // + response.incomplete on the open stream, which the pump
     // translates into the cancelled bubble decoration. We deliberately
     // do NOT abort the local SSE stream — it remains open across
     // turns; switchTo or tab unload is the only thing that tears it
     // down.
-    void interruptSession(sessionId).catch(() => {
-      // Interrupt is best-effort. A network failure here means the
-      // user's cancel won't reach the server, but the local UI already
-      // reflects the user's stop request below.
-    });
+    void interruptSession(sessionId)
+      .then((response) => {
+        // Hand back the startup messages the server deleted unsent so they can be corrected
+        // and resent, after anything already in the composer.
+        const restored = discardedDraft(pendingMessages, response.discardedInputs);
+        if (restored === null) return;
+        if (
+          !isConversationDisposed(sessionId) &&
+          setterForState(sessionId)?.failedSendDraft === null
+        ) {
+          setterFor(sessionId)({
+            failedSendDraft: { ...restored, conversationId: sessionId, appendToDraft: true },
+          });
+          return;
+        }
+        const existing = getSessionDraft(sessionId);
+        setSessionDraft(
+          sessionId,
+          existing
+            ? {
+                ...existing,
+                text: joinDraftText(existing.text, restored.text),
+                files: [...existing.files, ...restored.files],
+              }
+            : restored,
+        );
+      })
+      .catch(() => {
+        // Interrupt is best-effort. A network failure here means the
+        // user's cancel won't reach the server, but the local UI already
+        // reflects the user's stop request below.
+      });
     setActive((s) => {
       if (s.conversationId !== sessionId) return {};
       const patch: Partial<ChatState> = {
@@ -7111,7 +7176,7 @@ export function takeFailedSendDraft(conversationId: string, hasDraft: boolean) {
   const failed = state?.failedSendDraft;
   if (!state || !failed || failed.conversationId !== conversationId) return null;
   const delivered = committedItemProvesDelivery(state.blocks, failed);
-  const restore = !hasDraft && !delivered;
+  const restore = (!hasDraft || failed.appendToDraft === true) && !delivered;
   const patch: Partial<ConversationState> = { failedSendDraft: null };
   if (!delivered) patch.pendingRetryStableId = restore ? (failed.stableId ?? null) : null;
   // A discarded failure must not untrack an earlier draft still in the composer.
