@@ -17,7 +17,7 @@
   "pi": {
     "kind": "npm",
     "package": "@earendil-works/pi-coding-agent",
-    "version": "1.0.4",
+    "version": "1.3.0",
     "binary": "pi",
     "lockfile": "locks/pi/package-lock.json"
   },
