@@ -34,6 +34,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_launch_model,
     read_model_env,
     read_model_picker_values,
+    terminal_dialog_pending,
 )
 from omnigent.inner.executor import (
     EnqueuedContent,
@@ -55,11 +56,19 @@ from omnigent.models.claude_model_vocabulary import claude_model_command_arg, no
 
 _logger = logging.getLogger(__name__)
 
-# How long a turn waits for the person to answer a Claude question or permission
-# prompt that held its message before anything was typed. Inside the server's
-# 600 s pending-input lifetime, so a message still held at the end is reported.
+# How long a turn waits for the person to answer a Claude question, permission
+# prompt or terminal dialog that held its message before anything was typed.
+# Inside the server's 600 s pending-input lifetime, so a message still held at
+# the end is reported.
 _ANSWER_HOLD_S = 8 * 60.0
 _ANSWER_POLL_S = 1.0
+
+
+def _awaits_answer(exc: ClaudeUserPromptPending | ClaudeTerminalDialog) -> bool:
+    """Return whether a refusal came before typing and waits on the person's answer."""
+    if isinstance(exc, ClaudeUserPromptPending):
+        return exc.nothing_typed
+    return exc.awaits_answer
 
 
 class ClaudeNativeExecutor(Executor):
@@ -170,10 +179,11 @@ class ClaudeNativeExecutor(Executor):
 
     async def _wait_for_answer(self, deadline: float) -> bool:
         """
-        Hold a turn whose message a pending question or permission prompt refused.
+        Hold a turn whose message a pending question, permission prompt or dialog refused.
 
-        The web UI and the embedded terminal both offer the prompt, so once the
-        person answers it the message can be delivered instead of failed.
+        Questions and permission prompts are offered in the web UI and the
+        embedded terminal; the dialogs only the terminal shows are answered
+        there. Once the person answers, the message is delivered instead of failed.
 
         :param deadline: Event-loop time the hold ends at, shared by every
             refusal in the turn.
@@ -188,7 +198,9 @@ class ClaudeNativeExecutor(Executor):
         while loop.time() < deadline:
             await asyncio.sleep(_ANSWER_POLL_S)
             try:
-                pending = await asyncio.to_thread(has_pending_user_prompt, self._bridge_dir)
+                pending = await asyncio.to_thread(
+                    has_pending_user_prompt, self._bridge_dir
+                ) or await asyncio.to_thread(terminal_dialog_pending, self._bridge_dir)
             except (OSError, RuntimeError):
                 continue
             if not pending:
@@ -235,9 +247,9 @@ class ClaudeNativeExecutor(Executor):
             ``config.model``) and the switch is applied inline, before the
             message — see the ``/model`` handling below.
         :yields: :class:`TurnComplete` after the input was injected,
-            or :class:`ExecutorError` on bridge failure. A question or
-            permission prompt that refuses the message before anything is
-            typed holds the turn until it is answered (see
+            or :class:`ExecutorError` on bridge failure. A question,
+            permission prompt or terminal dialog that refuses the message
+            before anything is typed holds the turn until it is answered (see
             :meth:`_wait_for_answer`), then the message is delivered.
         """
         del tools, system_prompt
@@ -300,9 +312,9 @@ class ClaudeNativeExecutor(Executor):
                     try:
                         await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
                         break
-                    except ClaudeUserPromptPending as exc:
+                    except (ClaudeUserPromptPending, ClaudeTerminalDialog) as exc:
                         # Refused before anything was typed: wait for the answer and retry.
-                        if not exc.nothing_typed:
+                        if not _awaits_answer(exc):
                             raise
                         if answer_deadline is None:
                             answer_deadline = asyncio.get_running_loop().time() + _ANSWER_HOLD_S
@@ -355,7 +367,8 @@ class ClaudeNativeExecutor(Executor):
             return
         except ClaudeTerminalDialog as exc:
             # The pane is parked on a surface the person clears from the
-            # embedded terminal; reaping it would destroy that. Both raisers
+            # embedded terminal (past the hold, for a dialog); reaping it would
+            # destroy that. Both raisers
             # (the readiness gate, and the slash-command refusal ahead of a
             # routed /model) fail before the first keystroke, so the sender's
             # queued copy is the only record of the message.
