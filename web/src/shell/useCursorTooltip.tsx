@@ -28,7 +28,6 @@ function placeTooltip(pointer: Point, size: Size) {
   return {
     left: Math.max(EDGE_MARGIN, left),
     top: Math.max(EDGE_MARGIN, top),
-    maxWidth: clientWidth - 2 * EDGE_MARGIN,
   };
 }
 
@@ -45,31 +44,67 @@ export function useCursorTooltip(text: string): {
   };
   tooltip: React.ReactNode;
 } {
-  const [cursorPos, setCursorPos] = useState<Point | null>(null);
-  const [size, setSize] = useState<Size>({ width: 0, height: 0 });
+  const [open, setOpen] = useState(false);
+  const pointerRef = useRef<Point | null>(null);
   const tooltipRef = useRef<HTMLDivElement>(null);
+  const positionRef = useRef<(() => void) | null>(null);
+  const frameRef = useRef<number | null>(null);
 
-  // Measure before paint on every pointer move or text change while shown, so an
-  // edge flip never shows at the unflipped spot and follows a re-wrap (resize,
-  // zoom, font load) on the next move.
+  // Measure before the first paint, then only when the text or dimensions change.
+  // Pointer frames reuse that size and move the box without rendering the row.
   useLayoutEffect(() => {
-    if (!tooltipRef.current) return;
-    const { width, height } = tooltipRef.current.getBoundingClientRect();
-    setSize((prev) => (prev.width === width && prev.height === height ? prev : { width, height }));
-  }, [cursorPos, text]);
+    const node = tooltipRef.current;
+    if (!node) return;
+    let size: Size;
+    const position = () => {
+      if (!pointerRef.current) return;
+      const { left, top } = placeTooltip(pointerRef.current, size);
+      node.style.transform = `translate(${left}px, ${top}px)`;
+    };
+    const measure = () => {
+      node.style.maxWidth = `${document.documentElement.clientWidth - 2 * EDGE_MARGIN}px`;
+      size = node.getBoundingClientRect();
+      position();
+    };
+    positionRef.current = position;
+    measure();
+    const observer = new ResizeObserver(measure);
+    observer.observe(node);
+    window.addEventListener("resize", measure);
+    return () => {
+      positionRef.current = null;
+      observer.disconnect();
+      window.removeEventListener("resize", measure);
+      if (frameRef.current !== null) cancelAnimationFrame(frameRef.current);
+      frameRef.current = null;
+    };
+  }, [open, text]);
 
   const handlers = {
-    onMouseMove: (e: React.MouseEvent) => setCursorPos({ x: e.clientX, y: e.clientY }),
-    onMouseLeave: () => setCursorPos(null),
+    onMouseMove: (e: React.MouseEvent) => {
+      if (!pointerRef.current) setOpen(true);
+      pointerRef.current = { x: e.clientX, y: e.clientY };
+      if (positionRef.current && frameRef.current === null) {
+        frameRef.current = requestAnimationFrame(() => {
+          frameRef.current = null;
+          positionRef.current?.();
+        });
+      }
+    },
+    onMouseLeave: () => {
+      pointerRef.current = null;
+      setOpen(false);
+    },
   };
 
-  const tooltip = cursorPos
+  const tooltip = open
     ? createPortal(
         <div
           ref={tooltipRef}
           style={{
             position: "fixed",
-            ...placeTooltip(cursorPos, size),
+            left: 0,
+            top: 0,
             pointerEvents: "none",
           }}
           className="z-50 inline-flex w-max items-center wrap-anywhere rounded-md border border-border bg-popover px-3 py-1.5 text-sm text-popover-foreground shadow-tooltip"
