@@ -39,6 +39,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RunnerTunnelAuthRejectedError,
 )
 from omnigent.util.event_loop_watchdog import monitor_event_loop
+from omnigent.util.keep_awake import keep_awake_enabled, run_keep_awake_monitor
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -1958,6 +1959,17 @@ async def _run_tunnel_from_env() -> None:
         name=f"runner-ws-tunnel:{runner_id}",
     )
     stop_task = asyncio.create_task(stop_event.wait(), name="runner-signal-wait")
+    keep_awake_task: asyncio.Task[None] | None = None
+    if keep_awake_enabled():
+
+        def _turn_in_flight() -> bool:
+            callback = getattr(app.state, "has_turn_in_flight", None)
+            return callable(callback) and bool(callback())
+
+        keep_awake_task = asyncio.create_task(
+            run_keep_awake_monitor(_turn_in_flight, runner_id=runner_id),
+            name=f"runner-keep-awake:{runner_id}",
+        )
     idle_task: asyncio.Task[None] | None = None
     if idle_timeout_s > 0:
 
@@ -2050,6 +2062,10 @@ async def _run_tunnel_from_env() -> None:
         if idle_task is not None:
             with contextlib.suppress(asyncio.CancelledError):
                 await idle_task
+        if keep_awake_task is not None:
+            keep_awake_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await keep_awake_task
         if direct_attach_listener is not None:
             with contextlib.suppress(Exception):
                 await direct_attach_listener.stop()

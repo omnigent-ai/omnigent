@@ -1507,6 +1507,20 @@ def create_runner_app(
 
     app.state.has_active_work = _has_active_work
 
+    def _has_turn_in_flight() -> bool:
+        # Narrower than _has_active_work: timers and approvals pending outside
+        # a turn can wait for hours and must not pin a laptop awake.
+        if _active_turns or _claude_prompt_waiters:
+            return True
+        session_ids = set(_session_start_cache) | set(_session_agent_ids)
+        if process_manager is not None and any(
+            process_manager.has_active_turn(session_id) for session_id in session_ids
+        ):
+            return True
+        return any(_native_turn_in_flight(session_id) for session_id in session_ids)
+
+    app.state.has_turn_in_flight = _has_turn_in_flight
+
     def _drain_session_streams() -> None:
         for queue in list(_session_event_queues.values()):
             queue.put_nowait(None)
