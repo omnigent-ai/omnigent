@@ -1359,6 +1359,38 @@ class SqlHost(OmnigentBase):
     )
 
 
+class SqlSandboxProfile(OmnigentBase):
+    """Administrator-managed launch profiles, partitioned by workspace."""
+
+    __tablename__ = "sandbox_profiles"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    name: Mapped[str] = mapped_column(String(100), nullable=False)
+    description: Mapped[str] = mapped_column(String(500), nullable=False)
+    provider: Mapped[str] = mapped_column(String(32), nullable=False)
+    config_json: Mapped[bytes] = mapped_column(LargeBinary(16383), nullable=False)
+    revision: Mapped[str] = mapped_column(String(64), nullable=False)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
+
+    __table_args__ = (Index("ix_sandbox_profiles_enabled", "workspace_id", "enabled", "id"),)
+
+
+class SqlSandboxProfileBinding(OmnigentBase):
+    """Immutable accepted launch configuration for one session and its host."""
+
+    __tablename__ = "sandbox_profile_bindings"
+
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    host_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    snapshot_json: Mapped[bytes] = mapped_column(LargeBinary(16383), nullable=False)
+
+    __table_args__ = (
+        Index("ix_sandbox_profile_bindings_host", "workspace_id", "host_id", "session_id"),
+    )
+
+
 class SqlUserDailyCost(OmnigentBase):
     """
     SQLAlchemy model for the ``user_daily_cost`` table.
