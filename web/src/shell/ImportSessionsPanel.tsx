@@ -6,6 +6,7 @@ import { HostLabel } from "./HostLabel";
 import { Button } from "@/components/ui/button";
 import { Spinner } from "@/components/ui/spinner";
 import { Input } from "@/components/ui/input";
+import { Switch } from "@/components/ui/switch";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import {
   Select,
@@ -37,7 +38,8 @@ type ImportMode = "recent" | "session";
  * Inline (non-modal) import UI for the Settings "Import sessions" section.
  * Imports recent transcripts or one known harness session through the chosen
  * host, then refreshes the sidebar. Already-imported sessions are skipped
- * server-side; progress and results show aggregate counts.
+ * server-side unless a session-by-ID import replaces its earlier copy; progress
+ * and results show aggregate counts.
  */
 export function ImportSessionsPanel() {
   const queryClient = useQueryClient();
@@ -51,6 +53,15 @@ export function ImportSessionsPanel() {
   const [limit, setLimit] = useState(request?.limit ?? 25);
   const [mode, setMode] = useState<ImportMode>(request?.sessionId ? "session" : "recent");
   const [sessionId, setSessionId] = useState(request?.sessionId ?? "");
+  // A run that neither failed nor skipped a session turns replacing off, so a
+  // later import never replaces by accident.
+  const finishedCleanly = result !== null && result.failed === 0 && result.alreadyImported === 0;
+  const [replaceExisting, setReplaceExisting] = useState(
+    request?.force === true && !finishedCleanly,
+  );
+  useEffect(() => {
+    if (finishedCleanly) setReplaceExisting(false);
+  }, [finishedCleanly]);
 
   // Default to the caller's current online machine — the transcripts are read
   // on the host, so there's nothing to import without one.
@@ -66,7 +77,13 @@ export function ImportSessionsPanel() {
     if (mode === "session" && exactSessionId.length === 0) return;
     await start(
       mode === "session"
-        ? { hostId, source, limit, sessionId: exactSessionId }
+        ? {
+            hostId,
+            source,
+            limit,
+            sessionId: exactSessionId,
+            ...(replaceExisting ? { force: true } : {}),
+          }
         : { hostId, source, limit },
       queryClient,
     );
@@ -79,6 +96,7 @@ export function ImportSessionsPanel() {
     setLimit(request.limit);
     setMode(request.sessionId ? "session" : "recent");
     setSessionId(request.sessionId ?? "");
+    setReplaceExisting(request.force === true);
     void start(request, queryClient);
   }
 
@@ -202,6 +220,30 @@ export function ImportSessionsPanel() {
         </div>
       )}
 
+      {mode === "session" && (
+        <div className="flex items-start justify-between gap-x-6 gap-y-3 border-b border-border py-4">
+          <div className="min-w-0 flex-1">
+            <label htmlFor="import-replace-existing" className="text-ui font-normal md:font-medium">
+              Replace existing snapshot
+            </label>
+            <p id="import-replace-existing-help" className="text-sm text-muted-foreground">
+              If this session was already imported, replace that copy with the latest transcript.
+              The old copy's comments, sharing, labels, project, and custom title are removed.
+            </p>
+          </div>
+          <Switch
+            id="import-replace-existing"
+            data-testid="import-replace-toggle"
+            aria-describedby="import-replace-existing-help"
+            checked={replaceExisting}
+            disabled={importing}
+            onCheckedChange={setReplaceExisting}
+            className="mt-0.5 shrink-0"
+            componentId="settings.import.replace_existing"
+          />
+        </div>
+      )}
+
       <div className="flex justify-end pt-4">
         <Button
           data-testid="import-submit"
@@ -272,7 +314,9 @@ export function ImportSessionsPanel() {
                   Retry failed
                 </Button>
                 <p className="mt-1 text-xs text-muted-foreground">
-                  Retrying re-runs the import; sessions already imported are skipped.
+                  {request?.force === true
+                    ? "Retrying re-runs the replacement."
+                    : "Retrying re-runs the import; sessions already imported are skipped."}
                 </p>
               </div>
             </div>

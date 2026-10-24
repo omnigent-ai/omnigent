@@ -145,6 +145,7 @@ interface SessionResponseWire {
    */
   background_tasks?: BackgroundTaskInfo[] | null;
   created_at: number;
+  updated_at?: number | null;
   /**
    * Human-readable session title, e.g. ``"researcher:auth"`` for a
    * sub-agent or a user-supplied string for a top-level session.
@@ -333,6 +334,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     backgroundTaskCount: wire.background_task_count ?? undefined,
     backgroundTasks: parseBackgroundTasks(wire.background_tasks),
     createdAt: wire.created_at,
+    updatedAt: wire.updated_at ?? undefined,
     title: wire.title ?? null,
     labels: wire.labels,
     projectId: wire.project_id ?? null,
@@ -575,7 +577,8 @@ function toImportFailureRef(evt: Record<string, unknown>): ImportFailureRef {
  * host reads + normalizes its own transcripts over the tunnel (they live on
  * that machine, not the server); already-imported sessions are skipped.
  * Passing `sessionId` loads that exact session from `source` without listing
- * local history. Otherwise, `source` may be "all" for every harness at once.
+ * local history; `force` then replaces an earlier import of it with the current
+ * transcript. Otherwise, `source` may be "all" for every harness at once.
  *
  * Prefers the streaming endpoint `POST /v1/imports/local/stream` (NDJSON):
  * `onSession` fires for each newly imported session as its frame lands, so
@@ -593,8 +596,15 @@ export async function importLocalSessions(
   limit: number,
   onSession?: (session: ImportedSessionRef) => void,
   sessionId?: string,
+  force = false,
 ): Promise<LocalImportResult> {
-  const body = { host_id: hostId, source, limit, session_id: sessionId };
+  const body = {
+    host_id: hostId,
+    source,
+    limit,
+    session_id: sessionId,
+    ...(force ? { force: true } : {}),
+  };
   const res = await authenticatedFetch("/v1/imports/local/stream", {
     method: "POST",
     headers: { "Content-Type": "application/json", "X-Omnigent-Client": getClientSurface() },

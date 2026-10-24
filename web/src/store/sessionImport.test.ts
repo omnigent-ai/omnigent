@@ -1,16 +1,28 @@
 import { QueryClient } from "@tanstack/react-query";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
+import { markConversationRead } from "@/hooks/useUnseenConversations";
 import {
+  getSessionSlim,
   importLocalSessions,
   type ImportedSessionRef,
   type LocalImportResult,
 } from "@/lib/sessionsApi";
+import type { Session } from "@/lib/types";
+import { reloadConversation } from "@/store/chatStore";
 import { useSessionImportStore } from "./sessionImport";
 
-vi.mock("@/lib/sessionsApi", () => ({ importLocalSessions: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({
+  importLocalSessions: vi.fn(),
+  getSessionSlim: vi.fn(),
+}));
+vi.mock("@/store/chatStore", () => ({ reloadConversation: vi.fn() }));
+vi.mock("@/hooks/useUnseenConversations", () => ({ markConversationRead: vi.fn() }));
 
 const importMock = vi.mocked(importLocalSessions);
+const reloadMock = vi.mocked(reloadConversation);
+const sessionMock = vi.mocked(getSessionSlim);
+const markReadMock = vi.mocked(markConversationRead);
 
 const DONE: LocalImportResult = {
   imported: 2,
@@ -42,6 +54,9 @@ function spyInvalidate(queryClient: QueryClient) {
 
 beforeEach(() => {
   importMock.mockReset();
+  reloadMock.mockReset().mockResolvedValue(undefined);
+  sessionMock.mockReset();
+  markReadMock.mockReset();
   useSessionImportStore.setState({
     importing: false,
     importedCount: 0,
@@ -119,9 +134,71 @@ describe("useSessionImportStore", () => {
       25,
       expect.any(Function),
       "thread-9",
+      false,
     );
+    stream.session({ id: "c1", title: "One" });
+    expect(reloadMock).not.toHaveBeenCalled();
     stream.resolve(DONE);
     await first;
+    expect(sessionMock).not.toHaveBeenCalled();
+  });
+
+  it("drops cached copies of each session a forced import replaced and marks it read", async () => {
+    reloadMock.mockRejectedValue(new Error("Snapshot fetch failed"));
+    sessionMock.mockImplementation(async (id) => {
+      if (id === "c1") return { createdAt: 1_700_000_000, updatedAt: 1_700_000_123 } as Session;
+      if (id === "c2") return { createdAt: 1_700_000_050 } as Session;
+      throw new Error("Session lookup failed");
+    });
+    const stream = pendingImport();
+    const queryClient = new QueryClient();
+    const invalidate = spyInvalidate(queryClient);
+
+    const run = useSessionImportStore
+      .getState()
+      .start(
+        { hostId: "host_1", source: "claude", limit: 25, sessionId: "thread-9", force: true },
+        queryClient,
+      );
+    expect(importMock).toHaveBeenCalledWith(
+      "host_1",
+      "claude",
+      25,
+      expect.any(Function),
+      "thread-9",
+      true,
+    );
+
+    stream.session({ id: "c1", title: "One" });
+    stream.session({ id: "c2", title: "Two" });
+    stream.session({ id: "c3", title: "Three" });
+    expect(reloadMock).toHaveBeenCalledWith("c1");
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session", "c1"] });
+    stream.resolve(DONE);
+    await run;
+    expect(markReadMock.mock.calls).toEqual([
+      ["c1", 1_700_000_123],
+      ["c2", 1_700_000_050],
+    ]);
+    expect(useSessionImportStore.getState().result).toEqual(DONE);
+    expect(useSessionImportStore.getState().error).toBeNull();
+  });
+
+  it("ignores force when importing recent sessions", async () => {
+    importMock.mockImplementation(async (_host, _source, _limit, onSession) => {
+      onSession?.({ id: "c1", title: "One" });
+      return DONE;
+    });
+    const queryClient = new QueryClient();
+    spyInvalidate(queryClient);
+
+    await useSessionImportStore
+      .getState()
+      .start({ hostId: "host_1", source: "claude", limit: 25, force: true }, queryClient);
+
+    expect(importMock).toHaveBeenCalledWith("host_1", "claude", 25, expect.any(Function));
+    expect(reloadMock).not.toHaveBeenCalled();
+    expect(markReadMock).not.toHaveBeenCalled();
   });
 
   it("refreshes the session list every 5s only while the import is in flight", async () => {

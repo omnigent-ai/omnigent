@@ -2836,7 +2836,7 @@ function ImportSection() {
   return (
     <Section
       title="Import sessions"
-      description="Pull local chats from a machine you're running into Omnigent. Sessions already imported are skipped."
+      description="Pull local chats from a machine you're running into Omnigent. Sessions already imported are skipped unless you replace one by ID."
     >
       <div className="flex flex-col gap-3">
         <h2 className="text-ui font-medium">Import from a machine</h2>

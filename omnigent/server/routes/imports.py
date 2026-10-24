@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
 import secrets
 import threading
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
+from contextlib import asynccontextmanager
 from dataclasses import dataclass
 from typing import Any, Literal, cast, get_args
 
@@ -127,7 +129,9 @@ class LocalImportRequest(BaseModel):
     asks the chosen host to read + normalize its own transcripts over the
     tunnel — the transcripts live on the caller's machine, not the server. A
     supplied ``session_id`` loads that exact session without enumerating local
-    history.
+    history. ``force`` replaces an earlier import of that exact session with
+    the host's current transcript, unless the caller doesn't own it or it was
+    resumed in Omnigent.
     """
 
     host_id: str
@@ -136,6 +140,7 @@ class LocalImportRequest(BaseModel):
     source: ImportSource | Literal["all"]
     limit: int = Field(default=10, ge=1, le=1000)
     session_id: str | None = Field(default=None, min_length=1, max_length=128)
+    force: bool = False
 
     @field_validator("session_id")
     @classmethod
@@ -153,6 +158,8 @@ class LocalImportRequest(BaseModel):
         """An id is only meaningful within one harness namespace."""
         if self.session_id is not None and self.source == "all":
             raise ValueError("an exact session import requires a specific harness")
+        if self.force and self.session_id is None:
+            raise ValueError("replacing an import requires an exact session_id")
         return self
 
 
@@ -223,9 +230,12 @@ def _import_event_line(payload: dict[str, object]) -> bytes:
     return (json.dumps(payload) + "\n").encode()
 
 
-async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[None]:
+@asynccontextmanager
+async def _source_import_lock(
+    source: ImportSource, external_session_id: str
+) -> AsyncIterator[None]:
     """Serialize concurrent imports for one source identity in this server."""
-    key = (body.source, body.external_session_id)
+    key = (source, external_session_id)
     with _IMPORT_LOCKS_GUARD:
         entry = _IMPORT_LOCKS.setdefault(key, _ImportLockEntry(lock=asyncio.Lock()))
         entry.users += 1
@@ -237,6 +247,12 @@ async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[
             entry.users -= 1
             if entry.users == 0:
                 _IMPORT_LOCKS.pop(key, None)
+
+
+async def _serialize_source_import(body: ImportSessionRequest) -> AsyncIterator[None]:
+    """Hold the source import lock for one ``/imports`` request."""
+    async with _source_import_lock(body.source, body.external_session_id):
+        yield
 
 
 # Per-frame (inter-session) timeout: the host streams one session at a time, so
@@ -353,6 +369,7 @@ def create_imports_router(
         project_id: str | None = None,
         host_id: str | None = None,
         replace_conversation_id: str | None = None,
+        replace_guard: Callable[[], Awaitable[str | None]] | None = None,
     ) -> tuple[str, str | None]:
         """Create the conversation, append items, stamp import labels, grant owner.
 
@@ -365,7 +382,10 @@ def create_imports_router(
         resuming defaults to the machine the workspace lives on; bound only
         alongside a workspace (the ``ck_conversations_workspace_required_for_host``
         check constraint). Caller authorizes any ``replace_conversation_id``;
-        replacement waits until validation succeeds. Returns ``(conversation id, title)``.
+        replacement waits until validation succeeds, then ``replace_guard`` may
+        refuse it with a reason. Resume does not take the import lock, so one
+        landing between the guard and the delete is not caught. Returns
+        ``(conversation id, title)``.
         """
         native_agent = native_coding_agent_for_harness(f"{source}-native")
         if native_agent is None:
@@ -409,6 +429,9 @@ def create_imports_router(
         resolved_host_id = resolved_create.body.host_id
         title = (native_title or "").strip() or title_from_items(items)
         if replace_conversation_id is not None:
+            refusal = await replace_guard() if replace_guard is not None else None
+            if refusal is not None:
+                raise OmnigentError(refusal, code=ErrorCode.FORBIDDEN)
             await conversation_store.delete_conversation(replace_conversation_id)
         try:
             conversation = await asyncio.to_thread(
@@ -532,6 +555,38 @@ def create_imports_router(
             raise host_absent_error(host)
         return user_id, host_conn
 
+    async def _replacement_refusal(
+        conversation_id: str, source: ImportSource, user_id: str | None
+    ) -> str | None:
+        """Return why a forced import must not replace ``conversation_id``, or ``None``."""
+        try:
+            await require_access(
+                user_id, conversation_id, LEVEL_OWNER, permission_store, conversation_store
+            )
+        except OmnigentError:
+            return "Only the owner of the imported session can replace it."
+        existing = await asyncio.to_thread(conversation_store.get_conversation, conversation_id)
+        if existing is None:
+            return None
+        if existing.labels.get(IMPORT_SOURCE_LABEL_KEY) != source:
+            return "Only a session imported from this harness can be replaced."
+        if existing.runner_id is not None or await _has_items_added_after_import(existing.id):
+            return "This session was resumed in Omnigent, so it can't be replaced."
+        return None
+
+    async def _has_items_added_after_import(conversation_id: str) -> bool:
+        # One append stamps every imported item with the same second; a later
+        # stamp means the session was used in Omnigent.
+        first, last = await asyncio.gather(
+            asyncio.to_thread(conversation_store.list_items, conversation_id, limit=1),
+            asyncio.to_thread(
+                conversation_store.list_items, conversation_id, limit=1, order="desc"
+            ),
+        )
+        return (
+            bool(first.data and last.data) and last.data[0].created_at != first.data[0].created_at
+        )
+
     async def _import_local_core(
         body: LocalImportRequest,
         user_id: str | None,
@@ -541,14 +596,15 @@ def create_imports_router(
     ) -> AsyncIterator[ImportedSessionRef]:
         """Import the host's requested sessions, one at a time.
 
-        Yields one ref per newly imported session and tracks the running tally in
+        Yields one ref per newly imported or replaced session and tracks the tally in
         ``counts`` (``imported`` / ``already_imported`` / ``failed``); each failed
         session appends an :class:`ImportFailureRef` (with a reason) to
         ``failures``, so ``len(failures) == counts["failed"]``. Persists each
         session as its frame arrives, so a large batch never buffers. Raises
         ``OmnigentError`` if the host read drops mid-stream, after the sessions
         read so far are already committed (retry is idempotent, and re-import of a
-        success comes back as already-imported, never a duplicate).
+        success comes back as already-imported unless ``force`` replaces it, never
+        a duplicate).
         """
         assert host_registry is not None  # guaranteed by _resolve_import_target
         # Each session carries its own source (an "all" import mixes harnesses),
@@ -604,51 +660,65 @@ def create_imports_router(
                     "This session's transcript was malformed or too large to import.",
                 )
                 continue
+            if not raw_items:
+                _fail(
+                    external_session_id, session_source, "This session has no messages to import."
+                )
+                continue
             # The guard above rejected None and anything outside valid_sources
             # (get_args(ImportSource), which excludes "all"), so this is a
             # concrete harness — narrow off the request's ImportSource | "all".
             source = cast(ImportSource, source)
-            existing = await asyncio.to_thread(
-                conversation_store.find_conversation_by_external_session_id,
-                external_session_id,
-            )
-            if existing is not None:
-                counts["already_imported"] += 1
-                continue
-            try:
-                items = [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
-                workspace = session.get("workspace")
-                native_title = session.get("title")
-                session_id, title = await _persist_import(
-                    source=source,
-                    external_session_id=external_session_id,
-                    items=items,
-                    workspace=workspace if isinstance(workspace, str) else None,
-                    user_id=user_id,
-                    native_title=native_title if isinstance(native_title, str) else None,
-                    host_id=body.host_id,
+            async with _source_import_lock(source, external_session_id):
+                existing = await asyncio.to_thread(
+                    conversation_store.find_conversation_by_external_session_id,
+                    external_session_id,
                 )
-            except OmnigentError as exc:
-                # A create that lost the dedup race collides on the deterministic
-                # conversation id (CONFLICT). That's the same source session, so
-                # it's already-imported, never a failure and never a duplicate.
-                if exc.code == ErrorCode.CONFLICT:
+                if existing is not None and not body.force:
                     counts["already_imported"] += 1
                     continue
-                _fail(external_session_id, source, exc.message)
-                continue
-            except ValueError:
-                _fail(external_session_id, source, "This session's data could not be imported.")
-                continue
-            except HTTPException:
-                # Host authorization can change during a batch. Retain the
-                # per-session failure handling instead of aborting the batch.
-                _fail(
-                    external_session_id,
-                    source,
-                    "This session's host is no longer available to you.",
-                )
-                continue
+                try:
+                    items = [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
+                    workspace = session.get("workspace")
+                    native_title = session.get("title")
+                    session_id, title = await _persist_import(
+                        source=source,
+                        external_session_id=external_session_id,
+                        items=items,
+                        workspace=workspace if isinstance(workspace, str) else None,
+                        user_id=user_id,
+                        native_title=native_title if isinstance(native_title, str) else None,
+                        host_id=body.host_id,
+                        replace_conversation_id=existing.id if existing is not None else None,
+                        replace_guard=(
+                            functools.partial(_replacement_refusal, existing.id, source, user_id)
+                            if existing is not None
+                            else None
+                        ),
+                    )
+                except OmnigentError as exc:
+                    # A create that lost the dedup race collides on the deterministic
+                    # conversation id (CONFLICT). That's the same source session, so
+                    # it's already-imported, never a failure and never a duplicate.
+                    if exc.code == ErrorCode.CONFLICT:
+                        counts["already_imported"] += 1
+                        continue
+                    _fail(external_session_id, source, exc.message)
+                    continue
+                except ValueError:
+                    _fail(
+                        external_session_id, source, "This session's data could not be imported."
+                    )
+                    continue
+                except HTTPException:
+                    # Host authorization can change during a batch. Retain the
+                    # per-session failure handling instead of aborting the batch.
+                    _fail(
+                        external_session_id,
+                        source,
+                        "This session's host is no longer available to you.",
+                    )
+                    continue
             counts["imported"] += 1
             yield ImportedSessionRef(session_id=session_id, title=title)
         # Fold in sessions the host enumerated but couldn't read. Newer hosts send
@@ -680,7 +750,8 @@ def create_imports_router(
         The transcripts live on the caller's machine, so the read happens on
         the connected host over its tunnel — the server can't see them. The
         host loads an exact id or enumerates recent sessions, then normalizes
-        them; the server imports those not already imported.
+        them; the server imports those not already imported. ``force`` replaces
+        an existing import of the exact id unless it was resumed in Omnigent.
 
         Buffered form: returns the whole batch's tally in one JSON body. For a
         live per-session list use ``POST /v1/imports/local/stream``. Not atomic:
