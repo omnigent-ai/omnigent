@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import json
 import logging
 import os
 
@@ -27,7 +26,9 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
         validate_claude_hook_interpreter_compatibility,
     )
     from omnigent.harnesses.claude_native.main import (
+        build_native_claude_settings_env,
         build_native_claude_terminal_env,
+        claude_settings_file_args,
         resolve_native_claude_config,
     )
     from omnigent.runner.native.orchestration import _claude_terminal_env_unset
@@ -70,50 +71,46 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
             settings["apiKeyHelper"] = claude_config.api_key_helper
         if claude_config.model_overrides:
             settings["modelOverrides"] = claude_config.model_overrides
-    if settings:
-        args.extend(("--settings", json.dumps(settings)))
+        settings["env"] = build_native_claude_settings_env(claude_config)
 
-    command, launch_args = resolve_claude_launch("claude", args)
-    if command == "claude":
-        # Mirrors the check in _auto_create_claude_terminal: this bare
-        # "claude" is resolved against this process's PATH by
-        # create_subprocess_exec's env=... below, so validate the same
-        # binary that will actually run. Degrades to a skipped title
-        # (like the config-resolution fallback above) rather than raising,
-        # since a background title is best-effort, not session-critical.
-        resolved_claude = resolve_cli_binary("claude")
-        if resolved_claude is not None:
-            try:
-                validate_claude_hook_interpreter_compatibility(resolved_claude)
-            except ClaudeNativeHookInterpreterMismatchError:
-                _logger.warning(
-                    "background Claude Code title skipped: %s is Windows-native "
-                    "under WSL and cannot run Omnigent's hook command",
-                    resolved_claude,
-                )
-                return None
-    env = dict(os.environ)
-    env.update(build_native_claude_terminal_env(claude_config))
-    for name in _claude_terminal_env_unset(claude_config):
-        env.pop(name, None)
+    with claude_settings_file_args(settings) as settings_args:
+        command, launch_args = resolve_claude_launch("claude", [*args, *settings_args])
+        if command == "claude":
+            # Validate the PATH-resolved binary that will run; a mismatch skips
+            # this best-effort title instead of failing the session.
+            resolved_claude = resolve_cli_binary("claude")
+            if resolved_claude is not None:
+                try:
+                    validate_claude_hook_interpreter_compatibility(resolved_claude)
+                except ClaudeNativeHookInterpreterMismatchError:
+                    _logger.warning(
+                        "background Claude Code title skipped: %s is Windows-native "
+                        "under WSL and cannot run Omnigent's hook command",
+                        resolved_claude,
+                    )
+                    return None
+        env = dict(os.environ)
+        env.update(build_native_claude_terminal_env(claude_config))
+        for name in _claude_terminal_env_unset(claude_config):
+            env.pop(name, None)
 
-    process = await asyncio.create_subprocess_exec(
-        command,
-        *launch_args,
-        cwd=str(context.cwd) if context.cwd is not None else None,
-        env=env,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE,
-    )
-    try:
-        async with asyncio.timeout(BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS):
-            stdout, stderr = await process.communicate()
-    except (TimeoutError, asyncio.CancelledError):
-        if process.returncode is None:
-            process.kill()
-        with contextlib.suppress(Exception):
-            await process.wait()
-        raise
+        process = await asyncio.create_subprocess_exec(
+            command,
+            *launch_args,
+            cwd=str(context.cwd) if context.cwd is not None else None,
+            env=env,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        try:
+            async with asyncio.timeout(BACKGROUND_TITLE_INFERENCE_TIMEOUT_SECONDS):
+                stdout, stderr = await process.communicate()
+        except (TimeoutError, asyncio.CancelledError):
+            if process.returncode is None:
+                process.kill()
+            with contextlib.suppress(Exception):
+                await process.wait()
+            raise
 
     if process.returncode != 0:
         detail = stderr.decode(errors="replace").strip()

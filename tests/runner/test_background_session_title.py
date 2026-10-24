@@ -524,7 +524,14 @@ async def test_claude_native_title_uses_tool_free_print_mode(
             return b"Debug authentication timeout\n", b"ignored warning"
 
     async def create_subprocess_exec(command: str, *args: str, **kwargs: Any) -> FakeProcess:
-        captured.update(command=command, args=args, kwargs=kwargs)
+        settings_path = Path(args[args.index("--settings") + 1])
+        captured.update(
+            command=command,
+            args=args,
+            kwargs=kwargs,
+            settings_path=settings_path,
+            settings=json.loads(settings_path.read_text()),
+        )
         return FakeProcess()
 
     monkeypatch.setattr(
@@ -565,7 +572,12 @@ async def test_claude_native_title_uses_tool_free_print_mode(
     assert args[args.index("--tools") + 1] == ""
     assert args[args.index("--output-format") + 1] == "text"
     assert args[args.index("--model") + 1] == "claude-sonnet-4-6"
-    settings = json.loads(args[args.index("--settings") + 1])
+    assert not any("printf token" in arg for arg in args)
+    assert not captured["settings_path"].exists()
+    settings = captured["settings"]
+    settings_env = settings.pop("env")
+    assert settings_env["ANTHROPIC_BASE_URL"] == "https://gateway.example/anthropic"
+    assert settings_env["ANTHROPIC_DEFAULT_OPUS_MODEL"] == ""
     assert settings == {
         "apiKeyHelper": "printf token",
         "modelOverrides": {

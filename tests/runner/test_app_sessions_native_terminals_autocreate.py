@@ -2560,6 +2560,9 @@ async def test_auto_create_claude_terminal_injects_ucode_gateway_config(
         "claude-opus-4-8": "databricks-claude-opus-4-8",
         "claude-sonnet-5": "databricks-claude-sonnet-5",
     }
+    # The gateway routing outranks a user settings.json env block.
+    assert settings["env"]["ANTHROPIC_BASE_URL"] == "https://gw.example/anthropic"
+    assert settings["env"]["ANTHROPIC_DEFAULT_OPUS_MODEL"] == ""
     assert recorded_configs == {"13efa494411f3ae60211e6be5635062a": ucode}
 
     await fake_client.aclose()

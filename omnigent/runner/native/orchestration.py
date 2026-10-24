@@ -8817,6 +8817,7 @@ async def _auto_create_claude_terminal(
     _runner_auth = _RunnerDatabricksAuth(_auth_factory)
 
     from omnigent.harnesses.claude_native.main import (
+        build_native_claude_settings_env,
         build_native_claude_terminal_env,
         claude_config_with_launch_model_pinned,
         claude_config_with_routed_arms_pinned,
@@ -9335,6 +9336,7 @@ async def _auto_create_claude_terminal(
         skills_filter=skills_filter,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
+        settings_env=build_native_claude_settings_env(claude_config),
         subagent_router_dir=subagent_router_dir,
         append_system_prompt="\n\n".join(
             x

@@ -2331,6 +2331,7 @@ def build_hook_settings(
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
     model_overrides: Mapping[str, str] | None = None,
+    settings_env: Mapping[str, str] | None = None,
     launch_model: str | None = None,
     launch_permission_mode: str | None = None,
     launch_bypass_permissions: bool = False,
@@ -2367,6 +2368,10 @@ def build_hook_settings(
         ``{"claude-opus-4-8": "databricks-claude-opus-4-8"}``. Empty or
         ``None`` writes no ``modelOverrides`` (the endpoint already
         speaks canonical ids, or the catalog was not enumerated).
+    :param settings_env: Provider routing env pinned in the settings ``env``
+        block so a user or project ``settings.json`` cannot redirect it, e.g.
+        ``{"ANTHROPIC_BASE_URL": "https://example.com"}``. Empty or ``None``
+        writes no ``env``.
     :param launch_model: Effective launch model from ``--model``. Mirrored
         into the invocation-local settings sidecar so a wrapped Claude Code
         re-exec that preserves ``--settings`` but rebuilds argv cannot fall
@@ -2655,6 +2660,8 @@ def build_hook_settings(
         settings["apiKeyHelper"] = api_key_helper
     if model_overrides:
         settings["modelOverrides"] = dict(model_overrides)
+    if settings_env:
+        settings["env"] = dict(settings_env)
     # Override Claude Code's statusLine so we receive its stdin (the
     # only place ``context_window`` surfaces). A /bin/sh shim captures
     # the raw payload atomically (no interpreter spawn on Claude's
@@ -2743,6 +2750,7 @@ def augment_claude_args(
     ap_auth_headers: dict[str, str] | None = None,
     api_key_helper: str | None = None,
     model_overrides: Mapping[str, str] | None = None,
+    settings_env: Mapping[str, str] | None = None,
     bundle_dir: Path | None = None,
     workspace: Path | None = None,
     agent_name: str | None = None,
@@ -2777,6 +2785,9 @@ def augment_claude_args(
         threaded to :func:`build_hook_settings` so the sidecar carries
         Claude Code's ``modelOverrides`` map. ``None`` or empty omits
         the key.
+    :param settings_env: Provider routing env threaded to
+        :func:`build_hook_settings` for the sidecar's ``env`` block.
+        ``None`` or empty omits the key.
     :param bundle_dir: Materialized agent-bundle root, when the
         session's agent ships a ``skills/`` directory. Triggers
         ``--plugin-dir <bundle>`` so Claude Code discovers bundled
@@ -2814,6 +2825,7 @@ def augment_claude_args(
         ap_auth_headers=ap_auth_headers,
         api_key_helper=api_key_helper,
         model_overrides=model_overrides,
+        settings_env=settings_env,
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_bypass_permissions=_args_request_bypass_permissions(claude_args),

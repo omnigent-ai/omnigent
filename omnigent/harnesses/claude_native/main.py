@@ -39,7 +39,7 @@ from omnigent.util.json_types import JsonObject as _JsonObject
 if sys.platform != "win32":
     import termios
     import tty
-from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
+from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from enum import Enum
@@ -275,6 +275,25 @@ _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV = CUSTOM_MODEL_OPTION_ENV_VAR
 _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV = CUSTOM_MODEL_OPTION_NAME_ENV_VAR
 _UCODE_CLAUDE_CUSTOM_TIER = LEGACY_CUSTOM_SLOT_ROW_ID
 _UCODE_CLAUDE_CUSTOM_TIER_LABEL = "Sonnet 5"
+# Endpoint, request-header and model keys a resolved launch config owns; see
+# build_native_claude_settings_env.
+_CLAUDE_SETTINGS_OWNED_ROUTING_ENV: tuple[str, ...] = (
+    _UCODE_CLAUDE_BASE_URL_ENV,
+    _ANTHROPIC_BEDROCK_BASE_URL_ENV,
+    _CLAUDE_CODE_USE_BEDROCK_ENV,
+    "CLAUDE_CODE_USE_VERTEX",
+    _CLAUDE_CODE_CUSTOM_HEADERS_ENV,
+    _ANTHROPIC_MODEL_ENV,
+    *_UCODE_CLAUDE_TIER_TO_ENV.values(),
+    _ANTHROPIC_CUSTOM_MODEL_OPTION_ENV,
+    _ANTHROPIC_CUSTOM_MODEL_OPTION_NAME_ENV,
+    "ANTHROPIC_SMALL_FAST_MODEL",
+)
+# Credentials that would replace the config's apiKeyHelper token.
+_CLAUDE_SETTINGS_HELPER_CREDENTIAL_ENV: tuple[str, ...] = (
+    _ANTHROPIC_API_KEY_ENV,
+    "ANTHROPIC_AUTH_TOKEN",
+)
 _DEFAULT_UCODE_AUTH_REFRESH_INTERVAL_MS = 900_000
 _SESSION_LABELS = {
     "omnigent.ui": "terminal",
@@ -915,10 +934,24 @@ def _parse_claude_current_model(stdout: str) -> dict[str, str]:
     return resolved
 
 
+def _claude_model_probe_settings(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> dict[str, object]:
+    """The ``--settings`` payload shared by every probe run for *claude_config*."""
+    probe_settings: dict[str, object] = {}
+    if claude_config is not None and claude_config.api_key_helper:
+        probe_settings["apiKeyHelper"] = claude_config.api_key_helper
+    settings_env = build_native_claude_settings_env(claude_config)
+    if settings_env:
+        probe_settings["env"] = settings_env
+    return probe_settings
+
+
 def _claude_model_probe_invocation(
     claude_config: ClaudeNativeUcodeConfig | None,
     extra_args: Sequence[str] = (),
     *,
+    settings_args: Sequence[str],
     stream_input: bool = False,
 ) -> tuple[str, list[str], dict[str, str]]:
     """
@@ -930,6 +963,8 @@ def _claude_model_probe_invocation(
 
     :param claude_config: The resolved native launch config, or ``None``.
     :param extra_args: Appended CLI args (e.g. ``--model <alias>``).
+    :param settings_args: ``--settings`` args from
+        :func:`claude_settings_file_args`, valid for the whole run.
     :param stream_input: Send control requests and /model over stdin.
     :returns: ``(command, launch_args, env)`` ready to exec.
     """
@@ -952,10 +987,9 @@ def _claude_model_probe_invocation(
             '{"mcpServers":{}}',
             "--no-session-persistence",
             *extra_args,
+            *settings_args,
         ]
     )
-    if claude_config is not None and claude_config.api_key_helper:
-        args.extend(("--settings", json.dumps({"apiKeyHelper": claude_config.api_key_helper})))
     command, launch_args = resolve_claude_launch("claude", args)
     env = dict(os.environ)
     env.update(build_native_claude_terminal_env(claude_config))
@@ -979,6 +1013,7 @@ def _claude_model_probe_invocation(
 async def _resolve_claude_model_alias(
     claude_config: ClaudeNativeUcodeConfig | None,
     alias: str,
+    settings_args: Sequence[str],
 ) -> dict[str, str]:
     """
     Ask the harness what one printed alias resolves to.
@@ -989,12 +1024,14 @@ async def _resolve_claude_model_alias(
 
     :param claude_config: The resolved native launch config, or ``None``.
     :param alias: The alias exactly as the harness printed it.
+    :param settings_args: The probe's ``--settings`` args.
     :returns: Whichever of ``{"model": …, "label": …}`` resolved; empty on
         any failure (the alias keeps its bare row).
     """
     command, launch_args, env = _claude_model_probe_invocation(
         claude_config,
         ("--model", alias),
+        settings_args=settings_args,
     )
     try:
         process = await asyncio.create_subprocess_exec(
@@ -1030,6 +1067,7 @@ async def _resolve_claude_model_alias(
 async def _resolve_claude_model_aliases(
     claude_config: ClaudeNativeUcodeConfig | None,
     aliases: Sequence[str],
+    settings_args: Sequence[str],
 ) -> dict[str, dict[str, str]]:
     """
     Resolve every printed alias concurrently, best-effort.
@@ -1040,6 +1078,7 @@ async def _resolve_claude_model_aliases(
 
     :param claude_config: The resolved native launch config, or ``None``.
     :param aliases: The harness-printed aliases.
+    :param settings_args: The probe's ``--settings`` args.
     :returns: Non-empty resolutions keyed by alias.
     """
     if not aliases:
@@ -1048,7 +1087,7 @@ async def _resolve_claude_model_aliases(
 
     async def _bounded(alias: str) -> dict[str, str]:
         async with semaphore:
-            return await _resolve_claude_model_alias(claude_config, alias)
+            return await _resolve_claude_model_alias(claude_config, alias, settings_args)
 
     tasks = {alias: asyncio.create_task(_bounded(alias)) for alias in aliases}
     try:
@@ -1142,12 +1181,13 @@ def _parse_claude_picker_models(stdout: str) -> list[dict[str, Any]] | None:
 
 async def _run_claude_model_probe(
     claude_config: ClaudeNativeUcodeConfig | None,
+    settings_args: Sequence[str],
     *,
     stream_input: bool,
 ) -> str | None:
     """Run a bounded client-side probe, with or without control initialization."""
     command, launch_args, env = _claude_model_probe_invocation(
-        claude_config, stream_input=stream_input
+        claude_config, settings_args=settings_args, stream_input=stream_input
     )
     requests = [
         {
@@ -1240,14 +1280,23 @@ async def probe_claude_model_options(
     :param claude_config: The resolved native launch config, or ``None``.
     :returns: The probe result, or ``None`` when both discovery methods fail.
     """
-    text = await _run_claude_model_probe(claude_config, stream_input=True)
+    with claude_settings_file_args(_claude_model_probe_settings(claude_config)) as settings_args:
+        return await _probe_claude_model_options(claude_config, settings_args)
+
+
+async def _probe_claude_model_options(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    settings_args: Sequence[str],
+) -> ClaudeModelProbe | None:
+    """Run :func:`probe_claude_model_options` with one shared settings file."""
+    text = await _run_claude_model_probe(claude_config, settings_args, stream_input=True)
     models = _parse_claude_picker_models(text) if text is not None else None
     empty_picker = models is not None and not any(
         model.get("disabled") is not True for model in models
     )
     if models is None:
         _logger.info("Claude structured model picker unavailable; falling back to /model")
-        text = await _run_claude_model_probe(claude_config, stream_input=False)
+        text = await _run_claude_model_probe(claude_config, settings_args, stream_input=False)
         if text is None:
             return None
         models = _parse_claude_legacy_models(text)
@@ -1269,7 +1318,7 @@ async def probe_claude_model_options(
     ]
     # Older CLIs omit resolvedModel; resolve only their enabled picker values.
     unresolved = [model["value"] for model in enabled if not model.get("resolvedModel")]
-    resolutions = await _resolve_claude_model_aliases(claude_config, unresolved)
+    resolutions = await _resolve_claude_model_aliases(claude_config, unresolved, settings_args)
     alias_rows: list[dict[str, object]] = []
     seen_models: set[object] = set()
     for model in enabled:
@@ -1320,7 +1369,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         ambient_gateway = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV)
     return fingerprint_of(
         "claude-native",
-        "control-picker-v3",
+        "control-picker-v4",
         sorted(claude_config.env.items()) if claude_config is not None else None,
         claude_config.api_key_helper if claude_config is not None else None,
         claude_config.model if claude_config is not None else None,
@@ -1558,6 +1607,57 @@ def build_native_claude_terminal_env(
                 "Claude Code via the helper, not the environment."
             )
     return terminal_env
+
+
+def build_native_claude_settings_env(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> dict[str, str]:
+    """
+    Build the ``env`` block for Claude Code's command-line ``--settings``.
+
+    A user ``settings.json`` ``env`` block (as ``ucode`` writes) overrides the
+    process env, so it could send this provider's ``apiKeyHelper`` token to
+    another endpoint. Command-line settings outrank user and project settings;
+    owned keys the config leaves unset are blanked there. The block can carry
+    the config's credentials, so deliver it via :func:`claude_settings_file_args`
+    or another owner-only file, never inline in argv.
+
+    :param claude_config: The resolved launch config, or ``None`` (Claude's own
+        login, which keeps honouring the user's settings).
+    :returns: e.g. ``{"ANTHROPIC_BASE_URL": "https://example.com",
+        "ANTHROPIC_DEFAULT_OPUS_MODEL": ""}``; empty for ``None``.
+    """
+    if claude_config is None:
+        return {}
+    owned_keys = [*_CLAUDE_SETTINGS_OWNED_ROUTING_ENV]
+    if claude_config.api_key_helper:
+        owned_keys.extend(_CLAUDE_SETTINGS_HELPER_CREDENTIAL_ENV)
+    settings_env = dict.fromkeys(owned_keys, "")
+    settings_env.update(claude_config.env)
+    return settings_env
+
+
+@contextlib.contextmanager
+def claude_settings_file_args(settings: Mapping[str, object]) -> Iterator[tuple[str, ...]]:
+    """
+    Yield ``--settings`` args backed by an owner-only file for one launch.
+
+    Settings can carry credentials, so they never ride in argv. The file and
+    its private directory are removed on exit.
+
+    :param settings: Claude Code settings, e.g. ``{"env": {...}}``; empty
+        yields no args.
+    :returns: A context manager yielding ``("--settings", path)`` or ``()``.
+    """
+    if not settings:
+        yield ()
+        return
+    with TemporaryDirectory(prefix="omnigent-claude-settings-") as directory:
+        path = Path(directory) / "settings.json"
+        descriptor = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with os.fdopen(descriptor, "w", encoding="utf-8") as handle:
+            json.dump(settings, handle)
+        yield ("--settings", str(path))
 
 
 def _mark_startup_step(
@@ -6511,6 +6611,7 @@ def _claude_terminal_request(
         ap_auth_headers=ap_auth_headers,
         api_key_helper=claude_config.api_key_helper if claude_config is not None else None,
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
+        settings_env=build_native_claude_settings_env(claude_config),
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
     )
