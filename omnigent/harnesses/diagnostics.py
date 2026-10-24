@@ -213,6 +213,10 @@ def sign_in_running_elsewhere(screen: str | None) -> bool:
     return bool(screen) and _SIGN_IN_ELSEWHERE.search(screen) is not None
 
 
+# Closes a sign-in card's next step; dropped for a held message, which is sent on its own.
+SIGN_IN_RESEND_STEP = "; then send your message again."
+
+
 # A launcher, or a ``sudo`` it runs, reading a password from the terminal, e.g.
 # "Password:" or "[sudo] password for alice:". Typed input is not echoed, so
 # the prompt stays the last line until it is answered.
@@ -248,5 +252,5 @@ def sign_in_next_step(agent: str) -> str:
     """
     return (
         f"Open the sign-in link and sign in. {agent} continues on its own once the "
-        "sign-in completes; then send your message again."
+        f"sign-in completes{SIGN_IN_RESEND_STEP}"
     )

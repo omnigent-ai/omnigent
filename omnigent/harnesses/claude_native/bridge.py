@@ -79,6 +79,7 @@ from omnigent.harnesses.claude_native.submit_verification import (
     has_matching_hook_refusal,
 )
 from omnigent.harnesses.diagnostics import (
+    SIGN_IN_RESEND_STEP,
     detect_sign_in_prompt,
     launcher_password_prompt,
     sign_in_next_step,
@@ -6697,7 +6698,7 @@ def _wait_for_claude_prompt_ready(
                 remediation=(
                     "Finish the sign-in that another session opened, in your browser or in "
                     "that session's terminal. Claude Code continues on its own once it "
-                    "completes; then send your message again."
+                    f"completes{SIGN_IN_RESEND_STEP}"
                 ),
             )
         waited_on_sign_in = waiting_on_sign_in
