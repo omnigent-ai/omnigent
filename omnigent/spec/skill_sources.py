@@ -642,6 +642,7 @@ def _claude_command_roots(ctx: SkillSourceContext) -> list[Path]:
 
     The user tier comes first, then the workspace and its ancestors up to the
     repository root, stopping short of the home directory as Claude Code does.
+    Claude Code walks ``.claude/skills`` differently, so the two walks differ too.
     """
     roots = [_claude_user_dir(ctx) / "commands"]
     if not ctx.roots:
@@ -805,7 +806,7 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     Claude host skills and commands plus enabled plugins.
 
     Native Claude loads its own tiers before the bridged ``.agents`` skills,
-    so an existing Claude command wins a collision. Its ``.claude/commands``
+    so a native skill wins a collision with a bridged one. Its ``.claude/commands``
     entries come after the skills, which win a same-named command as they do
     in Claude Code. SDK discovery retains the generic host walk.
     """

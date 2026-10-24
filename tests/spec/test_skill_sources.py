@@ -1660,19 +1660,28 @@ def test_claude_command_directory_with_skill_md_is_one_command(
 def test_claude_skill_and_personal_command_win_name_collisions(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """As in Claude Code, skills beat same-named commands and personal ones beat project ones."""
+    """As in Claude Code, skills beat same-named commands and personal ones beat project ones.
+
+    A command named like a plugin entry (``<plugin>/<name>.md``) beats that entry too.
+    """
     home, workspace = _claude_workspace(tmp_path)
     monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    _claude_home_with_plugin_command(home)
     _write_skill(home / ".claude" / "skills", "deploy")
     personal = home / ".claude" / "commands"
     project = workspace / ".claude" / "commands"
     _write_plugin_command(project, "deploy", "---\ndescription: project deploy\n---\nbody\n")
     _write_plugin_command(personal, "ship", "---\ndescription: personal ship\n---\nbody\n")
     _write_plugin_command(project, "ship", "---\ndescription: project ship\n---\nbody\n")
+    _write_plugin_command(
+        project / "knowledge-base", "kb-review", "---\ndescription: project review\n---\nbody\n"
+    )
 
     out = resolve_harness_skills(_ctx(workspace, home), "claude-native")
     assert sorted((s.name, s.description) for s in out) == [
         ("deploy", "deploy desc"),
+        ("knowledge-base:kb-review", "project review"),
+        ("knowledge-base:kb-search", "kb-search desc"),
         ("ship", "personal ship"),
     ]
 
