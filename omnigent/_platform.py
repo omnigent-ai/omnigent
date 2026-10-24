@@ -114,10 +114,23 @@ def resolve_cli_binary(
     on_path = which(name)
     if on_path is not None:
         return on_path
+    # Basenames to probe in each fallback dir. On Windows the installed binary
+    # is ``claude.exe`` / ``codex.cmd`` — not a bare ``claude`` — so a plain
+    # ``directory / name`` never matches and the whole fallback ladder is a
+    # no-op there. Mirror the PATHEXT expansion ``shutil.which`` applies on
+    # ``PATH`` so the ladder can resolve native-install ``.exe`` / ``.cmd``
+    # shims (e.g. the Claude Code installer's ``~/.local/bin/claude.exe``) that
+    # the host daemon's frozen ``PATH`` omits. On POSIX the bare name suffices.
+    candidates = [name]
+    if os.name == "nt" and not os.path.splitext(name)[1]:
+        # PATHEXT is semicolon-delimited on Windows regardless of ``os.pathsep``.
+        pathext = os.environ.get("PATHEXT", ".COM;.EXE;.BAT;.CMD")
+        candidates += [name + ext for ext in pathext.split(";") if ext]
     for directory in _cli_fallback_dirs():
-        candidate = directory / name
-        if candidate.is_file() and os.access(candidate, os.X_OK):
-            return str(candidate)
+        for candidate_name in candidates:
+            candidate = directory / candidate_name
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return str(candidate)
     return None
 
 
