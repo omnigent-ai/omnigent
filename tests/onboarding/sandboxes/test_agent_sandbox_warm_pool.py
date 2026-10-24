@@ -404,6 +404,42 @@ def test_shared_pool_claims_and_activates_for_different_agents(
     assert k8s._AGENT_LABEL not in harness.pod.raw["metadata"]["labels"]
 
 
+def test_per_agent_image_lands_in_classified_template_but_not_shared() -> None:
+    launcher = _launcher(agent_images={"researcher": "host-image:research"})
+
+    def images(spec: dict[str, Any]) -> set[str]:
+        return {c["image"] for c in spec["podTemplate"]["spec"]["containers"]}
+
+    assert images(launcher.template_spec(agent_name="researcher")) == {"host-image:research"}
+    assert images(launcher.template_spec(agent_name="coder")) == {"host-image:test"}
+    assert images(launcher.template_spec(shared=True)) == {"host-image:test"}
+
+
+def test_shared_pool_does_not_serve_agent_with_its_own_image(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.launcher._agent_images = {"researcher": "host-image:research"}
+    _set_profile(harness, harness.launcher.template_spec(shared=True))
+    harness.launcher.prepare_for_launch(agent_name="researcher")
+    direct = MagicMock(return_value="direct-sandbox")
+    monkeypatch.setattr(AgentSandboxLauncher, "provision", direct)
+    assert harness.launcher.provision("managed-test") == "direct-sandbox"
+    harness.custom.create_namespaced_custom_object.assert_not_called()
+    direct.assert_called_once_with("managed-test")
+
+
+def test_classified_pool_serves_agent_with_its_own_image(
+    harness: _Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    harness.launcher._agent_images = {"researcher": "host-image:research"}
+    _set_profile(harness, harness.launcher.template_spec(agent_name="researcher"))
+    harness.launcher.prepare_for_launch(agent_name="researcher")
+    assert harness.launcher.provision("managed-test") == _HANDLE.encode()
+    execute = _exec_states(harness, monkeypatch, "waiting", "prepared")
+    harness.launcher.start_host(_HANDLE.encode(), **_START_ARGS, agent_name="researcher")
+    assert any(call.args[2] == "activate" for call in execute.call_args_list)
+
+
 @pytest.mark.parametrize("agent_name", [None, "different-agent", "privileged-agent"])
 def test_classified_pool_still_requires_its_exact_agent(
     harness: _Harness, monkeypatch: pytest.MonkeyPatch, agent_name: str | None
