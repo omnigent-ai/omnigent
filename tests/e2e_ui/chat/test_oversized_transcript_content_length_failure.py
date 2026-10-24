@@ -150,6 +150,8 @@ def test_oversized_session_turn_and_fork_fail_with_content_length_error(
     )
     fork_id = page.url.rstrip("/").rsplit("/c/", 1)[1]
     assert fork_id and fork_id != session_id
+    # Wait for snapshot hydration before publishing transient native status edges.
+    expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible(timeout=90_000)
 
     # The fork's first turn carries the inherited oversized transcript and is
     # rejected by the same content-length cap.
