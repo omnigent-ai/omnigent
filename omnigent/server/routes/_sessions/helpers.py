@@ -8978,6 +8978,7 @@ def _load_agent_spec_for_session(*args: Any, **kwargs: Any) -> AgentSpec | None:
 def _load_agent_spec_for_session_impl(
     conv: Conversation,
     agent_store: AgentStore,
+    agent_cache: AgentCache | None = None,
 ) -> AgentSpec | None:
     # Split from _build_policy_engine_from_spec so the caller can run the
     # cheap guardrails/default-policy skip check between the two and avoid
@@ -8988,7 +8989,8 @@ def _load_agent_spec_for_session_impl(
     agent = agent_store.get(conv.agent_id)
     if agent is None:
         return None
-    agent_cache = cast(AgentCache, get_agent_cache())
+    if agent_cache is None:
+        agent_cache = cast(AgentCache, get_agent_cache())
     spec = agent_cache.load(
         agent.id,
         agent.bundle_location,

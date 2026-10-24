@@ -97,6 +97,36 @@ async def test_load_acp_model_options_returns_empty_without_agent_store(
 
 
 @pytest.mark.asyncio
+async def test_fetch_model_options_loads_acp_spec_from_the_resolving_cache(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The ACP picker loads the spec through the cache its harness came from.
+
+    A snapshot resolves the harness once with its injected cache, so loading the
+    options through the runtime global cache instead fails when there is none.
+    """
+    monkeypatch.setattr("omnigent.runtime._globals._agent_cache", None)
+    store = MagicMock()
+    store.get.return_value = MagicMock(
+        id="agent_1", bundle_location="bundle", operator_authored=False
+    )
+    cache = MagicMock()
+    cache.load.return_value.spec = AgentSpec(spec_version=1, name="test-acp")
+    curated = ("gpt-5.4", "claude-fable-5")
+    with (
+        patch.object(orch, "_publish_model_options"),
+        patch("omnigent.models.model_catalog.acp_curated_models", return_value=curated),
+        patch("omnigent.models.model_catalog._acp_launch_model", return_value=curated[0]),
+    ):
+        options = await orch._fetch_model_options(
+            None, "conv_acp", _conv(), store, harness="acp", agent_cache=cache
+        )
+
+    assert [option["id"] for option in options] == list(curated)
+    cache.load.assert_called_once_with("agent_1", "bundle", expand_env=False)
+
+
+@pytest.mark.asyncio
 async def test_load_acp_model_options_caches_and_serves() -> None:
     """A resolved curated shortlist fills the cache and returns on hit."""
     conv = _conv()
