@@ -55,6 +55,7 @@ import contextlib
 import hashlib
 import json
 import logging
+import re
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -314,7 +315,7 @@ def _model_usage_from_step(step: dict[str, object]) -> dict[str, object] | None:
     if cache_read > 0:
         data["cumulative_cache_read_input_tokens"] = cache_read
     if isinstance(model_enum, str) and model_enum:
-        data["model"] = model_enum  # resolved to displayName by caller
+        data["model"] = model_enum  # resolved to a catalog id by caller
 
     if not data:
         return None
@@ -382,6 +383,29 @@ def _resolve_display_name(model_enum: str, catalog: dict[str, object]) -> str:
             if isinstance(display, str) and display:
                 return display
     return model_enum
+
+
+_MODEL_PAREN_GROUP_RE = re.compile(r"\s*\([^()]*\)\s*")
+
+
+def _catalog_model_id(display_name: str) -> str:
+    """Normalize an agy display name (``"Gemini 3.8 Flash (Medium)"``) to the id the
+    server prices with (``"gemini-3.8-flash"``): every parenthetical tier/qualifier
+    dropped, lowercased, hyphenated; Claude version dots become hyphens. An unresolved
+    raw enum (``MODEL_PLACEHOLDER_M20``) is returned unchanged, since it matches no
+    catalog id either way."""
+    label = _MODEL_PAREN_GROUP_RE.sub(" ", display_name).strip()
+    if not label:
+        return display_name
+    # An unresolved raw enum (UPPER_SNAKE, e.g. MODEL_PLACEHOLDER_M20) matches no
+    # catalog id, so report it verbatim rather than lowercasing it into a
+    # different non-id; a human label (even one word) is still normalized.
+    if label == display_name and not any(ch.isspace() for ch in label) and "_" in label:
+        return display_name
+    slug = "-".join(label.lower().split())
+    if slug.startswith("claude"):
+        slug = slug.replace(".", "-")
+    return slug
 
 
 def _parse_activity_timestamp(value: object) -> datetime | None:
@@ -2648,12 +2672,15 @@ async def _maybe_emit_session_usage(
     state.cumulative_cache_read_input_tokens += _int_field(
         per_call, "cumulative_cache_read_input_tokens"
     )
-    # Resolve the raw model enum to a displayName if the catalog is available.
+    # Resolve the raw model enum through the agy catalog and post the
+    # catalog-style id: the server prices and buckets usage by this string,
+    # and agy's spaced, tiered display name matches no catalog entry.
     model_enum = per_call.get("model")
-    display_name: str | None = None
+    model_id: str | None = None
     if isinstance(model_enum, str) and model_enum:
         catalog = await _ensure_catalog(state)
-        display_name = _resolve_display_name(model_enum, catalog)
+        model_id = _catalog_model_id(_resolve_display_name(model_enum, catalog))
+        _logger.debug("agy usage model enum=%r priced as id=%r", model_enum, model_id)
     # Build the cumulative payload (SET-semantics running totals).
     payload: dict[str, object] = {}
     if state.cumulative_input_tokens > 0:
@@ -2662,8 +2689,8 @@ async def _maybe_emit_session_usage(
         payload["cumulative_output_tokens"] = state.cumulative_output_tokens
     if state.cumulative_cache_read_input_tokens > 0:
         payload["cumulative_cache_read_input_tokens"] = state.cumulative_cache_read_input_tokens
-    if display_name is not None:
-        payload["model"] = display_name
+    if model_id is not None:
+        payload["model"] = model_id
     if not payload:
         return
     step_idx = _step_index(step) or 0
