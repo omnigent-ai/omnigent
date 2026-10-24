@@ -7,6 +7,7 @@ by ``omnigent login``.
 from __future__ import annotations
 
 import contextlib
+import os
 import sys
 import time
 
@@ -1154,3 +1155,48 @@ def test_token_file_path_defaults_to_home_state_dir(tmp_path, monkeypatch) -> No
     assert "omnigent_ui_sdk.terminal" not in sys.modules, (
         "computing the auth token path imported the TUI SDK"
     )
+
+
+@pytest.mark.skipif(hasattr(os, "geteuid") and os.geteuid() == 0, reason="root writes anywhere")
+def test_remember_default_server_warns_instead_of_crashing_the_login(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """A config the process cannot write must not fail a login that succeeded.
+
+    The grant is already stored by the time the default-server memo runs, so
+    an unwritable config home (a container running the CLI as a uid with no
+    access to ``$HOME``) used to end a working login with a traceback and
+    exit 1.
+    """
+    from omnigent.cli import _remember_default_server
+
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(locked))
+    os.chmod(locked, 0)
+    try:
+        _remember_default_server("https://example.invalid/api")
+    finally:
+        os.chmod(locked, 0o755)
+
+    captured = capsys.readouterr()
+    assert "could not save" in captured.err
+    assert str(locked / "config.yaml") in captured.err
+    assert "Pass --server explicitly." in captured.err
+    # The success line is the one the user must NOT see when nothing was saved.
+    assert "as your default server" not in captured.out
+
+
+def test_remember_default_server_reports_success_when_writable(
+    tmp_path, monkeypatch, capsys
+) -> None:
+    """The ordinary path still writes the memo and confirms it."""
+    from omnigent.cli import _remember_default_server
+
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+
+    _remember_default_server("https://example.invalid/api")
+
+    captured = capsys.readouterr()
+    assert "as your default server" in captured.out
+    assert (tmp_path / "config.yaml").read_text().count("example.invalid") == 1

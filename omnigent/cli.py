@@ -13565,9 +13565,22 @@ def _remember_default_server(server: str) -> None:
         ``"https://example.databricks.com/api/2.0/omnigent"``. Stored as-is
         (the wire form); the confirmation shows the display form.
     """
+    from omnigent.config import global_config_path
     from omnigent.util.server_url import display_server_url
 
-    _save_global_config({"server": server})
+    # The grant is already stored and usable by the time this runs, so a
+    # config the process cannot write is a lost convenience, not a failed
+    # login: say which path and what to pass instead, and leave the exit
+    # status alone.
+    try:
+        _save_global_config({"server": server})
+    except OSError as exc:
+        click.echo(
+            f"Warning: could not save {global_config_path()} as the default server: "
+            f"{exc.strerror or exc}. Pass --server explicitly.",
+            err=True,
+        )
+        return
     click.echo(f"Set {display_server_url(server)} as your default server.")
 
 
