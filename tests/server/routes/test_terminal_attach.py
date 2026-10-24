@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 from collections.abc import AsyncIterator, Iterator
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 import httpx
@@ -641,6 +642,88 @@ async def test_attach_terminal_runner_close_propagates_close_code(
             ws.receive_bytes()
 
     assert exc_info.value.code == 4404
+
+
+async def test_attach_terminal_registry_abort_sends_wire_valid_close(app: FastAPI) -> None:
+    from websockets.frames import OP_CLOSE, Close, Frame
+
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
+    from omnigent.server._runner_ws_tunnel import _TunneledWSConn
+
+    class _RunnerSocket:
+        async def send_text(self, text: str) -> None:
+            pass
+
+    registry = TunnelRegistry()
+
+    @asynccontextmanager
+    async def factory(path: str):
+        session = registry.register(
+            "runner",
+            _RunnerSocket(),
+            HelloFrame(runner_version="test", frame_protocol_version=1),
+        )
+        async with _TunneledWSConn(registry=registry, session=session, runner_path=path) as conn:
+            registry.deregister("runner", session=session)
+            yield conn
+
+    set_runner_ws_factory(factory)
+    with (
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
+        ) as ws,
+        pytest.raises(WebSocketDisconnect) as exc_info,
+    ):
+        ws.receive_bytes()
+
+    closed = exc_info.value
+    # TestClient accepts close metadata that a real WebSocket cannot serialize.
+    Frame(OP_CLOSE, Close(closed.code, closed.reason).serialize()).serialize(mask=False)
+    assert closed.code == 1011
+    assert closed.reason == "tunnel aborted"
+
+
+@pytest.mark.parametrize(
+    ("code", "reason", "expected_code", "expected_reason"),
+    [
+        (None, "", 1011, ""),
+        (1005, "", 1011, ""),
+        (1006, "tunnel aborted", 1011, "tunnel aborted"),
+        (4404, "terminal missing", 4404, "terminal missing"),
+        (4405, "detached", 4405, "detached"),
+        (4500, "internal error", 4500, "internal error"),
+        (1000, "normal", 1000, "normal"),
+        (1013, "retry later", 1013, "retry later"),
+        (4404, "🙂" * 31, 4404, "🙂" * 30),
+    ],
+)
+async def test_attach_terminal_normalizes_runner_close_metadata(
+    app: FastAPI, code: int | None, reason: str, expected_code: int, expected_reason: str
+) -> None:
+    from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
+    from websockets.frames import OP_CLOSE, Close, Frame
+
+    class _ClosingConn(_FakeRunnerWSConn):
+        async def recv(self) -> bytes | str:
+            if code == 1005:
+                received = Close.parse(b"")
+                raise ConnectionClosedOK(received, received, True)
+            received = Close(code, reason) if code is not None else None
+            raise ConnectionClosedError(received, None)
+
+    set_runner_ws_factory(_FakeRunnerWSFactory(_ClosingConn()))
+    with (
+        TestClient(app).websocket_connect(
+            "/v1/sessions/conv_ws/resources/terminals/terminal_bash_s1/attach"
+        ) as ws,
+        pytest.raises(WebSocketDisconnect) as exc_info,
+    ):
+        ws.receive_bytes()
+
+    closed = exc_info.value
+    assert (closed.code, closed.reason) == (expected_code, expected_reason)
+    Frame(OP_CLOSE, Close(closed.code, closed.reason).serialize()).serialize(mask=False)
 
 
 # ── WS attach: local fallback when no ws factory ─────────
