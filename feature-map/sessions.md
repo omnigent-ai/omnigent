@@ -45,6 +45,9 @@ the header menu), and each place is a separate entry point.
   including for the session being viewed. Its dot appears once the turn is
   idle; approval and error indicators can take precedence. A row showing the
   unread dot offers Mark as read instead. Bulk selection also offers these actions.
+  Reading a session or marking it read or unread usually reaches the user's other
+  open clients on their next session-list update, without a reload (best-effort
+  while read state lives in server memory).
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
 - `project-rename`: the project menu opens a dialog with the name selected;
@@ -444,6 +447,9 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`unread`, sidebar row menu:**
   `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_mark_unread_lights_the_dot_and_persists_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_unread_dot_survives_reload_from_localStorage_when_server_seed_is_empty`.
+  Cross-client sync:
+  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_reading_on_one_client_clears_the_dot_on_another_open_client`,
+  `tests/e2e_ui/sessions/test_sidebar_mark_unread.py::test_marking_unread_on_one_client_lights_the_dot_on_another_open_client`.
   The header-menu rename test above lists Mark as unread; manually choose it
   and expect the row's dot. The row dropdown's Mark as read action has coverage
   in `web/src/shell/Sidebar.readStateActions.test.tsx`. Right-click read-state

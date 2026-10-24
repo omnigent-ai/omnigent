@@ -2912,6 +2912,19 @@ class ReadStatePutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class ReadStatePutResponse(BaseModel):
+    """
+    Response body for ``PUT /v1/sessions/{session_id}/read-state``.
+
+    :param revision: Epoch-microsecond revision assigned to this write, the
+        same value later reported as ``viewer_read_state_revision`` in the
+        session list. The writing client uses it to ignore list values that
+        predate its own write.
+    """
+
+    revision: int
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -3006,6 +3019,10 @@ class SessionListItem(BaseModel):
     :param viewer_unread: Whether the *requesting user* explicitly
         marked this session unread. Per-viewer; lifts the active-row
         dot suppression on the client. ``False`` by default.
+    :param viewer_read_state_revision: Epoch-microsecond revision of the
+        *requesting user's* latest read-state write for this session, or
+        ``None``. Increases with every write on the serving replica;
+        in-memory only.
     :param search_snippet: Excerpt of the chat content that matched the
         request's ``search_query``, centered on the match with ``…``
         marking elided ends, so the search UI can show *where* a session
@@ -3038,6 +3055,7 @@ class SessionListItem(BaseModel):
     comments_updated_at: int | None = None
     viewer_last_seen: int | None = None
     viewer_unread: bool = False
+    viewer_read_state_revision: int | None = None
     search_snippet: str | None = None
     parent_session_id: str | None = None
     # First-class project this session is filed under, or ``None`` when

@@ -42,7 +42,7 @@ from pydantic import ValidationError
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError, StatementError
 
 from omnigent.codex_approval_modes import CODEX_NATIVE_PERMISSION_VALUES
-from omnigent.db.utils import generate_task_id
+from omnigent.db.utils import generate_task_id, now_epoch_us
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.debug_logging import debug_event, runner_log_scope
 from omnigent.entities import (
@@ -237,6 +237,7 @@ from omnigent.server.routes._sessions.common import (  # noqa: F401
     _pushed_model_options_cache,
     _read_explicit_unread,
     _read_last_seen,
+    _read_state_revision,
     _session_active_response_cache,
     _session_background_task_count_cache,
     _session_background_tasks_cache,
@@ -590,23 +591,26 @@ def _claude_native_remember_host(tool_name: str, tool_input: Any) -> str | None:
     return host
 
 
-def _read_state_entry(user_id: str | None, session_id: str) -> tuple[int | None, bool]:
+def _read_state_entry(user_id: str | None, session_id: str) -> tuple[int | None, bool, int | None]:
     """
     Read the caller's read-state for one session, for embedding in the
     per-user ``GET /v1/sessions`` list items.
 
     :param user_id: Authenticated user id, or ``None`` in single-user mode.
     :param session_id: Session/conversation identifier.
-    :returns: ``(last_seen, unread)`` — the wall-clock baseline (or ``None``
-        when the user has never seen the session) and the explicit-unread flag.
+    :returns: ``(last_seen, unread, revision)`` — the wall-clock baseline (or
+        ``None`` when the user has never seen the session), the explicit-unread
+        flag, and the epoch-microsecond revision of the latest write (or
+        ``None`` when there is none).
     """
     key = _discovery_key(user_id)
     last_seen = _read_last_seen.get(key, {}).get(session_id)
     unread = session_id in _read_explicit_unread.get(key, set())
-    return last_seen, unread
+    revision = _read_state_revision.get(key, {}).get(session_id)
+    return last_seen, unread, revision
 
 
-def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread: bool) -> None:
+def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread: bool) -> int:
     """
     Set the caller's read-state for one session.
 
@@ -614,15 +618,21 @@ def _set_read_state(user_id: str | None, session_id: str, last_seen: int, unread
     :param session_id: Session/conversation identifier.
     :param last_seen: Wall-clock baseline in seconds.
     :param unread: Whether the session is explicitly flagged unread.
+    :returns: The epoch-microsecond revision assigned to this write, strictly
+        greater than the session's previous revision for this user.
     """
     key = _discovery_key(user_id)
     _read_last_seen.setdefault(key, {})[session_id] = last_seen
+    revisions = _read_state_revision.setdefault(key, {})
+    revision = max(now_epoch_us(), revisions.get(session_id, 0) + 1)
+    revisions[session_id] = revision
     if unread:
         _read_explicit_unread.setdefault(key, set()).add(session_id)
     else:
         unread_set = _read_explicit_unread.get(key)
         if unread_set is not None:
             unread_set.discard(session_id)
+    return revision
 
 
 def _prune_session_read_state(session_id: str) -> None:
@@ -643,6 +653,8 @@ def _prune_session_read_state(session_id: str) -> None:
         seen.pop(session_id, None)
     for unread in _read_explicit_unread.values():
         unread.discard(session_id)
+    for revisions in _read_state_revision.values():
+        revisions.pop(session_id, None)
 
 
 def _discovery_key(user_id: str | None) -> str:

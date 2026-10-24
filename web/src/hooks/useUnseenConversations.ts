@@ -7,10 +7,7 @@
 // on a pod that never saw the user's read-state PUT, so its
 // `viewer_last_seen` / `viewer_unread` fields can be null even for a
 // session the user has read. The local copy is therefore the durable
-// source; the server seed only ever *raises* a baseline (max-merge), which
-// also picks up newer reads from the user's other devices when the serving
-// replica happens to have them. Cross-device unread is best-effort by
-// design.
+// source; server values apply only with a newer revision (best-effort).
 //
 // A conversation is "unseen" when its server-side updated_at exceeds the
 // stored baseline. A conversation with no baseline anywhere seeds to its
@@ -37,10 +34,20 @@ function notifySubscribers(): void {
 type LastSeenMap = Record<string, number>;
 
 // The browser-durable read-state, hydrated from localStorage at module
-// load, raised (never lowered) by the server seed, and updated
-// optimistically on each mutation before the best-effort PUT lands.
+// load, merged with newer server read-state, and updated optimistically on
+// each mutation before the best-effort PUT lands.
 let lastSeenMap: LastSeenMap = {};
 const explicitlyUnread = new Set<string>();
+// Server revision (epoch µs) of the newest read-state applied per
+// conversation, from the list or from this tab's own PUT response.
+let appliedRevision: LastSeenMap = {};
+// Conversations with a PUT in flight. Server values for these are deferred: they
+// can predate the local write that is still landing.
+const pendingWrites = new Set<string>();
+// Conversations changed again while their PUT was in flight; resent once it settles.
+const queuedWrites = new Set<string>();
+// The highest-revision list value deferred per conversation, replayed once its PUTs settle.
+const deferredSeeds = new Map<string, ReadStateSeed>();
 
 // localStorage persistence. Best-effort everywhere: storage can be
 // missing (SSR), full, or blocked — the in-memory mirror always works.
@@ -49,18 +56,21 @@ const STORAGE_KEY = "omnigent.readState.v1";
 // to the seed's read-as-of-load behavior.
 const STORAGE_MAX_ENTRIES = 1000;
 
+function hydrateNumberMap(source: unknown, target: LastSeenMap): void {
+  if (typeof source !== "object" || source === null) return;
+  for (const [id, value] of Object.entries(source)) {
+    if (typeof value === "number") target[id] = value;
+  }
+}
+
 function hydrateFromStorage(): void {
   try {
     const raw = globalThis.localStorage?.getItem(STORAGE_KEY);
     if (!raw) return;
     const parsed: unknown = JSON.parse(raw);
     if (typeof parsed !== "object" || parsed === null) return;
-    const lastSeen = (parsed as { lastSeen?: unknown }).lastSeen;
-    if (typeof lastSeen === "object" && lastSeen !== null) {
-      for (const [id, value] of Object.entries(lastSeen)) {
-        if (typeof value === "number") lastSeenMap[id] = value;
-      }
-    }
+    hydrateNumberMap((parsed as { lastSeen?: unknown }).lastSeen, lastSeenMap);
+    hydrateNumberMap((parsed as { revisions?: unknown }).revisions, appliedRevision);
     const unread = (parsed as { unread?: unknown }).unread;
     if (Array.isArray(unread)) {
       for (const id of unread) {
@@ -78,9 +88,15 @@ function persistToStorage(): void {
     if (entries.length > STORAGE_MAX_ENTRIES) {
       entries = entries.sort((a, b) => b[1] - a[1]).slice(0, STORAGE_MAX_ENTRIES);
     }
+    const keptIds = new Set(entries.map(([id]) => id));
+    const revisions = Object.entries(appliedRevision).filter(([id]) => keptIds.has(id));
     globalThis.localStorage?.setItem(
       STORAGE_KEY,
-      JSON.stringify({ lastSeen: Object.fromEntries(entries), unread: [...explicitlyUnread] }),
+      JSON.stringify({
+        lastSeen: Object.fromEntries(entries),
+        unread: [...explicitlyUnread],
+        revisions: Object.fromEntries(revisions),
+      }),
     );
   } catch {
     // Quota/blocked storage → in-memory state still serves this tab.
@@ -89,11 +105,9 @@ function persistToStorage(): void {
 
 hydrateFromStorage();
 
-// Sessions already seeded from the list. Seeding is once-per-session: the
-// first time a conversation is seen we copy its server `viewer_*` into the
-// mirror, then ignore later list values so an in-flight poll can't clobber a
-// local optimistic write. Cross-device changes after first load surface on a
-// reload (a deliberate Phase-1 scope: live merge is a follow-up).
+// Sessions already seeded from the list. Only the first seed max-merges a
+// server value that has no revision; later list values apply only when their
+// revision is newer, so a stale poll can't clobber a local optimistic write.
 const seeded = new Set<string>();
 
 // Until the first seed runs we don't know the server's baselines, so the
@@ -108,22 +122,51 @@ export function nowSeconds(): number {
 }
 
 /**
- * Pushes the calling user's read-state for one conversation to the server.
- * Best-effort and fire-and-forget: a failed PUT leaves the optimistic local
- * mirror in place, which the next mutation or a reload reconciles. Skips the
- * call when there's no baseline to report (nothing meaningful to sync).
+ * Pushes one conversation's read-state, one PUT at a time so the server gets
+ * this tab's writes in order. Fire-and-forget: a failed PUT keeps the local
+ * mirror until a newer server value arrives.
  */
 async function syncReadState(conversationId: string): Promise<void> {
-  const lastSeen = lastSeenMap[conversationId];
-  if (lastSeen === undefined) return;
+  if (lastSeenMap[conversationId] === undefined) return;
+  if (pendingWrites.has(conversationId)) {
+    queuedWrites.add(conversationId);
+    return;
+  }
+  pendingWrites.add(conversationId);
+  do {
+    queuedWrites.delete(conversationId);
+    // oxlint-disable-next-line no-await-in-loop
+    await putReadState(conversationId);
+  } while (queuedWrites.has(conversationId));
+  pendingWrites.delete(conversationId);
+  const deferred = deferredSeeds.get(conversationId);
+  deferredSeeds.delete(conversationId);
+  if (deferred) seedReadState([deferred]);
+}
+
+/** PUTs the current read-state and records the revision the server assigned. */
+async function putReadState(conversationId: string): Promise<void> {
   try {
-    await authenticatedFetch(`/v1/sessions/${encodeURIComponent(conversationId)}/read-state`, {
-      method: "PUT",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ last_seen: lastSeen, unread: explicitlyUnread.has(conversationId) }),
-    });
+    const response = await authenticatedFetch(
+      `/v1/sessions/${encodeURIComponent(conversationId)}/read-state`,
+      {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          last_seen: lastSeenMap[conversationId],
+          unread: explicitlyUnread.has(conversationId),
+        }),
+      },
+    );
+    if (!response.ok) return;
+    const body: unknown = await response.json();
+    const revision = (body as { revision?: unknown } | null)?.revision;
+    if (typeof revision === "number" && revision > (appliedRevision[conversationId] ?? 0)) {
+      appliedRevision[conversationId] = revision;
+      persistToStorage();
+    }
   } catch {
-    // Network/auth errors must not break the UI; local state stays.
+    // Best-effort: keep local state on any failure, including a bodiless 204.
   }
 }
 
@@ -132,39 +175,92 @@ export interface ReadStateSeed {
   id: string;
   viewer_last_seen?: number | null;
   viewer_unread?: boolean;
+  viewer_read_state_revision?: number | null;
   updated_at?: number;
 }
 
 /**
- * Seeds the local mirror from the conversation list (the server's per-viewer
- * read path). Once-per-session: a conversation is merged the first time it
- * appears, then ignored, so an in-flight list poll can't clobber a local
- * optimistic write. The merge is max(localStorage baseline, server value) —
- * last-seen is monotonic, so taking the max is always safe and picks up a
- * newer read from another device when the serving replica has it. A session
- * with no baseline on either side seeds to its `updated_at` ("read as of
- * load"): pod-independent, so a replica that can't see the user's read-state
- * can never freeze a row's dot off. Flips {@link hydrated} on the first call
- * (even for an empty list) so the automatic mark-seen can resume.
+ * Applies a server read-state newer than the mirror's. A newer "Mark as
+ * unread" pins the server's baseline and flag; a newer read clears the flag
+ * and only raises the baseline, so it never lights a dot this device cleared.
+ *
+ * @returns Whether the visible read-state changed.
+ */
+function adoptServerReadState(
+  conversationId: string,
+  server: number | undefined,
+  unread: boolean,
+): boolean {
+  const local = lastSeenMap[conversationId];
+  let baseline = local;
+  if (server !== undefined) {
+    baseline = unread || local === undefined ? server : Math.max(local, server);
+  }
+  if (baseline !== undefined) lastSeenMap[conversationId] = baseline;
+  const wasUnread = explicitlyUnread.has(conversationId);
+  if (unread) explicitlyUnread.add(conversationId);
+  else explicitlyUnread.delete(conversationId);
+  return baseline !== local || wasUnread !== unread;
+}
+
+/**
+ * Max-merges a server read-state that carries no revision into the mirror on
+ * a conversation's first seed: last-seen is monotonic, so the higher baseline
+ * is safe to keep, and a server unread flag is added.
+ *
+ * @returns Whether the visible read-state changed.
+ */
+function mergeUnrevisionedReadState(conv: ReadStateSeed, server: number | undefined): boolean {
+  const local = lastSeenMap[conv.id];
+  const baseline =
+    local !== undefined && server !== undefined ? Math.max(local, server) : (local ?? server);
+  let changed = false;
+  if (baseline !== undefined && baseline !== local) {
+    lastSeenMap[conv.id] = baseline;
+    changed = true;
+  }
+  if (conv.viewer_unread && !explicitlyUnread.has(conv.id)) {
+    explicitlyUnread.add(conv.id);
+    changed = true;
+  }
+  return changed;
+}
+
+/**
+ * Adopts newer-revision server state, defers values during an in-flight PUT,
+ * and max-merges revisionless values on first seed only. A session with no
+ * baseline seeds to its `updated_at`; the first call flips {@link hydrated}.
  */
 export function seedReadState(conversations: readonly ReadStateSeed[]): void {
   let changed = false;
+  let revisionsChanged = false;
   for (const conv of conversations) {
-    if (seeded.has(conv.id)) continue;
-    seeded.add(conv.id);
-    const local = lastSeenMap[conv.id];
-    const server = typeof conv.viewer_last_seen === "number" ? conv.viewer_last_seen : undefined;
-    let baseline =
-      local !== undefined && server !== undefined ? Math.max(local, server) : (local ?? server);
-    if (baseline === undefined && typeof conv.updated_at === "number") {
-      baseline = conv.updated_at;
+    const revision = conv.viewer_read_state_revision;
+    if (pendingWrites.has(conv.id)) {
+      const heldRevision = deferredSeeds.get(conv.id)?.viewer_read_state_revision;
+      if (
+        typeof heldRevision !== "number" ||
+        (typeof revision === "number" && revision >= heldRevision)
+      ) {
+        deferredSeeds.set(conv.id, conv);
+      }
+      continue;
     }
-    if (baseline !== undefined && baseline !== local) {
-      lastSeenMap[conv.id] = baseline;
+    const firstSeed = !seeded.has(conv.id);
+    seeded.add(conv.id);
+    const server = typeof conv.viewer_last_seen === "number" ? conv.viewer_last_seen : undefined;
+    if (typeof revision === "number") {
+      const applied = appliedRevision[conv.id];
+      if (applied === undefined || revision > applied) {
+        appliedRevision[conv.id] = revision;
+        revisionsChanged = true;
+        if (adoptServerReadState(conv.id, server, conv.viewer_unread === true)) changed = true;
+      }
+    } else if (firstSeed && mergeUnrevisionedReadState(conv, server)) {
       changed = true;
     }
-    if (conv.viewer_unread && !explicitlyUnread.has(conv.id)) {
-      explicitlyUnread.add(conv.id);
+    if (firstSeed && lastSeenMap[conv.id] === undefined && typeof conv.updated_at === "number") {
+      lastSeenMap[conv.id] = conv.updated_at;
       changed = true;
     }
   }
@@ -172,10 +268,8 @@ export function seedReadState(conversations: readonly ReadStateSeed[]): void {
     hydrated = true;
     changed = true;
   }
-  if (changed) {
-    persistToStorage();
-    notifySubscribers();
-  }
+  if (changed || revisionsChanged) persistToStorage();
+  if (changed) notifySubscribers();
 }
 
 /**
@@ -201,6 +295,10 @@ export function useSeedReadState(conversations: readonly ReadStateSeed[] | undef
 export function resetReadStateForTests(): void {
   lastSeenMap = {};
   explicitlyUnread.clear();
+  appliedRevision = {};
+  pendingWrites.clear();
+  queuedWrites.clear();
+  deferredSeeds.clear();
   seeded.clear();
   hydrated = false;
   try {

@@ -48,6 +48,12 @@ function putCount(): number {
     .length;
 }
 
+async function settlePuts(): Promise<void> {
+  await new Promise<void>((resolve) => {
+    setTimeout(resolve, 0);
+  });
+}
+
 function setWindowFocused(focused: boolean): void {
   vi.spyOn(document, "hasFocus").mockReturnValue(focused);
 }
@@ -71,7 +77,7 @@ describe("seedReadState", () => {
     expect(mod.isExplicitlyUnread("conv-2")).toBe(true);
   });
 
-  it("seeds a session only once — a later list value can't clobber a local write", async () => {
+  it("ignores a later list value without a newer revision — it can't clobber a local write", async () => {
     const mod = await loadFresh();
     mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
     // User marks it unread locally (optimistic).
@@ -192,6 +198,7 @@ describe("markConversationRead", () => {
     const mod = await loadFresh();
     mod.seedReadState([]);
     mod.markConversationUnread("conv-1", 5_000);
+    await settlePuts();
     authFetch.mockClear();
     // Client wall clock (4000) lags the row's updated_at (5000) — the
     // baseline must still clear the dot by anchoring at updated_at.
@@ -389,6 +396,335 @@ describe("useMarkConversationSeen", () => {
 
     expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
     expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+  });
+});
+
+describe("cross-device read-state (server revisions)", () => {
+  function respondWithRevision(revision: number): void {
+    authFetch.mockResolvedValue({ ok: true, status: 200, json: async () => ({ revision }) });
+  }
+
+  it("applies a newer read from another device to an already-seeded session", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 1 },
+    ]);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+
+    mod.seedReadState([
+      {
+        id: "conv-1",
+        viewer_last_seen: 6_000,
+        viewer_unread: false,
+        viewer_read_state_revision: 2,
+      },
+    ]);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+  });
+
+  it("applies a newer Mark as unread from another device below this device's baseline", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 1 }]);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 2 },
+    ]);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+  });
+
+  it("ignores a value whose revision is not newer than the one applied", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 5 },
+    ]);
+
+    for (const revision of [5, 4]) {
+      mod.seedReadState([
+        {
+          id: "conv-1",
+          viewer_last_seen: 6_000,
+          viewer_unread: false,
+          viewer_read_state_revision: revision,
+        },
+      ]);
+    }
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+  });
+
+  it("never lowers this device's baseline for a newer read", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 1 }]);
+
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 3_000, viewer_read_state_revision: 2 }]);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+  });
+
+  it("keeps a local write over list values that are in flight or predate its PUT", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 1 }]);
+    let resolvePut: (response: unknown) => void = () => {};
+    authFetch.mockReturnValue(
+      new Promise((resolve) => {
+        resolvePut = resolve;
+      }),
+    );
+
+    mod.markConversationUnread("conv-1", 5_000);
+    // An earlier write's echo arrives while this PUT is still in flight.
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 2 }]);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+
+    resolvePut({ ok: true, status: 200, json: async () => ({ revision: 3 }) });
+    await settlePuts();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 2 }]);
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
+
+  it("applies a newer value that arrived while this device's PUT was in flight", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 1 }]);
+    let resolvePut: (response: unknown) => void = () => {};
+    authFetch.mockReturnValue(
+      new Promise((resolve) => {
+        resolvePut = resolve;
+      }),
+    );
+
+    mod.markConversationUnread("conv-1", 5_000);
+    // Another device's read lands after this write and streams in before its PUT returns.
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 7_000, viewer_read_state_revision: 3 }]);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+
+    resolvePut({ ok: true, status: 200, json: async () => ({ revision: 2 }) });
+    await settlePuts();
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+  });
+
+  it("replays the highest-revision value held while this device's PUT was in flight", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 1 }]);
+    let resolvePut: (response: unknown) => void = () => {};
+    authFetch.mockReturnValue(
+      new Promise((resolve) => {
+        resolvePut = resolve;
+      }),
+    );
+
+    mod.markConversationUnread("conv-1", 5_000);
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 7_000, viewer_read_state_revision: 3 }]);
+    // Older list responses, from another replica or a server without revisions, arrive after it.
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 2 },
+    ]);
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true }]);
+
+    resolvePut({ ok: true, status: 200, json: async () => ({ revision: 2 }) });
+    await settlePuts();
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+  });
+
+  it.each([
+    ["fails", { ok: false, status: 503, json: async () => ({}) }],
+    [
+      "returns a bodiless 204",
+      {
+        ok: true,
+        status: 204,
+        json: async () => {
+          throw new SyntaxError("Unexpected end of JSON input");
+        },
+      },
+    ],
+  ])(
+    "applies a newer value held during a PUT that %s before the first seed",
+    async (_, response) => {
+      const mod = await loadFresh();
+      let resolvePut: (response: unknown) => void = () => {};
+      authFetch.mockReturnValue(
+        new Promise((resolve) => {
+          resolvePut = resolve;
+        }),
+      );
+
+      mod.markConversationUnread("conv-1", 5_000);
+      mod.seedReadState([{ id: "conv-1", viewer_last_seen: 7_000, viewer_read_state_revision: 3 }]);
+      expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+
+      resolvePut(response);
+      await settlePuts();
+
+      expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+      expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    },
+  );
+
+  it("applies a Mark as unread made elsewhere while this device was closed", async () => {
+    const mod = await loadFresh();
+    respondWithRevision(1);
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000 }]);
+    mod.markConversationSeen("conv-1", 6_000);
+    await settlePuts();
+
+    const reloaded = await reloadKeepingStorage();
+    reloaded.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 2 },
+    ]);
+
+    expect(reloaded.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+    expect(reloaded.isExplicitlyUnread("conv-1")).toBe(true);
+  });
+
+  it("keeps the stored read-state when a reload sees a revision it already applied", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 1 },
+    ]);
+    respondWithRevision(2);
+    mod.markConversationRead("conv-1", 6_000);
+    await settlePuts();
+
+    // The serving replica still holds the older unread write.
+    const reloaded = await reloadKeepingStorage();
+    reloaded.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 1 },
+    ]);
+
+    expect(reloaded.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+    expect(reloaded.isExplicitlyUnread("conv-1")).toBe(false);
+  });
+
+  it("skips malformed stored revisions and keeps valid ones", async () => {
+    localStorage.clear();
+    localStorage.setItem(
+      "omnigent.readState.v1",
+      JSON.stringify({
+        lastSeen: { "conv-1": 6_000, "conv-2": 6_000 },
+        unread: [],
+        revisions: { "conv-1": "x", "conv-2": 9 },
+      }),
+    );
+    const mod = await reloadKeepingStorage();
+
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 1 },
+      { id: "conv-2", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 9 },
+    ]);
+
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+    expect(mod.isConversationUnseen("conv-2", 5_000, "idle")).toBe(false);
+    expect(mod.isExplicitlyUnread("conv-2")).toBe(false);
+  });
+
+  it("applies another device's Mark as unread to a session this device only seeded", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: null, updated_at: 5_000 }]);
+
+    const reloaded = await reloadKeepingStorage();
+    reloaded.seedReadState([
+      { id: "conv-1", viewer_last_seen: 4_999, viewer_unread: true, viewer_read_state_revision: 1 },
+    ]);
+
+    expect(reloaded.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
+  });
+
+  it("records no revision from a failed PUT", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 1 }]);
+    authFetch.mockResolvedValue({ ok: false, status: 503, json: async () => ({ revision: 9 }) });
+    mod.markConversationUnread("conv-1", 5_000);
+    await settlePuts();
+
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 1 }]);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 7_000, viewer_read_state_revision: 2 }]);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+  });
+
+  it("keeps the applied revision when a PUT returns an older one", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 6_000, viewer_read_state_revision: 5 }]);
+    // A replica whose clock lags assigns this later write a lower revision.
+    respondWithRevision(3);
+    mod.markConversationUnread("conv-1", 5_000);
+    await settlePuts();
+
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 7_000, viewer_read_state_revision: 4 }]);
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+  });
+
+  it("sends a conversation's writes one at a time, so the latest action reaches the server last", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 1_000, viewer_read_state_revision: 1 }]);
+    const resolvers: ((response: unknown) => void)[] = [];
+    authFetch.mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolvers.push(resolve);
+        }),
+    );
+    mod.markConversationUnread("conv-1", 5_000);
+    mod.markConversationRead("conv-1", 6_000);
+    expect(putCount()).toBe(1);
+    expect(lastPutBody()?.unread).toBe(true);
+
+    resolvers[0]({ ok: true, status: 200, json: async () => ({ revision: 10 }) });
+    await settlePuts();
+    expect(putCount()).toBe(2);
+    expect(lastPutBody()?.unread).toBe(false);
+    // The first write's echo arrives while the second is in flight.
+    mod.seedReadState([
+      {
+        id: "conv-1",
+        viewer_last_seen: 4_999,
+        viewer_unread: true,
+        viewer_read_state_revision: 10,
+      },
+    ]);
+    resolvers[1]({ ok: true, status: 200, json: async () => ({ revision: 20 }) });
+    await settlePuts();
+
+    // Another device's unread landed between this device's two writes.
+    mod.seedReadState([
+      {
+        id: "conv-1",
+        viewer_last_seen: 4_999,
+        viewer_unread: true,
+        viewer_read_state_revision: 15,
+      },
+    ]);
+
+    expect(putCount()).toBe(2);
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(false);
+  });
+
+  it("applies a revisioned flag without a server baseline, keeping the local one", async () => {
+    const mod = await loadFresh();
+    mod.seedReadState([{ id: "conv-1", viewer_last_seen: 4_999, viewer_read_state_revision: 1 }]);
+
+    mod.seedReadState([
+      { id: "conv-1", viewer_last_seen: null, viewer_unread: true, viewer_read_state_revision: 2 },
+    ]);
+
+    expect(mod.isExplicitlyUnread("conv-1")).toBe(true);
+    expect(mod.isConversationUnseen("conv-1", 4_999, "idle")).toBe(false);
+    expect(mod.isConversationUnseen("conv-1", 5_000, "idle")).toBe(true);
   });
 });
 

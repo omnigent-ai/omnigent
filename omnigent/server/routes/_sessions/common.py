@@ -655,6 +655,11 @@ _read_last_seen: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCach
 _read_explicit_unread: WorkspaceScopedCache[str, set[str]] = WorkspaceScopedCache()
 
 
+# Epoch-us revision of each read-state write, so clients can order updates
+# from the user's other devices and ignore an older value served later.
+_read_state_revision: WorkspaceScopedCache[str, dict[str, int]] = WorkspaceScopedCache()
+
+
 _interrupt_fenced_sessions: WorkspaceScopedSet[str] = WorkspaceScopedSet()
 
 
@@ -1256,6 +1261,7 @@ __all__ = [
     "_pushed_model_options_cache",
     "_read_explicit_unread",
     "_read_last_seen",
+    "_read_state_revision",
     "_recent_mirrored_tool_calls",
     "_runner_relay_tasks",
     "_runner_status_probe_backoff",

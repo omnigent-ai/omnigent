@@ -1,9 +1,10 @@
 """Tests for the per-user read-state feature:
 
   * ``PUT /v1/sessions/{session_id}/read-state`` — set the caller's
-    read-state for one session (returns ``204``).
-  * ``viewer_last_seen`` / ``viewer_unread`` embedded per-user in the
-    ``GET /v1/sessions`` list items (built by ``_build_session_list_item``).
+    read-state for one session (returns the write's revision).
+  * ``viewer_last_seen`` / ``viewer_unread`` / ``viewer_read_state_revision``
+    embedded per-user in the ``GET /v1/sessions`` list items (built by
+    ``_build_session_list_item``).
 
 Read state is per-user and in-memory on the server (module-level dicts in
 ``omnigent.server.routes.sessions``); each test resets those globals so
@@ -24,6 +25,7 @@ from starlette.testclient import TestClient
 from omnigent.entities import Conversation
 from omnigent.errors import OmnigentError
 from omnigent.server.routes import sessions as sessions_mod
+from omnigent.server.routes._sessions import helpers as session_helpers
 from omnigent.server.routes.sessions import create_sessions_router
 
 
@@ -93,52 +95,71 @@ def _build_item(user_id: str | None, conv: Conversation) -> object:
 @pytest.fixture(autouse=True)
 def _reset_read_state() -> Iterator[None]:
     """Clear the module-level read-state caches around each test."""
-    sessions_mod._read_last_seen.clear()
-    sessions_mod._read_explicit_unread.clear()
+    caches = (
+        sessions_mod._read_last_seen,
+        sessions_mod._read_explicit_unread,
+        sessions_mod._read_state_revision,
+    )
+    for cache in caches:
+        cache.clear()
     yield
-    sessions_mod._read_last_seen.clear()
-    sessions_mod._read_explicit_unread.clear()
+    for cache in caches:
+        cache.clear()
 
 
-def test_put_mark_unread_returns_204_and_updates_cache() -> None:
-    """Marking unread persists the baseline + override and returns 204."""
+def test_put_mark_unread_updates_cache_and_returns_revision() -> None:
+    """Marking unread persists the baseline + override and returns its revision."""
     client = TestClient(_build_app())
 
     resp = client.put(
         "/v1/sessions/conv_a/read-state",
         json={"last_seen": 4_999, "unread": True},
     )
-    assert resp.status_code == 204, resp.text
-    assert resp.content == b""
+    assert resp.status_code == 200, resp.text
     # The single-user (None) caller maps to the shared discovery key.
     key = sessions_mod._discovery_key(None)
     assert sessions_mod._read_last_seen[key]["conv_a"] == 4_999
     assert "conv_a" in sessions_mod._read_explicit_unread[key]
+    assert resp.json() == {"revision": sessions_mod._read_state_revision[key]["conv_a"]}
 
 
 def test_put_mark_seen_clears_unread_and_advances_baseline() -> None:
     """Marking seen (unread=false) drops the override and moves last_seen up."""
     client = TestClient(_build_app())
-    client.put("/v1/sessions/conv_a/read-state", json={"last_seen": 4_999, "unread": True})
+    first = client.put("/v1/sessions/conv_a/read-state", json={"last_seen": 4_999, "unread": True})
 
     resp = client.put(
         "/v1/sessions/conv_a/read-state",
         json={"last_seen": 9_000, "unread": False},
     )
-    assert resp.status_code == 204, resp.text
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["revision"] > first.json()["revision"]
     key = sessions_mod._discovery_key(None)
     assert sessions_mod._read_last_seen[key]["conv_a"] == 9_000
     assert "conv_a" not in sessions_mod._read_explicit_unread.get(key, set())
 
 
+def test_read_state_revision_increases_when_the_clock_does_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Back-to-back writes in the same microsecond still get ordered revisions."""
+    monkeypatch.setattr(session_helpers, "now_epoch_us", lambda: 1_000)
+
+    first = sessions_mod._set_read_state("alice@example.com", "conv_a", 4_999, True)
+    second = sessions_mod._set_read_state("alice@example.com", "conv_a", 9_000, False)
+
+    assert (first, second) == (1_000, 1_001)
+
+
 def test_list_item_embeds_viewer_read_state() -> None:
     """``_build_session_list_item`` reflects the caller's read-state."""
     client = TestClient(_build_app())
-    client.put("/v1/sessions/conv_a/read-state", json={"last_seen": 4_999, "unread": True})
+    resp = client.put("/v1/sessions/conv_a/read-state", json={"last_seen": 4_999, "unread": True})
 
     item = _build_item(None, _make_conversation("conv_a"))
     assert item.viewer_last_seen == 4_999  # type: ignore[attr-defined]
     assert item.viewer_unread is True  # type: ignore[attr-defined]
+    assert item.viewer_read_state_revision == resp.json()["revision"]  # type: ignore[attr-defined]
 
 
 def test_list_item_reports_a_booting_session_as_running() -> None:
@@ -168,6 +189,7 @@ def test_list_item_defaults_when_user_never_saw_session() -> None:
     item = _build_item(None, _make_conversation("conv_untouched"))
     assert item.viewer_last_seen is None  # type: ignore[attr-defined]
     assert item.viewer_unread is False  # type: ignore[attr-defined]
+    assert item.viewer_read_state_revision is None  # type: ignore[attr-defined]
 
 
 def test_read_state_is_scoped_per_user() -> None:
@@ -185,6 +207,7 @@ def test_read_state_is_scoped_per_user() -> None:
     assert alice_item.viewer_unread is True  # type: ignore[attr-defined]
     assert bob_item.viewer_unread is False  # type: ignore[attr-defined]
     assert bob_item.viewer_last_seen is None  # type: ignore[attr-defined]
+    assert bob_item.viewer_read_state_revision is None  # type: ignore[attr-defined]
     del client, app
 
 
@@ -192,12 +215,12 @@ def test_prune_clears_read_state_across_all_users() -> None:
     """Pruning a session drops its read-state from every user's caches."""
     sessions_mod._set_read_state("alice@example.com", "conv_a", 4_999, True)
     sessions_mod._set_read_state("bob@example.com", "conv_a", 100, False)
-    sessions_mod._set_read_state("alice@example.com", "conv_b", 200, True)  # untouched
+    revision_b = sessions_mod._set_read_state("alice@example.com", "conv_b", 200, True)
 
     sessions_mod._prune_session_read_state("conv_a")
 
     # conv_a is gone for both users...
-    assert sessions_mod._read_state_entry("alice@example.com", "conv_a") == (None, False)
-    assert sessions_mod._read_state_entry("bob@example.com", "conv_a") == (None, False)
+    assert sessions_mod._read_state_entry("alice@example.com", "conv_a") == (None, False, None)
+    assert sessions_mod._read_state_entry("bob@example.com", "conv_a") == (None, False, None)
     # ...but other sessions are untouched.
-    assert sessions_mod._read_state_entry("alice@example.com", "conv_b") == (200, True)
+    assert sessions_mod._read_state_entry("alice@example.com", "conv_b") == (200, True, revision_b)

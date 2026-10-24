@@ -1229,7 +1229,9 @@ def _build_session_list_item(
     # Per-viewer read tracking, embedded so the client hydrates the unread
     # dots straight from the list (no separate fetch). Built per-user here —
     # `user_id` is the requesting caller, never broadcast to other viewers.
-    viewer_last_seen, viewer_unread = _read_state_entry(user_id, conv.id)
+    viewer_last_seen, viewer_unread, viewer_read_state_revision = _read_state_entry(
+        user_id, conv.id
+    )
     return SessionListItem(
         id=conv.id,
         agent_id=conv.agent_id,
@@ -1274,6 +1276,7 @@ def _build_session_list_item(
         ),
         viewer_last_seen=viewer_last_seen,
         viewer_unread=viewer_unread,
+        viewer_read_state_revision=viewer_read_state_revision,
         # Transient; set by the store only on a content search. The WS
         # push-stream path leaves it None (no query in flight there).
         search_snippet=conv.search_snippet,

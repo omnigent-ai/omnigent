@@ -317,6 +317,32 @@ def test_title_change_pushes_changed_frame(app: FastAPI, stores, fast_rescan: No
         assert items[s1]["title"] == "after"
 
 
+def test_read_state_put_pushes_changed_frame(app: FastAPI, stores, fast_rescan: None) -> None:
+    """A read-state write reaches the writer's other open clients as a
+    ``changed`` frame carrying the new flag and revision."""
+    s1 = _seed_session(stores, owner=ALICE, title="read-state")
+    client = TestClient(app)
+    try:
+        with client.websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as ws:
+            ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+            snapshot = _recv_until(ws, {"snapshot"})
+            assert snapshot["items"][0]["viewer_read_state_revision"] is None  # type: ignore[index]
+            response = client.put(
+                f"/v1/sessions/{s1}/read-state",
+                json={"last_seen": 4_999, "unread": True},
+                headers={"X-Forwarded-Email": ALICE},
+            )
+            assert response.status_code == 200
+            item = {i["id"]: i for i in _recv_until(ws, {"changed"})["items"]}[s1]  # type: ignore[index]
+            assert item["viewer_unread"] is True
+            assert item["viewer_last_seen"] == 4_999
+            assert item["viewer_read_state_revision"] == response.json()["revision"]
+    finally:
+        sessions_routes._prune_session_read_state(s1)
+
+
 def test_cleared_field_pushes_explicit_null(app: FastAPI, stores, fast_rescan: None) -> None:
     """Clearing a previously-set nullable field (a runner unbind nulling
     ``runner_id``) pushes a ``changed`` frame that carries the key as an

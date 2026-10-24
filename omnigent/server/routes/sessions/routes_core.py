@@ -193,6 +193,7 @@ from omnigent.server.schemas import (
     PaginatedList,
     ProjectSessionCreateRequest,
     ReadStatePutRequest,
+    ReadStatePutResponse,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
     SessionCreateRequest,
@@ -1434,13 +1435,13 @@ def register_core_routes(
 
     @router.put(
         "/sessions/{session_id}/read-state",
-        status_code=204,
+        response_model=ReadStatePutResponse,
     )
     async def put_read_state(
         request: Request,
         session_id: str,
         body: ReadStatePutRequest,
-    ) -> Response:
+    ) -> ReadStatePutResponse:
         """
         Set the calling user's read-state for one session.
 
@@ -1448,22 +1449,21 @@ def register_core_routes(
         only track read-state for sessions you can see. Stores the values
         verbatim (the client enforces the baseline's monotonicity and the
         unread semantics); the server does not interpret them against
-        session status. Returns ``204`` — the client already has the
-        optimistic state and re-reads the authoritative value on the next
-        ``GET /v1/sessions`` poll.
+        session status. The client already has the optimistic state; the
+        returned revision lets it ignore list values older than this write.
 
         :param request: The incoming FastAPI request (for auth).
         :param session_id: Session/conversation identifier.
         :param body: The validated :class:`ReadStatePutRequest`.
-        :returns: An empty ``204 No Content`` response.
+        :returns: The revision assigned to this write.
         :raises OmnigentError: 403 if the caller lacks read access.
         """
         user_id = _require_user(request, auth_provider)
         await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
-        _set_read_state(user_id, session_id, body.last_seen, body.unread)
-        return Response(status_code=204)
+        revision = _set_read_state(user_id, session_id, body.last_seen, body.unread)
+        return ReadStatePutResponse(revision=revision)
 
     # ── GET /sessions/{session_id} ───────────────────────────────
 

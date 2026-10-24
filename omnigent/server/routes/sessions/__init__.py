@@ -327,6 +327,7 @@ from omnigent.server.routes._sessions.common import (
     _pushed_model_options_cache as _pushed_model_options_cache,
     _read_explicit_unread as _read_explicit_unread,
     _read_last_seen as _read_last_seen,
+    _read_state_revision as _read_state_revision,
     _recent_mirrored_tool_calls as _recent_mirrored_tool_calls,
     _runner_relay_tasks as _runner_relay_tasks,
     _runner_status_probe_backoff as _runner_status_probe_backoff,
