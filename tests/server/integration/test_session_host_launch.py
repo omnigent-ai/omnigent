@@ -1544,6 +1544,97 @@ async def test_stop_session_stops_host_launched_runner(
     )
 
 
+async def _serve_one_stat(comm: ApplicationCommunicator) -> None:
+    """Answer the workspace ``host.stat`` a host-bound create sends."""
+    deadline = Deadline(20.0)
+    for _ in range(40):
+        output = await comm.receive_output(timeout=deadline.next_wait(10.0))
+        if output["type"] != "websocket.send":
+            continue
+        frame = decode_host_frame(output["text"])
+        if isinstance(frame, HostStatFrame):
+            reply = HostStatResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                exists=True,
+                type="directory",
+                canonical_path=frame.path,
+            )
+            await comm.send_input({"type": "websocket.receive", "text": encode_host_frame(reply)})
+            return
+    raise AssertionError("host never received a stat frame")
+
+
+def _drain_stop_runner_ids(comm: ApplicationCommunicator) -> list[str]:
+    """Return the runner ids of stop frames already sent to the host, without waiting.
+
+    A ``receive_output`` timeout would cancel the mock host tunnel, so this only
+    reads frames that are already queued.
+    """
+    stopped: list[str] = []
+    while not comm.output_queue.empty():
+        output = comm.output_queue.get_nowait()
+        if output["type"] != "websocket.send":
+            continue
+        with contextlib.suppress(ValueError):
+            frame = decode_host_frame(output["text"])
+            if isinstance(frame, HostStopRunnerFrame):
+                stopped.append(frame.runner_id)
+    return stopped
+
+
+async def test_delete_session_stops_host_runner_once_no_session_uses_it(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+) -> None:
+    """Deleting a session tree stops the host-launched runners it was using.
+
+    Sub-agents ride their parent's runner, so deleting one of them must leave
+    the runner up for the parent and siblings. Deleting the parent removes the
+    whole tree, after which nothing uses its runner, or the runner a sub-agent
+    moved to, and the host must stop both; otherwise they linger until their
+    idle timeout.
+    """
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    agent_id = (await client.get(f"/v1/sessions/{parent['id']}")).json()["agent_id"]
+    children = []
+    for title in ("child A", "child B", "child C"):
+        # A sub-agent keeps its parent's host and workspace and inherits its runner.
+        stat_responder = asyncio.create_task(_serve_one_stat(comm))
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": agent_id,
+                "host_id": _HOST_ID,
+                "parent_session_id": parent["id"],
+                "workspace": _WORKSPACE,
+                "title": title,
+            },
+        )
+        await stat_responder
+        assert create_resp.status_code == 201, create_resp.text
+        children.append(create_resp.json())
+    assert [child["runner_id"] for child in children] == [parent["runner_id"]] * 3
+    # Child C relaunched onto a runner of its own.
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(children[2]["id"], "runner_child_own")
+
+    child_delete = await client.delete(f"/v1/sessions/{children[0]['id']}")
+    assert child_delete.status_code == 200, child_delete.text
+    assert _drain_stop_runner_ids(comm) == []
+
+    async def _serve_two_stops() -> set[str]:
+        return {await _serve_one_stop(comm), await _serve_one_stop(comm)}
+
+    stop_responder = asyncio.create_task(_serve_two_stops())
+    parent_delete = await client.delete(f"/v1/sessions/{parent['id']}")
+    assert parent_delete.status_code == 200, parent_delete.text
+    assert await stop_responder == {parent["runner_id"], "runner_child_own"}
+    for child in children[1:]:
+        assert (await client.get(f"/v1/sessions/{child['id']}")).status_code == 404
+
+
 @pytest.mark.parametrize("runner_status", ["alive", "dead", "unknown", "offline", None])
 async def test_stop_session_requires_confirmed_host_runner_exit(
     client: httpx.AsyncClient,

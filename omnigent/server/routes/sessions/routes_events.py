@@ -250,6 +250,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _evaluate_input_policy,
     _evaluate_tool_call_policy,
     _heal_subagent_runner_binding_via_parent,
+    _host_runner_bindings,
     _is_native_terminal_session,
     _mark_dispatch_in_flight,
     _maybe_relaunch_managed_sandbox,
@@ -268,6 +269,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _runner_live_on_another_replica_from_conversations,
     _side_chat_source_id,
     _stop_host_runner_intentionally,
+    _stop_released_host_runners,
     _wait_for_host_bound_runner_client,
     _wait_for_host_reconnect,
     ensure_runner_connected,
@@ -3610,6 +3612,9 @@ def register_events_routes(
             raise _session_not_found()
         # Capture relay IDs before subtree deletion removes parent links.
         descendant_ids = await _best_effort_stop(session_id, conversation_store, runner_router)
+        host_runner_bindings = await _host_runner_bindings(
+            conversation_store, conv, descendant_ids
+        )
         # Runner-side resource cleanup is best-effort: if the bound
         # runner is offline or unbound, the session must still be
         # deletable. Server-owned records (files and conversation row
@@ -3705,6 +3710,14 @@ def register_events_routes(
         # A relay still inside an offline runner's reconnect grace must not
         # fail the deleted turns when that grace expires.
         _cancel_runner_relays([session_id, *descendant_ids])
+        # The runner-side delete frees the session's resources but not the
+        # host-launched runner process, which would linger until idle timeout.
+        await _stop_released_host_runners(
+            session_id,
+            host_runner_bindings,
+            conversation_store,
+            getattr(request.app.state, "host_registry", None),
+        )
         # The session is gone, so is its launch-progress state. Failed
         # launches are retained in the cache for reload visibility while
         # the session exists; without this eviction every deleted

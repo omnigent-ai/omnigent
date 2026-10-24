@@ -436,6 +436,11 @@ plain `uv run pytest`, which starts a private server for the test.
 - **`delete`:**
   `tests/e2e_ui/sessions/test_sidebar_delete.py::test_delete_session_removes_row_and_from_store`,
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_delete_removes_sessions`
+- **`delete`, host-launched runner:**
+  `tests/server/integration/test_session_host_launch.py::test_delete_session_stops_host_runner_once_no_session_uses_it`
+  (plain `uv run pytest`): deleting a sub-agent keeps the runner it shares with
+  its parent; deleting the parent stops the runners the tree used. Manually:
+  delete a host session and expect its runner process to exit within seconds.
 - **`export`, header menu (own environment):**
   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_session_menu_offers_export`,
   `tests/e2e_ui/sessions/test_export_chat_menu.py::test_header_export_downloads_transcript`
