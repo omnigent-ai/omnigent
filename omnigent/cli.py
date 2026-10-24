@@ -2989,6 +2989,7 @@ def _terminate_host_unit(record: _HostDaemonRecord, *, reason: str) -> None:
     click.echo(
         f"Restarting host daemon for {_host_display_url(record.target)!r} ({reason}).", err=True
     )
+    _record_daemon_stop_requested(record, reason=reason, force=True)
     # Best-effort: a daemon that refuses to die shouldn't hard-fail the
     # run — the fresh daemon's record overwrites this one regardless.
     with contextlib.suppress(click.ClickException):
@@ -5118,6 +5119,7 @@ def _stop_local_server_and_daemon(*, force: bool) -> bool:
     if local_record is not None:
         # A stubborn daemon shouldn't block stopping the server.
         with contextlib.suppress(click.ClickException):
+            _record_daemon_stop_requested(local_record, reason="local_server_stop", force=force)
             _terminate_daemon(local_record, force=force)
     stop_local_omnigent_server()
     # Also catch an orphan on the canonical port whose pidfile was lost, so
@@ -5322,6 +5324,7 @@ def stop(force: bool) -> None:
         # off-switch doesn't need the graceful per-session HTTP stop that
         # `host stop` does — that keeps teardown quiet and dependency-free.
         try:
+            _record_daemon_stop_requested(record, reason="stop", force=force)
             _terminate_daemon(record, force=force)
             stopped += 1
         except click.ClickException as exc:
@@ -9548,6 +9551,7 @@ def _run_background_host(
     except click.ClickException:
         if not reused:
             with contextlib.suppress(click.ClickException):
+                _record_daemon_stop_requested(record, reason="background_start_failed", force=True)
                 _terminate_daemon(record, force=True)
         raise
     headline = _cli_style(
@@ -10022,6 +10026,7 @@ def _daemon_session_request_params(
     *,
     connected_only: bool,
     after: str | None,
+    include_sub_agents: bool = False,
 ) -> dict[str, str | int]:
     """
     Build query parameters for one sessions page.
@@ -10030,6 +10035,8 @@ def _daemon_session_request_params(
         sessions only.
     :param after: Optional cursor from the prior page, e.g.
         ``"conv_abc123"``.
+    :param include_sub_agents: When ``True``, also list sub-agent sessions,
+        which the server omits from ``GET /v1/sessions`` by default.
     :returns: Query parameters for ``GET /v1/sessions``.
     """
     params: dict[str, str | int] = {
@@ -10037,6 +10044,8 @@ def _daemon_session_request_params(
         "include_archived": "true",
         "visibility": "all",
     }
+    if include_sub_agents:
+        params["kind"] = "any"
     if connected_only:
         params["connected"] = "true"
     if after is not None:
@@ -10101,6 +10110,7 @@ def _fetch_session_pages(
     *,
     base_url: str,
     connected_only: bool,
+    include_sub_agents: bool = False,
 ) -> _SessionPagesResult:
     """
     Fetch every available session page from a server.
@@ -10109,6 +10119,7 @@ def _fetch_session_pages(
         ``"https://example.databricksapps.com"``.
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
+    :param include_sub_agents: When ``True``, also fetch sub-agent sessions.
     :returns: Accumulated sessions result. ``error`` is ``None`` on success.
     """
     after: str | None = None
@@ -10121,6 +10132,7 @@ def _fetch_session_pages(
             params=_daemon_session_request_params(
                 connected_only=connected_only,
                 after=after,
+                include_sub_agents=include_sub_agents,
             ),
         )
         page = _decode_sessions_page(page_result)
@@ -10164,10 +10176,51 @@ def _local_server_confirmed_dead() -> bool:
     return not _pid_alive(pid)
 
 
+def _daemon_owned_sessions(
+    sessions: list[_HostSessionRow],
+    *,
+    host_id: str,
+    include_sub_agents: bool,
+) -> list[_HostSessionRow]:
+    """
+    Select the sessions a daemon's host runs, optionally with their sub-agents.
+
+    A sub-agent carries no host id of its own: it runs on its parent's host.
+    With *include_sub_agents*, a sub-agent joins when its parent chain reaches
+    a session this host owns, so a stop reaches children mid-turn.
+
+    :param sessions: Session rows from the server, e.g. ``[{"id": "conv_1", ...}]``.
+    :param host_id: Host id the daemon advertises, e.g. ``"host_abc123"``.
+    :param include_sub_agents: Whether to add sub-agent rows to the owned set.
+    :returns: Owned session rows, parents before their children.
+    """
+    owned = [s for s in sessions if s.get("host_id") == host_id]
+    if not include_sub_agents:
+        return owned
+    owned_ids = {s.get("id") for s in owned}
+    pending = [
+        s for s in sessions if s.get("kind") == "sub_agent" and s.get("id") not in owned_ids
+    ]
+    grew = True
+    while grew and pending:
+        grew = False
+        still_pending: list[_HostSessionRow] = []
+        for session in pending:
+            if session.get("parent_session_id") in owned_ids:
+                owned.append(session)
+                owned_ids.add(session.get("id"))
+                grew = True
+            else:
+                still_pending.append(session)
+        pending = still_pending
+    return owned
+
+
 def _sessions_for_daemon(
     record: _HostDaemonRecord,
     *,
     connected_only: bool = False,
+    include_sub_agents: bool = False,
 ) -> _DaemonSessionsResult:
     """
     Fetch sessions owned by a daemon's host id.
@@ -10175,6 +10228,8 @@ def _sessions_for_daemon(
     :param record: Daemon record whose sessions should be listed.
     :param connected_only: When ``True``, ask the server for connected
         sessions only.
+    :param include_sub_agents: When ``True``, also return sub-agent sessions
+        of the daemon's sessions.
     :returns: Sessions result. ``error`` is ``None`` on success.
     """
     base_url = _daemon_base_url(record)
@@ -10199,6 +10254,7 @@ def _sessions_for_daemon(
     pages = _fetch_session_pages(
         base_url=base_url,
         connected_only=connected_only,
+        include_sub_agents=include_sub_agents,
     )
     if pages.error is not None:
         return _DaemonSessionsResult(
@@ -10207,7 +10263,11 @@ def _sessions_for_daemon(
             error=pages.error,
             unreachable=pages.unreachable,
         )
-    owned = [s for s in pages.sessions if s.get("host_id") == host_id]
+    owned = _daemon_owned_sessions(
+        pages.sessions,
+        host_id=host_id,
+        include_sub_agents=include_sub_agents,
+    )
     return _DaemonSessionsResult(base_url=base_url, sessions=owned, error=None)
 
 
@@ -10803,6 +10863,7 @@ def host_enable(
     target = _normalize_daemon_target(resolved_server)
     record = _find_daemon_record(target)
     if record is not None:
+        _record_daemon_stop_requested(record, reason="host_enable", force=False)
         _terminate_daemon(record, force=False)
 
     from omnigent.host.service import HostServiceError, enable_user_host_service
@@ -10953,7 +11014,7 @@ def _stop_daemon_sessions(
     :returns: Number of sessions successfully stopped.
     :raises click.ClickException: If session listing or any stop fails.
     """
-    result = _sessions_for_daemon(record)
+    result = _sessions_for_daemon(record, include_sub_agents=True)
     if result.error is not None:
         if result.unreachable:
             # A dead server holds no reachable sessions to stop; failing here
@@ -11072,6 +11133,41 @@ def _signal_daemon_pid(record: _HostDaemonRecord, sig: int) -> str:
     return _SIGNAL_DELIVERED
 
 
+def _record_daemon_stop_requested(record: _HostDaemonRecord, *, reason: str, force: bool) -> None:
+    """
+    Log which command is about to signal a live host daemon, and why.
+
+    A host exit by SIGTERM names no sender, so this row is the only record of
+    a CLI teardown. Sent through the debug-log sink, which flushes at exit.
+
+    :param record: Daemon record about to be signalled.
+    :param reason: Short cause, e.g. ``"host_stop"`` or ``"host tunnel is offline"``.
+    :param force: Whether the stop escalates to SIGKILL after the grace period.
+    """
+    from omnigent.debug_logging import attach_debug_log_sink, debug_event
+    from omnigent.diagnostics import redact_url
+
+    if not _pid_is_recorded_daemon(record):
+        return
+    logger = logging.getLogger("omnigent.host.daemon_stop")
+    logger.setLevel(logging.INFO)
+    attach_debug_log_sink([logger], source="cli", level=logging.INFO)
+    logger.info(
+        "host daemon stop requested: %s",
+        reason,
+        extra=debug_event(
+            "host_daemon_stop_requested",
+            reason=reason,
+            force=force,
+            daemon_pid=record.pid,
+            daemon_mode=record.mode,
+            daemon_target=redact_url(record.target),
+            daemon_uptime_s=round(max(0.0, time.time() - record.started_at), 1),
+            cli_pid=os.getpid(),
+        ),
+    )
+
+
 def _terminate_daemon(record: _HostDaemonRecord, *, force: bool) -> str:
     """
     Terminate one local daemon process.
@@ -11170,6 +11266,7 @@ def host_stop(
         stopped = 0
         if not daemon_only and not force:
             stopped = _stop_daemon_sessions(record)
+        _record_daemon_stop_requested(record, reason="host_stop", force=force)
         outcome = _terminate_daemon(record, force=force)
         target = _host_display_url(record.target)
         if outcome == _STOP_DROPPED_FOREIGN:
