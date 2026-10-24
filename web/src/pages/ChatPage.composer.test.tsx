@@ -4530,6 +4530,29 @@ describe("Composer placeholder", () => {
     expect(textarea().disabled).toBe(true);
     expect(textarea().placeholder).toMatch(/reconnect below/i);
   });
+
+  it.each(["keyboard", "button"])("allows a desktop reconnecting send via %s", (entryPoint) => {
+    const props = composerProps({ unreachable: true, canReconnectOnSend: true });
+    render(<Composer {...props} />);
+    const input = textarea();
+    expect(input).toBeEnabled();
+    fireEvent.change(input, { target: { value: "Continue after reconnecting" } });
+    if (entryPoint === "keyboard") fireEvent.keyDown(input, { key: "Enter" });
+    else fireEvent.click(screen.getByRole("button", { name: "Send" }));
+    expect(props.onSend).toHaveBeenCalledExactlyOnceWith("Continue after reconnecting", undefined);
+    expect(input).toHaveValue("");
+  });
+
+  it.each([{ permissionLevel: 1 }, { readOnlyReason: "Mirrored transcript" }])(
+    "keeps a read-only composer blocked even with desktop recovery: %j",
+    (overrides) => {
+      const props = composerProps({ unreachable: true, canReconnectOnSend: true, ...overrides });
+      render(<Composer {...props} />);
+      expect(textarea()).toBeDisabled();
+      expect(screen.getByRole("button", { name: "Send" })).toBeDisabled();
+      expect(props.onSend).not.toHaveBeenCalled();
+    },
+  );
 });
 
 // A pending elicitation parks the agent's turn server-side on the verdict

@@ -14,9 +14,10 @@ export const HOST_HOLD_RECHECK_MS = 60_000;
  * Release a session's sends that were held because its host was offline,
  * once the host is back. The queue flush then sends them in order.
  *
- * @param sessionId The open session, or `null` while none (or a temp id) is open.
+ * @param sessionId The queued message's session, or `null` before it is created.
+ * @param reconnected Whether desktop startup succeeded; allows an immediate online retry.
  */
-export function useReleaseHostHeldSends(sessionId: string | null): void {
+export function useReleaseHostHeldSends(sessionId: string | null, reconnected = false): void {
   const hostOnline = useSessionHostOnline(sessionId ?? undefined);
   const hasHeldSends = useChatStore((s) =>
     s.queuedMessages.some((m) => m.conversationId === sessionId && m.waitingForHost),
@@ -37,12 +38,12 @@ export function useReleaseHostHeldSends(sessionId: string | null): void {
       return;
     }
     if (hostOnline !== true) return;
-    if (seenOffline.current.offline) {
+    if (seenOffline.current.offline || reconnected) {
       seenOffline.current.offline = false;
       releaseHostHeldMessages(sessionId);
       return;
     }
     const timer = window.setTimeout(() => releaseHostHeldMessages(sessionId), HOST_HOLD_RECHECK_MS);
     return () => window.clearTimeout(timer);
-  }, [sessionId, hasHeldSends, hostOnline, releaseHostHeldMessages]);
+  }, [sessionId, hasHeldSends, hostOnline, reconnected, releaseHostHeldMessages]);
 }

@@ -187,7 +187,6 @@ import {
 import { useSession } from "@/hooks/useSession";
 import { useOpenGithubTab } from "@/shell/FileViewerContext";
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
-import { useReleaseHostHeldSends } from "@/hooks/useReleaseHostHeldSends";
 import { useRefreshSessionStateOnRunnerOnline } from "@/hooks/useSessionOnlineRefresh";
 import {
   type LivenessRow,
@@ -910,12 +909,19 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
-  const { reconnect, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
-    useSessionReconnect({
-      sessionId: urlConvId ?? null,
-      hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
-      isOwner: isOwnerLevel(permissionLevel),
-    });
+  const {
+    reconnect,
+    canReconnectOnSend,
+    dialogOpen,
+    setDialogOpen,
+    localReconnect,
+    arcaReconnect,
+  } = useSessionReconnect({
+    sessionId: urlConvId ?? null,
+    hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
+    hostName: sessionHost?.name,
+    isOwner: isOwnerLevel(permissionLevel),
+  });
 
   const onSend = useCallback(
     (text: string, files?: File[], replyDraft?: StoredReplyDraft) => {
@@ -934,7 +940,11 @@ export function ChatPage() {
       }
       // Recover the unreachable host before dispatching another turn.
       if (urlConvId && isUnreachable) {
-        void reconnect();
+        if (canReconnectOnSend) {
+          useChatStore.getState().enqueueMessage(text, files, replyDraft, { waitingForHost: true });
+        } else {
+          void reconnect();
+        }
         return;
       }
       // Queue instead of POSTing now (see shouldQueueSend). enqueueMessage flushes
@@ -980,6 +990,7 @@ export function ChatPage() {
       isUnboundFork,
       canResumeOnLocalHost,
       isUnreachable,
+      canReconnectOnSend,
       reconnect,
       navigate,
     ],
@@ -1165,6 +1176,7 @@ export function ChatPage() {
       onSendSlashCommand={onSendSlashCommand}
       onStop={onStop}
       onShowReconnectHelp={onShowReconnectHelp}
+      canReconnectOnSend={canReconnectOnSend}
       agents={visibleAgents}
       selectedAgentId={agentId}
       hasMoreHistory={hasMoreHistory}
@@ -1317,6 +1329,7 @@ interface MainAgentSurfaceProps {
   onSendSlashCommand?: (name: string, args: string) => void;
   onStop: () => void;
   onShowReconnectHelp: () => void;
+  canReconnectOnSend: boolean;
   agents: Agent[] | undefined;
   selectedAgentId: string | null;
   /** Whether older messages exist that haven't been loaded yet. */
@@ -1490,6 +1503,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   onNewSession,
   onStop,
   onShowReconnectHelp,
+  canReconnectOnSend,
   agents,
   selectedAgentId,
   hasMoreHistory,
@@ -1839,6 +1853,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
               (liveness.kind === "host_offline" || liveness.kind === "local_stranded")
             }
             onShowReconnectHelp={onShowReconnectHelp}
+            canReconnectOnSend={canReconnectOnSend}
             costRoutingEligible={costRoutingEligible}
             subagentRoutingEligible={subagentRoutingEligible}
             subAgentLabel={subAgentLabel}
@@ -1978,11 +1993,12 @@ interface ComposerProps {
    */
   isNativeWrapper?: boolean;
   /**
-   * The session is unreachable (`host_offline` / `local_stranded`): a message
-   * can't wake it. The composer is blocked (disabled) and the reconnect
-   * banner below is the only affordance.
+   * The session needs recovery (`host_offline` / `local_stranded`). Sending
+   * is blocked unless the desktop can request a host reconnect.
    */
   unreachable?: boolean;
+  /** Queue sends while requesting recovery through the desktop bridge. */
+  canReconnectOnSend?: boolean;
   /**
    * Open the reconnect help dialog. Always wired to the status line's host
    * badge, which turns itself into a clickable reconnect affordance whenever
@@ -2321,6 +2337,7 @@ function ComposerImpl(
     showPollyCodexGoalControl = false,
     isNativeWrapper = false,
     unreachable = false,
+    canReconnectOnSend = false,
     onShowReconnectHelp,
     costRoutingEligible = false,
     subAgentLabel = null,
@@ -2329,6 +2346,7 @@ function ComposerImpl(
   }: ComposerProps,
   ref: ForwardedRef<ComposerHandle>,
 ) {
+  const hostBlocksSend = unreachable && !canReconnectOnSend;
   const {
     draft,
     value,
@@ -2503,8 +2521,6 @@ function ComposerImpl(
   // No server session behind a temp id — gate goal/workspace fetches on it so
   // the create window issues no `/v1/sessions/temp:*` requests.
   const composerSessionId = isTempConvId(conversationId) ? null : conversationId;
-  // A send held while the host was offline goes out once the host is back.
-  useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
   const mcpPanelRequested = composerSessionId !== null && value.trim() === "/mcp";
   const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
@@ -3510,6 +3526,7 @@ function ComposerImpl(
     if (
       (!trimmed && files.length === 0 && mentionedItems.length === 0) ||
       disabled ||
+      hostBlocksSend ||
       sendDisabledReason !== null ||
       hasPendingElicitation
     )
@@ -3938,7 +3955,7 @@ function ComposerImpl(
               ? readOnlyReason
               : isReadOnly
                 ? "You have read-only access to this session"
-                : unreachable && sendDisabledReason === null
+                : hostBlocksSend && sendDisabledReason === null
                   ? "Session offline — reconnect below to continue"
                   : hasPendingElicitation
                     ? "Respond to the pending request above to continue"
@@ -3949,7 +3966,7 @@ function ComposerImpl(
                         : "Send a message…",
           rows: 1,
           disabled:
-            ((disabled || unreachable) && sendDisabledReason === null) ||
+            ((disabled || hostBlocksSend) && sendDisabledReason === null) ||
             isReadOnly ||
             composerLockedByBtw,
           "data-slash-command": composerIsCommand ? "true" : undefined,
@@ -3968,7 +3985,7 @@ function ComposerImpl(
                 quotes={draft.quotes}
                 activeTextId={activeTextId}
                 keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
-                disabled={disabled || isReadOnly || unreachable || composerLockedByBtw}
+                disabled={disabled || isReadOnly || hostBlocksSend || composerLockedByBtw}
                 onGrowth={onViewportShrinkPinScroll}
                 onRemove={(id) => {
                   removeQuote(id);
@@ -4246,6 +4263,7 @@ function ComposerImpl(
                           ? isReadOnly
                           : !hasDraft ||
                             disabled ||
+                            hostBlocksSend ||
                             isReadOnly ||
                             sendDisabledReason !== null ||
                             hasPendingElicitation

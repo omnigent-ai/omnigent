@@ -3,6 +3,7 @@ import { useEffect } from "react";
 import type { ReactNode } from "react";
 
 import { useChatStore } from "@/store/chatStore";
+import { HostSendRecovery } from "./HostSendRecovery";
 
 /**
  * Drives the background flush of the client-side message queue.
@@ -44,5 +45,10 @@ export function QueueFlushProvider({ children }: { children: ReactNode }) {
     return unsubscribe;
   }, [queryClient, flushBackgroundQueues]);
 
-  return children;
+  return (
+    <>
+      {children}
+      <HostSendRecovery />
+    </>
+  );
 }

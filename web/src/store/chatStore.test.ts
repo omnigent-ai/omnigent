@@ -3191,11 +3191,25 @@ describe("chatStore — send (first-send ordering)", () => {
     useChatStore.getState().maybeFlushQueuedHead();
     expect(holdHeaders).toHaveLength(1);
 
+    // Startup can succeed before delivery is ready; retain its attempt on refusal.
+    useChatStore.setState((s) => ({
+      queuedMessages: s.queuedMessages.map((m) => ({ ...m, hostReconnectAttempted: true })),
+    }));
+    useChatStore.getState().releaseHostHeldMessages("conv_existing");
+    useChatStore.getState().maybeFlushQueuedHead();
+    await vi.waitFor(() =>
+      expect(useChatStore.getState().queuedMessages[0]).toMatchObject({
+        waitingForHost: true,
+        hostReconnectAttempted: true,
+      }),
+    );
+    expect(holdHeaders).toEqual(["on", "on"]);
+
     hostBack = true;
     useChatStore.getState().releaseHostHeldMessages("conv_existing");
     // ChatPage's level-triggered flush effect runs on the queue change.
     useChatStore.getState().maybeFlushQueuedHead();
-    await vi.waitFor(() => expect(holdHeaders).toEqual(["on", "on"]));
+    await vi.waitFor(() => expect(holdHeaders).toEqual(["on", "on", "on"]));
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
@@ -17860,6 +17874,75 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
+  it.each([false, true])(
+    "holds a desktop reconnecting send with its file and quote across navigation (startup: %s)",
+    async (startupPending) => {
+      seedSession("conv_offline", []);
+      seedSession("conv_other", []);
+      await useChatStore.getState().switchTo("conv_offline");
+      useChatStore.setState({ startupPending, status: "idle", sessionStatus: "idle" });
+      const file = new File(["pixels"], "screenshot.png", { type: "image/png" });
+      const replyDraft: StoredReplyDraft = {
+        version: 1,
+        quotes: [{ before: "", text: "Original question" }],
+        text: "Continue here",
+      };
+      const text = serializeReplyDraft(replyDraft);
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/resources/files")) {
+          return mockResponse({
+            id: "file_recovered",
+            name: file.name,
+            metadata: { filename: file.name, bytes: file.size, created_at: 0 },
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const posts = () =>
+        fetchMock.mock.calls.filter(
+          ([url, init]) => String(url).endsWith("/events") && init?.method === "POST",
+        );
+      useChatStore.getState().enqueueMessage(text, [file], replyDraft, { waitingForHost: true });
+      const [held] = useChatStore.getState().queuedMessages;
+      expect(held).toMatchObject({
+        text,
+        files: [file],
+        replyDraft,
+        conversationId: "conv_offline",
+        waitingForHost: true,
+      });
+      useChatStore.getState().maybeFlushQueuedHead();
+      await tick();
+      expect(posts()).toEqual([]);
+      expect(fetchMock.mock.calls.some(([url]) => String(url).endsWith("/resources/files"))).toBe(
+        false,
+      );
+
+      await useChatStore.getState().switchTo("conv_other");
+      useChatStore.getState().releaseHostHeldMessages("conv_other");
+      useChatStore.getState().maybeFlushQueuedHead();
+      expect(useChatStore.getState().queuedMessages[0]).toBe(held);
+      expect(posts()).toEqual([]);
+
+      useChatStore.getState().releaseHostHeldMessages("conv_offline");
+      useChatStore.getState().maybeFlushQueuedHead();
+      expect(posts()).toEqual([]);
+      await useChatStore.getState().switchTo("conv_offline");
+      useChatStore.getState().maybeFlushQueuedHead();
+      useChatStore.getState().maybeFlushQueuedHead();
+      await vi.waitFor(() => expect(posts()).toHaveLength(1));
+      expect(posts()[0]![0]).toBe("/v1/sessions/conv_offline/events");
+      expect(JSON.parse(posts()[0]![1]!.body as string).data).toMatchObject({
+        stable_id: held!.stableId,
+        content: [
+          { type: "input_image", file_id: "file_recovered", filename: file.name },
+          { type: "input_text", text },
+        ],
+      });
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+    },
+  );
+
   it.each(["steer", "idle", "bulk"])("carries quote provenance from enqueue through %s", (mode) => {
     const replyDraft: StoredReplyDraft = {
       version: 1,
@@ -18576,6 +18659,59 @@ describe("chatStore — background cross-session flush", () => {
         )?.text;
         return { id, text };
       });
+
+  it.each([true, false])(
+    "holds a background refusal and delivers to its original session (sidebar row: %s)",
+    async (hasSidebarRow) => {
+      seedSession("conv_bg");
+      client.setQueryData(["session", "conv_bg"], await getSessionSlim("conv_bg"));
+      seedConversationsCache([
+        conv("conv_active", "idle"),
+        ...(hasSidebarRow ? [conv("conv_bg", "idle")] : []),
+      ]);
+      useChatStore.setState({
+        conversationId: "conv_active",
+        queuedMessages: [
+          {
+            queueId: "q_original",
+            text: "Continue in the original session",
+            conversationId: "conv_bg",
+            stableId: "original-message",
+          },
+        ],
+      });
+      const headers: (string | null)[] = [];
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/v1/sessions/conv_bg/events")) {
+          headers.push(new Headers(init?.headers).get("x-omnigent-hold-when-host-offline"));
+          return headers.length === 1
+            ? mockResponse(
+                { error: { code: "host_offline", message: "Waiting for the host." } },
+                { ok: false, status: 503 },
+              )
+            : mockResponse({ queued: true });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      useChatStore.getState().flushBackgroundQueues();
+      await vi.waitFor(() =>
+        expect(useChatStore.getState().queuedMessages[0]?.waitingForHost).toBe(true),
+      );
+      expect(useChatStore.getState().queuedMessages[0]).toMatchObject({
+        conversationId: "conv_bg",
+        stableId: "original-message",
+      });
+      expect(headers).toEqual(["on"]);
+      useChatStore.getState().flushBackgroundQueues();
+      expect(headers).toHaveLength(1);
+      useChatStore.getState().releaseHostHeldMessages("conv_bg");
+      useChatStore.getState().flushBackgroundQueues();
+      await vi.waitFor(() => expect(headers).toEqual(["on", "on"]));
+      expect(useChatStore.getState().queuedMessages).toEqual([]);
+      expect(useChatStore.getState().conversationId).toBe("conv_active");
+    },
+  );
 
   it("flushes an idle non-active conversation's head via postEvent", async () => {
     // Viewing conv_active; conv_bg is idle in the sidebar cache with a queue.

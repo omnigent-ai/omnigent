@@ -14,50 +14,15 @@ from urllib.parse import urlparse
 import pytest
 from playwright.sync_api import Page, Route, expect
 
+from tests._helpers.desktop_host_recovery import (
+    LOCAL_DESKTOP_BRIDGE_INIT_SCRIPT as _DESKTOP_BRIDGE_INIT_SCRIPT,
+)
+from tests._helpers.desktop_host_recovery import THIS_MACHINE_HOST_ID as _THIS_MACHINE_HOST_ID
 from tests.e2e_ui.conftest import fetch_with_retry
 
-# This machine's host id, as the injected desktop bridge reports it and as the
-# patched session snapshot binds to -- so the offline host IS "This Mac".
-_THIS_MACHINE_HOST_ID = "host_this_machine"
 # Unix seconds well before now so the offline host is outside STARTING_GRACE_S
 # and reads its real (offline) liveness rather than `starting`.
 _OLD_CREATED_AT = 1_700_000_000
-
-# Electron preload stub: makes isElectronShell() true, reports THIS machine as a
-# CLI-installed host, and records controlHost() calls so the test can assert the
-# in-app reconnect actually drove the desktop bridge. Runs before any app script.
-_DESKTOP_BRIDGE_INIT_SCRIPT = f"""
-window.__controlHostCalls = [];
-window.__hostStatusListeners = [];
-window.omnigentDesktop = {{
-  kind: "electron",
-  setBadgeCount: function () {{}},
-  notify: function () {{ return Promise.resolve(false); }},
-  onNotificationActivated: function () {{ return function () {{}}; }},
-  getServerPicker: function () {{ return Promise.resolve(null); }},
-  switchServer: function () {{ return Promise.resolve(); }},
-  openServerSetup: function () {{}},
-  getHostIdentity: function () {{
-    return Promise.resolve({{ cliInstalled: true, hostId: {_THIS_MACHINE_HOST_ID!r} }});
-  }},
-  onHostStatusChanged: function (callback) {{
-    window.__hostStatusListeners.push(callback);
-    return () => {{
-      window.__hostStatusListeners = window.__hostStatusListeners.filter(cb => cb !== callback);
-    }};
-  }},
-  controlHost: function (action) {{
-    window.__controlHostCalls.push(action);
-    return new Promise(resolve => {{
-      window.__finishReconnect = result => {{
-        resolve(result);
-        window.__hostStatusListeners.forEach(callback => callback());
-      }};
-    }});
-  }},
-  getDesktopFeatures: function () {{ return Promise.resolve(null); }},
-}};
-"""
 
 
 @pytest.fixture(autouse=True)

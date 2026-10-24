@@ -18,6 +18,7 @@ retain configuration, fault injection and behavioral assertions.
 | Server and runner lifecycle | `server_runner` in [server_runner.py](server_runner.py) | [Runner shutdown](../e2e/test_runner_shutdown_mcp_notify_hang_e2e.py) |
 | Real host with isolated identity/home | `isolated_host` in [host.py](host.py) | [Host reconnect](../e2e/test_host_transient_404_restart.py) |
 | Per-user page, sync or async | `user_page`, `async_user_page` in [browser.py](browser.py) | [Permissions](../e2e_ui/collaboration/test_permissions_modal.py), [async readiness](../e2e_ui/chat/test_credentialless_host_harness_readiness.py) |
+| Controlled desktop host identity and startup | Bridge scripts in [desktop_host_recovery.py](desktop_host_recovery.py) | [Desktop reconnect](../e2e_ui/sessions/test_reconnect_arca_from_app.py), [late refusal](../browser_ui/chat/test_desktop_host_send_recovery.py) |
 | Native-wrapper session | `create_native_session` in [native_session.py](native_session.py) | [Native workspace](../e2e_ui/messages/test_native_codex_workspace_cwd.py) |
 | Local Codex marketplace/plugin install | `install_codex_plugin` in [codex_plugins.py](codex_plugins.py), with caller-owned home/workspace and names | [Plugin catalog](../harnesses/codex_native/test_skill_discovery.py), [both composers](../e2e_ui/chat/test_codex_plugin_skills.py) |
 | Provider resolution without the developer's config, overlay or ambient credentials | `isolate_provider_resolution` in [providers.py](providers.py) | [Host model options](../host/test_connect.py) |

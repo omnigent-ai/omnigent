@@ -33,6 +33,26 @@ afterEach(() => {
 });
 
 describe("useReleaseHostHeldSends", () => {
+  it("releases promptly after reconnect succeeds even when health never reports offline", () => {
+    health.hostOnline = true;
+    const { rerender } = renderHook(
+      ({ reconnected }) => useReleaseHostHeldSends("conv_a", reconnected),
+      { initialProps: { reconnected: false } },
+    );
+    expect(held()).toBe(true);
+    rerender({ reconnected: true });
+    expect(held()).toBe(false);
+  });
+
+  it("waits for host readiness after the reconnect request succeeds", () => {
+    health.hostOnline = false;
+    const { rerender } = renderHook(() => useReleaseHostHeldSends("conv_a", true));
+    expect(held()).toBe(true);
+    health.hostOnline = true;
+    rerender();
+    expect(held()).toBe(false);
+  });
+
   it("releases a held send as soon as the host comes back after an outage", () => {
     health.hostOnline = false;
     const { rerender } = renderHook(() => useReleaseHostHeldSends("conv_a"));
