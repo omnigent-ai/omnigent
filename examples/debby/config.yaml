@@ -12,9 +12,15 @@
 # Usage:
 #   omnigent run examples/debby
 #
-# Debby's two heads run on the claude-sdk and codex harnesses, so
-# configure both a Claude and an OpenAI provider first (e.g. `omnigent setup`,
-# or export ANTHROPIC_API_KEY and OPENAI_API_KEY).
+# Debby's two heads run on the claude-sdk and codex harnesses, so configure a
+# provider for each first (`omnigent setup`). That does not require two vendor
+# accounts — a single Databricks workspace serves both heads. What each harness
+# actually needs:
+#   - claude-sdk — any Claude provider: an Anthropic API key, a Claude
+#     subscription, an OpenAI-compatible gateway, or a Databricks workspace.
+#   - codex — an endpoint implementing OpenAI's *Responses* API: OpenAI itself,
+#     or a gateway that exposes it (a Databricks workspace does). A
+#     Chat-Completions-only endpoint will not work.
 
 spec_version: 1
 name: debby
