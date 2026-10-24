@@ -1097,18 +1097,35 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       options: [{ label: "Allow" }, { label: "Block" }],
       isOther: false,
       value: "Allow",
+      textInput: undefined,
     },
-    { name: "input", harness: "Pi", options: [], isOther: true, value: "hello world" },
+    {
+      name: "input",
+      harness: "Pi",
+      options: [],
+      isOther: true,
+      value: "hello world",
+      textInput: undefined,
+    },
+    ...["original note", "Keep as-is", "", "  two\nlines\n"].map((value) => ({
+      name: `editor ${JSON.stringify(value)}`,
+      harness: "Pi",
+      options: [],
+      isOther: true,
+      value,
+      textInput: { default: "original note" },
+    })),
     {
       name: "plan choice",
       harness: "Codex",
       options: [{ label: "Implement the plan" }, { label: "Keep planning" }],
       isOther: false,
       value: "Implement the plan",
+      textInput: undefined,
     },
   ])(
     "submits a $harness $name using its supported inputs",
-    ({ options, isOther, value, harness }) => {
+    ({ options, isOther, value, harness, textInput }) => {
       const submitSpy = vi.fn().mockResolvedValue(undefined);
       useChatStore.setState({ submitApproval: submitSpy } as Partial<
         ReturnType<typeof useChatStore.getState>
@@ -1133,6 +1150,7 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
                 options,
                 multiSelect: false,
                 isOther,
+                textInput,
               },
             ],
           }}
@@ -1143,11 +1161,16 @@ describe("ApprovalCard — AskUserQuestion form (parsed from content_preview)", 
       ).toBeDefined();
       expect(screen.queryByText("Claude has questions")).toBeNull();
       const submit = screen.getByTestId("ask-user-question-submit");
-      expect(submit.hasAttribute("disabled")).toBe(true);
+      expect(submit.hasAttribute("disabled")).toBe(!textInput);
+      if (textInput) {
+        expect(screen.getByTestId("ask-user-question-custom-input")).toHaveValue(textInput.default);
+      }
       if (isOther) {
-        fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
-          target: { value },
-        });
+        if (value !== textInput?.default) {
+          fireEvent.change(screen.getByTestId("ask-user-question-custom-input"), {
+            target: { value },
+          });
+        }
       } else {
         expect(screen.queryByTestId("ask-user-question-custom-input")).toBeNull();
         fireEvent.click(screen.getByLabelText(value));
