@@ -293,12 +293,39 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        cleanup_error: str | None = None
         try:
             with telemetry.span("claude_native.inject"):
                 answer_deadline: float | None = None
                 while True:
                     try:
-                        await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
+                        async with self._inject_lock:
+                            try:
+                                context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
+                                context_path.unlink(missing_ok=True)
+                                if wanted_model_arg is not None:
+                                    # ``/model <id>`` also saves the pick as the person's
+                                    # global default (accepted trade-off). It runs under the
+                                    # same lock, so its confirm Enter can't race the message.
+                                    await self._inject(
+                                        partial(
+                                            inject_slash_command,
+                                            self._bridge_dir,
+                                            command=f"/model {wanted_model_arg}",
+                                            auto_confirm=True,
+                                            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                                        )
+                                    )
+                                    # Track the routed id, not the alias: the next turn's
+                                    # comparison is against what routing asked for.
+                                    self._applied_model = wanted_model
+                                await self._inject_prompt(text, notices)
+                            except (ClaudePromptTimeout, ClaudeTerminalExited):
+                                # Reap while still holding the lock: a failed pane may
+                                # yet come alive, and queued steering must not land in it
+                                # before the kill finishes.
+                                cleanup_error = await self._reap_failed_turn()
+                                raise
                         break
                     except ClaudeUserPromptPending as exc:
                         # Refused before anything was typed: wait for the answer and retry.
@@ -321,7 +348,6 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -332,7 +358,6 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: prompt delivery to harness timed out",
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
             message = describe_exception(exc)
             if cleanup_error is not None:
                 message = f"{message} Cleanup also failed: {cleanup_error}"
@@ -406,11 +431,34 @@ class ClaudeNativeExecutor(Executor):
                     await asyncio.shield(worker)
             with contextlib.suppress(Exception, asyncio.CancelledError):
                 worker.result()
-            self._reap_failed_turn()
+            await self._reap_failed_turn()
             raise
 
-    def _reap_failed_turn(self) -> str | None:
-        """Kill the Claude pane before a delivery timeout becomes ``failed``."""
+    async def _reap_failed_turn(self) -> str | None:
+        """Kill the failed turn's pane off-loop, finishing the kill before any cancel propagates.
+
+        Returns a cleanup error, or None when the pane was killed or already gone."""
+        # Created outside cancellable_injection, so the delivery's cancellation
+        # flag cannot reject the kill's own tmux command.
+        worker = asyncio.create_task(asyncio.to_thread(self._kill_failed_session))
+        cancelled: asyncio.CancelledError | None = None
+        while not worker.done():
+            try:
+                # Worker exceptions surface via worker.result() below.
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(worker)
+            except asyncio.CancelledError as exc:
+                cancelled = exc
+        if cancelled is not None:
+            with contextlib.suppress(Exception):
+                worker.result()
+            raise cancelled
+        return worker.result()
+
+    def _kill_failed_session(self) -> str | None:
+        """Blocking half of :meth:`_reap_failed_turn`; runs in a worker thread.
+
+        tmux and OS failures come back as text, so cleanup never replaces the turn's own error."""
         try:
             kill_session(self._bridge_dir, timeout_s=1.0)
         except TmuxSessionNotAdvertised:
@@ -418,7 +466,7 @@ class ClaudeNativeExecutor(Executor):
                 "claude-native: timed-out session already disappeared",
                 extra={"session_id": self._request_session_id},
             )
-        except RuntimeError as exc:
+        except (OSError, RuntimeError) as exc:
             _logger.warning(
                 "claude-native: failed to reap timed-out session",
                 exc_info=True,

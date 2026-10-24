@@ -23,7 +23,7 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 from omnigent.inner import claude_native_executor
 from omnigent.inner.claude_native_executor import ClaudeNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete, describe_exception
 from omnigent.inner.native_attachments import attachment_cache_dir
 
 # Minimal valid 1x1 white PNG used for multimodal attachment tests.
@@ -1901,6 +1901,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     keeps the ERROR and its traceback.
     """
     bridge_dir = tmp_path / "bridge"
+    killed: list[Path] = []
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
@@ -1911,7 +1912,9 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(
-        claude_native_executor, "kill_session", lambda bridge_dir_arg, *, timeout_s: None
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
     )
 
     with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_native_executor"):
@@ -1925,6 +1928,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
         ]
 
     # The turn still fails: the pane is gone either way.
+    assert killed == [bridge_dir]
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert events[0].undelivered is True
@@ -2063,21 +2067,25 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [ClaudePromptTimeout, ClaudeTerminalExited])
+@pytest.mark.parametrize(
+    "kill_error",
+    [RuntimeError("tmux kill failed"), FileNotFoundError("No such file or directory: 'tmux'")],
+    ids=["tmux-error", "tmux-binary-missing"],
+)
 async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    failure: type[ClaudePromptTimeout],
+    kill_error: Exception,
 ) -> None:
     """A failed hard-stop remains visible beside the delivery error."""
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
-        raise failure("terminal did not become ready")
+        raise ClaudePromptTimeout("terminal did not become ready")
 
     def fail_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
         del bridge_dir_arg, timeout_s
-        raise RuntimeError("tmux kill failed")
+        raise kill_error
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(claude_native_executor, "kill_session", fail_kill)
@@ -2094,7 +2102,7 @@ async def test_run_turn_reports_reap_failure_with_prompt_timeout(
 
     assert isinstance(events[0], ExecutorError)
     assert "terminal did not become ready" in events[0].message
-    assert "Cleanup also failed: tmux kill failed" in events[0].message
+    assert describe_exception(kill_error) in events[0].message
     assert events[0].undelivered is True
 
 
@@ -2128,3 +2136,205 @@ async def test_run_turn_ignores_missing_tmux_during_timeout_reap(
 
     assert isinstance(events[0], ExecutorError)
     assert events[0].message == "terminal did not become ready"
+
+
+@pytest.mark.asyncio
+async def test_prompt_timeout_reap_keeps_event_loop_responsive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """The loop keeps running during cleanup, and steering waits until the kill ends."""
+    kill_started = threading.Event()
+    release_kill = threading.Event()
+    killed = threading.Event()
+    steered: list[str] = []
+
+    def inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, timeout_s
+        if content == "hi":
+            raise ClaudePromptTimeout("terminal did not become ready")
+        steered.append("after kill" if killed.is_set() else "mid kill")
+
+    def slow_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
+        del bridge_dir_arg, timeout_s
+        kill_started.set()
+        assert release_kill.wait(10), "test did not release the in-flight kill"
+        killed.set()
+
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", slow_kill)
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+
+    async def collect() -> list[object]:
+        return [
+            event
+            async for event in executor.run_turn(
+                messages=[{"role": "user", "content": "hi"}],
+                tools=[],
+                system_prompt="",
+            )
+        ]
+
+    turn = asyncio.create_task(collect())
+    steer: asyncio.Task[bool] | None = None
+    try:
+        assert await asyncio.wait_for(asyncio.to_thread(kill_started.wait, 10), 15)
+        # A synchronous kill blocks this coroutine until its wait has already ended.
+        assert not killed.is_set(), "cleanup blocked the event loop"
+        assert not turn.done(), "turn finished before cleanup completed"
+        # A timed-out pane may still come alive: steering queued mid-kill must
+        # wait for the injection lock rather than land in the doomed pane.
+        steer = asyncio.create_task(executor.enqueue_session_message("session", "steer"))
+        await asyncio.sleep(0.05)
+        assert not steer.done(), "steering entered the pane while the kill was pending"
+        assert executor._inject_lock.locked()
+        release_kill.set()
+        events = await asyncio.wait_for(turn, 10)
+        assert await asyncio.wait_for(steer, 10) is True
+    finally:
+        release_kill.set()
+        for task in (turn, steer):
+            if task is not None and not task.done():
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await task
+
+    assert killed.is_set(), "cleanup skipped or orphaned the kill"
+    assert steered == ["after kill"]
+    assert len(events) == 1
+    assert isinstance(events[0], ExecutorError)
+
+
+@pytest.mark.asyncio
+async def test_cancel_during_timeout_cleanup_completes_kill_before_unlock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Cancelling a turn while its timeout cleanup waits on tmux finishes the kill
+    before the injection lock releases and the cancellation propagates, message intact."""
+    kill_started = threading.Event()
+    release_kill = threading.Event()
+    killed = threading.Event()
+
+    def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        raise ClaudePromptTimeout("terminal did not become ready")
+
+    def slow_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
+        del bridge_dir_arg, timeout_s
+        kill_started.set()
+        assert release_kill.wait(10), "test did not release the in-flight kill"
+        killed.set()
+
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", slow_kill)
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+
+    async def deliver() -> None:
+        async for _event in executor.run_turn(
+            messages=[{"role": "user", "content": "hi"}],
+            tools=[],
+            system_prompt="",
+        ):
+            raise AssertionError("cancelled turn emitted an event")
+
+    task = asyncio.create_task(deliver())
+    try:
+        assert await asyncio.to_thread(kill_started.wait, 10), "timeout cleanup never started"
+        task.cancel("stop requested")
+        await asyncio.sleep(0.05)
+        assert not task.done(), "cancellation mid-kill abandoned the cleanup"
+        assert executor._inject_lock.locked(), (
+            "injection lock released while the kill was in flight"
+        )
+        release_kill.set()
+        await asyncio.wait({task}, timeout=10)
+        assert task.done(), "turn did not finish after the kill was released"
+        with pytest.raises(asyncio.CancelledError) as cancelled:
+            task.result()
+        assert cancelled.value.args == ("stop requested",)
+        assert killed.is_set()
+        assert not executor._inject_lock.locked()
+    finally:
+        release_kill.set()
+        if not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
+
+@pytest.mark.asyncio
+async def test_repeated_cancellation_mid_reap_completes_kill_before_unlock(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A cancel arriving mid-kill never orphans the kill: the injection lock stays
+    held until the kill finishes, and only then does the cancellation propagate."""
+    inject_started = threading.Event()
+    inject_release = threading.Event()
+    reap_started = threading.Event()
+    reap_release = threading.Event()
+    reap_finished = threading.Event()
+
+    def blocking_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
+        del bridge_dir_arg, content, timeout_s
+        inject_started.set()
+        assert inject_release.wait(10), "test did not release the in-flight delivery"
+
+    def slow_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
+        del bridge_dir_arg, timeout_s
+        # The kill must run outside the cancelled delivery's scope, or
+        # this raises and the pane survives.
+        claude_bridge._check_injection_cancelled()
+        reap_started.set()
+        assert reap_release.wait(10), "test did not release the in-flight kill"
+        reap_finished.set()
+
+    monkeypatch.delenv(REQUEST_SESSION_ID_ENV_VAR, raising=False)
+    monkeypatch.setattr(claude_native_executor, "inject_user_message", blocking_inject)
+    monkeypatch.setattr(claude_native_executor, "kill_session", slow_kill)
+
+    executor = ClaudeNativeExecutor(tmp_path / "bridge")
+
+    async def deliver() -> None:
+        async for _event in executor.run_turn(
+            messages=[{"role": "user", "content": "hello"}],
+            tools=[],
+            system_prompt="",
+        ):
+            raise AssertionError("cancelled turn emitted a completion")
+
+    task = asyncio.create_task(deliver())
+    try:
+        assert await asyncio.to_thread(inject_started.wait, 10)
+        task.cancel()
+        inject_release.set()
+        # The drained delivery hands off to the kill; observing it start
+        # requires a live event loop (a blocked loop deadlocks here).
+        assert await asyncio.to_thread(reap_started.wait, 10), (
+            "kill never started after the cancelled delivery drained"
+        )
+        assert not task.done()
+        assert executor._inject_lock.locked(), (
+            "injection lock released while the kill was in flight"
+        )
+        task.cancel()
+        await asyncio.sleep(0.05)
+        assert not task.done(), "cancellation mid-kill abandoned the cleanup"
+        reap_release.set()
+        await asyncio.wait({task}, timeout=10)
+        assert task.done(), "turn did not finish after the kill was released"
+        with pytest.raises(asyncio.CancelledError):
+            task.result()
+        assert reap_finished.is_set()
+        assert not executor._inject_lock.locked()
+    finally:
+        inject_release.set()
+        reap_release.set()
+        if not task.done():
+            task.cancel()
+        await asyncio.wait({task})
+        with contextlib.suppress(asyncio.CancelledError):
+            task.result()
