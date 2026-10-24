@@ -1,9 +1,10 @@
 import { createElement } from "react";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { RenderItem } from "@/lib/renderItems";
+import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
 import { ToolCard, ToolGroupSummary, formatToolDuration, getOutputPreview } from "./ToolCard";
 
 afterEach(cleanup);
@@ -252,9 +253,7 @@ describe("ToolCard shell terminal panel", () => {
     });
     const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
     expect(trigger).toHaveAttribute("title", "pnpm install");
-    expect(trigger.textContent).toContain("$ pnpm install");
-    // The prompt is decorative, so the row's accessible name is the bare command.
-    expect(screen.getByRole("button", { name: /^pnpm install/ })).toBe(trigger);
+    expect(trigger.textContent).toBe("pnpm install");
 
     expand(container);
     const terminal = screen.getByTestId("shell-tool-terminal");
@@ -404,6 +403,52 @@ describe("ToolCard shell terminal panel", () => {
     });
     const dimmed = container.querySelector(".opacity-60");
     expect(dimmed?.textContent).toBe('PATH="/opt/bin:$PATH" ');
+  });
+
+  it("shows a multi-line script's first line and line count in the row", () => {
+    // WHY: newlines collapsed into spaces made separate commands read as one.
+    const { container } = renderCard({
+      name: "Bash",
+      arguments: { command: "git diff --check\ngit add a \\\n  b\ngit status" },
+      output: "",
+      state: "output-available",
+    });
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(trigger.textContent).toBe("git diff --check +3 lines");
+  });
+});
+
+describe("ToolCard shell terminal theme", () => {
+  afterEach(() => writeTerminalThemeMode("auto"));
+
+  function renderExpandedShell() {
+    const { container } = renderCard({
+      name: "Bash",
+      arguments: { command: "ls" },
+      output: "README.md",
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    return screen.getByTestId("shell-tool-terminal");
+  }
+
+  it("keeps the app palette when the terminal theme follows the app", () => {
+    const terminal = renderExpandedShell();
+    expect(terminal).toHaveAttribute("data-terminal-theme", "light");
+    expect(terminal.style.getPropertyValue("--background")).toBe("");
+  });
+
+  it("repaints the block when the terminal theme pins the other scheme", () => {
+    // WHY: Settings > Terminal theme applies to terminal-styled shell output,
+    // not only to the terminal pane, and a change applies live.
+    writeTerminalThemeMode("dark");
+    const terminal = renderExpandedShell();
+    expect(terminal).toHaveAttribute("data-terminal-theme", "dark");
+    expect(terminal.style.getPropertyValue("--background")).toBe("#131517");
+
+    act(() => writeTerminalThemeMode("light"));
+    expect(terminal).toHaveAttribute("data-terminal-theme", "light");
+    expect(terminal.style.getPropertyValue("--background")).toBe("");
   });
 });
 

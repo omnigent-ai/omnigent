@@ -1,5 +1,6 @@
 import type { Meta, StoryObj } from "@storybook/react-vite";
 import { userEvent, within } from "storybook/test";
+import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
 import { ToolCard } from "./ToolCard";
 
 const longOutput = Array.from(
@@ -223,6 +224,52 @@ export const ShellAnsiColors: Story = {
     state: "output-available",
     startedAt: null,
     duration: 0.04,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+const multiLineScript = [
+  "git diff --check",
+  "git status --short",
+  "git add web/src/lib/format.ts web/src/lib/format.test.ts " +
+    "web/src/components/blocks/ToolCard.tsx web/src/components/blocks/ToolCard.test.ts",
+  "cat > /tmp/commit-message.txt <<'EOF'",
+  "fix(web): prompt each shell command",
+  "EOF",
+  'PATH="$HOME/.nvm/versions/node/v22.22.3/bin:$PATH" git commit -s \\',
+  "  -F /tmp/commit-message.txt > /tmp/commit.log 2>&1",
+].join("\n");
+
+// The row shows the first line and a line count; the panel keeps one prompt,
+// and wrapped text indents under it.
+export const ShellMultiLineScript: Story = {
+  args: {
+    name: "Bash",
+    arguments: { command: multiLineScript },
+    output: " M web/src/components/blocks/ToolCard.tsx\n?? web/src/lib/format.ts",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.31,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// Settings > Terminal theme pinned to dark while the app is light.
+export const ShellDarkTerminalInLightApp: Story = {
+  args: {
+    name: "shell",
+    arguments: {
+      command: "/bin/zsh -lc 'git diff --stat --color=always origin/main'",
+      cwd: "/home/dev/omnigent",
+    },
+    output: ShellAnsiColors.args.output,
+    state: "output-available",
+    startedAt: null,
+    duration: 0.04,
+  },
+  beforeEach: () => {
+    writeTerminalThemeMode("dark");
+    return () => writeTerminalThemeMode("auto");
   },
   play: async ({ canvasElement }) => expand(canvasElement),
 };
