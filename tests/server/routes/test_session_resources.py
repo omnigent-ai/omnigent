@@ -42,6 +42,7 @@ from omnigent.server.auth import (
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.conversation_store import TreeUsageNode
 from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
@@ -159,29 +160,17 @@ class _ConversationStore:
             return self.persisted_by_stable_id[item_id]
         return next((item for item in self.appended_items if item.id == item_id), None)
 
-    def list_conversations(
-        self,
-        *,
-        limit: int = 20,
-        after: str | None = None,
-        kind: str | None = None,
-        root_conversation_id: str | None = None,
-        **_kwargs: Any,
-    ) -> PagedList[Conversation]:
-        """Minimal list for policy-builder subtree walk.
+    def list_tree_usage(self, root_conversation_id: str) -> list[TreeUsageNode]:
+        """Minimal tree read for the policy-builder subtree walk.
 
-        :param limit: Max items per page.
-        :param after: Cursor for pagination.
-        :param kind: Conversation kind filter (ignored when ``None``).
         :param root_conversation_id: Filter by root tree id.
-        :returns: A :class:`PagedList` of matching conversations.
+        :returns: One node per conversation sharing the root.
         """
-        convs = list(self._conversations.values())
-        if root_conversation_id is not None:
-            convs = [c for c in convs if c.root_conversation_id == root_conversation_id]
-        if kind is not None:
-            convs = [c for c in convs if c.kind == kind]
-        return PagedList(data=convs, has_more=False)
+        return [
+            TreeUsageNode(c.id, c.parent_conversation_id, c.session_usage)
+            for c in self._conversations.values()
+            if c.root_conversation_id == root_conversation_id
+        ]
 
     def update_conversation(
         self,

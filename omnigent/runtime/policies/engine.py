@@ -13,6 +13,7 @@ The orchestration here handles composition.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Any
 
@@ -82,6 +83,10 @@ class PolicyEngine:
         from the conversation's persisted ``session_usage`` at
         engine-build time so counters survive across turns.
         Defaults to all-zeros when no prior usage exists.
+    :param usage_loader: Deferred alternative to ``initial_usage`` for an
+        engine whose policies never read usage: the seed is loaded only
+        when :attr:`usage` or :meth:`record_usage` first needs it, and is
+        not injected into evaluations until then.
     :param token_pricing: Full per-token pricing from the MLflow
         catalog, including cache-read and cache-write rates.
         ``None`` when pricing is unavailable — ``total_cost_usd``
@@ -116,6 +121,7 @@ class PolicyEngine:
         initial_labels: dict[str, str],
         initial_session_state: dict[str, Any] | None = None,
         initial_usage: dict[str, float] | None = None,
+        usage_loader: Callable[[], dict[str, float]] | None = None,
         initial_subtree_usage: dict[str, float] | None = None,
         initial_user_daily_cost: list[dict[str, float | str | None]]
         | list[DailyCostState]
@@ -138,21 +144,11 @@ class PolicyEngine:
         self._root_conversation_id = root_conversation_id or conversation_id
         self._labels = dict(initial_labels)
         self._session_state: dict[str, Any] = dict(initial_session_state or {})
-        self._usage: dict[str, float] = dict(
-            initial_usage
-            or {
-                "input_tokens": 0,
-                "output_tokens": 0,
-                "total_tokens": 0,
-                "cache_read_input_tokens": 0,
-                "cache_creation_input_tokens": 0,
-                "total_cost_usd": 0.0,
-            }
+        # ``None`` until a deferred seed is first needed (see ``usage_loader``).
+        self._usage_loader = usage_loader
+        self._usage: dict[str, float] | None = (
+            None if usage_loader is not None else _usage_counters(initial_usage)
         )
-        # Ensure cache-token keys exist even when seeded from old
-        # persisted usage that predates cache-token tracking.
-        self._usage.setdefault("cache_read_input_tokens", 0)
-        self._usage.setdefault("cache_creation_input_tokens", 0)
         # Subtree-scoped usage seed (this conversation + its descendants
         # only, not the whole session tree). Seeded at build time ONLY when
         # a ``subagent_cost_budget`` policy is configured — ``None``
@@ -215,7 +211,15 @@ class PolicyEngine:
             ``cache_creation_input_tokens``, and
             ``total_cost_usd``.
         """
-        return dict(self._usage)
+        return dict(self._loaded_usage())
+
+    def _loaded_usage(self) -> dict[str, float]:
+        """Return the usage counters, resolving a deferred seed on first use."""
+        if self._usage is None:
+            if self._usage_loader is None:
+                raise RuntimeError("usage counters have neither a seed nor a loader")
+            self._usage = _usage_counters(self._usage_loader())
+        return self._usage
 
     @property
     def model(self) -> str | None:
@@ -755,11 +759,12 @@ class PolicyEngine:
             ``2000``. Defaults to ``0`` for providers that don't
             report cache breakdowns.
         """
-        self._usage["input_tokens"] += input_tokens
-        self._usage["output_tokens"] += output_tokens
-        self._usage["total_tokens"] += total_tokens
-        self._usage["cache_read_input_tokens"] += cache_read_input_tokens
-        self._usage["cache_creation_input_tokens"] += cache_creation_input_tokens
+        usage = self._loaded_usage()
+        usage["input_tokens"] += input_tokens
+        usage["output_tokens"] += output_tokens
+        usage["total_tokens"] += total_tokens
+        usage["cache_read_input_tokens"] += cache_read_input_tokens
+        usage["cache_creation_input_tokens"] += cache_creation_input_tokens
         if self._token_pricing is not None:
             delta_usage = {
                 "input_tokens": input_tokens,
@@ -768,7 +773,7 @@ class PolicyEngine:
                 "cache_creation_input_tokens": cache_creation_input_tokens,
             }
             delta_cost = compute_llm_cost(delta_usage, self._token_pricing)
-            self._usage["total_cost_usd"] += delta_cost
+            usage["total_cost_usd"] += delta_cost
         else:
             delta_cost = 0.0
         if self._subtree_usage is not None:
@@ -778,7 +783,7 @@ class PolicyEngine:
             self._subtree_usage["cache_read_input_tokens"] += cache_read_input_tokens
             self._subtree_usage["cache_creation_input_tokens"] += cache_creation_input_tokens
             self._subtree_usage["total_cost_usd"] += delta_cost
-        self._store.set_session_usage(self._conversation_id, dict(self._usage))
+        self._store.set_session_usage(self._conversation_id, dict(usage))
 
     def _inject_usage(self, ctx: EvaluationContext) -> EvaluationContext:
         """
@@ -792,8 +797,11 @@ class PolicyEngine:
         :param ctx: Original :class:`EvaluationContext` from the
             caller.
         :returns: A new :class:`EvaluationContext` with ``usage``
-            set to a defensive copy of the cumulative counters.
+            set to a defensive copy of the cumulative counters; *ctx*
+            unchanged while a deferred seed is unresolved.
         """
+        if self._usage is None:
+            return ctx
         return replace(ctx, usage=dict(self._usage))
 
     def _inject_subtree_usage(self, ctx: EvaluationContext) -> EvaluationContext:
@@ -1041,6 +1049,30 @@ class PolicyEngine:
             "conversation_id": self._conversation_id,
             "session_state": dict(self._session_state),
         }
+
+
+def _usage_counters(seed: dict[str, float] | None) -> dict[str, float]:
+    """Build the engine's mutable usage counters from a persisted seed.
+
+    :param seed: Summed usage, or ``None``/empty for a session with none yet.
+    :returns: A fresh dict with every counter the engine increments.
+    """
+    usage: dict[str, float] = dict(
+        seed
+        or {
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "total_tokens": 0,
+            "cache_read_input_tokens": 0,
+            "cache_creation_input_tokens": 0,
+            "total_cost_usd": 0.0,
+        }
+    )
+    # Ensure cache-token keys exist even when seeded from old
+    # persisted usage that predates cache-token tracking.
+    usage.setdefault("cache_read_input_tokens", 0)
+    usage.setdefault("cache_creation_input_tokens", 0)
+    return usage
 
 
 def _apply_one(state: dict[str, Any], op: StateUpdate) -> None:

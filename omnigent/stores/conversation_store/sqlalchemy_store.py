@@ -109,6 +109,7 @@ from omnigent.stores.conversation_store import (
     CreatedSession,
     DailyCostState,
     SessionConnectivity,
+    TreeUsageNode,
     pinned_label_key,
 )
 from omnigent.stores.conversation_store.overrides import (
@@ -171,6 +172,10 @@ _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 # single statement it always was.
 _LIST_ITEMS_MAX_ROWS_PER_STATEMENT = 200
 
+# Rows per spawn-tree usage page: one statement for realistic trees, and far
+# below every backend's bind-parameter limit for the split-DB usage read.
+_TREE_USAGE_PAGE_SIZE = 500
+
 # How many co-located sessions ``has_other_live_session_in_workspace`` will
 # name before it stops looking. Real directories hold one or two sessions; the
 # bound keeps the archived-filter query's ``IN`` list small and caps the work a
@@ -180,6 +185,11 @@ _WORKSPACE_SHARER_SCAN_LIMIT = 32
 
 class _RowCountResult(Protocol):
     rowcount: int
+
+
+def _usage(raw: str | None) -> dict[str, Any]:
+    """Parse a stored ``session_usage`` blob; empty when none is recorded."""
+    return json.loads(raw) if raw else {}
 
 
 def _to_conversation(
@@ -1411,6 +1421,93 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             for row in rows
         }
+
+    def list_tree_usage(self, root_conversation_id: str) -> list[TreeUsageNode]:
+        """
+        Narrow column read of tree shape plus each row's usage blob.
+
+        Keyset pages of :data:`_TREE_USAGE_PAGE_SIZE` rows ordered by ``id``
+        on the ``(workspace_id, root_conversation_id, id)`` index, so every
+        statement is bounded and a row deleted mid-walk cannot truncate it.
+        Selects columns rather than ORM entities and skips labels and the
+        other metadata blobs. See :meth:`ConversationStore.list_tree_usage`.
+        """
+        nodes: list[TreeUsageNode] = []
+        after: str | None = None
+        with shared_read_scope():
+            while True:
+                page = self._tree_usage_page(root_conversation_id, after)
+                nodes.extend(page)
+                if len(page) < _TREE_USAGE_PAGE_SIZE:
+                    return nodes
+                after = page[-1].id
+
+    def _tree_usage_page(
+        self, root_conversation_id: str, after: str | None
+    ) -> list[TreeUsageNode]:
+        """
+        One page of :meth:`list_tree_usage`, after the ``after`` id.
+
+        One joined statement when conversations and metadata share an engine;
+        otherwise the page's shape from the AP DB, then its usage by primary key.
+        """
+        workspace_id = current_workspace_id()
+        in_page = [
+            SqlConversation.workspace_id == workspace_id,
+            SqlConversation.root_conversation_id == root_conversation_id,
+        ]
+        if after is not None:
+            in_page.append(SqlConversation.id > after)
+        if self._conv_engine is self._engine:
+            with self._conv_session("list_tree_usage") as session:
+                rows = session.execute(
+                    select(
+                        SqlConversation.id,
+                        SqlConversation.parent_conversation_id,
+                        SqlConversationMetadata.session_usage,
+                    )
+                    .outerjoin(
+                        SqlConversationMetadata,
+                        and_(
+                            SqlConversationMetadata.workspace_id == SqlConversation.workspace_id,
+                            SqlConversationMetadata.id == SqlConversation.id,
+                        ),
+                    )
+                    .where(*in_page)
+                    .order_by(SqlConversation.id)
+                    .limit(_TREE_USAGE_PAGE_SIZE)
+                ).all()
+            return [
+                TreeUsageNode(id=row_id, parent_conversation_id=parent, session_usage=_usage(raw))
+                for row_id, parent, raw in rows
+            ]
+        with self._conv_session("list_tree_usage") as session:
+            shape = session.execute(
+                select(SqlConversation.id, SqlConversation.parent_conversation_id)
+                .where(*in_page)
+                .order_by(SqlConversation.id)
+                .limit(_TREE_USAGE_PAGE_SIZE)
+            ).all()
+        if not shape:
+            return []
+        usage_by_id: dict[str, str | None] = {}
+        with self._session("list_tree_usage") as meta_sess:
+            usage_rows = meta_sess.execute(
+                select(SqlConversationMetadata.id, SqlConversationMetadata.session_usage).where(
+                    SqlConversationMetadata.workspace_id == workspace_id,
+                    SqlConversationMetadata.id.in_([row.id for row in shape]),
+                )
+            )
+            for meta_id, raw in usage_rows:
+                usage_by_id[meta_id] = raw
+        return [
+            TreeUsageNode(
+                id=row.id,
+                parent_conversation_id=row.parent_conversation_id,
+                session_usage=_usage(usage_by_id.get(row.id)),
+            )
+            for row in shape
+        ]
 
     def list_child_conversation_ids_by_parent(
         self,

@@ -318,6 +318,81 @@ def test_get_conversations_empty_input_skips_query(
     assert conversation_store.get_conversations([]) == {}
 
 
+def test_list_tree_usage_matches_the_full_tree_listing(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Single-DB mode: one joined statement covers the full listing's rows."""
+    from tests.stores.tree_usage_scenario import assert_tree_usage_matches_full_listing
+
+    assert_tree_usage_matches_full_listing(conversation_store)
+
+
+@pytest.mark.parametrize("page_size", [1, 2])
+def test_list_tree_usage_reads_bounded_pages(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    page_size: int,
+) -> None:
+    """Every tree statement is limited, and pages still cover the whole tree."""
+    from sqlalchemy import event as sa_event
+
+    from omnigent.stores.conversation_store import sqlalchemy_store
+    from tests.stores.tree_usage_scenario import assert_tree_usage_matches_full_listing
+
+    monkeypatch.setattr(sqlalchemy_store, "_TREE_USAGE_PAGE_SIZE", page_size)
+    statements: list[str] = []
+
+    def _on_exec(conn, cursor, statement, parameters, context, executemany):
+        statements.append(" ".join(statement.split()))
+
+    sa_event.listen(conversation_store._conv_engine, "before_cursor_execute", _on_exec)
+    try:
+        assert_tree_usage_matches_full_listing(conversation_store)
+    finally:
+        sa_event.remove(conversation_store._conv_engine, "before_cursor_execute", _on_exec)
+    tree_reads = [q for q in statements if "root_conversation_id = " in q]
+    assert len(tree_reads) > 1, "the tree should span several pages"
+    assert all(" LIMIT " in q for q in tree_reads), tree_reads
+
+
+def test_list_tree_usage_survives_a_delete_between_pages(
+    conversation_store: SqlAlchemyConversationStore, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Deleting the last row of a page mid-walk cannot drop the rows after it."""
+    import asyncio
+
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    root = conversation_store.create_conversation(conversation_id="00" * 15 + "01")
+    children = [
+        conversation_store.create_conversation(
+            conversation_id="00" * 15 + f"{suffix:02x}",
+            kind="sub_agent",
+            title=f"worker:{suffix}",
+            parent_conversation_id=root.id,
+        )
+        for suffix in (2, 3, 4)
+    ]
+    for conversation in [root, *children]:
+        conversation_store.set_session_usage(conversation.id, {"total_cost_usd": 1.0})
+    monkeypatch.setattr(sqlalchemy_store, "_TREE_USAGE_PAGE_SIZE", 2)
+    read_page = conversation_store._tree_usage_page
+    deleted: list[str] = []
+
+    def _delete_after_first_page(root_id: str, after: str | None) -> list:  # type: ignore[type-arg]
+        page = read_page(root_id, after)
+        if not deleted:
+            deleted.append(page[-1].id)
+            asyncio.run(conversation_store.delete_conversation(page[-1].id))
+        return page
+
+    monkeypatch.setattr(conversation_store, "_tree_usage_page", _delete_after_first_page)
+    nodes = conversation_store.list_tree_usage(root.id)
+
+    assert deleted == [children[0].id]
+    assert [node.id for node in nodes] == [root.id, *(child.id for child in children)]
+
+
 def test_list_latest_message_items_for_conversations(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:

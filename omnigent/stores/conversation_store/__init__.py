@@ -306,6 +306,26 @@ class SessionConnectivity:
     runner_last_seen: int | None = None
 
 
+@dataclass(frozen=True)
+class TreeUsageNode:
+    """
+    One spawn-tree row narrowed to what usage accounting reads.
+
+    Returned by :meth:`ConversationStore.list_tree_usage` so cost gating and
+    the subtree-cost display can sum a tree without hydrating full
+    :class:`Conversation` entities (labels, session state, overrides).
+
+    :param id: Conversation id, e.g. ``"conv_abc123"``.
+    :param parent_conversation_id: Spawning parent, or ``None`` for the root.
+    :param session_usage: The conversation's own persisted usage; empty when
+        none is recorded.
+    """
+
+    id: str
+    parent_conversation_id: str | None
+    session_usage: dict[str, Any]
+
+
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
 # replica refreshes live runners every ~30s (the tunnel ping interval),
 # so 3 missed refreshes = offline — the same budget the tunnel's own
@@ -672,6 +692,22 @@ class ConversationStore(ABC):
             don't resolve to a row are omitted (the caller decides
             whether a missing id is an error), so the result may be
             smaller than the input.
+        """
+        ...
+
+    @abstractmethod
+    def list_tree_usage(self, root_conversation_id: str) -> list[TreeUsageNode]:
+        """
+        Return every conversation in one spawn tree, narrowed to usage fields.
+
+        Covers the same rows as ``list_conversations(kind=None,
+        root_conversation_id=..., include_archived=True)`` — archived rows
+        included, since they still hold spend — without hydrating full
+        conversations, reading in bounded pages.
+
+        :param root_conversation_id: The tree's root id, e.g. ``"conv_abc123"``.
+        :returns: One node per conversation in the tree, in no particular
+            order. Empty when no conversation has that root.
         """
         ...
 

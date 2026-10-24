@@ -36,6 +36,8 @@ from omnigent.runtime.policies.builder import build_policy_engine
 from omnigent.spec.parser import parse
 from omnigent.spec.types import (
     AgentSpec,
+    FunctionPolicySpec,
+    FunctionRef,
     GuardrailsSpec,
     LabelDef,
     Phase,
@@ -63,6 +65,18 @@ def _rebind(store: SqlAlchemyConversationStore, conversation_id: str, agent_id: 
             .values(agent_id=agent_id)
         )
     assert result.rowcount == 1, f"rebind matched {result.rowcount} rows for {conversation_id!r}"
+
+
+# A session cost budget: reads ``event["context"]["usage"]``, so the builder
+# must seed usage eagerly from the spawn tree.
+_COST_BUDGET_POLICY = FunctionPolicySpec(
+    name="session_budget",
+    on=None,
+    function=FunctionRef(
+        path="omnigent.policies.builtins.cost.cost_budget",
+        arguments={"max_cost_usd": 100.0},
+    ),
+)
 
 
 def _sub_agent_title() -> str:
@@ -1150,14 +1164,12 @@ def test_build_issues_one_read_and_one_tree_scan(
     preloaded: bool,
 ) -> None:
     """
-    One engine build costs one conversation read plus ONE spawn-tree scan,
-    and nothing at all for the read when the caller supplies the row.
+    One engine build costs one conversation read, one bulk refresh of the
+    evaluated row and its root, and ONE narrow spawn-tree read — and nothing
+    for the first read when the caller supplies the row.
 
-    Counts SQL STATEMENTS, not store-method calls: the redundancy this
-    change removes was measured in queries, and a store-call count cannot
-    see a helper that issues three statements per call. The builder used to
-    re-fetch the conversation ~4x and walk the tree twice, once per usage
-    seed.
+    Counts SQL STATEMENTS, not store-method calls: a store-call count cannot
+    see a helper that issues three statements per call.
 
     Both seeds must stay correct and identical either way: session-wide
     gating from the whole tree, subtree display from the node's own subtree.
@@ -1198,18 +1210,212 @@ def test_build_issues_one_read_and_one_tree_scan(
     assert engine._subtree_usage is not None
     assert engine._subtree_usage["total_cost_usd"] == pytest.approx(0.05)
 
-    # The tree scan is one paged listing; the conversation read is a triplet
-    # (row + metadata + labels) and disappears entirely with a preload.
     # Shape first, then the total. SQLite's connection PRAGMAs are setup, not
     # work the builder asked for.
     executed = [" ".join(q.split()) for q in statements if not q.startswith("PRAGMA")]
     tree_scans = [q for q in executed if "root_conversation_id = " in q]
     point_reads = [q for q in executed if "FROM conversations" in q and "conversations.id = " in q]
+    label_reads = [q for q in executed if "FROM conversation_labels" in q]
     assert len(tree_scans) == 1, executed
+    assert tree_scans[0].startswith(
+        "SELECT conversations.id, conversations.parent_conversation_id, "
+        "omnigent_conversation_metadata.session_usage FROM"
+    ), "the tree scan must select columns, not hydrate whole rows"
     assert len(point_reads) == (0 if preloaded else 1), executed
-    # A conversation read is a triplet (row + metadata + labels), and so is the
-    # tree scan; the preload removes one whole triplet.
-    assert len(executed) == (3 if preloaded else 6), [q[:80] for q in executed]
+    # Labels only for rows the engine decides from, never the whole tree.
+    assert len(label_reads) == (1 if preloaded else 2), executed
+    # A conversation read is a triplet (row + metadata + labels), as is the
+    # bulk refresh of self and root; the tree read is one joined statement.
+    # The preload removes the first triplet.
+    assert len(executed) == (4 if preloaded else 7), [q[:80] for q in executed]
+
+
+def _usage_tree(store: SqlAlchemyConversationStore) -> tuple[str, str]:
+    """A root with two sub-agents that each recorded spend; returns (root, child)."""
+    root = store.create_conversation()
+    child = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id, title=_sub_agent_title()
+    )
+    sibling = store.create_conversation(
+        kind="sub_agent", parent_conversation_id=root.id, title=_sub_agent_title()
+    )
+    store.set_session_usage(
+        root.id,
+        {"input_tokens": 100, "output_tokens": 20, "total_tokens": 120, "total_cost_usd": 0.5},
+    )
+    store.set_session_usage(child.id, {"total_cost_usd": 0.25, "policy_cost_usd": 0.3})
+    store.set_session_usage(sibling.id, {"input_tokens": 7, "total_cost_usd": 0.125})
+    return root.id, child.id
+
+
+def test_build_skips_the_tree_when_no_policy_reads_usage(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    No usage-reading policy means no spawn-tree read during the build.
+
+    The deferred seed must still equal the eager one the moment something
+    asks for it, so introspection and persistence see the same numbers.
+    """
+    _, child_id = _usage_tree(conversation_store)
+    eager = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=child_id,
+        conversation_store=conversation_store,
+        default_policies=[_COST_BUDGET_POLICY],
+    )
+
+    tree_reads: list[str] = []
+    original = conversation_store.list_tree_usage
+
+    def _spy(root_conversation_id: str) -> object:
+        tree_reads.append(root_conversation_id)
+        return original(root_conversation_id)
+
+    conversation_store.list_tree_usage = _spy  # type: ignore[method-assign]
+    deferred = build_policy_engine(
+        spec=AgentSpec(spec_version=1, name="x"),
+        conversation_id=child_id,
+        conversation_store=conversation_store,
+    )
+    assert tree_reads == [], "a build with no usage-reading policy read the tree"
+    assert deferred.usage == eager.usage
+    assert len(tree_reads) == 1
+
+
+def test_deferred_usage_seed_persists_what_the_eager_seed_would(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """``record_usage`` resolves a deferred seed first, so it persists the same totals."""
+    _, child_id = _usage_tree(conversation_store)
+    before = conversation_store.get_conversation(child_id)
+    assert before is not None
+    persisted: list[dict[str, float]] = []
+    for policies in ([_COST_BUDGET_POLICY], None):
+        engine = build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=child_id,
+            conversation_store=conversation_store,
+            default_policies=policies,
+        )
+        engine.record_usage(input_tokens=10, output_tokens=5, total_tokens=15)
+        after = conversation_store.get_conversation(child_id)
+        assert after is not None
+        persisted.append(after.session_usage)
+        conversation_store.set_session_usage(child_id, before.session_usage)
+
+    assert persisted[0] == persisted[1]
+
+
+@pytest.mark.parametrize(
+    ("paths", "reads"),
+    [
+        (["omnigent.policies.builtins.safety.ask_on_add_policy"], False),
+        (["omnigent.policies.builtins.safety.ask_on_scheduled_task_change"], False),
+        (["omnigent.policies.builtins.cost.cost_budget"], True),
+        (["omnigent.policies.builtins.cel.cel"], True),
+        (["my_company.policies.custom"], True),
+        (["omnigent.policies.builtins.safety.ask_on_add_policy", "my_company.policies.x"], True),
+    ],
+)
+def test_only_listed_policies_are_trusted_not_to_read_usage(paths: list[str], reads: bool) -> None:
+    """Anything not verified usage-free keeps its eager seed."""
+    from omnigent.runtime.policies.builder import _policies_read_usage
+
+    specs = [
+        FunctionPolicySpec(name=f"p{i}", on=None, function=FunctionRef(path=path))
+        for i, path in enumerate(paths)
+    ]
+    assert _policies_read_usage(specs) is reads  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize(
+    "tool", ["sys_add_policy", "sys_scheduled_task_create", "sys_scheduled_task_update", "Bash"]
+)
+def test_usage_free_policies_never_touch_usage(tool: str) -> None:
+    """
+    Every allow-listed policy decides without reading ``event["context"]``.
+
+    The always-injected approval policies must all be on the list: one that
+    is not makes every build look like a usage reader and read the tree.
+    """
+    import importlib
+
+    from omnigent.runtime.policies.builder import (
+        _REQUIRED_APPROVAL_SPECS,
+        _USAGE_FREE_POLICY_PATHS,
+    )
+
+    class _NoContext(dict):  # type: ignore[type-arg]
+        def __getitem__(self, key: object) -> object:
+            if key == "context":
+                raise AssertionError("usage-free policy read the context")
+            return super().__getitem__(key)
+
+        def get(self, key: object, default: object = None) -> object:
+            if key == "context":
+                raise AssertionError("usage-free policy read the context")
+            return super().get(key, default)
+
+    required = {spec.function.path for spec in _REQUIRED_APPROVAL_SPECS if spec.function}
+    assert required <= _USAGE_FREE_POLICY_PATHS, required - _USAGE_FREE_POLICY_PATHS
+    for path in _USAGE_FREE_POLICY_PATHS:
+        module, name = path.rsplit(".", 1)
+        policy = getattr(importlib.import_module(module), name)
+        event = _NoContext(
+            type="tool_call",
+            target=tool,
+            data={"name": tool, "arguments": {"name": "p"}},
+            context={},
+        )
+        policy(event)  # type: ignore[arg-type]
+
+
+def test_build_reads_a_large_tree_without_hydrating_it(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    Engine cost must not scale with the spawn tree's full rows.
+
+    Every evaluation used to page the whole tree through ``list_conversations``
+    — ORM rows, metadata blobs and every label — to sum a few numbers. A tree
+    past one old page (100 rows) pins that the build reads it in the same
+    constant statements as a three-node tree, and labels only the evaluated row.
+    """
+    parent = conversation_store.create_conversation()
+    children = [
+        conversation_store.create_conversation(
+            kind="sub_agent", parent_conversation_id=parent.id, title=_sub_agent_title()
+        )
+        for _ in range(120)
+    ]
+    for node in [parent, *children]:
+        conversation_store.set_session_usage(node.id, {"total_cost_usd": 0.01})
+        conversation_store.set_labels(node.id, {"k": "v"})
+    row = conversation_store.get_conversation(parent.id)
+
+    listed: list[object] = []
+    original_list = conversation_store.list_conversations
+
+    def _spy_list(*args: object, **kwargs: object) -> object:
+        listed.append(kwargs)
+        return original_list(*args, **kwargs)  # type: ignore[arg-type]
+
+    conversation_store.list_conversations = _spy_list  # type: ignore[method-assign]
+    with _count_sql(conversation_store) as statements:
+        engine = build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="parent"),
+            conversation_id=parent.id,
+            conversation_store=conversation_store,
+            conversation=row,
+            default_policies=[_COST_BUDGET_POLICY],
+        )
+
+    assert engine.usage["total_cost_usd"] == pytest.approx(1.21)
+    assert listed == [], "the build must not list the tree as full conversations"
+    executed = [q for q in statements if not q.startswith("PRAGMA")]
+    # The bulk refresh triplet plus one joined tree read.
+    assert len(executed) == 4, [q[:80] for q in executed]
 
 
 def test_build_counts_archived_spend_and_inherits_approval(
@@ -1659,12 +1865,13 @@ def test_recreated_conversation_is_summed_in_its_new_tree(
     )
 
 
-class _MutateOnTreeLoad:
-    """Store proxy that commits *hazard* the first time the tree is scanned.
+class _MutateBeforeRefresh:
+    """Store proxy that commits *hazard* just before the builder's refresh read.
 
-    The builder reads the conversation, then scans the spawn tree. Anything
-    committed in between makes the earlier read stale — which is the window
-    the freshness refresh exists to close, whoever performed that read.
+    The builder holds a conversation row (preloaded or its own read), then
+    re-reads the rows it decides from. Anything committed in between makes
+    the earlier row stale — the window the refresh exists to close, whoever
+    performed that earlier read.
     """
 
     def __init__(self, inner: object, hazard: Callable[[], None]) -> None:
@@ -1672,11 +1879,11 @@ class _MutateOnTreeLoad:
         self._hazard = hazard
         self._fired = False
 
-    def list_conversations(self, *args: object, **kwargs: object) -> object:
+    def get_conversations(self, *args: object, **kwargs: object) -> object:
         if not self._fired:
             self._fired = True
             self._hazard()
-        return self._inner.list_conversations(*args, **kwargs)  # type: ignore[attr-defined]
+        return self._inner.get_conversations(*args, **kwargs)  # type: ignore[attr-defined]
 
     def __getattr__(self, name: str) -> object:
         return getattr(self._inner, name)
@@ -1690,8 +1897,8 @@ def test_mid_build_change_fails_closed_on_every_provenance(
     hazard: str,
 ) -> None:
     """
-    A change landing between the conversation read and the tree scan must
-    fail closed — regardless of who performed that read.
+    A change landing between the conversation read and the builder's refresh
+    must fail closed — regardless of who performed that read.
 
     Parametrized over provenance on purpose. An earlier revision gated the
     refresh on ``conversation is not None``, so the caller-preload path was
@@ -1722,7 +1929,7 @@ def test_mid_build_change_fails_closed_on_every_provenance(
 
         expected = "disappeared"
 
-    store = _MutateOnTreeLoad(conversation_store, _apply)
+    store = _MutateBeforeRefresh(conversation_store, _apply)
     with pytest.raises(OmnigentError, match=expected):
         build_policy_engine(
             spec=AgentSpec(spec_version=1, name="x"),
@@ -1820,82 +2027,134 @@ def test_engine_seeds_the_new_tree_when_a_child_is_recreated_elsewhere(
     )
 
 
+@pytest.mark.parametrize("mutation", ["move", "delete"])
+def test_engine_refuses_a_tree_that_changes_between_pages(
+    conversation_store: SqlAlchemyConversationStore,
+    monkeypatch: pytest.MonkeyPatch,
+    mutation: str,
+) -> None:
+    """
+    A move or delete landing between tree pages fails closed.
+
+    The tree is read in bounded pages ordered by id. The evaluated child sorts
+    last, so a change after the first page removes it from the rows read, and
+    the build must refuse rather than sum a tree the child has left.
+    """
+    import asyncio
+
+    from omnigent.errors import OmnigentError
+    from omnigent.stores.conversation_store import sqlalchemy_store
+
+    root = conversation_store.create_conversation(conversation_id="00" * 15 + "01")
+    for suffix in (2, 3):
+        conversation_store.create_conversation(
+            conversation_id="00" * 15 + f"{suffix:02x}",
+            kind="sub_agent",
+            parent_conversation_id=root.id,
+            title=_sub_agent_title(),
+        )
+    child = conversation_store.create_conversation(
+        conversation_id="ff" * 16,
+        kind="sub_agent",
+        parent_conversation_id=root.id,
+        title=_sub_agent_title(),
+    )
+    monkeypatch.setattr(sqlalchemy_store, "_TREE_USAGE_PAGE_SIZE", 2)
+    read_page = conversation_store._tree_usage_page
+    fired: list[bool] = []
+
+    def _change_after_first_page(root_id: str, after: str | None) -> list:  # type: ignore[type-arg]
+        page = read_page(root_id, after)
+        if not fired:
+            fired.append(True)
+            asyncio.run(conversation_store.delete_conversation(child.id))
+            if mutation == "move":
+                elsewhere = conversation_store.create_conversation(title="elsewhere")
+                conversation_store.create_conversation(
+                    conversation_id=child.id,
+                    kind="sub_agent",
+                    parent_conversation_id=elsewhere.id,
+                    title=_sub_agent_title(),
+                )
+        return page
+
+    monkeypatch.setattr(conversation_store, "_tree_usage_page", _change_after_first_page)
+    expected = (
+        "moved while its spawn tree"
+        if mutation == "move"
+        else "disappeared while building its policy engine"
+    )
+    with pytest.raises(OmnigentError, match=expected):
+        build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=child.id,
+            conversation_store=conversation_store,
+            default_policies=[_COST_BUDGET_POLICY],
+        )
+    assert fired
+
+
 @pytest.mark.parametrize("preload", [True, False], ids=["preloaded", "no-preload"])
-@pytest.mark.parametrize("mutation", ["switch", "delete"])
-def test_engine_refuses_a_tree_assembled_across_a_change(
+@pytest.mark.parametrize("mutation", ["move", "delete"])
+def test_engine_refuses_a_tree_that_changed_after_it_was_read(
     conversation_store: SqlAlchemyConversationStore,
     preload: bool,
     mutation: str,
 ) -> None:
     """
-    A paged tree does not share one read instant, so it cannot vouch for
-    itself.
+    The decision row is read first; the usage sums come from the tree after it.
 
-    Rows on page one are read before page two. The refresh takes the
-    evaluated row from the tree, so for a paged tree that row may predate
-    the last page — "the tree read is newer" is true of the tree, not of any
-    row in it. A switch OR a delete landing during paging must be caught
-    the same way, whether or not the caller preloaded the row — all four
-    preload/no-preload x switch/delete combinations previously proceeded.
+    A change landing between the two must fail closed rather than pair one
+    tree's spend with a row that has left it. A conversation recreated under
+    another root would gate on the old tree's spend and inherit the old
+    root's approvals; a deleted one would authorize from nothing. Both
+    provenances of the first read are covered.
     """
     import asyncio
 
     from omnigent.errors import OmnigentError
-    from omnigent.runtime.policies import builder as builder_mod
 
-    root = conversation_store.create_conversation(title="paged-root")
+    root = conversation_store.create_conversation(title="tree-root")
     child = conversation_store.create_conversation(
         kind="sub_agent", parent_conversation_id=root.id, title=_sub_agent_title()
     )
     row = conversation_store.get_conversation(child.id)
 
-    class _MutateDuringPaging:
-        """Switches or deletes the evaluated conversation between tree pages."""
+    class _MutateAfterRefresh:
+        """Moves or deletes the evaluated conversation once its row is re-read."""
 
         def __init__(self, inner: SqlAlchemyConversationStore) -> None:
             self._inner = inner
-            self._pages = 0
-            self._fired = False
 
-        def list_conversations(self, *args: object, **kwargs: object):
-            page = self._inner.list_conversations(*args, **kwargs)  # type: ignore[arg-type]
-            self._pages += 1
-            # Fire once the page holding the evaluated row has been read —
-            # which page that is depends on listing order, so keying on "page
-            # one" made the interleave dialect-dependent.
-            if not self._fired and any(c.id == child.id for c in page.data):
-                self._fired = True
-                if mutation == "switch":
-                    _rebind(self._inner, child.id, uuid.uuid4().hex)
-                else:
-                    asyncio.run(self._inner.delete_conversation(child.id))
-            return page
+        def get_conversations(self, conversation_ids: list[str]) -> object:
+            rows = self._inner.get_conversations(conversation_ids)
+            asyncio.run(self._inner.delete_conversation(child.id))
+            if mutation == "move":
+                elsewhere = self._inner.create_conversation(title="elsewhere")
+                self._inner.create_conversation(
+                    conversation_id=child.id,
+                    kind="sub_agent",
+                    parent_conversation_id=elsewhere.id,
+                    title=_sub_agent_title(),
+                )
+            return rows
 
-        def __getattr__(self, name: str):
+        def __getattr__(self, name: str) -> object:
             return getattr(self._inner, name)
 
-    # One row per page, so the tree genuinely pages. A switch survives the
-    # walk and is caught by the paged-tree guard ("moved"). A delete of the
-    # evaluated row invalidates the page cursor, so the walk restarts and the
-    # clean re-read observes the row is genuinely gone ("disappeared") — a
-    # different guard, same fail-closed refusal.
     expected = (
         "moved while its spawn tree"
-        if mutation == "switch"
+        if mutation == "move"
         else "disappeared while building its policy engine"
     )
-    original_page_size = builder_mod._SUBTREE_USAGE_PAGE_SIZE
-    builder_mod._SUBTREE_USAGE_PAGE_SIZE = 1
-    try:
-        with pytest.raises(OmnigentError, match=expected):
-            build_policy_engine(
-                spec=AgentSpec(spec_version=1, name="x"),
-                conversation_id=child.id,
-                conversation_store=_MutateDuringPaging(conversation_store),  # type: ignore[arg-type]
-                conversation=row if preload else None,
-            )
-    finally:
-        builder_mod._SUBTREE_USAGE_PAGE_SIZE = original_page_size
+    with pytest.raises(OmnigentError, match=expected):
+        build_policy_engine(
+            spec=AgentSpec(spec_version=1, name="x"),
+            conversation_id=child.id,
+            conversation_store=_MutateAfterRefresh(conversation_store),  # type: ignore[arg-type]
+            conversation=row if preload else None,
+            default_policies=[_COST_BUDGET_POLICY],
+        )
 
 
 @pytest.mark.parametrize(
