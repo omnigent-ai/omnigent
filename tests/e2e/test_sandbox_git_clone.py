@@ -183,6 +183,30 @@ def test_clone_policy_checkout_recovery_and_retained_workspace(
                 "git", "credential", "fill", input="protocol=https\nhost=github.com\n\n"
             )
             assert f"password={token}" in credential.splitlines()
+
+        project_venv = tmp_path / "project" / ".venv"
+        run(sys.executable, "-m", "venv", "--without-pip", str(project_venv))
+        # PYTHONPATH would let the project interpreter import Omnigent anyway.
+        project_env = {key: value for key, value in env.items() if key != "PYTHONPATH"}
+        project_env.update(
+            VIRTUAL_ENV=str(project_venv),
+            PATH=str(project_venv / "bin") + os.pathsep + env["PATH"],
+        )
+        broker_calls = len(requests)
+        project_credential = subprocess.run(
+            ["git", "credential", "fill"],
+            cwd=checkout,
+            env=project_env,
+            input="protocol=https\nhost=github.com\n\n",
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+        assert f"password={state['token']}" in project_credential.stdout.splitlines(), (
+            project_credential.stderr
+        )
+        assert len(requests) == broker_calls + 1
         assert requests and all(requests)
         assert state["token"] not in (checkout / ".git/config").read_text()
     finally:

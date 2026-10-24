@@ -149,13 +149,16 @@ def _install_broker_helper(server_url: str, host_id: str, token: str) -> None:
     would vend first and silently bypass the per-user broker. An empty value
     clears the inherited chain for github.com, so only the broker remains.
 
-    Idempotent by ``--replace-all``: the workspace-prep init container and the
-    host both wire the broker into the same shared ~/.gitconfig (and the host
-    re-runs on every resume). A plain set can't overwrite the 2+ values that
-    leaves, so without ``--replace-all`` broker entries would pile up.
+    Idempotent by ``--replace-all``: the host re-runs this against the same
+    ~/.gitconfig on every start and resume. A plain set can't overwrite the 2+
+    values a previous run leaves, so without ``--replace-all`` broker entries
+    would pile up.
+
+    Pins the host's own interpreter: an activated project virtualenv or
+    ``uv run`` puts a ``python3`` without Omnigent earlier on git's PATH.
     """
     helper = (
-        "!python3 -m omnigent.git_credential_github "
+        f"!{shlex.quote(sys.executable)} -m omnigent.git_credential_github "
         f"--server {shlex.quote(server_url)} --host-id {shlex.quote(host_id)} "
         f"--host-token {shlex.quote(token)}"
     )
