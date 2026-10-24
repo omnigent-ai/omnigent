@@ -323,6 +323,7 @@ output, it records `detail_source=missing`.
 | `failure_source`, `detail_source` | Distinguish Claude hooks, explicit transcript API errors, forwarder delivery failures, and legacy external status data |
 | `failure_id` | Stable observation identity across forwarding retries; deduplicate observations by this ID |
 | `native_error_category` | Original hook category, retained even when last-assistant text is also present |
+| `transcript_error_context_state` | Why a failed parent hook reused or declined the retained transcript API error; `hook_details_present` means the hook supplied its own detail and no lookup ran |
 | `native_error_message` | Bounded, redacted text from an explicit API-error record or formatted API-error payload, before display rewriting |
 | `native_session_id`, `native_agent_id`, `native_agent_role` | Native actor identity when supplied or established by the existing hook suppression rules |
 | `native_hook_event`, `native_hook_cursor`, `native_hook_offset`, `native_hook_recorded_at` | Original hook position and timestamp; not the time of a retry |
@@ -338,6 +339,18 @@ The server also retains typed provider fields from explicit failed-status
 another JSON error. Parsing is limited to 16,384 characters and three envelopes; malformed
 or unmarked text adds no inferred facts. Stored assistant prose and idle or
 cancelled status edges are not parsed for provider facts.
+
+For category-only Claude hooks, `transcript_error_context_state` distinguishes
+`matched`, `forward_state_unavailable`, `native_session_unavailable`,
+`response_mismatch`, `no_api_error_context`, `unmarked_error_context`,
+`native_session_mismatch`, `subagent_context`, and `error_text_unavailable`.
+An unavailable forwarder checkpoint may be missing, unreadable or malformed;
+it does not establish that the transcript file is missing. No retained API-error
+context can mean it was never observed or was cleared by later output. These
+states explain the existing lookup decision without reading the transcript or
+diagnostic files again, exporting their paths, or inferring a provider cause.
+The runner and server both need the updated failure-context normalizer; older
+servers drop this field.
 
 `provider_error_type`, `provider_error_code`, `provider_error_param`, available
 HTTP status and explicitly named request IDs reach the existing failure record

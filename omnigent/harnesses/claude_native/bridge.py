@@ -1925,14 +1925,16 @@ def _account_home_dir() -> Path:
 
 def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
     """
-    Pre-accept Claude Code's first-run trust + onboarding prompts.
+    Pre-accept Claude Code's first-run trust, onboarding, and mode prompts.
 
-    Claude Code blocks on two TUI prompts the first time it launches in
+    Claude Code blocks on TUI prompts the first time it launches in
     a new context: a global onboarding flow (theme / login) gated by the
     top-level ``hasCompletedOnboarding`` key in its global config
-    (:func:`claude_global_config_path`, usually ``~/.claude.json``), and a
+    (:func:`claude_global_config_path`, usually ``~/.claude.json``), a
     per-directory "Do you trust the files in this folder?" dialog gated
-    by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
+    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, and a "Make auto
+    mode your default permission mode?" question gated by
+    ``hasSeenAutoDefaultNudge``. None fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
@@ -1941,10 +1943,10 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     rooted at the home directory, whose interactively accepted trust
     Claude keeps for that session only.
 
-    Seed both gating keys idempotently so the launch never blocks. Only
-    those two keys are written; all other global config state (the
+    Seed the gating keys idempotently so the launch never blocks. Only
+    those keys are written; all other global config state (the
     user's own onboarding choices, project history, MCP config, OAuth
-    account) is preserved, and the file is left untouched when both keys
+    account) is preserved, and the file is left untouched when all keys
     are already set. This deliberately does NOT skip per-tool permission
     prompts — those still route to the web UI via the ``PermissionRequest``
     hook; only the unhookable startup gates are pre-accepted.
@@ -1996,6 +1998,11 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     # has never run Claude Code interactively.
     if data.get("hasCompletedOnboarding") is not True:
         data["hasCompletedOnboarding"] = True
+        changed = True
+    # Startup question offering to make auto the default mode, asked when the
+    # user's own settings pin another default. Declining it sets only this key.
+    if data.get("hasSeenAutoDefaultNudge") is not True:
+        data["hasSeenAutoDefaultNudge"] = True
         changed = True
 
     # Per-directory trust gate. Claude keys its ``projects`` map by the
@@ -6152,7 +6159,7 @@ def _composer_rows(pane: str) -> list[str]:
     :returns: The framed rows, e.g. ``["❯", "[Pasted text #1 +7 lines]"]``.
     """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
+    rules = _composer_frame_rule_indices(non_empty)
     if not rules:
         return []
     candidates = [rules[-2] + 1] if len(rules) >= 2 else []
@@ -6177,6 +6184,19 @@ class _ComposerBox(NamedTuple):
     framed: bool
 
 
+def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
+    """Keep frame edges, excluding further-indented rule text in a draft.
+
+    The last two rules can be a frame edge and a draft line; the less-indented
+    rule identifies the frame in both a complete and a clipped input box.
+    """
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if len(rules) < 2:
+        return rules
+    frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
+    return [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
+
+
 def _composer_box(pane: str) -> _ComposerBox | None:
     """
     Return every visible row of Claude Code's live input box, or ``None``.
@@ -6191,7 +6211,7 @@ def _composer_box(pane: str) -> _ComposerBox | None:
         screen, or ``None`` when no input box is on screen.
     """
     lines = pane.splitlines()
-    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    rules = _composer_frame_rule_indices(lines)
     if not rules:
         return None
     if len(rules) >= 2:

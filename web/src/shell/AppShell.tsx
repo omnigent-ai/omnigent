@@ -94,6 +94,7 @@ import {
   useDeleteTerminal,
 } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "./useWorkspaceResources";
+import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { citedFilePosition } from "./filePositionState";
 import { cn } from "@/lib/utils";
 import {
@@ -1442,6 +1443,8 @@ function AppShellImpl() {
     },
     [commitFileNavigation],
   );
+
+  useUiOpenFile(serverConversationId, showFilesPanel, openFileViewer);
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*

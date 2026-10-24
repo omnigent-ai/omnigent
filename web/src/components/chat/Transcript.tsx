@@ -670,7 +670,16 @@ export function VirtualBubbleList({
     };
     measure(false);
     if (typeof ResizeObserver === "undefined") return;
-    const observer = new ResizeObserver(() => measure(true));
+    let viewportHeight = scrollEl.clientHeight;
+    const observer = new ResizeObserver(() => {
+      const nextViewportHeight = scrollEl.clientHeight;
+      if (viewportHeight === 0 && nextViewportHeight > 0) {
+        // The browser can restore scrollTop without firing scroll when a hidden view returns.
+        scrollEl.dispatchEvent(new Event("scroll"));
+      }
+      viewportHeight = nextViewportHeight;
+      measure(true);
+    });
     observer.observe(scrollEl); // viewport height changes
     if (wrapper.parentElement) observer.observe(wrapper.parentElement); // content reflow above
     return () => observer.disconnect();

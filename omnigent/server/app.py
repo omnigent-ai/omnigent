@@ -3832,6 +3832,14 @@ def create_app(
                         f"within {HOST_OFFLINE_HOLD_S / 3600:g} hours."
                     ),
                 )
+            elif hold == "host_back_without_runner":
+                error = ErrorDetail(
+                    code="runner_disconnected",
+                    message=(
+                        "The host for this session came back without the runner that was "
+                        "running this turn, so the turn was lost. Send the message again to retry."
+                    ),
+                )
         if idle_shutdown:
             # The sweep's stop path settles these to idle instead of failing them.
             _note_runner_idle_shutdown(runner_id, affected)

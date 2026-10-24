@@ -986,6 +986,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     } satisfies SessionPresenceEvent;
   }
 
+  if (eventType === "ui.open_file") {
+    if (typeof data.path !== "string" || !data.path) return null;
+    return { type: "ui_open_file", path: data.path };
+  }
+
   // Embedded-browser action request: asks the desktop relay to run the agent's
   // browser_* action against the view. Ignored by non-Electron renderers.
   if (eventType === "browser.action_request") {

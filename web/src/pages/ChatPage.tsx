@@ -201,7 +201,7 @@ import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
-import { isBrandHarness, useHostMcpServers } from "@/hooks/useHarnessInventory";
+import { isBrandHarness, useHostMcpServers, type HostMcpServer } from "@/hooks/useHarnessInventory";
 import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
 import {
   getSessionHost,
@@ -342,6 +342,12 @@ export function isSubagentRoutingEligible(
 ): boolean {
   return smartRoutingEnabled(serverInfo) && isSubagentRoutingSession(session);
 }
+
+/** How often `/mcp` re-reads the host inventory while a server waits on a sign-in. */
+const HOST_MCP_SIGN_IN_POLL_MS = 5_000;
+
+/** Only an http(s) page is ever opened from a host's sign-in report. */
+const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
 
 // Leading whitespace + the command token, so the composer overlay can tint
 // just the `/command` or `$skill` and leave args in the default color.
@@ -2509,9 +2515,20 @@ function ComposerImpl(
   );
   const hostMcpRoutingId =
     sessionRoutingHostId(composerSession?.hostId, composerSession?.labels) ?? inheritedHostId;
+  // Poll while a host server awaits sign-in: the user completes it elsewhere.
   const hostMcpQuery = useHostMcpServers(
     hostMcpRoutingId,
     mcpPanelRequested && hostMcpHarness !== null,
+    useCallback(
+      (servers: HostMcpServer[] | undefined) =>
+        servers?.some(
+          (server) =>
+            server.harness === hostMcpHarness && server.auth_status === "sign_in_required",
+        )
+          ? HOST_MCP_SIGN_IN_POLL_MS
+          : false,
+      [hostMcpHarness],
+    ),
   );
   const hostMcpStatus =
     hostMcpHarness === null
@@ -3305,25 +3322,42 @@ function ComposerImpl(
               [server.plugin && `${server.plugin} plugin`, server.url_host]
                 .filter(Boolean)
                 .join(" · ") || undefined,
+            connection:
+              server.auth_status === "connected"
+                ? "connected"
+                : server.auth_status === "sign_in_required"
+                  ? "sign-in-required"
+                  : undefined,
+            // No URL means the state is still worth showing, with nothing to click.
+            // The scheme is enforced host-side and again at the frame decoder; this
+            // is the last gate before it becomes an href.
+            signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
+              ? { kind: "url", url: server.sign_in_url! }
+              : undefined,
           },
         ]),
     );
     const catalogLoaded = !registryCatalog.loading && !registryCatalog.error;
     for (const server of selectedAgent?.mcp_servers ?? []) {
+      // A shared name is not a shared endpoint, so an agent server claims none of
+      // the host's account state: its Sign in could point at the wrong service.
       const row: McpServerRow = {
         name: server.name,
-        description: server.description ?? undefined,
+        description: server.description ?? byName.get(server.name)?.description,
       };
-      // Only a catalog read that finished this open can be trusted: a stale
-      // "sign-in required" would offer a popup the user no longer needs.
+      // Only a read from this open: a stale row would offer a needless popup.
       if (hasRegistryServers && server.transport === "registry" && catalogLoaded) {
         const service = registryCatalog.services.find((s) => s.id === server.name);
         if (service) {
           row.description = service.description || row.description;
           row.connection = service.connected ? "connected" : "sign-in-required";
-          // A token or workspace URL has to be typed, which the panel has no room for.
-          if (!service.connected && (service.auth === "bearer" || service.auth === "databricks"))
-            row.signInHref = "/settings/mcp";
+          if (!service.connected) {
+            // A token or workspace URL has to be typed, which the panel has no room for.
+            row.signIn =
+              service.auth === "bearer" || service.auth === "databricks"
+                ? { kind: "settings", href: "/settings/mcp" }
+                : { kind: "inline" };
+          }
         } else {
           row.connection = "unavailable";
         }

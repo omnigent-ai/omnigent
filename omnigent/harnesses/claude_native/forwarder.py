@@ -3741,25 +3741,28 @@ def _stop_failure_detail(
 
 def _transcript_api_error_for_hook(
     bridge_dir: Path, record: ClaudeHookRecord, response_id: str | None
-) -> FailureContext | None:
-    """Match durable API-error evidence to the failed response and native session."""
+) -> tuple[FailureContext | None, str]:
+    """Match retained API-error evidence, explaining why it cannot be reused."""
     if not record.claude_session_id:
-        return None
+        return None, "native_session_unavailable"
     state = _read_forward_state(bridge_dir)
+    if state is None:
+        return None, "forward_state_unavailable"
     # ``None`` on both sides is between turns: evidence kept then is the ended turn's.
-    if state is None or state.current_response_id != response_id:
-        return None
+    if state.current_response_id != response_id:
+        return None, "response_mismatch"
     context = state.api_error_context
-    if (
-        not context
-        or context.get("native_api_error_message") is not True
-        or context.get("native_session_id") != record.claude_session_id
-        or context.get("native_agent_role") == "subagent"
-        or context.get("native_agent_id")
-        or not isinstance(context.get("native_error_message"), str)
-    ):
-        return None
-    return context
+    if not context:
+        return None, "no_api_error_context"
+    if context.get("native_api_error_message") is not True:
+        return None, "unmarked_error_context"
+    if context.get("native_session_id") != record.claude_session_id:
+        return None, "native_session_mismatch"
+    if context.get("native_agent_role") == "subagent" or context.get("native_agent_id"):
+        return None, "subagent_context"
+    if not isinstance(context.get("native_error_message"), str):
+        return None, "error_text_unavailable"
+    return context, "matched"
 
 
 def _is_subagent_hook_record(
@@ -3831,6 +3834,7 @@ def _stop_failure_context(
     parent_claude_session_ids: Collection[str],
     diagnostic_health: Callable[[], FailureContext] | None = None,
     transcript_context: FailureContext | None = None,
+    transcript_context_state: str | None = None,
 ) -> FailureContext:
     """Preserve hook evidence separately from the displayed error detail."""
     reason = _subagent_hook_reason(record, parent_claude_session_ids)
@@ -3852,6 +3856,7 @@ def _stop_failure_context(
         "failure_source": "claude_hook",
         "native_harness": "claude-native",
         "native_error_category": record.failure_category,
+        "transcript_error_context_state": transcript_context_state,
         "native_session_id": record.claude_session_id,
         "native_agent_id": record.agent_id,
         "native_agent_role": "subagent"
@@ -4570,8 +4575,9 @@ async def _forward_available_status_events(
         transcript_context: FailureContext | None = None
         if status == "failed":
             try:
+                transcript_context_state = "hook_details_present"
                 if record.failure_message is None:
-                    transcript_context = await asyncio.to_thread(
+                    transcript_context, transcript_context_state = await asyncio.to_thread(
                         _transcript_api_error_for_hook, bridge_dir, record, response_id
                     )
                 failure_context = _stop_failure_context(
@@ -4580,6 +4586,7 @@ async def _forward_available_status_events(
                     parent_claude_session_ids=parent_claude_session_ids,
                     diagnostic_health=diagnostic_health,
                     transcript_context=transcript_context,
+                    transcript_context_state=transcript_context_state,
                 )
             except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
                 _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)

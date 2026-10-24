@@ -161,9 +161,16 @@ export interface McpServerRow {
   name: string;
   description?: string | null;
   connection?: McpServerConnection;
-  /** Where to sign in when it cannot happen in place (token or workspace entry). */
-  signInHref?: string;
+  /** How a `sign-in-required` row signs in; absent rows offer no action. */
+  signIn?: McpSignIn;
 }
+
+/**
+ * Where a row's sign-in happens: in the panel (the registry popup), on a page the
+ * host named, or in Settings when a token or workspace URL has to be typed.
+ */
+export type McpSignIn =
+  { kind: "inline" } | { kind: "url"; url: string } | { kind: "settings"; href: string };
 
 /** A sign-in that failed for one `/mcp` row. */
 export interface McpSignInError {
@@ -249,11 +256,25 @@ function McpSignInAction({
   disabled: boolean;
   onSignIn?: (name: string) => void;
 }) {
-  if (server.signInHref)
+  const signIn = server.signIn;
+  if (signIn === undefined) return null;
+  if (signIn.kind === "url")
+    return (
+      <a
+        href={signIn.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        data-testid={`mcp-sign-in-url-${server.name}`}
+        className="flex shrink-0 items-center rounded-md border border-border px-2 py-0.5 text-xs text-foreground hover:bg-muted dark:hover:bg-muted/50"
+      >
+        Sign in
+      </a>
+    );
+  if (signIn.kind === "settings")
     return (
       <Link
         className="shrink-0 text-xs underline hover:text-foreground"
-        to={server.signInHref}
+        to={signIn.href}
         data-testid={`mcp-sign-in-link-${server.name}`}
       >
         Sign in from Settings

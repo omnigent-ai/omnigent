@@ -70,8 +70,14 @@ and steers messages while the agent is busy.
   that runs the popup sign-in and flips the row to connected, or a **Sign in
   from Settings** link for a service that needs a typed token or workspace URL;
   unavailable, for a service the account no longer sees; signing in; failed or
-  cancelled, reported on the row with Sign in available again. Host and custom
-  servers carry no account state.
+  cancelled, reported on the row with Sign in available again. A host-native
+  server, including one pinned by an organization's managed Claude config,
+  shows connected or sign-in required when the host's sign-in manager
+  reports it (via `~/.omnigent/mcp-auth-status.json`, see
+  `docs/MCP_AUTH_STATUS.md`); its **Sign
+  in** opens the reported URL in a new tab and the panel re-reads the host
+  inventory every few seconds until the row is connected. Custom agent servers
+  carry no account state.
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -86,6 +92,9 @@ and steers messages while the agent is busy.
   server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
+- `blocked-start`: hovering or focusing disabled Start explains the missing
+  setup. Clicking, tapping, or trying to submit pins that explanation until
+  dismissed or the missing setup is completed.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
   line indents it as a list item; the newline gesture continues the list
   (numbers increment) and ends it after an empty item.
@@ -154,7 +163,8 @@ and steers messages while the agent is busy.
 - Select `/mcp` to replace the suggestions with the MCP servers enabled for the
   session. A registry service that needs sign-in shows **Sign in**; click it
   and finish the popup, or follow **Sign in from Settings** for a token or
-  workspace service. An empty list points to Settings; the command is absent
+  workspace service. A host server that needs sign-in shows **Sign in** too,
+  opening the page its host reported in a new tab. An empty list points to Settings; the command is absent
   on the new-session composer.
 - For Codex plugin skills, type `$<skill-name>` in Chat and select the
   namespaced suggestion. The vendor terminal owns its own completion menu.
@@ -174,6 +184,10 @@ and steers messages while the agent is busy.
 
 **New-session composer** (landing page, or New session):
 
+- Write a prompt or attach a file before choosing a working directory. Hover
+  or focus disabled Start to see what is missing; click, tap, or press Enter to
+  keep the tooltip open. Click elsewhere or press Escape to dismiss it. Choose
+  a directory to clear the tooltip and enable Start.
 - Open `/?prompt=Explain%20this%20code`. Check that the
   draft is filled and editable, no session starts until Send, and an embedded
   deployment stays under its mount path. Browser proof:
@@ -277,6 +291,14 @@ managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
 
+- **`blocked-start`:** on a fresh new-session page with no working directory,
+  enter a prompt or attach a file. Hover disabled Start, click it, then move
+  away: its tooltip should stay visible. Check dismissal by outside click,
+  Escape, or tabbing away from focused Start, plus Tab focus and Enter submission;
+  no session should be created.
+  Choose a working directory and check that the tooltip disappears and Start
+  enables. Repeat with a phone viewport and touch input. Component coverage:
+  `web/src/shell/NewChatDialog.test.tsx`.
 - **`offline-hosts`:**
   `tests/e2e_ui/start_session/test_start_session.py::test_start_session_keeps_offline_host_selected`
   covers the connected-host and managed-sandbox variants with stubbed host responses.
@@ -411,7 +433,14 @@ Other connection providers alone do not enable the managed MCP picker.
   registry read when the server has it off or no row needs it);
   `web/src/hooks/useMcpRegistry.test.tsx` covers the sign-in hook's abort and
   confirmation paths, and a reopened panel shows no state from the previous
-  open. Manually, with the registry on, attach an OAuth service
+  open. Host account state: `tests/host/test_mcp_inventory.py` (the status
+  file), `tests/host/test_frames.py` (what survives the tunnel),
+  `tests/server/routes/test_mcp_servers.py` (the route) and
+  `ChatPage.composer.test.tsx` (row state, the new-tab Sign in, polling).
+  Manually, on a host whose sign-in manager writes the status file, expect a
+  host row to read **Sign-in required** with a Sign in that opens the reported
+  page, and to flip to **Connected** within 5s of the file changing. With the
+  registry on, attach an OAuth service
   that is not connected, select `/mcp`, expect **Sign-in required** and
   **Sign in**, complete the popup and expect **Connected**; cancel it instead
   and expect the message on the row with Sign in still offered.
