@@ -1643,8 +1643,10 @@ def register_core_routes(
             the session title or conversation content. ``None``
             or empty string disables the filter. A session
             matches if its title contains the query or any of
-            its conversation items' text does. Powers the
-            sidebar's session search.
+            its conversation items' text does. A query naming a
+            pull request (``#1234``, ``PR 1234``, ``!12``, or a PR
+            URL) instead matches sessions that reference that
+            exact PR. Powers the sidebar's session search.
         :param include_archived: When ``False`` (default), archived
             sessions are omitted. When ``True``, archived sessions
             are returned alongside active ones (the sidebar groups
