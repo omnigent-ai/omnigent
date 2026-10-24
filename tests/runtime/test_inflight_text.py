@@ -667,6 +667,107 @@ def test_native_delta_dedupes_by_index_before_fanout() -> None:
     assert inflight_text.snapshot_for(cid)[0]["delta"] == "Hello world"
 
 
+def test_native_out_of_order_chunks_reassemble_before_commit() -> None:
+    """Out-of-order chunks reassemble in index order, then the commit matches."""
+    cid = "conv_native_reorder"
+    inflight_text.record_publish(cid, _native_delta("m1", 1, "world", final=True))
+    inflight_text.record_publish(cid, _native_delta("m1", 0, "hello "))
+
+    # The late first chunk is absorbed into the ordered aggregate (not
+    # dropped as stale), so reconnect replays the full text...
+    snap = inflight_text.snapshot_for(cid)
+    assert [(event["message_id"], event["delta"]) for event in snap] == [("m1", "hello world")]
+
+    # ...and the commit reconciles against that same aggregate.
+    inflight_text.record_publish(cid, _message_done("ci_1", text="hello world"))
+    assert inflight_text.snapshot_for(cid) == []
+
+
+def test_native_late_first_chunk_after_commit_drops_entry() -> None:
+    """A late first chunk completing committed text drops the entry, no stale replay."""
+    cid = "conv_native_late_first"
+    inflight_text.record_publish(cid, _native_delta("m1", 1, "world", final=True))
+    inflight_text.record_publish(cid, _message_done("ci_1", text="hello world"))
+
+    inflight_text.record_publish(cid, _native_delta("m1", 0, "hello "))
+
+    assert inflight_text.snapshot_for(cid) == []
+
+
+def test_native_late_chunk_is_not_rebroadcast_live() -> None:
+    """A late lower-index chunk is absorbed but withheld from the live stream."""
+    cid = "conv_native_late_live"
+    first = _native_delta("m1", 1, "world")
+    assert inflight_text.record_publish(cid, first) == first
+
+    # The live preview already shows "world"; broadcasting "hello " now
+    # would append it out of order, so it is withheld...
+    assert inflight_text.record_publish(cid, _native_delta("m1", 0, "hello ")) is None
+
+    # ...while the reconnect replay carries the ordered aggregate.
+    assert inflight_text.snapshot_for(cid)[0]["delta"] == "hello world"
+
+
+def test_native_late_chunk_after_claim_is_not_recovered_live() -> None:
+    """A late chunk diverging from a claimed commit is withheld, still replayable.
+
+    A commit claims the aggregate while it is a prefix; a later chunk can
+    make it diverge. Re-broadcasting the whole aggregate then would append
+    it to text the client already shows, so it stays off the live wire —
+    but the diverged aggregate must replay on reconnect.
+    """
+    cid = "conv_native_late_claim"
+    inflight_text.record_publish(cid, _message_done("ci_ab", text="AB"))
+
+    assert inflight_text.record_publish(cid, _native_delta("m2", 2, "B")) == _native_delta(
+        "m2", 2, "B"
+    )
+    # Claims the "B" aggregate as a prefix of the commit, then diverges:
+    assert inflight_text.record_publish(cid, _native_delta("m2", 0, "A")) is None
+    assert inflight_text.record_publish(cid, _native_delta("m2", 1, "x")) is None
+
+    # Never live-broadcast as "AxB"; the reconnect replay carries it once.
+    assert inflight_text.snapshot_for(cid) == [
+        {
+            "type": "response.output_text.delta",
+            "delta": "AxB",
+            "message_id": "m2",
+            "index": 2,
+        }
+    ]
+
+    inflight_text.record_publish(cid, _message_done("ci_axb", text="AxB"))
+    assert inflight_text.snapshot_for(cid) == []
+
+
+def test_native_final_with_missing_index_is_not_dropped() -> None:
+    """A final chunk does not complete the message while a lower index is missing.
+
+    ``final_seen`` alone can be true while an earlier chunk is still in
+    flight; dropping on it would consume the committed text and replay the
+    orphaned remainder forever after the real aggregate commits.
+    """
+    cid = "conv_native_final_gap"
+    inflight_text.record_publish(cid, _message_done("ci_ab", text="AB"))
+
+    inflight_text.record_publish(cid, _native_delta("m2", 2, "B", final=True))
+    assert inflight_text.record_publish(cid, _native_delta("m2", 0, "A")) is None
+    assert inflight_text.record_publish(cid, _native_delta("m2", 1, "x")) is None
+
+    inflight_text.record_publish(cid, _message_done("ci_axb", text="AxB"))
+    assert inflight_text.snapshot_for(cid) == []
+
+
+def test_native_repeated_index_still_suppressed() -> None:
+    """A repeated index is suppressed even when it carries different text."""
+    cid = "conv_native_repeat"
+    inflight_text.record_publish(cid, _native_delta("m1", 0, "Hello "))
+    inflight_text.record_publish(cid, _native_delta("m1", 1, "world"))
+
+    assert inflight_text.record_publish(cid, _native_delta("m1", 0, "HELLO ")) is None
+    assert inflight_text.snapshot_for(cid)[0]["delta"] == "Hello world"
+
+
 def test_native_reconnect_aggregate_and_live_tail_do_not_overlap() -> None:
     """Reconnect gets the aggregate while the next live event stays incremental."""
     cid = "conv_native_reconnect"

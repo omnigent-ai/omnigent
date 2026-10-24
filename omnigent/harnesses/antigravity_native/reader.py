@@ -2071,12 +2071,13 @@ def _next_delta_index(delta_chunks: dict[int, int], idx: int) -> int:
     """
     Return the next text-delta ``index`` for planner step *idx*, and count it.
 
-    The server orders a message's chunks by this value and drops any that does
-    not exceed the last one it accepted, so it must only ever go up. A plain
-    per-step counter is the only thing that guarantees that: the forwarded byte
-    offset does not, because a shorter post-moderation rewrite re-anchors the
-    prefix tracker downwards, and the closing ``final`` chunk that follows would
-    then be dropped — leaving the message un-retired and replayed.
+    The server orders a message's chunks by this value, drops a repeated one,
+    and matches the message to its committed text only once every value from 0
+    up to the final chunk's has arrived, so it must count 0, 1, 2, … A plain
+    per-step counter guarantees that: the forwarded byte offset does not, because
+    it skips values and a shorter post-moderation rewrite re-anchors it
+    downwards, so the closing ``final`` chunk could be dropped as a repeat —
+    leaving the message un-retired and replayed.
 
     :param delta_chunks: Per-``step_index`` emitted-chunk counter (mutated here).
     :param idx: The planner step's trajectory index.

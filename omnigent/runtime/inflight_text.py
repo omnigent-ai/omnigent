@@ -172,8 +172,12 @@ class _NativeMessage:
 
     :param text: Aggregate delta text, e.g. ``"Let me check that."``.
     :param last_index: Highest chunk ``index`` accumulated so far, e.g.
-        ``4``. Used to reject repeated chunks and included in reconnect
-        replay events for wire-shape fidelity.
+        ``4``. A chunk below it arrived late and is not re-broadcast live;
+        it is also included in reconnect replay events for wire-shape
+        fidelity. Repeats are rejected through ``chunks``.
+    :param chunks: Indexed chunk text keyed by ``index``, e.g.
+        ``{0: "Let me ", 1: "check that."}``. Kept so chunks arriving out
+        of index order still reassemble into ``text`` in order.
     :param forwarded: Whether any text for this message has reached live
         subscribers. A prefix suppressed behind a committed message is
         forwarded as one aggregate if it later diverges.
@@ -184,6 +188,7 @@ class _NativeMessage:
 
     text: str = ""
     last_index: int = -1
+    chunks: dict[int, str] = field(default_factory=dict)
     forwarded: bool = False
     final_seen: bool = False
     claimed: bool = False
@@ -236,6 +241,18 @@ def _drop_native_message(conversation_id: str, message_id: str) -> None:
         messages.pop(message_id, None)
         if not messages:
             _native_inflight.pop(conversation_id, None)
+
+
+def _native_complete(message: _NativeMessage) -> bool:
+    """
+    Whether the final chunk arrived and no lower indexed chunk is still missing.
+
+    Assumes producers number a message's chunks 0, 1, 2, ... (claude-native,
+    codex-native and antigravity all use a per-message counter from 0).
+    """
+    return message.final_seen and (
+        not message.chunks or len(message.chunks) == max(message.chunks) + 1
+    )
 
 
 def _consume_recent_native_text(conversation_id: str, text: str) -> None:
@@ -297,10 +314,12 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> dict[str, Any
       the delta to the current (response-scoped) turn's accumulated text.
     * ``response.output_text.delta`` WITH a ``message_id`` (native
       message-scoped streaming) — append to that message's own buffer in
-      :data:`_native_inflight`, ordered/de-duped by ``index``. Suppress the
-      running aggregate while it is a prefix of a recent committed message.
-      On divergence, forward the whole aggregate once, then resume sending
-      incremental deltas.
+      :data:`_native_inflight`; chunks are reassembled in ``index`` order
+      and de-duped by ``index``, and a late lower-index chunk joins the
+      aggregate without being re-broadcast live (the live preview already
+      shows the later chunks). Suppress the running aggregate while it is a
+      prefix of a recent committed message. On divergence, forward the
+      whole aggregate once, then resume sending incremental deltas.
     * ``response.output_item.done`` for a ``message`` item — it just
       committed to the conversation store. Drop an equal aggregate or claim
       a matching prefix so it no longer appears in reconnect snapshots, then
@@ -375,16 +394,20 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> dict[str, Any
                         return None
                     message = _NativeMessage()
                     messages[message_id] = message
+                late = False
                 if isinstance(index, int) and not isinstance(index, bool):
-                    if index <= message.last_index:
+                    if index in message.chunks:
                         return None
-                    message.last_index = index
-                if delta:
+                    message.chunks[index] = delta
+                    late = index < message.last_index
+                    message.last_index = max(message.last_index, index)
+                    message.text = "".join(message.chunks[i] for i in sorted(message.chunks))
+                elif delta:
                     message.text += delta
                 if final:
                     message.final_seen = True
                 if not delta:
-                    if message.claimed and final:
+                    if message.claimed and final and _native_complete(message):
                         aggregate = message.text
                         recent = _native_recent_committed.get(conversation_id)
                         if aggregate in (recent or ()):
@@ -400,11 +423,16 @@ def record_publish(conversation_id: str, event: dict[str, Any]) -> dict[str, Any
                 )
                 if matched is not None:
                     message.claimed = True
-                    if matched == aggregate and message.final_seen:
+                    if matched == aggregate and _native_complete(message):
                         _drop_native_message(conversation_id, message_id)
                         _consume_recent_native_text(conversation_id, matched)
                     return None
 
+                if late:
+                    # Withhold the earlier chunk from the live tail (order); the
+                    # diverged aggregate stays replayable on reconnect.
+                    message.claimed = False
+                    return None
                 recovered = message.claimed or not message.forwarded
                 message.claimed = False
                 message.forwarded = True
