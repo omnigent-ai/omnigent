@@ -1259,7 +1259,7 @@ describe("index.css electron-mac sidebar header", () => {
  * sidebar is reopened" bug on the macOS desktop shell.
  *
  * A maximized workspace rail breaks out to the window's top-left corner, so its
- * tab strip is padded 10.5rem to clear the traffic lights and the title-bar
+ * tab strip is padded to clear the traffic lights and the title-bar
  * cluster. Maximizing normally collapses the sidebar, but the user can reopen
  * it (⌘⌥[ / the title-bar toggle) over the still-maximized rail. The sidebar
  * (z above the rail) then covers that corner — the lights sit over IT, and the
@@ -1299,7 +1299,9 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
 
   it("has the clearance rule this test exists to protect", () => {
     expect(rule, "the maximized rail tab-strip padding rule is gone from index.css").toBeDefined();
-    expect(rule).toContain("padding-left: calc(var(--mac-traffic-light-width) + 5rem)");
+    expect(rule).toContain(
+      "padding-left: calc(var(--mac-traffic-light-width) + var(--mac-title-cluster-width))",
+    );
   });
 
   it("clears the lights on the mac shell while the sidebar is collapsed", () => {
@@ -1309,7 +1311,7 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
   });
 
   it("drops the clearance once the sidebar is reopened over the maximized rail", () => {
-    // The exact bug: sidebar open covers the window corner, so the 10.5rem
+    // The exact bug: sidebar open covers the window corner, so the clearance
     // padding has nothing to clear and would push the tabs into the middle.
     const strip = makeStrip(true, { "data-sidebar-open": "true" });
     expect(strip.matches(selector)).toBe(false);
@@ -1320,6 +1322,43 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
     const strip = makeStrip(false);
     expect(strip.matches(selector)).toBe(false);
     strip.closest(".app-shell")?.remove();
+  });
+});
+
+/* The title-bar cluster widens for Back/Forward only while they render in it,
+ * so an embedded app, which leaves them out, keeps the narrower clearance. */
+describe("index.css mac title-bar cluster width", () => {
+  const rule = cssBlocks
+    .map(([block]) => block)
+    .find((block) => block.includes("--mac-title-cluster-width: 8.5rem"));
+  const selector = selectorOf(rule ?? "{");
+
+  afterEach(() => {
+    document.documentElement.removeAttribute("data-electron-mac");
+    document.body.replaceChildren();
+  });
+
+  function renderCluster(withHistoryButtons: boolean) {
+    document.documentElement.setAttribute("data-electron-mac", "true");
+    const cluster = document.createElement("div");
+    cluster.className = "electron-sidebar-header-actions";
+    if (withHistoryButtons) {
+      const buttons = document.createElement("div");
+      buttons.className = "history-navigation-buttons";
+      cluster.appendChild(buttons);
+    }
+    document.body.appendChild(cluster);
+  }
+
+  it("widens while Back/Forward render in the cluster", () => {
+    expect(rule, "the wider cluster rule is gone from index.css").toBeDefined();
+    renderCluster(true);
+    expect(document.documentElement.matches(selector)).toBe(true);
+  });
+
+  it("stays narrow without them", () => {
+    renderCluster(false);
+    expect(document.documentElement.matches(selector)).toBe(false);
   });
 });
 

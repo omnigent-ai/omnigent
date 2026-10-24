@@ -14,10 +14,11 @@ import { readPanelSizePreference, writePanelSizePreference } from "@/lib/panelSi
 
 // Default 320px (20rem) — wider than the old fixed ``md:w-64`` (256px) sidebar
 // so conversation titles have more room before truncating. The floor keeps the
-// search box + "New session" button usable; the viewport-relative ceiling keeps
-// the sidebar from consuming more than half of the desktop layout.
+// search box + "New session" button usable and fits the header's action cluster
+// beside the wordmark or the macOS traffic lights; the viewport-relative ceiling
+// keeps the sidebar from consuming more than half of the desktop layout.
 const DEFAULT_WIDTH_PX = 320;
-const MIN_WIDTH_PX = 220;
+const MIN_WIDTH_PX = 250;
 const MAX_WIDTH_RATIO = 0.5;
 
 function clamp(w: number): number {
