@@ -163,7 +163,9 @@ function CyclePreview({ section, hint }: { section: ComposerConfigSection; hint?
         {section.header}: {selected?.label}
       </span>
       <ComposerConfigSections models={section} />
-      {hint && <div className="px-2 py-1.5 text-xs text-muted-foreground">{hint}</div>}
+      {hint && (
+        <div className="whitespace-normal px-2 py-1.5 text-xs text-muted-foreground">{hint}</div>
+      )}
     </div>
   );
 }
