@@ -97,6 +97,29 @@ def test_create_minimal_defaults(store: SqlAlchemyScheduledTaskStore) -> None:
     assert task.execution_target == "connected_host"
     assert task.host_id is None
     assert task.state == "active"
+    assert task.project_id is None
+
+
+def test_project_id_create_get_update_and_unfile_round_trip(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    first = _uid("project-first")
+    second = _uid("project-second")
+    task_id = _uid("project-task")
+    created = store.create(
+        scheduled_task_id=task_id,
+        name="filed",
+        prompt="p",
+        rrule="FREQ=DAILY",
+        user_id="alice@example.com",
+        agent_id=_uid("ag"),
+        timezone="UTC",
+        project_id=first,
+    )
+    assert created.project_id == first
+    assert store.get(task_id).project_id == first
+    assert store.update(task_id, project_id=second).project_id == second
+    assert store.update(task_id, project_id=None).project_id is None
 
 
 # ── state enum ────────────────────────────────────────────────────────────────

@@ -446,6 +446,84 @@ def test_scheduled_task_row_run_controls(
     assert _has_failed_run(), "Run now did not record a failed run within the timeout"
 
 
+def test_automation_project_picker_filter_and_unfile(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Assign, filter, unfile, reassign, and survive Project deletion."""
+    project_a = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Automation Project A"},
+        timeout=10.0,
+    )
+    project_a.raise_for_status()
+    project_b = httpx.post(
+        f"{live_server}/v1/projects",
+        json={"name": "Automation Project B"},
+        timeout=10.0,
+    )
+    project_b.raise_for_status()
+
+    page.goto(f"{live_server}/tasks")
+    _open_create_dialog(page)
+    page.get_by_test_id("task-name-input").fill("Project automation")
+    page.get_by_test_id("task-prompt-input").fill("Summarize Project activity.")
+    _pick_select_option(page, "task-project-trigger", "Automation Project A")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+
+    row = _row_by_name(page, "Project automation")
+    expect(row).to_be_visible(timeout=30_000)
+    expect(row.get_by_test_id("task-project-chip")).to_have_text("Automation Project A")
+
+    _pick_select_option(page, "tasks-project-filter", "Automation Project A")
+    expect(row).to_be_visible(timeout=30_000)
+    _pick_select_option(page, "tasks-project-filter", "Automation Project B")
+    expect(page.get_by_test_id("tasks-empty-state")).to_have_text("No automations found")
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(row).to_be_hidden(timeout=30_000)
+    _pick_select_option(page, "tasks-project-filter", "All projects")
+
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    _pick_select_option(page, "task-project-trigger", "No project")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(row.get_by_test_id("task-project-chip")).to_be_hidden(timeout=30_000)
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(row).to_be_visible(timeout=30_000)
+
+    row.hover()
+    row.get_by_test_id("task-row-menu").click()
+    page.get_by_test_id("task-edit").click()
+    _pick_select_option(page, "task-project-trigger", "Automation Project A")
+    page.get_by_test_id("create-scheduled-task-submit").click()
+    expect(row).to_be_hidden(timeout=30_000)
+    _pick_select_option(page, "tasks-project-filter", "All projects")
+    expect(row.get_by_test_id("task-project-chip")).to_have_text("Automation Project A")
+
+    sidebar = page.get_by_role("complementary", name="Conversations")
+    project_heading = sidebar.get_by_text("Automation Project A", exact=True)
+    project_heading.click()
+    expect(sidebar.get_by_text("Project automation", exact=True)).to_have_count(0)
+
+    sidebar.get_by_role("button", name="Project actions for Automation Project A").click()
+    page.get_by_test_id("delete-project").click()
+    page.get_by_role("button", name="Delete project", exact=True).click()
+    expect(project_heading).to_be_hidden(timeout=30_000)
+
+    page.reload()
+    row = _row_by_name(page, "Project automation")
+    expect(row).to_be_visible(timeout=30_000)
+    expect(row).to_have_attribute("data-state", "active")
+    expect(row.get_by_test_id("task-project-chip")).to_be_hidden()
+    _pick_select_option(page, "tasks-project-filter", "Unfiled")
+    expect(row).to_be_visible(timeout=30_000)
+
+    tasks = httpx.get(f"{live_server}/v1/scheduled-tasks", timeout=10.0).json()["scheduled_tasks"]
+    stored = next(task for task in tasks if task["name"] == "Project automation")
+    assert (stored["project_id"], stored["state"]) == (None, "active")
+
+
 # ── Model + reasoning-effort selectors (PR #3331) ──────────────────────────
 #
 # The create/edit dialog renders a Model|Effort row (ModelEffortFields) that is

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import time
+import uuid
 from collections.abc import AsyncIterator
 from pathlib import Path
 
@@ -41,6 +42,7 @@ from omnigent.stores.permission_store.sqlalchemy_store import (
     SqlAlchemyPermissionStore,
 )
 from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 ALICE = "alice@example.com"
 BOB = "bob@example.com"
@@ -206,6 +208,60 @@ async def test_delete_project(project_client: httpx.AsyncClient) -> None:
 
     second_delete = await project_client.delete(f"/v1/projects/{created['id']}")
     assert second_delete.status_code == 404
+
+
+async def test_delete_project_unfiles_only_its_automations(
+    project_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    deleted = (await project_client.post("/v1/projects", json={"name": "Tasks"})).json()
+    kept = (await project_client.post("/v1/projects", json={"name": "Other"})).json()
+    task_store = SqlAlchemyScheduledTaskStore(db_uri)
+
+    def create_task(project_id: str) -> str:
+        return task_store.create(
+            uuid.uuid4().hex,
+            "nightly",
+            "prompt",
+            "FREQ=DAILY",
+            None,
+            uuid.uuid4().hex,
+            "UTC",
+            project_id=project_id,
+        ).id
+
+    unfiled_id = create_task(deleted["id"])
+    kept_id = create_task(kept["id"])
+
+    response = await project_client.delete(f"/v1/projects/{deleted['id']}")
+
+    assert response.status_code == 200
+    unfiled = task_store.get(unfiled_id)
+    assert unfiled is not None
+    assert (unfiled.project_id, unfiled.state) == (None, "active")
+    kept_task = task_store.get(kept_id)
+    assert kept_task is not None
+    assert kept_task.project_id == kept["id"]
+
+
+async def test_delete_project_logically_unfiles_first_class_sessions_without_nulling_or_deleting(
+    project_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    project = (await project_client.post("/v1/projects", json={"name": "Sessions"})).json()
+    agent_id = uuid.uuid4().hex
+    SqlAlchemyAgentStore(db_uri).create(agent_id, "agent", f"{agent_id}/bundle")
+    store = SqlAlchemyConversationStore(db_uri)
+    conversation = store.create_conversation(agent_id=agent_id, project_id=project["id"])
+
+    response = await project_client.delete(f"/v1/projects/{project['id']}")
+    unfiled = (await project_client.get("/v1/sessions?project=")).json()
+    stored = store.get_conversation(conversation.id)
+
+    assert response.status_code == 200
+    assert conversation.id in {row["id"] for row in unfiled["data"]}
+    assert stored is not None
+    assert stored.project_id == project["id"]
 
 
 async def test_session_projects_unions_first_class_and_labels(
@@ -610,3 +666,43 @@ async def test_order_endpoints_enforce_owner_and_announce_changes(
         assert alice_events == [{"type": "projects_changed"}] * 2
         await asyncio.sleep(0.05)
         assert bob_events == []
+
+
+async def test_delete_other_users_project_does_not_clear_their_or_callers_tasks(
+    multi_user_client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    bob_project = (
+        await multi_user_client.post("/v1/projects", json={"name": "Bob"}, headers=_as_user(BOB))
+    ).json()
+    task_store = SqlAlchemyScheduledTaskStore(db_uri)
+    alice_task = task_store.create(
+        uuid.uuid4().hex,
+        "alice",
+        "p",
+        "FREQ=DAILY",
+        ALICE,
+        uuid.uuid4().hex,
+        "UTC",
+    )
+    bob_task = task_store.create(
+        uuid.uuid4().hex,
+        "bob",
+        "p",
+        "FREQ=DAILY",
+        BOB,
+        uuid.uuid4().hex,
+        "UTC",
+        project_id=bob_project["id"],
+    )
+
+    response = await multi_user_client.delete(
+        f"/v1/projects/{bob_project['id']}", headers=_as_user(ALICE)
+    )
+
+    assert response.status_code == 404
+    assert task_store.get(alice_task.id).project_id is None
+    assert task_store.get(bob_task.id).project_id == bob_project["id"]
+    assert (
+        await multi_user_client.get(f"/v1/projects/{bob_project['id']}", headers=_as_user(BOB))
+    ).status_code == 200

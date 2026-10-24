@@ -120,7 +120,8 @@ class ProjectStore(ABC):
         Delete an owned project. Idempotent.
 
         Deleting a project does not delete its member sessions; unfiling them
-        (clearing ``project_id``) is the caller's responsibility.
+        (clearing ``project_id``) is the caller's responsibility. Automations
+        assigned to it are unfiled in the same transaction.
 
         :param project_id: Opaque project identifier.
         :param user_id: The requesting owner.

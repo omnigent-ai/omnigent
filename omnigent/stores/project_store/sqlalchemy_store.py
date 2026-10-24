@@ -17,7 +17,12 @@ from sqlalchemy.sql.dml import Insert
 
 from omnigent.db.account_authority import require_active_account
 from omnigent.db.compression import decode, encode
-from omnigent.db.db_models import SqlPreference, SqlProject, current_workspace_id
+from omnigent.db.db_models import (
+    SqlPreference,
+    SqlProject,
+    SqlScheduledTask,
+    current_workspace_id,
+)
 from omnigent.db.utils import (
     get_or_create_engine,
     make_named_managed_session_maker,
@@ -313,6 +318,14 @@ class SqlAlchemyProjectStore(ProjectStore):
             if row is None or row.user_id != user_id:
                 return False
             session.delete(row)
+            session.execute(
+                update(SqlScheduledTask)
+                .where(
+                    SqlScheduledTask.workspace_id == current_workspace_id(),
+                    SqlScheduledTask.project_id == project_id,
+                )
+                .values(project_id=None, updated_at=now_epoch())
+            )
             return True
 
         return run_write_transaction(self._session_immediate, "delete_project", write)

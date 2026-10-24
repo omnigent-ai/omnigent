@@ -204,6 +204,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         workspace: str | None = None,
         host_id: str | None = None,
         execution_target: str = "connected_host",
+        project_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
         """Insert a new scheduled task with a required recurring ``rrule``."""
@@ -228,6 +229,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 base_branch=None,
                 execution_target=encode_scheduled_task_execution_target(execution_target),
                 host_id=host_id,
+                project_id=project_id,
                 state=encode_scheduled_task_state(state),
                 last_run_at=None,
                 last_run_conversation_id=None,
@@ -338,6 +340,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
         workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
         execution_target: str | None = None,
+        project_id: str | None = _UNSET,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,
@@ -407,6 +410,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 if row.execution_target != encoded_target:
                     row.execution_target = encoded_target
                     changed = True
+            if project_id is not _UNSET and row.project_id != project_id:
+                row.project_id = project_id
+                changed = True
             if state is not None:
                 encoded_state = encode_scheduled_task_state(state)
                 if row.state != encoded_state:

@@ -40,6 +40,7 @@ const TASK_WIRE = {
   workspace: null,
   host_id: null,
   execution_target: "connected_host",
+  project_id: "project_1",
   state: "active",
   last_run_at: null,
   last_run_conversation_id: null,
@@ -71,6 +72,7 @@ describe("listScheduledTasks", () => {
       state: "active",
       hostId: null,
       workspace: null,
+      projectId: "project_1",
     });
   });
 
@@ -144,6 +146,23 @@ describe("createScheduledTask", () => {
     expect(body).not.toHaveProperty("host_id");
     expect(body).not.toHaveProperty("workspace");
     expect(body).not.toHaveProperty("timezone");
+    expect(body).not.toHaveProperty("project_id");
+  });
+
+  it("serializes a non-empty Project and omits an unfiled create sentinel", async () => {
+    fetchMock.mockResolvedValue(mockResponse(TASK_WIRE));
+    const base = {
+      name: "n",
+      prompt: "p",
+      rrule: "FREQ=DAILY;BYHOUR=9;BYMINUTE=0",
+      agentId: "ag_1",
+    };
+
+    await createScheduledTask({ ...base, projectId: "project_1" });
+    await createScheduledTask({ ...base, projectId: "" });
+
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body).project_id).toBe("project_1");
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).not.toHaveProperty("project_id");
   });
 
   it("includes the host/workspace pair and timezone when provided", async () => {
@@ -173,6 +192,13 @@ describe("updateScheduledTask", () => {
     expect(init.method).toBe("PATCH");
     expect(JSON.parse(init.body)).toEqual({ state: "paused" });
     expect(updated.state).toBe("paused");
+  });
+
+  it("serializes an empty Project id when unfiling", async () => {
+    fetchMock.mockResolvedValueOnce(mockResponse({ ...TASK_WIRE, project_id: null }));
+    const updated = await updateScheduledTask("st_1", { projectId: "" });
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({ project_id: "" });
+    expect(updated.projectId).toBeNull();
   });
 });
 

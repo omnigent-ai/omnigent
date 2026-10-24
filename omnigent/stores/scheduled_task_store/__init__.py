@@ -55,6 +55,7 @@ class ScheduledTaskStore(ABC):
         workspace: str | None = None,
         host_id: str | None = None,
         execution_target: str = "connected_host",
+        project_id: str | None = None,
         state: str = "active",
     ) -> ScheduledTask:
         """
@@ -145,6 +146,7 @@ class ScheduledTaskStore(ABC):
         workspace: str | None = _UNSET,
         host_id: str | None = _UNSET,
         execution_target: str | None = None,
+        project_id: str | None = _UNSET,
         state: str | None = None,
         last_run_at: int | None = None,
         last_run_conversation_id: str | None = _UNSET,

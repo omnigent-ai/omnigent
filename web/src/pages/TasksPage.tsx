@@ -10,11 +10,19 @@
  * endpoint.
  */
 
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { ClockIcon, Loader2Icon, SearchIcon, TriangleAlertIcon } from "lucide-react";
 import { PageScroll } from "@/components/PageScroll";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import { ProjectLabel } from "@/components/ProjectLabel";
 import { useOmnigentAnalytics } from "@/lib/analytics";
 import { CreateScheduledTaskDialog } from "@/components/scheduled/CreateScheduledTaskDialog";
 import { ScheduledTaskRow } from "@/components/scheduled/ScheduledTaskRow";
@@ -29,6 +37,7 @@ import {
   useUpdateScheduledTask,
 } from "@/hooks/useScheduledTasks";
 import { useNow } from "@/hooks/useNow";
+import { useProjects } from "@/hooks/useConversations";
 import type { ScheduledTask } from "@/lib/scheduledTasksApi";
 import { nextRunAtMs } from "@/lib/scheduleText";
 import { cn } from "@/lib/utils";
@@ -40,6 +49,10 @@ const FILTER_TABS: { value: FilterTab; label: string }[] = [
   { value: "active", label: "Active" },
   { value: "paused", label: "Paused" },
 ];
+
+/** Project filter sentinels; any other value is a Project id. Radix Select disallows "". */
+const ALL_PROJECTS = "__all_projects__";
+const UNFILED = "__unfiled__";
 
 export function TasksPage() {
   const { data: tasks, isLoading, isError, refetch } = useScheduledTasks();
@@ -60,6 +73,30 @@ export function TasksPage() {
   // Null → the normal manual path (empty fields). Cleared on dialog close so a
   // stale prefill never leaks into a subsequent plain "New automation" open.
   const [prefill, setPrefill] = useState<ScheduledTaskSuggestion["prefill"] | null>(null);
+  const [projectFilter, setProjectFilter] = useState(ALL_PROJECTS);
+  const {
+    data: projects,
+    isLoading: projectsLoading,
+    isError: projectsError,
+    refetch: refetchProjects,
+  } = useProjects();
+  // Keyed by id to the whole summary so rows can render the project's emoji.
+  const projectsById = useMemo(
+    () =>
+      new Map(
+        (projects ?? []).flatMap((project) => (project.id ? [[project.id, project] as const] : [])),
+      ),
+    [projects],
+  );
+  const selectedProjectId =
+    projectFilter === ALL_PROJECTS || projectFilter === UNFILED ? null : projectFilter;
+
+  // A deleted Project can't stay selected.
+  useEffect(() => {
+    if (selectedProjectId && projects !== undefined && !projectsById.has(selectedProjectId)) {
+      setProjectFilter(ALL_PROJECTS);
+    }
+  }, [selectedProjectId, projects, projectsById]);
 
   function openManual() {
     setPrefill(null);
@@ -88,6 +125,11 @@ export function TasksPage() {
       if (filter === "active" && t.state !== "active") return false;
       if (filter === "paused" && t.state !== "paused") return false;
       if (q && !t.name.toLowerCase().includes(q)) return false;
+      if (selectedProjectId) return t.projectId === selectedProjectId;
+      // Unfiled includes an id whose Project no longer resolves.
+      if (projectFilter === UNFILED) {
+        return t.projectId === null || (projects !== undefined && !projectsById.has(t.projectId));
+      }
       return true;
     });
     const nextRunByTaskId = new Map(
@@ -111,7 +153,7 @@ export function TasksPage() {
       if (bNext == null) return -1;
       return aNext - bNext;
     });
-  }, [tasks, search, filter]);
+  }, [tasks, search, filter, projectFilter, selectedProjectId, projects, projectsById]);
 
   // A per-task busy flag so a row's menu disables while its own mutation runs.
   // Covers pause/resume (update), delete, and run-now so the ⋯ menu can't be
@@ -147,6 +189,8 @@ export function TasksPage() {
   }
 
   const hasAnyTasks = (tasks ?? []).length > 0;
+  // Suggestions are hidden whenever any filter narrows the list.
+  const showSuggestions = filter === "all" && projectFilter === ALL_PROJECTS;
 
   return (
     <PageScroll contentClassName="px-4 md:px-6">
@@ -206,6 +250,34 @@ export function TasksPage() {
             ))}
           </div>
         )}
+        {hasAnyTasks && (
+          <Select value={projectFilter} onValueChange={setProjectFilter}>
+            <SelectTrigger
+              data-testid="tasks-project-filter"
+              className="min-w-40"
+              disabled={projectsLoading}
+            >
+              {projectsLoading ? "Loading projects…" : <SelectValue />}
+            </SelectTrigger>
+            <SelectContent position="popper" align="start">
+              <SelectItem value={ALL_PROJECTS}>All projects</SelectItem>
+              <SelectItem value={UNFILED}>Unfiled</SelectItem>
+              {[...projectsById.values()].map((project) => (
+                <SelectItem key={project.id} value={project.id as string}>
+                  <ProjectLabel name={project.name} icon={project.icon} />
+                </SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        )}
+        {hasAnyTasks && projectsError && (
+          <p className="text-sm text-destructive">
+            Couldn&apos;t load projects.{" "}
+            <button type="button" className="underline" onClick={() => void refetchProjects()}>
+              Retry
+            </button>
+          </p>
+        )}
       </div>
 
       {isError ? (
@@ -233,7 +305,7 @@ export function TasksPage() {
       ) : filtered.length === 0 ? (
         <EmptyState
           hasAny={hasAnyTasks}
-          showSuggestions={filter === "all"}
+          showSuggestions={showSuggestions}
           onPickSuggestion={openFromSuggestion}
         />
       ) : (
@@ -245,6 +317,11 @@ export function TasksPage() {
             <ScheduledTaskRow
               key={task.id}
               task={task}
+              project={
+                projectFilter === ALL_PROJECTS && task.projectId
+                  ? projectsById.get(task.projectId)
+                  : undefined
+              }
               now={now}
               busy={busyId === task.id}
               onEdit={handleEdit}
@@ -260,15 +337,14 @@ export function TasksPage() {
           filter ("Active" / "Paused") is selected, per the product spec ("when
           all isn't selected, suggestions should disappear"). Driven by the same
           `filter` state as the list, so switching tabs toggles it live. */}
-      {filter === "all" && filtered.length > 0 && (
-        <SuggestionsSection onPick={openFromSuggestion} />
-      )}
+      {showSuggestions && filtered.length > 0 && <SuggestionsSection onPick={openFromSuggestion} />}
 
       <CreateScheduledTaskDialog
         open={manualOpen}
         onOpenChange={handleManualOpenChange}
         initialName={prefill?.name}
         initialPrompt={prefill?.prompt}
+        initialProjectId={selectedProjectId ?? undefined}
         editingTask={editingTask}
       />
     </PageScroll>

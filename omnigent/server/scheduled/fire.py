@@ -68,12 +68,14 @@ from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, R
 from omnigent.server.bundles import agent_for_user
 from omnigent.server.host_registry import host_owner_scope
 from omnigent.server.routes._session_create_validation import (
+    resolve_project_session_create,
     validate_existing_host_workspace,
     validate_session_agent,
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.schemas import SessionEventInput
+from omnigent.server.schemas import ProjectSessionCreateRequest, SessionEventInput
+from omnigent.stores.project_store import ProjectStore
 
 _logger = logging.getLogger(__name__)
 
@@ -145,6 +147,7 @@ class FireDeps:
     host_store: Any | None
     host_registry: Any | None
     policy_store: Any | None = None
+    project_store: ProjectStore | None = None
     agent_cache: Any | None = None
     runner_router: Any | None = None
     tunnel_registry: Any | None = None
@@ -490,6 +493,7 @@ async def _run_fire_for_task(
             )
             return
 
+        effective = replace(effective, project_id=await _resolve_fire_project(deps, task))
         try:
             effective = await _own_task_agent(deps, effective)
             conv = await _create_session(deps, effective)
@@ -733,6 +737,62 @@ async def _resolve_default_workspace(deps: FireDeps, host_id: str) -> str:
 _PERMISSION_MODE_HARNESS = "claude-native"
 
 
+async def _resolve_owned_fire_project(
+    project_store: ProjectStore,
+    task: ScheduledTask,
+) -> str | None:
+    """Resolve Projects across the two supported single-user owner forms."""
+    owners = (task.user_id,) if task.user_id is not None else (None, RESERVED_USER_LOCAL)
+    body = ProjectSessionCreateRequest(
+        agent_id=task.agent_id,
+        project_id=task.project_id,
+        host_id=task.host_id,
+        workspace=task.workspace,
+        git=None,
+    )
+    for owner in owners:
+        try:
+            resolution = await resolve_project_session_create(
+                body=body,
+                user_id=owner,
+                project_store=project_store,
+            )
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.NOT_FOUND:
+                continue
+            raise
+        if resolution.project_id is not None:
+            return resolution.project_id
+    return None
+
+
+async def _resolve_fire_project(
+    deps: FireDeps,
+    task: ScheduledTask,
+) -> str | None:
+    """Resolve one fire's Project; an unverifiable or missing one runs unfiled."""
+    if task.project_id is None:
+        return None
+    resolved = None
+    if deps.project_store is not None:
+        try:
+            resolved = await _resolve_owned_fire_project(deps.project_store, task)
+        except Exception:
+            _logger.warning(
+                "scheduled fire: task %s project %s lookup failed",
+                task.id,
+                task.project_id,
+                exc_info=True,
+            )
+    if resolved is None:
+        _logger.warning(
+            "scheduled fire: task %s project %s not found for its owner; run is unfiled",
+            task.id,
+            task.project_id,
+        )
+    return resolved
+
+
 async def _permission_mode_launch_args(deps: FireDeps, task: ScheduledTask) -> list[str] | None:
     """Derive the native-terminal ``--permission-mode`` args for a task.
 
@@ -886,6 +946,7 @@ async def _create_session(deps: FireDeps, task: ScheduledTask) -> Conversation:
         title=task.name,
         host_id=task.host_id,
         workspace=task.workspace,
+        project_id=task.project_id,
         terminal_launch_args=await _permission_mode_launch_args(deps, task),
     )
     reasoning_effort = task.reasoning_effort
