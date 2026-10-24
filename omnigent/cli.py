@@ -2348,6 +2348,7 @@ def main() -> None:
         "integration",
         "setup",
         "stop",
+        "uninstall",
         "update",
         "upgrade",
     }
@@ -5654,6 +5655,36 @@ def uninstall(
             )
             raise SystemExit(3)
         click.echo("No Omnigent install detected; nothing to uninstall.", err=True)
+        raise SystemExit(3)
+
+    if IS_WINDOWS:
+        # The uninstaller is a POSIX shell script, and a running omnigent.exe
+        # cannot remove its own uv tool environment on Windows anyway.
+        from omnigent.install_ledger import state_dir
+
+        message = (
+            "`omnigent uninstall` is not supported on native Windows. Run "
+            "`omnigent stop`, then `uv tool uninstall omnigent`. To also remove "
+            f"local state, delete {state_dir()}."
+        )
+        if json_output:
+            click.echo(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "dry_run": effective_dry_run,
+                        "ledger_source": ledger.ledger_source,
+                        "actions": [],
+                        "backups": [],
+                        "summary": {"done": 0, "skipped": 0, "failed": 0, "reported": 0},
+                        "exit_code": 3,
+                        "error": message,
+                    },
+                    indent=2,
+                )
+            )
+            raise SystemExit(3)
+        click.echo(f"Error: {message}", err=True)
         raise SystemExit(3)
 
     script_path = _uninstall_script_path()
