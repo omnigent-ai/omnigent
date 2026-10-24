@@ -8653,6 +8653,11 @@ def _transcript_items_from_entry(
             agent_name=agent_name,
             current_response_id=current_response_id,
         )
+    if entry.get("type") == "system" and (block := _hook_block_outcome(entry)) is not None:
+        # A blocked prompt neither starts nor ends a turn.
+        return current_response_id, _blocked_prompt_transcript_items(
+            entry, block, line_number=line_number, record_offset=record_offset
+        )
     # Only ``user``/``assistant`` records are conversation turns. Other typed
     # records can carry a ``message`` too, e.g. ``api-request-blob`` copies of
     # API requests that include injected ``<system-reminder>`` context.
@@ -8751,6 +8756,128 @@ def _attachment_transcript_items_from_entry(
         ),
     )
     return None, [item]
+
+
+# Claude Code's notice for a prompt a UserPromptSubmit hook blocked reads
+# "<header><reason><separator><original prompt>".
+_BLOCKED_PROMPT_HEADER = "UserPromptSubmit operation blocked by hook:\n"
+_BLOCKED_PROMPT_SEPARATOR = "\n\nOriginal prompt: "
+_BLOCKED_PROMPT_NOTICE = (
+    "Claude Code did not run this message: a UserPromptSubmit hook blocked it."
+)
+_BLOCKED_PROMPT_UNSEPARATED = (
+    "The hook's reason could not be told apart from the prompt in Claude's notice; "
+    "the Terminal view shows the full text."
+)
+
+
+def _hook_block_outcome(entry: _JsonObject) -> _JsonObject | None:
+    """
+    Return the outcome of Claude's record of a prompt a hook blocked.
+
+    :param entry: Decoded Claude transcript record of ``type == "system"``.
+    :returns: Its ``promptSubmitEnding.ending`` object, e.g.
+        ``{"kind": "blocked_by_hook", "reason": "Token detected."}``; an
+        outcome without a ``reason`` when the build recorded only the notice
+        text; or ``None`` when the record is not a hook block.
+    """
+    ending = entry.get("promptSubmitEnding")
+    if isinstance(ending, dict):
+        outcome = ending.get("ending")
+        if isinstance(outcome, dict) and outcome.get("kind") == "blocked_by_hook":
+            return cast(_JsonObject, outcome)
+        return None
+    # Claude Code builds up to at least 2.1.283 write no promptSubmitEnding;
+    # the notice text is their only record of the block.
+    content = entry.get("content")
+    if isinstance(content, str) and content.startswith(_BLOCKED_PROMPT_HEADER):
+        return {"kind": "blocked_by_hook"}
+    return None
+
+
+def _blocked_prompt_transcript_items(
+    entry: _JsonObject,
+    outcome: _JsonObject,
+    *,
+    line_number: int,
+    record_offset: int | None,
+) -> list[ClaudeTranscriptItem]:
+    """
+    Mirror a prompt a ``UserPromptSubmit`` hook blocked, with the hook's reason.
+
+    Claude records blocked prompts as system notices. Mirror the original
+    prompt to settle its web entry, then emit the hook reason as an
+    informational notice.
+
+    :param entry: Claude ``system`` record of the blocked prompt.
+    :param outcome: Its outcome from :func:`_hook_block_outcome`.
+    :param line_number: One-based transcript line number.
+    :param record_offset: Byte offset where the transcript record
+        starts, or ``None`` for legacy line-cursor reads.
+    :returns: The user message and the notice, or only the notice when
+        the prompt cannot be recovered from the record unambiguously.
+    """
+    content = entry.get("content")
+    body = (
+        content.removeprefix(_BLOCKED_PROMPT_HEADER)
+        if isinstance(content, str) and content.startswith(_BLOCKED_PROMPT_HEADER)
+        else None
+    )
+    structured = outcome.get("reason")
+    structured = structured if isinstance(structured, str) else None
+    if (
+        body is not None
+        and structured is not None
+        and body.startswith(structured + _BLOCKED_PROMPT_SEPARATOR)
+    ):
+        # The structured reason marks where the prompt starts even when either
+        # one contains the separator text.
+        reason, prompt = structured, body[len(structured + _BLOCKED_PROMPT_SEPARATOR) :]
+    elif body is not None and body.count(_BLOCKED_PROMPT_SEPARATOR) == 1:
+        notice_reason, _separator, prompt = body.partition(_BLOCKED_PROMPT_SEPARATOR)
+        reason = structured if structured is not None else notice_reason
+    else:
+        # No usable notice text, or a split that would be a guess: emit only
+        # the notice and leave the queued message to the server's own settlement.
+        prompt = ""
+        if structured is not None:
+            reason = structured
+        elif body is None or _BLOCKED_PROMPT_SEPARATOR in body:
+            # Echoing the whole notice would repeat the prompt the message shows.
+            reason = _BLOCKED_PROMPT_UNSEPARATED
+        else:
+            reason = body
+    prompt = _unwrap_pasted_content_markers(prompt)
+    source_key = _transcript_source_key(entry, line_number, record_offset)
+    response_id = _response_id_from_source(source_key)
+    notice = _BLOCKED_PROMPT_NOTICE
+    if reason.strip():
+        notice = f"{notice}\n\n{reason.strip()}"
+    items: list[ClaudeTranscriptItem] = []
+    if prompt.strip():
+        items.append(
+            ClaudeTranscriptItem(
+                source_id=_source_id(source_key, 0, "message"),
+                item_type="message",
+                data={"role": "user", "content": [{"type": "input_text", "text": prompt}]},
+                response_id=response_id,
+                agent_message_candidate=_is_agent_notification_text(prompt),
+            )
+        )
+    items.append(
+        ClaudeTranscriptItem(
+            source_id=_source_id(source_key, 1, "error"),
+            item_type="error",
+            data={
+                "source": "harness",
+                "code": "native_prompt_blocked_by_hook",
+                "message": notice,
+                "level": "info",
+            },
+            response_id=response_id,
+        )
+    )
+    return items
 
 
 # Slash-command marker handling. Claude Code's embedded TUI emits

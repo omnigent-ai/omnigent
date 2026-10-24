@@ -10491,6 +10491,215 @@ async def test_native_message_that_is_not_a_claude_btw_is_still_queued(
 
 
 @pytest.mark.asyncio
+async def test_hook_blocked_prompt_is_not_reclassified_as_missing_by_later_mirror(
+    tmp_path: Path,
+) -> None:
+    """A web message a ``UserPromptSubmit`` hook blocked settles with the hook's reason.
+
+    It must not be reported as never recorded once a later message is mirrored.
+    Claude Code 2.1.283 records the block only as a ``system`` notice without
+    ``promptSubmitEnding``; the records below were captured from a live session.
+    """
+    import json
+
+    from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+    from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    blocked_text = "BLOCKME hello"
+    later_text = "Reply with exactly this token and nothing else: tok-57536013"
+    claude_session = "3f28dadd-7edb-411a-8109-732efc8784b8"
+    records = [
+        {
+            "parentUuid": "11018b4e-e1ba-428a-b41c-975dc0d13701",
+            "isSidechain": False,
+            "type": "system",
+            "subtype": "informational",
+            "content": (
+                "UserPromptSubmit operation blocked by hook:\nBlocked: test\n\n"
+                f"Original prompt: {blocked_text}"
+            ),
+            "isMeta": False,
+            "timestamp": "2026-10-15T03:09:59.528Z",
+            "uuid": "93481c11-6a50-4830-a694-e42e92626939",
+            "level": "warning",
+            "preventContinuation": True,
+            "userType": "external",
+            "entrypoint": "cli",
+            "cwd": "/workspace",
+            "sessionId": claude_session,
+            "version": "2.1.283",
+            "gitBranch": "main",
+        },
+        {
+            "parentUuid": "93481c11-6a50-4830-a694-e42e92626939",
+            "isSidechain": False,
+            "promptId": "deb82924-c900-4c53-8402-776ad05448f3",
+            "type": "user",
+            "message": {"role": "user", "content": later_text},
+            "uuid": "a9ce77f8-74b8-44d0-bf19-c713c7b9b565",
+            "timestamp": "2026-10-15T03:10:19.600Z",
+            "permissionMode": "default",
+            "origin": {"kind": "human"},
+            "promptSource": "typed",
+            "turnOrigin": "human",
+            "userType": "external",
+            "entrypoint": "cli",
+            "cwd": "/workspace",
+            "sessionId": claude_session,
+            "version": "2.1.283",
+            "gitBranch": "main",
+        },
+    ]
+    transcript = tmp_path / f"{claude_session}.jsonl"
+    transcript.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    try:
+        blocked_pending = pending_inputs.record(
+            session_id,
+            [{"type": "input_text", "text": blocked_text}],
+            created_by="alice@example.com",
+            stable_id="1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a",
+        )
+        later_pending = pending_inputs.record(
+            session_id,
+            [{"type": "input_text", "text": later_text}],
+            created_by="alice@example.com",
+            stable_id="2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b",
+        )
+        _cursor, _response_id, items = read_transcript_items_since(
+            transcript, 0, agent_name=CLAUDE_NATIVE_AGENT_NAME
+        )
+        for item in items:
+            event = _external_conversation_item_event(item)
+            await _persist_external_conversation_item(
+                session_id,
+                conversation,
+                SessionEventInput(type=event["type"], data=event["data"]),
+                store,  # type: ignore[arg-type]
+            )
+
+        missing_errors = [
+            (item.data.code, item.data.message)
+            for item in store.appended_items
+            if item.type == "error" and item.data.code == "native_prompt_not_recorded"
+        ]
+        assert missing_errors == [], (
+            f"the hook-blocked input {blocked_pending} stayed pending and was reported missing "
+            f"when the later mirror settled {later_pending}; persisted={missing_errors}; "
+            f"parsed items={[(item.item_type, item.data) for item in items]}"
+        )
+        notices = [
+            (item.data.code, item.data.level, item.data.message)
+            for item in store.appended_items
+            if item.type == "error" and item.data.code == "native_prompt_blocked_by_hook"
+        ]
+        assert [(code, level) for code, level, _message in notices] == [
+            ("native_prompt_blocked_by_hook", "info")
+        ], f"parsed items={[(item.item_type, item.data) for item in items]}"
+        assert "Blocked: test" in notices[0][2]
+        assert [
+            item.data.content[0]["text"] for item in store.appended_items if item.type == "message"
+        ] == [blocked_text, later_text]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
+async def test_ambiguous_hook_block_notice_keeps_the_queued_original(tmp_path: Path) -> None:
+    """A notice-only block whose reason repeats the separator must not rewrite the message.
+
+    The parser cannot tell where the prompt starts, so it emits only the notice;
+    the queued web message keeps its own text and settles through the existing
+    skipped-input path once the next message is mirrored.
+    """
+    import json
+
+    from omnigent.harnesses.claude_native.bridge import read_transcript_items_since
+    from omnigent.harnesses.claude_native.forwarder import _external_conversation_item_event
+    from omnigent.runtime import pending_inputs
+    from omnigent.server.routes.sessions import _persist_external_conversation_item
+
+    pending_inputs.reset_for_tests()
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    store = _ConversationStore()
+    conversation = store.get_conversation(session_id)
+    assert conversation is not None
+    blocked_text = "deploy the blue build"
+    later_text = "continue"
+    reason = "Not now.\n\nOriginal prompt: was echoed by the hook"
+    records = [
+        {
+            "type": "system",
+            "subtype": "informational",
+            "uuid": "ambiguous-block",
+            "content": (
+                "UserPromptSubmit operation blocked by hook:\n"
+                f"{reason}\n\nOriginal prompt: {blocked_text}"
+            ),
+            "version": "2.1.283",
+        },
+        {
+            "type": "user",
+            "uuid": "later-record",
+            "message": {"role": "user", "content": later_text},
+        },
+    ]
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        "".join(json.dumps(record) + "\n" for record in records), encoding="utf-8"
+    )
+    try:
+        for text, stable_id in (
+            (blocked_text, "1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a"),
+            (later_text, "2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b"),
+        ):
+            pending_inputs.record(
+                session_id,
+                [{"type": "input_text", "text": text}],
+                created_by="alice@example.com",
+                stable_id=stable_id,
+            )
+        _cursor, _response_id, items = read_transcript_items_since(
+            transcript, 0, agent_name=CLAUDE_NATIVE_AGENT_NAME
+        )
+        for item in items:
+            event = _external_conversation_item_event(item)
+            await _persist_external_conversation_item(
+                session_id,
+                conversation,
+                SessionEventInput(type=event["type"], data=event["data"]),
+                store,  # type: ignore[arg-type]
+            )
+
+        assert [
+            item.data.content[0]["text"] for item in store.appended_items if item.type == "message"
+        ] == [blocked_text, later_text]
+        errors = [
+            (item.data.code, item.data.message)
+            for item in store.appended_items
+            if item.type == "error"
+        ]
+        assert [code for code, _message in errors] == [
+            "native_prompt_blocked_by_hook",
+            "native_prompt_not_recorded",
+        ]
+        assert errors[0][1].endswith("the Terminal view shows the full text.")
+        assert blocked_text not in errors[0][1]
+        assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(session_id)] == []
+    finally:
+        pending_inputs.reset_for_tests()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize(
     "suffix",
     [

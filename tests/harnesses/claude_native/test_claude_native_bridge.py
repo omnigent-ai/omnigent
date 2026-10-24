@@ -1355,6 +1355,199 @@ def test_read_transcript_items_since_marks_task_notifications_meta(tmp_path: Pat
     }
 
 
+def _blocked_prompt_entry(reason: str, prompt: str, **overrides: Any) -> dict[str, Any]:
+    """
+    Build Claude Code's record of a prompt a ``UserPromptSubmit`` hook blocked.
+
+    :param reason: The hook's block reason.
+    :param prompt: The prompt Claude dropped.
+    :param overrides: Record keys to replace.
+    :returns: The ``system`` transcript record.
+    """
+    return {
+        "type": "system",
+        "subtype": "informational",
+        "level": "warning",
+        "uuid": "blocked-record",
+        "content": (
+            f"UserPromptSubmit operation blocked by hook:\n{reason}\n\nOriginal prompt: {prompt}"
+        ),
+        "preventContinuation": True,
+        "promptSubmitEnding": {
+            "ending": {"kind": "blocked_by_hook", "reason": reason},
+            "promptKept": False,
+        },
+        **overrides,
+    }
+
+
+@pytest.mark.parametrize(
+    "reason,prompt",
+    [
+        ("Security: a token was detected in the prompt.", "deploy with this key"),
+        # Both the reason and the prompt contain the separator Claude writes between them.
+        ("Blocked.\n\nOriginal prompt: was refused", "line one\n\nOriginal prompt: quoted"),
+    ],
+)
+def test_transcript_mirrors_prompt_blocked_by_hook(
+    tmp_path: Path, reason: str, prompt: str
+) -> None:
+    """A hook-blocked prompt mirrors as its user message plus the hook's reason."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(_blocked_prompt_entry(reason, prompt)), encoding="utf-8"
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+    assert current_response_id == "active"
+    assert [item.item_type for item in items] == ["message", "error"]
+    assert items[0].data == {"role": "user", "content": [{"type": "input_text", "text": prompt}]}
+    assert items[1].data == {
+        "source": "harness",
+        "code": "native_prompt_blocked_by_hook",
+        "message": (
+            "Claude Code did not run this message: a UserPromptSubmit hook blocked it.\n\n"
+            + reason
+        ),
+        "level": "info",
+    }
+    assert items[0].response_id == items[1].response_id
+    assert len({item.source_id for item in items}) == 2
+
+
+def _notice_only_blocked_prompt_entry(reason: str, prompt: str) -> dict[str, Any]:
+    """The block record of a Claude Code build that writes no ``promptSubmitEnding``."""
+    entry = _blocked_prompt_entry(reason, prompt, version="2.1.283")
+    del entry["promptSubmitEnding"]
+    return entry
+
+
+def test_transcript_mirrors_prompt_blocked_by_hook_from_notice_text(tmp_path: Path) -> None:
+    """Without a structured ending, the reason and prompt come from the notice text."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(
+        _transcript_line(_notice_only_blocked_prompt_entry("Blocked: test", "BLOCKME hello")),
+        encoding="utf-8",
+    )
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+    assert current_response_id == "active"
+    assert [item.item_type for item in items] == ["message", "error"]
+    assert items[0].data == {
+        "role": "user",
+        "content": [{"type": "input_text", "text": "BLOCKME hello"}],
+    }
+    assert items[1].data["code"] == "native_prompt_blocked_by_hook"
+    assert items[1].data["message"].endswith("hook blocked it.\n\nBlocked: test")
+
+
+_HEADER = "UserPromptSubmit operation blocked by hook:\n"
+_UNSEPARATED = (
+    "The hook's reason could not be told apart from the prompt in Claude's notice; "
+    "the Terminal view shows the full text."
+)
+
+
+@pytest.mark.parametrize(
+    "entry,expected_reason",
+    [
+        (_notice_only_blocked_prompt_entry("a\n\nOriginal prompt: b", "c"), _UNSEPARATED),
+        (
+            _notice_only_blocked_prompt_entry("No.", "line one\n\nOriginal prompt: quoted"),
+            _UNSEPARATED,
+        ),
+        ({"type": "system", "subtype": "informational", "content": f"{_HEADER}No."}, "No."),
+        (_blocked_prompt_entry("No.", "", content=f"{_HEADER}No."), "No."),
+        (
+            _blocked_prompt_entry(
+                "Blocked.",
+                "hi",
+                content=f"{_HEADER}Blocked!\n\nOriginal prompt: x\n\nOriginal prompt: hi",
+            ),
+            "Blocked.",
+        ),
+        (_blocked_prompt_entry("No.", "hi", content=None), "No."),
+        (_blocked_prompt_entry("No.", "hi", content="A notice in a different shape"), "No."),
+    ],
+    ids=[
+        "separator-in-reason",
+        "separator-in-prompt",
+        "notice-without-prompt",
+        "structured-without-prompt",
+        "structured-reason-mismatch",
+        "structured-without-content",
+        "structured-foreign-content",
+    ],
+)
+def test_transcript_emits_only_the_notice_when_the_prompt_is_unrecoverable(
+    tmp_path: Path, entry: dict[str, Any], expected_reason: str
+) -> None:
+    """A block whose prompt cannot be split out unambiguously yields the notice alone."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(entry), encoding="utf-8")
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+    assert current_response_id == "active"
+    assert [item.item_type for item in items] == ["error"]
+    assert items[0].data["code"] == "native_prompt_blocked_by_hook"
+    assert items[0].data["message"].endswith(f"hook blocked it.\n\n{expected_reason}")
+
+
+def test_transcript_splits_on_the_only_separator_when_the_structured_reason_does_not_anchor(
+    tmp_path: Path,
+) -> None:
+    """A reason reformatted in the notice still yields the message when one separator remains."""
+    entry = _blocked_prompt_entry(
+        "Blocked: test ",
+        "BLOCKME hello",
+        content=f"{_HEADER}Blocked: test\n\nOriginal prompt: BLOCKME hello",
+    )
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(entry), encoding="utf-8")
+
+    _cursor, _current_response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+    assert [item.item_type for item in items] == ["message", "error"]
+    assert items[0].data["content"] == [{"type": "input_text", "text": "BLOCKME hello"}]
+    assert items[1].data["message"].endswith("hook blocked it.\n\nBlocked: test")
+
+
+@pytest.mark.parametrize(
+    "entry",
+    [
+        {"type": "system", "subtype": "informational", "content": "Conversation compacted"},
+        _blocked_prompt_entry(
+            "No.", "hi", promptSubmitEnding={"ending": {"kind": "stopped_by_hook"}}
+        ),
+    ],
+    ids=["other-notice", "not-a-block"],
+)
+def test_transcript_skips_system_records_without_a_blocked_prompt(
+    tmp_path: Path, entry: dict[str, Any]
+) -> None:
+    """Only a hook block becomes conversation items."""
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text(_transcript_line(entry), encoding="utf-8")
+
+    _cursor, current_response_id, items = read_transcript_items_since(
+        transcript, 0, agent_name="Claude", current_response_id="active"
+    )
+
+    assert current_response_id == "active"
+    assert items == []
+
+
 _TEAMMATE_MESSAGE = '<teammate-message teammate_id="reviewer">Done</teammate-message>'
 _TASK_COMPLETION = (
     "<task-notification><task-id>agent-1</task-id><status>completed</status></task-notification>"

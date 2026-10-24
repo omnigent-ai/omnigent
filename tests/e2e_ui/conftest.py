@@ -2642,6 +2642,7 @@ def _create_native_claude_session(
     runner_id: str,
     *,
     terminal_launch_args: list[str] | None = None,
+    workspace: str | None = None,
 ) -> str:
     """Register the ``claude-native`` wrapper agent and bind its session.
 
@@ -2668,11 +2669,15 @@ def _create_native_claude_session(
         by the plan-mode fixture to pass ``["--permission-mode", "plan"]`` so
         Claude boots into plan mode and reaches for ``ExitPlanMode``. ``None``
         launches with the production defaults.
+    :param workspace: Session workspace (Claude's cwd), e.g. a directory whose
+        ``.claude/settings.json`` the test seeded. ``None`` keeps the runner's cwd.
     :returns: The new session/conversation id.
     """
     metadata: dict[str, object] = {}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
+    if workspace is not None:
+        metadata["workspace"] = workspace
     created = create_native_session(httpx, base_url, harness="claude", metadata=metadata)
     session_id = str(created["session_id"])
     _bind_session_runner(base_url, session_id, runner_id)
@@ -2859,12 +2864,15 @@ def native_claude_mock_session_context(
     tmp_path_factory: pytest.TempPathFactory,
     *,
     terminal_launch_args: list[str] | None = None,
+    workspace: str | None = None,
 ) -> Iterator[tuple[str, str]]:
     """A real Claude CLI using an explicitly configured mock provider.
 
     Workflow-owned runners are already configured. Standalone tests temporarily
     install a mock provider regardless of ambient credential placeholders.
     ``terminal_launch_args`` are persisted on the session and passed to ``claude``.
+    ``workspace`` is the session's cwd, e.g. a directory whose project settings
+    (hooks) the test seeded.
     Callers request ``claude_managed_settings`` to expose real machine routing.
     """
     validate_native_claude_mock_routing(mock_llm_server_url)
@@ -2874,10 +2882,12 @@ def native_claude_mock_session_context(
         mock_llm_server_url, "claude", workflow_owned=bool(_server_state.get("workflow_owned"))
     ):
         # Keep the default create call unchanged; tests/test_ui_fixture_wiring.py pins it.
-        launch_args = (
-            {} if terminal_launch_args is None else {"terminal_launch_args": terminal_launch_args}
-        )
-        session_id = _create_native_claude_session(live_server, runner_id, **launch_args)
+        create_kwargs: dict[str, Any] = {}
+        if terminal_launch_args is not None:
+            create_kwargs["terminal_launch_args"] = terminal_launch_args
+        if workspace is not None:
+            create_kwargs["workspace"] = workspace
+        session_id = _create_native_claude_session(live_server, runner_id, **create_kwargs)
         try:
             yield (live_server, session_id)
         finally:
