@@ -388,3 +388,21 @@ select {
   background: var(--panel);
   max-width: 760px;
 }
+
+/* Workflow (functional styling only) */
+.workflow-panel { display: grid; gap: 12px; margin-top: 12px; }
+.workflow-section { border: 2px solid var(--line, #3a3f55); padding: 8px 12px; background: rgba(0, 0, 0, 0.15); }
+.workflow-section h3 { margin: 0 0 6px; }
+.workflow-section label { display: block; margin: 4px 0; }
+.workflow-section input, .workflow-section textarea, .theme-setup input, .theme-setup select, .approval-dialog input { width: 100%; box-sizing: border-box; }
+.theme-setup { border: 2px dashed var(--line, #3a3f55); padding: 12px; margin-top: 12px; }
+.theme-setup label, .theme-setup fieldset { display: block; margin: 6px 0; }
+.capability-table { border-collapse: collapse; margin: 8px 0; font-size: 0.85em; }
+.capability-table th, .capability-table td { border: 1px solid var(--line, #3a3f55); padding: 2px 6px; text-align: left; }
+.task-list, .requirements-list, .event-feed { padding-left: 18px; }
+.task { margin-bottom: 8px; }
+.task-done strong { text-decoration: line-through; opacity: 0.7; }
+.request-facts dt { font-weight: bold; margin-top: 4px; }
+.request-facts dd { margin: 0 0 0 8px; word-break: break-all; }
+.dictation { display: inline-flex; align-items: center; gap: 4px; }
+.activity-office .activity-kind { color: #9fb7ff; }

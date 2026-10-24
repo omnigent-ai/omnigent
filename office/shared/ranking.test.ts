@@ -18,6 +18,7 @@ function room(projectId: string, overrides: Partial<RoomSummary> = {}): RoomSumm
   return {
     projectId,
     name: projectId,
+    theme: null,
     createdAt: NOW - 100 * DAY,
     priority: "normal",
     keepUpstairs: false,

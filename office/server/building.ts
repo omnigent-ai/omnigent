@@ -4,7 +4,9 @@
 import type { BuildingSnapshot, Priority, RoomSettingsPatch, RoomSummary } from "../shared/types.ts";
 import { mergeScan, scanSession } from "./activity.ts";
 import { OmnigentError, type OmnigentClient, type OmnigentSessionListItem } from "./omnigentClient.ts";
+import { silentNotifier, type Notifier } from "./notifier.ts";
 import type { ApprovalDecision, StateStore } from "./stateStore.ts";
+import type { WorkflowService } from "./workflow.ts";
 
 const PRIORITIES: readonly Priority[] = ["normal", "high", "critical"];
 const MIN_REFRESH_INTERVAL_MS = 4_000;
@@ -32,11 +34,25 @@ export class BuildingService {
   private snapshot: BuildingSnapshot | null = null;
   private lastRefreshMs = 0;
   private inFlight: Promise<BuildingSnapshot> | null = null;
+  private workflow: WorkflowService | null = null;
+  private readonly notifier: Notifier;
+  /** Pending Omnigent requests per session at the last refresh, to notify only on new ones. */
+  private pendingSeen: Map<string, number> | null = null;
 
-  constructor(client: OmnigentClient, store: StateStore, clock: Clock = systemClock) {
+  constructor(
+    client: OmnigentClient,
+    store: StateStore,
+    clock: Clock = systemClock,
+    options: { notifier?: Notifier } = {},
+  ) {
     this.client = client;
     this.store = store;
     this.clock = clock;
+    this.notifier = options.notifier ?? silentNotifier;
+  }
+
+  attachWorkflow(workflow: WorkflowService): void {
+    this.workflow = workflow;
   }
 
   /** Return a recent snapshot, refreshing from Omnigent when it is stale. */
@@ -54,6 +70,7 @@ export class BuildingService {
     try {
       const [projects, sessions] = await Promise.all([this.client.listProjects(), this.client.listSessions()]);
       this.sessions = sessions.filter((session) => !session.archived);
+      this.notifyNewRequests(projects);
       await this.scanChangedSessions();
       const rooms = projects.map((project) => this.summarize(project, now));
       this.store.save();
@@ -70,6 +87,18 @@ export class BuildingService {
     return this.snapshot;
   }
 
+  private notifyNewRequests(projects: { id: string; name: string }[]): void {
+    const seen = new Map(this.sessions.map((session) => [session.id, session.pending_elicitations_count]));
+    if (this.pendingSeen) {
+      for (const session of this.sessions) {
+        if (!session.project_id || session.pending_elicitations_count <= (this.pendingSeen.get(session.id) ?? 0)) continue;
+        const room = projects.find((project) => project.id === session.project_id)?.name ?? "A room";
+        this.notifier.notify(`${room}: approval needed`, `${session.title ?? "A worker"} is waiting for your decision.`);
+      }
+    }
+    this.pendingSeen = seen;
+  }
+
   private async scanChangedSessions(): Promise<void> {
     const changed = this.sessions.filter(
       (session) =>
@@ -82,8 +111,12 @@ export class BuildingService {
       await Promise.all(
         changed.slice(index, index + concurrency).map(async (session) => {
           try {
-            const scan = await scanSession(session.id, session.updated_at, (sessionId, after) =>
-              this.client.listItems(sessionId, { after }),
+            const scan = await scanSession(
+              session.id,
+              session.updated_at,
+              (sessionId, after) => this.client.listItems(sessionId, { after }),
+              undefined,
+              (itemId) => this.workflow?.isRelayedItem(itemId) ?? false,
             );
             this.store.state.sessions[session.id] = mergeScan(this.store.state.sessions[session.id], scan);
           } catch {
@@ -109,9 +142,13 @@ export class BuildingService {
         latestInteractionAt = Math.max(latestInteractionAt ?? 0, decision.decidedAt);
       }
     }
+    const workflowDecisionAt = this.workflow?.latestDecisionAt(project.id) ?? null;
+    if (workflowDecisionAt !== null) latestInteractionAt = Math.max(latestInteractionAt ?? 0, workflowDecisionAt);
+    const branch = this.workflow?.activeBranch(project.id) ?? null;
     return {
       projectId: project.id,
       name: project.name,
+      theme: branch?.theme ?? null,
       icon: project.config?.icon,
       createdAt: project.created_at ?? roomState.firstSyncAt,
       priority: roomState.priority,
@@ -119,7 +156,9 @@ export class BuildingService {
       latestInteractionAt,
       firstSyncAt: roomState.firstSyncAt,
       historyComplete,
-      pendingRequestCount: sessions.reduce((total, session) => total + session.pending_elicitations_count, 0),
+      pendingRequestCount:
+        sessions.reduce((total, session) => total + session.pending_elicitations_count, 0) +
+        (this.workflow?.pendingHumanRequests(project.id) ?? 0),
       workerCount: sessions.length,
       activeWorkerCount: sessions.filter((session) => session.status === "running" || session.status === "launching").length,
     };
@@ -141,6 +180,19 @@ export class BuildingService {
     if (patch.keepUpstairs !== undefined) room.keepUpstairs = patch.keepUpstairs;
     this.store.save();
     return this.getSnapshot(true);
+  }
+
+  async createRoom(nameInput: unknown, iconInput: unknown): Promise<BuildingSnapshot> {
+    const name = typeof nameInput === "string" ? nameInput.trim() : "";
+    if (!name || name.length > 200) throw new OfficeRequestError(400, "invalid_name", "Give the room a name (up to 200 characters).");
+    const icon = typeof iconInput === "string" && iconInput.trim() ? [...iconInput.trim()].slice(0, 2).join("") : undefined;
+    await this.client.createProject(name, icon ? { icon } : {});
+    return this.getSnapshot(true);
+  }
+
+  /** Mark the snapshot stale so the next read refreshes from Omnigent. */
+  invalidate(): void {
+    this.lastRefreshMs = 0;
   }
 
   async listWorkers(projectId: string): Promise<OmnigentSessionListItem[]> {

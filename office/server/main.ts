@@ -7,9 +7,11 @@ import { homedir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { BuildingService } from "./building.ts";
-import { createOfficeHandler } from "./http.ts";
+import { MCP_PATH, createOfficeHandler, createUpgradeHandler } from "./http.ts";
+import { desktopNotifier, silentNotifier } from "./notifier.ts";
 import { OmnigentClient } from "./omnigentClient.ts";
 import { StateStore } from "./stateStore.ts";
+import { WorkflowService } from "./workflow.ts";
 
 const environment = process.env;
 const port = Number(environment.OMNIGENT_OFFICE_PORT ?? 6780);
@@ -24,9 +26,20 @@ const client = new OmnigentClient({
   userEmail: environment.OMNIGENT_USER_EMAIL,
 });
 const store = new StateStore(join(dataDir, "office-state.json"));
-const building = new BuildingService(client, store);
+const notifier = environment.OMNIGENT_OFFICE_NOTIFICATIONS === "off" ? silentNotifier : desktopNotifier();
+const building = new BuildingService(client, store, undefined, { notifier });
+// Role sessions run on hosts of this machine and reach the office over loopback.
+const workflow = new WorkflowService({
+  omnigent: client,
+  store,
+  notifier,
+  mcpUrl: environment.OMNIGENT_OFFICE_MCP_URL ?? `http://127.0.0.1:${port}${MCP_PATH}`,
+  clock: () => Math.floor(Date.now() / 1000),
+});
+building.attachWorkflow(workflow);
 const handler = createOfficeHandler({
   building,
+  workflow,
   client,
   allowedPorts: [port, devServerPort],
   staticDir: existsSync(join(staticDir, "index.html")) ? staticDir : null,
@@ -35,6 +48,7 @@ const handler = createOfficeHandler({
 const server = createServer((request, response) => {
   void handler(request, response);
 });
+server.on("upgrade", createUpgradeHandler({ client, allowedPorts: [port, devServerPort] }));
 
 server.listen(port, "127.0.0.1", () => {
   console.log(`Omnigent office service on http://127.0.0.1:${port}`);

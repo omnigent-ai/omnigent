@@ -23,6 +23,7 @@ export interface OmnigentSessionListItem {
   runner_online: boolean | null;
   pending_elicitations_count: number;
   archived: boolean;
+  labels?: Record<string, string>;
 }
 
 export class OmnigentError extends Error {
@@ -59,14 +60,19 @@ export class OmnigentClient {
     if (options.userEmail) this.headers["X-Forwarded-Email"] = options.userEmail;
   }
 
-  async request<T>(path: string, init: { method?: string; body?: unknown } = {}): Promise<T> {
+  /** Headers for direct upstream connections, such as the dictation socket proxy. */
+  get authHeaders(): Record<string, string> {
+    return { ...this.headers };
+  }
+
+  async request<T>(path: string, init: { method?: string; body?: unknown; form?: FormData } = {}): Promise<T> {
     const headers: Record<string, string> = { ...this.headers, Accept: "application/json" };
     if (init.body !== undefined) headers["Content-Type"] = "application/json";
     const response = await this.fetchImpl(`${this.baseUrl}${path}`, {
       method: init.method ?? "GET",
       headers,
-      body: init.body === undefined ? undefined : JSON.stringify(init.body),
-      signal: AbortSignal.timeout(15_000),
+      body: init.form ?? (init.body === undefined ? undefined : JSON.stringify(init.body)),
+      signal: AbortSignal.timeout(30_000),
     });
     const text = await response.text();
     const parsed = text ? (JSON.parse(text) as unknown) : null;
@@ -132,11 +138,58 @@ export class OmnigentClient {
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}?${params}`);
   }
 
-  async sendMessage(sessionId: string, text: string): Promise<{ queued: boolean; denied?: boolean }> {
+  /** A 32-hex stableId becomes the item id, which makes retries idempotent. */
+  async sendMessage(
+    sessionId: string,
+    text: string,
+    stableId?: string,
+  ): Promise<{ queued: boolean; denied?: boolean; item_id?: string }> {
+    const data: Record<string, unknown> = { role: "user", content: [{ type: "input_text", text }] };
+    if (stableId) data.stable_id = stableId;
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
       method: "POST",
-      body: { type: "message", data: { role: "user", content: [{ type: "input_text", text }] } },
+      body: { type: "message", data },
     });
+  }
+
+  async createProject(name: string, config: Record<string, unknown>): Promise<OmnigentProject> {
+    return this.request("/v1/projects", { method: "POST", body: { name, config } });
+  }
+
+  async createBundledSession(bundle: Buffer, metadata: Record<string, unknown>): Promise<{ session_id: string }> {
+    const form = new FormData();
+    form.append("metadata", JSON.stringify(metadata));
+    form.append("bundle", new Blob([new Uint8Array(bundle)], { type: "application/gzip" }), "agent.tar.gz");
+    return this.request("/v1/sessions", { method: "POST", form });
+  }
+
+  async bindRunner(sessionId: string, runnerId: string): Promise<void> {
+    await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}`, { method: "PATCH", body: { runner_id: runnerId } });
+  }
+
+  async addSessionPolicy(sessionId: string, name: string, expression: string): Promise<{ id: string }> {
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/policies`, {
+      method: "POST",
+      body: { name, type: "python", handler: "omnigent.policies.builtins.cel.cel_policy", factory_params: { expression } },
+    });
+  }
+
+  async deleteSessionPolicy(sessionId: string, policyId: string): Promise<void> {
+    await this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/policies/${encodeURIComponent(policyId)}`, {
+      method: "DELETE",
+    });
+  }
+
+  async listHosts(): Promise<unknown> {
+    return this.request("/v1/hosts");
+  }
+
+  async listHarnesses(): Promise<unknown> {
+    return this.request("/v1/harnesses");
+  }
+
+  async info(): Promise<Record<string, unknown>> {
+    return this.request("/v1/info");
   }
 
   async interrupt(sessionId: string): Promise<unknown> {

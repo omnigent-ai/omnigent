@@ -1,8 +1,18 @@
 import { useEffect, useState } from "react";
 import { type SessionDetail, type SessionItem, type WorkerSession, officeApi } from "../api.ts";
-import { WORKER_STATE_LABELS, deriveWorkerState, toActivity } from "../workers.ts";
+import { useRuntimeOptions } from "../capabilities.ts";
+import { DictationButton } from "../Dictation.tsx";
+import { type ActivityEntry, WORKER_STATE_LABELS, deriveWorkerState, toActivity } from "../workers.ts";
 
 const POLL_MS = 3_000;
+
+const ACTIVITY_LABELS: Record<ActivityEntry["kind"], string> = {
+  you: "You",
+  agent: "Worker",
+  office: "Office",
+  tool: "Tool",
+  error: "Error",
+};
 
 interface WorkerPanelProps {
   worker: WorkerSession;
@@ -15,6 +25,7 @@ export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
   const [draft, setDraft] = useState("");
   const [notice, setNotice] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
+  const dictationAvailable = useRuntimeOptions()?.dictationAvailable ?? false;
 
   useEffect(() => {
     let cancelled = false;
@@ -71,6 +82,7 @@ export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
       <header className="panel-header">
         <div>
           <h2>{worker.title ?? "Untitled session"}</h2>
+          {worker.labels?.["office.role"] ? <p className="muted small">SDLC role session · office branch {worker.labels["office.branch"]}</p> : null}
           <p className="muted">
             {detail?.harness ?? worker.agent_name ?? "Generalist"}
             {detail?.llm_model ? ` · ${detail.llm_model}` : ""}
@@ -101,7 +113,7 @@ export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
         {activity.length === 0 ? <li className="muted">No visible activity yet.</li> : null}
         {activity.map((entry) => (
           <li key={entry.id} className={`activity-${entry.kind}`}>
-            <span className="activity-kind">{entry.kind === "you" ? "You" : entry.kind === "agent" ? "Worker" : entry.kind === "tool" ? "Tool" : "Error"}</span>
+            <span className="activity-kind">{ACTIVITY_LABELS[entry.kind]}</span>
             <span>{entry.text}</span>
           </li>
         ))}
@@ -128,6 +140,10 @@ export function WorkerPanel({ worker, onClose }: WorkerPanelProps) {
           }}
         />
         <div className="composer-actions">
+          <DictationButton
+            available={dictationAvailable}
+            onText={(text) => setDraft((current) => (current.trim() ? `${current.trimEnd()} ${text}` : text))}
+          />
           <button type="submit" disabled={sending || !draft.trim()}>
             Send
           </button>

@@ -60,3 +60,12 @@ describe("mergeScan", () => {
     expect(mergeScan(scan, { ...scan })).toEqual(scan);
   });
 });
+
+describe("scanSession with office relays", () => {
+  it("skips messages the office relayed between agents", async () => {
+    const { fetch } = pagedFetch([[human("relay_1", 30), agent("a", 25), human("h", 20)]]);
+    const scan = await scanSession("conv", 30, fetch, 5, (itemId) => itemId === "relay_1");
+    expect(scan.latestHumanItemId).toBe("h");
+    expect(scan.latestHumanAt).toBe(20);
+  });
+});

@@ -1,7 +1,9 @@
 // Browser client for the office service. It never talks to Omnigent directly
 // and never sees Omnigent credentials.
 
+import type { GateType } from "../shared/sdlcTheme.ts";
 import type { BuildingSnapshot, RoomSettingsPatch } from "../shared/types.ts";
+import type { BranchRuntime, BranchView, Requirement } from "../shared/workflowTypes.ts";
 
 export interface WorkerSession {
   id: string;
@@ -14,6 +16,27 @@ export interface WorkerSession {
   host_online: boolean | null;
   runner_online: boolean | null;
   pending_elicitations_count: number;
+  labels?: Record<string, string>;
+}
+
+export interface HarnessOption {
+  id: string;
+  label?: string;
+  capabilities?: Record<string, string | boolean | null>;
+}
+
+export interface HostOption {
+  host_id: string;
+  name?: string;
+  status?: string;
+  sandbox_provider?: string | null;
+  configured_harnesses?: string[] | null;
+}
+
+export interface RuntimeOptions {
+  hosts: { hosts?: HostOption[] };
+  harnesses: { data?: HarnessOption[] };
+  dictationAvailable: boolean;
 }
 
 export interface PendingElicitation {
@@ -45,6 +68,7 @@ export interface SessionItem {
   arguments?: string;
   message?: string;
   is_meta?: boolean;
+  office_relayed?: boolean;
 }
 
 export class OfficeApiError extends Error {
@@ -98,4 +122,28 @@ export const officeApi = {
       `/sessions/${encodeURIComponent(sessionId)}/elicitations/${encodeURIComponent(elicitationId)}/decision`,
       { method: "POST", body: { action, feedback } },
     ),
+  createRoom: (name: string, icon: string) => call<BuildingSnapshot>("/rooms", { method: "POST", body: { name, icon } }),
+  runtimeOptions: () => call<RuntimeOptions>("/runtime-options"),
+  branch: async (projectId: string) =>
+    (await call<{ branch: BranchView | null }>(`/rooms/${encodeURIComponent(projectId)}/branch`)).branch,
+  assignTheme: (projectId: string, runtime: BranchRuntime, gates: Partial<Record<GateType, boolean>>) =>
+    call<BranchView>(`/rooms/${encodeURIComponent(projectId)}/theme`, { method: "POST", body: { runtime, gates } }),
+  updateBoard: (branchId: string, baseRevision: number, requirements: Requirement[]) =>
+    call<BranchView>(`/branches/${branchId}/board`, { method: "PUT", body: { baseRevision, requirements } }),
+  decideProposal: (branchId: string, proposalId: string, action: "accept" | "reject", feedback: string) =>
+    call<BranchView>(`/branches/${branchId}/proposals/${proposalId}/decision`, { method: "POST", body: { action, feedback } }),
+  decideGate: (branchId: string, gateId: string, action: "approve" | "request_changes", digest: string, feedback: string) =>
+    call<{ view: BranchView; replayed: boolean }>(`/branches/${branchId}/gates/${gateId}/decision`, {
+      method: "POST",
+      body: { action, digest, feedback },
+    }),
+  startInterview: (branchId: string, topic: string) =>
+    call<BranchView>(`/branches/${branchId}/interview`, { method: "POST", body: { topic } }),
+  answerInterview: (branchId: string, questionId: string, answer: string) =>
+    call<BranchView>(`/branches/${branchId}/interviews/${questionId}/answer`, { method: "POST", body: { answer } }),
+  completeTask: (branchId: string, taskId: string, summary: string) =>
+    call<BranchView>(`/branches/${branchId}/tasks/${taskId}/complete`, { method: "POST", body: { summary } }),
+  stopBranch: (branchId: string) => call<{ stopped: number; failed: string[] }>(`/branches/${branchId}/stop`, { method: "POST", body: {} }),
+  rollover: (branchId: string, role: string, reason: string) =>
+    call<BranchView>(`/branches/${branchId}/roles/${role}/rollover`, { method: "POST", body: { reason } }),
 };

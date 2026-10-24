@@ -46,11 +46,13 @@ export async function scanSession(
   updatedAt: number,
   fetchPage: FetchItemsPage,
   maxPages = MAX_SCAN_PAGES,
+  isRelayed: (itemId: string) => boolean = () => false,
 ): Promise<SessionScan> {
   let after: string | null = null;
   for (let page = 0; page < maxPages; page++) {
     const result = await fetchPage(sessionId, after);
-    const human = result.data.find(isHumanMessage);
+    // Messages the office relayed between agents are user-role items but not human input.
+    const human = result.data.find((item) => isHumanMessage(item) && !isRelayed(item.id));
     if (human) {
       return {
         scannedUpdatedAt: updatedAt,

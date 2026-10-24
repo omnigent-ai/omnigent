@@ -24,6 +24,7 @@ interface BuildingViewProps {
   placement: Placement;
   rooms: Map<string, RoomSummary>;
   onEnterRoom: (projectId: string) => void;
+  onNewRoom: () => void;
   /** The floor the elevator waits on, e.g. after returning from a room. */
   elevatorProjectId: string | null;
 }
@@ -115,7 +116,7 @@ function drawBuilding(
   context.setLineDash([6, 4]);
   context.strokeRect(newRoomX, lobbyTop + 14, SLOT_WIDTH, FLOOR_HEIGHT - 22);
   context.setLineDash([]);
-  context.fillText("New room — coming soon", newRoomX + 14, lobbyTop + 54);
+  context.fillText("+ New room", newRoomX + 14, lobbyTop + 54);
 
   rows.forEach((row) =>
     row.projectIds.forEach((projectId) => {
@@ -126,7 +127,7 @@ function drawBuilding(
   );
 }
 
-export function BuildingView({ placement, rooms, onEnterRoom, elevatorProjectId }: BuildingViewProps) {
+export function BuildingView({ placement, rooms, onEnterRoom, onNewRoom, elevatorProjectId }: BuildingViewProps) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const rows = useMemo(() => buildingRows(placement), [placement]);
   const targets = useMemo(() => slotPositions(rows), [rows]);
@@ -225,6 +226,18 @@ export function BuildingView({ placement, rooms, onEnterRoom, elevatorProjectId 
             );
           }),
         )}
+        <button
+          type="button"
+          className="room-hotspot"
+          style={{
+            left: SHAFT_WIDTH + SLOT_GAP + 2 * (SLOT_WIDTH + SLOT_GAP),
+            top: rowTop(rows, rows.findIndex((row) => row.kind === "lobby")) + 14,
+            width: SLOT_WIDTH,
+            height: FLOOR_HEIGHT - 22,
+          }}
+          aria-label="New room: create a project"
+          onClick={onNewRoom}
+        />
       </div>
     </div>
   );

@@ -8,8 +8,10 @@ import {
   prunePlacement,
 } from "../shared/ranking.ts";
 import type { BuildingSnapshot, RoomSettingsPatch } from "../shared/types.ts";
-import { officeApi } from "./api.ts";
+import { type RuntimeOptions, officeApi } from "./api.ts";
 import { BuildingView } from "./building/BuildingView.tsx";
+import { NewRoomDialog } from "./building/NewRoomDialog.tsx";
+import { RuntimeOptionsContext } from "./capabilities.ts";
 import { RoomView } from "./room/RoomView.tsx";
 
 const POLL_MS = 5_000;
@@ -21,6 +23,12 @@ export function App() {
   const [openRoomId, setOpenRoomId] = useState<string | null>(null);
   const [lastRoomId, setLastRoomId] = useState<string | null>(null);
   const [search, setSearch] = useState("");
+  const [creatingRoom, setCreatingRoom] = useState(false);
+  const [runtimeOptions, setRuntimeOptions] = useState<RuntimeOptions | null>(null);
+
+  useEffect(() => {
+    officeApi.runtimeOptions().then(setRuntimeOptions).catch(() => undefined);
+  }, []);
 
   const latest = useMemo(
     () => (snapshot ? computePlacement(snapshot.rooms, snapshot.serverNow) : null),
@@ -74,6 +82,7 @@ export function App() {
   const openRoom = openRoomId ? rooms.get(openRoomId) : undefined;
   if (openRoom && snapshot) {
     return (
+      <RuntimeOptionsContext.Provider value={runtimeOptions}>
       <RoomView
         room={openRoom}
         allRooms={snapshot.rooms}
@@ -82,6 +91,7 @@ export function App() {
         onExit={exitRoom}
         onUpdateRoom={(patch) => updateRoom(openRoom.projectId, patch)}
       />
+      </RuntimeOptionsContext.Provider>
     );
   }
 
@@ -110,13 +120,19 @@ export function App() {
       </header>
       {snapshot?.connection.ok && snapshot.rooms.length === 0 ? (
         <p className="empty-building" role="note">
-          This Omnigent instance has no projects yet, so the building has no rooms. Create a project in the Omnigent
-          web UI and move sessions into it; each project becomes a room here.
+          This Omnigent instance has no projects yet, so the building has no rooms. Use “New room” in the lobby, or
+          create a project in the Omnigent web UI; each project becomes a room here.
         </p>
       ) : null}
       <div className="building-layout">
         {shown ? (
-          <BuildingView placement={shown} rooms={rooms} onEnterRoom={setOpenRoomId} elevatorProjectId={lastRoomId} />
+          <BuildingView
+            placement={shown}
+            rooms={rooms}
+            onEnterRoom={setOpenRoomId}
+            onNewRoom={() => setCreatingRoom(true)}
+            elevatorProjectId={lastRoomId}
+          />
         ) : (
           <p className="muted">Loading building…</p>
         )}
@@ -168,6 +184,16 @@ export function App() {
           </p>
         </aside>
       </div>
+      {creatingRoom ? (
+        <NewRoomDialog
+          onClose={() => setCreatingRoom(false)}
+          onCreated={(next) => {
+            setCreatingRoom(false);
+            setSnapshot(next);
+            applyPlacement(next);
+          }}
+        />
+      ) : null}
     </div>
   );
 }

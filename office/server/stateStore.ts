@@ -1,9 +1,10 @@
-// Durable office presentation state, kept in one JSON file that survives
-// browser closure and service restarts.
+// Durable office state (presentation and workflow), kept in one JSON file
+// that survives browser closure and service restarts.
 
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname } from "node:path";
 import type { Priority } from "../shared/types.ts";
+import { emptyWorkflowState, type WorkflowState } from "../shared/workflowTypes.ts";
 import type { SessionScan } from "./activity.ts";
 
 export interface RoomState {
@@ -27,10 +28,11 @@ export interface OfficeState {
   sessions: Record<string, SessionScan>;
   /** Keyed by `${sessionId}:${elicitationId}`, so a retried decision is recorded once. */
   decisions: Record<string, ApprovalDecision>;
+  workflow: WorkflowState;
 }
 
 export function emptyState(): OfficeState {
-  return { version: 1, rooms: {}, sessions: {}, decisions: {} };
+  return { version: 1, rooms: {}, sessions: {}, decisions: {}, workflow: emptyWorkflowState() };
 }
 
 export class StateStore {
@@ -45,7 +47,7 @@ export class StateStore {
   private static load(path: string): OfficeState {
     try {
       const parsed = JSON.parse(readFileSync(path, "utf8")) as Partial<OfficeState>;
-      return { ...emptyState(), ...parsed, version: 1 };
+      return { ...emptyState(), ...parsed, workflow: { ...emptyWorkflowState(), ...parsed.workflow }, version: 1 };
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyState();
       throw new Error(`Cannot read office state at ${path}: ${(error as Error).message}`);

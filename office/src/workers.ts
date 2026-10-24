@@ -41,7 +41,7 @@ export function appearanceIndex(key: string, variants: number): number {
 
 export interface ActivityEntry {
   id: string;
-  kind: "you" | "agent" | "tool" | "error";
+  kind: "you" | "agent" | "office" | "tool" | "error";
   text: string;
   at?: number;
 }
@@ -68,7 +68,8 @@ export function toActivity(items: SessionItem[]): ActivityEntry[] {
   for (const item of items) {
     if (item.type === "message" && !item.is_meta) {
       const text = messageText(item);
-      if (text) entries.push({ id: item.id, kind: item.role === "user" ? "you" : "agent", text: clip(text), at: item.created_at });
+      const kind = item.role !== "user" ? "agent" : item.office_relayed ? "office" : "you";
+      if (text) entries.push({ id: item.id, kind, text: clip(text), at: item.created_at });
     } else if (item.type === "function_call" && item.name) {
       entries.push({ id: item.id, kind: "tool", text: `Used tool ${item.name}`, at: item.created_at });
     } else if (item.type === "error" && item.message) {
