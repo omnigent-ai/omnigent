@@ -117,6 +117,15 @@ Or with [Homebrew](https://github.com/omnigent-ai/homebrew-tap):
 brew install omnigent-ai/tap/omnigent
 ```
 
+Upgrade a Homebrew install with `brew upgrade omnigent-ai/tap/omnigent`;
+`omni upgrade` prints that command instead of changing Homebrew's files. To
+build the latest `main` instead of a release, run
+`brew install --HEAD omnigent-ai/tap/omnigent`, and update it later with
+`brew upgrade --fetch-HEAD omnigent-ai/tap/omnigent`. A HEAD build downloads
+the web UI's npm packages while it builds. It also reuses the latest release's
+dependency pins, so a dependency added on `main` since that release is missing
+until the next one.
+
 For source builds on networks that require package mirrors, replace these example
 URLs with your mirrors:
 

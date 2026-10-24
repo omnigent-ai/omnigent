@@ -5920,6 +5920,7 @@ def _upgrade_to_nightly(
         _NIGHTLY_REPO_URL,
         _build_nightly_upgrade_suggestion,
         _latest_nightly_version,
+        _pip_hint_invocation,
         _probe_installed_distribution,
         _run_upgrade_command,
         _upgrade_failure_message,
@@ -5957,13 +5958,14 @@ def _upgrade_to_nightly(
     if info.vcs_url is None:
         manual = f"git+{_NIGHTLY_REPO_URL}@v{target}"
         if info.detected_installer == "pip":
+            pip = _pip_hint_invocation()
             click.echo(
                 "omnigent was installed with pip, and pip does not record which "
                 f"extras were requested. `{cli_invocation(name='omni')} upgrade --nightly` "
                 "cannot preserve them safely, so install the nightly manually:\n\n"
-                f"    pip install --force-reinstall '{manual}'\n"
+                f"    {pip} install --force-reinstall '{manual}'\n"
                 "    # or, if you need extras:\n"
-                f"    pip install --force-reinstall '{manual}#egg=omnigent[your,extras,here]'"
+                f"    {pip} install --force-reinstall '{manual}#egg=omnigent[your,extras,here]'"
             )
             raise SystemExit(0)
         if info.detected_installer == "uv" and _uv_tool_receipt_path() is None:
@@ -6097,8 +6099,9 @@ def upgrade(
     Requires the install to have come from a tool that records extras:
     ``uv tool install`` or ``pipx install``. ``pip`` does not record
     extras, so ``omni upgrade`` refuses to auto-upgrade it and prints the
-    manual command instead. Source checkouts / editable installs are not
-    upgraded here — update those with ``git pull``.
+    manual command instead, as it does for Homebrew installs. Source
+    checkouts / editable installs are not upgraded here — update those with
+    ``git pull``.
 
     :param check_only: Only report availability; do not upgrade. Exits
         with status 1 when a newer release exists.
@@ -6118,6 +6121,7 @@ def upgrade(
         _build_upgrade_suggestion,
         _find_repo_root,
         _is_newer,
+        _pip_hint_invocation,
         _probe_installed_distribution,
         _read_installed_wheel_info,
         _run_upgrade_command,
@@ -6151,6 +6155,21 @@ def upgrade(
             "This is an editable install — update it with `git pull`, "
             f"not `{cli_invocation(name='omni')} upgrade`."
         )
+
+    # Homebrew owns its keg and deletes the old one (with the interpreter
+    # running this command) on upgrade, so every upgrade must go through brew.
+    # Its post-install cleaner rewrites the keg's INSTALLER to "brew".
+    if info.detected_installer == "brew" and not check_only:
+        click.echo(
+            "omnigent was installed with Homebrew, which manages its files. "
+            "Upgrade it with Homebrew instead:\n\n"
+            "    brew upgrade omnigent-ai/tap/omnigent\n"
+            "    # or, for a --HEAD install:\n"
+            "    brew upgrade --fetch-HEAD omnigent-ai/tap/omnigent\n\n"
+            "The tap's formula is updated after each PyPI release, so it can "
+            "briefly lag the newest version."
+        )
+        raise SystemExit(0)
 
     # Nightly channel: resolved from git tags, not the index, and applies to
     # every install shape, so it dispatches before the VCS-vs-registry split
@@ -6189,13 +6208,14 @@ def upgrade(
     # reports availability.
     if not check_only:
         if info.detected_installer == "pip":
+            pip = _pip_hint_invocation()
             click.echo(
                 "omnigent was installed with pip, and pip does not record which extras "
                 f"were requested. `{cli_invocation(name='omni')} upgrade` cannot preserve them "
                 "safely, so you should upgrade manually:\n\n"
-                "    pip install -U omnigent\n"
+                f"    {pip} install -U omnigent\n"
                 "    # or, if you need extras:\n"
-                "    pip install -U 'omnigent[your,extras,here]'"
+                f"    {pip} install -U 'omnigent[your,extras,here]'"
             )
             raise SystemExit(0)
         if info.detected_installer == "uv" and _uv_tool_receipt_path() is None:

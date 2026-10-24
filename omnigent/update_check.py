@@ -1481,6 +1481,17 @@ def _pip_invocation() -> str:
     return f"{shlex.quote(sys.executable)} -m pip"
 
 
+def _pip_hint_invocation() -> str:
+    """Return the pip prefix for a manual command the user pastes into a shell.
+
+    cmd.exe and PowerShell don't understand :func:`_pip_invocation`'s POSIX
+    quoting, so Windows keeps a bare ``pip``.
+    """
+    from omnigent._platform import IS_WINDOWS
+
+    return "pip" if IS_WINDOWS else _pip_invocation()
+
+
 def _package_spec(*, version: str | None = None, extras: Collection[str] = ()) -> str:
     """Build a PEP 508 package spec for ``omnigent``.
 
