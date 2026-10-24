@@ -1304,7 +1304,9 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     The Claude Code executable is part of the key. The catalog holds that
     binary's own answer, so an upgraded CLI must re-probe instead of
     serving model names the previous release printed. The binary is
-    resolved the same way the probe launches it.
+    resolved the same way the probe launches it. Without a resolved
+    config, the managed-settings model pins are part of the key too:
+    Claude Code applies them at launch, so a changed pin changes its answer.
 
     :param claude_config: The resolved launch config, or ``None``.
     :returns: A stable fingerprint string.
@@ -1315,9 +1317,11 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
 
     command, _ = resolve_claude_launch("claude", [])
     ambient_gateway = None
+    managed_models = None
     if claude_config is None:
         managed_base_url, _ = managed_claude_gateway_signal()
         ambient_gateway = managed_base_url or os.environ.get(_UCODE_CLAUDE_BASE_URL_ENV)
+        managed_models = _managed_claude_model_config()
     return fingerprint_of(
         "claude-native",
         "control-picker-v3",
@@ -1328,6 +1332,8 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
         binary_identity(command),
         ambient_gateway,
         claude_managed_model_picker() if claude_config is None else None,
+        sorted(managed_models.env.items()) if managed_models is not None else None,
+        managed_models.model if managed_models is not None else None,
     )
 
 
