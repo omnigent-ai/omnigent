@@ -1356,71 +1356,88 @@ describe("getSessionUsage", () => {
 });
 
 describe("exportSessionTranscript", () => {
-  it("writes session_meta first, then every item in ascending order", async () => {
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({ id: "sess_1", object: "conversation", title: "Planning" }),
-    );
-    fetchMock.mockResolvedValueOnce(
-      mockJsonResponse({
-        object: "list",
-        data: [
-          { id: "msg_1", type: "message", role: "user" },
-          { id: "msg_2", type: "message", role: "assistant" },
-        ],
-        first_id: "msg_1",
-        last_id: "msg_2",
-        has_more: false,
-      }),
-    );
+  it("downloads the server-built transcript verbatim", async () => {
+    const body =
+      '{"schema":"omnigent.transcript/1","session":"sess_1","title":"Planning"}\n' +
+      '{"turn":1,"seq":1,"role":"user","kind":"message","text":"hi"}\n';
+    fetchMock.mockResolvedValueOnce({
+      ok: true,
+      status: 200,
+      text: async () => body,
+    } as unknown as Response);
 
-    const jsonl = await exportSessionTranscript("sess_1");
+    const transcript = await exportSessionTranscript("sess_1");
 
-    expect(fetchMock.mock.calls[0]![0]).toBe(
-      "/v1/sessions/sess_1?include_items=false&include_liveness=false",
-    );
-    expect(fetchMock.mock.calls[1]![0]).toBe("/v1/sessions/sess_1/items?limit=500&order=asc");
-
-    expect(jsonl.endsWith("\n")).toBe(true);
-    const records = jsonl
-      .trimEnd()
-      .split("\n")
-      .map((line) => JSON.parse(line) as Record<string, unknown>);
-    expect(records.map((r) => r.record_type)).toEqual(["session_meta", "item", "item"]);
-    expect(records[0]).toMatchObject({ id: "sess_1", title: "Planning" });
-    expect(records.slice(1).map((r) => r.id)).toEqual(["msg_1", "msg_2"]);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(fetchMock.mock.calls[0]![0]).toBe("/v1/sessions/sess_1/export");
+    expect(transcript).toBe(body);
+    const header = JSON.parse(transcript.split("\n")[0]!) as Record<string, unknown>;
+    expect(header).toMatchObject({ schema: "omnigent.transcript/1", session: "sess_1" });
   });
 
-  it("pages forward with after=<last_id> until has_more is false", async () => {
-    fetchMock.mockResolvedValueOnce(mockJsonResponse({ id: "sess_1" }));
+  it("surfaces the server's error for a session the caller cannot read", async () => {
+    // The export 404 and the session probe 404 carry the same envelope: the
+    // session really is unknown, so no fallback.
+    const notFound = { error: { code: "not_found", message: "Not found" } };
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(notFound, { ok: false, status: 404, statusText: "Not Found" }),
+    );
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(notFound, { ok: false, status: 404, statusText: "Not Found" }),
+    );
+
+    await expect(exportSessionTranscript("sess_missing")).rejects.toMatchObject({
+      status: 404,
+      code: "not_found",
+    });
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls).toEqual([
+      "/v1/sessions/sess_missing/export",
+      "/v1/sessions/sess_missing?include_items=false&include_liveness=false",
+    ]);
+  });
+
+  it("builds the legacy export client-side when the server has no /export route", async () => {
+    // An older server that serves the web UI answers an unknown /v1 path with
+    // the same envelope as a missing session; only the session probe tells them apart.
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "not_found", message: "Not found" } },
+        { ok: false, status: 404, statusText: "Not Found" },
+      ),
+    );
+    fetchMock.mockResolvedValueOnce(mockJsonResponse({ id: "sess_1", title: "Planning" }));
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
-        object: "list",
-        data: [{ id: "msg_1" }],
-        last_id: "msg_1",
+        data: [{ id: "it_1", type: "message", role: "user" }],
         has_more: true,
+        last_id: "it_1",
       }),
     );
     fetchMock.mockResolvedValueOnce(
       mockJsonResponse({
-        object: "list",
-        data: [{ id: "msg_2" }],
-        last_id: "msg_2",
+        data: [{ id: "it_2", type: "message", role: "assistant" }],
         has_more: false,
+        last_id: "it_2",
       }),
     );
 
-    const jsonl = await exportSessionTranscript("sess_1");
+    const transcript = await exportSessionTranscript("sess_1");
 
-    expect(fetchMock).toHaveBeenCalledTimes(3);
-    expect(fetchMock.mock.calls[2]![0]).toBe(
-      "/v1/sessions/sess_1/items?limit=500&order=asc&after=msg_1",
-    );
-    const ids = jsonl
+    const urls = fetchMock.mock.calls.map((call) => String(call[0]));
+    expect(urls[0]).toBe("/v1/sessions/sess_1/export");
+    expect(urls[1]).toContain("/v1/sessions/sess_1?");
+    expect(urls[2]).toContain("/v1/sessions/sess_1/items?limit=500&order=asc");
+    expect(urls[3]).toContain("after=it_1");
+    const lines = transcript
       .trimEnd()
       .split("\n")
-      .slice(1)
-      .map((line) => (JSON.parse(line) as { id: string }).id);
-    expect(ids).toEqual(["msg_1", "msg_2"]);
+      .map((line) => JSON.parse(line) as unknown);
+    expect(lines).toEqual([
+      { record_type: "session_meta", id: "sess_1", title: "Planning" },
+      { record_type: "item", id: "it_1", type: "message", role: "user" },
+      { record_type: "item", id: "it_2", type: "message", role: "assistant" },
+    ]);
   });
 });
 

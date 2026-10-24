@@ -2220,6 +2220,22 @@ async def test_get_session_items_with_read_access(
         f"on GET /items is missing."
     )
 
+    # The transcript export reads the same items, so it carries the same gate.
+    resp = await auth_client.get(
+        f"/v1/sessions/{session_id}/export",
+        headers={"X-Forwarded-Email": "corey"},
+    )
+    assert resp.status_code == 200, (
+        f"Corey with read grant should GET /export -> 200, got {resp.status_code}."
+    )
+    resp = await auth_client.get(
+        f"/v1/sessions/{session_id}/export",
+        headers={"X-Forwarded-Email": "stranger"},
+    )
+    assert resp.status_code == 404, (
+        f"Stranger with no grant should get 404 on /export, got {resp.status_code}."
+    )
+
 
 # ── SSE stream without permissions → 404 ───────────────────
 

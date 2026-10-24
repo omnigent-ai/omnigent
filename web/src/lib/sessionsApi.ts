@@ -1294,24 +1294,49 @@ export async function fetchSessionItemsPage(
 }
 
 /**
- * Build a portable JSONL export of a session's transcript.
+ * Fetch a session's portable transcript (`omnigent.transcript/1` NDJSON, see
+ * `docs/session-export.md`); the server pages the items and the SPA passes
+ * the body through.
  *
- * Same format as `omnigent session export` (see `session_export` in
- * `omnigent/cli.py`): the first line is the session metadata
- * (`record_type: "session_meta"`), every following line is one committed
- * item (`record_type: "item"`) in chronological order, so the file
- * round-trips through `omnigent session import`. Records keep the raw
- * wire shape rather than the SPA's parsed types for that parity.
+ * An older server has no `/export` route, and its 404 looks exactly like a
+ * missing session's (the SPA fallback answers unknown `/v1` paths with the
+ * same error envelope). So on a 404 the session itself is fetched: if that
+ * succeeds the route is missing and the legacy export is built client-side;
+ * if not, the original "not found" is the real answer.
  */
 export async function exportSessionTranscript(sessionId: string): Promise<string> {
-  const metaParams = new URLSearchParams({
-    include_items: "false",
-    include_liveness: "false",
-  });
-  const metaRes = await authenticatedFetch(
-    `/v1/sessions/${encodeURIComponent(sessionId)}?${metaParams}`,
-  );
-  const meta = await readJsonOrThrow<Record<string, unknown>>(metaRes);
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/export`);
+  if (res.status === 404) {
+    const metaRes = await authenticatedFetch(sessionMetaUrl(sessionId));
+    if (metaRes.ok) {
+      return exportSessionTranscriptLegacy(
+        sessionId,
+        (await metaRes.json()) as Record<string, unknown>,
+      );
+    }
+    throw await apiErrorFromResponse(res);
+  }
+  if (!res.ok) throw await apiErrorFromResponse(res);
+  return await res.text();
+}
+
+function sessionMetaUrl(sessionId: string): string {
+  const params = new URLSearchParams({ include_items: "false", include_liveness: "false" });
+  return `/v1/sessions/${encodeURIComponent(sessionId)}?${params}`;
+}
+
+/**
+ * Build the pre-schema export client-side for a server without `/export`:
+ * a `record_type: "session_meta"` line, then one `record_type: "item"` line
+ * per committed item. `omnigent session import` still reads this shape.
+ *
+ * @deprecated Compatibility shim for servers older than the `/export` route
+ * (added in 0.20.0). Remove in 0.22.0, when those servers are out of support.
+ */
+async function exportSessionTranscriptLegacy(
+  sessionId: string,
+  meta: Record<string, unknown>,
+): Promise<string> {
   const lines = [JSON.stringify({ record_type: "session_meta", ...meta })];
 
   // Pages are a cursor chain (each request needs the previous last_id),
