@@ -25,6 +25,7 @@ from tests.e2e.conftest import configure_mock_llm, get_mock_requests
     ("model", "effort", "thinking"),
     [
         ("claude-opus-5-5", "none", "adaptive"),
+        ("system.ai.claude-opus-5-5[1m]", "none", "adaptive"),
         ("claude-sonnet-4-6", "high", "adaptive"),
         ("claude-haiku-4-5", "none", "disabled"),
         ("claude-haiku-4-5", "high", "enabled"),
@@ -54,6 +55,13 @@ def test_pi_launch_sends_supported_thinking(
             }
         }
     }
+    if model.endswith("[1m]"):
+        config["inference"] = {
+            "harnesses": {
+                harness: {"provider": "local", "default_model": model, "model_allowlist": [model]}
+                for harness in ("pi", "pi-native")
+            }
+        }
     config_home = tmp_path / "config"
     config_home.mkdir()
     (config_home / "config.yaml").write_text(yaml.safe_dump(config))
@@ -110,6 +118,7 @@ def test_pi_launch_sends_supported_thinking(
     assert "THINKING_OK" in result.stdout
     requests = get_mock_requests(mock_llm_server_url, key=model)[before:]
     assert len(requests) == 1
+    assert requests[0]["model"] == model
     assert requests[0]["thinking"]["type"] == thinking
     if thinking == "adaptive":
         assert requests[0]["output_config"]["effort"] == ("high" if effort == "high" else "low")

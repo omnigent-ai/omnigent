@@ -972,7 +972,10 @@ def _build_models_json(
                 model_entry = pi_generic_model_json_entry(model)
             else:
                 model_entry = {"id": model, "input": ["text", "image"]}
-                if pi_model_is_reasoning(model) or provider["api"] == "anthropic-messages":
+                if pi_model_is_reasoning(model) or (
+                    provider["api"] == "anthropic-messages"
+                    and model_catalog.model_family_token(model) == "claude"
+                ):
                     model_entry["reasoning"] = True
             if provider["api"] == "anthropic-messages":
                 model_entry = pi_model_with_thinking_defaults(model_entry)

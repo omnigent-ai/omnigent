@@ -34,6 +34,8 @@ PI_ANTHROPIC_THINKING_REQUIRED = StaticModelFallback(
 
 
 # Custom providers do not inherit Pi's built-in per-model compatibility flags.
+# On Pi upgrades, refresh adaptive/budget entries from pi-ai/dist/providers/data/anthropic.json.
+# Keep the thinking-required list above limited to gateway-verified restrictions.
 PI_ANTHROPIC_ADAPTIVE_THINKING = StaticModelFallback(
     model_ids=(
         "claude-opus-5-5",
@@ -49,6 +51,14 @@ PI_ANTHROPIC_ADAPTIVE_THINKING = StaticModelFallback(
     ),
     owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
     provenance="Pi 1.0.4 Anthropic catalog forceAdaptiveThinking entries",
+    discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
+)
+
+
+PI_ANTHROPIC_BUDGET_THINKING = StaticModelFallback(
+    model_ids=("claude-haiku-4-5", "claude-opus-4-5", "claude-sonnet-4-5"),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Pi 1.0.4 Anthropic catalog reasoning entries without forceAdaptiveThinking",
     discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
 )
 

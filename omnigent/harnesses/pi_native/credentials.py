@@ -163,6 +163,7 @@ class _PiProviderCompat(TypedDict, total=False):
     supportsStrictMode: bool
     supportsReasoningEffort: bool
     supportsUsageInStreaming: bool
+    forceAdaptiveThinking: bool
 
 
 class _PiProviderPayload(TypedDict):
@@ -384,6 +385,8 @@ class PiProviderConfig:
         if self.auth_header:
             provider["authHeader"] = True
         if self.api == "anthropic-messages":
+            # Preserve the native default for unlisted models; model-level flags win.
+            provider["compat"] = {"forceAdaptiveThinking": True}
             provider["models"] = [pi_model_with_thinking_defaults(entry) for entry in models]
         providers = {self.provider_id: provider}
         providers.update(additional)
