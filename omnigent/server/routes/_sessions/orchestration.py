@@ -3947,10 +3947,17 @@ async def _publish_runner_recovered_status_impl(
     # reconnect proves the runner is reachable again, which invalidates a
     # disconnect failure but says nothing about a genuine task error —
     # leave that one alone. Explicit rebinds skip this guard.
+    failure = disconnect_outcome.pending_failure(session_id)
+    conv: Conversation | None = None
     if require_disconnect_code:
         conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
         last_error = _last_task_error_from_labels(conv.labels) if conv is not None else None
         if last_error is None or last_error.get("code") != "runner_disconnected":
+            return
+        current_failure = disconnect_outcome.pending_failure(session_id)
+        if _session_status_cache.get(session_id) != "failed" or (
+            current_failure is not None and current_failure is not failure
+        ):
             return
     _session_status_cache[session_id] = "idle"
     session_live_state.persist_live_status(session_id, "idle")
@@ -3964,7 +3971,10 @@ async def _publish_runner_recovered_status_impl(
     if require_disconnect_code:
         # Only a passive reconnect can show the same turn resuming on its own.
         disconnect_outcome.note_disconnect_failure_cleared(
-            session_id, failure_code="runner_disconnected"
+            session_id,
+            failure_code="runner_disconnected",
+            runner_id=conv.runner_id if conv is not None else None,
+            failure=failure,
         )
     await _persist_session_status_error_labels(session_id, None, conversation_store)
 
@@ -4135,6 +4145,10 @@ async def _mark_runner_sessions_offline_once(
             continue
         if binding is None or binding[0] != conv.runner_id:
             continue
+        if error.code == "runner_disconnected":
+            disconnect_outcome.note_disconnect_failure(
+                conv.id, runner_id=conv.runner_id, response_id=turn_id
+            )
         _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
         await record_subagent_activity(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
@@ -8860,6 +8874,9 @@ async def _relay_runner_stream(
                     message="Runner disconnected unexpectedly.",
                 )
                 turn_id = _session_active_response_cache.get(session_id)
+                disconnect_outcome.note_disconnect_failure(
+                    session_id, runner_id=runner_id, response_id=turn_id
+                )
                 _publish_status(
                     session_id,
                     "failed",
@@ -9076,6 +9093,14 @@ async def _relay_runner_stream_once(
                         ):
                             continue
 
+                    disconnect_outcome.observe_event(
+                        session_id,
+                        event,
+                        runner_id=runner_id,
+                        response_id=(
+                            current_response_id or _session_active_response_cache.get(session_id)
+                        ),
+                    )
                     if evt_type == "session.status":
                         status = event.get("status", "")
                         if status in {"idle", "failed"} and pending_subagent_return_id is not None:
