@@ -41,7 +41,7 @@ from omnigent._platform import (
     installed_interactive_shells,
     normalize_interactive_shells,
 )
-from omnigent.cli_invocation import cli_invocation
+from omnigent.cli_invocation import cli_invocation, quote_hint_argument
 from omnigent.debug_logging import (
     ORIGIN_WORKSPACE_ID_ENV_VAR,
     PRIMARY_SESSION_ID_ENV_VAR,
@@ -1518,6 +1518,14 @@ class HostProcess:
 
         return display_server_url(self._server_url)
 
+    def _login_command(self) -> str:
+        """The ``omnigent login`` command to show in remedy hints.
+
+        :returns: A command that pastes into the user's shell intact, e.g.
+            ``"omnigent login 'https://ws.databricks.com/omnigent?o=123'"``.
+        """
+        return f"{cli_invocation()} login {quote_hint_argument(self._login_hint_url())}"
+
     def _credentials_fix_hint(self) -> str:
         """Build the remedy for a credential failure.
 
@@ -1527,7 +1535,7 @@ class HostProcess:
             command, e.g. ``"Run `omnigent login <url>` ..."``.
         """
         return (
-            f"Run `{cli_invocation()} login {self._login_hint_url()}` to authenticate (it "
+            f"Run `{self._login_command()}` to authenticate (it "
             "detects Databricks-fronted servers and logs in to the right "
             "workspace), or check your ambient Databricks credentials."
         )
@@ -1549,7 +1557,7 @@ class HostProcess:
         """
         return (
             "If this server uses Omnigent accounts or OIDC login, run "
-            f"`{cli_invocation()} login {self._login_hint_url()}` to authenticate."
+            f"`{self._login_command()}` to authenticate."
         )
 
     def _fatal_upgrade_error(self, exc: InvalidURI | InvalidStatus) -> HostConnectError | None:
@@ -1668,7 +1676,7 @@ class HostProcess:
                         f"{self._auth_retry_streak} times in a row — this is no "
                         "longer a transient network blip. If it persists, the "
                         "stored credential is likely no longer valid: run "
-                        f"`{cli_invocation()} login {self._login_hint_url()}` and restart the "
+                        f"`{self._login_command()}` and restart the "
                         "host. Still retrying."
                     )
                     _logger.warning("%s", escalated)
@@ -1707,8 +1715,8 @@ class HostProcess:
                 return HostConnectError(
                     "Connection refused (HTTP 403): your stored login "
                     f"session for {login_url} has EXPIRED, so the "
-                    "tunnel was dialed without credentials. Run `omnigent "
-                    f"login {login_url}` to re-authenticate, then "
+                    "tunnel was dialed without credentials. Run "
+                    f"`{self._login_command()}` to re-authenticate, then "
                     "restart the host."
                 )
             return HostConnectError(
@@ -2533,7 +2541,7 @@ class HostProcess:
         if auth_rejected:
             error = (
                 "The server rejected this host's credentials, so the runner could not "
-                f"connect. Sign in again with `{cli_invocation()} login {self._login_hint_url()}` "
+                f"connect. Sign in again with `{self._login_command()}` "
                 f"on this host, then retry. Details: {error}"
             )
         _logger.warning(

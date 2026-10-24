@@ -8,6 +8,7 @@ import errno
 import json
 import logging
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -103,6 +104,7 @@ from omnigent.runner.identity import (
 )
 from omnigent.runtime.harnesses.paths import HARNESS_TMP_PARENT_ENV_VAR
 from tests._helpers.providers import isolate_provider_resolution
+from tests._helpers.shell import pasted_shell_words
 
 pytestmark = pytest.mark.asyncio
 
@@ -807,9 +809,10 @@ async def test_handle_model_options_reports_the_endpoints_wider_catalog(
     _cleanup_host(host)
 
 
-def _make_host_process() -> HostProcess:
+def _make_host_process(server_url: str = "http://localhost:8000") -> HostProcess:
     """Create a HostProcess with a test identity.
 
+    :param server_url: Server URL the host connects to.
     :returns: A :class:`HostProcess` for testing.
     """
     identity = HostIdentity(
@@ -818,7 +821,7 @@ def _make_host_process() -> HostProcess:
     )
     return HostProcess(
         identity=identity,
-        server_url="http://localhost:8000",
+        server_url=server_url,
     )
 
 
@@ -1835,13 +1838,19 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
     """A runner refused on credentials before connecting asks for a new sign-in.
 
     The exit is a setup problem the person must fix, so it is categorized as
-    config at launch; any other exit stays a runner fault.
+    config at launch; any other exit stays a runner fault. The sign-in command
+    must survive being pasted into a shell.
     """
+    from omnigent.cli_auth import store_databricks_org_id
     from omnigent.runner.identity import RUNNER_AUTH_REJECTED_EXIT_CODE
 
+    server_url = "https://ws.cloud.databricks.com/api/2.0/omnigent"
     monkeypatch.setattr(Path, "home", classmethod(lambda _cls: tmp_path))
     monkeypatch.setattr("omnigent.host.connect._RUNNER_WATCH_INTERVAL_S", 0.01)
-    host = _make_host_process()
+    monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    store_databricks_org_id(server_url, "6051921418418893")
+    host = _make_host_process(server_url)
     tunnel = _FakeTunnel()
     host._ws = tunnel  # type: ignore[assignment] — duck-typed send
     workspace = tmp_path / "project"
@@ -1886,7 +1895,14 @@ async def test_watch_runner_reports_refused_credentials_as_sign_in(
         assert died.attributes["error_phase"] == "unknown"
     else:
         assert report.error.startswith("The server rejected this host's credentials")
-        assert " login " in report.error
+        [command] = re.findall(r"Sign in again with `([^`]*)`", report.error)
+        if os.name != "nt":
+            assert pasted_shell_words(command, tmp_path) == [
+                "isaac",
+                "omni",
+                "login",
+                "https://ws.cloud.databricks.com/omnigent?o=6051921418418893",
+            ]
         assert died.attributes["error_category"] == "config"
         assert died.attributes["error_phase"] == "runner_launch"
 
@@ -6232,7 +6248,7 @@ async def test_run_fails_loud_on_permanent_4xx(
 
 @pytest.mark.parametrize("status", [401, 403])
 async def test_auth_rejection_suggests_omnigent_login(
-    monkeypatch: pytest.MonkeyPatch, status: int
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, status: int
 ) -> None:
     """401/403 rejections point the user at ``omnigent login``.
 
@@ -6240,9 +6256,13 @@ async def test_auth_rejection_suggests_omnigent_login(
     an accounts/OIDC-mode server (a Databricks profile token may
     authenticate at the proxy yet be rejected by the server itself). The
     fatal message must name the exact remedy command, including the
-    server URL, so the user can copy-paste it.
+    workspace URL, so the user can paste it into a shell.
     """
-    server_url = "https://app.example.databricks.com"
+    from omnigent.cli_auth import store_databricks_org_id
+
+    server_url = "https://app.example.databricks.com/api/2.0/omnigent"
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    store_databricks_org_id(server_url, "123")
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
     spy = _ConnectSpy([_invalid_status(status)])
     _patch_connect(monkeypatch, spy)
@@ -6251,9 +6271,16 @@ async def test_auth_rejection_suggests_omnigent_login(
     with pytest.raises(HostConnectError) as excinfo:
         await host.run()
 
-    # The exact, copy-pasteable command — URL included — must be present,
-    # not just the bare word "login".
-    assert f"omnigent login {server_url}" in str(excinfo.value)
+    commands = re.findall(r"`([^`]* login [^`]*)`", str(excinfo.value))
+    assert commands
+    for command in commands:
+        assert command.startswith("omnigent login ")
+        if os.name != "nt":
+            assert pasted_shell_words(command, tmp_path) == [
+                "omnigent",
+                "login",
+                "https://app.example.databricks.com/omnigent?o=123",
+            ]
 
 
 async def test_non_auth_permanent_4xx_omits_login_hint(

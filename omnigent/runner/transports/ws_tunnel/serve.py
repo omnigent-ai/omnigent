@@ -35,7 +35,7 @@ from websockets.exceptions import (
     WebSocketException,
 )
 
-from omnigent.cli_invocation import cli_invocation
+from omnigent.cli_invocation import cli_invocation, quote_hint_argument
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
@@ -176,7 +176,8 @@ def _reauth_hint(server_url: str | None) -> str:
     # form keeps ``?o=``, which selects the workspace on multi-workspace hosts.
     from omnigent.util.server_url import display_server_url
 
-    return f"run `{cli_invocation()} login {display_server_url(server_url)}` to re-authenticate"
+    login_url = quote_hint_argument(display_server_url(server_url))
+    return f"run `{cli_invocation()} login {login_url}` to re-authenticate"
 
 
 class RunnerTunnelAuthRejectedError(RuntimeError):

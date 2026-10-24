@@ -6,10 +6,12 @@ import asyncio
 import contextlib
 import json
 import os
+import re
 import ssl
 import threading
 import time
 from dataclasses import dataclass
+from pathlib import Path
 from types import SimpleNamespace, TracebackType
 from typing import Any, TypedDict, Unpack
 
@@ -24,6 +26,7 @@ from websockets.exceptions import (
 from websockets.frames import Close
 from websockets.http11 import Response
 
+from omnigent.cli_auth import store_databricks_org_id
 from omnigent.runner.identity import (
     OMNIGENT_INTERNAL_WS_ORIGIN,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -48,6 +51,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     _websocket_http_status,
     serve_tunnel,
 )
+from tests._helpers.shell import pasted_shell_words
 
 
 @dataclass
@@ -439,6 +443,7 @@ async def test_serve_tunnel_no_credential_error_after_streak(
     )
 
     monkeypatch.delenv("OMNIGENT_WRAPPER_COMMAND", raising=False)
+    monkeypatch.setattr("omnigent.cli_invocation.IS_WINDOWS", False)
     attempt = 0
 
     async def _serve_once(app: Any, *, auth_token: str | None = None, **_kwargs: Any) -> None:
@@ -475,7 +480,7 @@ async def test_serve_tunnel_no_credential_error_after_streak(
     message = str(exc_info.value)
     assert attempt == _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
     assert message.startswith(serve_module.RUNNER_TUNNEL_NO_CREDENTIAL_PREFIX)
-    assert "login https://ws.cloud.databricks.com/omnigent?o=123` " in message
+    assert "login 'https://ws.cloud.databricks.com/omnigent?o=123'` " in message
 
 
 class _SignInFactory:
@@ -751,15 +756,33 @@ async def test_serve_tunnel_reads_sign_in_pending_off_the_event_loop(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("server_url", "login_url"),
+    [
+        ("https://example.databricksapps.com", "https://example.databricksapps.com"),
+        (
+            "https://ws.cloud.databricks.com/api/2.0/omnigent",
+            "https://ws.cloud.databricks.com/omnigent?o=6051921418418893",
+        ),
+    ],
+)
 async def test_serve_tunnel_reauth_hint_uses_wrapper_command(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    server_url: str,
+    login_url: str,
 ) -> None:
-    """``OMNIGENT_WRAPPER_COMMAND`` names the wrapper CLI in the login hint.
+    """The login hint names the wrapper CLI and pastes into a shell intact.
 
     :param monkeypatch: Pytest monkeypatch fixture.
+    :param tmp_path: Directory for the login record and the pasted command's globbing.
+    :param server_url: Runner server URL.
+    :param login_url: URL the pasted login command must receive.
     :returns: None.
     """
     monkeypatch.setenv("OMNIGENT_WRAPPER_COMMAND", "isaac omni")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    store_databricks_org_id(server_url, "6051921418418893")
 
     async def _serve_once(app: Any, **_kwargs: Any) -> None:
         """Raise 401.
@@ -779,17 +802,19 @@ async def test_serve_tunnel_reauth_hint_uses_wrapper_command(
     monkeypatch.setattr(serve_module, "_serve_tunnel_once", _serve_once)
     monkeypatch.setattr(serve_module.asyncio, "sleep", _sleep)
 
-    with pytest.raises(
-        RuntimeError,
-        match=r"run `isaac omni login https://example.databricksapps\.com` to re-authenticate",
-    ):
+    with pytest.raises(RuntimeError) as exc_info:
         await serve_tunnel(
             _noop_app,
-            server_url="https://example.databricksapps.com",
+            server_url=server_url,
             runner_id="runner_env_hint",
             runner_version="0.1.0",
             auth_token="tok-expired",
         )
+
+    [command] = re.findall(r"run `([^`]*)` to re-authenticate", str(exc_info.value))
+    assert command.startswith("isaac omni login ")
+    if os.name != "nt":
+        assert pasted_shell_words(command, tmp_path) == ["isaac", "omni", "login", login_url]
 
 
 def test_websocket_auth_redirect_url_detects_https_redirect() -> None:
