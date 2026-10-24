@@ -1168,7 +1168,7 @@ async def _prepare_codex_terminal(
     :param session_bundle: Gzipped agent bundle for new sessions.
     :param codex_args: Raw Codex CLI args.
     :param command: Codex executable.
-    :param model: Optional model id.
+    :param model: Explicit model id, otherwise the saved selection on cold resume.
     :param startup_progress: Optional user-visible progress renderer,
         e.g. a handle from :func:`runner_startup_progress`.
     :param developer_instructions: Raw author instructions persisted into
@@ -1235,6 +1235,10 @@ async def _prepare_codex_terminal(
                 raise click.ClickException(
                     f"Conversation {session_id!r} is missing its Codex thread id."
                 )
+            if model is None:
+                saved_model = payload.get("model_override")
+                if isinstance(saved_model, str) and saved_model:
+                    model = saved_model
 
         bridge_dir = prepare_bridge_dir(bridge_id)
         socket_path = socket_path_for_bridge_dir(bridge_dir)

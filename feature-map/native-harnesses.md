@@ -103,6 +103,8 @@ with a question about its result; verify the routed model and retained history.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+Codex cold resume keeps the session's saved model unless a new `--model` is
+supplied. Attaching to an already-running terminal keeps its active model.
 
 **Claude sub-agents:** from a web-launched Claude session or a locally launched
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
