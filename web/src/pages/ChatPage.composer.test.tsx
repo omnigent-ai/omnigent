@@ -2776,18 +2776,29 @@ describe("Composer shared visible controls", () => {
     },
   );
 
-  it("doesn't offer Read Only as a codex runtime switch", () => {
+  it("switches a running Codex session to Read Only from the permission picker", async () => {
+    const { setCodexApprovalMode } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ setCodexApprovalMode }));
     useChatStore.setState({
-      conversationId: "codex-no-read-only",
-      codexApprovalMode: "read-only",
+      conversationId: "codex-read-only",
+      codexApprovalMode: "ask-for-approval",
     });
+    const setApproval = vi
+      .spyOn(useChatStore.getState(), "setCodexApprovalMode")
+      .mockImplementation(async (mode) => {
+        useChatStore.setState({ codexApprovalMode: mode });
+      });
     renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
     const chip = screen.getByTestId("composer-permission-chip");
-    // A session launched read-only still shows its live mode on the chip.
+    fireEvent.keyDown(chip, { key: "ArrowDown" });
+    fireEvent.click(screen.getByTestId("composer-permission-option-read-only"));
+    await waitFor(() => expect(setApproval).toHaveBeenCalledWith("read-only"));
     expect(chip).toHaveTextContent("Read Only");
     fireEvent.keyDown(chip, { key: "ArrowDown" });
-    expect(screen.getByTestId("composer-permission-option-full-access")).toBeInTheDocument();
-    expect(screen.queryByTestId("composer-permission-option-read-only")).toBeNull();
+    expect(screen.getByTestId("composer-permission-option-read-only")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
   });
 });
 
@@ -2965,7 +2976,7 @@ describe("Composer permission-mode shortcut", () => {
     expect(setMode.mock.calls.map(([mode]) => mode)).toEqual(["auto", "plan", "default", "auto"]);
   });
 
-  it("cycles through every Codex mode, including Full Access, and wraps", async () => {
+  it("cycles through every Codex mode, including Full Access and Read Only, and wraps", async () => {
     useChatStore.setState({
       conversationId: "cycle-codex",
       sessionHarness: "codex-native",
@@ -2979,10 +2990,12 @@ describe("Composer permission-mode shortcut", () => {
     renderWithTooltips(<Composer {...composerProps({ showCodexApprovalMode: true })} />);
 
     await cycleTo("Full Access");
+    await cycleTo("Read Only");
     await cycleTo("Ask for approval");
     await cycleTo("Approve for me");
     expect(setApproval.mock.calls.map(([mode]) => mode)).toEqual([
       "full-access",
+      "read-only",
       "ask-for-approval",
       "approve-for-me",
     ]);
@@ -3012,7 +3025,7 @@ describe("Composer permission-mode shortcut", () => {
   });
 
   it.each([
-    { name: "a read-only Codex session", harness: "codex-native", codex: "read-only" },
+    { name: "a Codex session in an unknown mode", harness: "codex-native", codex: "unknown-mode" },
     { name: "a Claude session in Don't ask", harness: "claude-native", claude: "dontAsk" },
   ])("leaves the mode alone in $name, which the chip can't switch back to", (session) => {
     useChatStore.setState({

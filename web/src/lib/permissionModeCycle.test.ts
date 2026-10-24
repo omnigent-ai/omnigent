@@ -49,7 +49,7 @@ describe("nextCycledPermissionMode", () => {
     {
       harness: "Codex",
       options: CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
-      modes: ["ask-for-approval", "approve-for-me", "full-access", "ask-for-approval"],
+      modes: ["ask-for-approval", "approve-for-me", "full-access", "read-only", "ask-for-approval"],
     },
     {
       harness: "Devin",
@@ -69,7 +69,7 @@ describe("nextCycledPermissionMode", () => {
     expect(nextCycledPermissionMode(CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS, null)).toBe(
       "ask-for-approval",
     );
-    expect(nextCycledPermissionMode(CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS, "read-only")).toBe(
+    expect(nextCycledPermissionMode(CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS, "unknown-mode")).toBe(
       "ask-for-approval",
     );
   });
@@ -96,7 +96,7 @@ describe("nextCycledPermissionMode", () => {
       nextCycledPermissionMode(
         CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
         "ask-for-approval",
-        new Set(["approve-for-me", "full-access"]),
+        new Set(["approve-for-me", "full-access", "read-only"]),
       ),
     ).toBe(null);
     expect(nextCycledPermissionMode([{ value: "default" }], "default")).toBe(null);

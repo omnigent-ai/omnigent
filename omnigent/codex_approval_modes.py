@@ -10,8 +10,8 @@ then confirm the sub-dialog for the ones that ask.
 These presets use the popup's labels. Menu digits are discovered from the
 rendered popup because row positions vary by platform and configuration.
 
-Read Only is absent from the default macOS/Linux popup, but appears on Windows
-and with permission profiles. The full-bypass launch flag has no popup row.
+Available popup rows vary by CLI version and configuration. The full-bypass
+launch flag has no popup row.
 
 Kept dependency-free so the server routes, the runner, and the web contract can
 all agree on the same list.
@@ -62,8 +62,6 @@ CODEX_NATIVE_PERMISSION_PRESETS: tuple[CodexPermissionPreset, ...] = (
         description="Edit any file and access the internet without approval",
         needs_confirm=True,
     ),
-    # Read Only is absent from the default macOS/Linux popup; it appears on
-    # Windows and in the permission-profiles popup variant.
     CodexPermissionPreset(
         value="read-only",
         label="Read Only",

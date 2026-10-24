@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Route, expect
 
 from tests.e2e_ui.conftest import fetch_with_retry
@@ -83,14 +84,19 @@ def _patch_session_as_codex_native(
     return patch_bodies
 
 
+@pytest.mark.parametrize(
+    ("mode", "label"), [("approve-for-me", "Approve for me"), ("read-only", "Read Only")]
+)
 def test_codex_native_approval_mode_switch_persists(
     page: Page,
     seeded_session: tuple[str, str],
+    mode: str,
+    label: str,
 ) -> None:
-    """Picking an approval preset in the gear modal PATCHes the server.
+    """Picking an approval preset PATCHes the server and survives reload.
 
-    Selecting "Approve for me" sends ``{"approval_mode": "approve-for-me"}``
-    to ``PATCH /v1/sessions/{id}`` — the request that drives Codex's own
+    Selecting a mode sends ``{"approval_mode": mode}`` to
+    ``PATCH /v1/sessions/{id}`` — the request that drives Codex's own
     ``/permissions`` popup on the runner — and the picker then shows the
     server's stamped read-back label rather than a locally guessed value.
 
@@ -108,7 +114,7 @@ def test_codex_native_approval_mode_switch_persists(
     picker = page.get_by_test_id("composer-permission-chip")
     expect(picker).to_be_visible(timeout=15_000)
     picker.click()
-    expect(page.get_by_test_id("composer-permission-option-read-only")).to_have_count(0)
+    expect(page.get_by_test_id("composer-permission-option-read-only")).to_be_visible()
     with page.expect_response(
         lambda response: (
             response.request.method == "PATCH"
@@ -116,13 +122,13 @@ def test_codex_native_approval_mode_switch_persists(
             and response.status == 200
         )
     ):
-        page.get_by_test_id("composer-permission-option-approve-for-me").click()
+        page.get_by_test_id(f"composer-permission-option-{mode}").click()
 
-    assert patch_bodies[-1] == {"approval_mode": "approve-for-me"}
+    assert patch_bodies[-1] == {"approval_mode": mode}
 
-    expect(picker).to_contain_text("Approve for me")
+    expect(picker).to_contain_text(label)
     page.reload()
-    expect(page.get_by_test_id("composer-permission-chip")).to_contain_text("Approve for me")
+    expect(page.get_by_test_id("composer-permission-chip")).to_contain_text(label)
 
 
 def test_codex_native_approval_mode_starts_from_label(
