@@ -21,19 +21,24 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CodeBlock,
   CodeBlockActions,
+  type CodeColorScheme,
   type CodeLanguage,
   CodeBlockContainer,
   CodeBlockContent,
   CodeBlockHeader,
   CodeBlockTitle,
 } from "@/components/ai-elements/code-block";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
 import { dropTrailingPartialEscape, showControlCharacters, stripAnsi } from "@/lib/ansi";
+import { oneLineShellCommand, shellCommandStarts } from "@/lib/shellCommandLines";
 import { type ShellOutputFormat, parseShellToolOutput } from "@/lib/shellToolOutput";
+import { terminalSurfaceStyle } from "@/lib/terminalPalette";
 import { iconForTool } from "@/lib/toolIcon";
 import {
   type ToolRunCall,
@@ -378,15 +383,11 @@ function ToolTitleBody({ title, onBodyClick }: { title: ToolTitle; onBodyClick?:
   );
 }
 
-/** Collapsed-row command, styled like a terminal prompt line. */
+/** Collapsed-row command: a multi-line script folded onto one line. */
 function ShellCommandLine({ command }: { command: string }) {
-  const { env, rest } = splitEnvPrefix(command);
+  const { env, rest } = splitEnvPrefix(oneLineShellCommand(command));
   return (
     <span className="font-mono text-[0.92em]">
-      {/* Decorative prompt: keep it out of the row's accessible name. */}
-      <span aria-hidden="true" className="font-semibold text-foreground">
-        ${" "}
-      </span>
       {env.length > 0 && <span className="opacity-60">{env}</span>}
       <span>{rest}</span>
     </span>
@@ -416,6 +417,19 @@ function ShellTerminalPanel({
 }) {
   const [wrap, setWrap] = useState(true);
   const [showRaw, setShowRaw] = useState(false);
+  const terminalIsDark = useTerminalIsDark();
+  const appIsDark = useResolvedThemeMode() === "dark";
+  // The terminal theme setting can pin the scheme the app is not in; repaint
+  // just this block then, and otherwise keep the app's own palette.
+  let pinnedScheme: CodeColorScheme | undefined;
+  if (terminalIsDark !== appIsDark) pinnedScheme = terminalIsDark ? "dark" : "light";
+  const commandLineClasses = useMemo(
+    () =>
+      shellCommandStarts(command).map((starts) =>
+        starts ? SHELL_PROMPT_LINE_CLASS : SHELL_CONTINUATION_LINE_CLASS,
+      ),
+    [command],
+  );
   const parsed = useMemo(
     () => (output === null ? null : parseShellToolOutput(output, outputFormat)),
     [output, outputFormat],
@@ -456,7 +470,9 @@ function ShellTerminalPanel({
       <CodeBlockContainer
         language="bash"
         data-testid="shell-tool-terminal"
+        data-terminal-theme={terminalIsDark ? "dark" : "light"}
         className="@container/shell"
+        style={pinnedScheme === undefined ? undefined : terminalSurfaceStyle(terminalIsDark)}
       >
         {cwd !== null && (
           // On a narrow card the folder takes its own line and the actions wrap below
@@ -471,15 +487,14 @@ function ShellTerminalPanel({
             {actions}
           </div>
         )}
-        {/* The `$` prompt is a pseudo-element so selecting or copying the command skips it. */}
-        <div
-          className="[&_code>span:first-child]:before:font-semibold [&_code>span:first-child]:before:text-muted-foreground [&_code>span:first-child]:before:content-[var(--shell-prompt)]"
-          style={SHELL_PROMPT_STYLE}
-        >
+        {/* The `$` prompts are pseudo-elements so selecting or copying the command skips them. */}
+        <div style={SHELL_PROMPT_STYLE}>
           <CodeBlockContent
             code={command}
             language="bash"
             wrap={wrap}
+            colorScheme={pinnedScheme}
+            lineClassNames={commandLineClasses}
             className={cn(
               TERMINAL_PRE_CLASS,
               actionsBesideCommand && wrap ? "pt-2 pb-1 @max-[480px]/shell:pt-1" : "pt-1 pb-1",
@@ -507,6 +522,7 @@ function ShellTerminalPanel({
                 code={dropTrailingPartialEscape(text)}
                 language="ansi"
                 wrap={wrap}
+                colorScheme={pinnedScheme}
                 className={cn(TERMINAL_PRE_CLASS, "pt-0 pb-2")}
               />
             )}
@@ -544,6 +560,12 @@ function ShellTerminalPanel({
 
 // A non-breaking space keeps the prompt on the same line as the first word.
 const SHELL_PROMPT_STYLE = { "--shell-prompt": '"$\u00a0"' } as CSSProperties;
+
+// Each command gets a prompt; its continuation lines and wrapped text indent
+// past the prompt so they don't read as separate commands.
+const SHELL_PROMPT_LINE_CLASS =
+  "pl-[2ch] -indent-[2ch] before:font-semibold before:text-muted-foreground before:content-[var(--shell-prompt)]";
+const SHELL_CONTINUATION_LINE_CLASS = "pl-[2ch]";
 
 // Command and output share the panel's own background so the block reads as
 // one continuous terminal surface instead of stacked code panels.

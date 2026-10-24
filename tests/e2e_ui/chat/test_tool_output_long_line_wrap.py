@@ -19,7 +19,9 @@ shell terminal panel:
   - the long output line must FIT the panel (``scrollWidth`` no wider
     than ``clientWidth``), i.e. wrap instead of forcing a horizontal
     scrollbar;
-  - turning word wrap off switches the line to horizontal scrolling.
+  - turning word wrap off switches the line to horizontal scrolling;
+  - with Settings > Terminal theme pinned to dark under a light app, the
+    reloaded panel renders in the dark terminal palette.
 
 On the buggy build the line overflows horizontally by hundreds of
 pixels, so the final assertion fails — that failure is the reproduction.
@@ -242,3 +244,15 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
     # same line to horizontal scrolling instead of wrapping.
     terminal.get_by_role("button", name="Disable word wrap").click()
     page.wait_for_function(_SCROLLS, timeout=8_000)
+
+    # The terminal theme setting paints the shell panel too: pin a dark
+    # terminal under the light app, then reload the persisted turn.
+    page.evaluate(
+        "() => { localStorage.setItem('web-theme', 'light');"
+        " localStorage.setItem('omnigent:terminal-theme', 'dark'); }"
+    )
+    page.reload()
+    _expand_tool_output(page)
+    terminal = page.get_by_test_id("shell-tool-terminal")
+    expect(terminal).to_have_attribute("data-terminal-theme", "dark")
+    expect(terminal).to_have_css("background-color", "rgb(19, 21, 23)")
