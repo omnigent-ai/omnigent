@@ -104,7 +104,11 @@ from omnigent.runner.background_titles import (
 )
 from omnigent.runner.background_titles.service import BACKGROUND_TITLE_MAX_PROMPT_CHARS
 from omnigent.runner.codex.goal import CodexGoalRunner
-from omnigent.runner.launch_failure import FailureDiagnosis, classify_terminal_failure
+from omnigent.runner.launch_failure import (
+    FailureDiagnosis,
+    budget_exhaustion_log_attributes,
+    classify_terminal_failure,
+)
 from omnigent.runner.mcp_execution_registry import (
     McpExecutionRegistry,
 )
@@ -1684,6 +1688,10 @@ def create_runner_app(
         blocked_on: str | None = None,
     ) -> None:
         event: dict[str, object] = {"type": "session.status", "status": status}
+        if status == "failed":
+            # A terminal state signal carries no provider verdict; the native
+            # hook/transcript path supplies the actual turn failure separately.
+            event["status_source"] = "terminal_observation"
         if blocked_on is not None:
             event["blocked_on"] = blocked_on
         _publish_event(session_id, event)
@@ -2097,7 +2105,7 @@ def create_runner_app(
                     session_id,
                     resp.status_code,
                 )
-        except Exception:  # best-effort, but surface it
+        except Exception:
             _logger.warning(
                 "legacy model_override fallback for %s failed; a model-pinned "
                 "first turn may respawn",
@@ -3623,20 +3631,26 @@ def create_runner_app(
                     isinstance(value, str) and re.fullmatch(r"[\w.:-]{1,128}", value)
                 ):
                     dimensions[f"source_{key}"] = str(value)
-            # Canonical broken-turn signal: every failed turn shown in the UI
-            # funnels through here, so log once at ERROR for the dashboard.
-            _logger.error(
-                "turn surfaced to UI as failed for %s (harness=%s): %s",
+            budget_attributes = budget_exhaustion_log_attributes(
+                error.get("code") if error is not None else None,
+                error.get("message") if error is not None else None,
+            ) or budget_exhaustion_log_attributes(source.get("code"), source.get("message"))
+            # A spending limit blocks the turn without indicating a runner fault.
+            log = _logger.info if budget_attributes else _logger.error
+            log(
+                "%s for %s (harness=%s): %s",
+                "turn blocked by budget" if budget_attributes else "turn surfaced to UI as failed",
                 conv_id,
                 harness,
                 error,
                 extra=debug_event(
-                    "runner_turn_failed",
+                    "runner_turn_budget_exhausted" if budget_attributes else "runner_turn_failed",
                     session_id=conv_id,
                     harness=harness,
                     response_id=response_id,
                     **failure_log_attributes(source.get("failure_context")),
                     **dimensions,
+                    **budget_attributes,
                 ),
             )
         _publish_event(conv_id, event)
@@ -4051,7 +4065,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-        except Exception:  # best-effort: harness may have exited
+        except Exception:
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
@@ -4794,7 +4808,7 @@ def create_runner_app(
                     _publish_event,
                     now=asyncio.get_running_loop().time(),
                 )
-            except Exception:  # best-effort observer; never fail the hook
+            except Exception:
                 _logger.warning(
                     "native file-change recording failed for session=%s",
                     _captured_session_id,
@@ -7681,7 +7695,7 @@ def create_runner_app(
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
-            except Exception:  # best-effort; never block catch-up.
+            except Exception:
                 _logger.warning(
                     "Session status resync failed after reconnect",
                     exc_info=True,

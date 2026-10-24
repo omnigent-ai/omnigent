@@ -9165,7 +9165,13 @@ async def _relay_runner_stream_once(
                                     if isinstance(raw_response_id, str) and raw_response_id
                                     else None
                                 ),
-                                failure_origin="relayed_runner_status",
+                                failure_origin=(
+                                    "native_terminal_status"
+                                    if status == "failed"
+                                    and status_error is None
+                                    and event.get("status_source") == "terminal_observation"
+                                    else "relayed_runner_status"
+                                ),
                                 failure_context=event.get("failure_context"),
                                 blocked_on=(
                                     raw_blocked_on

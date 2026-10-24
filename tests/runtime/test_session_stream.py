@@ -1231,10 +1231,12 @@ def test_log_sse_event_emits_turn_finished_on_terminal(monkeypatch: pytest.Monke
 
 @pytest.mark.parametrize("legacy_error", [False, True])
 @pytest.mark.parametrize("source", ["llm", "execution", "tool", "harness"])
+@pytest.mark.parametrize("budget_exhausted", [False, True])
 def test_failed_event_logs_nested_error_code_without_content(
     monkeypatch: pytest.MonkeyPatch,
     legacy_error: bool,
     source: Literal["llm", "execution", "tool", "harness"],
+    budget_exhausted: bool,
 ) -> None:
     """Typed harness failures retain their code in both diagnostic streams."""
     from omnigent.server.schemas import ErrorDetail, FailedEvent, ResponseObject
@@ -1247,27 +1249,47 @@ def test_failed_event_logs_nested_error_code_without_content(
             status="failed",
             model="test-agent",
             created_at=1,
-            error=ErrorDetail(code="runner_error", message="private failure detail"),
+            error=ErrorDetail(
+                code="budget_exhausted" if budget_exhausted else "runner_error",
+                message="private failure detail",
+            ),
             output=[{"text": "private assistant output"}],
         ),
     ).model_dump(mode="json", exclude_none=True)
     if legacy_error:
         event["error"] = {
-            "code": "legacy_error",
+            "code": "budget_exhausted" if budget_exhausted else "legacy_error",
             "source": "execution",
             "message": "private legacy detail",
         }
-    expected_code = "legacy_error" if legacy_error else "runner_error"
+    expected_code = (
+        "budget_exhausted"
+        if budget_exhausted
+        else "legacy_error"
+        if legacy_error
+        else "runner_error"
+    )
     monkeypatch.setattr(session_stream, "sse_logging_enabled", lambda: True)
     monkeypatch.setattr(session_stream, "debug_sink_enabled", lambda: True)
     with _capturing_sse_logger() as sse_records, _capturing_audit_logger() as audit_records:
         session_stream._log_sse_event("conv_failed", event)
 
     assert len(sse_records) == len(audit_records) == 1
+    budget_attributes = (
+        {
+            "code": "budget_exhausted",
+            "error_category": "user",
+            "error_impact": "blocking",
+            "error_phase": "turn",
+        }
+        if budget_exhausted
+        else {}
+    )
     assert sse_records[0].attributes == {
         "response_id": "resp_failed",
         "error_code": expected_code,
         "error_source": source,
+        **budget_attributes,
     }
     assert audit_records[0].attributes == {
         "outcome": "failed",
@@ -1276,11 +1298,13 @@ def test_failed_event_logs_nested_error_code_without_content(
         "error_source": source,
         "error_impact": "blocking",
         "error_phase": "turn",
+        **budget_attributes,
     }
     for record in [*sse_records, *audit_records]:
         assert record.session_id == "conv_failed"
-        assert record.levelno == logging.WARNING
+        assert record.levelno == (logging.INFO if budget_exhausted else logging.WARNING)
         assert "private" not in record.getMessage()
+    assert audit_records[0].attributes["outcome"] == "failed"
 
 
 @pytest.mark.parametrize("source", [None, "private provider text", {"private": "data"}, []])

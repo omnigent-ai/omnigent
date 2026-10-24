@@ -10,6 +10,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge, forwarder
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.native.failure_telemetry import FailureContext
@@ -235,7 +236,7 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
 
 
 _SPEND_LIMIT_ERROR = (
-    'API Error: 403 {"error":{"type":"permission_error",'
+    'Please run /login · API Error: 403 {"error":{"type":"permission_error",'
     '"message":"Synthetic spend limit reached"}}'
 )
 _MAIN_API_ERROR: dict[str, object] = {
@@ -399,6 +400,8 @@ async def test_api_error_survives_next_turn_opening_before_stop_failure(
     assert context["detail_source"] == "explicit_api_error"
     assert context["native_record_id"] == "main-error"
     assert context["native_agent_role"] == "session_agent"
+    assert context["http_status"] == 403
+    assert context["provider_error_type"] == "permission_error"
 
 
 @pytest.mark.asyncio
@@ -905,7 +908,14 @@ async def test_explicit_transcript_api_error_is_observed_without_failing_session
     assert "omnigent-event-post-id" not in str(attrs)
 
 
-def test_model_prose_does_not_become_explicit_error_evidence(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "text",
+    [
+        "API Error: 400 is an example of the response.",
+        'Please run /login · API Error: 403 Budget "example" has reached its limit.',
+    ],
+)
+def test_model_prose_does_not_become_explicit_error_evidence(tmp_path: Path, text: str) -> None:
     path = tmp_path / "session.jsonl"
     path.write_text(
         json.dumps(
@@ -914,7 +924,7 @@ def test_model_prose_does_not_become_explicit_error_evidence(tmp_path: Path) -> 
                 "uuid": "prose",
                 "message": {
                     "role": "assistant",
-                    "content": "API Error: 400 is an example of the response.",
+                    "content": text,
                 },
             }
         )
@@ -922,6 +932,7 @@ def test_model_prose_does_not_become_explicit_error_evidence(tmp_path: Path) -> 
     )
     _, _, items = bridge.read_transcript_items_since(path, 0, agent_name="test-agent")
     assert items[0].failure_context is None
+    assert items[0].data["content"][0]["text"] == text
 
 
 def test_api_error_keeps_original_message_before_display_rewriting(tmp_path: Path) -> None:
@@ -943,6 +954,31 @@ def test_api_error_keeps_original_message_before_display_rewriting(tmp_path: Pat
     _, _, items = bridge.read_transcript_items_since(path, 0, agent_name="test-agent")
     assert items[0].data["content"][0]["text"].startswith("Context limit reached")
     assert items[0].failure_context["native_error_message"] == "Prompt is too long"
+
+
+def test_budget_refusal_has_an_informational_budget_observation(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    path = tmp_path / "session.jsonl"
+    detail = 'Please run /login · API Error: 403 Budget "example" has reached its limit.'
+    _append_transcript(
+        path,
+        {**_MAIN_API_ERROR, "message": {"role": "assistant", "content": detail}},
+    )
+    _, _, items = bridge.read_transcript_items_since(path, 0, agent_name="test-agent")
+
+    with caplog.at_level(logging.INFO, logger=forwarder.__name__):
+        forwarder._log_transcript_failure("conv_synthetic", items[0])
+
+    (record,) = [r for r in caplog.records if r.name == forwarder.__name__]
+    row = record_to_row(record, source="runner")
+    assert row["event_name"] == "native_budget_exhausted"
+    assert row["level"] == "INFO"
+    assert row["attributes"]["code"] == "budget_exhausted"
+    assert row["attributes"]["error_category"] == "user"
+    assert row["attributes"]["error_impact"] == "blocking"
+    assert row["attributes"]["native_error_message"] == detail
+    assert row["attributes"]["native_error_category"] == "authentication_failed"
 
 
 @pytest.mark.parametrize(

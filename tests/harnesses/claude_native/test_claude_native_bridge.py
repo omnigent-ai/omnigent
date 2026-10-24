@@ -1757,6 +1757,8 @@ def test_read_transcript_leaves_unflagged_login_text_untouched(
         "OAuth token revoked · Please run /login",
         "Your organization has disabled API key authentication · Run /login "
         "to sign in with your claude.ai account",
+        "Please run /login · API Error: 401 Invalid token",
+        "Please run /login · API Error: 403 Permission denied",
     ],
 )
 def test_read_transcript_rewrites_flagged_api_error_anywhere(
@@ -1775,6 +1777,22 @@ def test_read_transcript_rewrites_flagged_api_error_anywhere(
     """
     expected = f"{raw_text}\n\n{_LOGIN_GUIDANCE}"
     assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
+
+
+@pytest.mark.parametrize("is_api_error", [False, True])
+@pytest.mark.parametrize("prefix", ["", "Please run /login · "])
+def test_gateway_budget_error_does_not_suggest_signing_in(
+    tmp_path: Path, is_api_error: bool, prefix: str
+) -> None:
+    detail = (
+        'API Error: 403 Budget "example-budget" has reached its limit of $100. '
+        "To continue, contact an admin to increase the budget or use a different budget."
+    )
+    raw_text = f"{prefix}{detail}"
+
+    rendered = _assistant_transcript_text(tmp_path, raw_text, is_api_error=is_api_error)
+
+    assert rendered == (detail if is_api_error else raw_text)
 
 
 def test_read_transcript_flag_inside_message_also_counts(tmp_path: Path) -> None:

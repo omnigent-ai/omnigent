@@ -7,6 +7,7 @@ import pytest
 from omnigent.errors import ErrorCategory
 from omnigent.runner.launch_failure import (
     FailureDiagnosis,
+    budget_exhaustion_log_attributes,
     classify_native_turn_error,
     classify_terminal_failure,
     describe_failure_code,
@@ -273,6 +274,29 @@ def test_content_length_text_does_not_override_specific_failure_codes(code: str)
 )
 def test_classifies_budget_exhausted(code: str, message: str) -> None:
     assert classify_native_turn_error(code, message) == "budget_exhausted"
+    assert budget_exhaustion_log_attributes(code, message) == {
+        "code": "budget_exhausted",
+        "error_category": "user",
+        "error_impact": "blocking",
+        "error_phase": "turn",
+    }
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "expected"),
+    [
+        ("budget_exhausted", None, True),
+        ("codex_compaction_model_failed", "Budget X has reached its limit.", True),
+        ("native_turn_error", "API Error: 401 Invalid token", False),
+        ("native_turn_error", "API Error: 403 Permission denied", False),
+        ("authentication_failed", None, False),
+        (None, {"code": "budget_exhausted"}, False),
+    ],
+)
+def test_budget_log_attribution_requires_a_budget_code_or_explicit_evidence(
+    code: object, message: object, expected: bool
+) -> None:
+    assert bool(budget_exhaustion_log_attributes(code, message)) is expected
 
 
 def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:

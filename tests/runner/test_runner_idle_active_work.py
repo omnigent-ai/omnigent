@@ -437,6 +437,15 @@ async def test_native_pane_idle_after_mid_turn_follow_up_releases_pin() -> None:
         app.state.active_turns.pop(conv_id, None)
         publish_pane_status(conv_id, "idle", None)
         assert app.state.has_active_work() is False
+        events = app.state.session_event_queues[conv_id]
+        while not events.empty():
+            events.get_nowait()
+        publish_pane_status(conv_id, "failed", None)
+        observed = events.get_nowait()
+        assert observed["status"] == "failed"
+        assert observed["status_source"] == "terminal_observation"
+        assert "error" not in observed
+        assert app.state.native_pane_status[conv_id] == "failed"
 
 
 @pytest.mark.asyncio
