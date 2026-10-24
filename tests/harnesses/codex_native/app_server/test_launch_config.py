@@ -20,12 +20,14 @@ except ImportError:  # pragma: no cover - Python < 3.11
 from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.codex_native.app_server import (
     CodexDatabricksProfileMissingError,
+    CodexNativeAppServer,
     build_codex_native_server,
     codex_terminal_env,
 )
 from omnigent.runner.native.orchestration import _native_terminal_start_error_payload
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
+    _FakeStartupClient,
     _test_app_server,
 )
 
@@ -534,6 +536,183 @@ async def test_start_pins_reasoning_effort_in_config(
     assert tomllib.loads(rendered)["model_reasoning_effort"] == "ultra"
     assert rendered.count("model_reasoning_effort") == 1
     assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+
+
+_CONFIG_FALLBACK_EXIT = (
+    "Codex app-server exited early: Error: error loading default config after config "
+    "error: Model provider `Databricks` not found"
+)
+
+
+def _fail_first_readiness(
+    monkeypatch: pytest.MonkeyPatch,
+    stderr: list[str] | None = None,
+    error: str = _CONFIG_FALLBACK_EXIT,
+    failures: int = 1,
+) -> list[str]:
+    """Fail the first *failures* readiness waits as a config fallback; later waits succeed."""
+    configs: list[str] = []
+
+    async def wait(self: CodexNativeAppServer) -> _FakeStartupClient:
+        configs.append((self.codex_home / "config.toml").read_text(encoding="utf-8"))
+        if len(configs) <= failures:
+            self.recent_stderr = list(stderr or [])
+            raise RuntimeError(f"{error} (attempt {len(configs)})")
+        return _FakeStartupClient()
+
+    _disable_codex_startup_rpc(monkeypatch)
+    monkeypatch.setattr(CodexNativeAppServer, "_wait_until_ready", wait)
+    return configs
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        _CONFIG_FALLBACK_EXIT,
+        # Codex 0.162 reports only the provider the defaults lack.
+        "Codex app-server exited early: Error: Model provider `Databricks` not found",
+    ],
+)
+async def test_start_retries_without_a_model_catalog_codex_cannot_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: str
+) -> None:
+    """A catalog generated for another Codex build no longer fails every launch."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    original = 'model_catalog_json = "/home/me/.codex/stale-catalog.json"\nmodel = "gpt-test"\n'
+    (real_codex_home / "config.toml").write_text(original, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    configs = _fail_first_readiness(monkeypatch, error=error)
+
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    await server.start()
+    await server.close()
+
+    assert [("model_catalog_json" in config) for config in configs] == [True, False]
+    assert tomllib.loads(configs[1])["model"] == "gpt-test"
+    assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+
+
+@pytest.mark.parametrize(
+    ("error", "stderr"),
+    [
+        (
+            "Codex app-server exited early: Error: Model provider `Databricks` not found",
+            [
+                "ERROR codex_app_server: Invalid configuration; using defaults. "
+                "model_catalog_json: unknown variant `x`"
+            ],
+        ),
+        # The exit-time snapshot missed the fallback line that cleanup drained.
+        ("Codex app-server exited early", ["Error: Model provider `Databricks` not found"]),
+    ],
+    ids=["codex-names-the-catalog", "fallback-in-drained-stderr"],
+)
+async def test_start_retries_when_stderr_points_at_the_model_catalog(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, error: str, stderr: list[str]
+) -> None:
+    """The retry reads the cause Codex logged, including stderr drained after the exit."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text(
+        'model_catalog_json = "/home/me/.codex/stale-catalog.json"\n', encoding="utf-8"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    configs = _fail_first_readiness(monkeypatch, stderr, error=error)
+
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    await server.start()
+    await server.close()
+
+    assert [("model_catalog_json" in config) for config in configs] == [True, False]
+
+
+async def test_start_retries_without_the_model_catalog_only_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A launch that still fails without the catalog reports that second failure."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text(
+        'model_catalog_json = "/home/me/.codex/stale-catalog.json"\n', encoding="utf-8"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    configs = _fail_first_readiness(monkeypatch, failures=2)
+
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    with pytest.raises(RuntimeError, match=r"\(attempt 2\)"):
+        await server.start()
+
+    assert len(configs) == 2
+
+
+async def test_start_reports_the_startup_error_when_the_catalog_cannot_be_dropped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A filesystem error while dropping the catalog leaves the retry's own failure to report."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text(
+        'model_catalog_json = "/home/me/.codex/stale-catalog.json"\n', encoding="utf-8"
+    )
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    configs = _fail_first_readiness(monkeypatch, failures=2)
+
+    def unwritable(_path: Path) -> None:
+        raise PermissionError("read-only session home")
+
+    monkeypatch.setattr(codex_native_app_server, "_materialize_config_symlink", unwritable)
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    with pytest.raises(RuntimeError, match=r"\(attempt 2\)"):
+        await server.start()
+
+    assert len(configs) == 2
+
+
+@pytest.mark.parametrize(
+    ("config", "stderr", "error"),
+    [
+        ('model = "gpt-test"\n', [], _CONFIG_FALLBACK_EXIT),
+        (
+            'model_catalog_json = "/home/me/.codex/catalog.json"\n',
+            ["ERROR codex_app_server: Invalid configuration; using defaults. unknown field `x`"],
+            _CONFIG_FALLBACK_EXIT,
+        ),
+        (
+            'model_catalog_json = "/home/me/.codex/catalog.json"\n',
+            [],
+            "Codex app-server exited early: Error: Permission denied (os error 13)",
+        ),
+    ],
+    ids=["no-catalog", "codex-names-another-cause", "unrelated-startup-error"],
+)
+async def test_start_keeps_other_config_failures(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, config: str, stderr: list[str], error: str
+) -> None:
+    """Only a config that could fail on its model catalog is retried without it."""
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    (real_codex_home / "config.toml").write_text(config, encoding="utf-8")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    configs = _fail_first_readiness(monkeypatch, stderr, error=error)
+
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    with pytest.raises(RuntimeError, match=r"\(attempt 1\)"):
+        await server.start()
+
+    assert len(configs) == 1
 
 
 def test_build_codex_native_server_owns_add_dir_roots(tmp_path: Path) -> None:

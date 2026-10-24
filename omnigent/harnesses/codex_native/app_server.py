@@ -2068,6 +2068,8 @@ class CodexNativeAppServer:
     # bridge so the forwarder can fail a stuck turn with the cause.
     certificate_failure: CertificateFailure | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
+    # Set after Codex could not load a config that names a model catalog.
+    _without_model_catalog: bool = field(default=False, init=False)
 
     async def _spawn_app_server_process(self, resolved_listen: str) -> None:
         """
@@ -2123,10 +2125,46 @@ class CodexNativeAppServer:
         """
         Start the Codex app-server and wait for the socket.
 
+        A config Codex cannot load makes the app-server fall back to defaults that
+        lack the session's provider, so it exits. When the config names a
+        ``model_catalog_json`` (e.g. one generated for a different Codex build),
+        retry once without it instead of failing every launch.
+
         :returns: None.
         :raises OmnigentError: ``WORKSPACE_MISSING`` when the session's working
             directory was removed, e.g. a deleted git worktree.
         """
+        try:
+            await self._start()
+        except RuntimeError as exc:
+            catalog = _codex_home_model_catalog(self.codex_home)
+            stderr = self.recent_stderr or []
+            if (
+                self._without_model_catalog
+                or catalog is None
+                # The error holds stderr as of the exit; cleanup can drain the rest.
+                or not any(
+                    _CODEX_CONFIG_FALLBACK_EXIT.search(text) for text in (str(exc), *stderr)
+                )
+                or not _codex_config_error_may_be_model_catalog(stderr)
+            ):
+                raise
+            _logger.warning(
+                "Codex could not load the session config; retrying without model_catalog_json "
+                "%s (regenerate that catalog for this Codex version to use it again)",
+                catalog,
+                extra=debug_event(
+                    "codex_model_catalog_dropped",
+                    session_id=self.session_id,
+                    harness="codex-native",
+                    stage="app_server_startup",
+                ),
+            )
+            self._without_model_catalog = True
+            await self._start()
+
+    async def _start(self) -> None:
+        """Prepare the private Codex home, spawn the app-server, and wait for it."""
         if not self.cwd.is_dir():
             # Spawning in it would only fail with a bare ENOENT; name the cause.
             raise OmnigentError(
@@ -2221,6 +2259,8 @@ class CodexNativeAppServer:
         )
         if self.trust_project:
             _trust_codex_project(self.codex_home, self.cwd)
+        if self._without_model_catalog:
+            _drop_codex_model_catalog(self.codex_home)
         _add_codex_writable_roots(self.codex_home, self.writable_roots)
         # Write the MCP server config into config.toml so the app-server
         # discovers it at config load. The -c overrides may not be honored
@@ -3271,6 +3311,46 @@ def _trust_codex_project(codex_home: Path, cwd: Path) -> None:
         projects[project_key] = project
     project["trust_level"] = "trusted"
     config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+
+
+# How Codex exits when the session config fails to load and the defaults it falls
+# back to lack the session's provider (older builds add the first wording).
+_CODEX_CONFIG_FALLBACK_EXIT = re.compile(
+    r"error loading default config after config error|Model provider `[^`]*` not found"
+)
+
+
+def _codex_home_model_catalog(codex_home: Path) -> str | None:
+    """The ``model_catalog_json`` the private session config points at, if any."""
+    try:
+        document = tomlkit.parse((codex_home / "config.toml").read_text(encoding="utf-8"))
+    except (OSError, tomlkit.exceptions.TOMLKitError):
+        return None
+    catalog = document.get("model_catalog_json")
+    return str(catalog) if isinstance(catalog, str) else None
+
+
+def _codex_config_error_may_be_model_catalog(stderr: Sequence[str]) -> bool:
+    """Whether the config error Codex logged, if any, could be its model catalog.
+
+    Newer Codex logs ``Invalid configuration; using defaults. <cause>``. Older
+    builds log no cause, so the catalog may be the reason.
+    """
+    causes = [line for line in stderr if "Invalid configuration" in line]
+    return not causes or any("model_catalog_json" in line for line in causes)
+
+
+def _drop_codex_model_catalog(codex_home: Path) -> None:
+    """Remove ``model_catalog_json`` from the private session config only."""
+    config_path = codex_home / "config.toml"
+    try:
+        _materialize_config_symlink(config_path)
+        document = tomlkit.parse(config_path.read_text(encoding="utf-8"))
+        if document.pop("model_catalog_json", None) is not None:
+            config_path.write_text(tomlkit.dumps(document), encoding="utf-8")
+    except (OSError, tomlkit.exceptions.TOMLKitError):
+        # The retry then reports the startup error instead of this one.
+        _logger.warning("Could not drop model_catalog_json from %s", config_path, exc_info=True)
 
 
 def _add_codex_writable_roots(codex_home: Path, roots: Sequence[str]) -> None:
