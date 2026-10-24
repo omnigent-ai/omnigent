@@ -3353,6 +3353,13 @@ function shouldPlayNotificationSound(key) {
   return true;
 }
 
+// Electron never emits `click` for a garbage-collected Notification, so the
+// notify handler keeps each one alive until it is clicked or fails to show. The
+// cap bounds the ones dismissed without a click, whose `close` isn't reliable.
+const MAX_RETAINED_NOTIFICATIONS = 100;
+/** @type {Set<Electron.Notification>} */
+const retainedNotifications = new Set();
+
 /**
  * Forget the saved server URL and return the focused window to the bundled
  * setup page so the user can enter a new one. For an ephemeral (debug
@@ -4511,6 +4518,7 @@ function registerIpc() {
     // Focus the window that fired the notification (so a click lands on the
     // right one in a multi-window setup), falling back to any open window.
     notification.on("click", () => {
+      retainedNotifications.delete(notification);
       const win = BrowserWindow.fromWebContents(event.sender) ?? activeWindow();
       if (win) {
         if (win.isMinimized()) win.restore();
@@ -4528,6 +4536,11 @@ function registerIpc() {
         }
       }
     });
+    notification.on("failed", () => retainedNotifications.delete(notification));
+    retainedNotifications.add(notification);
+    if (retainedNotifications.size > MAX_RETAINED_NOTIFICATIONS) {
+      retainedNotifications.delete(retainedNotifications.values().next().value);
+    }
     notification.show();
     signalForeground();
     // Foreground + background audible cue on macOS: play the user's chosen

@@ -407,7 +407,9 @@ function loadNavigationHarness({
     Notification: Object.assign(
       function Notification(options) {
         calls.notifications = [...(calls.notifications ?? []), options];
-        return { on: () => {}, show: () => {} };
+        const notification = Object.assign(new EventEmitter(), { show: () => {} });
+        calls.notificationRefs = [...(calls.notificationRefs ?? []), new WeakRef(notification)];
+        return notification;
       },
       { isSupported: () => notificationsSupported },
     ),
@@ -657,7 +659,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect, retainedNotifications: () => retainedNotifications, maxRetainedNotifications: () => MAX_RETAINED_NOTIFICATIONS };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -5245,5 +5247,56 @@ describe("server names from the manifest", () => {
     h.api.windows.get(h.win).ephemeral = true;
     await h.api.loadServerUrl(h.win, server);
     assert.equal(fs.existsSync(h.settingsPath) ? saved(h).server_names : undefined, undefined);
+  });
+});
+
+describe("desktop notifications", () => {
+  const server = "https://omni.example";
+  const pageEvent = (h) => ({ sender: h.webContents, senderFrame: { url: server } });
+  const collectGarbage = () => {
+    require("node:v8").setFlagsFromString("--expose-gc");
+    vm.runInNewContext("gc")();
+  };
+
+  it("opens the notification's session when it is clicked after garbage collection", async (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.webContents.isDestroyed = () => false;
+    await h.ipc.get("omnigent:notify")(pageEvent(h), {
+      title: "Done",
+      navigatePath: "/c/conv_abc",
+    });
+    await wait();
+    collectGarbage();
+    await wait();
+    collectGarbage();
+
+    const notification = h.calls.notificationRefs.at(-1).deref();
+    assert.ok(notification, "the shown notification was garbage-collected before its click");
+    notification.emit("click");
+    assert.deepEqual(h.calls.progress.at(-1), {
+      channel: "omnigent:notification-activated",
+      data: "/c/conv_abc",
+    });
+  });
+
+  it("releases clicked or failed notifications and keeps only the newest others", (t) => {
+    const h = loadNavigationHarness({ serverUrl: server, notificationsSupported: true });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    h.webContents.isDestroyed = () => false;
+    for (let i = 0; i <= h.api.maxRetainedNotifications(); i++) {
+      h.ipc.get("omnigent:notify")(pageEvent(h), { title: "Done", navigatePath: `/c/${i}` });
+    }
+    const shown = h.calls.notificationRefs.map((ref) => ref.deref());
+    shown.at(-1).emit("click");
+    shown.at(-3).emit("failed");
+
+    const retained = shown.map((notification) => h.api.retainedNotifications().has(notification));
+    assert.deepEqual(
+      [retained[0], retained[1], retained.at(-3), retained.at(-2), retained.at(-1)],
+      [false, true, false, true, false],
+    );
   });
 });
