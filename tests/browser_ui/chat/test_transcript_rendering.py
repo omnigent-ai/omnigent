@@ -31,6 +31,13 @@ _INVALID_MERMAID = (
     "    Note over A,B: proceed once; do not call Save\n"
     "    A=>B: again\n```"
 )
+_MULTILINE_LABEL_MERMAID = (
+    "```mermaid\nflowchart LR\n"
+    '  A["Databricks machines<br/>every process;<br/>file, network, DNS<br/>event"]'
+    ' --> B["Collector<br/>normalize + enrich"]\n'
+    '  B --> C["camera footage: raw<br/>telemetry (FDR)"]\n'
+    '  B --> D["radio calls: EPP<br/>detections"]\n```'
+)
 
 
 def _seed_assistant_message(chat: ChatSessionContract, text: str) -> None:
@@ -218,6 +225,45 @@ def test_mermaid_recovery_uses_the_real_browser_renderer(
         )
         expect(escaped).to_contain_text("one semicolon escaped as #59; (first on line 3)")
     expect(page.get_by_test_id("mermaid-error")).to_have_count(0)
+
+
+@pytest.mark.parametrize("image_format", ["SVG", "PNG"])
+def test_mermaid_download_saves_a_complete_image(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    tmp_path: Path,
+    image_format: str,
+) -> None:
+    """A diagram with multi-line labels downloads as a well-formed SVG or a PNG."""
+    chat = chat_session_contract
+    _seed_assistant_message(chat, _MULTILINE_LABEL_MERMAID)
+    page.goto(chat.url)
+    diagram = page.locator('[data-streamdown="mermaid-block"] svg[aria-roledescription]')
+    expect(diagram.locator("g.node")).to_have_count(4, timeout=20_000)
+
+    page.get_by_title("Download diagram", exact=True).click()
+    menu_item = page.get_by_title(f"Download diagram as {image_format}")
+    with page.expect_download(timeout=10_000) as download_info:
+        menu_item.click()
+    download = download_info.value
+    saved = tmp_path / download.suggested_filename
+    download.save_as(saved)
+    expect(menu_item).to_be_hidden()
+
+    if image_format == "PNG":
+        assert saved.read_bytes().startswith(b"\x89PNG\r\n\x1a\n")
+        return
+    parsed = page.evaluate(
+        """text => {
+            const doc = new DOMParser().parseFromString(text, 'image/svg+xml');
+            return {
+                error: doc.querySelector('parsererror')?.textContent ?? null,
+                nodes: doc.querySelectorAll('g.node').length,
+            };
+        }""",
+        saved.read_text(encoding="utf-8"),
+    )
+    assert parsed == {"error": None, "nodes": 4}
 
 
 @pytest.mark.parametrize("activation", ["click", "keyboard"])
