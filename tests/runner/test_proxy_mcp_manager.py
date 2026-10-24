@@ -209,6 +209,37 @@ async def test_schemas_for_happy_path_parses_tools() -> None:
 
 
 @pytest.mark.asyncio
+async def test_schemas_for_ignores_local_tools_in_mixed_proxy_catalog() -> None:
+    """Runner injection only takes external MCP tools from the public catalog."""
+    rpc_resp = _json_resp(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "result": {
+                "tools": [
+                    {
+                        "name": "github__search",
+                        "description": "Search",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    },
+                    {
+                        "name": "sys_os_read",
+                        "description": "Read a file",
+                        "inputSchema": {"type": "object", "properties": {}},
+                    },
+                ]
+            },
+        }
+    )
+    manager = _make_manager(_StubTransport([rpc_resp]))
+
+    result = await manager.schemas_for(_make_spec("github"))
+
+    assert result.tool_names == {"github__search"}
+    assert [schema["name"] for schema in result.schemas] == ["github__search"]
+
+
+@pytest.mark.asyncio
 async def test_schemas_for_normalizes_null_input_schema() -> None:
     """A tool with ``inputSchema: null`` must normalize to ``{type: object, properties: {}}``.
 

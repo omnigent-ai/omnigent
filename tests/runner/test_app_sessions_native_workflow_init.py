@@ -20,6 +20,7 @@ from omnigent.entities.session_resources import SessionResourceView
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.inner.databricks_executor import DatabricksAuthError
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
@@ -41,6 +42,7 @@ from tests.runner.conftest import (
     _build_interrupt_app,
     _build_lifecycle_app,
     _FakeFileServerClient,
+    _FakeMcpManager,
     _FakeProcessManager,
     _ReadTimeoutTransport,
     _runner_client,
@@ -2039,7 +2041,11 @@ async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
     bundle_dir.mkdir()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    spec = AgentSpec(spec_version=1, name="bundle-agent")
+    spec = AgentSpec(
+        spec_version=1,
+        name="bundle-agent",
+        os_env=OSEnvSpec(type="caller_process", cwd=str(bundle_dir)),
+    )
 
     captured_workspaces: list[Path | None] = []
 
@@ -2096,6 +2102,140 @@ async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
     assert execute_resp.status_code == 200
     assert execute_resp.json() == {"result": {"output": "ok"}}
     assert captured_workspaces == [workspace]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_unknown_local_tool_returns_protocol_error() -> None:
+    """An unregistered tool must not look like a successful tool result."""
+    app, _ = await _build_app_for_spec(AgentSpec(spec_version=1, name="qa-agent"))
+    session_id = "77a8c01d832e4d0587d76028956eab07"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/call", "params": {"name": "qa_missing_tool", "arguments": {}}},
+        )
+
+    assert response.status_code == 200
+    assert response.json() == {
+        "error": {"code": -32602, "message": "Unknown tool: qa_missing_tool"}
+    }
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_list_advertises_callable_native_local_tools() -> None:
+    """Native MCP clients can discover the local tools that tools/call accepts."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="qa-native-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+    mcp_manager = _FakeMcpManager(tool_name="jira__search_issues")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        mcp_manager=mcp_manager,  # type: ignore[arg-type]
+    )
+    session_id = "a7b8c9d0e1f23456789a0b1c2d3e4f50"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+        )
+
+    assert response.status_code == 200
+    schemas = response.json()["result"]["schemas"]
+    by_name = {schema["name"]: schema for schema in schemas}
+    assert len(by_name) == len(schemas)
+    assert "jira__search_issues" in by_name
+    assert "sys_os_read" in by_name
+    assert "path" in by_name["sys_os_read"]["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_list_local_only_without_external_manager() -> None:
+    """An agent with no MCP servers still advertises its callable local tools."""
+    app, _ = await _build_app_for_spec(AgentSpec(spec_version=1, name="qa-agent"))
+    session_id = "f752d68321fb401b8442959c983c7db4"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+        )
+
+    assert response.status_code == 200
+    schemas = response.json()["result"]["schemas"]
+    names = {schema["name"] for schema in schemas}
+    assert "sys_session_list" in names
+    assert "sys_os_read" not in names
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_refuses_local_tool_outside_granted_surface() -> None:
+    """A non-native session cannot invoke an OS tool absent from its tool surface."""
+    app, _ = await _build_app_for_spec(AgentSpec(spec_version=1, name="qa-agent"))
+    session_id = "8d8c5d37ae154bb09cf0b307e095f644"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {"name": "sys_os_read", "arguments": {"path": "canary.txt"}},
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["error"]["code"] == -32602
+    assert "not enabled" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_refuses_local_tool_without_session_spec() -> None:
+    """Missing agent context cannot bypass the local tool grant check."""
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = "2ef95c280e534e5c8965b1236c78faae"
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {"name": "sys_os_read", "arguments": {"path": "canary.txt"}},
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["error"]["code"] == -32000
+    assert "No spec available" in payload["error"]["message"]
 
 
 @pytest.mark.asyncio

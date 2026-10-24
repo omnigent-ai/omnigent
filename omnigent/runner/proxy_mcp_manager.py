@@ -273,9 +273,13 @@ class ProxyMcpManager:
         tools_list = _json_object_list(result.get("tools"))
         schemas: list[_JsonObject] = []
         tool_names: set[str] = set()
+        from omnigent.runner.tool_dispatch import is_known_mcp_local_tool
+
         for tool in tools_list:
             name = tool.get("name")
-            if not isinstance(name, str) or not name:
+            # The public proxy also lists runner-local tools. The runner already
+            # registers those directly; injecting them again would duplicate tools.
+            if not isinstance(name, str) or not name or is_known_mcp_local_tool(name, spec):
                 continue
             if service:
                 name = f"{service}__{name}"
