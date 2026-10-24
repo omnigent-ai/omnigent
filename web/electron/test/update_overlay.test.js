@@ -3,7 +3,12 @@ const assert = require("node:assert/strict");
 const { EventEmitter } = require("node:events");
 const { pathToFileURL } = require("node:url");
 
-const { createUpdateOverlay, OVERLAY_INSET, OVERLAY_WIDTH } = require("../src/update_overlay");
+const {
+  createUpdateOverlay,
+  OVERLAY_INSET,
+  OVERLAY_WIDTH,
+  COLLAPSED_OVERLAY_HEIGHT,
+} = require("../src/update_overlay");
 
 class FakeWebContents extends EventEmitter {
   constructor() {
@@ -233,7 +238,7 @@ describe("update overlay", () => {
       channel: "omnigent:update-overlay-height",
       payload: 0,
     });
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.bounds.height, COLLAPSED_OVERLAY_HEIGHT);
     assert.deepEqual(overlay.ignoreMouse.at(-1), {
       ignore: true,
       options: { forward: true },
@@ -248,7 +253,7 @@ describe("update overlay", () => {
     await handleHandlers.get("omnigent:overlay-update-download")({ sender: overlay.webContents });
 
     assert.deepEqual(calls, [{ openAbout: parent }, "download"]);
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.bounds.height, COLLAPSED_OVERLAY_HEIGHT);
     assert.deepEqual(overlay.ignoreMouse.at(-1), {
       ignore: true,
       options: { forward: true },
@@ -281,7 +286,7 @@ describe("update overlay", () => {
     onHandlers.get("omnigent:overlay-height")({ sender: overlay.webContents }, 180);
 
     controller.suppress(parent);
-    assert.equal(overlay.bounds.height, 1);
+    assert.equal(overlay.bounds.height, COLLAPSED_OVERLAY_HEIGHT);
 
     controller.unsuppress(parent);
     assert.equal(overlay.bounds.height, 180);
