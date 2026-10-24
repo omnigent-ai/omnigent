@@ -250,6 +250,74 @@ def foreground_kill_command(pidfile: str) -> str:
     )
 
 
+# A sandbox woken from a memory-preserving pause resumes its old ``omnigent host``
+# on a revoked launch token; this stops it before a fresh daemon starts. Matches
+# ``"omnigent host"`` in full argv, so the restart supervisor goes too.
+_STOP_PRESERVED_HOST_DAEMON_SCRIPT = """\
+import os, signal, subprocess, time
+
+self_pids = {os.getpid(), os.getppid()}
+try:
+    output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
+except Exception as exc:
+    print(f"could not inspect process table: {exc}")
+    raise SystemExit(0)
+
+targets = []
+for line in output.splitlines():
+    parts = line.strip().split(None, 1)
+    if len(parts) != 2:
+        continue
+    try:
+        pid = int(parts[0])
+    except ValueError:
+        continue
+    args = parts[1]
+    if pid in self_pids:
+        continue
+    if "omnigent host" in args:
+        targets.append(pid)
+
+for pid in targets:
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except PermissionError as exc:
+        print(f"could not terminate preserved omnigent host pid {pid}: {exc}")
+
+time.sleep(0.5)
+for pid in targets:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        continue
+    except PermissionError:
+        continue
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+if targets:
+    print(f"stopped preserved omnigent host daemon(s): {', '.join(map(str, targets))}")
+"""
+
+
+def stop_preserved_host_daemon_command() -> str:
+    """
+    Build the remote command that stops a host daemon a resume preserved.
+
+    Used by launchers whose sandboxes keep memory across pause/resume
+    (Islo, boxd) before :meth:`ExecModelHostLauncher.start_host` launches a
+    daemon with a fresh token. Best-effort: it reports what it stopped and
+    exits 0 even when the process table cannot be read.
+
+    :returns: A ``python3 -c '<script>'`` shell command for :meth:`SandboxExecTransport.run`.
+    """
+    return f"python3 -c {shlex.quote(_STOP_PRESERVED_HOST_DAEMON_SCRIPT)}"
+
+
 # In-sandbox write of an injected host config, run via ``python3 -c``.
 # Self-contained on purpose (stdlib + yaml, both baked into any image that can
 # run ``omnigent host``): importing merge logic from the sandbox's installed
@@ -752,8 +820,8 @@ def supervise_host_command(command: str) -> str:
     not just the host — otherwise the loop faithfully restarts it. Both in-sandbox
     stop paths already do: ``foreground_kill_command`` signals the process the
     pidfile recorded (the supervisor, which is what ``exec``s under it), and
-    islo's preserved-daemon stop matches ``"omnigent host"`` against full argv,
-    which the supervisor's own ``sh -c <script>`` argv contains.
+    :func:`stop_preserved_host_daemon_command` matches ``"omnigent host"`` against
+    full argv, which the supervisor's own ``sh -c <script>`` argv contains.
 
     The attempt counter in the restart log makes a persistently-crashing host
     observable — the loop never gives up, so a wedged box would otherwise be

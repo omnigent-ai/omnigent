@@ -202,6 +202,10 @@ e2b = ["e2b>=2.26,<3"]
 # the base package and imports the SDK lazily, so only users of the
 # provider need this extra.
 islo = ["islo>=0.3.5,<0.4"]
+# boxd sandbox launcher (`omnigent sandbox --provider boxd` and
+# server-managed `sandbox.provider: boxd`). Same lazy-import posture as
+# above. Pre-1.0 SDK: pin minor.
+boxd = ["boxd>=0.2.16,<0.3"]
 # NVIDIA OpenShell launcher (`omnigent sandbox --provider openshell`).
 # Self-hosted gRPC gateway; the SDK pulls grpcio + protobuf. Same
 # lazy-import posture as above. Pre-1.0 SDK: pin minor. 0.1 addresses

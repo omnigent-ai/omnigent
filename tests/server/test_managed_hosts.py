@@ -5696,6 +5696,92 @@ def test_parse_gensee_rejects_invalid_config(gensee: dict[str, object]) -> None:
         )
 
 
+# ── boxd sandbox provider ───────────────────────────────────
+
+
+def test_parse_boxd_builds_core_launcher() -> None:
+    """The documented boxd block reaches the launcher with a 7-day token TTL."""
+    from omnigent.onboarding.sandboxes.boxd import BoxdSandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {
+            "provider": "boxd",
+            "server_url": "https://omnigent.example.com/",
+            "boxd": {
+                "env": ["ANTHROPIC_API_KEY", "GIT_TOKEN"],
+                "org": "acme",
+                "vcpu": 4,
+                "omnigent_spec": "omnigent==0.19.1",
+            },
+        }
+    )
+
+    assert deployment is not None
+    config = deployment.default
+    assert config.provider == "boxd"
+    assert config.server_url == "https://omnigent.example.com"
+    assert config.managed_launch_supported is True
+    assert config.token_ttl_s == 7 * 24 * 3600
+    launcher = config.launcher_factory()
+    assert isinstance(launcher, BoxdSandboxLauncher)
+    assert launcher.env == ("ANTHROPIC_API_KEY", "GIT_TOKEN")
+    assert (launcher.org, launcher.vcpu, launcher.snapshot) == ("acme", 4, None)
+    assert launcher.omnigent_spec == "omnigent==0.19.1"
+
+
+def test_parse_boxd_minimal_config_uses_launcher_defaults() -> None:
+    """`provider: boxd` + `server_url` is a complete config."""
+    from omnigent.onboarding.sandboxes.boxd import BoxdSandboxLauncher
+
+    deployment = parse_sandbox_config(
+        {"provider": "boxd", "server_url": "https://omnigent.example.com"}
+    )
+
+    assert deployment is not None
+    launcher = deployment.default.launcher_factory()
+    assert isinstance(launcher, BoxdSandboxLauncher)
+    assert (launcher.snapshot, launcher.env, launcher.org, launcher.vcpu) == (
+        None,
+        None,
+        None,
+        None,
+    )
+
+
+def test_parse_boxd_rejects_unknown_config_key() -> None:
+    with pytest.raises(ValueError, match=r"sandbox\.boxd.*unknown"):
+        parse_sandbox_config(
+            {
+                "provider": "boxd",
+                "server_url": "https://omnigent.example.com",
+                "boxd": {"image": "ghcr.io/omnigent-ai/omnigent-host:latest"},
+            }
+        )
+
+
+@pytest.mark.parametrize(
+    "boxd",
+    [
+        {"vcpu": 3},
+        {"vcpu": 2, "snapshot": "omnigent-host"},
+        {"vcpu": "2"},
+        {"snapshot": ""},
+        {"env": "ANTHROPIC_API_KEY"},
+        {"omnigent_spec": ""},
+    ],
+)
+def test_parse_boxd_rejects_invalid_config(boxd: dict[str, object]) -> None:
+    """Bad sizes, a size with a snapshot, and malformed fields stop startup."""
+    with pytest.raises(ValueError, match=r"sandbox\.boxd"):
+        parse_sandbox_config(
+            {
+                "provider": "boxd",
+                "server_url": "https://omnigent.example.com",
+                "boxd": boxd,
+            }
+        )
+
+
 # ── contributed sandbox providers ───────────────────────────
 
 

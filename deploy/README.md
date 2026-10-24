@@ -93,6 +93,9 @@ deploy/
 ├── gensee/            ← Gensee managed sandbox-provider guide (ephemeral
 │   └── README.md         provider-managed runtimes); NOT a server deploy target.
 │
+├── boxd/              ← boxd sandbox-provider guide (hosted microVMs that
+│   └── README.md         sleep and resume in place); NOT a server deploy target.
+│
 ├── openshell/         ← NVIDIA OpenShell sandbox-provider guide (self-hosted
 │   └── README.md         gRPC gateway, on-prem/air-gapped); NOT a server target.
 │
@@ -320,10 +323,10 @@ omnigent run path/to/agent.yaml --server https://your-host
 
 Don't want a laptop to be the host? Run the host in a cloud sandbox instead.
 
-**From the CLI (Modal, Daytona, Blaxel, Islo, or E2B).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, or `'omnigent[e2b]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, or `E2B_API_KEY`. Then run:
+**From the CLI (Modal, Daytona, Blaxel, Islo, E2B, or boxd).** Install the provider extra when needed (`pip install 'omnigent[modal]'`, `'omnigent[daytona]'`, `'omnigent[blaxel]'`, `'omnigent[e2b]'`, or `'omnigent[boxd]'`; Islo uses the built-in HTTP client). Authenticate with `modal token new`, `DAYTONA_API_KEY`, Blaxel's `BL_WORKSPACE` and `BL_API_KEY`, `ISLO_API_KEY`, `E2B_API_KEY`, or `BOXD_API_KEY`. Then run:
 
 ```bash
-omnigent sandbox create --provider modal     # or --provider daytona / blaxel / islo / e2b
+omnigent sandbox create --provider modal     # or --provider daytona / blaxel / islo / e2b / boxd
 omnigent sandbox connect --provider modal --sandbox-id <id> --server https://your-host
 ```
 
@@ -336,7 +339,7 @@ omnigent sandbox connect --provider modal --sandbox-id <id> --server https://you
 > rather than a registry image — build it once first; see
 > [`e2b/README.md`](e2b/README.md).
 
-**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, or Gensee).** With
+**Server-managed (Modal, Daytona, Blaxel, Islo, E2B, Gensee, or boxd).** With
 *managed hosts*, creating a session with `"host_type": "managed"` (e.g.
 `POST /v1/sessions {"agent_id": ..., "host_type": "managed"}`) makes the
 server provision a sandbox, start a host in it, and run the session there.
@@ -360,6 +363,7 @@ Daytona reads `DAYTONA_API_KEY`. Blaxel reads `BL_WORKSPACE` and `BL_API_KEY`.
 Islo reads `ISLO_API_KEY` and optional `ISLO_BASE_URL`. E2B reads `E2B_API_KEY`.
 Gensee reads `GENSEE_CONTROLLER_API_TOKEN`; see
 [`gensee/README.md`](gensee/README.md) for its managed-only configuration.
+boxd reads `BOXD_API_KEY` and optional `BOXD_ORG`.
 All credentials come from the server environment.
 Each sandbox authenticates back with a server-minted, per-launch token, so
 no user credentials ever enter the sandbox.
@@ -372,7 +376,7 @@ for a later sweep, while the session history and durable host binding stay
 available for a fresh sandbox generation. Both
 `terminate_after_offline_days` and `sweep_interval_s` must be positive integers.
 
-**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. Gensee uses a provider-managed runtime rather than this registry-image setting. To use a custom image with a provider that accepts one, build the same `host` target and point the provider config at it:
+**The host image.** Most sandboxes boot from the official prebaked host image (`ghcr.io/omnigent-ai/omnigent-host:latest`, published by CI from the `host` target of [`docker/Dockerfile`](docker/Dockerfile)), so the host starts in seconds instead of installing Omnigent at boot. The image ships the coding-harness CLIs (`claude`, `codex`, `pi`, `kiro-cli`). Blaxel uses `blaxel/omnigent-host:latest`, which combines this host runtime with Blaxel's required `sandbox-api`. E2B uses its provider template. Gensee uses a provider-managed runtime rather than this registry-image setting. boxd boots its own Ubuntu image and installs the host on first boot, or restores a prepared snapshot (see [`boxd/README.md`](boxd/README.md)). To use a custom image with a provider that accepts one, build the same `host` target and point the provider config at it:
 
 ```bash
 docker build -f docker/Dockerfile --target host \
@@ -416,7 +420,7 @@ sandbox:
     secrets: [omnigent-llm]
 ```
 
-For Daytona, Blaxel, and Islo, list server environment variable names under `sandbox.daytona.env`, `sandbox.blaxel.env`, or `sandbox.islo.env`. The launcher copies the current server values into each sandbox:
+For Daytona, Blaxel, Islo, and boxd, list server environment variable names under `sandbox.daytona.env`, `sandbox.blaxel.env`, `sandbox.islo.env`, or `sandbox.boxd.env`. The launcher copies the current server values into each sandbox:
 
 ```yaml
 sandbox:
@@ -441,7 +445,7 @@ a Modal secret (GitLab: add `GIT_USERNAME=oauth2`). The host image's git
 credential helper picks it up for the clone and for the agent's later
 fetch/push.
 
-See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), and [`islo`](islo/README.md) guides for provider setup and troubleshooting.
+See the [`modal`](modal/README.md), [`daytona`](daytona/README.md), [`blaxel`](blaxel/README.md), [`islo`](islo/README.md), and [`boxd`](boxd/README.md) guides for provider setup and troubleshooting.
 
 ## Auth
 

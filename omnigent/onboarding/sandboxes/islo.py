@@ -45,6 +45,7 @@ from omnigent.onboarding.sandboxes.base import (
     SandboxGoneError,
     SandboxLauncher,
     host_image_wheel_install_command,
+    stop_preserved_host_daemon_command,
 )
 from omnigent.onboarding.sandboxes.types import RepoWorkspace, SandboxCapabilities
 
@@ -97,56 +98,6 @@ except (FileNotFoundError, ValueError):
 if isinstance(settings, dict) and settings.pop("apiKeyHelper", None) is not None:
     with open(path, "w") as handle:
         json.dump(settings, handle, indent=2)
-"""
-
-_STOP_PRESERVED_HOST_DAEMON_SCRIPT = """\
-import os, signal, subprocess, time
-
-self_pids = {os.getpid(), os.getppid()}
-try:
-    output = subprocess.check_output(["ps", "-eo", "pid=,args="], text=True)
-except Exception as exc:
-    print(f"could not inspect process table: {exc}")
-    raise SystemExit(0)
-
-targets = []
-for line in output.splitlines():
-    parts = line.strip().split(None, 1)
-    if len(parts) != 2:
-        continue
-    try:
-        pid = int(parts[0])
-    except ValueError:
-        continue
-    args = parts[1]
-    if pid in self_pids:
-        continue
-    if "omnigent host" in args:
-        targets.append(pid)
-
-for pid in targets:
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except PermissionError as exc:
-        print(f"could not terminate preserved omnigent host pid {pid}: {exc}")
-
-time.sleep(0.5)
-for pid in targets:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        continue
-    except PermissionError:
-        continue
-    try:
-        os.kill(pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError):
-        pass
-
-if targets:
-    print(f"stopped preserved omnigent host daemon(s): {', '.join(map(str, targets))}")
 """
 
 
@@ -573,7 +524,7 @@ class IsloSandboxLauncher(SandboxLauncher):
         try:
             self.run(
                 sandbox_id,
-                f"python3 -c {shlex.quote(_STOP_PRESERVED_HOST_DAEMON_SCRIPT)}",
+                stop_preserved_host_daemon_command(),
                 check=False,
             )
         except click.ClickException as exc:

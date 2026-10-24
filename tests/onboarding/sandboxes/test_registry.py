@@ -143,6 +143,15 @@ def test_instantiate_loads_gensee_from_core() -> None:
     assert launcher.__class__.__module__ == "omnigent.onboarding.sandboxes.gensee"
 
 
+def test_instantiate_loads_boxd_without_optional_sdk() -> None:
+    """The lazy boxd module imports and lists before the optional SDK is installed."""
+    reset_plugin_state_for_tests()
+    assert "boxd" in available_providers()
+    launcher = instantiate("boxd")
+    assert launcher.provider == "boxd"
+    assert launcher.__class__.__module__ == "omnigent.onboarding.sandboxes.boxd"
+
+
 def test_instantiate_unknown_raises() -> None:
     """Instantiating an unknown provider raises SandboxRegistryError."""
     reset_plugin_state_for_tests()

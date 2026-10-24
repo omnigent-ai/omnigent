@@ -34,7 +34,7 @@ stores into ``create_app``):
 
        sandbox:
          # lakebox|databricks|modal|daytona|blaxel|boxlite|cwsandbox|islo|
-         # e2b|openshell|kubernetes|microsandbox|gensee
+         # e2b|openshell|kubernetes|microsandbox|gensee|boxd
          provider: modal
          server_url: https://omnigent.example.com
          # For SEVERAL providers, replace `provider:` with a `providers:`
@@ -121,6 +121,14 @@ stores into ``create_app``):
            api_token_env: GENSEE_CONTROLLER_API_TOKEN
            workspace_root: /mnt/gensee-tclone/workspaces
            env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES injected
+         boxd:                    # optional block (provider: boxd)
+           snapshot: omnigent-host           # optional boxd snapshot; default: the
+                                             # base image plus a host bootstrap
+           env: [OPENAI_API_KEY, GIT_TOKEN]  # SERVER env var NAMES sent with
+                                             # every command in the machine
+           org: my-org                       # optional; default: BOXD_ORG / key's org
+           vcpu: 2                           # optional 1|2|4|8 (4/8/16/32 GiB)
+           omnigent_spec: omnigent==0.19.1   # optional host package on fresh machines
 
    Most providers default to a public prebaked host image, so
    ``provider`` + ``server_url`` is a complete config. Gensee instead starts a
@@ -138,7 +146,8 @@ stores into ``create_app``):
    reads ``ISLO_API_KEY`` (plus optional ``ISLO_BASE_URL``) from the
    server process environment. Gensee reads the environment variable named by
    ``sandbox.gensee.api_token_env`` (``GENSEE_CONTROLLER_API_TOKEN`` by
-   default). The Blaxel launcher reads ``BL_WORKSPACE``
+   default). The boxd launcher reads ``BOXD_API_KEY`` (or ``BOXD_TOKEN``)
+   and optional ``BOXD_ORG``. The Blaxel launcher reads ``BL_WORKSPACE``
    and ``BL_API_KEY`` or the local ``bl login`` profile. The OpenShell
    launcher needs no API key:
    it connects to the gateway made active with ``openshell gateway
@@ -235,6 +244,7 @@ SUPPORTED_SANDBOX_PROVIDERS: frozenset[str] = frozenset(
         "kubernetes",
         "microsandbox",
         "agent_sandbox",
+        "boxd",
     }
 )
 PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
@@ -252,6 +262,7 @@ PROVIDERS_WITH_MANAGED_LAUNCH: frozenset[str] = frozenset(
         "kubernetes",
         "microsandbox",
         "agent_sandbox",
+        "boxd",
     }
 )
 
@@ -1899,6 +1910,24 @@ def _parse_single_provider_sandbox_config(raw: dict[str, object]) -> ManagedSand
             host_ports=_resolve_microsandbox_host_ports(raw, server_url),
         )
         token_ttl_s = MICROSANDBOX_MANAGED_TOKEN_TTL_S
+    elif provider == "boxd":
+        from omnigent.onboarding.sandboxes.boxd import MANAGED_TOKEN_TTL_S
+
+        boxd_section = _parse_provider_section(raw, "boxd")
+        if boxd_section is not None:
+            _reject_unknown_keys(
+                boxd_section,
+                {"snapshot", "env", "org", "vcpu", "omnigent_spec"},
+                "sandbox.boxd",
+            )
+        launcher_factory = _boxd_launcher_factory(
+            snapshot=_parse_provider_string(raw, "boxd", "snapshot"),
+            env=_parse_provider_env(raw, "boxd"),
+            org=_parse_provider_string(raw, "boxd", "org"),
+            vcpu=_parse_provider_positive_int(raw, "boxd", "vcpu"),
+            omnigent_spec=_parse_provider_string(raw, "boxd", "omnigent_spec"),
+        )
+        token_ttl_s = MANAGED_TOKEN_TTL_S
     elif provider in community:
         # A provider contributed through the `omnigent.sandbox_providers`
         # entry point group. The registry has validated it (name not shadowing
@@ -2515,6 +2544,48 @@ def _gensee_launcher_factory(
         _build()
     except ValueError as exc:
         raise ValueError(f"server config 'sandbox.gensee' is invalid: {exc}") from exc
+
+    return _build
+
+
+def _boxd_launcher_factory(
+    *,
+    snapshot: str | None,
+    env: list[str] | None,
+    org: str | None,
+    vcpu: int | None,
+    omnigent_spec: str | None,
+) -> Callable[[], SandboxHostLauncher]:
+    """
+    Build the launcher factory for the YAML ``provider: boxd`` path.
+
+    The launcher is constructed once here so an invalid size or a size
+    combined with a snapshot stops server startup instead of the first
+    managed session. Construction imports nothing from the optional SDK.
+
+    :param snapshot: boxd snapshot to create machines from, or ``None`` for
+        the base image plus the host bootstrap.
+    :param env: Server-process environment variable names sent with every
+        command, or ``None`` for the launcher's env-var fallback.
+    :param org: boxd organization slug, or ``None`` for ``BOXD_ORG`` / the
+        key's own organization.
+    :param vcpu: Machine size by vCPU count, or ``None`` for the org default.
+    :param omnigent_spec: pip requirement fresh machines install the host
+        from, or ``None`` for the server's own release.
+    :returns: A factory producing parameterized boxd launchers.
+    :raises ValueError: When the combination is invalid.
+    """
+    from omnigent.onboarding.sandboxes.boxd import BoxdSandboxLauncher
+
+    def _build() -> SandboxHostLauncher:
+        return BoxdSandboxLauncher(
+            snapshot=snapshot, env=env, org=org, vcpu=vcpu, omnigent_spec=omnigent_spec
+        )
+
+    try:
+        _build()
+    except ValueError as exc:
+        raise ValueError(f"server config 'sandbox.boxd' is invalid: {exc}") from exc
 
     return _build
 
