@@ -283,6 +283,11 @@ _CODEX_RATE_LIMIT_ERROR = re.compile(r"(?<![\w-])429(?![\w-])|too many requests|
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
+_CODEX_OUTPUT_LIMIT_ERROR = "Incomplete response returned, reason: max_output_tokens"
+_CODEX_OUTPUT_LIMIT_HINT = (
+    "The model reached its response length limit. Ask it to continue or split "
+    "the request into smaller parts."
+)
 # Budget/quota exhaustion from the AI gateway: the gateway returns HTTP 403 +
 # PERMISSION_DENIED for these, which looks like auth to the generic checks —
 # it isn't. Re-authenticating cannot resolve a spending limit.
@@ -7085,6 +7090,8 @@ async def _post_turn_status_edge(
         if edge.error.is_auth:
             reauth_required = True
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
+        elif output == _CODEX_OUTPUT_LIMIT_ERROR:
+            output = f"{output}\n\n{_CODEX_OUTPUT_LIMIT_HINT}"
     await _post_status(
         client,
         session_id,
