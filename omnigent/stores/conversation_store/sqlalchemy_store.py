@@ -82,6 +82,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    MessageData,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -2662,8 +2663,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
 
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            # updated_at drives the unread dot and sidebar order, so hidden
+            # context (is_meta messages) and resource events must not advance it.
             has_new_conversation_activity = any(
                 item.type != "resource_event"
+                and not (isinstance(item.data, MessageData) and item.data.is_meta)
                 and (item.stable_id is None or item.stable_id not in existing_by_id)
                 for item in items
             )

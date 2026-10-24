@@ -136,8 +136,9 @@ class Session:
         ``"running"``, or ``"failed"``.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of the last persisted session
-        activity. Advances when conversation items are appended and on session
-        metadata edits (rename, agent switch, archive), so a mid-stall rename
+        activity. Advances when conversation items are appended (except hidden
+        ``is_meta`` context and resource events) and on session metadata edits
+        (rename, agent switch, archive), so a mid-stall rename
         resets the clock — treat it as a session-write heartbeat, not a pure
         item-append signal. ``None`` when connected to an older server that
         does not return the field.

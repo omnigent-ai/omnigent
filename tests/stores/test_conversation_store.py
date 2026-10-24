@@ -2706,33 +2706,55 @@ def _deleted_terminal_event(conversation_id: str) -> NewConversationItem:
     )
 
 
-def test_resource_event_only_append_preserves_updated_at(
+def _hidden_context_message(conversation_id: str) -> NewConversationItem:
+    return NewConversationItem(
+        type="message",
+        response_id=conversation_id,
+        data=MessageData(
+            role="user",
+            content=[{"type": "input_text", "text": "[System: timer t1 fired]"}],
+            is_meta=True,
+        ),
+    )
+
+
+_NON_ACTIVITY_ITEMS = pytest.mark.parametrize(
+    "non_activity_item",
+    [_deleted_terminal_event, _hidden_context_message],
+    ids=["resource_event", "hidden_context_message"],
+)
+
+
+@_NON_ACTIVITY_ITEMS
+def test_non_activity_only_append_preserves_updated_at(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
+    non_activity_item: Callable[[str], NewConversationItem],
 ) -> None:
-    """Operational resource cleanup must not look like new conversation activity."""
+    """Items hidden from the transcript must not look like new conversation activity."""
     import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
 
     monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
     conv = conversation_store.create_conversation()
     monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    item = non_activity_item(conv.id)
 
-    appended = conversation_store.append(conv.id, [_deleted_terminal_event(conv.id)])
+    appended = conversation_store.append(conv.id, [item])
 
-    assert [item.type for item in appended] == ["resource_event"]
-    assert [item.type for item in conversation_store.list_items(conv.id).data] == [
-        "resource_event"
-    ]
+    assert [appended_item.type for appended_item in appended] == [item.type]
+    assert [stored.data for stored in conversation_store.list_items(conv.id).data] == [item.data]
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.updated_at == 1000
 
 
-def test_mixed_resource_and_message_append_bumps_updated_at(
+@_NON_ACTIVITY_ITEMS
+def test_non_activity_and_message_append_bumps_updated_at(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
+    non_activity_item: Callable[[str], NewConversationItem],
 ) -> None:
-    """A mixed batch remains real activity when it contains a new message."""
+    """A mixed batch remains real activity when it contains a new visible message."""
     import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
 
     monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
@@ -2744,18 +2766,20 @@ def test_mixed_resource_and_message_append_bumps_updated_at(
         data=MessageData(role="user", content=[{"type": "input_text", "text": "hi"}]),
     )
 
-    conversation_store.append(conv.id, [_deleted_terminal_event(conv.id), message])
+    conversation_store.append(conv.id, [non_activity_item(conv.id), message])
 
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.updated_at == 2000
 
 
-def test_resource_event_with_duplicate_message_preserves_updated_at(
+@_NON_ACTIVITY_ITEMS
+def test_non_activity_with_duplicate_message_preserves_updated_at(
     conversation_store: SqlAlchemyConversationStore,
     monkeypatch: pytest.MonkeyPatch,
+    non_activity_item: Callable[[str], NewConversationItem],
 ) -> None:
-    """A resource event plus a deduplicated message contains no new activity."""
+    """A non-activity item plus a deduplicated message contains no new activity."""
     import omnigent.stores.conversation_store.sqlalchemy_store as store_mod
 
     monkeypatch.setattr(store_mod, "now_epoch", lambda: 1000)
@@ -2768,11 +2792,12 @@ def test_resource_event_with_duplicate_message_preserves_updated_at(
     )
     conversation_store.append(conv.id, [message])
     monkeypatch.setattr(store_mod, "now_epoch", lambda: 2000)
+    item = non_activity_item(conv.id)
 
-    appended = conversation_store.append(conv.id, [message, _deleted_terminal_event(conv.id)])
+    appended = conversation_store.append(conv.id, [message, item])
 
     assert appended[0].deduplicated is True
-    assert [item.type for item in appended] == ["message", "resource_event"]
+    assert [appended_item.type for appended_item in appended] == ["message", item.type]
     fetched = conversation_store.get_conversation(conv.id)
     assert fetched is not None
     assert fetched.updated_at == 1000

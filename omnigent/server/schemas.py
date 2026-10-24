@@ -2384,8 +2384,9 @@ class SessionResponse(BaseModel):
         forwarders (claude-native) stamp a turn id on their status
         edges; other harnesses leave this ``None``.
     :param updated_at: Unix epoch timestamp of the last persisted session
-        activity. Advances when conversation items are appended and on session
-        metadata edits (rename, agent switch, archive); a mid-stall rename
+        activity. Advances when conversation items are appended (except hidden
+        ``is_meta`` context and resource events) and on session metadata edits
+        (rename, agent switch, archive); a mid-stall rename
         therefore resets the clock, so an orchestrator treating this as a pure
         item-append heartbeat should account for that. Can be compared across
         snapshots independently of lifecycle status.
