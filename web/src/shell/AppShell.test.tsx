@@ -2040,9 +2040,7 @@ describe("Workspace rail maximize", () => {
   });
 
   it("keeps peeking while the pointer rests on the header toggle that armed it", async () => {
-    // During the card's click-through entry window the pointer still hit-tests
-    // to the chat-header toggle beneath it, so a wobble there must count as
-    // "inside the peek surface" — not arm the outside-dismiss timer.
+    // A wobble over the toggle that armed the peek must not arm the outside-dismiss timer.
     mockConversations([{ id: "conv_abc", permission_level: null }]);
     renderShell("/c/conv_abc");
 

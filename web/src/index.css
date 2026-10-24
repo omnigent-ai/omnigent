@@ -799,12 +799,9 @@ html[data-electron-mac] {
   html[data-electron-mac] .sidebar-brand {
     display: none;
   }
-  /* The sidebar's own cluster is hidden here because an identical one renders in
-   * the title-bar strip (AppShell), where it survives the sidebar collapsing to
-   * w-0/inert and the peek card's inset-2 offset. Scoped to
-   * .conversations-sidebar so it can never match the AppShell copy. Hidden
-   * rather than removed from the JSX so every other platform keeps the
-   * in-sidebar cluster untouched. */
+  /* Hidden because AppShell renders this cluster in the title-bar strip, where it
+   * survives the sidebar collapsing and peeking. Scoped to .conversations-sidebar
+   * so it never matches the AppShell copy; other platforms keep the in-sidebar one. */
   html[data-electron-mac] .conversations-sidebar [data-testid="sidebar-header-actions"] {
     display: none;
   }
@@ -822,8 +819,9 @@ html[data-electron-mac] {
   html[data-electron-mac] .chat-header-sidebar-toggle {
     display: none;
   }
-  /* Float the peek card below the 48px drag strip, with the same 0.5rem
-   * breathing room as its other edges. The docked sidebar is unaffected. */
+  /* On macOS, float the peek card below the title-bar controls/drag strip,
+   * keeping the same 0.5rem breathing room as its other edges. The docked
+   * sidebar is unaffected. */
   html[data-electron-mac] .conversations-sidebar.is-peek {
     top: calc(var(--mac-titlebar-height) + 0.5rem);
   }
