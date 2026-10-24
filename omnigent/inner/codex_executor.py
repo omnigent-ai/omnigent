@@ -309,15 +309,10 @@ def _extract_codex_last_turn_usage(params: object, model: str | None) -> dict[st
     ``input_tokens`` — otherwise cached tokens are billed at the full input
     rate. Mirrors the codex-native forwarder split.
 
-    :param model: The resolved model this turn ran with, e.g.
-        ``"gpt-5.4-mini"`` — the ``run_turn`` argument, which carries the
-        harness/provider's resolved default even when the agent spec pins
-        none. Stamped into the returned usage as ``"model"`` so the
-        server's per-model cost/token attribution (``session_usage.by_model``)
-        can key on it instead of silently falling back to an unresolvable
-        spec model and dropping the turn from the per-model breakdown
-        (mirrors ``claude_sdk_executor``'s ``observed_model`` and every
-        other relay executor, all of which already report ``usage.model``).
+    :param model: The caller's model, or the model reported by
+        ``thread/start`` when unpinned. Stamped onto usage as ``"model"``
+        for per-model cost/token attribution (``session_usage.by_model``),
+        like every other relay executor's ``usage.model``.
     """
     if not isinstance(params, dict):
         return None
@@ -446,6 +441,29 @@ def _extract_codex_context_tokens(params: object) -> int | None:
         return total
     recomputed = int(last.get("inputTokens") or 0) + int(last.get("outputTokens") or 0)
     return recomputed or None
+
+
+def _extract_codex_context_window(params: object) -> int | None:
+    """Codex's effective context window from a ``thread/tokenUsage/updated``
+    payload: ``tokenUsage.modelContextWindow``, else ``total.contextWindow``.
+
+    Forwarded as ``context_window`` so the server sizes the occupancy ring from
+    the window Codex serves instead of the model catalog, which lacks or
+    mis-sizes Codex-only models. Mirrors the codex-native forwarder.
+    """
+    if not isinstance(params, dict):
+        return None
+    token_usage = params.get("tokenUsage")
+    if not isinstance(token_usage, dict):
+        return None
+    candidates = [token_usage.get("modelContextWindow")]
+    total = token_usage.get("total")
+    if isinstance(total, dict):
+        candidates.append(total.get("contextWindow"))
+    for window in candidates:
+        if isinstance(window, int) and not isinstance(window, bool) and window > 0:
+            return window
+    return None
 
 
 def _format_codex_error_params(params: object) -> str:
@@ -3680,6 +3698,9 @@ class _CodexAppServerSession:
             self._last_turn_usage = None
 
         assert self.thread_id is not None
+        # A subscription / cli-config turn passes no model; Codex reports the
+        # one it resolved on thread/start, and that is what usage must carry.
+        usage_model = model or self._thread_model
         latest_user_content = _extract_latest_user_content(messages)
         goal_objective = _goal_objective_from_content(latest_user_content)
         if goal_objective is not None:
@@ -4072,7 +4093,7 @@ class _CodexAppServerSession:
                                 final_response[:120],
                             )
                             turn_usage = self._consume_turn_usage()
-                            _notify_usage_from_dict(model=model, usage=turn_usage)
+                            _notify_usage_from_dict(model=usage_model, usage=turn_usage)
                             yield TurnComplete(response=final_response, usage=turn_usage)
                             return
                         continue
@@ -4088,12 +4109,12 @@ class _CodexAppServerSession:
                     if total_raw is not None:
                         self._thread_usage_total_raw = total_raw
                         self._last_turn_usage = _codex_turn_usage_from_totals(
-                            total_raw, self._thread_usage_baseline_raw, model
+                            total_raw, self._thread_usage_baseline_raw, usage_model
                         )
                     else:
                         # No cumulative breakdown — fall back to the newest
                         # request's ``last`` (under-reports multi-request turns).
-                        self._last_turn_usage = _extract_codex_last_turn_usage(params, model)
+                        self._last_turn_usage = _extract_codex_last_turn_usage(params, usage_model)
                     # context_tokens is window fill: a snapshot of the latest
                     # request from ``last``, carried alongside the billing
                     # figures so the occupancy meter reads it rather than the
@@ -4102,6 +4123,9 @@ class _CodexAppServerSession:
                         context_tokens = _extract_codex_context_tokens(params)
                         if context_tokens is not None:
                             self._last_turn_usage["context_tokens"] = context_tokens
+                        context_window = _extract_codex_context_window(params)
+                        if context_window is not None:
+                            self._last_turn_usage["context_window"] = context_window
                     continue
 
                 if method == "turn/completed":
@@ -4133,7 +4157,7 @@ class _CodexAppServerSession:
                             final_response=final_response,
                         )
                     turn_usage = self._consume_turn_usage()
-                    _notify_usage_from_dict(model=model, usage=turn_usage)
+                    _notify_usage_from_dict(model=usage_model, usage=turn_usage)
                     yield TurnComplete(response=final_response, usage=turn_usage)
                     return
 

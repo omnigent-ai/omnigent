@@ -515,6 +515,9 @@ def test_context_labels_from_turn_usage_shapes() -> None:
       own usage, so this path must not double-write their labels).
     * ``context_tokens`` but an unknown/blank model → numerator only (the ring
       simply won't render without a denominator, rather than guessing one).
+    * a harness-reported ``context_window`` → that denominator, even without a
+      model or when the catalog disagrees; a malformed one falls back to the
+      catalog.
     """
     from omnigent.llms.context_window import get_model_context_window
     from omnigent.server.routes.sessions import _context_labels_from_turn_usage
@@ -522,6 +525,22 @@ def test_context_labels_from_turn_usage_shapes() -> None:
     both = _context_labels_from_turn_usage({"context_tokens": 1234, "model": "claude-sonnet-5"})
     assert both["omnigent.last_context_tokens"] == "1234"
     assert both["omnigent.last_context_window"] == str(get_model_context_window("claude-sonnet-5"))
+
+    # The harness's own window beats the catalog (codex serves 258400 for
+    # models the catalog does not know).
+    reported = _context_labels_from_turn_usage(
+        {"context_tokens": 1234, "context_window": 258400, "model": "gpt-6-astra"}
+    )
+    assert reported["omnigent.last_context_window"] == "258400"
+    assert _context_labels_from_turn_usage({"context_tokens": 42, "context_window": 258400}) == {
+        "omnigent.last_context_tokens": "42",
+        "omnigent.last_context_window": "258400",
+    }
+    for bad_window in (0, -1, True, "258400"):
+        fallback = _context_labels_from_turn_usage(
+            {"context_tokens": 1234, "context_window": bad_window, "model": "claude-sonnet-5"}
+        )
+        assert fallback == both, bad_window
 
     # No window-fill signal → no labels (native external_session_usage owns it).
     assert _context_labels_from_turn_usage({"input_tokens": 10, "output_tokens": 5}) == {}
@@ -537,7 +556,10 @@ def test_context_labels_from_turn_usage_shapes() -> None:
 
 
 @pytest.mark.asyncio
-async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: str) -> None:
+@pytest.mark.parametrize("reported_window", [None, 258400])
+async def test_relay_persists_context_window_labels_for_inprocess_turn(
+    db_uri: str, reported_window: int | None
+) -> None:
     """
     An in-process turn's usage fills the context-window indicator.
 
@@ -549,6 +571,10 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
     the web context ring renders live AND survives a reload/snapshot. Before
     this, only the claude-native external_session_usage POST wrote those
     labels, leaving a model-unpinned claude-sdk session with no ring.
+
+    When the harness reports the window it actually serves (codex forwards
+    ``modelContextWindow`` as ``usage.context_window``), that figure is the
+    denominator instead of the catalog lookup.
     """
     from omnigent.llms.context_window import get_model_context_window
     from omnigent.runtime import session_stream
@@ -562,25 +588,24 @@ async def test_relay_persists_context_window_labels_for_inprocess_turn(db_uri: s
     # Denominator is the observed model's catalog window, computed the same way
     # the relay does (the resolved value varies with catalog availability, so
     # derive it rather than hard-coding a token count).
-    expected_window = get_model_context_window("claude-sonnet-5")
+    expected_window = reported_window or get_model_context_window("claude-sonnet-5")
 
     response_id = "resp_ctx_ring_1"
     # The observed model (a full id, not a bare alias) is what the SDK reports.
+    usage: dict[str, Any] = {
+        "input_tokens": 1000,
+        "output_tokens": 200,
+        "total_tokens": 1200,
+        "context_tokens": 45678,
+        "model": "claude-sonnet-5",
+    }
+    if reported_window is not None:
+        usage["context_window"] = reported_window
     turn_events: list[dict[str, Any]] = [
         {"type": "response.in_progress", "response": {"id": response_id, "model": "jarvis"}},
         {
             "type": "response.completed",
-            "response": {
-                "id": response_id,
-                "model": "jarvis",
-                "usage": {
-                    "input_tokens": 1000,
-                    "output_tokens": 200,
-                    "total_tokens": 1200,
-                    "context_tokens": 45678,
-                    "model": "claude-sonnet-5",
-                },
-            },
+            "response": {"id": response_id, "model": "jarvis", "usage": usage},
         },
     ]
     release = asyncio.Event()
