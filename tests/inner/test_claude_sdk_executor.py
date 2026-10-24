@@ -4417,6 +4417,96 @@ async def test_result_message_other_failure_stays_unclassified() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("profile", "login_command"),
+    [
+        ("oss", "databricks auth login --profile oss"),
+        (None, "databricks auth login --host https://host"),
+    ],
+)
+async def test_failing_api_key_helper_is_an_auth_error_not_a_reply(
+    profile: str | None, login_command: str
+) -> None:
+    """An empty gateway ``apiKeyHelper`` token fails the turn with a re-login hint.
+
+    The Claude CLI answers a helper that prints no token with a ``<synthetic>``
+    assistant message carrying ``error`` and then an ``is_error`` result. If this
+    regresses, that CLI text streams out as the reply (``omnigent run -p`` prints
+    it and exits 0) and the user is told to "Run /status", which they cannot.
+    """
+    from claude_agent_sdk.types import AssistantMessage as SDKAssistantMessage
+    from claude_agent_sdk.types import ClaudeAgentOptions as SDKClaudeAgentOptions
+    from claude_agent_sdk.types import ResultMessage as SDKResultMessage
+    from claude_agent_sdk.types import StreamEvent as SDKStreamEvent
+    from claude_agent_sdk.types import TextBlock as SDKTextBlock
+    from claude_agent_sdk.types import ThinkingBlock as SDKThinkingBlock
+    from claude_agent_sdk.types import ToolUseBlock as SDKToolUseBlock
+
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    cli_text = (
+        "Your apiKeyHelper script is failing · This usually means you need to "
+        "re-authenticate with your provider · Run /status to see the script's error output"
+    )
+
+    class _FakeSDK(_sdk_types()):
+        AssistantMessage = SDKAssistantMessage
+        TextBlock = SDKTextBlock
+        ThinkingBlock = SDKThinkingBlock
+        ToolUseBlock = SDKToolUseBlock
+        StreamEvent = SDKStreamEvent
+        ResultMessage = SDKResultMessage
+        ClaudeAgentOptions = SDKClaudeAgentOptions
+        messages = [
+            SDKAssistantMessage(
+                content=[SDKTextBlock(text=cli_text)],
+                model="<synthetic>",
+                error="invalid_request",
+            ),
+            SDKResultMessage(
+                subtype="success",
+                duration_ms=1,
+                duration_api_ms=0,
+                is_error=True,
+                num_turns=1,
+                session_id="s1",
+                result=cli_text,
+                api_error_status=403,
+            ),
+        ]
+
+        class ClaudeSDKClient(_SDKClient):
+            async def receive_response(self):
+                for message in _FakeSDK.messages:
+                    yield message
+
+    with patch(
+        "omnigent.inner.claude_sdk_executor._resolve_gateway_env",
+        return_value={
+            "ANTHROPIC_BASE_URL": "https://host/ai-gateway/anthropic",
+            "CLAUDE_CODE_API_KEY_HELPER_TTL_MS": "900000",
+            "OMNIGENT_CLAUDE_API_KEY_HELPER": "databricks auth token ...",
+        },
+    ):
+        # A pinned model skips live model discovery against the real ~/.databrickscfg.
+        executor = ClaudeSDKExecutor(
+            gateway=True, databricks_profile=profile, model="databricks-claude-sonnet-5-5"
+        )
+    with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
+        events = [e async for e in executor.run_turn([{"role": "user", "content": "hi"}], [], "")]
+
+    streamed = "".join(e.text for e in events if isinstance(e, TextChunk))
+    assert "apiKeyHelper" not in streamed, "the CLI's error text streamed out as the reply"
+    assert not [e for e in events if isinstance(e, TurnComplete)]
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert len(errors) == 1
+    message = errors[0].message
+    assert message.startswith("Claude SDK provider authentication failed (status=403)")
+    assert "apiKeyHelper script is failing" in message
+    assert f"`{login_command}`" in message
+
+
+@pytest.mark.asyncio
 async def test_context_tokens_uses_last_call_not_cumulative_on_multi_iteration_turn() -> None:
     """``context_tokens`` must reflect the LAST API call, not the cumulative sum.
 

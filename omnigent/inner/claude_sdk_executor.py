@@ -33,6 +33,7 @@ import json
 import logging
 import os
 import pathlib
+import shlex
 import sys
 import tempfile
 import time
@@ -41,6 +42,7 @@ from contextlib import ExitStack, contextmanager, suppress
 from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
+from urllib.parse import urlsplit
 
 from omnigent._platform import resolve_cli_binary, stable_user_id
 from omnigent.cli_invocation import cli_invocation
@@ -2103,6 +2105,26 @@ class ClaudeSDKExecutor(Executor):
         # the loop tears down.
         await self._force_close_client(state.client)
 
+    def _provider_auth_hint(self) -> str:
+        """Say where to fix a credential Claude Code could not authenticate with.
+
+        A Databricks profile gets the exact re-login command; other modes use
+        :func:`_claude_auth_remediation`.
+
+        :returns: One sentence, e.g. ``"Check your selected ~/.databrickscfg
+            profile; re-authenticate with `databricks auth login --profile oss`."``
+        """
+        if self._gateway_uses_databricks_profile:
+            if self._databricks_profile:
+                login = f"databricks auth login --profile {shlex.quote(self._databricks_profile)}"
+            else:
+                # No named profile: the token is minted with ``--host``, and this
+                # path's base URL is always ``<workspace host>/ai-gateway/anthropic``.
+                base_url = urlsplit(self._extra_env.get("ANTHROPIC_BASE_URL", ""))
+                login = f"databricks auth login --host {base_url.scheme}://{base_url.netloc}"
+            return f"Check your selected ~/.databrickscfg profile; re-authenticate with `{login}`."
+        return _claude_auth_remediation(databricks_profile=False, gateway=bool(self._gateway))
+
     def _evict_client_on_cancel(self, session_key: str) -> None:
         state = self._clients.pop(session_key, None)
         if state is None:
@@ -2899,10 +2921,7 @@ class ClaudeSDKExecutor(Executor):
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
         terminal_auth_failure = False
-        auth_remediation = _claude_auth_remediation(
-            databricks_profile=self._gateway_uses_databricks_profile,
-            gateway=bool(self._gateway),
-        )
+        auth_remediation = self._provider_auth_hint()
         compaction_occurred: bool = False
         claude_session_id: str | None = None
         compaction_transcript_path: pathlib.Path | None = None
@@ -3199,7 +3218,13 @@ class ClaudeSDKExecutor(Executor):
                         _am_model = concrete_reported_model(getattr(assistant_msg, "model", None))
                         if _am_model is not None:
                             observed_model = _am_model
-                        if got_stream_events:
+                        if getattr(assistant_msg, "error", None):
+                            # A failed API call (e.g. an apiKeyHelper that printed no
+                            # token) arrives as a ``<synthetic>`` message whose text is
+                            # the error, not a reply. The is_error ResultMessage that
+                            # follows fails the turn.
+                            pass
+                        elif got_stream_events:
                             # StreamEvents already emitted text. Emit the
                             # ToolCallRequest here, once the full
                             # ``tool_block.input`` has assembled — see the
@@ -3314,14 +3339,26 @@ class ClaudeSDKExecutor(Executor):
                                 self._agent_name,
                                 failure_text,
                             )
-                            terminal_auth_failure = is_claude_auth_failure_text(failure_text)
+                            error_status = getattr(result_msg, "api_error_status", None)
+                            # A rejected credential can arrive with text that names no auth
+                            # failure (an apiKeyHelper that minted no token), so the status
+                            # counts too.
+                            rejected = error_status in {401, 403}
+                            terminal_auth_failure = rejected or is_claude_auth_failure_text(
+                                failure_text
+                            )
                             # Keep the next step in the message too: the REPL and
                             # SDK stream render only code/message.
-                            terminal_error = (
-                                f"{failure_text.rstrip(_TRAILING_PUNCTUATION)}. {auth_remediation}"
-                                if terminal_auth_failure
-                                else failure_text
-                            )
+                            failure_line = failure_text.rstrip(_TRAILING_PUNCTUATION)
+                            if rejected:
+                                terminal_error = (
+                                    "Claude SDK provider authentication failed"
+                                    f" (status={error_status}): {failure_line}. {auth_remediation}"
+                                )
+                            elif terminal_auth_failure:
+                                terminal_error = f"{failure_line}. {auth_remediation}"
+                            else:
+                                terminal_error = failure_text
                         elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
