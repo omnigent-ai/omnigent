@@ -192,11 +192,12 @@ function WorkspacePathInlineCode({
         role="button"
         tabIndex={0}
         data-streamdown="inline-code"
-        // Keep the base inline-code class/props (merge, don't replace) so the
-        // link only adds the underline affordance on top of Streamdown's
-        // styling and any caller-provided attributes survive.
+        // Overriding the `inlineCode` slot replaces Streamdown's default
+        // rendering, so repeat the chip base (rounded/bg/padding) that plain
+        // inline code gets below, then add the openable-path affordance.
         className={cn(
-          "font-mono text-ui text-link underline decoration-dotted underline-offset-2 transition-colors cursor-pointer",
+          STREAMDOWN_INLINE_CODE_CLASS,
+          "underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer",
           className,
         )}
         aria-label={shortLabel ? text : undefined}
@@ -218,7 +219,7 @@ function WorkspacePathInlineCode({
   // looks unchanged.
   return (
     <code
-      className={cn("rounded bg-muted px-1.5 py-0.5 font-mono text-ui", className)}
+      className={cn(STREAMDOWN_INLINE_CODE_CLASS, className)}
       data-streamdown="inline-code"
       {...codeProps}
     >
@@ -232,6 +233,7 @@ function WorkspacePathInlineCode({
 // index.css keys the pointer cursor and the table-cell `overflow-wrap` rule
 // (which stops a link-only table column collapsing to ~2ch) on the attribute.
 const STREAMDOWN_LINK_CLASS = "wrap-anywhere font-medium text-link underline";
+const STREAMDOWN_INLINE_CODE_CLASS = "rounded bg-muted px-1.5 py-0.5 font-mono text-ui";
 
 function githubPullRequest(href: string | undefined): string | null {
   if (!href) return null;
