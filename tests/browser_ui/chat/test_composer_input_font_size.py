@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -10,12 +9,31 @@ import pytest
 from playwright.sync_api import Locator, Page, expect
 
 from tests._helpers.picker_routes import OWN_AGENTS
-from tests.e2e_ui.conftest import seed_committed_turn
-from tests.e2e_ui.mobile.test_ios_ipad_safe_layout import _IOS_SHELL_INIT_SCRIPT
-from tests.e2e_ui.sessions.test_reply_quotes_session_switch import _reply_to
+from tests.browser_ui.chat._geometry_helpers import open_landing, open_live
+from tests.browser_ui.chat.session_contract import (
+    ChatSessionContract,
+    list_payload,
+    message_item,
+)
 
 _TOUCH = pytest.mark.browser_context_args(has_touch=True)
-_AGENT_SCAN = re.compile(r"/v1/sessions\?(?!.*pinned=).*visibility=mine")
+# Minimal iOS shell bridge; the app marks itself native when this object exists.
+_IOS_SHELL_INIT_SCRIPT = """
+window.omnigentNative = {
+  kind: "ios",
+  setBadgeCount: function () {},
+  notify: function () { return Promise.resolve(false); },
+  onNotificationActivated: function () { return function () {}; },
+  onOpenPath: function () { return function () {}; },
+  onNativeInsets: function () { return function () {}; },
+  onSidebarDrag: function () { return function () {}; },
+  onViewModeChanged: function () { return function () {}; },
+  setViewMode: function () {},
+  setServerSwitcherHidden: function () {},
+  setSidebarOpen: function () {},
+};
+"""
+_CONTEXT_SKILL = {"name": "context", "description": "Review context"}
 
 
 def _metrics(element: Locator) -> dict[str, Any]:
@@ -36,6 +54,18 @@ def _metrics(element: Locator) -> dict[str, Any]:
             horizontalOverflow: element.scrollWidth - element.clientWidth,
         };
     }""")
+
+
+def _reply_to(page: Page, text: Locator) -> None:
+    text.evaluate("""element => {
+        const range = document.createRange();
+        range.selectNodeContents(element);
+        const selection = window.getSelection();
+        selection.removeAllRanges();
+        selection.addRange(range);
+        document.dispatchEvent(new Event("selectionchange"));
+    }""")
+    page.get_by_role("button", name="Reply", exact=False).click()
 
 
 def _exercise_input(page: Page, element: Locator, *, mobile: bool) -> None:
@@ -69,43 +99,46 @@ def _exercise_input(page: Page, element: Locator, *, mobile: bool) -> None:
 )
 def test_composer_input_font_setting_and_alignment(
     page: Page,
-    seeded_session: tuple[str, str],
+    chat_session_contract: ChatSessionContract,
     tmp_path: Path,
     width: int,
     font_size: int,
     native: bool,
 ) -> None:
     """Landing, command backdrops and interleaved replies share the chosen typography."""
-    base_url, session_id = seeded_session
+    chat = chat_session_contract
     mobile = width < 768
-    page.set_viewport_size({"width": width, "height": 844})
+    viewport = {"width": width, "height": 844}
     page.add_init_script(f"localStorage.setItem('omnigent:ui-font-size', '{font_size}')")
     if native:
         page.add_init_script(_IOS_SHELL_INIT_SCRIPT)
     quotes = ["First point to discuss.", "Second point to discuss."]
-    seed_committed_turn(session_id, prompt="Explain both points.", reply="\n\n".join(quotes))
+    chat.set_items(
+        [
+            message_item("assistant-points", "assistant", "\n\n".join(quotes), response_id="pts"),
+            message_item("user-points", "user", "Explain both points.", response_id="pts"),
+        ]
+    )
+    chat.set_skills([_CONTEXT_SKILL])
 
     # A bundled skill exposes the landing input's text-ui placeholder overlay.
-    page.route(
-        "**/v1/agents",
-        lambda route: route.fulfill(
-            json={
-                "data": [
-                    {
-                        "id": "ag_font_e2e",
-                        "name": "polly",
-                        "display_name": "Polly",
-                        "description": "Typography test agent",
-                        "harness": "claude-sdk",
-                        "skills": [{"name": "context", "description": "Review context"}],
-                    }
-                ]
-            }
-        ),
+    chat.contract.json(
+        "/v1/agents",
+        {
+            "data": [
+                {
+                    "id": "ag_font_e2e",
+                    "name": "polly",
+                    "display_name": "Polly",
+                    "description": "Typography test agent",
+                    "harness": "claude-sdk",
+                    "skills": [_CONTEXT_SKILL],
+                }
+            ]
+        },
     )
-    page.route(_AGENT_SCAN, lambda route: route.fulfill(json={"data": []}))
-    page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
-    page.goto(f"{base_url}/")
+    chat.contract.json(OWN_AGENTS, {"data": []})
+    open_landing(page, chat, viewport)
     landing = page.get_by_test_id("new-chat-landing-input")
     hint = page.get_by_text("Describe a task, or try a skill", exact=True)
     expect(hint).to_be_visible(timeout=30_000)
@@ -117,11 +150,10 @@ def test_composer_input_font_setting_and_alignment(
         {"landing": _metrics(landing), "landing-area": _metrics(landing.locator(".."))}
     )
     page.screenshot(path=tmp_path / "landing-composer.png", animations="disabled")
-    page.unroute("**/v1/agents")
-    page.unroute(_AGENT_SCAN)
-    page.unroute(OWN_AGENTS)
+    # The session page reads the contract's bound agent again.
+    chat.contract.json("/v1/agents", lambda _request: list_payload([chat._agent()]))
 
-    page.goto(f"{base_url}/c/{session_id}")
+    open_live(page, chat, viewport)
     if native:
         expect(page.locator(".app-shell")).to_have_attribute("data-ios-native", "true")
     main = page.get_by_role("textbox", name="Message the agent", exact=True)
@@ -187,6 +219,6 @@ def test_composer_input_font_setting_and_alignment(
             overlay_metrics[property_name], abs=2
         ), (property_name, textarea_metrics, overlay_metrics)
 
-    viewport = page.locator('meta[name="viewport"]').get_attribute("content") or ""
-    assert "user-scalable=no" not in viewport.replace(" ", "").lower()
-    assert "maximum-scale" not in viewport.lower()
+    viewport_meta = page.locator('meta[name="viewport"]').get_attribute("content") or ""
+    assert "user-scalable=no" not in viewport_meta.replace(" ", "").lower()
+    assert "maximum-scale" not in viewport_meta.lower()
