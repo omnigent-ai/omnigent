@@ -8,6 +8,7 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import { SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY } from "./projectHeaderActionPreferences";
 import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
@@ -37,6 +38,7 @@ const EXPORTABLE_KEYS = [
   "omnigent:always-use-worktree",
   DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,
   COMPOSER_SEND_SHORTCUT_STORAGE_KEY,
+  SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
   "web-theme",
 ] as const;
 
@@ -159,5 +161,8 @@ export function applyImportedSettings(imported: ExportedSettings): number {
   if (previousDefault !== readDefaultWorkspaceTab()) {
     resetSessionWorkspaceTabSelections();
   }
+  // Imports overwrite storage in this tab, so broadcast the clear to subscribers
+  // that normally refresh only on writes or browser storage events.
+  window.dispatchEvent(new StorageEvent("storage", { key: null }));
   return count;
 }

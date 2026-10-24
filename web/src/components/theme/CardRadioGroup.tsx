@@ -85,7 +85,7 @@ function SelectedBadge() {
   );
 }
 
-function themeCardClass(selected: boolean, layout?: string) {
+export function themeCardClass(selected: boolean, layout?: string) {
   return cn(
     "relative flex flex-col rounded-lg border-2 transition-[color,background-color,border-color,box-shadow]",
     selected

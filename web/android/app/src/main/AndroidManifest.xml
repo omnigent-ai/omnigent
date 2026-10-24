@@ -6,6 +6,8 @@
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <!-- Runtime-requested when the web UI first asks for the mic (voice input). -->
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
+    <!-- Long-press haptic for the sidebar row gesture. -->
+    <uses-permission android:name="android.permission.VIBRATE" />
 
     <uses-feature android:name="android.hardware.microphone" android:required="false" />
 

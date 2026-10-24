@@ -44,9 +44,11 @@ import {
 } from "react";
 import { useViewerId } from "@/hooks/useViewerId";
 import {
+  ArchiveIcon,
   ArchiveRestoreIcon,
   AlertTriangleIcon,
   BotIcon,
+  ChevronDownIcon,
   DownloadIcon,
   FileDiffIcon,
   FilesIcon,
@@ -78,9 +80,15 @@ import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
 import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
-import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
+import { CardRadioGroup, themeCardClass } from "@/components/theme/CardRadioGroup";
 import { IconSegmentedControl } from "@/components/theme/IconSegmentedControl";
-import { PaletteChip, PaletteSwatchPreview } from "@/components/theme/AppearancePreviews";
+import {
+  DARK_MODE_PREVIEW,
+  LIGHT_MODE_PREVIEW,
+  PaletteChip,
+  PaletteSwatchPreview,
+  SwipeActionPreview,
+} from "@/components/theme/AppearancePreviews";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
@@ -91,6 +99,13 @@ import {
   SelectTrigger,
   SelectValue,
 } from "@/components/ui/select";
+import {
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuRadioGroup,
+  DropdownMenuRadioItem,
+  DropdownMenuTrigger,
+} from "@/components/ui/dropdown-menu";
 import {
   Dialog,
   DialogClose,
@@ -224,6 +239,21 @@ import {
   readHideUnconfiguredHarnesses,
   writeHideUnconfiguredHarnesses,
 } from "@/lib/harnessVisibilityPreferences";
+import {
+  DEFAULT_SWIPE_ACTIONS,
+  isSwipeAction,
+  type SwipeAction,
+  swipeActions as swipeActionOptions,
+  type SwipeDirection,
+  useSwipeActions,
+  writeSwipeActions,
+} from "@/lib/swipeActionPreferences";
+import {
+  DEFAULT_SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH,
+  SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
+  useShowProjectHeaderActionsOnTouch,
+  writeShowProjectHeaderActionsOnTouch,
+} from "@/lib/projectHeaderActionPreferences";
 import {
   applyThemePalette,
   DEFAULT_PALETTE,
@@ -441,10 +471,14 @@ const workspaceTabCards: {
 ];
 
 /** Centered icon + label body shared by the Mode and Terminal theme cards. */
-function iconCardBody(Icon: ComponentType<{ className?: string }>, label: string) {
+function iconCardBody(
+  Icon: ComponentType<{ className?: string }>,
+  label: string,
+  iconClassName?: string,
+) {
   return (
     <>
-      <Icon aria-hidden="true" className="size-6 text-muted-foreground" />
+      <Icon aria-hidden="true" className={cn("size-6 text-muted-foreground", iconClassName)} />
       <span className="text-ui font-normal md:font-medium">{label}</span>
     </>
   );
@@ -917,6 +951,156 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+const SWIPE_ACTION_LABELS: Record<SwipeAction, string> = {
+  archive: "Archive",
+  delete: "Delete",
+  none: "None",
+};
+
+/**
+ * Archive is always blue and Delete always red, whatever the colour palette. These
+ * shades keep AA contrast on every built-in palette's card, hover, open and menu surfaces.
+ */
+const SWIPE_ACTION_TONES: Record<SwipeAction, string | undefined> = {
+  archive: "text-blue-700 dark:text-blue-300",
+  delete: "text-red-800 dark:text-red-200",
+  none: undefined,
+};
+
+// Menu items reset highlighted text to foreground; keep the tone on the checked item.
+const SWIPE_ACTION_FOCUS_TONES: Record<SwipeAction, string | undefined> = {
+  archive: "focus:text-blue-700 dark:focus:text-blue-300",
+  delete: "focus:text-red-800 dark:focus:text-red-200",
+  none: undefined,
+};
+
+const SWIPE_ACTION_ICONS: Record<SwipeAction, ComponentType<{ className?: string }>> = {
+  archive: ArchiveIcon,
+  delete: Trash2Icon,
+  none: MinusIcon,
+};
+
+/**
+ * Per-device swipe actions for sidebar session rows on touch devices. One
+ * card per direction, laid out like the Default transcript view cards; each
+ * opens a menu of Archive / Delete / None. Delete stays behind the row's
+ * confirm dialog; None makes that direction inert.
+ */
+function SwipeActionsControl() {
+  // Live subscription so the cards reflect writes from anywhere (other tabs,
+  // and the shared source every session row reads). writeSwipeActions notifies.
+  const actions = useSwipeActions();
+  const swatch = useResolvedThemeMode() === "dark" ? DARK_MODE_PREVIEW : LIGHT_MODE_PREVIEW;
+  const [openDirection, setOpenDirection] = useState<SwipeDirection | null>(null);
+  const labelId = useId();
+
+  const choose = useCallback(
+    (direction: SwipeDirection, next: SwipeAction) => {
+      writeSwipeActions({ ...actions, [direction]: next });
+    },
+    [actions],
+  );
+
+  return (
+    <ThemeSubsection
+      labelId={labelId}
+      title="Swipe actions"
+      helper="Choose what swiping a session in the sidebar does. Delete always asks first."
+    >
+      <div role="group" aria-labelledby={labelId} className="grid grid-cols-2 gap-3">
+        {(["right", "left"] as const).map((direction) => {
+          const action = actions[direction];
+          const tone = SWIPE_ACTION_TONES[action];
+          const open = openDirection === direction;
+          return (
+            <DropdownMenu
+              key={direction}
+              open={open}
+              onOpenChange={(next) => setOpenDirection(next ? direction : null)}
+            >
+              <DropdownMenuTrigger asChild>
+                {/* The border shows "selected" only while this card's menu is open. */}
+                <button
+                  type="button"
+                  aria-label={`Swipe ${direction}: ${SWIPE_ACTION_LABELS[action]}`}
+                  data-testid={`swipe-action-${direction}`}
+                  className={themeCardClass(open, "items-center gap-2 p-4")}
+                >
+                  {iconCardBody(SWIPE_ACTION_ICONS[action], `Swipe ${direction}`, tone)}
+                  <span
+                    data-testid={`swipe-action-${direction}-label`}
+                    className={cn("flex items-center gap-1 text-sm text-muted-foreground", tone)}
+                  >
+                    {SWIPE_ACTION_LABELS[action]}
+                    <ChevronDownIcon aria-hidden="true" className="size-4 text-muted-foreground" />
+                  </span>
+                </button>
+              </DropdownMenuTrigger>
+              {/* Radix names the menu after its card, e.g. "Swipe right: Archive". */}
+              <DropdownMenuContent className="min-w-(--radix-dropdown-menu-trigger-width)">
+                <DropdownMenuRadioGroup
+                  value={action}
+                  onValueChange={(next) => {
+                    if (isSwipeAction(next)) choose(direction, next);
+                  }}
+                >
+                  {swipeActionOptions.map((option) => (
+                    <DropdownMenuRadioItem
+                      key={option}
+                      value={option}
+                      data-testid={`swipe-action-${direction}-${option}`}
+                      className={cn(
+                        "gap-3 [&_svg]:text-current",
+                        option === action && [
+                          SWIPE_ACTION_TONES[option],
+                          SWIPE_ACTION_FOCUS_TONES[option],
+                        ],
+                      )}
+                    >
+                      <span className="w-24 shrink-0">
+                        <SwipeActionPreview swatch={swatch} direction={direction} action={option} />
+                      </span>
+                      {SWIPE_ACTION_LABELS[option]}
+                    </DropdownMenuRadioItem>
+                  ))}
+                </DropdownMenuRadioGroup>
+              </DropdownMenuContent>
+            </DropdownMenu>
+          );
+        })}
+      </div>
+    </ThemeSubsection>
+  );
+}
+
+function ProjectHeaderActionsOnTouchControl() {
+  const enabled = useShowProjectHeaderActionsOnTouch();
+  const labelId = useId();
+  const descriptionId = useId();
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Show action buttons on touch"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="Show the project menu and New session buttons on project folders. When off, long-press a folder to open its menu."
+        descriptionClassName="text-ui"
+      />
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={writeShowProjectHeaderActionsOnTouch}
+        data-testid="show-project-header-actions-on-touch-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.show_project_header_actions_on_touch"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
   // replace it with a note (plus a link to the host's own theme settings when
@@ -953,6 +1137,9 @@ function AppearanceSection() {
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
 
+    writeSwipeActions(DEFAULT_SWIPE_ACTIONS);
+    writeShowProjectHeaderActionsOnTouch(DEFAULT_SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH);
+
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
     writeCodeFontSizePx(CODE_FONT_SIZE_DEFAULT);
@@ -979,6 +1166,8 @@ function AppearanceSection() {
           "omnigent:default-workspace-tab",
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
+          "omnigent:swipe-actions",
+          SHOW_PROJECT_HEADER_ACTIONS_ON_TOUCH_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -1109,6 +1298,13 @@ function AppearanceSection() {
             </div>
             <div className="mt-4 border-t border-border pt-4">
               <UiCodeFontWeightControl />
+            </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Touch & mobile" testId="settings-group-touch">
+            <ProjectHeaderActionsOnTouchControl />
+            <div className="border-t border-border pt-4">
+              <SwipeActionsControl />
             </div>
           </SettingsGroup>
         </div>

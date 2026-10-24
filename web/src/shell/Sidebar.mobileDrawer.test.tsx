@@ -23,20 +23,24 @@ vi.mock("@/lib/serverOrigin", () => ({
 }));
 
 import { useConversations } from "@/hooks/useConversations";
+import { stubMatchMedia } from "@/test-helpers/matchMedia";
 
 const useConvMock = vi.mocked(useConversations);
+const originalMatchMedia = window.matchMedia;
 
 function mockConversations(conversations: Conversation[]) {
   useConvMock.mockImplementation(() => conversationPage(conversations));
 }
 
 beforeEach(() => {
+  stubMatchMedia({ width: 375 });
   mockConversations([conv("conv_a")]);
 });
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  window.matchMedia = originalMatchMedia;
 });
 
 describe("mobile sidebar drawer", () => {
