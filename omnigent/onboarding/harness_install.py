@@ -835,6 +835,18 @@ def _binary_signature(binary: str) -> tuple[str, int, int] | None:
     return (binary, stat.st_mtime_ns, stat.st_size)
 
 
+def _invalidate_version_probe_cache(binary: str) -> None:
+    """Forget cached versions for *binary* after an install attempt.
+
+    Package managers can replace dependencies behind a stable launcher without
+    changing that launcher's path, mtime, or size. The next post-install probe
+    must therefore run even when the cached signature still matches.
+    """
+    with _PROBE_CACHE_LOCK:
+        for cache_key in [key for key in _VERSION_PROBE_CACHE if key[0] == binary]:
+            _VERSION_PROBE_CACHE.pop(cache_key, None)
+
+
 def _harness_cli_version_satisfies(
     spec: HarnessInstallSpec,
     binary: str,
@@ -1086,9 +1098,10 @@ def harness_install_display(key: str) -> str:
 class HarnessInstallResult(NamedTuple):
     """Outcome of :func:`try_install_harness_cli`.
 
-    :param installed: Whether the CLI resolves after the attempt, via the same
-        :func:`resolve_cli_binary` ladder readiness uses (``PATH`` plus the
-        common global install dirs), not bare ``PATH`` alone.
+    :param installed: Whether the installer exited 0 and the CLI then resolves
+        via the same :func:`resolve_cli_binary` ladder readiness uses (``PATH``
+        plus the common global install dirs) at a version inside the spec's
+        declared range.
     :param reason: Human-readable failure reason when ``installed`` is False;
         ``None`` on success.
     """
@@ -1107,11 +1120,13 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     host" instead of a silent boolean failure.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: A :class:`HarnessInstallResult` — ``(True, None)`` once the CLI
-        resolves via :func:`resolve_cli_binary` (including the no-op where it
-        was already present), otherwise ``(False, reason)`` naming the failure
-        (manual-only spec, missing installer, timeout, OS error, non-zero exit,
-        or a post-install binary-not-found).
+    :returns: A :class:`HarnessInstallResult` — ``(True, None)`` only when the
+        installer exits 0 and the CLI then resolves via
+        :func:`resolve_cli_binary` at a version inside the spec's declared
+        range, otherwise ``(False, reason)`` naming the failure (manual-only
+        spec, missing installer, timeout, OS error, non-zero exit even when a
+        binary still resolves, post-install binary-not-found, or an
+        unsupported/unverifiable version).
     :raises KeyError: If *key* has no install spec.
     """
     spec = harness_install_spec(key)
@@ -1124,6 +1139,14 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     try:
         result = subprocess.run(cmd, check=False, timeout=300)
     except subprocess.TimeoutExpired:
+        # A partial upgrade can change dependencies behind an unchanged launcher.
+        if spec is not None:
+            try:
+                resolved = resolve_cli_binary(spec.binary)
+            except OSError:
+                resolved = None
+            if resolved is not None:
+                _invalidate_version_probe_cache(resolved)
         return HarnessInstallResult(False, "install timed out after 300s")
     except OSError as exc:
         return HarnessInstallResult(False, f"install command failed to run: {exc}")
@@ -1132,39 +1155,47 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
     assert spec is not None
     # Resolve the freshly-installed binary via the SAME ladder readiness uses
     # (:func:`resolve_cli_binary` — ``PATH`` plus the nvm/npm-global/homebrew
-    # fallback dirs), so the install verdict and the readiness badge can never
-    # disagree. A bare ``shutil.which`` here would report "not found" for a
+    # fallback dirs), so a "not found" verdict never contradicts the readiness
+    # badge. A bare ``shutil.which`` here would report "not found" for a
     # binary the host daemon's frozen ``PATH`` omits but readiness still resolves
     # via the ladder — the spurious "failed" toast next to a green "ready" tick.
     resolved = resolve_cli_binary(spec.binary)
     if resolved is not None:
-        # Put the resolving dir on ``PATH`` for this process so the setup
-        # wizard's *later* steps — harness_login / harness_cli_logged_in /
-        # harness_logout — which shell out with the bare binary name and only
-        # bare ``shutil.which``, can find it too. Without this, an install that
-        # succeeded via a fallback dir (nvm/homebrew/…) would be followed by a
-        # login step that can't locate the very binary just installed.
-        resolved_dir = str(Path(resolved).resolve().parent)
-        path_entries = os.environ.get("PATH", "").split(os.pathsep)
-        if resolved_dir not in path_entries:
-            os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
-        return HarnessInstallResult(True, None)
+        _invalidate_version_probe_cache(resolved)
+    # Callers install only when readiness rejects the CLI, so a binary that
+    # still resolves after a failed installer is a partial or concurrent
+    # install; report the installer's failure rather than trusting it.
     if result.returncode != 0:
         return HarnessInstallResult(False, f"installer exited with code {result.returncode}")
-    return HarnessInstallResult(
-        False, f"installer completed but {spec.binary!r} could not be found"
-    )
+    if resolved is None:
+        return HarnessInstallResult(
+            False, f"installer completed but {spec.binary!r} could not be found"
+        )
+    if not _harness_cli_version_satisfies(spec, resolved):
+        return HarnessInstallResult(
+            False,
+            f"installed {spec.binary!r}, but its version is unsupported or could not be verified",
+        )
+    # Put the resolving dir on ``PATH`` for this process so the setup wizard's
+    # later login steps, which shell out with the bare binary name, can find the
+    # binary just installed via a fallback dir (nvm/homebrew/…).
+    resolved_dir = str(Path(resolved).resolve().parent)
+    path_entries = os.environ.get("PATH", "").split(os.pathsep)
+    if resolved_dir not in path_entries:
+        os.environ["PATH"] = os.pathsep.join([resolved_dir, *path_entries])
+    return HarnessInstallResult(True, None)
 
 
 def install_harness_cli(key: str) -> bool:
-    """Install the harness CLI; return whether it landed on ``PATH``.
+    """Install the harness CLI; return whether a usable CLI resulted.
 
     Thin wrapper over :func:`try_install_harness_cli` that discards the failure
     reason, preserving the boolean contract the setup wizard relies on.
 
     :param key: A harness family or :data:`PI_KEY`.
-    :returns: ``True`` when the CLI is on ``PATH`` after the install attempt,
-        ``False`` if the installer is missing or the install failed.
+    :returns: ``True`` when the installer exited 0 and the CLI then resolves at
+        a supported version, ``False`` if the installer is missing or failed or
+        the resulting CLI is missing or unsupported.
     :raises KeyError: If *key* has no install spec.
     """
     return try_install_harness_cli(key).installed
