@@ -39,7 +39,12 @@ async def select_landing_agent(page: Page, agent_id: str) -> None:
     option = page.get_by_test_id(f"new-chat-landing-agent-{agent_id}")
     await expect(option).to_be_visible(timeout=60_000)
     await option.click()
+    await dismiss_landing_agent_menu(page)
 
+
+async def dismiss_landing_agent_menu(page: Page) -> None:
+    """Close the agent menu layer that can outlive a selection."""
+    trigger = page.get_by_test_id("new-chat-landing-agent-select")
     # The selected row becomes the integrated model/effort/config submenu.
     # Radix can preserve the root layer across that rerender, so close it before
     # interacting with composer controls behind the modal overlay.
