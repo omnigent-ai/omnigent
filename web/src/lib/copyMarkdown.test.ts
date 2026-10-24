@@ -1,6 +1,8 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 
-import { copyMarkdown, markdownToHtml } from "./copyMarkdown";
+import type { ClipboardEvent } from "react";
+
+import { copyMarkdown, handleMarkdownSelectionCopy, markdownToHtml } from "./copyMarkdown";
 
 const clipboardDescriptor = Object.getOwnPropertyDescriptor(Navigator.prototype, "clipboard");
 const execCommandDescriptor = Object.getOwnPropertyDescriptor(Document.prototype, "execCommand");
@@ -135,5 +137,46 @@ describe("copyMarkdown", () => {
     await copyMarkdown("A **bold** claim");
 
     expect(writeText).toHaveBeenCalledWith("A **bold** claim");
+  });
+});
+
+describe("handleMarkdownSelectionCopy", () => {
+  /** Selects `root`'s contents and fires the handler with a recording clipboard. */
+  function copySelection(root: HTMLElement) {
+    document.body.appendChild(root);
+    const range = document.createRange();
+    range.selectNodeContents(root);
+    const selection = window.getSelection()!;
+    selection.removeAllRanges();
+    selection.addRange(range);
+    const flavors: Record<string, string> = {};
+    const preventDefault = vi.fn();
+    handleMarkdownSelectionCopy({
+      currentTarget: root,
+      clipboardData: { setData: (type: string, value: string) => (flavors[type] = value) },
+      preventDefault,
+    } as unknown as ClipboardEvent<HTMLElement>);
+    return { flavors, preventDefault };
+  }
+
+  it("writes a selected list as markdown and HTML so its bullets survive the paste", () => {
+    const root = document.createElement("div");
+    root.innerHTML = "<p>Steps</p><ol><li>first</li><li>second</li></ol>";
+
+    const { flavors, preventDefault } = copySelection(root);
+
+    expect(preventDefault).toHaveBeenCalled();
+    expect(flavors["text/plain"]).toBe("Steps\n\n1. first\n2. second");
+    expect(flavors["text/html"]).toBe("<p>Steps</p>\n<ol>\n<li>first</li>\n<li>second</li>\n</ol>");
+  });
+
+  it("keeps the browser's copy for a selection without a list", () => {
+    const root = document.createElement("div");
+    root.innerHTML = "<p>Just prose</p>";
+
+    const { flavors, preventDefault } = copySelection(root);
+
+    expect(preventDefault).not.toHaveBeenCalled();
+    expect(flavors).toEqual({});
   });
 });

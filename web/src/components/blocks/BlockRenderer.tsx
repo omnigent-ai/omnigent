@@ -20,6 +20,7 @@ import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
 import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
+import { handleMarkdownSelectionCopy } from "@/lib/copyMarkdown";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import type { RenderItem } from "@/lib/renderItems";
@@ -746,6 +747,7 @@ function renderItem(
           key={key}
           data-testid="assistant-text-section"
           className={cn("min-w-0", followsText && "mt-2")}
+          onCopy={handleMarkdownSelectionCopy}
         >
           <FilePathAwareMessageResponse
             className="chat-markdown"
