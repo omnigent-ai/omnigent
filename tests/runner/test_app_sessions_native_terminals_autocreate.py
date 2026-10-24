@@ -3112,7 +3112,7 @@ async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
     monkeypatch.setattr(
         claude_native_bridge, "ensure_claude_workspace_trusted", lambda *a, **k: None
     )
-    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.setattr(claude_native, "_claude_projects_dir", lambda: tmp_path / "projects")
     monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
     monkeypatch.setattr("omnigent.config.load_effective_config", lambda **_: {})
     forwarder = AsyncMock()
