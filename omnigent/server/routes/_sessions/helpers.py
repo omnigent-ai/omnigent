@@ -1526,6 +1526,21 @@ async def _apply_liveness_to_items(
     if liveness_lookup is None or not items:
         return
     liveness = await asyncio.to_thread(liveness_lookup, [item.id for item in items])
+    _apply_liveness_results(items, liveness)
+
+
+def _apply_liveness_results(
+    items: list[SessionListItem],
+    liveness: dict[str, SessionLiveness],
+) -> None:
+    """
+    Attach already-resolved liveness to session-list items.
+
+    :param items: Session-list rows to annotate; every id must be in
+        ``liveness``.
+    :param liveness: Bulk liveness results keyed by session id.
+    :returns: ``None``. Mutates ``items`` in place.
+    """
     for item in items:
         result = liveness[item.id]
         item.runner_online = result.runner_online

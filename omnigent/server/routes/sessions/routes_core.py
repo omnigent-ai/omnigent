@@ -30,7 +30,7 @@ from starlette.datastructures import UploadFile as StarletteUploadFile
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
-from omnigent.db.utils import generate_agent_id, generate_file_id
+from omnigent.db.utils import generate_agent_id, generate_file_id, shared_read_scope
 from omnigent.debug_logging import add_audit_attrs, debug_event, set_current_runner_id
 from omnigent.entities import (
     Agent,
@@ -122,6 +122,7 @@ from omnigent.server.routes._sessions.helpers import (
     _agent_carries_cursor_fork_history,
     _agent_carries_native_fork_history,
     _announce_session_added,
+    _apply_liveness_results,
     _apply_liveness_to_items,
     _authorize_bundled_parent_and_inherit_runner,
     _codex_plan_mode_enabled,
@@ -236,6 +237,19 @@ from omnigent.util.session_lifecycle import (
     labels_with_closed_status,
 )
 from omnigent.version import VERSION
+
+
+@dataclasses.dataclass(frozen=True)
+class _WatchedSessionRows:
+    """Store rows one ``WS /v1/sessions/updates`` tick builds its items from."""
+
+    perms_by_conv: dict[str, list[SessionPermission]]
+    user_is_admin: bool
+    conversations: list[Conversation]
+    agent_names_by_id: dict[str, str]
+    child_ids_by_parent: dict[str, list[str]]
+    comments_fingerprints: dict[str, CommentsFingerprint]
+    liveness: dict[str, SessionLiveness] | None
 
 
 def _require_attachment_compatible_history(
@@ -1915,6 +1929,71 @@ def register_core_routes(
 
     # ── WS /sessions/updates ────────────────────────────────────
 
+    def _read_watched_rows(
+        watched: list[str],
+        user_id: str | None,
+    ) -> _WatchedSessionRows | None:
+        """
+        Read every store row one session-updates tick needs.
+
+        Runs in a worker thread inside one :func:`shared_read_scope`, so the
+        tick's ~9 read-only queries share a pool checkout per engine instead
+        of paying a checkout, ping and commit for each.
+
+        :param watched: Deduplicated conversation ids the client displays,
+            e.g. ``["conv_abc"]``.
+        :param user_id: The authenticated user, or ``None`` when
+            permissions are disabled.
+        :returns: The rows, or ``None`` when no watched id is an accessible
+            session.
+        """
+        with shared_read_scope():
+            if permission_store is not None:
+                perms_by_conv = permission_store.list_for_sessions(watched)
+                user_is_admin = (
+                    permission_store.is_admin(user_id) if user_id is not None else False
+                )
+                accessible = [
+                    cid
+                    for cid in watched
+                    if _permission_level_from_grants(
+                        user_id, perms_by_conv.get(cid, []), user_is_admin
+                    )
+                    is not None
+                ]
+            else:
+                perms_by_conv = {}
+                user_is_admin = False
+                accessible = list(watched)
+            if not accessible:
+                return None
+            by_id = conversation_store.get_conversations(accessible)
+            # Keep the caller's id order for deterministic output.
+            convs = [
+                conv
+                for cid in accessible
+                if (conv := by_id.get(cid)) is not None and conv.agent_id is not None
+            ]
+            if not convs:
+                return None
+            conv_ids = [c.id for c in convs]
+            unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
+            return _WatchedSessionRows(
+                perms_by_conv=perms_by_conv,
+                user_is_admin=user_is_admin,
+                conversations=convs,
+                agent_names_by_id=agent_store.get_names(unique_agent_ids),
+                child_ids_by_parent=(
+                    conversation_store.list_child_conversation_ids_by_parent(conv_ids)
+                ),
+                comments_fingerprints=(
+                    comment_store.get_comments_fingerprints(conv_ids)
+                    if comment_store is not None
+                    else {}
+                ),
+                liveness=liveness_lookup(conv_ids) if liveness_lookup is not None else None,
+            )
+
     async def _fetch_watched_items(
         watched: list[str],
         user_id: str | None,
@@ -1945,68 +2024,26 @@ def register_core_routes(
         """
         if not watched:
             return []
-        if permission_store is not None:
-            perms_by_conv = await asyncio.to_thread(permission_store.list_for_sessions, watched)
-            user_is_admin = (
-                await asyncio.to_thread(permission_store.is_admin, user_id)
-                if user_id is not None
-                else False
-            )
-            accessible = [
-                cid
-                for cid in watched
-                if _permission_level_from_grants(
-                    user_id, perms_by_conv.get(cid, []), user_is_admin
-                )
-                is not None
-            ]
-        else:
-            perms_by_conv = {}
-            user_is_admin = False
-            accessible = list(watched)
-        if not accessible:
+        rows = await asyncio.to_thread(_read_watched_rows, watched, user_id)
+        if rows is None:
             return []
-
-        def _load_sessions(ids: list[str]) -> list[Conversation]:
-            """Bulk-load the accessible conversations that are sessions
-            (non-null ``agent_id``) in one batched store call, preserving
-            the caller's id order for deterministic output."""
-            by_id = conversation_store.get_conversations(ids)
-            return [
-                conv
-                for cid in ids
-                if (conv := by_id.get(cid)) is not None and conv.agent_id is not None
-            ]
-
-        convs = await asyncio.to_thread(_load_sessions, accessible)
-        if not convs:
-            return []
-        unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
-        conv_ids = [c.id for c in convs]
-        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
-            asyncio.to_thread(agent_store.get_names, unique_agent_ids),
-            asyncio.to_thread(
-                conversation_store.list_child_conversation_ids_by_parent,
-                conv_ids,
-            ),
-            _comments_fingerprints_for(conv_ids),
-        )
-        pending_counts = pending_elicitations.counts_for(conv_ids)
+        pending_counts = pending_elicitations.counts_for([c.id for c in rows.conversations])
         items = [
             _build_session_list_item(
                 conv,
-                agent_names_by_id=agent_names_by_id,
-                grants=perms_by_conv.get(conv.id, []),
+                agent_names_by_id=rows.agent_names_by_id,
+                grants=rows.perms_by_conv.get(conv.id, []),
                 user_id=user_id,
-                user_is_admin=user_is_admin,
+                user_is_admin=rows.user_is_admin,
                 permissions_enabled=permission_store is not None,
                 pending_count=pending_counts.get(conv.id, 0),
-                child_session_ids=child_ids_by_parent[conv.id],
-                comments_fingerprint=comments_fingerprints.get(conv.id),
+                child_session_ids=rows.child_ids_by_parent[conv.id],
+                comments_fingerprint=rows.comments_fingerprints.get(conv.id),
             )
-            for conv in convs
+            for conv in rows.conversations
         ]
-        await _apply_liveness_to_items(items, liveness_lookup)
+        if rows.liveness is not None:
+            _apply_liveness_results(items, rows.liveness)
         # Full-row dumps (every field, nulls included) — NOT exclude_none. The
         # stream is a diff source: the client overlays these onto its cached
         # rows, so a field that cleared to null must arrive as an explicit null
