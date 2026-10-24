@@ -2253,6 +2253,7 @@ class CodexNativeAppServer:
         self.config_overrides = materialize_codex_provider_config(
             self.codex_home,
             self.config_overrides,
+            source_home=config_source,
         )
         if codex_version is not None and not policy_hooks_supported:
             self._disable_policy_hook(
