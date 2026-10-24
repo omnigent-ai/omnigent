@@ -1497,7 +1497,12 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
     // One deadline at a time: the launch's while the sandbox starts, then the model's.
     let timer: ReturnType<typeof setTimeout> | undefined;
     let deadline: "launch" | "model" | undefined;
+    // Counts armed deadlines, so a model re-read can tell whether a newer one replaced it.
+    let armedDeadlines = 0;
+    let settled = false;
     const finish = (ready: boolean, error?: Error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       unsubscribe();
       unsubscribeDisposed();
@@ -1508,9 +1513,26 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
       if (deadline === phase) return;
       clearTimeout(timer);
       deadline = phase;
-      timer = setTimeout(() => finish(false, new Error(message)), ms);
+      const armed = ++armedDeadlines;
+      timer = setTimeout(() => {
+        if (phase === "launch") {
+          finish(false, new Error(message));
+          return;
+        }
+        // The stream does not replay `session.model`, so a report this tab missed
+        // (a dropped stream, a sleeping laptop) would fail a ready runner's message.
+        // `catch` first: a failed read must still reach the final check below.
+        void adoptSnapshotModel(conversationId)
+          .catch(() => undefined)
+          .then(() => {
+            check();
+            // A launch during the read re-armed the deadlines; the newer one applies.
+            if (armedDeadlines === armed) finish(false, new Error(message));
+          });
+      }, ms);
     };
     const check = () => {
+      if (settled) return;
       const entry = conversationRegistry.peek(conversationId);
       const state = entry?.getState();
       if (
@@ -1557,6 +1579,35 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
     });
     check();
   });
+}
+
+/** Settle a seeded model from a snapshot, under the condition `sessionBindingPatch` uses at bind. */
+function snapshotModelPatch(
+  session: Session,
+  s: Pick<ConversationState, "sessionModelSeeded">,
+): Partial<ConversationState> {
+  return s.sessionModelSeeded && session.llmModel != null
+    ? { llmModel: session.llmModel, sessionModelSeeded: false }
+    : {};
+}
+
+/** Adopt the model a fresh session snapshot shows, in case this tab's stream missed it. */
+async function adoptSnapshotModel(conversationId: string): Promise<void> {
+  const entry = conversationRegistry.peek(conversationId);
+  if (entry === undefined) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS);
+  let session: Session;
+  try {
+    session = await getSessionSlim(conversationId, { signal: controller.signal });
+  } catch {
+    return;
+  } finally {
+    clearTimeout(timeout);
+  }
+  // A conversation reopened under the same id during the read is a different entry.
+  if (entry.disposed) return;
+  entrySetter(entry)((s) => snapshotModelPatch(session, s));
 }
 
 /**
@@ -5152,6 +5203,9 @@ function reconnectStatusPatch(
     sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
     ...launchSnapshotPatch(session, s),
+    // A `session.model` missed in the gap would otherwise hold a first
+    // message on `waitForInitialDispatch` until its deadline.
+    ...snapshotModelPatch(session, s),
   };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
