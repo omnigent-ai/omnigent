@@ -68,7 +68,11 @@ from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
-from omnigent.native.failure_telemetry import FailureContext, normalize_failure_context
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    exception_code_origin,
+    normalize_failure_context,
+)
 from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_terminal_name,
@@ -8050,6 +8054,7 @@ def _native_terminal_start_error_payload(
         if os_error is not None and os_error.errno is not None
         else None,
         native_launch_winerror=getattr(os_error, "winerror", None),
+        native_launch_code_origin=exception_code_origin(exc, prefer_module_prefix="omnigent."),
         exception_context_type=type(exc.__context__).__name__
         if exc.__context__ is not None
         else None,
@@ -8187,6 +8192,9 @@ def _native_terminal_start_failure_context(exc: BaseException, error_id: str) ->
             if os_error is not None and os_error.errno is not None
             else None,
             "native_launch_winerror": getattr(os_error, "winerror", None),
+            "native_launch_code_origin": exception_code_origin(
+                exc, prefer_module_prefix="omnigent."
+            ),
         }
     )
 

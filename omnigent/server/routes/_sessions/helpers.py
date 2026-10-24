@@ -6892,7 +6892,10 @@ def _native_terminal_failure_from_runner_response(
                 f"Native {display_name} terminal ensure failed with malformed "
                 f"runner response (HTTP {resp.status_code})."
             ),
-        )
+        ),
+        failure_context=normalize_failure_context(body.get("failure_context"))
+        if isinstance(body, dict)
+        else None,
     )
 
 

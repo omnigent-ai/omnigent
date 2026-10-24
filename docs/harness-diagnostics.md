@@ -203,6 +203,11 @@ classes. `native_launch_os_errno`, `native_launch_os_errno_name`, and
 chain. Missing fields mean unavailable evidence. These fields contain no raw
 exception messages, paths, arguments, or pane output.
 
+`native_launch_code_origin` identifies the last available Omnigent module,
+function, and line in the exception traceback, falling back to the available
+leaf when no framework frame exists. It names the launch operation without
+exporting its filesystem path; an exception without a traceback omits it.
+
 Older runners can omit the context; malformed and unknown fields are ignored.
 The context does not change error codes, display text, status handling, or
 retry policy, and does not add failure records.
