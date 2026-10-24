@@ -365,6 +365,7 @@ const arcaConnectFlow = createArcaConnectFlow({
       return "arca ssh isaac omni host …"; // the run itself re-validates and fails loud
     }
   },
+  attachContextMenu,
   log: (message) => console.log(`[omnigent] ${message}`),
 });
 

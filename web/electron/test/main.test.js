@@ -188,6 +188,7 @@ function loadNavigationHarness({
     dbcertSyncs: 0,
     dbcertPreflights: 0,
     arcaConsentRuns: [],
+    menuPopups: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
     arcaLogins: [],
@@ -247,6 +248,7 @@ function loadNavigationHarness({
   const browserRegistryCalls = { setActive: [], closeAll: [] };
   let browserRegistryDeps;
   let browserIpcDeps;
+  let arcaConnectFlowDeps;
   const permissionPromptCalls = { show: [], dismiss: [] };
   let currentUrl = serverUrl;
   const appEvents = new Map();
@@ -387,6 +389,7 @@ function loadNavigationHarness({
     Menu: {
       buildFromTemplate: (template) => ({
         template,
+        popup: (options) => calls.menuPopups.push({ template, options }),
         getMenuItemById: (id) => {
           const find = (items) => {
             for (const item of items ?? []) {
@@ -638,18 +641,21 @@ function loadNavigationHarness({
 
   if (arcaConsentResult !== undefined) {
     localRequires["./arca_connect_window"] = {
-      createArcaConnectFlow: (deps) => ({
-        run: async (_parentWin, consentServerUrl, options) => {
-          calls.arcaConsentRuns.push({ serverUrl: consentServerUrl, options });
-          const consent =
-            typeof arcaConsentResult === "function"
-              ? await arcaConsentResult(consentServerUrl, options)
-              : arcaConsentResult;
-          if (consent?.ok !== true) return consent;
-          const connect = deps.startConnect(consentServerUrl, () => {});
-          return { ...(await connect.promise), shownInConsole: true };
-        },
-      }),
+      createArcaConnectFlow: (deps) => {
+        arcaConnectFlowDeps = deps;
+        return {
+          run: async (_parentWin, consentServerUrl, options) => {
+            calls.arcaConsentRuns.push({ serverUrl: consentServerUrl, options });
+            const consent =
+              typeof arcaConsentResult === "function"
+                ? await arcaConsentResult(consentServerUrl, options)
+                : arcaConsentResult;
+            if (consent?.ok !== true) return consent;
+            const connect = deps.startConnect(consentServerUrl, () => {});
+            return { ...(await connect.promise), shownInConsole: true };
+          },
+        };
+      },
     };
   }
 
@@ -705,6 +711,7 @@ function loadNavigationHarness({
     browserRegistryCalls,
     browserRegistryDeps: () => browserRegistryDeps,
     browserIpcDeps: () => browserIpcDeps,
+    arcaConnectFlowDeps: () => arcaConnectFlowDeps,
     permissionPromptCalls,
     electron,
     powerMonitor,
@@ -4540,6 +4547,21 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(await recover(), false);
     await until(() => h.calls.arcaConnects.length === 2, "second failed recovery");
     assert.equal(h.calls.arcaConsentRuns.length, 2);
+  });
+
+  it("gives the Arca console the shell's Copy menu for selected text", (t) => {
+    const h = loadNavigationHarness({ arcaConsentResult: { ok: true } });
+    t.after(h.cleanup);
+    const consoleWindow = { webContents: new EventEmitter() };
+    h.arcaConnectFlowDeps().attachContextMenu(consoleWindow);
+    consoleWindow.webContents.emit(
+      "context-menu",
+      {},
+      { selectionText: "arca ssh isaac omni host", isEditable: false, linkURL: "" },
+    );
+    assert.equal(h.calls.menuPopups.length, 1);
+    assert.equal(JSON.stringify(h.calls.menuPopups[0].template), '[{"role":"copy"}]');
+    assert.equal(h.calls.menuPopups[0].options.window, consoleWindow);
   });
 
   it("closes the window's browserRegistry when pinWindow changes origin", () => {
