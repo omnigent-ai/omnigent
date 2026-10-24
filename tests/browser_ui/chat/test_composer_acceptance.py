@@ -1,10 +1,11 @@
 from __future__ import annotations
 
+import re
 from itertools import pairwise
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
 
 from tests._helpers.workspace_geometry import workspace_bar_needs_collapse
 from tests.browser_ui.chat.session_contract import ChatSessionContract
@@ -364,3 +365,57 @@ def test_long_model_and_permission_remain_single_row(
     page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_role("menuitemcheckbox", name=display_name, exact=True)).to_be_visible()
     assert all(results.values()), results
+
+
+@pytest.mark.parametrize("surface", ["main", "mobile"])
+def test_cline_permission_selection_is_persistent_and_reversible(
+    page: Page, chat_session_contract, tmp_path, surface: str
+) -> None:
+    chat = chat_session_contract
+    sid = chat.session_id
+    row = {
+        **chat._session(),
+        "id": sid,
+        "title": "Cline approval controls",
+        "harness": "acp",
+        "labels": {"omnigent.acp.permission_mode": "auto"},
+    }
+    changes = []
+    reject = False
+
+    def session_route(route: Route) -> None:
+        if route.request.method == "PATCH":
+            body = route.request.post_data_json
+            changes.append(body)
+            if reject:
+                route.fulfill(status=503, json={"detail": "Runner unavailable"})
+                return
+            row["labels"]["omnigent.acp.permission_mode"] = body["permission_mode"]
+        route.fulfill(json=row)
+
+    chat.contract.route(
+        re.compile(rf"{re.escape(chat.base_url)}/v1/sessions/{sid}(?:\?.*)?$"), session_route
+    )
+    page.set_viewport_size({"width": 390 if surface == "mobile" else 1600, "height": 900})
+    page.goto(chat.url)
+    chip = page.get_by_test_id("composer-permission-chip")
+    expect(chip).to_have_accessible_name("Permission mode: Ask every time")
+    chip.click()
+    page.get_by_test_id("composer-permission-option-bypassPermissions").click()
+    expect(chip).to_have_accessible_name("Permission mode: Full access")
+    assert changes == [{"permission_mode": "bypassPermissions"}]
+    page.reload()
+    expect(chip).to_have_accessible_name("Permission mode: Full access")
+    page.screenshot(path=str(tmp_path / f"cline-full-access-{surface}.png"), full_page=True)
+    reject = True
+    chip.click()
+    page.get_by_test_id("composer-permission-option-auto").click()
+    expect(page.get_by_text("Runner unavailable", exact=False).first).to_be_visible()
+    expect(chip).to_have_accessible_name("Permission mode: Full access")
+    reject = False
+    chip.click()
+    page.get_by_test_id("composer-permission-option-auto").click()
+    expect(chip).to_have_accessible_name("Permission mode: Ask every time")
+    expect(page.get_by_text("Runner unavailable", exact=False)).not_to_be_visible()
+    page.screenshot(path=str(tmp_path / f"cline-permissions-{surface}.png"), full_page=True)
+    assert not chat.contract.violations, chat.contract.violations

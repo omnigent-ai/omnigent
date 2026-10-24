@@ -20,6 +20,7 @@ export type PermissionModeConcept =
   "manual" | "automatic" | "edit-automatic" | "read-only" | "deny" | "full-access" | "default";
 
 const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConcept>> = {
+  acp: { auto: "manual", bypassPermissions: "full-access" },
   "claude-native": {
     default: "manual",
     auto: "automatic",
@@ -67,7 +68,7 @@ export function permissionModeConcept(
   value: string | null | undefined,
 ): PermissionModeConcept {
   if (!harness || !value) return "default";
-  const canonicalHarness = canonicalNativeHarness(harness);
+  const canonicalHarness = harness.startsWith("acp:") ? "acp" : canonicalNativeHarness(harness);
   return PERMISSION_MODE_CONCEPTS[canonicalHarness]?.[value] ?? "default";
 }
 

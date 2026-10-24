@@ -139,6 +139,7 @@ vi.mock("@/hooks/useChildSessions", async (importOriginal) => ({
 // (no host bound) without needing a QueryClient provider around these renders.
 const { composerSessionSnapshot } = vi.hoisted(() => ({
   composerSessionSnapshot: {
+    harness: undefined as string | undefined,
     hostId: null as string | null,
     workspace: null as string | null,
     labels: {} as Record<string, string>,
@@ -2873,6 +2874,33 @@ describe("Composer permission-mode shortcut", () => {
     expect(setMode.mock.calls.map(([mode]) => mode)).toEqual(["auto", "acceptEdits"]);
     expect(input).toHaveFocus();
     expect(input).toHaveValue("half-written prompt");
+  });
+
+  it("cycles an ACP session's own permission modes with Shift+Tab", async () => {
+    const { acpPermissionMode, setAcpPermissionMode } = useChatStore.getState();
+    const previousHarness = composerSessionSnapshot.harness;
+    onTestFinished(() => {
+      useChatStore.setState({ acpPermissionMode, setAcpPermissionMode });
+      composerSessionSnapshot.harness = previousHarness;
+    });
+    composerSessionSnapshot.harness = "acp:cline";
+    const setMode = vi
+      .spyOn(useChatStore.getState(), "setAcpPermissionMode")
+      .mockImplementation(async (mode) => {
+        useChatStore.setState({ acpPermissionMode: mode });
+      });
+    useChatStore.setState({
+      conversationId: "cycle-acp",
+      sessionHarness: "acp:cline",
+      acpPermissionMode: "auto",
+    });
+    renderWithTooltips(<Composer {...composerProps()} />);
+    pressShiftTab(textarea());
+    await waitFor(() => expect(chip()).toHaveTextContent("Full access"));
+    await settled();
+    pressShiftTab(textarea());
+    await waitFor(() => expect(chip()).toHaveTextContent("Ask every time"));
+    expect(setMode.mock.calls.map(([mode]) => mode)).toEqual(["bypassPermissions", "auto"]);
   });
 
   it("holds Shift+Tab without a second request while a change is in flight", async () => {

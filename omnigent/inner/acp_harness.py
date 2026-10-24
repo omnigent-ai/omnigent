@@ -59,8 +59,11 @@ import json
 import logging
 import os
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, Response
+from pydantic import BaseModel
 
+from omnigent.acp_permissions import ACP_PERMISSION_MODES
 from omnigent.cli_invocation import cli_invocation
 from omnigent.inner.acp_executor import AcpAgentConfig, AcpExecutor
 from omnigent.inner.acp_extension import NO_ACP_EXTENSION, AcpExtension
@@ -150,7 +153,7 @@ def _resolve_os_env() -> OSEnvSpec:
     )
 
 
-def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> Executor:
+def _build_acp_executor(extension: AcpExtension = NO_ACP_EXTENSION) -> AcpExecutor:
     """Construct an :class:`AcpExecutor` from env-var config (lazily, on first turn).
 
     :param extension: Vendor behavior to inject, from the calling wrap. Defaults
@@ -203,7 +206,39 @@ def create_app(extension: AcpExtension = NO_ACP_EXTENSION) -> FastAPI:
     :returns: The app the runner serves.
     """
     label = os.environ.get(_ENV_NAME, "").strip() or "ACP agent"
-    adapter = ExecutorAdapter(
-        executor_factory=lambda: _build_acp_executor(extension), harness_label=label
-    )
-    return adapter.build()
+    executor: AcpExecutor | None = None
+    selected_mode: str | None = None
+
+    def factory() -> Executor:
+        nonlocal executor
+        executor = _build_acp_executor(extension)
+        if selected_mode is not None:
+            executor.set_permission_mode(selected_mode)
+        return executor
+
+    adapter = ExecutorAdapter(executor_factory=factory, harness_label=label)
+    app = adapter.build()
+
+    @app.post("/v1/sessions/{conversation_id}/acp-permission-mode")
+    async def set_permission_mode(
+        conversation_id: str, body: _PermissionModeRequest, request: Request
+    ) -> Response:
+        nonlocal selected_mode
+        denied = adapter._check_auth(request)
+        if denied is not None:
+            return denied
+        adapter._check_conversation_id(request, conversation_id)
+        if body.permission_mode not in ACP_PERMISSION_MODES:
+            return JSONResponse(
+                status_code=400, content={"detail": "Unsupported ACP permission mode"}
+            )
+        if executor is not None:
+            executor.set_permission_mode(body.permission_mode)
+        selected_mode = body.permission_mode
+        return JSONResponse(content={"permission_mode": selected_mode})
+
+    return app
+
+
+class _PermissionModeRequest(BaseModel):
+    permission_mode: str

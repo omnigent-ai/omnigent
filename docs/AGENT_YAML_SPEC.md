@@ -327,6 +327,18 @@ Then run it with `omni run --harness acp:openclaw` or select `OpenClaw` in the
 app. See the [OpenClaw integration guide](openclaw.md) for registry import,
 Gateway setup, and compatibility details.
 
+In an existing ACP chat, including Cline, the composer's **Permissions** menu
+offers **Ask every time** and **Full access**. The choice applies to that chat's
+subsequent tool requests, persists across reload/reconnect, and is available in
+desktop and mobile. A new selection appears only
+after the runner confirms it; an older runner needs an update/reconnect. An
+unselected chat keeps its configured launch behavior, shown as **Permissions**
+until an explicit choice is confirmed. Full access waives ordinary approval
+cards; explicit policy DENY/ASK decisions still apply. An already pending card
+still needs its own answer. The menu does not change Cline's global settings or
+its own native auto-approval flags, so leave those flags off when Omnigent owns
+the permission prompts.
+
 To offer a curated model picker for a custom ACP agent, explicitly reference a
 named provider in its agent spec:
 

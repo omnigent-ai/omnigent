@@ -134,6 +134,7 @@ import { attachmentKey } from "@/lib/attachments";
 import type { ActiveResponse } from "./types";
 import { supportsEffortControl } from "@/lib/sessionCapabilities";
 import { fetchHarnessCatalog, type HarnessCatalog } from "@/lib/agentLabels";
+import { acpPermissionModeFromSession, isAcpSession } from "@/lib/acpPermissionMode";
 import { claudePermissionModeFromSession } from "@/lib/claudePermissionMode";
 import { codexApprovalModeFromSession } from "@/lib/codexApprovalMode";
 import { codexPlanModeFromSession, isCodexNativeSession } from "@/lib/codexPlanMode";
@@ -834,6 +835,8 @@ export interface ConversationState {
    * composer hides the picker rather than showing a guessed mode.
    */
   claudePermissionMode: string;
+  /** Confirmed ACP approval stance; empty until this session has an explicit selection. */
+  acpPermissionMode: string;
   /**
    * Approval mode of a running codex-native session, one of
    * ``"ask-for-approval"``, ``"approve-for-me"``, ``"full-access"``,
@@ -1347,6 +1350,7 @@ export interface ChatActions {
    * No-ops when there is no active conversation.
    */
   setClaudePermissionMode: (mode: string) => Promise<void>;
+  setAcpPermissionMode: (mode: string) => Promise<void>;
   /**
    * Switch a running codex-native session's approval/sandbox mode (e.g. to
    * ``"full-access"``). Rejects when the live Codex thread could not accept the
@@ -2058,6 +2062,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   subagentRoutingOverride: null,
   codexPlanMode: false,
   claudePermissionMode: "",
+  acpPermissionMode: "",
   codexApprovalMode: "",
   hasMoreHistory: false,
   loadingMoreHistory: false,
@@ -3609,6 +3614,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     }
   },
 
+  setAcpPermissionMode: async (mode) => {
+    const { conversationId } = get();
+    if (!conversationId) return;
+    const patchSet = setterFor(conversationId);
+    const session = await updateSession(conversationId, { acpPermissionMode: mode });
+    patchSet({ acpPermissionMode: acpPermissionModeFromSession(session) });
+  },
+
   setClaudePermissionMode: async (mode) => {
     const { conversationId } = get();
     if (!conversationId) return;
@@ -4507,6 +4520,7 @@ function sessionBindingPatch(
   | "subagentRoutingOverride"
   | "codexPlanMode"
   | "claudePermissionMode"
+  | "acpPermissionMode"
   | "codexApprovalMode"
   | "contextWindow"
   | "gitBranch"
@@ -4542,6 +4556,7 @@ function sessionBindingPatch(
     claudePermissionMode: isNativeTerminalSessionFn(session)
       ? (claudePermissionModeFromSession(session) ?? "")
       : "",
+    acpPermissionMode: isAcpSession(session) ? acpPermissionModeFromSession(session) : "",
     codexApprovalMode: isCodexNativeSession(session)
       ? (codexApprovalModeFromSession(session) ?? "")
       : "",
@@ -7828,6 +7843,7 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       // has confirmed this is the session's live mode.
       applyToNamedConversation(event.conversationId, {
         claudePermissionMode: event.permissionMode,
+        acpPermissionMode: event.permissionMode,
       });
       return;
     case "session_collaboration_mode":

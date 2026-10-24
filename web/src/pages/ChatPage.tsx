@@ -261,6 +261,7 @@ import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { effortLevelsForFamily, supportsEffortControl } from "@/lib/sessionCapabilities";
+import { ACP_PERMISSION_MODES, isAcpSession } from "@/lib/acpPermissionMode";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
   claudePermissionModeLabel,
@@ -2545,6 +2546,8 @@ function ComposerImpl(
     (hostMcpRoutingId ? `?host=${encodeURIComponent(hostMcpRoutingId)}` : "");
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
+  const acpPermissionMode = useChatStore((s) => s.acpPermissionMode);
+  const showAcpPermissionMode = isAcpSession(composerSession);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
   const [configBusy, setConfigBusy] = useState(false);
   const configBusyRef = useRef(false);
@@ -2584,22 +2587,29 @@ function ComposerImpl(
   // Devin shares this control but not Claude's vocabulary: its rungs are
   // normal / accept-edits / smart / dangerous, cycled in the TUI.
   const devinPermissionControl = modelPickerKind === "devin";
-  const permissionOptions = showClaudePermissionMode
-    ? devinPermissionControl
-      ? DEVIN_NATIVE_PERMISSION_MODES
-      : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
-    : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
-  const permissionLabel = showClaudePermissionMode
-    ? devinPermissionControl
-      ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
-        claudePermissionMode)
-      : claudePermissionModeLabel(claudePermissionMode)
-    : codexApprovalModeLabel(codexApprovalMode);
-  const selectedPermissionMode = showClaudePermissionMode
-    ? claudePermissionMode
-    : codexApprovalMode;
+  const permissionOptions = showAcpPermissionMode
+    ? ACP_PERMISSION_MODES
+    : showClaudePermissionMode
+      ? devinPermissionControl
+        ? DEVIN_NATIVE_PERMISSION_MODES
+        : CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES
+      : CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS;
+  const permissionLabel = showAcpPermissionMode
+    ? (ACP_PERMISSION_MODES.find((option) => option.value === acpPermissionMode)?.label ??
+      "Permissions")
+    : showClaudePermissionMode
+      ? devinPermissionControl
+        ? (DEVIN_NATIVE_PERMISSION_MODES.find((m) => m.value === claudePermissionMode)?.label ??
+          claudePermissionMode)
+        : claudePermissionModeLabel(claudePermissionMode)
+      : codexApprovalModeLabel(codexApprovalMode);
+  const selectedPermissionMode = showAcpPermissionMode
+    ? acpPermissionMode
+    : showClaudePermissionMode
+      ? claudePermissionMode
+      : codexApprovalMode;
   const permissionControlInteractive =
-    (showClaudePermissionMode || showCodexApprovalMode) &&
+    (showClaudePermissionMode || showCodexApprovalMode || showAcpPermissionMode) &&
     !isReadOnly &&
     !unreachable &&
     isOwnerLevel(permissionLevel);
@@ -2610,17 +2620,23 @@ function ComposerImpl(
   );
   const currentPermissionMode = (): string => {
     const state = useChatStore.getState();
-    return showClaudePermissionMode ? state.claudePermissionMode : state.codexApprovalMode;
+    return showAcpPermissionMode
+      ? state.acpPermissionMode
+      : showClaudePermissionMode
+        ? state.claudePermissionMode
+        : state.codexApprovalMode;
   };
   /** Applies *mode*; resolves whether the session landed on it. */
   const changePermission = async (mode: string): Promise<boolean> => {
     if (isReadOnly || unreachable || configBusyRef.current) return false;
+    setCommandError(null);
     configBusyRef.current = true;
     setConfigBusy(true);
     const sourceSessionId = useChatStore.getState().conversationId;
     try {
       const store = useChatStore.getState();
-      if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
+      if (showAcpPermissionMode) await store.setAcpPermissionMode(mode);
+      else if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
       if (useChatStore.getState().conversationId !== sourceSessionId) return false;
       // The store reconciles to the mode the server confirms the session reached.
@@ -4159,7 +4175,7 @@ function ComposerImpl(
                   onReconnect={onShowReconnectHelp}
                 />
               )}
-              {(showClaudePermissionMode || showCodexApprovalMode) && (
+              {(showClaudePermissionMode || showCodexApprovalMode || showAcpPermissionMode) && (
                 <ComposerPermissionPicker
                   label="Permission mode"
                   value={permissionLabel || "Permission mode"}

@@ -9903,7 +9903,7 @@
                 "type": "null"
               }
             ],
-            "description": "Owner-only Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
+            "description": "Session permission mode. ACP accepts `auto` (ask) or `bypassPermissions` (approve policy-silent requests), with an exact acknowledgement from the live runner before persistence. For Claude-native, the permission mode switches a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
             "title": "Permission Mode"
           },
           "project_id": {
