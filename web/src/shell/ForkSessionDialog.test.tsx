@@ -1598,6 +1598,8 @@ describe("ForkSessionDialog", () => {
       );
       expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
       expect(screen.queryByTestId("fork-session-connect-host-toggle")).not.toBeInTheDocument();
+      // The only target is preselected, so the default state is submittable.
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Arclet Sandbox");
       openHostSelect();
       expect(screen.getAllByRole("option")).toHaveLength(1);
       expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Arclet Sandbox");

@@ -152,7 +152,8 @@ describe("useSessionActionRestrictions", () => {
       hostId: "host-1",
       labels: { "omnigent.host_type": "managed" },
     });
-    expect(result.current).toEqual(unsupported);
+    // Until the host lookup settles, the provider could still be a forkable Arclet.
+    expect(result.current).toEqual({ ...unsupported, forkDisabledReason: SESSION_ACTIONS_LOADING });
     await waitFor(() =>
       expect(client.getQueryState(["session", "session-1"])?.status).toBe("error"),
     );
@@ -160,6 +161,27 @@ describe("useSessionActionRestrictions", () => {
       expect(client.getQueryState(["hosts", { includeSandbox: true }])?.status).toBe("error"),
     );
     expect(result.current).toEqual(unsupported);
+  });
+
+  it("reports a managed source as loading, not unsupported, while its host loads", async () => {
+    let resolveHosts: (response: Response) => void = () => {};
+    fetchMock.mockImplementation(
+      () =>
+        new Promise<Response>((resolve) => {
+          resolveHosts = resolve;
+        }),
+    );
+    const { result } = renderRestrictions(undefined, session({ "omnigent.host_type": "managed" }), {
+      managed_sandboxes_enabled: true,
+      sandbox_providers: ["arclet"],
+    });
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+    expect(result.current.forkDisabledReason).toBe(SESSION_ACTIONS_LOADING);
+
+    act(() => resolveHosts(hostsResponse("arclet")));
+
+    await waitFor(() => expect(result.current.forkSandboxProvider).toBe("arclet"));
+    expect(result.current.forkDisabledReason).toBeUndefined();
   });
 
   it("explains a failed snapshot lookup instead of enabling actions", async () => {

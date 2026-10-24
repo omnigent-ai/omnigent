@@ -805,10 +805,9 @@ function SupportedForkSessionForm({
   const [showErrors, setShowErrors] = useState(false);
   const [focusField, setFocusField] = useState<ForkField | null>(null);
 
-  // A coding source ran in a working directory; only then does the fork
-  // need a host + directory to start. A non-coding source forks with just
-  // name + agent (no directory to pick). A sandbox-only fork always picks
-  // its sandbox, so it takes the coding path.
+  // A coding source ran in a working directory, so the fork needs a host +
+  // directory to start; a sandbox-only fork always picks its sandbox. Others
+  // fork with just name + agent (no directory to pick).
   const sandboxOnly = sandboxOnlyProvider !== undefined;
   const isCodingSource = workspaceRecovery || Boolean(sourceWorkspace) || sandboxOnly;
 
@@ -1599,10 +1598,9 @@ function SupportedForkSessionForm({
                     ))}
                   </SelectContent>
                 </Select>
-                {/* A sandbox is a usable target, so no dead-end even with no
-                    host online: offer connecting one as a collapsed, optional
-                    step rather than an alarming "no hosts connected" banner.
-                    A sandbox-only fork can't use one, so it says why instead. */}
+                {/* A sandbox is a usable target, so connecting a host is a
+                    collapsed, optional step rather than a "no hosts connected"
+                    banner. A sandbox-only fork can't use one, so it says why. */}
                 {sandboxOnlyProvider !== undefined ? (
                   <p
                     className="text-sm text-muted-foreground"

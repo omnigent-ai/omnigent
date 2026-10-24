@@ -207,7 +207,7 @@ def test_arclet_session_forks_only_onto_a_new_arclet(
     mock_llm_server_url: str,
     tmp_path: Path,
 ) -> None:
-    """Every fork entry point opens a clone whose only target is a fresh Arclet."""
+    """Fork entry points are enabled, and the header Fork offers only a fresh Arclet."""
     del mock_llm_server_url
     base_url, session_id = seeded_session
     page.goto(f"{base_url}/c/{session_id}")
@@ -252,7 +252,9 @@ def test_arclet_session_forks_only_onto_a_new_arclet(
     expect(page.get_by_test_id("fork-session-sandbox-only-hint")).to_have_text(
         "This session can only be cloned onto a new Arclet Sandbox."
     )
-    page.get_by_test_id("fork-session-host-select").click()
+    host_select = page.get_by_test_id("fork-session-host-select")
+    expect(host_select).to_contain_text("Arclet Sandbox")
+    host_select.click()
     expect(page.get_by_role("option")).to_have_count(1)
     sandbox_row = page.get_by_test_id("fork-session-sandbox-option")
     expect(sandbox_row).to_have_text("Arclet Sandbox")

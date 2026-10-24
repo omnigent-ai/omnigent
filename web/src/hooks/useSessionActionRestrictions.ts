@@ -48,8 +48,12 @@ export function useSessionActionRestrictions(
   if (lookupFailed) lookupReason = SESSION_ACTIONS_UNAVAILABLE;
   else if (loading) lookupReason = SESSION_ACTIONS_LOADING;
   const hostMissing = Boolean(hostId && hosts && !host);
+  // A managed source's provider decides whether it forks, so wait for its host.
+  const hostPending = Boolean(hostId && hostsLoading);
   return {
-    forkDisabledReason: restrictions.forkDisabledReason ?? forkTargetReason ?? lookupReason,
+    forkDisabledReason: hostPending
+      ? lookupReason
+      : (restrictions.forkDisabledReason ?? forkTargetReason ?? lookupReason),
     forkSandboxProvider,
     switchHostDisabledReason:
       restrictions.switchHostDisabledReason ??

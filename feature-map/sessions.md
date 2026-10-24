@@ -307,8 +307,8 @@ devices fold some row controls into the menu.
 the clone dialog with a new Arclet sandbox as its only host; connected hosts
 and other sandbox providers are not offered. The repository prefills from the
 source's. Fork stays disabled when the server offers no Arclet, and **Continue
-in another directory…** explains that the session can only be cloned onto a new
-sandbox.
+in another directory…** is disabled because the session can only be cloned onto
+a new sandbox.
 
 **Databricks Sandbox and Arclet sessions:** Fork is disabled for Databricks
 Sandbox sessions in the header, sidebar menus, and message actions. The
