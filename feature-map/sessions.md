@@ -22,10 +22,14 @@ the header menu), and each place is a separate entry point.
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
 - `archive`: archived sessions leave the main list and appear in the archived
-  view, which can be filtered by project and paged. On a server with worktree
-  cleanup, archiving a session that has a git worktree first asks whether to
-  also delete the worktree (the branch is kept); Remember my choice saves the
-  answer, which Settings → Git can change later.
+  view, which can be filtered by project and paged. Settings → Archived can
+  also be searched: search matches titles and content, and also matches a
+  pasted Omnigent or source-harness session ID exactly. A harness ID must be 8
+  to 128 characters and contain a digit, `-` or `_`, and on split-database
+  servers it needs a signed-in user. On a server with worktree cleanup,
+  archiving a session that has a git worktree first asks whether to also delete
+  the worktree (the branch is kept); Remember my choice saves the answer, which
+  Settings → Git can change later.
 - `stop`: Stop session on a hosted parent ends its runner, including side chats
   and sub-agents sharing that runner. Conversation histories are kept.
 - `side-chat-lifecycle`: generic side chats reuse their parent's live runner;
@@ -37,8 +41,10 @@ the header menu), and each place is a separate entry point.
   writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
   interleaved comments and existing attachments; removing a quote keeps its comments.
   Live side chats accept pasted images in every reply text field.
-- `unarchive`: offered on archived rows, in bulk selection, and in the header
-  menu of an archived session.
+- `unarchive`: offered on archived rows, in bulk selection, in the header
+  menu of an archived session, and on an exact-ID import that finds the session
+  already imported and archived. Unarchiving a row in Settings → Archived opens
+  the session.
 - `delete`: confirmed, then removed from the list and the server.
 - `export`: Export in the header menu saves the transcript as a local file.
 - `unread`: Mark as unread flags a session to revisit and survives a reload,
@@ -91,7 +97,8 @@ the header menu), and each place is a separate entry point.
 - `import-progress`: import recent sessions or one session by ID from an online
   machine. Settings shows a spinner and count; the sidebar heading retains
   progress after leaving Settings. Results stay compact, with expandable failure
-  details and retry of the original selection.
+  details and retry of the original selection. An exact-ID import of a session
+  you can read that is already imported names it and links to it.
 - `resume-imported`: an imported session can be resumed onto a chosen local host.
 - `recent-switcher`: the desktop app opens the five most recent sessions with
   Control+Tab; Tab and Shift+Tab cycle, releasing Control switches, and Escape cancels.
@@ -232,7 +239,8 @@ Dismissing it cancels the archive. Settings → Git → Worktrees holds the save
 choice only when the server supports cleanup.
 
 **Archived view:** choose Display → Archived sessions in the sidebar filter
-menu, then filter by project.
+menu, then filter by project. Settings → Archived sessions has the same list
+with a search box; paste a session ID there to find that archived session.
 
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
 Projects header holds Grouping, Display, Ordering and Show. In
@@ -419,6 +427,12 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_sidebar_bulk_actions.py::test_bulk_archive_moves_session_to_archived`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_narrows_and_resets`,
   `tests/e2e_ui/sessions/test_archived_project_filter.py::test_archived_project_filter_load_more_pages_through`
+- **`archive`, session-ID search:**
+  `tests/e2e_ui/sessions/test_archived_session_id_search.py::test_archived_search_finds_and_unarchives_session_by_id`
+  searches Settings → Archived by a real import's harness ID and Omnigent ID,
+  then unarchives it back into the sidebar.
+  `tests/stores/test_conversation_store_session_id_search.py` covers ID
+  spellings, access control, and single- and split-database stores.
 - **`archive`, worktree prompt:**
   `tests/server/integration/test_sessions_archive.py::test_archive_stop_removes_worktree_when_requested`
   and
@@ -430,6 +444,11 @@ plain `uv run pytest`, which starts a private server for the test.
   `web/src/shell/HeaderConversationMenu.test.tsx`. Manually: archive a
   worktree session from the row menu, bulk selection, and header menu, and
   expect the dialog each time; a session without a worktree archives silently.
+- **`unarchive`, already-imported session:**
+  `tests/e2e_ui/sessions/test_archived_session_id_search.py::test_reimporting_archived_session_offers_unarchive`
+  (stubbed host and import stream naming a real archived session).
+  `tests/server/routes/test_imports.py::test_exact_local_import_names_the_existing_session_to_its_reader`
+  checks that only a reader of the existing session learns its ID.
 - **`unarchive`, header menu:**
   `tests/e2e_ui/sessions/test_archived_session_header_menu.py::test_archived_session_header_menu_offers_unarchive`.
   The sidebar row and bulk unarchive have web unit coverage only: archive a

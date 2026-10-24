@@ -1775,6 +1775,7 @@ describe("importLocalSessions", () => {
         { id: "c2", title: null },
       ],
       failures: [],
+      alreadyImportedSession: null,
     });
     // Hits the streaming endpoint with the snake_case body.
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
@@ -1784,6 +1785,53 @@ describe("importLocalSessions", () => {
       source: "all",
       limit: 25,
     });
+  });
+
+  it("returns the existing session an exact-id import already created", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "done",
+          imported: 0,
+          already_imported: 1,
+          failed: 0,
+          already_imported_session: {
+            session_id: "c9",
+            title: "Planning",
+            archived: true,
+            can_unarchive: true,
+          },
+        }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "claude", 25, undefined, "harness-9");
+
+    expect(result.alreadyImported).toBe(1);
+    expect(result.alreadyImportedSession).toEqual({
+      id: "c9",
+      title: "Planning",
+      archived: true,
+      canUnarchive: true,
+    });
+  });
+
+  it("ignores a malformed existing-session reference", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({
+          event: "done",
+          imported: 0,
+          already_imported: 1,
+          failed: 0,
+          already_imported_session: { title: "No id" },
+        }),
+      ]),
+    );
+
+    const result = await importLocalSessions("host_1", "claude", 25, undefined, "harness-9");
+
+    expect(result.alreadyImportedSession).toBeNull();
   });
 
   it("collects per-session failure reasons from failed events and the tally", async () => {
@@ -1891,6 +1939,7 @@ describe("importLocalSessions", () => {
         { id: "c2", title: null },
       ],
       failures: [],
+      alreadyImportedSession: null,
     });
     // First the stream endpoint (404), then the buffered fallback.
     expect(fetchMock.mock.calls[0][0]).toBe("/v1/imports/local/stream");

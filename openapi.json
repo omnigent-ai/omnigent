@@ -2329,6 +2329,41 @@
         "title": "ErrorResponse",
         "type": "object"
       },
+      "ExistingImportRef": {
+        "description": "The session an exact-id import found already imported.\n\nLets the UI point at the existing session (which may be archived) instead\nof only counting it. Only reported when the caller can read that session.",
+        "properties": {
+          "archived": {
+            "default": false,
+            "title": "Archived",
+            "type": "boolean"
+          },
+          "can_unarchive": {
+            "default": false,
+            "title": "Can Unarchive",
+            "type": "boolean"
+          },
+          "session_id": {
+            "title": "Session Id",
+            "type": "string"
+          },
+          "title": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Title"
+          }
+        },
+        "required": [
+          "session_id"
+        ],
+        "title": "ExistingImportRef",
+        "type": "object"
+      },
       "ExtensionAssetErrorResponse": {
         "description": "Concise diagnostic for one unresolved browser bundle.",
         "properties": {
@@ -3628,6 +3663,16 @@
             "format": "int64",
             "title": "Already Imported",
             "type": "integer"
+          },
+          "already_imported_session": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/ExistingImportRef"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "failed": {
             "format": "int64",
@@ -12227,7 +12272,7 @@
     },
     "/v1/imports/local/stream": {
       "post": {
-        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch. Each session that could not be imported\nemits one `{\"event\": \"failed\", \"external_session_id\", \"source\", \"reason\"}` line (after the successes), and a terminal\n`{\"event\": \"done\", ...}` carries the tally plus the full `failures`\nlist. A mid-stream host read failure emits `{\"event\": \"error\", ...}`\nbefore `done` (the sessions read so far are already committed and a\nretry is idempotent). Request validation still fails ahead of the stream\nwith the usual HTTP error.",
+        "description": "Stream local transcripts from a chosen host.\n\nSame import as the buffered `POST /v1/imports/local`, but responds with\nNDJSON: one `{\"event\": \"session\", ...}` line per newly imported session\nas its frame lands, so the caller lists sessions as they arrive rather\nthan waiting out the whole batch. Each session that could not be imported\nemits one `{\"event\": \"failed\", \"external_session_id\", \"source\", \"reason\"}` line (after the successes), and a terminal\n`{\"event\": \"done\", ...}` carries the tally, the full `failures`\nlist, and `already_imported_session` (see `LocalImportResponse`).\nA mid-stream host read failure emits `{\"event\": \"error\", ...}`\nbefore `done` (the sessions read so far are already committed and a\nretry is idempotent). Request validation still fails ahead of the stream\nwith the usual HTTP error.",
         "operationId": "import_local_sessions_stream_v1_imports_local_stream_post",
         "requestBody": {
           "content": {
@@ -13185,7 +13230,7 @@
             }
           },
           {
-            "description": "Case-insensitive substring filter on the session title or conversation content. `None` or empty string disables the filter. A session matches if its title contains the query or any of its conversation items' text does. Powers the sidebar's session search.",
+            "description": "Case-insensitive substring filter on the session title or conversation content. `None` or empty string disables the filter. A session matches if its title contains the query or any of its conversation items' text does. A pasted session id also finds that session, by its Omnigent id or the harness session id it was imported from. Powers the sidebar's and Archived settings' session search.",
             "in": "query",
             "name": "search_query",
             "required": false,

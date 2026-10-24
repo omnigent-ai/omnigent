@@ -1,15 +1,17 @@
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { MemoryRouter } from "react-router-dom";
 
 import { ImportSessionsPanel } from "./ImportSessionsPanel";
 import { useHosts } from "@/hooks/useHosts";
+import { useArchiveConversation } from "@/hooks/useConversations";
 import { importLocalSessions, type LocalImportResult } from "@/lib/sessionsApi";
 import { useSessionImportStore } from "@/store/sessionImport";
 
 vi.mock("@/hooks/useHosts", () => ({ useHosts: vi.fn() }));
+vi.mock("@/hooks/useConversations", () => ({ useArchiveConversation: vi.fn() }));
 vi.mock("@/lib/sessionsApi", () => ({ importLocalSessions: vi.fn() }));
 vi.mock("./HostLabel", () => ({
   HostLabel: ({ host }: { host: { name: string } }) => <span>{host.name}</span>,
@@ -42,6 +44,15 @@ vi.mock("@/components/ui/select", () => ({
 
 const useHostsMock = vi.mocked(useHosts);
 const importLocalSessionsMock = vi.mocked(importLocalSessions);
+const useArchiveConversationMock = vi.mocked(useArchiveConversation);
+const unarchiveMutateAsync = vi.fn();
+
+function mockUnarchiveState(state: { isPending?: boolean } = {}) {
+  useArchiveConversationMock.mockReturnValue({
+    mutateAsync: unarchiveMutateAsync,
+    isPending: state.isPending ?? false,
+  } as unknown as ReturnType<typeof useArchiveConversation>);
+}
 
 function renderPanel() {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
@@ -57,6 +68,9 @@ function renderPanel() {
 beforeEach(() => {
   useHostsMock.mockReset();
   importLocalSessionsMock.mockReset();
+  unarchiveMutateAsync.mockReset();
+  unarchiveMutateAsync.mockResolvedValue({});
+  mockUnarchiveState();
   useSessionImportStore.setState({
     importing: false,
     importedCount: 0,
@@ -86,7 +100,14 @@ describe("ImportSessionsPanel", () => {
         title: `Session ${i}`,
       }));
       sessions.forEach((session) => onSession?.(session));
-      return { imported: 35, alreadyImported: 1, failed: 0, sessions, failures: [] };
+      return {
+        imported: 35,
+        alreadyImported: 1,
+        failed: 0,
+        sessions,
+        failures: [],
+        alreadyImportedSession: null,
+      };
     });
     renderPanel();
     fireEvent.change(screen.getAllByRole("combobox")[3], { target: { value: "50" } });
@@ -118,6 +139,7 @@ describe("ImportSessionsPanel", () => {
           { externalSessionId: "bad-1", source: "codex", reason: "No visible messages to import." },
           { externalSessionId: null, source: null, reason: "This session could not be read." },
         ],
+        alreadyImportedSession: null,
       };
     });
 
@@ -180,6 +202,7 @@ describe("ImportSessionsPanel", () => {
       failed: 0,
       sessions: [{ id: "c1", title: "First session" }],
       failures: [],
+      alreadyImportedSession: null,
     });
     await waitFor(() =>
       expect(screen.getByTestId("import-result")).toHaveTextContent("Imported 1."),
@@ -198,6 +221,7 @@ describe("ImportSessionsPanel", () => {
         failed: 0,
         sessions: [{ id: "c1", title: "Exact session" }],
         failures: [],
+        alreadyImportedSession: null,
       };
     });
 
@@ -222,6 +246,109 @@ describe("ImportSessionsPanel", () => {
       ),
     );
   });
+
+  async function importArchivedExactSession(canUnarchive = true) {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockResolvedValue({
+      imported: 0,
+      alreadyImported: 1,
+      failed: 0,
+      sessions: [],
+      failures: [],
+      alreadyImportedSession: {
+        id: "c9",
+        title: "Planning thread",
+        archived: true,
+        canUnarchive,
+      },
+    });
+
+    const view = renderPanel();
+    fireEvent.change(screen.getAllByRole("combobox")[1], { target: { value: "session" } });
+    fireEvent.change(screen.getByTestId("import-session-id"), {
+      target: { value: "harness-9" },
+    });
+    fireEvent.click(screen.getByTestId("import-submit"));
+    return { view, notice: await screen.findByTestId("import-existing-session") };
+  }
+
+  it("links an already-imported exact session and restores it when archived", async () => {
+    const { view, notice } = await importArchivedExactSession();
+    expect(screen.getByTestId("import-result")).toHaveTextContent(
+      "Imported 0, 1 already imported.",
+    );
+    expect(notice).toHaveTextContent("Already imported as “Planning thread” (archived).");
+    expect(screen.getByTestId("import-existing-session-open")).toHaveAttribute("href", "/c/c9");
+    fireEvent.click(screen.getByTestId("import-existing-session-unarchive"));
+    expect(unarchiveMutateAsync).toHaveBeenCalledWith({ id: "c9", archived: false });
+
+    expect(await screen.findByTestId("import-existing-session-restored")).toBeInTheDocument();
+    expect(screen.getByTestId("import-existing-session")).not.toHaveTextContent("(archived)");
+    expect(screen.queryByTestId("import-existing-session-unarchive")).toBeNull();
+
+    // The import result outlives the panel, so coming back to Settings stays current.
+    view.unmount();
+    renderPanel();
+    expect(screen.getByTestId("import-existing-session")).not.toHaveTextContent("(archived)");
+    expect(screen.queryByTestId("import-existing-session-unarchive")).toBeNull();
+  });
+
+  it("keeps offering Unarchive when restoring the existing session fails", async () => {
+    unarchiveMutateAsync.mockRejectedValue(new Error("server down"));
+    const { notice } = await importArchivedExactSession();
+    fireEvent.click(screen.getByTestId("import-existing-session-unarchive"));
+    await waitFor(() => expect(unarchiveMutateAsync).toHaveBeenCalledTimes(1));
+    // Let the rejected restore chain settle before checking nothing changed.
+    await act(async () => {
+      await new Promise((resolve) => {
+        setTimeout(resolve, 0);
+      });
+    });
+
+    expect(notice).toHaveTextContent("(archived)");
+    expect(screen.getByTestId("import-existing-session-unarchive")).toBeInTheDocument();
+    expect(screen.queryByTestId("import-existing-session-restored")).toBeNull();
+    expect(useSessionImportStore.getState().result?.alreadyImportedSession?.archived).toBe(true);
+  });
+
+  it("disables Unarchive while the restore is in flight", async () => {
+    mockUnarchiveState({ isPending: true });
+    await importArchivedExactSession();
+    expect(screen.getByTestId("import-existing-session-unarchive")).toBeDisabled();
+  });
+
+  it("does not offer Unarchive to a reader who cannot unarchive the session", async () => {
+    const { notice } = await importArchivedExactSession(false);
+    expect(notice).toHaveTextContent("Already imported as “Planning thread” (archived).");
+    expect(screen.getByTestId("import-existing-session-open")).toHaveAttribute("href", "/c/c9");
+    expect(screen.queryByTestId("import-existing-session-unarchive")).toBeNull();
+  });
+
+  it("does not offer Unarchive for an already-imported active session", async () => {
+    useHostsMock.mockReturnValue({
+      data: [{ host_id: "host_1", name: "mac-laptop", owner: "alice", status: "online" }],
+    } as unknown as ReturnType<typeof useHosts>);
+    importLocalSessionsMock.mockResolvedValue({
+      imported: 0,
+      alreadyImported: 1,
+      failed: 0,
+      sessions: [],
+      failures: [],
+      alreadyImportedSession: { id: "c3", title: null, archived: false, canUnarchive: false },
+    });
+
+    renderPanel();
+    fireEvent.change(screen.getAllByRole("combobox")[1], { target: { value: "session" } });
+    fireEvent.change(screen.getByTestId("import-session-id"), { target: { value: "harness-3" } });
+    fireEvent.click(screen.getByTestId("import-submit"));
+
+    const notice = await screen.findByTestId("import-existing-session");
+    expect(notice).toHaveTextContent("Already imported as “Untitled session”.");
+    expect(screen.getByTestId("import-existing-session-open")).toHaveAttribute("href", "/c/c3");
+    expect(screen.queryByTestId("import-existing-session-unarchive")).toBeNull();
+  });
 });
 
 it("Retry failed preserves the original request after leaving Settings", async () => {
@@ -240,6 +367,7 @@ it("Retry failed preserves the original request after leaving Settings", async (
     failures: [
       { externalSessionId: "thread-to-retry", source: "codex", reason: "Could not read session" },
     ],
+    alreadyImportedSession: null,
   };
   importLocalSessionsMock.mockImplementation(
     () =>

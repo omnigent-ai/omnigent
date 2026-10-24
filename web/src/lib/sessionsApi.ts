@@ -543,6 +543,15 @@ export interface ImportedSessionRef {
   title: string | null;
 }
 
+/** The session an exact-id import matched, when the caller can read it. */
+export interface ExistingImportRef {
+  id: string;
+  title: string | null;
+  archived: boolean;
+  /** Unarchiving needs owner access, which a reader may lack. */
+  canUnarchive: boolean;
+}
+
 /** One session that could not be imported, with a user-facing reason. */
 export interface ImportFailureRef {
   /** null when the failing session's id wasn't known (host reported a count only). */
@@ -559,6 +568,21 @@ export interface LocalImportResult {
   sessions: ImportedSessionRef[];
   /** One entry per failed session, with a reason; length equals `failed`. */
   failures: ImportFailureRef[];
+  /** Set when an exact-id import found the session already imported. */
+  alreadyImportedSession: ExistingImportRef | null;
+}
+
+/** Parse the `already_imported_session` wire field; null when absent or malformed. */
+function toExistingImportRef(value: unknown): ExistingImportRef | null {
+  if (typeof value !== "object" || value === null) return null;
+  const record = value as Record<string, unknown>;
+  if (typeof record.session_id !== "string" || !record.session_id) return null;
+  return {
+    id: record.session_id,
+    title: typeof record.title === "string" ? record.title : null,
+    archived: record.archived === true,
+    canUnarchive: record.can_unarchive === true,
+  };
 }
 
 /** Map one `failed`/`failures[]` wire record to an {@link ImportFailureRef}. */
@@ -616,6 +640,7 @@ export async function importLocalSessions(
   let imported = 0;
   let alreadyImported = 0;
   let failed = 0;
+  let alreadyImportedSession: ExistingImportRef | null = null;
   let errorMessage: string | null = null;
 
   const handleLine = (line: string): void => {
@@ -640,6 +665,7 @@ export async function importLocalSessions(
       imported = typeof evt.imported === "number" ? evt.imported : sessions.length;
       alreadyImported = typeof evt.already_imported === "number" ? evt.already_imported : 0;
       failed = typeof evt.failed === "number" ? evt.failed : failures.length;
+      alreadyImportedSession = toExistingImportRef(evt.already_imported_session);
     } else if (evt.event === "error") {
       errorMessage = typeof evt.message === "string" ? evt.message : "Import failed. Try again.";
     }
@@ -670,7 +696,7 @@ export async function importLocalSessions(
   }
 
   if (errorMessage !== null) throw new Error(errorMessage);
-  return { imported, alreadyImported, failed, sessions, failures };
+  return { imported, alreadyImported, failed, sessions, failures, alreadyImportedSession };
 }
 
 /**
@@ -715,6 +741,8 @@ async function importLocalSessionsBuffered(
       source: f.source,
       reason: f.reason,
     })),
+    // The buffered fallback is never used for exact-id imports.
+    alreadyImportedSession: null,
   };
 }
 

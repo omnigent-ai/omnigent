@@ -18,12 +18,13 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 
 from omnigent.db.utils import builtin_agent_id
 from omnigent.db.workspace_cache import WorkspaceScopedCache
-from omnigent.entities import NewConversationItem, parse_item_data
+from omnigent.entities import Conversation, NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import HostImportLocalByIdFrame, HostImportLocalFrame, encode_host_frame
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
-from omnigent.server.auth import LEVEL_OWNER, AuthProvider
+from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
+from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import require_access, require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
@@ -169,6 +170,20 @@ class ImportedSessionRef(BaseModel):
     title: str | None = None
 
 
+class ExistingImportRef(BaseModel):
+    """The session an exact-id import found already imported.
+
+    Lets the UI point at the existing session (which may be archived) instead
+    of only counting it. Only reported when the caller can read that session.
+    """
+
+    session_id: str
+    title: str | None = None
+    archived: bool = False
+    # Unarchiving needs owner access, which a reader of the session may lack.
+    can_unarchive: bool = False
+
+
 class ImportFailureRef(BaseModel):
     """One session that could not be imported, with a user-facing reason.
 
@@ -196,6 +211,9 @@ class LocalImportResponse(BaseModel):
     sessions: list[ImportedSessionRef]
     # One entry per failed session (with a reason); its length equals ``failed``.
     failures: list[ImportFailureRef] = Field(default_factory=list)
+    # Set only by an exact-id import whose session already exists and is
+    # readable by the caller.
+    already_imported_session: ExistingImportRef | None = None
 
 
 @dataclass
@@ -532,19 +550,41 @@ def create_imports_router(
             raise host_absent_error(host)
         return user_id, host_conn
 
+    async def _caller_has_access(
+        user_id: str | None, conversation: Conversation, level: int
+    ) -> bool:
+        """Whether the importing user holds *level* on *conversation*.
+
+        Import dedup is workspace-wide, so the existing session may be another user's.
+        """
+        if permission_store is None:
+            return True
+        return await asyncio.to_thread(
+            check_session_access,
+            user_id,
+            conversation.id,
+            level,
+            permission_store,
+            conversation_store,
+            conversation,
+        )
+
     async def _import_local_core(
         body: LocalImportRequest,
         user_id: str | None,
         host_conn: HostConnection,
         counts: dict[str, int],
         failures: list[ImportFailureRef],
+        existing_sessions: list[ExistingImportRef],
     ) -> AsyncIterator[ImportedSessionRef]:
         """Import the host's requested sessions, one at a time.
 
         Yields one ref per newly imported session and tracks the running tally in
         ``counts`` (``imported`` / ``already_imported`` / ``failed``); each failed
         session appends an :class:`ImportFailureRef` (with a reason) to
-        ``failures``, so ``len(failures) == counts["failed"]``. Persists each
+        ``failures``, so ``len(failures) == counts["failed"]``. An exact-id
+        import that finds its session already imported appends it to
+        ``existing_sessions`` when the caller can read it. Persists each
         session as its frame arrives, so a large batch never buffers. Raises
         ``OmnigentError`` if the host read drops mid-stream, after the sessions
         read so far are already committed (retry is idempotent, and re-import of a
@@ -557,6 +597,24 @@ def create_imports_router(
         counts["imported"] = 0
         counts["already_imported"] = 0
         counts["failed"] = 0
+
+        async def _note_existing_import(existing: Conversation | None) -> None:
+            """Report an exact-id import's already-imported session when readable."""
+            if body.session_id is None or existing is None:
+                return
+            if not await _caller_has_access(user_id, existing, LEVEL_READ):
+                return
+            can_unarchive = existing.archived and await _caller_has_access(
+                user_id, existing, LEVEL_OWNER
+            )
+            existing_sessions.append(
+                ExistingImportRef(
+                    session_id=existing.id,
+                    title=existing.title,
+                    archived=existing.archived,
+                    can_unarchive=can_unarchive,
+                )
+            )
 
         def _fail(external_session_id: object, source: object, reason: str) -> None:
             counts["failed"] += 1
@@ -614,6 +672,7 @@ def create_imports_router(
             )
             if existing is not None:
                 counts["already_imported"] += 1
+                await _note_existing_import(existing)
                 continue
             try:
                 items = [ImportItemInput.model_validate(raw).to_item() for raw in raw_items]
@@ -634,6 +693,13 @@ def create_imports_router(
                 # it's already-imported, never a failure and never a duplicate.
                 if exc.code == ErrorCode.CONFLICT:
                     counts["already_imported"] += 1
+                    if body.session_id is not None:
+                        await _note_existing_import(
+                            await asyncio.to_thread(
+                                conversation_store.get_conversation,
+                                _import_conversation_id(source, external_session_id),
+                            )
+                        )
                     continue
                 _fail(external_session_id, source, exc.message)
                 continue
@@ -692,8 +758,11 @@ def create_imports_router(
         counts: dict[str, int] = {}
         sessions: list[ImportedSessionRef] = []
         failures: list[ImportFailureRef] = []
+        existing_sessions: list[ExistingImportRef] = []
         try:
-            async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
+            async for ref in _import_local_core(
+                body, user_id, host_conn, counts, failures, existing_sessions
+            ):
                 sessions.append(ref)
         except OmnigentError as exc:
             error_id, message = _record_local_import_failure(exc)
@@ -713,6 +782,7 @@ def create_imports_router(
             failed=counts.get("failed", 0),
             sessions=sessions,
             failures=failures,
+            already_imported_session=existing_sessions[0] if existing_sessions else None,
         )
 
     @router.post(
@@ -734,8 +804,9 @@ def create_imports_router(
         than waiting out the whole batch. Each session that could not be imported
         emits one ``{"event": "failed", "external_session_id", "source",
         "reason"}`` line (after the successes), and a terminal
-        ``{"event": "done", ...}`` carries the tally plus the full ``failures``
-        list. A mid-stream host read failure emits ``{"event": "error", ...}``
+        ``{"event": "done", ...}`` carries the tally, the full ``failures``
+        list, and ``already_imported_session`` (see :class:`LocalImportResponse`).
+        A mid-stream host read failure emits ``{"event": "error", ...}``
         before ``done`` (the sessions read so far are already committed and a
         retry is idempotent). Request validation still fails ahead of the stream
         with the usual HTTP error.
@@ -745,9 +816,12 @@ def create_imports_router(
         async def _events() -> AsyncIterator[bytes]:
             counts: dict[str, int] = {}
             failures: list[ImportFailureRef] = []
+            existing_sessions: list[ExistingImportRef] = []
             error: tuple[str, str] | None = None
             try:
-                async for ref in _import_local_core(body, user_id, host_conn, counts, failures):
+                async for ref in _import_local_core(
+                    body, user_id, host_conn, counts, failures, existing_sessions
+                ):
                     yield _import_event_line(
                         {"event": "session", "session_id": ref.session_id, "title": ref.title}
                     )
@@ -775,6 +849,9 @@ def create_imports_router(
                     "already_imported": counts.get("already_imported", 0),
                     "failed": counts.get("failed", 0),
                     "failures": [failure.model_dump() for failure in failures],
+                    "already_imported_session": (
+                        existing_sessions[0].model_dump() if existing_sessions else None
+                    ),
                 }
             )
 
