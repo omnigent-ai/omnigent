@@ -1770,6 +1770,20 @@ describe("NewChatLandingScreen initial picker loading", () => {
     }
   });
 
+  it("keeps the placeholder when the model-picker hotkey fires during a cold load", async () => {
+    mockModelQueries(() => pendingModels);
+    renderLanding();
+    const loading = expectLoading();
+
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    expect(expectLoading()).toBe(loading);
+    expect(screen.queryByRole("menu")).toBeNull();
+
+    mockModelQueries(() => CLAUDE_MODEL_OPTIONS_RESULT);
+    editDraft("Models arrived");
+    expect(await screen.findByTestId("new-chat-landing-agent-models")).toBeVisible();
+  });
+
   it("keeps ready cached selections visible during background refetches", () => {
     localStorage.setItem(
       HARNESS_OPTIONS_KEY,
@@ -6151,6 +6165,146 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("new-chat-landing-agent-a_pi")).toBeNull();
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
     expect(screen.getByTestId("new-chat-landing-agent-a_pi")).not.toHaveAttribute("data-active");
+  });
+
+  it("keeps the Other... flyout open while an edited harness loads its models", () => {
+    mockAgents([
+      testAgent("a_claude", "claude-native-ui", {
+        display_name: "Claude Code",
+        harness: "claude-native",
+      }),
+      testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
+    ]);
+    let piModels: Partial<ReturnType<typeof useHostModelOptions>> = {
+      ...PENDING_QUERY_STATE,
+      data: undefined,
+    };
+    mockModelQueries((harness) =>
+      harness === "pi-native" ? piModels : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    const other = screen.getByTestId("new-chat-landing-harness-more");
+    fireEvent.click(other);
+    const otherMenu = screen.getByTestId("new-chat-landing-agent-a_pi").closest('[role="menu"]');
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a_pi"));
+
+    // Pi's catalog is loading: the open menu stays mounted instead of the placeholder.
+    expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
+    expect(other).toBeInTheDocument();
+    expect(other).toHaveAttribute("data-state", "open");
+    expect(otherMenu).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "Loading models…",
+    );
+
+    // The config submenu can open under a resting cursor; the browser then
+    // reports the pointer leaving the Other... row toward it.
+    fireEvent.pointerLeave(other, {
+      pointerType: "mouse",
+      relatedTarget: screen.getByTestId("new-chat-landing-agent-models"),
+    });
+    expect(other).toHaveAttribute("data-state", "open");
+    expect(otherMenu).toBeInTheDocument();
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "Loading models…",
+    );
+
+    piModels = {
+      ...SUCCESS_QUERY_STATE,
+      data: [{ id: "example/model-a", model: "example/model-a", displayName: "Model A" }],
+    };
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Pi models arrived" },
+    });
+    expect(screen.getByTestId("new-chat-landing-agent-model-example/model-a")).toBeVisible();
+    expect(other).toHaveAttribute("data-state", "open");
+    expect(otherMenu).toContainElement(screen.getByTestId("new-chat-landing-agent-a_pi"));
+  });
+
+  it("keeps an inline harness's model submenu mounted while its models load", () => {
+    mockAgents([
+      testAgent("a_claude", "claude-native-ui", {
+        display_name: "Claude Code",
+        harness: "claude-native",
+      }),
+      testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
+    ]);
+    localStorage.setItem(LAST_AGENT_KEY, "a_pi");
+    const piModels = {
+      ...SUCCESS_QUERY_STATE,
+      data: [{ id: "example/model-a", model: "example/model-a", displayName: "Model A" }],
+    };
+    let claudeModels: Partial<ReturnType<typeof useHostModelOptions>> = {
+      ...PENDING_QUERY_STATE,
+      data: undefined,
+    };
+    mockModelQueries((harness) => (harness === "claude-native" ? claudeModels : piModels));
+    renderLanding();
+    const select = screen.getByTestId("new-chat-landing-agent-select");
+    expect(select.getAttribute("aria-label")).toMatch(/^Pi/);
+    fireEvent.pointerDown(select, { button: 0 });
+    const claudeRow = screen.getByTestId("new-chat-landing-agent-a_claude");
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a_claude"));
+
+    // Claude Code's catalog is loading: the open menu and its submenu stay mounted.
+    expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
+    expect(claudeRow).toHaveAttribute("data-state", "open");
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "Loading models…",
+    );
+
+    claudeModels = CLAUDE_MODEL_OPTIONS_RESULT;
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Claude models arrived" },
+    });
+    expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-model-opus")).toBeVisible();
+    expect(claudeRow).toHaveAttribute("data-state", "open");
+  });
+
+  it("shows the placeholder again when the preserved menu closes during an uncached load", () => {
+    mockAgents([
+      testAgent("a_claude", "claude-native-ui", {
+        display_name: "Claude Code",
+        harness: "claude-native",
+      }),
+      testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
+    ]);
+    let piModels: Partial<ReturnType<typeof useHostModelOptions>> = {
+      ...PENDING_QUERY_STATE,
+      data: undefined,
+    };
+    mockModelQueries((harness) =>
+      harness === "pi-native" ? piModels : CLAUDE_MODEL_OPTIONS_RESULT,
+    );
+    renderLanding();
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a_pi"));
+    expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-models")).toHaveTextContent(
+      "Loading models…",
+    );
+
+    // Dismissing the menu mid-load falls back to the cold-load placeholder.
+    closeMenu();
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-picker-loading")).toBeVisible();
+
+    piModels = {
+      ...SUCCESS_QUERY_STATE,
+      data: [{ id: "example/model-a", model: "example/model-a", displayName: "Model A" }],
+    };
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Pi models arrived" },
+    });
+    expect(screen.queryByTestId("new-chat-landing-picker-loading")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByRole("menu")).toBeNull();
   });
 
   // claude-native (a1, fully supported) plus cursor-native (a_cursor, not) so

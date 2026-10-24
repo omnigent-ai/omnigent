@@ -1,6 +1,7 @@
 import {
   type ComponentProps,
   type KeyboardEvent,
+  type PointerEvent,
   type ReactElement,
   type ReactNode,
   type SyntheticEvent,
@@ -128,6 +129,23 @@ function focusSelectedMenuItem(content: HTMLElement): void {
       (item) => item.getAttribute("aria-checked") === "true" || item.dataset.active === "true",
     ) ?? items[0];
   selected?.focus();
+}
+
+// Pointer-leave handler for picker rows. A submenu opened from inside this menu
+// can appear under a resting cursor, which the browser reports as leaving the
+// row; left to Radix, that refocuses the menu and closes the open flyout.
+export function ignorePointerLeaveIntoSubmenu(event: PointerEvent<HTMLElement>): void {
+  const ownMenu = event.currentTarget.closest('[role="menu"]');
+  let menu =
+    event.relatedTarget instanceof Element ? event.relatedTarget.closest('[role="menu"]') : null;
+  if (menu === ownMenu) return;
+  while (menu && menu !== ownMenu) {
+    const triggerId = menu.getAttribute("aria-labelledby")?.split(/\s+/)[0];
+    menu = triggerId
+      ? (menu.ownerDocument.getElementById(triggerId)?.closest('[role="menu"]') ?? null)
+      : null;
+  }
+  if (menu !== null) event.preventDefault();
 }
 
 export function HarnessPickerSubContent({
@@ -401,6 +419,7 @@ export function HarnessPickerEntry({
               onPointerMove={() => {
                 allowConfigOpen.current = false;
               }}
+              onPointerLeave={ignorePointerLeaveIntoSubmenu}
               onClick={(event) => {
                 if (disabled) {
                   event.preventDefault();
@@ -448,6 +467,7 @@ export function HarnessPickerEntry({
         withTooltip(
           <DropdownMenuItem
             {...rowProps}
+            onPointerLeave={ignorePointerLeaveIntoSubmenu}
             onSelect={(event) => {
               if (disabled) event.preventDefault();
               else onSelect?.();
