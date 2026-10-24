@@ -779,6 +779,17 @@ def register_resources_routes(
         """
         return LEVEL_OWNER if ntpath.isabs(client_path) else within_workspace
 
+    from omnigent.server.routes.routes_uploads import register_upload_routes
+
+    register_upload_routes(
+        router,
+        validate_session=_validate_session,
+        browse_level=_browse_level,
+        conversation_store=conversation_store,
+        runner_router=runner_router,
+        auth_provider=auth_provider,
+    )
+
     async def _authorize_browse_read(
         session_id: str,
         request: Request | None,
