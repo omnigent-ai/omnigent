@@ -33,13 +33,14 @@ import ipaddress
 import logging
 import socket
 import ssl
+import urllib.request
 from collections.abc import Callable
 from dataclasses import dataclass
 from email.message import Message
 from email.parser import BytesParser
 from pathlib import Path
 from typing import cast
-from urllib.parse import urlparse
+from urllib.parse import unquote, urlparse
 
 from omnigent.inner.credential_proxy import (
     SYNTHETIC_CREDENTIAL_PREFIX,
@@ -151,6 +152,55 @@ _CLOUD_TRAP_NETWORKS: tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, ...] 
     # See: https://learn.microsoft.com/en-us/azure/virtual-network/what-is-ip-address-168-63-129-16
     ipaddress.ip_network("168.63.129.16/32"),
 )
+
+
+async def _open_upstream(
+    host: str, connect_host: str, port: int, ssl_ctx: ssl.SSLContext | None = None
+) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
+    """Dial the destination, tunnelling via the ambient HTTP(S)_PROXY when set.
+
+    ``NO_PROXY`` hosts connect directly. TLS (when ``ssl_ctx`` is given) is
+    negotiated end-to-end with ``host`` over the CONNECT tunnel. Only env
+    vars are read (``ALL_PROXY`` is the fallback); OS proxy settings are ignored.
+
+    The CONNECT target is the DNS-pinned IP, and plain HTTP also uses CONNECT
+    (to port 80). Proxies that deny CONNECT to non-TLS ports (Squid's default)
+    or filter by hostname will refuse. Schemeless proxy values are read as
+    ``http://``; any other scheme is logged as an error and ignored (direct dial).
+    """
+    proxies = urllib.request.getproxies_environment()
+    proxy = proxies.get("https" if ssl_ctx else "http") or proxies.get("all")
+    p = urlparse(proxy if "://" in proxy else f"http://{proxy}") if proxy else None
+    if p and (p.scheme != "http" or not p.hostname):  # https:// would need TLS-in-TLS
+        logger.error("Unsupported upstream proxy scheme %r; connecting directly", p.scheme)
+        p = None
+    if not p or urllib.request.proxy_bypass_environment(f"{host}:{port}", proxies):
+        return await asyncio.open_connection(
+            connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
+        )
+    reader, writer = await asyncio.open_connection(p.hostname, p.port or 80)
+    try:
+        auth = b""
+        if p.username:  # basic auth only; no NTLM/Kerberos
+            cred = f"{unquote(p.username)}:{unquote(p.password or '')}".encode()
+            auth = b"Proxy-Authorization: Basic " + base64.b64encode(cred) + b"\r\n"
+        target = (
+            f"{connect_host}:{port}" if ":" not in connect_host else f"[{connect_host}]:{port}"
+        )
+        writer.write(f"CONNECT {target} HTTP/1.1\r\nHost: {target}\r\n".encode() + auth + b"\r\n")
+        await writer.drain()
+        head = await reader.readuntil(b"\r\n\r\n")
+        version, _, rest = head.split(b"\r\n", 1)[0].partition(b" ")
+        code = rest[:3]
+        if not (version.startswith(b"HTTP/1.") and code.isdigit() and code.startswith(b"2")):
+            # Status code only: the proxy's reason text is untrusted.
+            raise OSError(f"upstream proxy refused CONNECT: {code.decode(errors='replace')[:3]}")
+        if ssl_ctx:
+            await writer.start_tls(ssl_ctx, server_hostname=host)
+    except BaseException:
+        writer.close()
+        raise
+    return reader, writer
 
 
 class EgressProxy:
@@ -748,12 +798,7 @@ class EgressProxy:
         connect_host = pinned_ip or host
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    connect_host,
-                    port,
-                    ssl=self._upstream_h2_ssl_ctx,
-                    server_hostname=host,
-                ),
+                _open_upstream(host, connect_host, port, self._upstream_h2_ssl_ctx),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — closing the h2 stream signals failure
@@ -832,12 +877,7 @@ class EgressProxy:
         headers_raw = self._force_connection_close(rewrite.headers)
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(
-                    connect_host,
-                    port,
-                    ssl=ssl_ctx,
-                    server_hostname=host,
-                ),
+                _open_upstream(host, connect_host, port, ssl_ctx),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
@@ -997,7 +1037,7 @@ class EgressProxy:
         connect_host = pinned_ip or host
         try:
             upstream_reader, upstream_writer = await asyncio.wait_for(
-                asyncio.open_connection(connect_host, port),
+                _open_upstream(host, connect_host, port),
                 timeout=30,
             )
         except Exception as exc:  # noqa: BLE001 — upstream connect failure maps to 502
