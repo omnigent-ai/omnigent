@@ -12,8 +12,11 @@ invoking a bridged tool) lives in the gated e2e test.
 from __future__ import annotations
 
 import asyncio
+import importlib
+import inspect
 import json
 import os
+import secrets
 import sys
 import types
 from types import SimpleNamespace
@@ -24,6 +27,7 @@ import pytest
 from omnigent.inner.cursor_executor import (
     CursorExecutor,
     UnresolvableCursorModelError,
+    _argv_safe_auth_token,
     _build_cursor_prompt,
     _normalize_cursor_usage,
     _resolve_model,
@@ -1937,6 +1941,147 @@ async def test_bridge_spawns_in_workspace_cwd(
     assert os.path.realpath(sdk_state["launch_cwds"][0]) == os.path.realpath(str(workspace))
     # ...and the process cwd was restored afterwards.
     assert os.getcwd() == original_cwd
+
+
+async def test_bridge_launch_hardens_sdk_callback_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """The executor swaps both callback factories before launch; they redraw dash-leading tokens.
+
+    The fake SDK replays the bridge's leading-dash parser rule; the real-bridge
+    test below drives the actual SDK.
+    """
+    sdk_state = _install_fake_sdk(monkeypatch, [{"messages": [_assistant("ok")], "result": "ok"}])
+    fake_sdk = sys.modules["cursor_sdk"]
+
+    def _dash_leading_token() -> str:
+        return "-" + "a" * 42
+
+    generators: dict[str, types.ModuleType] = {}
+    for name in ("cursor_sdk._tool_callback", "cursor_sdk._store_callback"):
+        module = types.ModuleType(name)
+        module._new_auth_token = _dash_leading_token  # type: ignore[attr-defined]
+        monkeypatch.setitem(sys.modules, name, module)
+        generators[name] = module
+
+    launch_bridge = fake_sdk.AsyncClient.launch_bridge
+
+    async def launch_bridge_with_flag_parser(cls: Any, **kwargs: Any) -> Any:
+        token = sys.modules["cursor_sdk._tool_callback"]._new_auth_token()
+        if token.startswith("-"):  # the bridge's takeValue() rule
+            raise RuntimeError(
+                "Bridge exited before discovery with status 1: cursor-sdk-bridge "
+                "failed: Error: Missing value for --tool-callback-auth-token"
+            )
+        return await launch_bridge(**kwargs)
+
+    monkeypatch.setattr(
+        fake_sdk.AsyncClient, "launch_bridge", classmethod(launch_bridge_with_flag_parser)
+    )
+
+    executor = CursorExecutor(api_key="crsr_x", cwd=str(tmp_path))
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors == [], [e.message for e in errors]
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert len(sdk_state["launch_kwargs"]) == 1
+    # Both swapped factories redraw past a dash-leading token, even when called
+    # with a byte length like some factory signatures take.
+    for name, module in generators.items():
+        draws = iter(["-dash-first", "safe-second"])
+        monkeypatch.setattr(secrets, "token_urlsafe", lambda nbytes=None, draws=draws: next(draws))
+        assert module._new_auth_token(32) == "safe-second", name
+
+
+def test_argv_safe_auth_token_fails_fast_when_every_draw_is_dash_leading(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A token source that only yields dash-leading values errors out instead of spinning."""
+    monkeypatch.setattr(secrets, "token_urlsafe", lambda nbytes=None: "-stuck")
+    with pytest.raises(RuntimeError, match="argv-safe"):
+        _argv_safe_auth_token()
+
+
+async def test_real_bridge_launch_survives_dash_leading_callback_token(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """The real cursor-sdk bridge launches even when the token draw starts with ``-``.
+
+    Drives the installed cursor-sdk and its vendored bridge binary (skipped
+    without the ``cursor`` extra). Only ``AsyncAgent.create`` is faked: a real
+    agent needs Cursor credentials and network, while bridge launch -- the
+    boundary under test -- does not. The first ``secrets.token_urlsafe`` draw
+    is scripted to the 1-in-64 dash-leading case, and the test checks that the
+    hardened factory is what consumed it.
+    """
+    cursor_sdk = pytest.importorskip("cursor_sdk")
+    monkeypatch.delenv("RUNNER_SERVER_URL", raising=False)
+    # The executor swaps the SDK's factories in place; restore them on teardown.
+    factories: dict[str, Any] = {}
+    for name in ("cursor_sdk._tool_callback", "cursor_sdk._store_callback"):
+        module = importlib.import_module(name)
+        factory = getattr(module, "_new_auth_token", None)
+        if factory is not None:
+            factories[name] = factory
+            monkeypatch.setattr(module, "_new_auth_token", factory)
+    if not factories:
+        pytest.skip("installed cursor-sdk mints argv-safe tokens itself; nothing to harden")
+
+    real_token_urlsafe = secrets.token_urlsafe
+    scripted = iter(["-" + real_token_urlsafe(32)[1:]])
+    draws: list[tuple[str, str]] = []
+
+    def token_urlsafe(nbytes: int | None = None) -> str:
+        token = next(scripted, None) or real_token_urlsafe(nbytes)
+        draws.append((inspect.stack()[1].function, token))
+        return token
+
+    monkeypatch.setattr(secrets, "token_urlsafe", token_urlsafe)
+
+    class _Run:
+        async def events(self) -> Any:
+            yield SimpleNamespace(sdk_message=_assistant("ok"), interaction_update=None)
+
+        async def wait(self) -> Any:
+            return SimpleNamespace(status="finished", result="ok")
+
+        async def cancel(self) -> None:
+            pass
+
+    class _Agent:
+        async def send(self, prompt: str, **kwargs: Any) -> _Run:
+            return _Run()
+
+        async def close(self) -> None:
+            pass
+
+    clients: list[Any] = []
+
+    async def create(cls: Any, *, client: Any, **kwargs: Any) -> _Agent:
+        clients.append(client)
+        return _Agent()
+
+    monkeypatch.setattr(cursor_sdk.AsyncAgent, "create", classmethod(create))
+
+    executor = CursorExecutor(api_key="crsr_x", cwd=str(tmp_path))
+    try:
+        events = [e async for e in executor.run_turn([_user("hi")], [], "SYS")]
+    finally:
+        await executor.close()
+
+    errors = [e for e in events if isinstance(e, ExecutorError)]
+    assert errors == [], [e.message for e in errors]
+    assert any(isinstance(e, TurnComplete) for e in events)
+    assert len(clients) == 1 and isinstance(clients[0], cursor_sdk.AsyncClient)
+    # The dash-leading draw was consumed by the hardened factory, not elsewhere.
+    assert next(scripted, None) is None
+    assert draws[0][0] == "_argv_safe_auth_token" and draws[0][1].startswith("-")
 
 
 async def test_hooks_json_not_written_without_server_url(
