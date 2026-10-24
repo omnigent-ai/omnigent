@@ -19,6 +19,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `needs-auth`: a harness without usable credentials is shown as needing
   sign-in, with a repair hint, instead of failing after launch. A harness the
   host has not configured can be hidden from the picker.
+- `picker-entry-visibility`: the user hides individual harnesses and agents from
+  the new-chat picker in Settings → Appearance, per device. Independent of the
+  readiness filter above, which only drops rows that cannot launch.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the
@@ -103,6 +106,11 @@ with a question about its result; verify the routed model and retained history.
 
 **CLI:** run `omnigent <name>` from the matrix below; add `--resume` with or
 without a session ID to resume.
+
+**Picker visibility:** open Settings → Appearance → **Show in the new-chat
+picker** and turn an entry off, or press **Show all** to restore them. This is
+the user's own per-device choice, unlike "Hide unconfigured harnesses" next to
+it, which only drops rows that cannot launch on the selected host.
 
 **Claude sub-agents:** from a web-launched Claude session or a locally launched
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
@@ -360,6 +368,13 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`picker-entry-visibility`:**
+  `tests/e2e_ui/start_session/test_hidden_picker_entries.py` covers the
+  Settings → Appearance switches and the picker rows they drop. Unit coverage:
+  `web/src/lib/pickerEntryVisibility.test.ts`,
+  `web/src/shell/AgentHarnessPicker.visibility.test.tsx` and
+  `web/src/lib/agentGrouping.test.ts` (Settings and the picker group an entry
+  the same way).
 - **`model-and-effort`, Pi inference bindings (component):**
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal

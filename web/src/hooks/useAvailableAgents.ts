@@ -430,6 +430,23 @@ const AGENT_CATALOG_QUERY_KEY = ["available-agents-catalog"] as const;
 export const USER_AGENTS_QUERY_KEY = ["available-agents-user"] as const;
 const AVAILABLE_AGENTS_STALE_MS = 30_000;
 
+/**
+ * The server's agent catalog alone — no session discovery.
+ *
+ * Shares the picker's query key, and works outside a ``SidebarDataProvider``.
+ * Agents known only from a session (a one-off upload) are therefore absent.
+ *
+ * @param enabled - Whether to fetch; defaults true.
+ */
+export function useAgentCatalog(enabled = true) {
+  return useQuery({
+    queryKey: AGENT_CATALOG_QUERY_KEY,
+    queryFn: fetchAgentCatalog,
+    enabled,
+    staleTime: AVAILABLE_AGENTS_STALE_MS,
+  });
+}
+
 interface UseAvailableAgentsOptions {
   enabled?: boolean;
   /**
