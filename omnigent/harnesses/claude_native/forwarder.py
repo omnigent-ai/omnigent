@@ -29,11 +29,12 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeMessageDelta,
     ClaudeTranscriptItem,
     HookReadResult,
+    TranscriptCostTally,
     TranscriptReadResult,
     _display_text,
+    _read_complete_jsonl_records,
     _transcript_items_from_entry,
     _transcript_timestamp,
-    compute_transcript_cumulative_cost,
     read_active_session_id,
     read_bridge_id,
     read_claude_context_state,
@@ -46,6 +47,7 @@ from omnigent.harnesses.claude_native.bridge import (
     read_transcript_items_from_offset,
     read_transcript_items_since_with_position,
     read_transcript_path,
+    tally_transcript_cost,
     transcript_has_forked_from_marker,
     transcript_has_recent_local_command,
     url_component,
@@ -103,6 +105,9 @@ _TRUNCATABLE_SUBAGENT_FIELDS = frozenset(
 # surviving a cursor rewind that re-reads an already-persisted summary.
 _MAX_PERSISTED_COMPACTION_SEQS = 16
 _COMPACTION_SNAPSHOT_MAX_FAILURES = 8
+# Polls (about 10 s at the default cadence) a sub-agent may wait for its spawn
+# record or parent before it is set aside instead of re-correlated forever.
+_SUBAGENT_RESOLVE_MAX_ATTEMPTS = 40
 
 
 class _CompactionSnapshotError(ValueError):
@@ -957,16 +962,23 @@ class _TranscriptCostCacheEntry:
 
     The cost is recomputed only when the file's byte size changes, so the
     forwarder doesn't re-parse an unchanged transcript on every (0.25s)
-    poll. Append-only JSONL makes byte size a sound cache key.
+    poll. Append-only JSONL makes byte size a sound cache key. A grown file
+    whose bytes before ``tally.byte_offset`` still match
+    ``cursor_fingerprint`` is priced from its appended records only.
 
     :param size: File size in bytes when ``cost_usd`` was computed,
         e.g. ``81920``.
     :param cost_usd: Cumulative USD cost computed from the transcript at
         that size, or ``None`` when nothing could be priced.
+    :param tally: Incremental cost state read up to ``tally.byte_offset``.
+    :param cursor_fingerprint: :func:`_jsonl_cursor_fingerprint` at that
+        offset, or ``None`` when the file could not be fingerprinted.
     """
 
     size: int
     cost_usd: float | None
+    tally: TranscriptCostTally
+    cursor_fingerprint: str | None
 
 
 @dataclass
@@ -1155,6 +1167,12 @@ class _PostRetryTracker:
             exhausted=False,
             permanent=permanent,
         )
+
+    def record_unresolved(self, key: str) -> int:
+        """Count one poll that could not resolve ``key``, without backoff or HTTP health."""
+        entry = self._entries.setdefault(key, _PostRetryEntry())
+        entry.attempts += 1
+        return entry.attempts
 
     def record_snapshot_failure(
         self,
@@ -2536,7 +2554,8 @@ def _tool_use_ids_in_transcript(
     transcript_path: Path,
     *,
     include_sidechains: bool,
-) -> set[str] | None:
+    byte_offset: int = 0,
+) -> tuple[set[str], int] | None:
     """Return assistant tool-use ids from a Claude transcript.
 
     A partial trailing record is ignored because Claude may still be writing it;
@@ -2545,21 +2564,22 @@ def _tool_use_ids_in_transcript(
     :param transcript_path: Claude JSONL transcript to inspect.
     :param include_sidechains: Whether records mirrored from child agents
         belong to this transcript owner.
-    :returns: Tool-use ids owned by this transcript, or ``None`` when the file
-        could not be read so the caller retries on the next poll.
+    :param byte_offset: Start of the first record to read, e.g. ``4096``.
+    :returns: Tool-use ids owned by the complete records read and the byte
+        offset after the last of them, or ``None`` when the file could not be
+        read so the caller retries on the next poll.
     """
     try:
-        # ``errors="replace"`` tolerates a snapshot that ends mid-multibyte char
-        # while Claude is writing; the mangled tail line fails JSON parse below
-        # and is skipped, and the completed record is read on the next poll.
-        lines = transcript_path.read_text(encoding="utf-8", errors="replace").splitlines()
+        read = _read_complete_jsonl_records(transcript_path, byte_offset=byte_offset, start_line=0)
     except OSError:
         return None
     tool_use_ids: set[str] = set()
-    for line in lines:
+    for jsonl_record in read.records:
+        if jsonl_record.text is None:
+            continue
         try:
-            record = json.loads(line)
-        except (json.JSONDecodeError, TypeError):
+            record = json.loads(jsonl_record.text)
+        except ValueError:
             continue
         if not isinstance(record, dict):
             continue
@@ -2582,17 +2602,24 @@ def _tool_use_ids_in_transcript(
             tool_use_id = block.get("id")
             if isinstance(tool_use_id, str) and tool_use_id:
                 tool_use_ids.add(tool_use_id)
-    return tool_use_ids
+    return tool_use_ids, read.byte_offset
 
 
 @dataclass(frozen=True)
 class _TranscriptSpawnIdCacheEntry:
-    """Spawn tool-use IDs cached for a transcript's size, mtime and sidechain mode."""
+    """Spawn tool-use IDs cached for a transcript's size, mtime and sidechain mode.
+
+    ``byte_offset`` ends the last complete record scanned and
+    ``cursor_fingerprint`` hashes the bytes before it, so growth past an
+    unchanged prefix is scanned from the offset instead of from byte 0.
+    """
 
     size: int
     mtime_ns: int
     include_sidechains: bool
     tool_use_ids: frozenset[str]
+    byte_offset: int
+    cursor_fingerprint: str | None
 
 
 # Spawn-id memo keyed by transcript path: an unregistered meta re-runs
@@ -2607,21 +2634,26 @@ def _spawn_tool_use_ids_cached(
     transcript_path: Path,
     *,
     include_sidechains: bool,
-) -> frozenset[str]:
+) -> frozenset[str] | None:
     """
-    :func:`_tool_use_ids_in_transcript`, rescanning only when the file changed.
+    :func:`_tool_use_ids_in_transcript`, reading only what changed since the
+    previous scan.
+
+    An unchanged file is served from the memo. A file that grew past an
+    unchanged scanned prefix is read from the end of that prefix; any other
+    change rescans from byte 0.
 
     :param transcript_path: Claude JSONL transcript to inspect.
     :param include_sidechains: Forwarded to :func:`_tool_use_ids_in_transcript`.
-    :returns: Spawn tool-use ids owned by this transcript; empty when it
-        cannot be read.
+    :returns: Spawn tool-use ids owned by this transcript, empty when it does
+        not exist, or ``None`` when it exists but could not be read.
     """
     try:
         stat = transcript_path.stat()
-    except OSError:
+    except OSError as exc:
         with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
             _SPAWN_TOOL_USE_ID_CACHE.pop(transcript_path, None)
-        return frozenset()
+        return frozenset() if isinstance(exc, FileNotFoundError) else None
     with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
         cached = _SPAWN_TOOL_USE_ID_CACHE.pop(transcript_path, None)
         if (
@@ -2633,20 +2665,43 @@ def _spawn_tool_use_ids_cached(
             # Re-insert so the entry is the most recently used.
             _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = cached
             return cached.tool_use_ids
+    resume = (
+        cached
+        if cached is not None
+        and cached.include_sidechains == include_sidechains
+        and stat.st_size > cached.size
+        and cached.cursor_fingerprint is not None
+        and _readable_cursor_fingerprint(transcript_path, cached.byte_offset)
+        == cached.cursor_fingerprint
+        else None
+    )
     # Stat before read: a write landing in between is filed under the older
-    # stat, so the next poll sees a changed file and rescans.
-    scanned = _tool_use_ids_in_transcript(transcript_path, include_sidechains=include_sidechains)
+    # stat, so the next poll sees a changed file and scans it.
+    scanned = _tool_use_ids_in_transcript(
+        transcript_path,
+        include_sidechains=include_sidechains,
+        byte_offset=resume.byte_offset if resume is not None else 0,
+    )
     if scanned is None:
-        # A failed read is not an empty transcript; leave it uncached so the
-        # next poll retries instead of trusting an empty result.
-        return frozenset()
-    tool_use_ids = frozenset(scanned)
+        # A failed read is not an empty transcript; keep only a validated
+        # earlier scan so the next poll retries the rest.
+        if resume is not None:
+            with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
+                _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = resume
+        return None
+    new_ids, byte_offset = scanned
+    tool_use_ids = frozenset(new_ids) | (
+        resume.tool_use_ids if resume is not None else frozenset()
+    )
+    cursor_fingerprint = _readable_cursor_fingerprint(transcript_path, byte_offset)
     with _SPAWN_TOOL_USE_ID_CACHE_LOCK:
         _SPAWN_TOOL_USE_ID_CACHE[transcript_path] = _TranscriptSpawnIdCacheEntry(
             size=stat.st_size,
             mtime_ns=stat.st_mtime_ns,
             include_sidechains=include_sidechains,
             tool_use_ids=tool_use_ids,
+            byte_offset=byte_offset,
+            cursor_fingerprint=cursor_fingerprint,
         )
         while len(_SPAWN_TOOL_USE_ID_CACHE) > _SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES:
             _SPAWN_TOOL_USE_ID_CACHE.pop(next(iter(_SPAWN_TOOL_USE_ID_CACHE)))
@@ -2671,17 +2726,21 @@ def _subagent_own_spawn_tool_use_id(agent_jsonl_path: Path) -> str | None:
 def _subagent_parents_by_tool_use(
     transcript_path: Path,
     subagents_dir: Path,
-) -> dict[str, str | None]:
+) -> tuple[dict[str, str | None], list[Path]]:
     """Correlate Claude spawn tool ids to their immediate transcript owner.
 
-    Scans the root transcript and every ``agent-*.jsonl``, re-reading a file
-    only when its size or mtime changed since the previous scan. The caller
-    only invokes this while unregistered meta files exist; an orphan meta whose
-    spawn record never lands therefore costs one ``stat`` per transcript per
-    poll rather than a full re-parse of every file.
+    Scans the root transcript and every ``agent-*.jsonl``, reading a file
+    only when its size or mtime changed since the previous scan and, when it
+    only grew, only its appended records. The caller only invokes this while
+    unregistered meta files exist, so an unresolved meta costs one ``stat``
+    per idle transcript per poll rather than a full re-parse of every file.
+
+    :returns: The owners map and the transcripts that could not be read; an
+        unreadable transcript may own a spawn id missing from the map.
     """
     owners: dict[str, str | None] = {}
     ambiguous: set[str] = set()
+    unreadable_transcripts: list[Path] = []
     transcript_owners: list[tuple[Path, str | None]] = [(transcript_path, None)]
     transcript_owners.extend(
         (path, _subagent_id_from_meta_path(path))
@@ -2699,10 +2758,14 @@ def _subagent_parents_by_tool_use(
         own_spawn_tool_use_id = (
             _subagent_own_spawn_tool_use_id(path) if owner_id is not None else None
         )
-        for tool_use_id in _spawn_tool_use_ids_cached(
+        spawn_tool_use_ids = _spawn_tool_use_ids_cached(
             path,
             include_sidechains=owner_id is not None,
-        ):
+        )
+        if spawn_tool_use_ids is None:
+            unreadable_transcripts.append(path)
+            continue
+        for tool_use_id in spawn_tool_use_ids:
             if tool_use_id == own_spawn_tool_use_id:
                 continue
             if tool_use_id in owners and owners[tool_use_id] != owner_id:
@@ -2711,7 +2774,7 @@ def _subagent_parents_by_tool_use(
                 owners[tool_use_id] = owner_id
     for tool_use_id in ambiguous:
         owners.pop(tool_use_id, None)
-    return owners
+    return owners, unreadable_transcripts
 
 
 async def _forward_available_subagents(
@@ -2749,7 +2812,8 @@ async def _forward_available_subagents(
     :param agent_name: Agent/model name to stamp on mirrored items
         (mirrors the value used for the parent's transcript).
     :param start_retry_tracker: Backoff tracker for failed
-        ``external_subagent_start`` POSTs (keyed by ``subagent_id``).
+        ``external_subagent_start`` POSTs (keyed by ``subagent_id``) and
+        the per-sub-agent count of polls that could not resolve a parent.
     :param item_retry_tracker: Backoff tracker for failed
         ``external_conversation_item`` POSTs (keyed by source id).
     :param status_retry_tracker: Backoff tracker for failed
@@ -2781,33 +2845,91 @@ async def _forward_available_subagents(
         if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
         and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
     ]
-    parents_by_tool_use = (
+    candidate_metas: list[tuple[Path, dict[str, str]]] = []
+    for meta_path in candidate_meta_paths:
+        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
+        if meta is not None:
+            candidate_metas.append((meta_path, meta))
+    # Metas that can never correlate (teammates, malformed files) must not
+    # trigger a transcript scan on every poll.
+    parents_by_tool_use, unreadable_transcripts = (
         await asyncio.to_thread(
             _subagent_parents_by_tool_use,
             transcript_path,
             subagents_dir,
         )
-        if candidate_meta_paths
-        else {}
+        if candidate_metas
+        else ({}, [])
     )
+
+    async def _note_unresolved(
+        subagent_id: str, tool_use_id: str, parent_subagent_id: str | None
+    ) -> None:
+        """Count a poll without a resolved parent; park once the budget is spent."""
+        nonlocal updated
+        if unreadable_transcripts:
+            # An unreadable transcript may hold the spawn record; retry uncharged.
+            unreadable_polls = start_retry_tracker.record_unresolved(
+                f"subagent_unreadable:{subagent_id}"
+            )
+            if unreadable_polls == _SUBAGENT_RESOLVE_MAX_ATTEMPTS:
+                _logger.warning(
+                    "Cannot read claude-native transcripts to resolve sub-agent; still "
+                    "retrying; parent_session=%s subagent_id=%s tool_use_id=%s "
+                    "transcripts=%s",
+                    parent_session_id,
+                    subagent_id,
+                    tool_use_id,
+                    [path.name for path in unreadable_transcripts],
+                )
+            return
+        resolve_key = f"subagent_resolve:{subagent_id}"
+        attempts = start_retry_tracker.record_unresolved(resolve_key)
+        if attempts < _SUBAGENT_RESOLVE_MAX_ATTEMPTS:
+            _logger.debug(
+                "Deferring claude-native sub-agent with no resolved parent; "
+                "parent_session=%s subagent_id=%s tool_use_id=%s "
+                "parent_subagent_id=%s attempt=%s",
+                parent_session_id,
+                subagent_id,
+                tool_use_id,
+                parent_subagent_id,
+                attempts,
+            )
+            return
+        # Parked like a dropped parent: the empty child id keeps it out of the
+        # tail loops, and its own children are parked through the same path.
+        _logger.warning(
+            "Setting aside claude-native sub-agent whose parent never resolved; "
+            "parent_session=%s subagent_id=%s tool_use_id=%s parent_subagent_id=%s "
+            "attempts=%s",
+            parent_session_id,
+            subagent_id,
+            tool_use_id,
+            parent_subagent_id,
+            attempts,
+        )
+        start_retry_tracker.discard(resolve_key)
+        start_retry_tracker.discard(f"subagent_unreadable:{subagent_id}")
+        updated = SubagentForwardState(
+            subagents={
+                **updated.subagents,
+                subagent_id: SubagentEntry(
+                    subagent_id=subagent_id,
+                    child_conversation_id="",
+                    parent_subagent_id=parent_subagent_id,
+                ),
+            }
+        )
+        await _write_subagent_forward_state_async(bridge_dir, updated)
+
     pending: list[tuple[Path, dict[str, str], str | None]] = []
-    for meta_path in candidate_meta_paths:
-        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
-        if meta is None:
-            continue
+    for meta_path, meta in candidate_metas:
         tool_use_id = meta["toolUseId"]
         if tool_use_id not in parents_by_tool_use:
             # No transcript owns this spawn yet: the record is still mid-write, or
-            # it resolved to two owners and was dropped as ambiguous. Either way we
-            # retry next tick; log so a persistent miss (e.g. a transcript-format
-            # drift) is diagnosable rather than silent.
-            _logger.debug(
-                "Deferring claude-native sub-agent with no resolved parent; "
-                "parent_session=%s subagent_id=%s tool_use_id=%s",
-                parent_session_id,
-                _subagent_id_from_meta_path(meta_path),
-                tool_use_id,
-            )
+            # it resolved to two owners and was dropped as ambiguous.
+            await _note_unresolved(_subagent_id_from_meta_path(meta_path), tool_use_id, None)
             continue
         pending.append((meta_path, meta, parents_by_tool_use[tool_use_id]))
 
@@ -2920,6 +3042,8 @@ async def _forward_available_subagents(
                 )
                 continue
             start_retry_tracker.clear(retry_key)
+            start_retry_tracker.discard(f"subagent_resolve:{subagent_id}")
+            start_retry_tracker.discard(f"subagent_unreadable:{subagent_id}")
             updated = SubagentForwardState(
                 subagents={
                     **updated.subagents,
@@ -2934,14 +3058,15 @@ async def _forward_available_subagents(
             made_progress = True
         if not made_progress:
             # A full pass registered nothing: every deferred child is waiting on a
-            # parent we haven't seen on disk yet. Retry next tick; log the stuck
-            # set so a parent that never arrives doesn't strand children silently.
-            if deferred:
-                _logger.debug(
-                    "Deferring claude-native sub-agents whose parent is not yet "
-                    "registered; parent_session=%s pending=%s",
-                    parent_session_id,
-                    [_subagent_id_from_meta_path(path) for path, _, _ in deferred],
+            # parent we haven't registered. A parent still retrying its own start
+            # POST does not spend the child's budget.
+            for meta_path, meta, parent_subagent_id in deferred:
+                if start_retry_tracker.has_retry_state(f"subagent_start:{parent_subagent_id}"):
+                    continue
+                await _note_unresolved(
+                    _subagent_id_from_meta_path(meta_path),
+                    meta["toolUseId"],
+                    parent_subagent_id,
                 )
             break
         pending = deferred
@@ -3012,17 +3137,16 @@ def _transcript_cost_size_cached(
     cache: dict[Path, _TranscriptCostCacheEntry],
 ) -> float | None:
     """
-    Cumulative transcript cost, recomputed only when the file grows.
+    Cumulative transcript cost, recomputed only when the file changes size.
 
-    Wraps :func:`compute_transcript_cumulative_cost` with a per-process
-    size-keyed cache so an unchanged transcript isn't re-parsed every
-    poll. On a forwarder restart the cache starts empty and the first
-    call recomputes from the full file, so the estimate is correct across
-    restarts (unlike an in-memory running sum, which would lose the
-    pre-restart portion).
+    Wraps :func:`tally_transcript_cost` with a per-process size-keyed cache
+    so an unchanged transcript isn't re-parsed every poll, and a grown one
+    is read from where the previous tally stopped. On a forwarder restart
+    the cache starts empty and the first call reads the full file, so the
+    estimate is correct across restarts.
 
     :param transcript_path: Transcript JSONL path.
-    :param include_sidechains: Forwarded to
+    :param include_sidechains: See
         :func:`compute_transcript_cumulative_cost` — ``False`` for a
         parent transcript (sub-agent records are sidechains counted
         elsewhere), ``True`` for a sub-agent's own transcript.
@@ -3038,10 +3162,22 @@ def _transcript_cost_size_cached(
     cached = cache.get(transcript_path)
     if cached is not None and cached.size == size:
         return cached.cost_usd
-    cost = compute_transcript_cumulative_cost(
-        transcript_path, include_sidechains=include_sidechains
+    tally = (
+        cached.tally
+        if cached is not None
+        and cached.tally.include_sidechains == include_sidechains
+        and cached.cursor_fingerprint is not None
+        and _readable_cursor_fingerprint(transcript_path, cached.tally.byte_offset)
+        == cached.cursor_fingerprint
+        else TranscriptCostTally(include_sidechains=include_sidechains)
     )
-    cache[transcript_path] = _TranscriptCostCacheEntry(size=size, cost_usd=cost)
+    cost = tally_transcript_cost(transcript_path, tally)
+    cache[transcript_path] = _TranscriptCostCacheEntry(
+        size=size,
+        cost_usd=cost,
+        tally=tally,
+        cursor_fingerprint=_readable_cursor_fingerprint(transcript_path, tally.byte_offset),
+    )
     return cost
 
 
@@ -8018,6 +8154,20 @@ def _jsonl_cursor_fingerprint(
         return None
     payload = byte_offset.to_bytes(8, "big", signed=False) + sample
     return hashlib.sha256(payload).hexdigest()
+
+
+def _readable_cursor_fingerprint(path: Path, byte_offset: int) -> str | None:
+    """
+    :func:`_jsonl_cursor_fingerprint`, or ``None`` when the file cannot be read.
+
+    :param path: JSONL file path.
+    :param byte_offset: Cursor byte offset, e.g. ``4096``.
+    :returns: Cursor fingerprint, or ``None`` for an unreadable file.
+    """
+    try:
+        return _jsonl_cursor_fingerprint(path, byte_offset)
+    except OSError:
+        return None
 
 
 def _write_json_atomic(path: Path, payload: Mapping[str, object]) -> None:

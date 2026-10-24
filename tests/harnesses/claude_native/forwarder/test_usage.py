@@ -15,7 +15,9 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 
+import omnigent.harnesses.claude_native.bridge as claude_native_bridge
 import omnigent.harnesses.claude_native.forwarder as forwarder
+from tests._helpers.process_io import process_bytes_read
 
 
 def test_usage_from_status_state_surfaces_cumulative_cost() -> None:
@@ -326,15 +328,17 @@ def test_transcript_cost_size_cached_recomputes_only_on_growth(
     The cost is recomputed only when the transcript's byte size changes.
 
     Guards the per-poll optimization: an unchanged transcript must not be
-    re-parsed every 0.25s tick, but a grown one must be re-priced.
+    re-parsed every 0.25s tick, but a grown one must be re-priced from the
+    previous tally unless the bytes it already read were rewritten.
     """
-    calls: list[Path] = []
+    calls: list[tuple[Path, int, int]] = []
 
-    def fake_compute(path: Path, *, include_sidechains: bool) -> float | None:
-        calls.append(path)
-        return float(path.stat().st_size)
+    def fake_tally(path: Path, tally: claude_native_bridge.TranscriptCostTally) -> float | None:
+        calls.append((path, id(tally), tally.byte_offset))
+        tally.byte_offset = path.stat().st_size
+        return float(tally.byte_offset)
 
-    monkeypatch.setattr(forwarder, "compute_transcript_cumulative_cost", fake_compute)
+    monkeypatch.setattr(forwarder, "tally_transcript_cost", fake_tally)
     cache: dict[Path, forwarder._TranscriptCostCacheEntry] = {}
     path = tmp_path / "t.jsonl"
     path.write_text("abc", encoding="utf-8")  # 3 bytes
@@ -346,12 +350,19 @@ def test_transcript_cost_size_cached_recomputes_only_on_growth(
         path, include_sidechains=True, cache=cache
     ) == pytest.approx(3.0)
     assert len(calls) == 1
-    # File grows → recompute.
+    # File grows past an unchanged prefix → the same tally resumes at its offset.
     path.write_text("abcdef", encoding="utf-8")  # 6 bytes
     assert forwarder._transcript_cost_size_cached(
         path, include_sidechains=True, cache=cache
     ) == pytest.approx(6.0)
-    assert len(calls) == 2
+    assert calls[1] == (path, calls[0][1], 3)
+    # A rewritten prefix starts a new tally from byte 0.
+    path.write_text("xyzdefgh", encoding="utf-8")
+    assert forwarder._transcript_cost_size_cached(
+        path, include_sidechains=True, cache=cache
+    ) == pytest.approx(8.0)
+    assert calls[2][2] == 0
+    assert calls[2][1] != calls[0][1]
     # Missing file → None, no recompute attempt recorded as a priced call.
     assert (
         forwarder._transcript_cost_size_cached(
@@ -381,10 +392,10 @@ def test_session_cost_estimate_takes_max_of_status_and_transcript_sum(
 
     per_path_cost = {parent: 0.10, sub_path: 0.55}
 
-    def fake_compute(path: Path, *, include_sidechains: bool) -> float | None:
+    def fake_tally(path: Path, tally: claude_native_bridge.TranscriptCostTally) -> float | None:
         return per_path_cost.get(path)
 
-    monkeypatch.setattr(forwarder, "compute_transcript_cumulative_cost", fake_compute)
+    monkeypatch.setattr(forwarder, "tally_transcript_cost", fake_tally)
     entries = [forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")]
 
     # S stale ($0.005) < C (0.10 + 0.55 = 0.65) → C wins (mid-run).
@@ -402,6 +413,63 @@ def test_session_cost_estimate_takes_max_of_status_and_transcript_sum(
         status_cost=2.0,
         cost_cache={},
     ) == pytest.approx(2.0)
+
+
+def test_session_cost_estimate_after_growth_reads_only_the_appended_records(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Re-pricing a grown parent transcript must not re-read it from byte 0,
+    and the estimate still includes the appended response."""
+    from omnigent.llms.context_window import ModelPricing
+
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing",
+        lambda model: ModelPricing(input_per_token=1.0, output_per_token=1.0),
+    )
+    monkeypatch.setattr("omnigent.onboarding.provider_config.load_config", dict)
+    monkeypatch.setattr(claude_native_bridge, "_TRANSCRIPT_PRICING_CACHE", {})
+
+    def priced_record(index: int) -> str:
+        return json.dumps(
+            {
+                "type": "assistant",
+                "message": {
+                    "id": f"msg_{index}",
+                    "role": "assistant",
+                    "model": "m",
+                    "usage": {"input_tokens": 1, "output_tokens": 1},
+                    "content": [{"type": "text", "text": "x" * 2000}],
+                },
+            }
+        )
+
+    parent = tmp_path / "sess.jsonl"
+    parent.write_text("".join(priced_record(index) + "\n" for index in range(2000)))
+    subagents_dir = forwarder._subagents_dir_for_transcript(parent)
+    subagents_dir.mkdir(parents=True)
+    (subagents_dir / "agent-aaa.jsonl").write_text("", encoding="utf-8")
+    estimate_kwargs: dict[str, Any] = {
+        "parent_transcript_path": parent,
+        "active_subagents": [
+            forwarder.SubagentEntry(subagent_id="aaa", child_conversation_id="conv_child")
+        ],
+        "status_cost": None,
+        "cost_cache": {},
+    }
+    assert forwarder._session_cost_estimate(**estimate_kwargs) == pytest.approx(4000.0)
+
+    with parent.open("a", encoding="utf-8") as handle:
+        handle.write(priced_record(2000) + "\n")
+    bytes_before = process_bytes_read()
+    estimate = forwarder._session_cost_estimate(**estimate_kwargs)
+    bytes_read = process_bytes_read() - bytes_before
+
+    assert estimate == pytest.approx(4002.0)
+    transcript_size = parent.stat().st_size
+    assert bytes_read < transcript_size // 10, (
+        f"re-pricing after one appended response read {bytes_read} bytes of a "
+        f"{transcript_size}-byte transcript"
+    )
 
 
 @pytest.mark.asyncio
