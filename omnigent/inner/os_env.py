@@ -1799,12 +1799,15 @@ def _shell_impl(
         characters.
     """
     argv = _shell_argv(shell_path, command)
+    encoding, errors = _shell_output_decoding(shell_path)
     try:
         completed = subprocess.run(
             argv,
             cwd=str(cwd),
             env=_child_shell_env(),
             text=True,
+            encoding=encoding,
+            errors=errors,
             capture_output=True,
             timeout=timeout,
         )
@@ -1879,12 +1882,42 @@ def _is_within(path: Path, root: Path) -> bool:
         return False
 
 
+# Without a console (a background host) Windows PowerShell writes the OEM code
+# page; switch it to UTF-8 to match :func:`_shell_output_decoding`. The console
+# setter can throw when no console is attached, hence the try.
+_POWERSHELL_UTF8_PREFIX = (
+    "try { [Console]::OutputEncoding = [System.Text.Encoding]::UTF8 } catch {}; "
+    "$OutputEncoding = [System.Text.Encoding]::UTF8; "
+)
+
+
+def _shell_output_decoding(shell_path: str) -> tuple[str | None, str | None]:
+    """The ``encoding`` and ``errors`` used to decode a shell's captured output.
+
+    On Windows the locale code page (e.g. cp1252) matches none of the shells:
+    bash/sh and PowerShell (switched by :func:`_shell_argv`) write UTF-8, and
+    cmd.exe writes the OEM code page. ``errors="replace"`` keeps one
+    undecodable byte from dropping the whole output. POSIX keeps the locale
+    default.
+
+    :param shell_path: Shell binary, e.g. ``"C:\\Program Files\\Git\\bin\\bash.exe"``.
+    :returns: ``(encoding, errors)`` for :func:`subprocess.run`, e.g.
+        ``("utf-8", "replace")``; ``(None, None)`` on POSIX.
+    """
+    if not IS_WINDOWS:
+        return None, None
+    if Path(shell_path).name.lower() in ("cmd.exe", "cmd"):
+        return "oem", "replace"
+    return "utf-8", "replace"
+
+
 def _shell_argv(shell_path: str, command: str) -> list[str]:
     shell_name = Path(shell_path).name.lower()
     if shell_name in ("cmd.exe", "cmd"):
         return [shell_path, "/c", command]
     if shell_name in ("powershell.exe", "powershell", "pwsh.exe", "pwsh"):
-        return [shell_path, "-NoProfile", "-Command", command]
+        prefix = _POWERSHELL_UTF8_PREFIX if IS_WINDOWS else ""
+        return [shell_path, "-NoProfile", "-Command", prefix + command]
     if shell_name in ("bash", "bash.exe"):
         return [shell_path, "--noprofile", "--norc", "-c", command]
     return [shell_path, "-c", command]
