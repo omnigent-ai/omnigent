@@ -74,10 +74,8 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         # An unrecognised effort is dropped (not a Claude effort), so it
         # never reaches the CLI as a bogus ``--effort`` value.
         ("bogus-effort", None, None, ()),
-        # A leading positional prompt (how the CLI forwards ``-p``) keeps
-        # its place ahead of pass-through value flags, and the model
-        # default is appended after — re-appending the prompt last would
-        # let a variadic flag like ``--mcp-config`` swallow it.
+        # Older clients put the prompt first; fresh launches still accept it
+        # ahead of variadic flag values and the model default.
         (
             None,
             "claude-opus-4-7",
@@ -123,10 +121,17 @@ def test_build_claude_native_base_args(
 
 
 @pytest.mark.parametrize(
-    ("reasoning_effort", "model_override", "terminal_launch_args", "resume", "expected"),
+    (
+        "reasoning_effort",
+        "model_override",
+        "terminal_launch_args",
+        "resume",
+        "skip_initial_prompt",
+        "expected",
+    ),
     [
         # Resume alone → just the --resume prefix.
-        (None, None, None, "sid-123", ("--resume", "sid-123")),
+        (None, None, None, "sid-123", False, ("--resume", "sid-123")),
         # --resume comes FIRST, before effort / pass-through / model —
         # mirroring the CLI's (*cold_resume_args, *claude_args) order.
         (
@@ -134,19 +139,77 @@ def test_build_claude_native_base_args(
             "claude-opus-4-7",
             ["--verbose"],
             "sid-123",
+            False,
             ("--resume", "sid-123", "--effort", "high", "--verbose", "--model", "claude-opus-4-7"),
         ),
         # No resume id → no --resume (fresh launch, or no local
         # transcript could be synthesized).
-        (None, None, ["--verbose"], None, ("--verbose",)),
+        (None, None, ["--verbose"], None, False, ("--verbose",)),
+        (
+            None,
+            None,
+            [
+                "old prompt\nsecond line",
+                "--permission-mode",
+                "auto",
+                "--mcp-config",
+                "a.json",
+                "b.json",
+            ],
+            "sid-123",
+            False,
+            (
+                "--resume",
+                "sid-123",
+                "--permission-mode",
+                "auto",
+                "--mcp-config",
+                "a.json",
+                "b.json",
+            ),
+        ),
+        (None, None, ["old prompt"], "sid-123", False, ("--resume", "sid-123")),
+        (
+            None,
+            None,
+            ["old prompt", "--model=sonnet", "--verbose"],
+            None,
+            True,
+            ("--model=sonnet", "--verbose"),
+        ),
+        (
+            None,
+            None,
+            ["--permission-mode", "auto", "--mcp-config", "a.json", "b.json"],
+            "sid-123",
+            False,
+            (
+                "--resume",
+                "sid-123",
+                "--permission-mode",
+                "auto",
+                "--mcp-config",
+                "a.json",
+                "b.json",
+            ),
+        ),
     ],
-    ids=["resume-only", "resume-first-ordering", "no-resume"],
+    ids=[
+        "resume-only",
+        "resume-first-ordering",
+        "no-resume",
+        "legacy-prompt-omitted",
+        "legacy-prompt-only",
+        "legacy-prompt-omitted-without-transcript",
+        "flag-values-preserved",
+    ],
 )
 def test_build_claude_native_base_args_resume_prefix(
     reasoning_effort: str | None,
     model_override: str | None,
     terminal_launch_args: list[str] | None,
     resume: str | None,
+    skip_initial_prompt: bool,
     expected: tuple[str, ...],
 ) -> None:
     """
@@ -166,6 +229,7 @@ def test_build_claude_native_base_args_resume_prefix(
             model_override=model_override,
             terminal_launch_args=terminal_launch_args,
             resume_external_session_id=resume,
+            skip_initial_prompt=skip_initial_prompt,
         )
         == expected
     )

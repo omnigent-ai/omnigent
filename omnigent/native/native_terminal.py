@@ -99,6 +99,51 @@ def url_component(value: str) -> str:
     return urllib.parse.quote(value, safe="")
 
 
+async def post_initial_prompt(
+    *,
+    base_url: str,
+    headers: dict[str, str],
+    session_id: str,
+    prompt: str,
+    auth: httpx.Auth | None,
+    harness_name: str,
+) -> None:
+    """Queue a prompt as a message rather than persisting it in launch args.
+
+    :param base_url: Omnigent server base URL.
+    :param headers: HTTP auth headers for Omnigent requests.
+    :param session_id: Prepared session id, e.g. ``"conv_abc123"``.
+    :param prompt: User prompt text, including any newlines.
+    :param auth: Optional refresh-capable HTTP auth.
+    :param harness_name: Display name for errors, e.g. ``"Claude"``.
+    :returns: None.
+    :raises click.ClickException: If Omnigent rejects the prompt.
+    """
+    from omnigent.cli_auth import open_server_client
+
+    async with open_server_client(
+        base_url,
+        headers=headers,
+        auth=auth,
+        timeout=httpx.Timeout(30.0),
+    ) as client:
+        response = await client.post(
+            f"/v1/sessions/{url_component(session_id)}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+            },
+        )
+    if response.status_code >= 400:
+        raise click.ClickException(
+            f"{harness_name} initial prompt failed ({response.status_code}): "
+            f"{error_text(response)}"
+        )
+
+
 def terminal_attach_url(base_url: str, session_id: str, terminal_id: str) -> str:
     """
     Build the terminal attach WebSocket URL.

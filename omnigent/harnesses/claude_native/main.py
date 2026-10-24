@@ -148,6 +148,7 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
+from omnigent.native.native_terminal import post_initial_prompt
 from omnigent.native.native_terminal import (
     request_with_429_retry as _request_with_429_retry,
 )
@@ -1613,13 +1614,11 @@ def run_claude_native(
     :param resume_picker: ``True`` runs the claude-native picker
         once the server is reachable; ``False`` keeps the existing
         ``session_id``-or-fresh-session behavior.
-    :param prompt: Optional first prompt for the TUI, e.g.
-        ``"review the last commit"``. Delivered as Claude Code's
-        positional prompt argument, so a multi-line prompt survives
-        intact (one argv entry — never a tmux paste). Placed before
-        the pass-through args: a trailing variadic value flag (e.g.
-        ``--mcp-config <configs...>``) would consume a trailing
-        positional as another value. ``None`` starts the TUI empty.
+    :param prompt: Optional prompt for the TUI, e.g.
+        ``"review the last commit"``. Remote launches queue it as a
+        message after preparing the terminal, including on explicit resume.
+        Local launches pass it as one leading positional argv entry.
+        ``None`` starts the TUI empty.
     :param command: Executable to run in the terminal resource,
         e.g. ``"claude"``. Kept off the public CLI surface so v0
         always exposes Claude Code, while tests can supply a fake
@@ -1649,14 +1648,7 @@ def run_claude_native(
     _preflight_local_tools(resolved_command)
     startup_profiler.mark("local tools ready")
     sanitized_args = _strip_resume_from_claude_args(claude_args)
-    # Claude Code takes the initial prompt as a positional argument, so it
-    # rides along with the launch args (persisted for the runner on the remote
-    # path). One argv entry keeps newlines and quotes intact. The prompt goes
-    # first: pass-through args may end in a variadic value flag (e.g.
-    # ``--mcp-config <configs...>``) that would swallow a trailing positional
-    # as another value, while every later merge point only appends flags.
-    if prompt and prompt.strip():
-        sanitized_args = (prompt, *sanitized_args)
+    prompt = prompt if prompt and prompt.strip() else None
     startup_profiler.mark("claude args normalized")
     # Resolve the launch config across all offerings: a configured provider
     # (configure harnesses), the Databricks ucode profile, or Claude's own
@@ -1674,11 +1666,13 @@ def run_claude_native(
         spec_path = _materialize_claude_agent_spec(Path(tmpdir))
         startup_profiler.mark("agent spec materialized")
         if server is None:
+            # Keep the one-shot local prompt ahead of variadic flag values.
+            local_args = (prompt, *sanitized_args) if prompt is not None else sanitized_args
             _run_with_local_server(
                 spec_path,
                 session_id=session_id,
                 resume_picker=resume_picker,
-                claude_args=sanitized_args,
+                claude_args=local_args,
                 command=resolved_command,
                 claude_config=claude_config,
                 auto_open_conversation=auto_open_conversation,
@@ -1694,6 +1688,7 @@ def run_claude_native(
                 session_id=session_id,
                 resume_picker=resume_picker,
                 claude_args=sanitized_args,
+                prompt=prompt,
                 auto_open_conversation=auto_open_conversation,
                 startup_profiler=startup_profiler,
             )
@@ -4833,6 +4828,7 @@ def _run_with_remote_server(
     session_id: str | None,
     resume_picker: bool,
     claude_args: tuple[str, ...],
+    prompt: str | None = None,
     auto_open_conversation: bool = False,
     startup_profiler: StartupProfiler | None = None,
 ) -> None:
@@ -4859,6 +4855,8 @@ def _run_with_remote_server(
         launches ``claude`` itself and derives the ucode config from the
         provider config, so this path takes neither a ``command`` nor a
         ``claude_config``.)
+    :param prompt: Optional message to submit once after preparation,
+        outside terminal attach/reconnect attempts.
     :param auto_open_conversation: When ``True``, open the browser
         conversation URL after the session is prepared.
     :param startup_profiler: Optional startup profiler for timing
@@ -5003,6 +5001,18 @@ def _run_with_remote_server(
             headers.clear()
             headers.update(new_headers)
 
+        if prompt:
+            asyncio.run(
+                post_initial_prompt(
+                    base_url=base_url,
+                    headers=headers,
+                    session_id=prepared.session_id,
+                    prompt=prompt,
+                    auth=forwarder_auth,
+                    harness_name="Claude",
+                )
+            )
+            record_startup_event("initial_prompt_submitted")
         startup_profiler.mark("opening remote terminal attach")
         outcome = asyncio.run(
             _attach_with_transcript_forwarder(

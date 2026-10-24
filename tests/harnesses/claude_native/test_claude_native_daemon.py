@@ -282,19 +282,24 @@ def _install_daemon_seam_mocks(
     monkeypatch.setattr(claude_native, "_attach_with_transcript_forwarder", _fake_attach)
 
 
+@pytest.mark.parametrize("session_id", [None, "conv_existing"])
+@pytest.mark.parametrize("prompt", [None, "Reply with READY.\nThen wait."])
 def test_run_with_remote_server_routes_through_daemon(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    session_id: str | None,
+    prompt: str | None,
 ) -> None:
     """
-    A fresh remote launch routes through _prepare_claude_terminal_via_daemon.
+    Remote launches prepare through the daemon and queue a prompt once.
 
     Proves the CLI no longer spawns the runner itself: it routes the launch
     through ``_prepare_claude_terminal_via_daemon`` with this host's id,
     the cwd as workspace, and the user's ``claude_args`` (so the runner
     can apply them). Daemon start is handled by ``_ensure_backend`` in
     ``cli_native.py`` before ``_run_with_remote_server`` is called — not
-    inside ``_run_with_remote_server`` itself.
+    inside ``_run_with_remote_server`` itself. Attach recovery must not
+    resubmit the explicit prompt on either fresh launch or resume.
     """
     spec_path = tmp_path / "claude.yaml"
     spec_path.write_text("name: claude-native-ui\nprompt: hi\n")
@@ -302,10 +307,10 @@ def test_run_with_remote_server_routes_through_daemon(
     captured: dict[str, Any] = {}
     ensured: list[str] = []
     prepared = claude_native.PreparedClaudeTerminal(
-        session_id="conv_new",
+        session_id=session_id or "conv_new",
         terminal_id=claude_native.claude_terminal_resource_id(),
         bridge_dir=tmp_path / "bridge",
-        reattached=False,
+        reattached=session_id is not None,
     )
     _install_daemon_seam_mocks(
         monkeypatch,
@@ -315,12 +320,37 @@ def test_run_with_remote_server_routes_through_daemon(
         ensured=ensured,
     )
 
+    messages: list[dict[str, Any]] = []
+
+    def handle_message(request: httpx.Request) -> httpx.Response:
+        assert request.method == "POST"
+        assert request.url.path == f"/v1/sessions/{prepared.session_id}/events"
+        messages.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda base_url, **kwargs: httpx.AsyncClient(
+            base_url=base_url, transport=httpx.MockTransport(handle_message), **kwargs
+        ),
+    )
+
+    async def attach_with_recovery(**kwargs: Any) -> claude_native._AttachOutcome:
+        assert len(messages) == (0 if prompt is None else 1)
+        await kwargs["recover"]()
+        await kwargs["recover"]()
+        assert len(messages) == (0 if prompt is None else 1)
+        return claude_native._AttachOutcome.EXITED
+
+    monkeypatch.setattr(claude_native, "_attach_with_transcript_forwarder", attach_with_recovery)
+
     claude_native._run_with_remote_server(
         "https://example.com",
         spec_path,
-        session_id=None,
+        session_id=session_id,
         resume_picker=False,
         claude_args=("--dangerously-skip-permissions",),
+        prompt=prompt,
     )
 
     # Daemon start is now _ensure_backend's responsibility (called from
@@ -330,7 +360,21 @@ def test_run_with_remote_server_routes_through_daemon(
     assert captured["host_id"] == "host_1"
     assert captured["workspace"] == str(tmp_path.resolve())
     assert captured["claude_args"] == ("--dangerously-skip-permissions",)
-    assert captured["session_id"] is None
+    assert captured["session_id"] == session_id
+    assert "prompt" not in captured
+    assert messages == (
+        [
+            {
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": prompt}],
+                },
+            }
+        ]
+        if prompt is not None
+        else []
+    )
 
 
 def test_run_with_remote_server_detach_prints_resume_hint(

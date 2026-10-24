@@ -7731,6 +7731,7 @@ def _build_claude_native_base_args(
     model_override: str | None,
     terminal_launch_args: list[str] | None,
     resume_external_session_id: str | None = None,
+    skip_initial_prompt: bool = False,
 ) -> tuple[str, ...]:
     """
     Assemble the base ``claude`` CLI args for a native-terminal launch.
@@ -7758,7 +7759,8 @@ def _build_claude_native_base_args(
         ``None`` adds nothing.
     :param terminal_launch_args: The user's pass-through CLI args,
         e.g. ``["--dangerously-skip-permissions"]``. ``None`` or an
-        empty list contributes nothing.
+        empty list contributes nothing. A legacy leading positional
+        prompt is omitted when resuming.
     :param resume_external_session_id: Claude-native session id to
         resume, e.g. ``"02857840-6362-408f-b41f-309e396ed7c6"``.
         Prepended as ``--resume <value>`` so Claude reopens the prior
@@ -7768,6 +7770,8 @@ def _build_claude_native_base_args(
         the same plain ``--resume`` path serves both cold resume and
         fork resume. ``None`` (a fresh launch, or no local transcript
         could be synthesized) adds nothing.
+    :param skip_initial_prompt: Also omit a legacy prompt when resuming
+        history failed and the terminal must launch without ``--resume``.
     :returns: The assembled base args, e.g.
         ``("--resume", "<sid>", "--effort", "high")``.
     """
@@ -7779,7 +7783,11 @@ def _build_claude_native_base_args(
     if reasoning_effort is not None and reasoning_effort in CLAUDE_EFFORTS:
         args.extend(("--effort", reasoning_effort))
     if terminal_launch_args:
-        args.extend(terminal_launch_args)
+        # Older clients persisted the prompt first, before all flag values.
+        skip_leading_prompt = (
+            resume_external_session_id is not None or skip_initial_prompt
+        ) and not terminal_launch_args[0].startswith("-")
+        args.extend(terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args)
     # model_override is a default: it applies only when the user did
     # not pass their own ``--model`` (in either the long ``--model X``
     # or the joined ``--model=X`` form).
@@ -9278,6 +9286,7 @@ async def _auto_create_claude_terminal(
         model_override=launch_model,
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,
+        skip_initial_prompt=session_external_id is not None or fork_source_external_id is not None,
     )
 
     # Pass ``ap_server_url`` so ``build_hook_settings`` registers the
