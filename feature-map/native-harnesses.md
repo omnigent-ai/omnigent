@@ -10,6 +10,12 @@ implements them separately, so a fix for one harness does not reach the others.
 ## Sub-features
 
 - `launch-web`: pick the harness in the new-session composer and start a session.
+- `picker-curation`: server config `restrict_to_agent_names` limits and orders
+  what New Chat offers, and `default_agent_name` pre-selects one for a user
+  with no remembered pick. Curated, the menu is one flat list with no Harnesses
+  heading, no "Other..." submenus and no "Create custom agent" entry; a name
+  matching nothing shows an empty state and logs at startup. Display only, and
+  New Chat only: the scheduled-task and project-settings pickers are untouched.
 - `agent-instructions`: Pi native delivers authored instructions at launch/resume;
   authors can keep or replace Pi's base prompt and disable automatic context files.
 - `launch-cli`: `omnigent <name>` starts the harness in the user's terminal with
@@ -356,6 +362,13 @@ Cross-harness journeys:
   response contract is covered by
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
+- **`picker-curation`:** `tests/server/test_server_config.py` (parsing),
+  `tests/server/test_app.py` (the `/v1/info` block and the startup warning),
+  `web/src/lib/capabilities.test.ts` (probe parsing),
+  `web/src/shell/AgentHarnessPicker.curation.test.tsx` (menu shape) and the
+  "picker curation" cases in `web/src/shell/NewChatDialog.test.tsx` (default
+  pre-selection, remembered picks and the empty state in the real landing
+  flow). Set the two keys in the server config, restart, and open New Chat.
 - **`needs-auth`:**
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,

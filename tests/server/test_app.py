@@ -2813,3 +2813,64 @@ async def test_on_runner_connect_reassign_http_status_levels(
     assert row.levelno == level
     assert row.exc_info is None
     assert f"HTTP {status}: runner said no" in row.getMessage()
+
+
+@pytest.mark.asyncio
+async def test_info_publishes_the_picker_curation(
+    db_uri: str,
+    runtime_init: None,
+    tmp_path: Path,
+) -> None:
+    """``GET /v1/info`` carries both keys as configured, so the web picker can act on them."""
+    app = _build_branding_app(
+        db_uri,
+        tmp_path,
+        "picker",
+        server_config={
+            "restrict_to_agent_names": ["polly", "claude-native-ui"],
+            "default_agent_name": "polly",
+        },
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        resp = await c.get("/v1/info")
+
+    assert resp.status_code == 200
+    assert resp.json()["picker"] == {
+        "restrict_to_agent_names": ["polly", "claude-native-ui"],
+        "default_agent_name": "polly",
+    }
+
+
+@pytest.mark.asyncio
+async def test_info_reports_an_uncurated_picker_by_default(client: httpx.AsyncClient) -> None:
+    """Without the keys the block is present and empty, never missing."""
+    resp = await client.get("/v1/info")
+    assert resp.status_code == 200
+    assert resp.json()["picker"] == {"restrict_to_agent_names": [], "default_agent_name": None}
+
+
+def test_picker_restriction_warning_names_only_the_missing_agents(
+    db_uri: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A mistyped name is called out at startup; a real one is not."""
+    from omnigent.db.utils import builtin_agent_id
+    from omnigent.server.server_config import PickerCuration
+
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    agent_store.create(builtin_agent_id("polly"), name="polly", bundle_location="test:///p")
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        server_app._warn_on_empty_picker_restriction(
+            agent_store, PickerCuration(restrict_to_agent_names=("polly", "pollly"))
+        )
+    assert "pollly" in caplog.text
+    assert "does not have" in caplog.text
+    assert "will be empty" not in caplog.text
+
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="omnigent.server.app"):
+        server_app._warn_on_empty_picker_restriction(
+            agent_store, PickerCuration(restrict_to_agent_names=("nope",))
+        )
+    assert "will be empty" in caplog.text

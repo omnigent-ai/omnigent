@@ -240,6 +240,61 @@ export interface ServerInfo {
   filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
+  /**
+   * How the deployment curates the New Chat picker. Display only: it narrows
+   * what the picker offers, never what exists, so a session already bound to
+   * an unlisted agent keeps working and the API still reaches it. Absent on
+   * an older server, which means no restriction.
+   */
+  picker?: PickerCuration;
+}
+
+/** The deployment's New Chat picker curation, as reported by ``/v1/info``. */
+export interface PickerCuration {
+  /** Agent names the picker may offer, in config order. Empty means all. */
+  restrictToAgentNames: ReadonlySet<string>;
+  /** Agent a fresh New Chat starts on; a remembered pick still wins. */
+  defaultAgentName: string | null;
+}
+
+/** The unrestricted picker: what an older server, or a failed probe, means. */
+export const UNRESTRICTED_PICKER: PickerCuration = {
+  restrictToAgentNames: new Set<string>(),
+  defaultAgentName: null,
+};
+
+/**
+ * The picker curation a probe reported, or the unrestricted default.
+ *
+ * @param info Probe result, or "loading" before it resolves.
+ * @returns The curation to render with; unrestricted while loading, on an
+ *   older server, and on a failed probe.
+ */
+export function pickerCuration(info: ServerInfo | "loading"): PickerCuration {
+  return info === "loading" ? UNRESTRICTED_PICKER : (info.picker ?? UNRESTRICTED_PICKER);
+}
+
+function parsePicker(raw: unknown): PickerCuration {
+  if (raw === null || typeof raw !== "object") return UNRESTRICTED_PICKER;
+  const value = raw as Record<string, unknown>;
+  // Blank names read as unset, the same way the server strips them.
+  const names = Array.isArray(value.restrict_to_agent_names)
+    ? value.restrict_to_agent_names
+        .filter((name): name is string => typeof name === "string")
+        .map((name) => name.trim())
+        .filter((name) => name !== "")
+    : [];
+  const fallbackDefault =
+    typeof value.default_agent_name === "string" && value.default_agent_name.trim() !== ""
+      ? value.default_agent_name.trim()
+      : null;
+  // A default outside the restriction could never be selected; the server drops
+  // it too, so agreeing here keeps a stale payload from pinning an absent pick.
+  const defaultAgentName =
+    fallbackDefault !== null && names.length > 0 && !names.includes(fallbackDefault)
+      ? null
+      : fallbackDefault;
+  return { restrictToAgentNames: new Set(names), defaultAgentName };
 }
 
 /** The server's filesystem attachment policy, as reported by ``/v1/info``. */
@@ -318,6 +373,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   archive_worktree_cleanup: false,
   request_managed_sandbox_host_id: false,
   branding: null,
+  picker: UNRESTRICTED_PICKER,
 };
 
 /**
@@ -435,6 +491,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           agent_config_edit: data.agent_config_edit === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           branding: parseBranding(data.branding),
+          picker: parsePicker(data.picker),
         };
         return cachedServerInfo;
       }

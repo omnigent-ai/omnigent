@@ -137,7 +137,12 @@ import {
 
 // Re-exported for tests that import the readiness helpers from this module.
 export { harnessUnavailableReasonOnHost, harnessUnconfiguredOnHost, harnessWarningBadgeText };
-import { isFeatureEnabled, sandboxOptionLabel, sandboxProviderOptions } from "@/lib/capabilities";
+import {
+  isFeatureEnabled,
+  pickerCuration,
+  sandboxOptionLabel,
+  sandboxProviderOptions,
+} from "@/lib/capabilities";
 import { useHeading, usePoweredBy } from "@/lib/branding";
 import {
   isSlashCommandText,
@@ -1342,6 +1347,15 @@ function visibleModelLabel(label: string): string {
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 
+// Harness icon kinds preferred for the picker's inline list, in display order.
+// A deployment that seeds none of these (OMNIGENT_SEEDED_AGENTS) backfills the
+// list from whatever is launchable rather than showing an empty group.
+const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex"];
+// Preferred order within the "Other..." submenu.
+const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
+// How many rows the backfill promotes — matches the inline list's usual size.
+const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
+
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
     nativeAgentHasCapability(agent, "modelPicker") ||
@@ -1439,6 +1453,7 @@ export function AgentHarnessPicker({
   openNonce = 0,
   blockedReasons,
   onPrefetchEntries,
+  curatedEntries,
 }: {
   agentEntries: AvailableAgent[];
   harnessEntries: AvailableAgent[];
@@ -1517,6 +1532,9 @@ export function AgentHarnessPicker({
   blockedReasons?: ReadonlyMap<string, string>;
   /** Called with the ids of rows the menu is about to show. */
   onPrefetchEntries?: (agentIds: string[]) => void;
+  /** Set when the deployment curates New Chat: exactly these rows, in this
+   *  order, as one flat list. Other embedders leave it unset. */
+  curatedEntries?: AvailableAgent[];
 }) {
   // Controlled so picking a row can close the menu.
   const [open, setOpen] = useState(false);
@@ -1737,27 +1755,44 @@ export function AgentHarnessPicker({
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
     const ready: AvailableAgent[] = [];
     const more: AvailableAgent[] = [];
-    const primaryOrder = ["claude", "cursor", "codex"];
-    const secondaryOrder = ["opencode", "pi"];
     for (const agent of harnessEntries) {
       const selected = agent.id === effectiveAgentId;
       const readiness = harnessReadinessOnHost(agent.harness, host);
       const unavailable = !readiness.selectable && readiness.fallbackRelevant;
       if (!selected && hideUnconfigured && unavailable) continue;
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      const primary = primaryOrder.includes(key) || agent.id === promotedHarnessId;
+      const primary = PRIMARY_HARNESS_ORDER.includes(key) || agent.id === promotedHarnessId;
       // Unavailable primaries demote to "Other..." — the main list stays
       // launch-ready; the selected harness always keeps its slot.
       if (primary && (selected || !unavailable)) {
         ready.push(agent);
       } else more.push(agent);
     }
-    const rank = (agent: AvailableAgent, order: string[]) => {
+    const rank = (agent: AvailableAgent, order: readonly string[]) => {
       const index = order.indexOf(nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "");
       return index < 0 ? order.length : index;
     };
-    ready.sort((first, second) => rank(first, primaryOrder) - rank(second, primaryOrder));
-    more.sort((first, second) => rank(first, secondaryOrder) - rank(second, secondaryOrder));
+    ready.sort(
+      (first, second) => rank(first, PRIMARY_HARNESS_ORDER) - rank(second, PRIMARY_HARNESS_ORDER),
+    );
+    more.sort(
+      (first, second) =>
+        rank(first, SECONDARY_HARNESS_ORDER) - rank(second, SECONDARY_HARNESS_ORDER),
+    );
+    // Nothing preferred survived, but something launchable did: pull the best
+    // of it inline. A deployment that trims to harnesses outside
+    // PRIMARY_HARNESS_ORDER would otherwise render an empty "Harnesses" list
+    // with its only choices buried in the "Other..." submenu.
+    if (ready.length === 0) {
+      const launchable = more.filter((agent) => {
+        const readiness = harnessReadinessOnHost(agent.harness, host);
+        return readiness.selectable || !readiness.fallbackRelevant;
+      });
+      for (const agent of launchable.slice(0, INLINE_HARNESS_FALLBACK)) {
+        ready.push(agent);
+        more.splice(more.indexOf(agent), 1);
+      }
+    }
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
   }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
   // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
@@ -1780,6 +1815,9 @@ export function AgentHarnessPicker({
     () => partitionAgentsByKind(agentEntries),
     [agentEntries],
   );
+
+  // Curated deployments get one flat list in config order.
+  const curated = curatedEntries !== undefined;
 
   // Existing custom / pending agents fold into an "Other..." submenu so a
   // long roster doesn't crowd the recommended picks. When there are none, the
@@ -1882,7 +1920,7 @@ export function AgentHarnessPicker({
         }
       }}
       trigger={{
-        disabled: disabledLabel !== undefined || previewOnly || !hasAgents,
+        disabled: disabledLabel !== undefined || previewOnly || (!hasAgents && !curated),
         "aria-busy": loading || undefined,
         label: disabledLabel ?? visibleCachedPreview?.label ?? triggerAccessibleName,
         model: disabledLabel ?? visibleCachedPreview?.model ?? triggerText,
@@ -1980,6 +2018,25 @@ export function AgentHarnessPicker({
           <DropdownMenuSeparator />
           {customAgentsBody}
         </div>
+      ) : curated ? (
+        // One flat list: the agents this deployment offers, in its order.
+        <div data-testid="new-chat-landing-curated">
+          {curatedEntries?.length === 0 ? (
+            <div
+              data-testid="new-chat-landing-no-agents"
+              role="status"
+              // The menu is whitespace-nowrap; this copy is a sentence and has to wrap.
+              className="px-2 py-3 text-ui whitespace-normal text-muted-foreground"
+            >
+              No agents are available here.
+              <div className="text-xs leading-4">
+                This deployment limits which agents New Chat offers.
+              </div>
+            </div>
+          ) : (
+            curatedEntries?.map(renderEntry)
+          )}
+        </div>
       ) : (
         <>
           {/* Smart Routing sits in its own unlabeled group above the
@@ -2065,8 +2122,13 @@ export function AgentHarnessPicker({
               <DropdownMenuSeparator />
             </>
           )}
-          {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
-          <PickerSectionHeader>Agents</PickerSectionHeader>
+          {/* Agents group — built-in bundle agents (Polly / Debby) inline. The
+            header is conditional like "Harnesses" above: a deployment that
+            seeds no bundle agents and has no custom group would otherwise
+            render a heading with nothing under it. */}
+          {(bundleEntries.length > 0 || hasCustomGroup) && (
+            <PickerSectionHeader>Agents</PickerSectionHeader>
+          )}
           {bundleEntries.map(renderEntry)}
           {/* Existing custom agents fold into an "Other..." submenu (with
             the pending upload and the create action). With no custom agents the
@@ -2275,13 +2337,19 @@ export function NewChatLandingScreen() {
     conversationsData !== undefined &&
     conversationsData.pages.every((page) => page.data.length === 0);
 
-  const agentList = useMemo(
-    () =>
-      selectableSessionAgents(
-        (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
-      ),
-    [agents, agentsLoading, cachedPickerOptions],
-  );
+  // Narrow to the deployment's restrict_to_agent_names, in config order.
+  const serverInfo = useServerInfo();
+  const curation = pickerCuration(serverInfo);
+  const agentList = useMemo(() => {
+    const selectable = selectableSessionAgents(
+      (agentsLoading ? cachedPickerOptions?.agents : undefined) ?? agents ?? [],
+    );
+    if (curation.restrictToAgentNames.size === 0) return selectable;
+    const allowed = selectable.filter((agent) => curation.restrictToAgentNames.has(agent.name));
+    // Order follows the config, so a deployment can put its own agent first.
+    const order = [...curation.restrictToAgentNames];
+    return allowed.sort((first, second) => order.indexOf(first.name) - order.indexOf(second.name));
+  }, [agents, agentsLoading, cachedPickerOptions, curation.restrictToAgentNames]);
 
   // Split the picker into "Harnesses" (harness-backed picks — the native
   // terminal CLIs plus generic-ACP harness agents like Grok / Devin / Kilocode)
@@ -3167,7 +3235,10 @@ export function NewChatLandingScreen() {
           : (agentsLoading || prefillConfig === undefined) &&
               agentList.some((agent) => agent.id === cachedPickerOptions?.agent.id)
             ? cachedPickerOptions!.agent.id
-            : (agentList[0]?.id ?? null);
+            : // No remembered pick: use the configured default, else the first agent.
+              (agentList.find((agent) => agent.name === curation.defaultAgentName)?.id ??
+              agentList[0]?.id ??
+              null);
   const effectiveAgentId = automaticHarnessFallback?.candidate?.value.id ?? defaultEffectiveAgentId;
   const selectedAgent = useMemo(
     () =>
@@ -3711,7 +3782,8 @@ export function NewChatLandingScreen() {
   useEffect(() => {
     setPickerReadyTarget(pickerDataLoading ? null : pickerTarget);
   }, [pickerDataLoading, pickerTarget]);
-  const pickerLoading = pickerDataLoading || pickerReadyTarget !== pickerTarget;
+  const pickerLoading =
+    pickerDataLoading || pickerReadyTarget !== pickerTarget || serverInfo === "loading";
   const [interactiveCacheKey, setInteractiveCacheKey] = useState<string | null>(null);
   useEffect(() => {
     setInteractiveCacheKey(cachedPickerOptions ? pickerCacheKey : null);
@@ -7227,6 +7299,9 @@ export function NewChatLandingScreen() {
                         effectiveAgentId={effectiveAgentId}
                         agentLabel={agentLabel}
                         hasAgents={agentList.length > 0}
+                        curatedEntries={
+                          curation.restrictToAgentNames.size > 0 ? agentList : undefined
+                        }
                         loading={pickerLoading}
                         interactiveWhileLoading={pickerInteractiveWhileLoading}
                         disabledLabel={noExecutionTargetSelected ? "No host selected" : undefined}

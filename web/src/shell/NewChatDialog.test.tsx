@@ -12239,3 +12239,62 @@ describe("managed sandbox gateway preview", () => {
     ).toBeVisible();
   });
 });
+
+// Server config can curate what New Chat offers. These run the real landing
+// flow, so the restriction, the default and the empty state are checked where
+// the picker is actually fed, not just on the picker in isolation.
+describe("NewChatLandingScreen picker curation", () => {
+  beforeEach(setupLandingMocks);
+  afterEach(() => {
+    cleanup();
+    localStorage.clear();
+    vi.restoreAllMocks();
+  });
+
+  const curated = (names: string[], defaultAgentName: string | null = null) =>
+    renderLanding({ picker: { restrictToAgentNames: new Set(names), defaultAgentName } });
+  const openPicker = () =>
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+  const row = (id: string) => screen.queryByTestId(`new-chat-landing-agent-${id}`);
+
+  it("starts a user with no history on the configured default", () => {
+    mockClaudeModels([{ id: "opus", displayName: "Opus", isDefault: true }]);
+    curated(["claude-native-ui", "codex-native-ui"], "codex-native-ui");
+    openPicker();
+
+    expect(row("a2")).toHaveAttribute("data-active", "true");
+    expect(row("a1")).not.toHaveAttribute("data-active");
+  });
+
+  it("lets a remembered pick the deployment still offers win over the default", () => {
+    localStorage.setItem(LAST_AGENT_KEY, "a1");
+    mockClaudeModels([{ id: "opus", displayName: "Opus", isDefault: true }]);
+    curated(["claude-native-ui", "codex-native-ui"], "codex-native-ui");
+    openPicker();
+
+    expect(row("a1")).toHaveAttribute("data-active", "true");
+  });
+
+  it("falls back to the default when the remembered pick is no longer offered", () => {
+    localStorage.setItem(LAST_AGENT_KEY, "a1");
+    mockClaudeModels([{ id: "opus", displayName: "Opus", isDefault: true }]);
+    curated(["codex-native-ui"], "codex-native-ui");
+    openPicker();
+
+    // The hidden agent is not in the menu at all, let alone selected.
+    expect(row("a1")).toBeNull();
+    expect(row("a2")).toHaveAttribute("data-active", "true");
+  });
+
+  it("opens to an explanation, not a disabled trigger, when nothing matches", () => {
+    mockClaudeModels([{ id: "opus", displayName: "Opus", isDefault: true }]);
+    curated(["not-installed"]);
+
+    const trigger = screen.getByTestId("new-chat-landing-agent-select");
+    expect(trigger).toBeEnabled();
+    openPicker();
+    expect(screen.getByTestId("new-chat-landing-no-agents")).toHaveTextContent(
+      "This deployment limits which agents New Chat offers.",
+    );
+  });
+});
