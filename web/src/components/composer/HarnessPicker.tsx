@@ -565,6 +565,22 @@ export function HarnessPickerConfigRow({
   );
 }
 
+/** A drill-in page rendered in place of the picker's list on mobile. */
+export function HarnessPickerPage({ children }: { children: ReactNode }) {
+  const pageRef = useRef<HTMLDivElement>(null);
+  // The list and its pages share one scroll container, so a scrolled list
+  // would otherwise open the page with its Back row above the visible edge.
+  useLayoutEffect(() => {
+    const menu = pageRef.current?.closest<HTMLElement>('[role="menu"]');
+    if (menu) menu.scrollTop = 0;
+  }, []);
+  return (
+    <div ref={pageRef} className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
+      {children}
+    </div>
+  );
+}
+
 export function HarnessPickerConfigPage({
   onBack,
   backTestId,
@@ -577,7 +593,7 @@ export function HarnessPickerConfigPage({
   children: ReactNode;
 }) {
   return (
-    <div className="animate-in fade-in-0 slide-in-from-right-2 duration-150">
+    <HarnessPickerPage>
       <DropdownMenuItem
         data-testid={backTestId}
         className="items-center font-medium"
@@ -590,6 +606,6 @@ export function HarnessPickerConfigPage({
       </DropdownMenuItem>
       <DropdownMenuSeparator />
       <div data-testid={testId}>{children}</div>
-    </div>
+    </HarnessPickerPage>
   );
 }
