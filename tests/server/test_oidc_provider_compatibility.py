@@ -260,7 +260,7 @@ def test_authorization_override_preserves_provider_query(monkeypatch, request, r
     assert query["code_challenge"] != ["wrong"]
     assert query["code_challenge_method"] == ["S256"]
     assert query["prompt"] == (["login"] if reauth else ["select_account"])
-    assert query["max_age"] == (["0"] if reauth else ["300"])
+    assert query["max_age"] == ["300"]
 
 
 def test_public_pkce_ps256_login_and_code_replay(provider_client):

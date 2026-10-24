@@ -8,10 +8,10 @@ page to force re-authentication.
 In accounts mode ``?reauth=1`` is honoured by the SPA login form (it shows the
 password field even when the user is already signed in).  In OIDC mode
 ``/auth/login`` must forward a forced-re-authentication demand to the IdP —
-``prompt=login`` plus ``max_age=0`` — so the IdP cannot silently reuse an
+``prompt=login`` plus a short ``max_age`` — so the IdP cannot silently reuse an
 existing IdP session.
 
-``/auth/login`` must both (a) forward ``prompt=login`` + ``max_age=0`` to the
+``/auth/login`` must both (a) forward ``prompt=login`` + ``max_age`` to the
 IdP and (b) stamp ``reauth_at`` into the signed state cookie so the callback can
 verify the id_token's ``auth_time`` proves a real re-authentication.  Without
 (a) the bypass was:
@@ -117,7 +117,7 @@ def test_login_without_reauth_sends_no_prompt(login_client: TestClient) -> None:
 
 
 def test_login_with_reauth_forces_prompt_login_at_idp(login_client: TestClient) -> None:
-    """OIDC /auth/login?reauth=1 must forward prompt=login + max_age=0 to the IdP.
+    """OIDC /auth/login?reauth=1 must forward prompt=login + a usable max_age.
 
     This is the anti-phishing gate: when the device-grant consent page detects a
     stale session it bounces here with reauth=1.  Without prompt=login the IdP
@@ -136,8 +136,11 @@ def test_login_with_reauth_forces_prompt_login_at_idp(login_client: TestClient) 
         "so the IdP cannot silently reuse an existing session; "
         f"got authorization URL: {location!r}"
     )
-    assert params.get("max_age") == ["0"], (
-        "/auth/login?reauth=1 must add max_age=0 to the IdP authorization URL "
+    # Not zero: an IdP that caps the id_token's exp at auth_time + max_age
+    # (Entra ID) would hand back a token that has already expired. Freshness
+    # is enforced by the callback's auth_time >= reauth_at check instead.
+    assert params.get("max_age") == ["300"], (
+        "/auth/login?reauth=1 must add a positive max_age to the IdP authorization URL "
         f"got authorization URL: {location!r}"
     )
 
@@ -217,3 +220,30 @@ def test_github_provider_reauth_sends_no_prompt(
     assert "max_age" not in params, (
         f"GitHub OAuth /auth/login must NOT include max_age; got authorization URL: {location!r}"
     )
+
+
+def test_reauth_max_age_is_configurable(
+    login_client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deployment whose IdP needs a different window can set one."""
+    monkeypatch.setenv("OMNIGENT_OIDC_REAUTH_MAX_AGE", "90")
+
+    params = _parse_auth_url(
+        login_client.get("/auth/login", params={"reauth": "1"}).headers["location"]
+    )
+
+    assert params.get("max_age") == ["90"]
+
+
+@pytest.mark.parametrize("value", ["0", "-5", "abc", ""])
+def test_an_unusable_reauth_max_age_falls_back_to_the_default(
+    login_client: TestClient, monkeypatch: pytest.MonkeyPatch, value: str
+) -> None:
+    """A typo must not reintroduce the expired-on-arrival failure."""
+    monkeypatch.setenv("OMNIGENT_OIDC_REAUTH_MAX_AGE", value)
+
+    params = _parse_auth_url(
+        login_client.get("/auth/login", params={"reauth": "1"}).headers["location"]
+    )
+
+    assert params.get("max_age") == ["300"]

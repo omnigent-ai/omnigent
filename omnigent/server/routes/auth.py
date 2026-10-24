@@ -28,6 +28,7 @@ import hmac
 import html
 import json
 import logging
+import os
 import re
 import secrets
 import time
@@ -356,7 +357,7 @@ def create_auth_router(
             # Ask the IdP to force the user to re-enter credentials
             # rather than silently reusing an existing IdP session.
             params["prompt"] = "login"
-            params["max_age"] = "0"
+            params["max_age"] = str(_reauth_max_age_seconds())
         endpoint = urlsplit(config.authorization_endpoint)
         query = [
             (name, value)
@@ -492,6 +493,17 @@ def create_auth_router(
                 )
             else:
                 email = _resolve_oidc_email(token_json, config)
+                if not email and _validate_id_token(token_json, config) is None:
+                    # Say which step failed. These are different operator
+                    # problems — a bad signature, issuer, audience or expiry
+                    # against a missing or unverified claim — and the email
+                    # message sent at least one deployment looking in the
+                    # wrong place for a token that had expired on arrival.
+                    _logger.error(
+                        "Rejecting login: the IdP's id_token did not validate "
+                        "(see the id_token validation warning above for the reason)"
+                    )
+                    return fail(400, "IdP id_token failed validation", "server_error")
 
         if not email:
             return fail(400, "Could not determine user email from IdP", "server_error")
@@ -1399,6 +1411,45 @@ def _auth_state_exp() -> int:
     import time
 
     return int(time.time()) + _AUTH_STATE_TTL_SECONDS
+
+
+#: How recently the IdP must have authenticated the user, in seconds, sent as
+#: ``max_age`` on a forced re-auth. Not zero: some IdPs (Microsoft Entra ID)
+#: cap the id_token's ``exp`` at ``auth_time + max_age``, so ``max_age=0``
+#: returns a token that has already expired by the time it reaches us, and
+#: every CLI, host and device login fails. The real freshness gate is the
+#: ``auth_time >= reauth_at`` check in the callback, which is stricter than
+#: ``max_age`` anyway: it compares against the instant this server demanded
+#: re-authentication, not a window the IdP is free to interpret.
+_REAUTH_MAX_AGE_ENV = "OMNIGENT_OIDC_REAUTH_MAX_AGE"
+_REAUTH_MAX_AGE_DEFAULT_SECONDS = 300
+
+
+def _reauth_max_age_seconds() -> int:
+    """Return the ``max_age`` to send on a forced re-auth.
+
+    :data:`_REAUTH_MAX_AGE_ENV` overrides the default for a deployment whose
+    IdP needs a different window. A value that is not a positive integer is
+    ignored: a typo must not reintroduce the expired-on-arrival failure, and
+    the callback's own freshness check still holds either way.
+
+    :returns: Seconds to send as ``max_age``.
+    """
+    raw = os.environ.get(_REAUTH_MAX_AGE_ENV, "").strip()
+    if not raw:
+        return _REAUTH_MAX_AGE_DEFAULT_SECONDS
+    try:
+        seconds = int(raw)
+    except ValueError:
+        seconds = 0
+    if seconds <= 0:
+        _logger.warning(
+            "%s must be a positive number of seconds; using %d",
+            _REAUTH_MAX_AGE_ENV,
+            _REAUTH_MAX_AGE_DEFAULT_SECONDS,
+        )
+        return _REAUTH_MAX_AGE_DEFAULT_SECONDS
+    return seconds
 
 
 async def _resolve_github_email(

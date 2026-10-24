@@ -501,7 +501,7 @@ def _do_callback_reauth(client: TestClient, id_token: str, *, reauth_at: int) ->
 
     Mirrors :func:`_do_callback` but stamps ``reauth_at`` into the signed
     state — the marker ``/auth/login?reauth=1`` writes when it forwards
-    ``prompt=login``/``max_age=0`` to the IdP. The callback must then
+    ``prompt=login``/``max_age`` to the IdP. The callback must then
     verify the id_token's ``auth_time`` proves a real re-authentication.
     """
     client.app.state.pending_id_token[0] = id_token
@@ -624,7 +624,7 @@ def test_cli_ticket_generic_oidc_reauth_round_trip(
     login = client.get(str(login_url), follow_redirects=False)
     authorization = parse_qs(urlsplit(login.headers["location"]).query)
     assert authorization["prompt"] == ["login"]
-    assert authorization["max_age"] == ["0"]
+    assert authorization["max_age"] == ["300"]
     state = jwt.decode(
         client.cookies[_AUTH_STATE_COOKIE_PLAIN], _TEST_SECRET, algorithms=["HS256"]
     )
@@ -924,3 +924,70 @@ def test_cli_poll_without_grant_store_keeps_legacy_shape(
         r = client.get(f"/auth/cli-poll?ticket={ticket}&code_verifier={cli_verifier}")
         assert r.status_code == 200, r.text
         assert "refresh_token" not in r.json()
+
+
+# ── Entra ID: exp is capped at auth_time + max_age ─────────────────
+
+
+def test_reauth_login_sends_a_max_age_an_entra_token_survives(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """A forced re-auth must ask for a window the IdP can mint a live token in.
+
+    Microsoft Entra ID caps the id_token's ``exp`` at ``auth_time + max_age``.
+    With ``max_age=0`` the token it returns has already expired by the time the
+    callback validates it, so every CLI, host and device login fails — and says
+    "Could not determine user email from IdP", because a failed validation
+    yields no claims to read an email from.
+
+    This drives the real shape end to end: take the ``max_age`` the login route
+    actually puts on the wire, mint the token Entra would mint for it, and
+    require the callback to accept it. Reading it from the redirect rather than
+    from a helper is the point — a hardcoded zero would otherwise go unnoticed.
+    """
+    client, keys = callback_client
+    redirect = client.get("/auth/login", params={"reauth": "1"}, follow_redirects=False)
+    assert redirect.status_code == 302, redirect.text
+    max_age = int(parse_qs(urlsplit(redirect.headers["location"]).query)["max_age"][0])
+    now = int(time.time())
+    # The real sequence: the demand, then the user types their password, then
+    # the redirect and the code exchange. auth_time is behind "now" by the
+    # seconds that took, which is what makes exp == auth_time fatal.
+    reauth_at = now - 10
+    auth_time = now - 5
+    token = keys.sign_id_token(
+        {
+            "email": "alice@example.com",
+            "email_verified": True,
+            "auth_time": auth_time,
+            # Entra's rule. At max_age=0 this is already in the past.
+            "exp": auth_time + max_age,
+        }
+    )
+
+    resp = _do_callback_reauth(client, token, reauth_at=reauth_at)
+
+    assert resp.status_code == 302, resp.text
+    assert resp.cookies.get("ap_session") is not None
+
+
+def test_a_token_that_does_not_validate_says_so(
+    callback_client: tuple[TestClient, _IdpKeys],
+) -> None:
+    """An expired token must not be reported as a missing email.
+
+    The email message sent at least one deployment looking at its claim
+    configuration for what was actually an expiry problem; the real cause was
+    only in the server log.
+    """
+    client, keys = callback_client
+    now = int(time.time())
+    token = keys.sign_id_token(
+        {"email": "alice@example.com", "email_verified": True, "exp": now - 1}
+    )
+
+    resp = _do_callback(client, token)
+
+    assert resp.status_code == 400, resp.text
+    assert "id_token failed validation" in resp.text
+    assert "email" not in resp.text.lower()
