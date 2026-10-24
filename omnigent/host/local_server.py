@@ -948,6 +948,30 @@ def _local_server_health_ok(base_url: str) -> bool:
     return isinstance(body, dict) and body.get("status") == "ok"
 
 
+def _process_uses_local_data_dir(pid: int) -> bool:
+    """Whether a process belongs to this invocation's local runtime directory."""
+    try:
+        process = psutil.Process(pid)
+        env = process.environ()
+        home = env.get("HOME") or env.get("USERPROFILE")
+        raw_data_dir = env.get("OMNIGENT_DATA_DIR")
+        if not raw_data_dir:
+            if not home:
+                return False
+            data_dir = Path(home) / ".omnigent"
+        elif raw_data_dir == "~" or raw_data_dir.startswith("~/"):
+            if not home:
+                return False
+            data_dir = Path(home) / raw_data_dir[2:]
+        else:
+            data_dir = Path(raw_data_dir).expanduser()
+        if not data_dir.is_absolute():
+            data_dir = Path(process.cwd()) / data_dir
+        return data_dir.resolve() == _local_data_dir().resolve()
+    except (psutil.Error, OSError, RuntimeError):
+        return False
+
+
 def stop_untracked_local_server(port: int = _DEFAULT_LOCAL_PORT) -> int | None:
     """Stop an orphaned local server on *port* that the pidfile doesn't track.
 
@@ -957,7 +981,8 @@ def stop_untracked_local_server(port: int = _DEFAULT_LOCAL_PORT) -> int | None:
     pidfile PID — so ``omnigent stop`` / ``server stop`` would leave it
     running. This sweep covers that hole: if a live Omnigent server answers
     ``/health`` on the canonical loopback *port*, find its PID and terminate
-    it. Call it AFTER :func:`stop_local_omnigent_server` so a normally-tracked
+    it only when its runtime data directory matches this invocation's.
+    Call it AFTER :func:`stop_local_omnigent_server` so a normally-tracked
     server is already gone and ``/health`` no longer answers (this is a
     no-op). Best-effort: returns ``None`` when nothing untracked is found or
     ``lsof`` is unavailable.
@@ -969,7 +994,7 @@ def stop_untracked_local_server(port: int = _DEFAULT_LOCAL_PORT) -> int | None:
     if not _local_server_health_ok(base_url):
         return None
     pid = _pid_listening_on_port(port)
-    if pid is None or not _pid_alive(pid):
+    if pid is None or not _pid_alive(pid) or not _process_uses_local_data_dir(pid):
         return None
     _terminate_pid(pid)
     return pid

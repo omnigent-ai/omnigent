@@ -1045,16 +1045,35 @@ def _fake_subprocess(stdout: str | None = None, raises: BaseException | None = N
     return _Sub
 
 
-def test_stop_untracked_local_server_kills_orphan_on_default_port(
+@pytest.mark.parametrize(
+    ("server_env", "expected_pid"),
+    [
+        ({"HOME": "/runtime/other", "OMNIGENT_DATA_DIR": "/runtime/ours/.omnigent"}, 93359),
+        ({"HOME": "/runtime/ours", "OMNIGENT_DATA_DIR": "/runtime/other"}, None),
+        ({"HOME": "/runtime/ours", "OMNIGENT_DATA_DIR": "/runtime/ours/.omnigent-sibling"}, None),
+        ({"HOME": "/runtime/ours", "OMNIGENT_DATA_DIR": ""}, 93359),
+        ({"HOME": "/runtime/ours", "OMNIGENT_DATA_DIR": "~/.omnigent"}, 93359),
+        ({"HOME": "/runtime/ours", "OMNIGENT_DATA_DIR": ".omnigent"}, 93359),
+        ({"HOME": "/runtime/other"}, None),
+        ({}, None),
+    ],
+    ids=[
+        "matching-data",
+        "different-data",
+        "sibling-data",
+        "matching-home",
+        "tilde-data",
+        "relative-data",
+        "other-home",
+        "unknown",
+    ],
+)
+def test_stop_untracked_local_server_only_kills_own_orphan(
     monkeypatch: pytest.MonkeyPatch,
+    server_env: dict[str, str],
+    expected_pid: int | None,
 ) -> None:
-    """A live Omnigent server on :8000 with no pidfile entry is found and stopped.
-
-    This is the reported bug: the pidfile was lost while the server lived, so
-    ``stop_local_omnigent_server`` (pidfile-scoped) couldn't see it. The sweep must
-    confirm it's our server via ``/health``, resolve its PID via lsof, and
-    terminate it — returning the PID so the off-switch can report it.
-    """
+    """An orphan sweep must leave another runtime's healthy local server running."""
 
     def _healthy(url: str, *, timeout: float, trust_env: bool) -> _FakeHealthResp:
         assert trust_env is False
@@ -1063,14 +1082,30 @@ def test_stop_untracked_local_server_kills_orphan_on_default_port(
     monkeypatch.setattr("httpx.get", _healthy)
     monkeypatch.setattr(local_server, "subprocess", _fake_subprocess(stdout="93359\n93360\n"))
     monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(local_server, "_local_data_dir", lambda: Path("/runtime/ours/.omnigent"))
     terminated: list[int] = []
     monkeypatch.setattr(local_server, "_terminate_pid", terminated.append)
 
-    result = local_server.stop_untracked_local_server(port=8000)
+    with patch.object(local_server.psutil, "Process") as process:
+        process.return_value.environ.return_value = server_env
+        process.return_value.cwd.return_value = "/runtime/ours"
+        result = local_server.stop_untracked_local_server(port=8000)
 
-    # The first lsof PID is the listener; it must actually be terminated.
-    assert result == 93359
-    assert terminated == [93359]
+    assert result == expected_pid
+    assert terminated == ([expected_pid] if expected_pid is not None else [])
+
+
+@pytest.mark.parametrize("error", [local_server.psutil.AccessDenied(93359), OSError("gone")])
+def test_stop_untracked_local_server_leaves_unreadable_process(
+    monkeypatch: pytest.MonkeyPatch, error: Exception
+) -> None:
+    """Unavailable process ownership never authorizes stopping another runtime."""
+    monkeypatch.setattr(local_server, "_local_server_health_ok", lambda url: True)
+    monkeypatch.setattr(local_server, "_pid_listening_on_port", lambda port: 93359)
+    monkeypatch.setattr(local_server, "_pid_alive", lambda pid: True)
+    monkeypatch.setattr(local_server, "_terminate_pid", _raise_if_called)
+    with patch.object(local_server.psutil, "Process", side_effect=error):
+        assert local_server.stop_untracked_local_server(port=8000) is None
 
 
 def test_stop_untracked_local_server_noop_when_nothing_listening(
