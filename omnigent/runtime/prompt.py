@@ -20,7 +20,7 @@ from omnigent.runtime.tool_result_replay import (
     image_omitted_placeholder,
     strip_unparseable_image_output,
 )
-from omnigent.spec import AgentSpec
+from omnigent.spec import AgentSpec, spec_dispatches_subagents
 
 # Shape of the wake notice the runner posts into a parent session when a
 # dispatched sub-agent finishes (``omnigent.runner.subagent_work._format_subagent_wake_notice``).
@@ -63,11 +63,11 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
     """
     Framework instructions that apply to every turn of ``spec``.
 
-    Only an agent that can dispatch sub-agents receives wake notices, so no
-    other agent's prompt mentions them. That is the ``sys_session_send``
-    registration gate in ``omnigent.tools.manager`` (declared sub-agents or
-    ``spawn: true``) plus the ``web_fetch`` builtin, which dispatches the
-    built-in web researcher through the same path.
+    The wake-notice announcement goes to every agent that can dispatch
+    sub-agents (:func:`omnigent.spec.spec_dispatches_subagents`), and those
+    agents always have ``sys_read_inbox`` registered to collect the results —
+    even under ``async: false``, where
+    ``ToolManager._register_async_inbox_tools`` keeps the inbox drain.
 
     The embedded-browser priority guidance follows the ``browser_*``
     registration gate (``ToolManager._register_browser_tools``): every
@@ -79,8 +79,7 @@ def _framework_instructions_for(spec: AgentSpec) -> list[str]:
         an agent with no sub-agents and the browser group disabled.
     """
     instructions: list[str] = []
-    dispatches_web_researcher = any(entry.name == "web_fetch" for entry in spec.tools.builtins)
-    if spec.tools.agents or spec.spawn or dispatches_web_researcher:
+    if spec_dispatches_subagents(spec):
         instructions.append(SUBAGENT_WAKE_NOTICE_INSTRUCTION)
     if spec.tool_groups.browser:
         instructions.append(EMBEDDED_BROWSER_PRIORITY_INSTRUCTION)

@@ -1524,7 +1524,9 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
         — the same YAML must produce the same tool surface
         whether the user opts into Omnigent mode or runs the legacy
         path. Agents that want to suppress the async surface
-        declare ``async: false`` explicitly. See
+        declare ``async: false`` explicitly; a spec that can
+        dispatch sub-agents (:func:`spec_dispatches_subagents`)
+        still gets ``sys_read_inbox`` to collect their results. See
         ``designs/SERVER_HARNESS_CONTRACT.md`` §Async work +
         inbox + the step-11 sub-step entries.
     :param os_env: The agent's OS environment, e.g.
@@ -1653,3 +1655,24 @@ class AgentSpec:  # type: ignore[explicit-any]  # params: dict[str, Any] field (
     tool_groups: ToolGroupsConfig = field(default_factory=ToolGroupsConfig)
     agent_session_sharing: SharePolicy = SharePolicy.NONE
     source_rel_dir: str | None = field(default=None, compare=False)
+
+
+def spec_dispatches_subagents(spec: AgentSpec) -> bool:
+    """
+    Whether *spec* can dispatch sub-agents.
+
+    A dispatching spec receives the sub-agent results as inbox payloads,
+    so it always needs the ``sys_read_inbox`` drain regardless of its
+    ``async_enabled`` kill-switch. The dispatch grants are declared
+    sub-agents (``tools.agents``), ``spawn: true`` (``sys_session_create``),
+    and the ``web_fetch`` builtin, whose built-in web researcher runs
+    through the same path.
+
+    :param spec: The parsed AgentSpec.
+    :returns: ``True`` when the spec can dispatch sub-agents.
+    """
+    return bool(
+        spec.tools.agents
+        or spec.spawn
+        or any(entry.name == "web_fetch" for entry in spec.tools.builtins)
+    )
