@@ -910,10 +910,12 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
+  const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
   const { reconnect, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
     useSessionReconnect({
       sessionId: urlConvId ?? null,
-      hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
+      hostId: reconnectHostId,
+      hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
       isOwner: isOwnerLevel(permissionLevel),
     });
 

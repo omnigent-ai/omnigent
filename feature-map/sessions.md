@@ -65,9 +65,11 @@ the header menu), and each place is a separate entry point.
   explanations. Their forms cannot submit.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
-  dialog with the command to run; the desktop app can reconnect a local host
-  itself or explicitly reconnect a remembered Arca host. States: reconnecting
-  (spinner), reconnect failed (retry), host offline.
+  dialog with the command to run; the desktop app reconnects a local host
+  itself, and starts an Arca host recognized by its saved ID or CLI-seeded name
+  from the same action (the desktop's Arca console still asks before running).
+  A failed attempt opens the dialog for retry. States: reconnecting (spinner),
+  reconnect failed (retry), host offline.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
   worktree of it, to fork the conversation into a new session; the original
@@ -270,9 +272,10 @@ status and live session updates, including when the app is embedded.
 **Reconnect:** in a session whose agent stopped, use the reconnect affordance
 in the chat; the dialog shows the command for this situation (for example
 `omnigent host` when the host is offline, or the harness's `--resume` command
-when a local session is stranded). In the desktop app, reconnect acts directly
-for this machine; an Arca-hosted session offers an explicit **Reconnect Arca**
-action in the same dialog.
+when a local session is stranded). In the desktop app, **Reconnect host** acts
+directly for this machine or a recognized Arca host; Arca's connect console
+asks for confirmation before running, and a failed attempt opens the dialog,
+whose **Reconnect Arca** action retries.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -645,7 +648,13 @@ plain `uv run pytest`, which starts a private server for the test.
   that stays usable after closing its side chat.
 - **`reconnect`, desktop app (own environment):**
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
-  `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`
+  `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,
+  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_reconnects_arca_from_current_chat`,
+  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_arca_reconnect_failure_offers_retry`
+  drive the real SPA and server with an injected desktop bridge and offline host
+  responses. The Arca journeys cover a remembered host and a CLI-seeded host
+  with no saved ID; they check one-action start, progress, failure and retry,
+  not live SSH or the desktop's consent console.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It
