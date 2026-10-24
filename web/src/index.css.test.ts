@@ -236,6 +236,47 @@ const allWidthNativeLayoutRules = [
   ["native Plan tracker", ".chat-plan-accordion", "--omnigent-safe-top"],
 ] as const;
 
+/* The header's companions must follow its safe-top offset at tablet widths,
+ * where the phone-only inset rules no longer apply; otherwise scrolled text
+ * paints through the transparent header controls. */
+const HEADER_OFFSET = "max(0px, var(--omnigent-safe-top) - 0.5rem)";
+const tabletNativeCompanionRules = [
+  [
+    "transcript fade",
+    ":is([data-ios-native], [data-android-native]) .chat-scroll-fade",
+    `--fade-start: calc(48px + ${HEADER_OFFSET})`,
+  ],
+  [
+    "transcript top padding",
+    ":is([data-ios-native], [data-android-native]) .chat-scroll-fade .chat-conversation-content",
+    `padding-top: calc(5rem + ${HEADER_OFFSET})`,
+  ],
+  [
+    "fold-row snap margin",
+    ":is([data-ios-native], [data-android-native]) .turn-fold-row",
+    `scroll-margin-top: calc(88px + ${HEADER_OFFSET})`,
+  ],
+] as const;
+
+/** The prelude of the at-rule enclosing the block starting at `index` ("" at top level). */
+function enclosingAtRule(index: number): string {
+  const before = cssSource.slice(0, index);
+  let depth = 0;
+  for (let i = before.length - 1; i >= 0; i--) {
+    if (before[i] === "}") depth++;
+    else if (before[i] === "{") {
+      if (depth === 0) {
+        return before
+          .slice(before.lastIndexOf("}", i) + 1, i)
+          .replace(/\/\*[\s\S]*?\*\//g, "")
+          .trim();
+      }
+      depth--;
+    }
+  }
+  return "";
+}
+
 describe("index.css native tablet layout", () => {
   it.each(allWidthNativeLayoutRules)(
     "keeps the %s rule outside width media queries",
@@ -249,6 +290,16 @@ describe("index.css native tablet layout", () => {
       const opens = (before.match(/\{/g) ?? []).length;
       const closes = (before.match(/\}/g) ?? []).length;
       expect(opens - closes, `${selector} must not sit inside an at-rule`).toBe(0);
+    },
+  );
+
+  it.each(tabletNativeCompanionRules)(
+    "shifts the %s by the header offset at tablet widths",
+    (_, selector, declaration) => {
+      const matches = cssBlocks.filter(([block]) => selectorOf(block) === selector);
+      expect(matches, `missing the tablet-width ${selector} rule`).toHaveLength(1);
+      expect(matches[0][0]).toContain(declaration);
+      expect(enclosingAtRule(matches[0].index!)).toBe("@media (width >= 48rem)");
     },
   );
 });
