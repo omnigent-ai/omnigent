@@ -505,6 +505,32 @@ def _cursor_restore_escape(meta: _PaneMetadata | None) -> bytes:
     return cup + visibility
 
 
+async def _set_shared_window_size_largest(tmux: str, socket_path: str, tmux_target: str) -> None:
+    """Max the shared window to its widest owner so a phone can't shrink the desktop.
+
+    tmux's default ``window-size latest`` sizes the window to its most recently
+    active client; ``largest`` maxes columns and rows across size-contributing
+    clients instead (read-only viewers already use ``ignore-size``). Best-effort:
+    a tmux that rejects the option keeps the previous behavior.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            tmux,
+            "-S",
+            socket_path,
+            "set-window-option",
+            "-t",
+            tmux_target,
+            "window-size",
+            "largest",
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+        )
+        await proc.wait()
+    except (OSError, ValueError):
+        return
+
+
 async def bridge_tmux_control_to_websocket(
     websocket: WebSocket,
     *,
@@ -556,6 +582,9 @@ async def bridge_tmux_control_to_websocket(
     if seed:
         with contextlib.suppress(RuntimeError, WebSocketDisconnect):
             await websocket.send_bytes(seed)
+
+    # Apply before attaching so already-running sessions get the policy too.
+    await _set_shared_window_size_largest(tmux, socket_path, tmux_target)
 
     argv = [tmux, "-S", socket_path, "-f", "/dev/null", "-C", "attach"]
     if read_only:
