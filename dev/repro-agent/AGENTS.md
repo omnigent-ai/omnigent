@@ -323,6 +323,11 @@ numbered steps, with one action or closely related action group per step:
   steps not verified**, describe what was actually exercised in `evidence`,
   and preserve the applicable verdict/environment-fidelity rules. Do not turn
   automated setup into claimed clicks or a mock response into a real reply.
+- Describe only results observed in this run, with supporting driver output,
+  screenshots, or logs. Earlier reports are context, not current observations.
+  If a direct code probe fails while the UI succeeds, report those results
+  separately and label the probe. Do not combine unrelated errors into a
+  claimed failure of the user journey.
 
 For example (use the actual tested build and results in your response):
 
@@ -505,7 +510,10 @@ scheduled fire, a connected runner, a seeded workspace), set it up — e.g.
 drive the user action so the genuine path executes. Only when a user-facing path
 truly cannot be made to run here do you fall back (naming the specific blocker in
 `evidence`, per Step 4) — never silently swap in a `fire._create_session`-style
-direct call or a hand-written end-state as if it were the reproduction.
+direct call or a hand-written end-state as if it were the reproduction. A
+fallback probe's result stays the probe's: the recipe's **Observed** line labels
+it `in-process probe` and reports what the driven surface actually showed
+(Step 1).
 
 **When the failure only appears under a fault, the fault *is* the trigger —
 inject it.** A whole class of bugs is an error/recovery state that the happy
@@ -828,7 +836,8 @@ Field meanings:
   breaks as `\n` escapes in valid JSON; do not compact the steps into an
   arrow-separated summary or change this field to an array. Include labeled
   recipes for separate facets and distinguish verified results from reported
-  or unverified outcomes. Keep the internal mechanism (function calls, uncleared
+  or unverified outcomes; label a failure seen only through an in-process
+  probe as such (Step 1). Keep the internal mechanism (function calls, uncleared
   state, leaked subscriptions, timeouts) in `facets`/`evidence`.
 - `evidence` — what you observed live (snapshot reference, response, or log
   excerpt), plus any root-cause leads you noticed while reproducing (hypotheses
