@@ -4619,6 +4619,8 @@ async def _forward_available_status_events(
                 if status == "failed"
                 else None,
                 failure_context=failure_context,
+                # The Stop hook may arrive before its final transcript item is mirrored.
+                output=record.completion_output if status == "idle" else None,
             )
         except httpx.HTTPError as exc:
             decision = retry_tracker.record_failure(retry_key, exc, session_id=session_id)
