@@ -38,6 +38,7 @@ from omnigent.entities import Conversation
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import (
+    CAP_FILESYSTEM_ROOTS,
     CAP_REFRESH_HARNESSES,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
@@ -737,6 +738,7 @@ def create_hosts_router(
         now = now_epoch()
         result: list[dict[str, Any]] = []
         for host in hosts:
+            live_connection = host_registry.get(host.host_id)
             # Status comes from the DB, not host_registry. The registry
             # is per-replica; if a host is connected to replica B and
             # this request lands on replica A, A's registry won't know
@@ -759,6 +761,13 @@ def create_hosts_router(
                     # user-connectable machines.
                     "sandbox_provider": host.sandbox_provider,
                     "configured_harnesses": host.configured_harnesses,
+                    # Root enumeration was added after the original filesystem
+                    # RPC. Older Hosts and connections on another replica fail
+                    # closed so clients retain the existing home/path flow.
+                    "filesystem_roots": bool(
+                        live_connection
+                        and CAP_FILESYSTEM_ROOTS in live_connection.hello.capabilities
+                    ),
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
                     # emitted as-is so a client can tell "unknown" from "not
@@ -804,6 +813,10 @@ def create_hosts_router(
             # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
             "configured_harnesses": host.configured_harnesses,
+            "filesystem_roots": bool(
+                (live_connection := host_registry.get(host.host_id))
+                and CAP_FILESYSTEM_ROOTS in live_connection.hello.capabilities
+            ),
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".
             "gateway_inference": host_registry.gateway_inference(host.host_id),
@@ -1245,24 +1258,35 @@ def create_hosts_router(
             "status": "launching",
         }
 
-    @router.get("/hosts/{host_id}/filesystem")
+    @router.get(
+        "/hosts/{host_id}/filesystem",
+        responses={
+            409: {
+                "description": (
+                    "Host is offline or does not advertise filesystem-root enumeration"
+                )
+            }
+        },
+    )
     async def list_host_filesystem_root(
         request: Request,
         host_id: str,
+        roots: bool = Query(default=False),
         limit: int = Query(default=_LIST_DIR_DEFAULT_LIMIT, ge=1, le=_LIST_DIR_MAX_LIMIT),
         after: str | None = Query(default=None),
         before: str | None = Query(default=None),
     ) -> dict[str, Any]:
         """
-        List the contents of the host daemon's home directory.
+        List the host daemon's home directory or platform roots.
 
-        Empty trailing path → forward ``~`` to the host (the host
-        expands against its own process owner). Used by the
-        Web UI's directory picker to show the "root" view.
+        By default, forwards ``~`` so the Host expands its process owner's
+        home. ``roots=true`` asks a capable Host to enumerate Windows drives
+        or the POSIX ``/`` root.
 
         :param request: FastAPI request (for auth).
         :param host_id: Host identifier, e.g.
             ``"host_a1b2c3d4..."``.
+        :param roots: Whether to enumerate platform filesystem roots.
         :param limit: Max entries per page.
         :param after: Optional forward pagination cursor (entry
             path), e.g. ``"/Users/corey/projects/m"``.
@@ -1271,16 +1295,18 @@ def create_hosts_router(
             mirroring the existing session-scoped filesystem
             endpoint shape.
         :raises HTTPException: 404 if host not found, 403 if not
-            owned by caller, 409 if host is offline, 504 on host
-            timeout, 502 on host I/O failure.
+            owned by caller, 409 if host is offline or ``roots=true`` is not
+            supported by its current connection, 504 on host timeout, 502 on
+            host I/O failure.
         """
         return await _list_host_filesystem(
             request=request,
             host_id=host_id,
-            path="~",
+            path="" if roots else "~",
             limit=limit,
             after=after,
             before=before,
+            require_filesystem_roots=roots,
         )
 
     @router.get("/hosts/{host_id}/filesystem/{path:path}")
@@ -1340,6 +1366,7 @@ def create_hosts_router(
         limit: int,
         after: str | None,
         before: str | None,
+        require_filesystem_roots: bool = False,
     ) -> dict[str, Any]:
         """
         Shared implementation for the filesystem endpoints.
@@ -1354,6 +1381,8 @@ def create_hosts_router(
         :param limit: Max entries.
         :param after: Forward cursor.
         :param before: Backward cursor.
+        :param require_filesystem_roots: Whether the live Host must advertise
+            filesystem-root enumeration before the request is forwarded.
         :returns: Listing dict with ``object``, ``data``, ``has_more``.
         :raises HTTPException: See per-route docstrings for codes.
         """
@@ -1379,6 +1408,11 @@ def create_hosts_router(
         conn = host_registry.get(host.host_id)
         if conn is None:
             raise _host_absent_error(host)
+        if require_filesystem_roots and CAP_FILESYSTEM_ROOTS not in conn.hello.capabilities:
+            raise HTTPException(
+                status_code=409,
+                detail="host does not support filesystem root enumeration",
+            )
 
         result = await _proxy_list_dir(
             host_registry=host_registry,
