@@ -5812,12 +5812,13 @@ async def _wait_for_runner_client_impl(
     instant we are convinced, neither speculatively early nor a full
     timeout late.
 
-    A lookup that misses right after the connect is retried a few times
-    (:func:`_resolve_connected_runner_client`): the binding the router checks
-    can settle just after the tunnel registers, and giving up then reports a
-    healthy runner as failed. The retries share ``timeout_s`` with the connect
-    wait; no lookup starts or result is accepted after that budget expires.
-    The outcome is logged once as ``runner_client_wait``.
+    A lookup that misses after the connect is retried until the deadline
+    (:func:`_resolve_connected_runner_client`): a store that caches
+    conversations can keep serving the previous runner binding for several
+    seconds after a rebind, and giving up then reports a healthy runner as
+    failed. The retries share ``timeout_s`` with the connect wait; no lookup
+    starts or result is accepted after that budget expires. The outcome is
+    logged once as ``runner_client_wait``.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -5936,10 +5937,10 @@ async def _resolve_connected_runner_client(
     """
     Resolve the client of a runner whose tunnel has connected, retrying a miss.
 
-    Tries up to ``_RUNNER_CLIENT_RESOLVE_ATTEMPTS`` lookups,
-    ``_RUNNER_CLIENT_RESOLVE_RETRY_S`` apart. Each pause is clamped to the time
-    left before ``deadline``, and no further lookup starts once the deadline
-    has passed or the daemon has reported the runner dead.
+    Looks up every ``_RUNNER_CLIENT_RESOLVE_RETRY_S`` until one resolves. Each
+    pause is clamped to the time left before ``deadline``, and no further
+    lookup starts once the deadline has passed or the daemon has reported the
+    runner dead.
 
     :param session_id: Session/conversation identifier,
         e.g. ``"conv_abc123"``.
@@ -5966,7 +5967,7 @@ async def _resolve_connected_runner_client(
             runner_exit_reports is not None and runner_exit_reports.get(runner_id) is not None
         ):
             return None, attempts
-        if client is not None or attempts >= _facade._RUNNER_CLIENT_RESOLVE_ATTEMPTS:
+        if client is not None:
             return client, attempts
         await asyncio.sleep(min(_facade._RUNNER_CLIENT_RESOLVE_RETRY_S, remaining))
 

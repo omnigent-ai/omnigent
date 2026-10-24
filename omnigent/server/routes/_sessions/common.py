@@ -439,10 +439,7 @@ _MANAGED_RESUMABLE_TUNNEL_STALE_S = 30.0
 _RUNNER_CONVICTION_POLL_S = 0.25
 
 
-# Lookups, and the gap between them, when resolving a connected runner's client.
-_RUNNER_CLIENT_RESOLVE_ATTEMPTS = 3
-
-
+# Gap between lookups when resolving a connected runner's client.
 _RUNNER_CLIENT_RESOLVE_RETRY_S = 2.0
 
 
@@ -1207,7 +1204,6 @@ __all__ = [
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
     "_RACE_TASK_REAP_TIMEOUT_S",
     "_RETRY_SESSION_TYPE",
-    "_RUNNER_CLIENT_RESOLVE_ATTEMPTS",
     "_RUNNER_CLIENT_RESOLVE_RETRY_S",
     "_RUNNER_CONVICTION_POLL_S",
     "_RUNNER_FORWARD_TIMEOUT",
