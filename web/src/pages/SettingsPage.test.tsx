@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
+import { NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY } from "@/lib/newChatProjectPromptPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
 import {
@@ -331,6 +332,7 @@ function installUpdateBridge(config: UpdateConfig = DEFAULT_UPDATE_CONFIG) {
 describe("SettingsPage", () => {
   beforeEach(() => {
     localStorage.removeItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY);
+    localStorage.removeItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY);
   });
 
   it("groups General settings into titled outlined cards and hides its description on mobile", () => {
@@ -367,6 +369,22 @@ describe("SettingsPage", () => {
 
     expect(toggle).not.toBeChecked();
     expect(localStorage.getItem(BACKGROUND_SESSION_TITLES_STORAGE_KEY)).toBe("off");
+  });
+
+  it("renders the new-session project prompt enabled by default", async () => {
+    renderPage("/settings/general");
+
+    expect(await screen.findByTestId("new-chat-project-prompt-toggle")).toBeChecked();
+  });
+
+  it("persists turning the new-session project prompt off", async () => {
+    renderPage("/settings/general");
+    const toggle = await screen.findByTestId("new-chat-project-prompt-toggle");
+
+    fireEvent.click(toggle);
+
+    expect(toggle).not.toBeChecked();
+    expect(localStorage.getItem(NEW_CHAT_PROJECT_PROMPT_STORAGE_KEY)).toBe("off");
   });
 
   it("asks before terminal copying by default and explains the scope", () => {

@@ -211,6 +211,10 @@ import {
 } from "@/lib/composerSendShortcutPreferences";
 import { readAlwaysUseWorktree, writeAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import {
+  readNewChatProjectPromptEnabled,
+  writeNewChatProjectPromptEnabled,
+} from "@/lib/newChatProjectPromptPreferences";
+import {
   readDeleteWorktreesOnArchive,
   writeDeleteWorktreesOnArchive,
 } from "@/lib/archiveWorktreePreferences";
@@ -1714,6 +1718,39 @@ function OpenLinksInAppControl() {
   );
 }
 
+function NewChatProjectPromptControl() {
+  const [enabled, setEnabled] = useState(readNewChatProjectPromptEnabled);
+  const labelId = useId();
+  const descriptionId = useId();
+
+  const toggle = useCallback((next: boolean) => {
+    setEnabled(next);
+    writeNewChatProjectPromptEnabled(next);
+  }, []);
+
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Ask for a project when starting a session"
+        labelId={labelId}
+        descriptionId={descriptionId}
+        className="flex-1"
+        description="When you have projects, New session and its shortcut first ask which project the session belongs to, so its defaults fill in the composer."
+        descriptionClassName="text-ui"
+      />
+      <Switch
+        aria-labelledby={labelId}
+        aria-describedby={descriptionId}
+        checked={enabled}
+        onCheckedChange={toggle}
+        data-testid="new-chat-project-prompt-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.general.new_chat_project_prompt"
+      />
+    </div>
+  );
+}
+
 function BackgroundSessionTitlesControl() {
   const [enabled, setEnabled] = useState(readBackgroundSessionTitlesEnabled);
   const labelId = useId();
@@ -1831,6 +1868,9 @@ function GeneralSection() {
         </SettingsGroup>
         <SettingsGroup title="Sessions" testId="settings-group-sessions">
           <BackgroundSessionTitlesControl />
+          <div className="mt-4 border-t border-border pt-4">
+            <NewChatProjectPromptControl />
+          </div>
         </SettingsGroup>
         <SettingsGroup title="Terminal" testId="settings-group-terminal">
           <TerminalClipboardControl />

@@ -47,6 +47,7 @@ from playwright.async_api import Route, async_playwright
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests._helpers.polling import poll_until_async
+from tests.e2e_ui.conftest import DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT
 from tests.e2e_ui.start_session.helpers import stub_empty_host_picker_data
 
 # Unique sentinels so each POST body is unambiguously identifiable.
@@ -167,6 +168,8 @@ async def _drive_initial_prompt_switch(base_url: str, session_a: str, session_b:
                 else:
                     await route.continue_()
 
+            # The shared server may hold projects; keep New session on the composer.
+            await page.add_init_script(DISABLE_NEW_CHAT_PROJECT_PROMPT_SCRIPT)
             await page.route("**/v1/sessions/*/events", handle_events)
             await page.route("**/v1/hosts", handle_hosts)
             await stub_empty_host_picker_data(page, "host_e2e")

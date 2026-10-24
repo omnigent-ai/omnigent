@@ -103,6 +103,15 @@ and steers messages while the agent is busy.
 - `new-session-hotkey`: ⌘+Shift+O on macOS or Ctrl+Shift+O on Windows/Linux
   opens and focuses the new-session composer in browsers. Native shells retain
   ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
+- `palette-new-chat-in-project`: typing in the ⌘K command palette lists a
+  "New chat in <project>" row per project; every typed word must match, so
+  `project`, `new omni` and `omni` all find it. Choosing a row opens the
+  new-session composer with that project's defaults. The rows are hidden while
+  the query is empty and absent from the sessions-only switcher.
+- `new-session-project-prompt`: when projects exist, the hotkey, the sidebar's
+  New session links, and the palette's New chat first ask for a project (or No
+  project), then open the composer with its defaults. Settings › General ›
+  Sessions turns it off. Modified clicks on the links still open a new tab.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
   can be steered into the running turn.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
@@ -211,6 +220,15 @@ and steers messages while the agent is busy.
 - With the browser app focused, press ⌘+Shift+O (macOS) or
   Ctrl+Shift+O (Windows/Linux) to open and focus a clean new-session
   composer.
+- Press ⌘/Ctrl+K, type part of a project's name (or `project`), and pick
+  **New chat in <project>** to open the new-session composer with that
+  project's host, workspace and agent prefilled.
+- With at least one project, press the hotkey or click New session (also from
+  the mobile drawer): a "Start a new session in…" picker opens. Type part of a
+  project name and press Enter to land on `/?project=<name>` with its defaults;
+  choose No project for a plain composer. Turn off **Ask for a project when
+  starting a session** in Settings and the same actions open the composer
+  directly.
 - Hover the model/effort pill to see the tooltip.
 - Hover the host chip to see the selected host or sandbox and its connection.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
@@ -553,6 +571,10 @@ Other connection providers alone do not enable the managed MCP picker.
   a deployment that does.
 - **`new-session-hotkey`:**
   `tests/e2e_ui/sessions/test_new_session_hotkey.py::test_new_session_hotkey_from_focused_composer`
+- **`palette-new-chat-in-project`:** component coverage in
+  `web/src/shell/CommandPalette.test.tsx` (`new chat in project`). Manually: ⌘K,
+  type part of a project name, press Enter on the row, and check the composer
+  shows that project's host, workspace and agent.
 - **`import-bundle`:** no browser-level coverage; the web unit tests for the
   Create custom agent and new-session dialogs cover it. Manually: open the agent
   picker's custom agents, then Create custom agent → Import bundle, and pick a

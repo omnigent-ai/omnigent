@@ -14,7 +14,14 @@ import {
 } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
-import { Outlet, useLocation, useParams, useRebasePath, useSearchParams } from "@/lib/routing";
+import {
+  Outlet,
+  useLocation,
+  useNavigate,
+  useParams,
+  useRebasePath,
+  useSearchParams,
+} from "@/lib/routing";
 import { CANVAS_CONVERSATION_MIN_WIDTH } from "@/canvas/CanvasWorkspace";
 import { isCanvasPathname } from "@/canvas/canvasNavigation";
 import { useCanvasSidebar } from "@/canvas/useCanvasSidebar";
@@ -25,6 +32,7 @@ import { useApproveHotkey } from "@/hooks/useApproveHotkey";
 import { useSidebarToggleHotkeys } from "@/hooks/useSidebarToggleHotkeys";
 import { useCommandPaletteHotkey } from "@/hooks/useCommandPaletteHotkey";
 import { useNewSessionHotkey } from "@/hooks/useNewSessionHotkey";
+import { useShouldPromptForProject } from "@/hooks/useNewChatProjectPrompt";
 import { useNewShellHotkey } from "@/hooks/useNewShellHotkey";
 import { useSettingsHotkey } from "@/hooks/useSettingsHotkey";
 import { useIsEmbedded } from "@/lib/embedded";
@@ -1714,6 +1722,7 @@ function AppShellImpl() {
   // Bound here where the palette's open-state lives.
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [sessionSearch, setSessionSearch] = useState(false);
+  const [projectStep, setProjectStep] = useState(false);
   // Stable handlers so the memoized Sidebar doesn't re-render on AppShell's
   // frequent re-renders (chatStore status churn during a bind). Inline
   // callbacks would give it fresh props each time and defeat the memo.
@@ -1730,22 +1739,38 @@ function AppShellImpl() {
   );
   const handleOpenSearch = useCallback(() => {
     setSessionSearch(false);
+    setProjectStep(false);
     setCommandPaletteOpen(true);
   }, []);
+  // Every "new session" entry point lands here: with projects to choose from,
+  // the palette asks which one first; otherwise the plain composer opens.
+  const shouldPromptForProject = useShouldPromptForProject();
+  const navigate = useNavigate();
+  const handleNewSession = useCallback(() => {
+    if (!shouldPromptForProject()) {
+      navigate("/");
+      return;
+    }
+    setSessionSearch(false);
+    setProjectStep(true);
+    setCommandPaletteOpen(true);
+  }, [navigate, shouldPromptForProject]);
   const isEmbedded = useIsEmbedded();
   useCommandPaletteHotkey(
     () => {
       setSessionSearch(false);
-      setCommandPaletteOpen((prev) => sessionSearch || !prev);
+      setProjectStep(false);
+      setCommandPaletteOpen((prev) => sessionSearch || projectStep || !prev);
     },
     true,
     undefined,
     () => {
       setSessionSearch(true);
-      setCommandPaletteOpen((prev) => !sessionSearch || !prev);
+      setProjectStep(false);
+      setCommandPaletteOpen((prev) => !sessionSearch || projectStep || !prev);
     },
   );
-  useNewSessionHotkey();
+  useNewSessionHotkey(true, undefined, handleNewSession);
   useSettingsHotkey();
 
   // Mobile back button: close the open file and return to the files/changes
@@ -2453,6 +2478,7 @@ function AppShellImpl() {
               dragProgress={sidebarDragProgress}
               onClose={handleSidebarClose}
               onOpenSearch={handleOpenSearch}
+              onNewSession={handleNewSession}
             />
 
             {/* Content region (everything right of the sidebar): a relative
@@ -2820,8 +2846,10 @@ function AppShellImpl() {
               there even though the ⌘K hotkey is disabled (it belongs to the
               host page). */}
           <CommandPalette
-            key={sessionSearch ? "sessions" : "commands"}
+            key={projectStep ? "project" : sessionSearch ? "sessions" : "commands"}
             sessionsOnly={sessionSearch}
+            projectStep={projectStep}
+            onNewSession={handleNewSession}
             open={commandPaletteOpen}
             onOpenChange={setCommandPaletteOpen}
             onToggleLeftSidebar={toggleLeftSidebar}

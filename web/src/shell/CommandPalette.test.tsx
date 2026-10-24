@@ -10,8 +10,10 @@ vi.mock("@/lib/routing", () => ({
 }));
 
 const useConversations = vi.fn();
+const useProjects = vi.fn();
 vi.mock("@/hooks/useConversations", () => ({
   useConversations: (...args: unknown[]) => useConversations(...args),
+  useProjects: () => useProjects(),
 }));
 
 function conv(
@@ -49,6 +51,7 @@ beforeEach(() => {
   navigate.mockClear();
   useConversations.mockReset();
   setSessions([]);
+  useProjects.mockReturnValue({ data: [] });
 });
 afterEach(cleanup);
 
@@ -339,6 +342,140 @@ describe("CommandPalette — match preview", () => {
     expect(screen.getByText(/deploy/)).toBeTruthy();
     // No second line: only the single title row is present.
     expect(screen.queryByText(/runbook.*\n/)).toBeNull();
+  });
+});
+
+describe("CommandPalette — new chat in project", () => {
+  beforeEach(() => {
+    useProjects.mockReturnValue({
+      data: [
+        { id: "p1", name: "omnigent", icon: "🔥" },
+        { id: null, name: "home lab", icon: null },
+      ],
+    });
+  });
+
+  it("hides project rows until the user types", () => {
+    renderPalette();
+    expect(screen.queryByText("New chat in project")).toBeNull();
+    expect(screen.queryByText("New chat in omnigent")).toBeNull();
+  });
+
+  it("matches every typed word against the row label", () => {
+    renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "new omni" },
+    });
+    expect(screen.getByText("New chat in omnigent")).toBeTruthy();
+    expect(screen.queryByText("New chat in home lab")).toBeNull();
+    expect(screen.getByTestId("project-icon").textContent).toBe("🔥");
+  });
+
+  it("lists every project when the query is the group heading's word", () => {
+    renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "project" },
+    });
+    expect(screen.getByText("New chat in omnigent")).toBeTruthy();
+    expect(screen.getByText("New chat in home lab")).toBeTruthy();
+  });
+
+  it("opens the highlighted project row with Enter", () => {
+    const { onOpenChange } = renderPalette();
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.change(input, { target: { value: "omni" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/?project=omnigent");
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("opens the composer with the project's defaults and closes", () => {
+    const { onOpenChange } = renderPalette();
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "home" },
+    });
+    fireEvent.click(screen.getByText("New chat in home lab"));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(navigate).toHaveBeenCalledWith("/?project=home%20lab");
+  });
+
+  it("routes the New chat action through onNewSession", () => {
+    const onNewSession = vi.fn();
+    const { onOpenChange } = renderPalette({ onNewSession });
+    fireEvent.click(screen.getByText("New chat"));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
+  it("omits project rows in the sessions-only switcher", () => {
+    renderPalette({ sessionsOnly: true });
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "omni" },
+    });
+    expect(screen.queryByText("New chat in omnigent")).toBeNull();
+  });
+});
+
+describe("CommandPalette — project step", () => {
+  beforeEach(() => {
+    setSessions([conv("s1", "Cached session")]);
+    useProjects.mockReturnValue({
+      data: [
+        { id: "p1", name: "omnigent", icon: "🔥" },
+        { id: null, name: "home lab", icon: null },
+      ],
+    });
+  });
+
+  it("offers No project first, then every project, and nothing else", () => {
+    renderPalette({ projectStep: true });
+
+    expect(screen.getByPlaceholderText("Start a new session in…")).toBeTruthy();
+    const rows = screen.getAllByRole("option").map((row) => row.textContent);
+    expect(rows).toEqual(["No project", "🔥omnigent", "home lab"]);
+    expect(useConversations).toHaveBeenCalledWith("", false, { enabled: false });
+  });
+
+  it("filters projects by name as the user types", () => {
+    renderPalette({ projectStep: true });
+    fireEvent.change(screen.getByTestId("command-palette-input"), {
+      target: { value: "lab" },
+    });
+    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual(["home lab"]);
+  });
+
+  it.each([
+    ["No project", "/"],
+    ["home lab", "/?project=home%20lab"],
+  ])("opens the composer for %s", (row, path) => {
+    const { onOpenChange } = renderPalette({ projectStep: true });
+    fireEvent.click(screen.getByText(row));
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+    expect(navigate).toHaveBeenCalledWith(path);
+  });
+
+  it.each([
+    ["", "/"],
+    ["lab", "/?project=home%20lab"],
+  ])("opens the first row with Enter after typing %j", (typed, path) => {
+    const { onOpenChange } = renderPalette({ projectStep: true });
+    const input = screen.getByTestId("command-palette-input");
+    if (typed) fireEvent.change(input, { target: { value: typed } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith(path);
+    expect(onOpenChange).toHaveBeenCalledWith(false);
+  });
+
+  it("hides a stale session-load error", () => {
+    useConversations.mockReturnValue({ isError: true, isFetching: false, refetch: vi.fn() });
+    renderPalette({ projectStep: true });
+    expect(screen.queryByText("Couldn't load sessions.")).toBeNull();
+    expect(screen.getAllByRole("option").map((row) => row.textContent)).toEqual([
+      "No project",
+      "🔥omnigent",
+      "home lab",
+    ]);
   });
 });
 

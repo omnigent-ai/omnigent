@@ -134,6 +134,16 @@ describe("useNewSessionHotkey", () => {
     expect(navigate).toHaveBeenCalledExactlyOnceWith("/");
   });
 
+  it("hands the shortcut to onNewSession instead of navigating", () => {
+    const onNewSession = vi.fn();
+    renderHook(() => useNewSessionHotkey(true, false, onNewSession));
+
+    press({ key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
+
+    expect(onNewSession).toHaveBeenCalledTimes(1);
+    expect(navigate).not.toHaveBeenCalled();
+  });
+
   it("ignores auto-repeat", () => {
     renderHook(() => useNewSessionHotkey(true, false));
 
