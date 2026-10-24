@@ -35,6 +35,7 @@ when the credentials file is absent — see ``ambient._claude_login_detected``.)
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 import re
@@ -881,6 +882,32 @@ def _harness_cli_version_satisfies(
         except InvalidVersion:
             return False
     return True
+
+
+def binary_meets_min_version(
+    binary: str,
+    min_version: str,
+    *,
+    timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_S,
+) -> bool:
+    """Return whether *binary* reports ``--version`` at or above *min_version*.
+
+    Uses the Claude install spec's probe and cache, so a launch-time check on a
+    feature floor costs one ``--version`` run per binary. A missing binary, a
+    failed probe or unparseable output counts as not meeting the floor.
+
+    :param binary: Resolved path of the CLI, e.g. ``"/usr/local/bin/claude"``.
+    :param min_version: Inclusive floor, e.g. ``"2.1.301"``.
+    :param timeout: Seconds to wait for the ``--version`` subprocess.
+    :returns: ``True`` when the reported version is at least *min_version*.
+    """
+    anthropic_spec = harness_install_spec(ANTHROPIC_FAMILY)
+    if anthropic_spec is None:
+        return False
+    floor_spec = dataclasses.replace(
+        anthropic_spec, min_version=min_version, max_version_exclusive=None
+    )
+    return _harness_cli_version_satisfies(floor_spec, binary, timeout)
 
 
 def harness_install_spec(key: str) -> HarnessInstallSpec | None:

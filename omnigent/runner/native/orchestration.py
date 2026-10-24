@@ -65,6 +65,7 @@ from omnigent.errors import (
     OmnigentError,
 )
 from omnigent.harness_plugins import native_provider_for_key
+from omnigent.harnesses.claude_native.mod_channel import claude_mod_enabled_for_launch
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
@@ -96,6 +97,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitEnvelope,
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
+from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.spec.types import AgentSpec
 
 _logger = logging.getLogger("omnigent.runner.app")
@@ -9324,6 +9326,20 @@ async def _auto_create_claude_terminal(
         launch_metadata.auto_harness,
         router_started=subagent_router_dir is not None,
     )
+    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
+    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
+        resolve_harness_args,
+        resolve_harness_command,
+    )
+
+    _harness_cfg = load_effective_config(workspace=workspace)
+    launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
+    # The version probe runs ``claude --version``, so keep it off the event loop.
+    claude_mod = await asyncio.to_thread(
+        claude_mod_enabled_for_launch,
+        feature_enabled=resolve_feature_flags().enabled(Feature.CLAUDE_MOD_CHANNEL),
+        claude_binary=resolve_cli_binary(launch_command),
+    )
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,
@@ -9346,24 +9362,12 @@ async def _auto_create_claude_terminal(
         # The route-turn hook is registered only when this session can
         # actually route; otherwise every submit would pay its round trip.
         turn_routing=_claude_turn_router is not None,
+        claude_mod=claude_mod,
     )
 
-    # Apply the per-harness startup command/args override from config
-    # (``harness.claude-native.{command,args}`` in ~/.omnigent/config.yaml) so a
-    # downstream integration can wrap this managed-host launch — e.g. Databricks'
-    # ``isaac`` sets ``command: isaac`` + ``args: ["--"]`` to run
-    # ``isaac -- <augmented args>`` (the config args prepend, and augmentation
-    # appended above, so the ``--`` stays first). Identity by default. This is
-    # the same resolver the local-CLI native launch uses (see cli_native.py), so
-    # both terminal-creation paths honour one config surface.
-    from omnigent.config import load_effective_config  # noqa: FlagLocalImports
-    from omnigent.harness_startup_config import (  # noqa: FlagLocalImports
-        resolve_harness_args,
-        resolve_harness_command,
-    )
-
-    _harness_cfg = load_effective_config(workspace=workspace)
-    launch_command = resolve_harness_command("claude-native", default="claude", cfg=_harness_cfg)
+    # Config ``harness.claude-native.{command,args}`` can wrap this launch, as isaac does
+    # with ``args: ["--"]``: config args prepend the augmented ones, as on the local-CLI
+    # path. The command was resolved above so the mod's version probe saw this binary.
     launch_args = resolve_harness_args("claude-native", tuple(claude_args), cfg=_harness_cfg)
     # Validate the binary this terminal will actually spawn: ``launch_command``
     # already reflects the OMNIGENT_CLAUDE_PATH / config overrides, and a bare

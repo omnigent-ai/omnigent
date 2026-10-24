@@ -36,6 +36,7 @@ import asyncio
 import contextlib
 import functools
 import hashlib
+import hmac
 import ipaddress
 import json
 import logging
@@ -69,7 +70,7 @@ from filelock import FileLock
 from filelock import Timeout as FileLockTimeout
 
 from omnigent._platform import IS_WINDOWS, is_wsl, stable_user_id
-from omnigent.harnesses.claude_native import delivery_diagnostics
+from omnigent.harnesses.claude_native import delivery_diagnostics, mod_channel
 from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_context
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
@@ -240,6 +241,19 @@ _TOOLS_CHANGED_READY_TIMEOUT_S = 30.0
 _TOOLS_CHANGED_POST_TIMEOUT_S = 10.0
 # The control POST carries an empty JSON object; anything larger is not ours.
 _TOOLS_CHANGED_BODY_MAX_BYTES = 4096
+# Headroom the harness adds over a command's own wait, for the HTTP round trip.
+_MOD_COMMAND_HTTP_MARGIN_S = 5.0
+_MOD_COMMAND_MAX_WAIT_S = 60.0
+_MOD_POST_PATHS = frozenset({"/mod/hello", "/mod/event", "/mod/result", "/mod/command"})
+# Answers the control server sends before it queues a command.
+_MOD_COMMAND_REFUSED_STATUSES = frozenset(
+    {
+        HTTPStatus.BAD_REQUEST,
+        HTTPStatus.UNAUTHORIZED,
+        HTTPStatus.NOT_FOUND,
+        HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+    }
+)
 # Ceiling the relay HTTP handler (``_run_relay_tool``) waits for a single
 # tool dispatch to complete on the harness event loop.
 _TOOL_CALL_TIMEOUT_S = 300.0
@@ -2751,6 +2765,7 @@ def augment_claude_args(
     allowed_tools: tuple[str, ...] = (),
     subagent_router_dir: Path | None = None,
     turn_routing: bool = False,
+    claude_mod: bool = False,
 ) -> list[str]:
     """
     Return Claude CLI args with Omnigent MCP/hook/skill injection.
@@ -2804,6 +2819,10 @@ def augment_claude_args(
         Routing on, threaded to :func:`build_hook_settings` so the
         ``UserPromptSubmit`` first-message routing hook is registered.
         ``False`` keeps every prompt off the routing round trip.
+    :param claude_mod: ``True`` when the caller decided this launch loads
+        the Omnigent Claude mod (see
+        :func:`mod_channel.claude_mod_enabled_for_launch`). Adds a
+        ``--plugin-dir`` for the bridge's copy of the mod.
     :returns: Augmented argument list for the terminal resource.
     """
     mcp_config = build_mcp_config(bridge_dir, python_executable=python_executable)
@@ -2848,6 +2867,15 @@ def augment_claude_args(
     if workspace is not None:
         roots = (workspace, bundle_dir) if bundle_dir is not None else (workspace,)
         args.extend(claude_agents_skill_args(bridge_dir, roots, skills_filter))
+    if claude_mod:
+        try:
+            args.extend(["--plugin-dir", str(mod_channel.install_claude_mod(bridge_dir))])
+        except OSError:
+            # Every mod path falls back to tmux, so a broken install only costs the mod.
+            _logger.warning(
+                "Claude mod files could not be installed; launching without the mod",
+                exc_info=True,
+            )
     from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
 
     return augment_claude_debug_args(args, bridge_dir)
@@ -5513,22 +5541,183 @@ def post_tools_changed(
         raise RuntimeError(f"tools-changed POST failed with HTTP {status}")
 
 
-def _control_connection(server: _JsonObject) -> HTTPConnection:
+def mod_channel_live(bridge_dir: Path, *, now: float | None = None) -> bool:
+    """
+    Return whether the Claude mod heartbeated recently to the live control server.
+
+    :param bridge_dir: Bridge directory path.
+    :param now: Clock reading to judge freshness against, e.g. ``time.time()``;
+        ``None`` reads the wall clock.
+    :returns: ``True`` when ``mod.json`` is fresh and was written by the
+        serve-mcp process that ``server.json`` advertises.
+    """
+    state = _read_json_file(bridge_dir / mod_channel.MOD_STATE_FILE)
+    server = _read_json_file(bridge_dir / _SERVER_FILE)
+    updated_at = state.get("updated_at")
+    if state.get("v") != mod_channel.MOD_PROTOCOL_VERSION or not isinstance(
+        updated_at, (int, float)
+    ):
+        return False
+    if server.get("pid") is None or state.get("server_pid") != server.get("pid"):
+        return False
+    current = time.time() if now is None else now
+    return current - updated_at <= mod_channel.MOD_LIVE_MAX_AGE_S
+
+
+def send_mod_command(
+    bridge_dir: Path,
+    operation: str,
+    arguments: _JsonObject,
+    *,
+    timeout_s: float,
+) -> mod_channel.ModCommandOutcome:
+    """
+    Run one allowlisted operation through the Claude mod and wait for its answer.
+
+    Blocking, so call it from a worker thread. Transport trouble is reported
+    as an outcome rather than raised; callers decide the tmux fallback with
+    :func:`mod_channel.may_fall_back_to_tmux`.
+
+    :param bridge_dir: Bridge directory path.
+    :param operation: Allowlisted operation, e.g. ``"abort"``.
+    :param arguments: Operation arguments, e.g. ``{"model": "haiku"}``.
+    :param timeout_s: Seconds the control server waits for the mod's answer.
+    :returns: The mod's outcome for the operation.
+    """
+    if not mod_channel_live(bridge_dir):
+        return _not_started("the Claude mod is not live")
+    server = _read_json_file(bridge_dir / _SERVER_FILE)
+    token = server.get("token")
+    if not isinstance(token, str):
+        return _not_started("the Claude mod server file has no token")
+    try:
+        connection = _control_connection(server, timeout=timeout_s + _MOD_COMMAND_HTTP_MARGIN_S)
+    except RuntimeError as exc:
+        return _not_started(str(exc))
+    # Raw UTF-8 rather than ``\u`` escapes, so a submit within its cap fits the body cap.
+    body = json.dumps(
+        {"op": operation, "args": arguments, "timeout_s": timeout_s},
+        separators=(",", ":"),
+        ensure_ascii=False,
+    ).encode("utf-8")
+    try:
+        connection.request(
+            "POST",
+            "/mod/command",
+            body=body,
+            headers={"Authorization": f"Bearer {token}", "Content-Type": "application/json"},
+        )
+    except (OSError, HTTPException) as exc:
+        return _not_started(str(exc))
+    try:
+        response = connection.getresponse()
+        status_code = response.status
+        raw = response.read()
+    except (OSError, HTTPException) as exc:
+        return _unanswered(str(exc))
+    finally:
+        connection.close()
+    return _outcome_from_wire(status_code, raw)
+
+
+def send_mod_command_if_pane_ready(
+    bridge_dir: Path,
+    operation: str,
+    arguments: _JsonObject,
+    *,
+    timeout_s: float,
+) -> mod_channel.ModCommandOutcome:
+    """
+    Run a mod operation only while the pane shows its input box with nothing on top.
+
+    The mod cannot see a dialog or picker that owns the composer, and a prompt
+    sent behind one would wait in Claude's queue. Those panes report
+    ``not_started`` so the tmux path, which knows how to answer them, handles
+    the operation.
+
+    :param bridge_dir: Bridge directory path.
+    :param operation: Allowlisted operation, e.g. ``"submit"``.
+    :param arguments: Operation arguments.
+    :param timeout_s: Seconds the control server waits for the mod's answer.
+    :returns: The mod's outcome, or ``not_started`` when no mod is live or a
+        dialog is open.
+    """
+    # Without a live mod the pane is never captured, so the tmux path runs as before.
+    if not mod_channel_live(bridge_dir):
+        return _not_started("the Claude mod is not live")
+    if not claude_pane_ready(bridge_dir):
+        return _not_started("the Claude pane shows a dialog or picker")
+    return send_mod_command(bridge_dir, operation, arguments, timeout_s=timeout_s)
+
+
+def _not_started(error: str) -> mod_channel.ModCommandOutcome:
+    return mod_channel.ModCommandOutcome(status="not_started", error=error)
+
+
+def _unanswered(error: str) -> mod_channel.ModCommandOutcome:
+    return mod_channel.ModCommandOutcome(status="unanswered", error=error)
+
+
+def _refusal_detail(status_code: int, raw: bytes) -> str:
+    """Name why the control server refused a command, from its JSON error when it sent one."""
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        payload = None
+    if isinstance(payload, dict) and isinstance(payload.get("error"), str):
+        return payload["error"]
+    return f"the control server refused the command (HTTP {status_code})"
+
+
+def _outcome_from_wire(status_code: int, raw: bytes) -> mod_channel.ModCommandOutcome:
+    """
+    Turn the control server's answer to ``POST /mod/command`` into an outcome.
+
+    :param status_code: HTTP status of the answer.
+    :param raw: Response body.
+    :returns: The outcome; a refusal before queueing is ``not_started``, and
+        any other unreadable answer is ``unanswered``.
+    """
+    if status_code in _MOD_COMMAND_REFUSED_STATUSES:
+        # Refused before queueing: the mod never saw the command.
+        return _not_started(_refusal_detail(status_code, raw))
+    try:
+        payload = json.loads(raw)
+    except ValueError:
+        return _unanswered("the control server sent an unreadable answer")
+    if not isinstance(payload, dict):
+        return _unanswered("the control server sent an unexpected answer")
+    status = payload.get("status")
+    if status_code != HTTPStatus.OK or status not in mod_channel.MOD_COMMAND_STATUSES:
+        return _unanswered(f"the control server answered HTTP {status_code}")
+    result = payload.get("result")
+    error = payload.get("error")
+    return mod_channel.ModCommandOutcome(
+        status=cast(mod_channel.ModCommandStatus, status),
+        result=result if isinstance(result, dict) else {},
+        error=error if isinstance(error, str) else None,
+    )
+
+
+def _control_connection(
+    server: _JsonObject, *, timeout: float = _TOOLS_CHANGED_POST_TIMEOUT_S
+) -> HTTPConnection:
     """
     Open the client side of the control endpoint *server* advertises.
 
     :param server: Parsed ``server.json``: a ``socket`` path, or under the
         bind-host override a ``url`` such as ``"http://127.0.0.1:28700"``.
+    :param timeout: Connect and read timeout in seconds.
     :returns: An unconnected connection; ``request`` connects it.
     :raises RuntimeError: If the advertisement names neither endpoint.
     """
     socket_path = server.get("socket")
     if isinstance(socket_path, str):
-        return _UnixHTTPConnection(socket_path, timeout=_TOOLS_CHANGED_POST_TIMEOUT_S)
+        return _UnixHTTPConnection(socket_path, timeout=timeout)
     url = server.get("url")
     if not isinstance(url, str):
         raise RuntimeError("Claude native bridge server file is missing socket/url")
-    return HTTPConnection(urllib.parse.urlsplit(url).netloc, timeout=_TOOLS_CHANGED_POST_TIMEOUT_S)
+    return HTTPConnection(urllib.parse.urlsplit(url).netloc, timeout=timeout)
 
 
 class _UnixHTTPConnection(HTTPConnection):
@@ -7095,7 +7284,7 @@ def _start_http_ingress(
         writer thread.
     :returns: Started server; ``shutdown`` and ``server_close`` end it.
     """
-    handler_cls = _handler_factory(token, notification_queue)
+    handler_cls = _handler_factory(token, notification_queue, _ModChannelHost(bridge_dir))
     server_info: _JsonObject = {
         "token": token,
         "pid": os.getpid(),
@@ -7171,6 +7360,7 @@ def _start_unix_control_server(
 def _handler_factory(
     token: str,
     notification_queue: queue.Queue[_JsonObject | None],
+    mod_host: _ModChannelHost,
 ) -> type[BaseHTTPRequestHandler]:
     """
     Create an HTTP handler class bound to the MCP notification queue.
@@ -7178,8 +7368,11 @@ def _handler_factory(
     :param token: Bearer token expected in ``Authorization``.
     :param notification_queue: Queue receiving MCP notification
         payloads.
+    :param mod_host: Serve-mcp side of the Claude mod channel behind
+        the ``/mod/*`` routes.
     :returns: A concrete :class:`BaseHTTPRequestHandler` subclass.
     """
+    expected_authorization = f"Bearer {token}".encode()
 
     class _ControlHandler(BaseHTTPRequestHandler):
         """HTTP handler for the local MCP control endpoint."""
@@ -7195,27 +7388,61 @@ def _handler_factory(
             """
             del format, args
 
+        def _authorized(self) -> bool:
+            """
+            Check the bearer token in constant time.
+
+            :returns: ``True`` when ``Authorization`` carries this server's token.
+            """
+            presented = (self.headers.get("Authorization") or "").encode()
+            return hmac.compare_digest(presented, expected_authorization)
+
         def do_GET(self) -> None:
             """
-            Serve the local health endpoint.
+            Serve the health endpoint and the mod's long poll for commands.
 
             :returns: None.
             """
+            if self.path == "/mod/next":
+                self._serve_mod_next()
+                return
             if self.path != "/health":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
             self._send_json({"status": "ok"})
 
-        def do_POST(self) -> None:
+        def _serve_mod_next(self) -> None:
             """
-            Accept the local MCP control POST for tools/list_changed.
+            Hold the mod's poll until a command is queued, or answer 204 when none comes.
 
             :returns: None.
             """
+            if not self._authorized():
+                self.send_error(HTTPStatus.UNAUTHORIZED)
+                return
+            pending = mod_host.take_command()
+            if pending is None:
+                self._send_empty(HTTPStatus.NO_CONTENT)
+                return
+            try:
+                self._send_json(pending.wire())
+            except OSError:
+                # The mod went away mid-answer; keep the command for its next poll.
+                mod_host.hand_back(pending)
+
+        def do_POST(self) -> None:
+            """
+            Accept the local MCP control POST for tools/list_changed and the mod routes.
+
+            :returns: None.
+            """
+            if self.path in _MOD_POST_PATHS:
+                self._serve_mod_post()
+                return
             if self.path != "/tools-changed":
                 self.send_error(HTTPStatus.NOT_FOUND)
                 return
-            if self.headers.get("Authorization") != f"Bearer {token}":
+            if not self._authorized():
                 self.send_error(HTTPStatus.UNAUTHORIZED)
                 return
             length = int(self.headers.get("Content-Length") or 0)
@@ -7235,21 +7462,175 @@ def _handler_factory(
             )
             self._send_json({"ok": True})
 
-        def _send_json(self, payload: _JsonObject) -> None:
+        def _serve_mod_post(self) -> None:
+            """
+            Answer one mod-channel POST: a heartbeat, an event, a result or a harness command.
+
+            :returns: None.
+            """
+            if not self._authorized():
+                self.send_error(HTTPStatus.UNAUTHORIZED)
+                return
+            try:
+                length = int(self.headers.get("Content-Length") or 0)
+            except ValueError:
+                self.send_error(HTTPStatus.BAD_REQUEST)
+                return
+            if not 0 <= length <= mod_channel.MOD_MAX_BODY_BYTES:
+                self.send_error(HTTPStatus.REQUEST_ENTITY_TOO_LARGE)
+                return
+            # Drain before answering, for the same EPIPE reason as /tools-changed.
+            raw = self.rfile.read(length)
+            try:
+                payload = json.loads(raw or b"null")
+                if self.path == "/mod/hello":
+                    mod_host.record_hello(payload)
+                    self._send_json({"ok": True})
+                elif self.path == "/mod/event":
+                    mod_host.record_event(payload)
+                    self._send_json({"ok": True})
+                elif self.path == "/mod/result":
+                    if mod_host.record_result(payload):
+                        self._send_json({"ok": True})
+                    else:
+                        self._send_json(
+                            {"error": "unknown or abandoned command"},
+                            status=HTTPStatus.NOT_FOUND,
+                        )
+                else:
+                    self._send_json(mod_host.run_command(payload))
+            except ValueError as exc:
+                self._send_json({"error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+
+        def _send_json(self, payload: _JsonObject, status: HTTPStatus = HTTPStatus.OK) -> None:
             """
             Send a JSON response body.
 
             :param payload: JSON-compatible response object.
+            :param status: Response status, e.g. ``HTTPStatus.OK``.
             :returns: None.
             """
             raw = json.dumps(payload, separators=(",", ":")).encode("utf-8")
-            self.send_response(HTTPStatus.OK)
+            self.send_response(status)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(raw)))
             self.end_headers()
             self.wfile.write(raw)
 
+        def _send_empty(self, status: HTTPStatus) -> None:
+            """
+            Send a status line with no body.
+
+            :param status: Response status, e.g. ``HTTPStatus.NO_CONTENT``.
+            :returns: None.
+            """
+            self.send_response(status)
+            self.end_headers()
+
     return _ControlHandler
+
+
+class _ModChannelHost:
+    """
+    Serve-mcp side of the Claude mod channel.
+
+    Writes the mod's state and event files into the bridge directory and
+    holds the command queue the harness fills and the mod's long poll
+    drains. Protocol checks live in :mod:`mod_channel`.
+
+    :param bridge_dir: Bridge directory the state files are written into.
+    """
+
+    def __init__(self, bridge_dir: Path) -> None:
+        self._bridge_dir = bridge_dir
+        self._commands = mod_channel.ModCommandQueue()
+        self._events_lock = threading.Lock()
+
+    def record_hello(self, payload: _JsonObject) -> None:
+        """
+        Rewrite ``mod.json`` for one heartbeat from the mod.
+
+        :param payload: Decoded ``POST /mod/hello`` body.
+        :returns: None.
+        :raises ValueError: If the body is not a version 1 hello.
+        """
+        hello = mod_channel.normalize_mod_hello(payload)
+        state = mod_channel.mod_state_record(hello, server_pid=os.getpid(), now=time.time())
+        _write_json_file(self._bridge_dir / mod_channel.MOD_STATE_FILE, state)
+
+    def record_event(self, payload: _JsonObject) -> None:
+        """
+        Append one turn event to ``mod_events.jsonl`` and flush it.
+
+        :param payload: Decoded ``POST /mod/event`` body.
+        :returns: None.
+        :raises ValueError: If the body is not a known version 1 event.
+        """
+        event = mod_channel.normalize_mod_event(payload)
+        record = mod_channel.mod_event_record(event, now=time.time())
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        with self._events_lock:
+            descriptor = os.open(
+                self._bridge_dir / mod_channel.MOD_EVENTS_FILE,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT,
+                0o600,
+            )
+            with os.fdopen(descriptor, "a", encoding="utf-8") as handle:
+                handle.write(line)
+                handle.flush()
+
+    def record_result(self, payload: _JsonObject) -> bool:
+        """
+        Hand the mod's answer to the harness call waiting on it.
+
+        :param payload: Decoded ``POST /mod/result`` body.
+        :returns: ``False`` when the command is unknown or was abandoned.
+        :raises ValueError: If the body is malformed.
+        """
+        command_id, ok, result, error = mod_channel.normalize_mod_result(payload)
+        return self._commands.finish(command_id, ok=ok, result=result, error=error)
+
+    def run_command(self, payload: _JsonObject) -> _JsonObject:
+        """
+        Queue one harness command and block until the mod answers or the wait ends.
+
+        :param payload: Decoded ``POST /mod/command`` body, ``{"op", "args",
+            "timeout_s"}``.
+        :returns: ``{"status", "result", "error"}`` for the harness.
+        :raises ValueError: If the operation, its arguments or the wait are invalid.
+        """
+        if not isinstance(payload, dict):
+            raise ValueError("command body must be a JSON object")
+        operation, arguments = mod_channel.normalize_mod_command(
+            payload.get("op"), payload.get("args", {})
+        )
+        timeout_s = payload.get("timeout_s")
+        if (
+            not isinstance(timeout_s, (int, float))
+            or isinstance(timeout_s, bool)
+            or not 0 < timeout_s <= _MOD_COMMAND_MAX_WAIT_S
+        ):
+            raise ValueError(f"timeout_s must be in (0, {_MOD_COMMAND_MAX_WAIT_S:g}]")
+        pending = self._commands.enqueue(operation, arguments)
+        outcome = self._commands.await_outcome(pending, float(timeout_s))
+        return {"status": outcome.status, "result": outcome.result, "error": outcome.error}
+
+    def take_command(self) -> mod_channel.PendingModCommand | None:
+        """
+        Hold the mod's long poll for the next queued command.
+
+        :returns: The command now in flight, or ``None`` after the poll hold.
+        """
+        return self._commands.take(mod_channel.MOD_POLL_HOLD_S)
+
+    def hand_back(self, pending: mod_channel.PendingModCommand) -> None:
+        """
+        Requeue a command whose poll response could not be written.
+
+        :param pending: Command from :meth:`take_command`.
+        :returns: None.
+        """
+        self._commands.hand_back(pending)
 
 
 # Cap for the upstream-failure detail echoed in the policy-eval proxy's 502

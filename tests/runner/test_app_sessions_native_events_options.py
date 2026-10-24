@@ -190,6 +190,64 @@ async def test_events_effort_change_on_native_session_returns_503_when_bridge_no
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mod_status", "expected_status", "typed"),
+    [("ok", 204, []), ("unanswered", 503, []), ("not_started", 204, ["/effort high"])],
+)
+async def test_events_effort_change_types_only_what_the_mod_never_took(
+    monkeypatch: pytest.MonkeyPatch,
+    mod_status: str,
+    expected_status: int,
+    typed: list[str],
+) -> None:
+    """
+    A live Claude mod takes the effort change; tmux types it only when the mod never got it.
+
+    An unanswered change may already have landed, and typing ``/effort`` again can
+    raise a second confirm dialog, so it fails instead.
+    """
+    from omnigent.harnesses.claude_native.mod_channel import ModCommandOutcome
+
+    commands: list[str] = []
+    mod_calls: list[tuple[str, dict[str, Any]]] = []
+
+    def _fake_inject(bridge_dir: Any, *, command: str, **kwargs: Any) -> None:
+        del bridge_dir, kwargs
+        commands.append(command)
+
+    def _fake_mod(
+        bridge_dir: Any, operation: str, arguments: dict[str, Any], *, timeout_s: float
+    ) -> ModCommandOutcome:
+        del bridge_dir, timeout_s
+        mod_calls.append((operation, arguments))
+        return ModCommandOutcome(status=mod_status)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    monkeypatch.setattr(claude_native_bridge, "send_mod_command_if_pane_ready", _fake_mod)
+    monkeypatch.setattr(
+        claude_native_bridge, "confirm_dialog_if_open", lambda _bridge_dir, *, hint: False
+    )
+    monkeypatch.setattr(native_controls, "_CLAUDE_MOD_DIALOG_WINDOW_S", 0.05)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+    conv_id = uuid.uuid4().hex
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            f"/v1/sessions/{conv_id}/events",
+            json={"type": "effort_change", "effort": "high"},
+        )
+
+    assert resp.status_code == expected_status, resp.text
+    assert mod_calls == [("effort", {"level": "high"})]
+    assert commands == typed
+
+
+@pytest.mark.asyncio
 async def test_events_effort_change_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -398,8 +456,14 @@ async def test_events_permission_mode_change_on_non_native_session_is_204_noop(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("mod_status", "expected_status"),
+    [(None, 200), ("ok", 200), ("unanswered", 503)],
+)
 async def test_events_compact_on_native_session_types_slash_command(
     monkeypatch: pytest.MonkeyPatch,
+    mod_status: str | None,
+    expected_status: int,
 ) -> None:
     """
     POST ``/events`` with ``{"type":"compact"}`` on a claude-native
@@ -415,8 +479,11 @@ async def test_events_compact_on_native_session_types_slash_command(
     The 200 (not 204) is load-bearing: the Omnigent server reads it to know
     the control was handled in the terminal. A regression returning 204 here
     would make the server return a 400 "not available for this session type"
-    error instead of the native compact succeeding.
+    error instead of the native compact succeeding. When the Claude mod
+    confirms the compaction nothing is typed, and when it took the command
+    without answering nothing is typed either: the compaction may be running.
     """
+    from omnigent.harnesses.claude_native.mod_channel import ModCommandOutcome
     from omnigent.runner.app import _session_event_queues_ref
 
     captured: list[Any] = []
@@ -434,6 +501,12 @@ async def test_events_compact_on_native_session_types_slash_command(
         captured.append((bridge_dir, command, timeout_s, auto_confirm))
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    if mod_status is not None:
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "send_mod_command_if_pane_ready",
+            lambda *args, **kwargs: ModCommandOutcome(status=mod_status),  # type: ignore[arg-type]
+        )
 
     native_spec = _harness_spec("claude-native")
 
@@ -473,9 +546,16 @@ async def test_events_compact_on_native_session_types_slash_command(
     # 200 = native dispatch routed to the compact handler and injected
     # successfully. 204 would mean the wrong harness branch fired (→ server
     # returns 400). 404 = dispatch fell through to the generic forward.
-    assert resp.status_code == 200, (
-        f"Native compact must return 200 from /events; got {resp.status_code}: {resp.text}"
+    assert resp.status_code == expected_status, (
+        f"Native compact must return {expected_status} from /events; "
+        f"got {resp.status_code}: {resp.text}"
     )
+    # /compact is a control signal, not a state change.
+    assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
+    if mod_status is not None:
+        # The mod ran /compact, or may have, so the tmux fallback typed nothing.
+        assert captured == [], f"compact through the mod must not type; got {captured!r}."
+        return
     # Exactly one inject call. 0 = native dispatch missed; 2+ = handler ran twice.
     assert len(captured) == 1, (
         f"Expected one inject_slash_command call from native compact, got {len(captured)}."
@@ -495,8 +575,6 @@ async def test_events_compact_on_native_session_types_slash_command(
     assert auto_confirm is False, (
         f"compact must not auto-confirm; got auto_confirm={auto_confirm!r}."
     )
-    # /compact is a control signal, not a state change.
-    assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
 
 
 @pytest.mark.asyncio
@@ -2022,16 +2100,22 @@ async def _post_model_change_with_status_sequence(
     empty_session_catalog: bool = False,
     stored_catalog_rows: list[dict[str, object]] | None = None,
     pane_idle_after_polls: int | None = None,
+    mod_status: str | None = None,
+    mod_calls: list[str] | None = None,
+    expect_typed: bool | None = None,
 ) -> Any:
     """Run one claude-native ``model_change`` with a scripted status file.
 
     ``status_values`` are successive ``read_claude_status_model`` answers
     (the first is the pre-injection baseline); the last value repeats once
     the script is exhausted. Injection is stubbed; the confirm pacing is
-    tightened so the unconfirmed path stays fast.
+    tightened so the unconfirmed path stays fast. ``mod_status`` answers a
+    live Claude mod's model switch, recording each requested model in
+    ``mod_calls``; ``expect_typed`` overrides whether ``/model`` must be typed.
 
     :returns: The ``/events`` HTTP response.
     """
+    from omnigent.harnesses.claude_native.mod_channel import ModCommandOutcome
 
     commands: list[str] = []
 
@@ -2048,6 +2132,17 @@ async def _post_model_change_with_status_sequence(
         commands.append(command)
 
     monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    if mod_status is not None:
+
+        def _fake_mod(
+            bridge_dir: Any, operation: str, arguments: dict[str, Any], *, timeout_s: float
+        ) -> ModCommandOutcome:
+            del bridge_dir, operation, timeout_s
+            if mod_calls is not None:
+                mod_calls.append(arguments["model"])
+            return ModCommandOutcome(status=mod_status)  # type: ignore[arg-type]
+
+        monkeypatch.setattr(claude_native_bridge, "send_mod_command_if_pane_ready", _fake_mod)
     monkeypatch.setattr(
         claude_native_bridge,
         "read_model_env",
@@ -2136,9 +2231,45 @@ async def _post_model_change_with_status_sequence(
             "/v1/sessions/68c7c1acc5eeec3978c5e62043da51a5/events",
             json={"type": "model_change", "model": model},
         )
-    switch_rejected = empty_session_catalog or stored_catalog_rows == []
-    assert commands == ([] if switch_rejected else [f"/model {model}"])
+    if expect_typed is None:
+        expect_typed = not (empty_session_catalog or stored_catalog_rows == [])
+    assert commands == ([f"/model {model}"] if expect_typed else [])
     return response
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("model", "mod_status", "sent_to_mod", "typed"),
+    [
+        ("sonnet", "ok", True, False),
+        # It may have landed, so the status line decides instead of a second /model.
+        ("sonnet", "unanswered", True, False),
+        ("sonnet", "not_started", True, True),
+        # The mod's config row takes aliases only, so a full id goes straight to tmux.
+        ("claude-opus-4-7", "ok", False, True),
+    ],
+)
+async def test_events_model_change_types_only_what_the_mod_cannot_or_did_not_take(
+    monkeypatch: pytest.MonkeyPatch,
+    model: str,
+    mod_status: str,
+    sent_to_mod: bool,
+    typed: bool,
+) -> None:
+    """A live Claude mod takes an alias switch; tmux types ``/model`` for the rest."""
+    mod_calls: list[str] = []
+
+    resp = await _post_model_change_with_status_sequence(
+        monkeypatch,
+        ["claude-opus-4-6", "claude-opus-4-6", "claude-sonnet-5"],
+        model=model,
+        mod_status=mod_status,
+        mod_calls=mod_calls,
+        expect_typed=typed,
+    )
+
+    assert resp.status_code == 204, resp.text
+    assert mod_calls == ([model] if sent_to_mod else [])
 
 
 @pytest.mark.asyncio

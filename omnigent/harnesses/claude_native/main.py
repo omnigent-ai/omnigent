@@ -65,6 +65,7 @@ from omnigent_client._http import is_loopback_url
 from websockets.exceptions import ConnectionClosed, ConnectionClosedError, WebSocketException
 from websockets.frames import Close
 
+from omnigent._platform import resolve_cli_binary
 from omnigent._runner_startup import RunnerStartupProgress, runner_startup_progress
 from omnigent._startup_events import record_startup_event
 from omnigent._startup_profile import StartupProfiler
@@ -105,6 +106,7 @@ from omnigent.harnesses.claude_native.forwarder import (
     reset_transcript_forward_state,
     supervise_forwarder,
 )
+from omnigent.harnesses.claude_native.mod_channel import claude_mod_enabled_for_launch
 from omnigent.harnesses.claude_native.state import (
     read_launch_state,
     redirect_launch_state,
@@ -155,6 +157,7 @@ from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
 from omnigent.process_logging import log_info_once
+from omnigent.server.feature_flags import Feature, resolve_feature_flags
 from omnigent.terminals.ws_common import (
     WS_CLOSE_TERMINAL_DETACHED,
     WS_CLOSE_TERMINAL_NOT_FOUND,
@@ -6503,6 +6506,10 @@ def _claude_terminal_request(
         claude_args,
         model=claude_config.model if claude_config is not None else None,
     )
+    claude_mod = claude_mod_enabled_for_launch(
+        feature_enabled=resolve_feature_flags().enabled(Feature.CLAUDE_MOD_CHANNEL),
+        claude_binary=resolve_cli_binary(command),
+    )
     args = augment_claude_args(
         claude_args,
         bridge_dir=bridge_dir,
@@ -6513,6 +6520,7 @@ def _claude_terminal_request(
         model_overrides=claude_config.model_overrides if claude_config is not None else None,
         append_system_prompt=append_system_prompt,
         allowed_tools=allowed_tools,
+        claude_mod=claude_mod,
     )
     # Let a registered launcher plugin (e.g. Databricks' isaac) rewrite the
     # command/args to wrap the same fully-augmented Claude launch. Identity by

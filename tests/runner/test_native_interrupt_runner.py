@@ -665,3 +665,47 @@ async def test_claude_interrupt_resolves_bridge_id_and_injects(
     # No optimistic 'cancelled': the outcome is unknown until an edge lands.
     assert captured["wakes"] == []
     assert runner.take_pending_interrupt("conv_cl")[0] is True
+
+
+@pytest.mark.asyncio
+async def test_claude_interrupt_stays_on_escape_while_the_mod_is_live(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A live Claude mod does not take interrupts; the Escape keystroke still does.
+
+    Claude writes its "Interrupted" transcript record only when Escape interrupts
+    a turn, and the web shows that record as the marker. An abort through the mod
+    would leave the marker out, so interrupts stay on Escape.
+    """
+    import omnigent.harnesses.claude_native.bridge as claude_bridge
+    from omnigent.harnesses.claude_native.mod_channel import ModCommandOutcome
+    from omnigent.runner.native import interrupt as interrupt_mod
+
+    async def _fake_bridge_id(*, server_client: Any, session_id: str) -> str:
+        return f"bid-{session_id}"
+
+    mod_operations: list[str] = []
+    injected: list[Any] = []
+
+    def _mod_ended_the_turn(
+        bridge_dir: Any, operation: str, arguments: Any, *, timeout_s: float
+    ) -> ModCommandOutcome:
+        mod_operations.append(operation)
+        return ModCommandOutcome(status="ok", result={"ended": True})
+
+    monkeypatch.setattr(interrupt_mod, "_claude_native_bridge_id_for_session", _fake_bridge_id)
+    monkeypatch.setattr(claude_bridge, "bridge_dir_for_bridge_id", lambda bid: f"dir/{bid}")
+    monkeypatch.setattr(claude_bridge, "send_mod_command", _mod_ended_the_turn)
+    monkeypatch.setattr(
+        claude_bridge,
+        "inject_interrupt",
+        lambda bridge_dir, *, timeout_s: injected.append(bridge_dir),
+    )
+
+    runner, _ = _make_runner()
+    resp = await runner.interrupt("claude-native", "conv_cl")
+
+    assert isinstance(resp, Response) and resp.status_code == 204
+    assert mod_operations == []
+    assert injected == ["dir/bid-conv_cl"]
+    assert runner.take_pending_interrupt("conv_cl")[0] is True

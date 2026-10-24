@@ -6,10 +6,12 @@ import asyncio
 import contextlib
 import logging
 import os
+import re
 import threading
 from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
+from typing import Literal, TypeVar
 
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
@@ -34,7 +36,9 @@ from omnigent.harnesses.claude_native.bridge import (
     read_launch_model,
     read_model_env,
     read_model_picker_values,
+    send_mod_command_if_pane_ready,
 )
+from omnigent.harnesses.claude_native.mod_channel import may_fall_back_to_tmux
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -51,15 +55,40 @@ from omnigent.inner.native_attachments import (
     attachment_reference_line,
     framework_notices,
 )
-from omnigent.models.claude_model_vocabulary import claude_model_command_arg, normalized_model_id
+from omnigent.models.claude_model_vocabulary import (
+    claude_model_command_arg,
+    is_claude_model_alias,
+    normalized_model_id,
+)
 
 _logger = logging.getLogger(__name__)
+_DeliveryResult = TypeVar("_DeliveryResult")
 
 # How long a turn waits for the person to answer a Claude question or permission
 # prompt that held its message before anything was typed. Inside the server's
 # 600 s pending-input lifetime, so a message still held at the end is reported.
 _ANSWER_HOLD_S = 8 * 60.0
 _ANSWER_POLL_S = 1.0
+# Wait for the Claude mod's answer before falling back to tmux typing.
+_MOD_SUBMIT_TIMEOUT_S = 5.0
+_MOD_CONTROL_TIMEOUT_S = 8.0
+# Input the Claude TUI reads itself rather than as a plain prompt: slash commands,
+# shell mode and the memory shortcut, and @file mentions it expands in place.
+_TUI_INPUT_PREFIXES = ("/", "!", "#")
+_AT_MENTION_PATTERN = re.compile(r"(?:^|\s)@\S")
+
+
+def _can_submit_via_mod(text: str) -> bool:
+    """
+    Return whether *text* reaches the model the same way through the mod as typed.
+
+    :param text: Latest user text for the turn.
+    :returns: ``False`` for input the Claude TUI handles itself, which must
+        stay on the tmux path.
+    """
+    return not text.lstrip().startswith(_TUI_INPUT_PREFIXES) and not (
+        _AT_MENTION_PATTERN.search(text)
+    )
 
 
 class ClaudeNativeExecutor(Executor):
@@ -149,24 +178,86 @@ class ClaudeNativeExecutor(Executor):
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
             context_path.unlink(missing_ok=True)
             if wanted_model_arg is not None:
-                # Accepted trade-off: ``/model <id>`` also saves the
-                # pick as the person's global default for new Claude
-                # sessions. Runs to completion before the message
-                # inject below (same lock), so its confirm Enter can't
-                # race the message.
-                await self._inject(
-                    partial(
-                        inject_slash_command,
-                        self._bridge_dir,
-                        command=f"/model {wanted_model_arg}",
-                        auto_confirm=True,
-                        confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                switch = await self._switch_model_via_mod(wanted_model_arg)
+                if switch == "fall_back":
+                    # Accepted trade-off: ``/model`` also saves the pick as the global
+                    # default. It finishes under this lock, so its confirm Enter cannot
+                    # race the message.
+                    await self._inject(
+                        partial(
+                            inject_slash_command,
+                            self._bridge_dir,
+                            command=f"/model {wanted_model_arg}",
+                            auto_confirm=True,
+                            confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+                        )
                     )
-                )
-                # Track the routed id, not the alias: the next turn's
-                # comparison is against what routing asked for.
-                self._applied_model = wanted_model
-            await self._inject_prompt(text, notices)
+                if switch != "unconfirmed":
+                    # Track the routed id, not the alias: the next turn's
+                    # comparison is against what routing asked for.
+                    self._applied_model = wanted_model
+            await self._inject_prompt(text, notices, via_mod=True)
+
+    async def _switch_model_via_mod(
+        self, model_arg: str
+    ) -> Literal["switched", "fall_back", "unconfirmed"]:
+        """
+        Switch the pane's model through the Claude mod.
+
+        :param model_arg: ``/model`` argument the pane accepts, e.g. ``"sonnet"``.
+        :returns: ``"switched"`` when the mod confirmed it, ``"fall_back"`` when
+            the tmux ``/model`` path must type it (the mod takes aliases only), or
+            ``"unconfirmed"`` when the mod took it without answering.
+        """
+        if not is_claude_model_alias(model_arg):
+            return "fall_back"
+        outcome = await self._run_delivery(
+            partial(
+                send_mod_command_if_pane_ready,
+                self._bridge_dir,
+                "model",
+                {"model": model_arg},
+                timeout_s=_MOD_CONTROL_TIMEOUT_S,
+            )
+        )
+        if outcome.status == "ok":
+            return "switched"
+        if may_fall_back_to_tmux(outcome):
+            return "fall_back"
+        # It may have landed, and typing it could pop a second dialog; the mod's
+        # config write is safe to repeat, so the next turn retries it instead.
+        _logger.warning(
+            "claude-native: the mod did not confirm the model switch; sending the turn",
+            extra={"session_id": self._request_session_id},
+        )
+        return "unconfirmed"
+
+    async def _submit_via_mod(self, text: str) -> bool:
+        """
+        Deliver *text* as the person's own prompt through the Claude mod.
+
+        :param text: Message text for the turn.
+        :returns: ``True`` when Claude accepted the prompt; ``False`` when the
+            tmux path must type it instead.
+        :raises RuntimeError: When the mod may have submitted the prompt without
+            confirming it, so typing it again could deliver it twice.
+        """
+        if not _can_submit_via_mod(text):
+            return False
+        outcome = await self._run_delivery(
+            partial(
+                send_mod_command_if_pane_ready,
+                self._bridge_dir,
+                "submit",
+                {"text": text},
+                timeout_s=_MOD_SUBMIT_TIMEOUT_S,
+            )
+        )
+        if outcome.status == "ok":
+            return True
+        if may_fall_back_to_tmux(outcome):
+            return False
+        raise RuntimeError(f"Claude did not confirm the message through the mod: {outcome.error}")
 
     async def _wait_for_answer(self, deadline: float) -> bool:
         """
@@ -195,13 +286,24 @@ class ClaudeNativeExecutor(Executor):
                 return True
         return False
 
-    async def _inject_prompt(self, text: str, notices: list[str]) -> None:
-        """Inject user text with one-shot context while holding the injection lock."""
+    async def _inject_prompt(
+        self, text: str, notices: list[str], *, via_mod: bool = False
+    ) -> None:
+        """
+        Inject user text with one-shot context while holding the injection lock.
+
+        :param text: Message text for the turn.
+        :param notices: Framework notices for the ``UserPromptSubmit`` hook.
+        :param via_mod: ``True`` for an idle turn, which may go through the
+            Claude mod. Mid-turn steering stays on tmux, where Claude queues it.
+        """
         context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
         context_path.unlink(missing_ok=True)
         if notices:
             context_path.write_text("\n\n".join(notices), encoding="utf-8")
         try:
+            if via_mod and await self._submit_via_mod(text):
+                return
             await self._inject(partial(inject_user_message, self._bridge_dir, content=text))
         except BaseException:
             context_path.unlink(missing_ok=True)
@@ -394,11 +496,24 @@ class ClaudeNativeExecutor(Executor):
 
     async def _inject(self, operation: Callable[[], None]) -> None:
         """Drain cancelled delivery workers before releasing the pane's injection lock."""
+        await self._run_delivery(operation)
+
+    async def _run_delivery(self, operation: Callable[[], _DeliveryResult]) -> _DeliveryResult:
+        """
+        Run one pane delivery in a worker thread and return its result.
+
+        A cancelled turn waits for the worker before the injection lock is
+        released, then reaps the pane, so neither a half-typed message nor a
+        prompt the mod submits late outlives the cancellation.
+
+        :param operation: Blocking delivery, e.g. a tmux inject or a mod command.
+        :returns: What *operation* returned.
+        """
         cancelled = threading.Event()
         with cancellable_injection(cancelled):
             worker = asyncio.create_task(asyncio.to_thread(operation))
         try:
-            await asyncio.shield(worker)
+            return await asyncio.shield(worker)
         except asyncio.CancelledError:
             cancelled.set()
             while not worker.done():

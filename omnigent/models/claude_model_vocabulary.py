@@ -121,6 +121,22 @@ def normalized_model_id(model: str) -> str:
     return prefix_folded_model_id(model).removesuffix("[1m]")
 
 
+def is_claude_model_alias(model: str) -> bool:
+    """Whether *model* is a family alias, bracket variants such as ``opus[1m]`` included.
+
+    Bracket variants are settable aliases in their own right: the harness lists
+    them in ``/model``'s usage line and resolves the marker itself.
+
+    :param model: A ``/model`` argument, e.g. ``"sonnet"``.
+    :returns: ``True`` when Claude Code resolves *model* itself.
+    """
+    candidate = model.strip().lower()
+    base, bracket, marker = candidate.partition("[")
+    if bracket:
+        return marker.endswith("]") and base in CLAUDE_MODEL_ALIASES
+    return candidate in CLAUDE_MODEL_ALIASES
+
+
 def alias_pins(env: Mapping[str, str] | None = None) -> dict[str, str]:
     """Read the session's alias → model-id pinning.
 
@@ -249,17 +265,10 @@ def claude_model_alias(
     """
     if not isinstance(model, str) or not model.strip():
         return None
-    candidate = model.strip().lower()
-    if candidate in CLAUDE_MODEL_ALIASES:
-        return candidate
-    # Bracket variants of the family aliases (``sonnet[1m]``) are settable
-    # aliases in their own right — the harness enumerates them in /model's
-    # usage line and resolves the marker itself (the family pin plus the
-    # marker on a pinned env). Stepping one down to its family would
-    # silently drop the marker; refusing it blocks a switch the pane accepts.
-    base, bracket, marker = candidate.partition("[")
-    if bracket and marker.endswith("]") and base in CLAUDE_MODEL_ALIASES:
-        return candidate
+    # A bracket variant (``sonnet[1m]``) stays whole: stepping it down to its
+    # family would drop the marker, and refusing it blocks a switch the pane accepts.
+    if is_claude_model_alias(model):
+        return model.strip().lower()
     pins = alias_pins(env)
     normalized = normalized_model_id(model)
     for alias, pinned in pins.items():
