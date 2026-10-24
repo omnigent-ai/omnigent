@@ -614,7 +614,7 @@ def test_launcher_rejects_visible_credential_sources(
         monkeypatch.setattr(
             bwrap_sandbox,
             "_ensure_executable_visible",
-            lambda argv, cwd: ["--ro-bind", str(private), "/runtime"],
+            lambda argv, bound_roots, writable_roots: ["--ro-bind", str(private), "/runtime"],
         )
     else:
         source = Path("/usr/lib/private-token")
@@ -865,6 +865,148 @@ def test_wrap_launcher_argv_binds_intermediate_symlink_at_literal_path(
         f"literal venv path fails with ENOENT because the floating "
         f"symlink dir is missing inside the sandbox. Pairs: {pairs}"
     )
+
+
+def _symlinked_venv_layout(tmp_path: Path) -> tuple[Path, Path, Path]:
+    """Build ``<tmp>/checkout/.venv -> <tmp>/venvs/real`` around the running
+    interpreter and return ``(checkout, real_venv, literal interpreter path)``."""
+    tmp_path = tmp_path.resolve()
+    real_python = Path(os.path.realpath(sys.executable))
+    real_venv = tmp_path / "venvs" / "real"
+    (real_venv / "bin").mkdir(parents=True)
+    (real_venv / "bin" / "python").symlink_to(real_python)
+    (real_venv / "pyvenv.cfg").write_text(f"home = {real_python.parent}\n")
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / ".venv").symlink_to(real_venv, target_is_directory=True)
+    return checkout, real_venv, checkout / ".venv" / "bin" / "python"
+
+
+def _bind_paths(argv: list[str]) -> list[str]:
+    """Every bind source and destination in a bwrap argv."""
+    flags = {"--bind", "--bind-try", "--ro-bind", "--ro-bind-try"}
+    return [path for i, token in enumerate(argv) if token in flags for path in argv[i + 1 : i + 3]]
+
+
+def _covering_policy(
+    tmp_path: Path, checkout: Path, covering_bind: str
+) -> tuple[Path, SandboxPolicy]:
+    """Return ``(cwd, policy)`` showing *checkout* via the cwd bind or a ``read_paths`` bind."""
+    if covering_bind == "cwd":
+        return checkout, _make_policy(checkout, allow_hidden=[".venv"])
+    scratch = tmp_path.resolve() / "scratch"
+    scratch.mkdir()
+    return scratch, _make_policy(scratch, read_roots=[checkout])
+
+
+@pytest.mark.parametrize("covering_bind", ["cwd", "read_root"])
+def test_wrap_launcher_argv_binds_symlinked_venv_target_at_its_own_path(
+    tmp_path: Path, covering_bind: str
+) -> None:
+    """
+    An interpreter under a wholesale bind (cwd or a ``read_paths`` root)
+    reached through ``<checkout>/.venv -> <elsewhere>/venv`` needs the
+    symlink target mounted at its own path: the bind shows the symlink
+    itself, and a bind at the literal ``.venv`` name would be shadowed by
+    the later wholesale bind, leaving ``execvp`` a dangling link.
+    """
+    checkout, real_venv, interp = _symlinked_venv_layout(tmp_path)
+    cwd, policy = _covering_policy(tmp_path, checkout, covering_bind)
+
+    argv = _make_backend().wrap_launcher_argv([str(interp), "-c", "pass"], policy, cwd)
+
+    pairs = [
+        (argv[i + 1], argv[i + 2]) for i in range(len(argv) - 2) if argv[i] == "--ro-bind-try"
+    ]
+    assert (str(real_venv), str(real_venv)) in pairs, (
+        f"Expected the symlink target {str(real_venv)!r} bound at its own path so "
+        f"{str(checkout / '.venv')!r} resolves inside the sandbox. Pairs: {pairs}"
+    )
+    shadowed = [
+        dst for _, dst in pairs if Path(dst) != checkout and Path(dst).is_relative_to(checkout)
+    ]
+    assert shadowed == [], (
+        f"Binds underneath {str(checkout)!r} are shadowed by its own later bind: {shadowed}"
+    )
+
+
+@pytest.mark.parametrize("case", ["not_a_venv", "dangling", "non_bin_child", "writable_link"])
+def test_wrap_launcher_argv_does_not_mount_unsafe_symlink_targets(
+    tmp_path: Path, case: str
+) -> None:
+    """
+    A covered directory-symlink is followed only when it leads to a working
+    virtualenv's root or ``bin`` and the agent cannot retarget it. A link at
+    an arbitrary directory holding a stray ``bin/python``, a venv whose
+    interpreter does not exist, a non-``bin`` child of a venv, or a venv
+    link inside a writable root (an agent could point ``.venv`` at any
+    readable venv) must not widen the mount set.
+    """
+    tmp_path = tmp_path.resolve()
+    real_python = os.path.realpath(sys.executable)
+    if case == "writable_link":
+        checkout, target, interp = _symlinked_venv_layout(tmp_path)
+        policy = _make_policy(checkout, allow_hidden=[".venv"], write_roots=[checkout])
+    else:
+        target = tmp_path / "target"
+        link_target = target
+        (target / "bin").mkdir(parents=True)
+        if case == "not_a_venv":
+            (target / "bin" / "python").symlink_to(real_python)
+        elif case == "non_bin_child":
+            (target / "pyvenv.cfg").write_text("home = /usr/bin\n")
+            link_target = target / "lib"
+            (link_target / "bin").mkdir(parents=True)
+            (link_target / "bin" / "python").symlink_to(real_python)
+        else:
+            (target / "pyvenv.cfg").write_text("home = /usr/bin\n")
+        checkout = tmp_path / "checkout"
+        checkout.mkdir()
+        (checkout / ".venv").symlink_to(link_target, target_is_directory=True)
+        interp = checkout / ".venv" / "bin" / "python"
+        policy = _make_policy(checkout, allow_hidden=[".venv"])
+
+    argv = _make_backend().wrap_launcher_argv([str(interp), "-c", "pass"], policy, checkout)
+
+    exposed = [path for path in _bind_paths(argv) if Path(path).is_relative_to(target)]
+    assert exposed == [], f"symlink target {str(target)!r} must not be mounted: {exposed}"
+
+
+def test_wrap_launcher_argv_does_not_follow_venv_through_writable_alias(tmp_path: Path) -> None:
+    """
+    The writability check must look at the directory that stores the link:
+    a read-only cwd may alias into a write root (``ws/out -> data/out``),
+    where the agent can retarget ``data/out/.venv`` between helper launches.
+    Neither the venv it points at first nor the one it is retargeted to may
+    be mounted.
+    """
+    tmp_path = tmp_path.resolve()
+    real_python = Path(os.path.realpath(sys.executable))
+    venvs: dict[str, Path] = {}
+    for name in ("legit", "secret"):
+        venv = tmp_path / "venvs" / name
+        (venv / "bin").mkdir(parents=True)
+        (venv / "bin" / "python").symlink_to(real_python)
+        (venv / "pyvenv.cfg").write_text(f"home = {real_python.parent}\n")
+        venvs[name] = venv
+    ws = tmp_path / "ws"
+    ws.mkdir()
+    out = tmp_path / "data" / "out"
+    out.mkdir(parents=True)
+    (ws / "out").symlink_to(out, target_is_directory=True)
+    link = out / ".venv"
+    link.symlink_to(venvs["legit"], target_is_directory=True)
+    interp = ws / "out" / ".venv" / "bin" / "python"
+    policy = _make_policy(ws, allow_hidden=[".venv"], write_roots=[out])
+    backend = _make_backend()
+
+    first = _bind_paths(backend.wrap_launcher_argv([str(interp), "-c", "pass"], policy, ws))
+    link.unlink()
+    link.symlink_to(venvs["secret"], target_is_directory=True)
+    second = _bind_paths(backend.wrap_launcher_argv([str(interp), "-c", "pass"], policy, ws))
+
+    leaked = [path for path in first + second if Path(path).is_relative_to(tmp_path / "venvs")]
+    assert leaked == [], f"a venv behind a writable alias must not be mounted: {leaked}"
 
 
 def test_wrap_launcher_argv_target_binds_non_default_path(
@@ -2006,6 +2148,34 @@ def test_interpreter_under_masked_dotdir_still_spawns(tmp_path: Path) -> None:
     assert "SECRET_LEAK" not in completed.stdout, (
         "the re-expose bind leaked an unrelated secret under the masked "
         ".local dir; only the interpreter subtree should be re-exposed."
+    )
+
+
+@pytestmark_bwrap
+@pytest.mark.parametrize("covering_bind", ["cwd", "read_root"])
+def test_interpreter_behind_symlinked_venv_dir_still_spawns(
+    tmp_path: Path, covering_bind: str
+) -> None:
+    """
+    End-to-end: an interpreter behind ``<checkout>/.venv``, a symlink to a
+    venv outside every sandbox mount, still execs whether the cwd bind or a
+    ``read_paths`` bind shows the symlink, and runs as that venv. Without
+    the target bind bwrap died with ``execvp .../.venv/bin/python: No such
+    file or directory``.
+    """
+    checkout, _real_venv, interp = _symlinked_venv_layout(tmp_path)
+    cwd, policy = _covering_policy(tmp_path, checkout, covering_bind)
+    probe = "import sys; sys.stdout.write(sys.prefix)"
+    argv = _make_backend().wrap_launcher_argv([str(interp), "-c", probe], policy, cwd)
+
+    completed = subprocess.run(argv, capture_output=True, text=True, timeout=30, check=False)
+
+    assert completed.returncode == 0, (
+        f"interpreter behind the symlinked .venv failed to spawn (rc="
+        f"{completed.returncode}). stderr={completed.stderr[-400:]!r}"
+    )
+    assert completed.stdout == str(checkout / ".venv"), (
+        f"helper did not run as the symlinked venv. stdout={completed.stdout!r}"
     )
 
 
