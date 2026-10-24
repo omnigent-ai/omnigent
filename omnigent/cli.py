@@ -1779,22 +1779,48 @@ _ACCENT_RGB = (244, 59, 166)
 _ALIAS_COMMANDS: frozenset[str] = frozenset({"update", "antigravity"})
 
 
+@dataclass(frozen=True)
+class _ExtrasGatedHarness:
+    """A harness command whose SDK ships as an optional pip extra.
+
+    :param label: Display name, e.g. ``"Copilot"``.
+    :param sdk: SDK distribution name, e.g. ``"github-copilot-sdk"``.
+    :param extra: The pip extra that installs it, e.g. ``"copilot"``.
+    :param installed: Whether the SDK is importable (``find_spec``, no heavy import).
+    """
+
+    label: str
+    sdk: str
+    extra: str
+    installed: Callable[[], bool]
+
+
+def _extras_gated_harnesses() -> dict[str, _ExtrasGatedHarness]:
+    """Harness commands gated on an optional SDK extra, by command name.
+
+    The single roster behind :func:`_harness_extra_checks` (the ``--help``
+    listing) and the missing-SDK message of :func:`_run_harness_shorthand`.
+    """
+    from omnigent.onboarding.copilot_auth import COPILOT_EXTRA, copilot_sdk_installed
+    from omnigent.onboarding.cursor_auth import CURSOR_EXTRA, cursor_sdk_installed
+
+    return {
+        "copilot": _ExtrasGatedHarness(
+            "Copilot", "github-copilot-sdk", COPILOT_EXTRA, copilot_sdk_installed
+        ),
+        "cursor": _ExtrasGatedHarness("Cursor", "cursor-sdk", CURSOR_EXTRA, cursor_sdk_installed),
+    }
+
+
 def _harness_extra_checks() -> dict[str, Callable[[], bool]]:
     """Map extras-gated harness commands to their SDK-installed predicate.
 
     Harnesses that ride an optional pip extra (lazily imported on first
     turn) are hidden from ``omnigent --help`` until the extra is
     importable, so the listing only advertises harnesses ready to launch.
-    The predicates use ``importlib.util.find_spec`` (no heavy import).
     Commands absent from this map are always listed.
     """
-    from omnigent.onboarding.copilot_auth import copilot_sdk_installed
-    from omnigent.onboarding.cursor_auth import cursor_sdk_installed
-
-    return {
-        "copilot": copilot_sdk_installed,
-        "cursor": cursor_sdk_installed,
-    }
+    return {name: gated.installed for name, gated in _extras_gated_harnesses().items()}
 
 
 def _cli_style(text: str, **style: object) -> str:
@@ -14362,6 +14388,37 @@ def _bundled_agent_brain_harness_fallback(name: str) -> str | None:
     return None
 
 
+def _forwarded_run_params(run_args: tuple[str, ...]) -> dict[str, Any] | None:
+    """Parse pass-through ``run`` args with ``run``'s own Click parser.
+
+    Resilient mode (no callbacks, no prompts, errors swallowed) so flag-shape
+    handling — attached short options (``-rID``), option values that merely
+    look like flags (``-p --harness``) — agrees exactly with the downstream
+    dispatch instead of re-implementing Click's rules by hand.
+
+    :param run_args: Unparsed pass-through CLI args for ``run``.
+    :returns: The parsed ``run`` params, or ``None`` for malformed args — the
+        forwarded ``run`` re-parses and reports them, so nothing launches or
+        mutates on this partial parse.
+    """
+    try:
+        with run.make_context("omnigent run", list(run_args), resilient_parsing=True) as ctx:
+            return dict(ctx.params)
+    except click.ClickException:
+        return None
+
+
+def _forwarded_run_requests_help(run_args: tuple[str, ...], params: dict[str, Any]) -> bool:
+    """Whether forwarded ``run`` args carry a real ``--help``.
+
+    A ``--help`` consumed as an option VALUE (e.g. ``-p --help``) is prompt text,
+    not a help request; the parsed *params* resolve which.
+    """
+    return "--help" in run_args and all(
+        value != "--help" for value in params.values() if isinstance(value, str)
+    )
+
+
 def _bundled_brain_fallback_applies(run_args: tuple[str, ...]) -> bool:
     """Whether this bundled launch may reroute its brain harness.
 
@@ -14373,30 +14430,14 @@ def _bundled_brain_fallback_applies(run_args: tuple[str, ...]) -> bool:
     supply the brain's routing server-side (e.g. a managed gateway), so a
     missing local credential there is not evidence the brain can't run.
 
-    The forwarded args are parsed with ``run``'s own Click parser in
-    resilient mode (no callbacks, no prompts, errors swallowed) so
-    flag-shape handling — attached short options (``-rID``), option values
-    that merely look like flags (``-p --harness``) — agrees exactly with the
-    downstream dispatch instead of re-implementing Click's rules by hand.
-
     :param run_args: Unparsed pass-through CLI args for ``run``.
     :returns: ``True`` when the fallback may inject ``--harness``.
     """
-    try:
-        with run.make_context("omnigent run", list(run_args), resilient_parsing=True) as ctx:
-            params = dict(ctx.params)
-    except click.ClickException:
-        # Malformed args — the forwarded run re-parses and reports them.
-        # (Resilient parsing swallows most of these; a partial parse at
-        # worst prints the reroute notice before the real parse rejects
-        # the command — nothing launches or mutates.)
+    params = _forwarded_run_params(run_args)
+    if params is None:
         return False
-    # A real --help never launches, so keep the fallback (and its notice)
-    # out. A "--help" consumed as an option VALUE (e.g. ``-p --help``) is
-    # prompt text, not a help request — the parse above resolves which.
-    if "--help" in run_args and all(
-        value != "--help" for value in params.values() if isinstance(value, str)
-    ):
+    # A real --help never launches, so keep the fallback (and its notice) out.
+    if _forwarded_run_requests_help(run_args, params):
         return False
     if params.get("harness") is not None or params.get("model") is not None:
         return False
@@ -14524,15 +14565,51 @@ def _run_bundled_agent(name: str, run_args: tuple[str, ...]) -> None:
     )
 
 
+def _missing_harness_sdk_error(harness: str, gated: _ExtrasGatedHarness) -> click.ClickException:
+    """Error for an extras-gated launch whose SDK is not installed.
+
+    Names the SDK, the install command for this install shape and the setup
+    route, instead of booting a REPL whose first turn fails on the lazy import.
+
+    :param harness: The shorthand command, e.g. ``"copilot"``.
+    :param gated: Its :func:`_extras_gated_harnesses` entry.
+    :returns: The exception to raise.
+    """
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+    from omnigent.onboarding.extra_install import extra_install_display
+
+    prog = cli_invocation()
+    exc = click.ClickException(
+        f"{gated.label}'s SDK ({gated.sdk}) isn't installed, so `{prog} {harness}` can't "
+        f"run on this machine. Install the optional `{gated.extra}` extra:\n\n"
+        f"    {extra_install_display(gated.extra)}\n\n"
+        f"or run `{prog} setup` and open {gated.label} to install it from there."
+    )
+    # A missing dependency is not something `omnigent stop` can fix.
+    setattr(exc, SUPPRESS_RECOVERY_HINT_ATTR, True)
+    return exc
+
+
 def _run_harness_shorthand(harness: str, run_args: tuple[str, ...]) -> None:
     """Forward a harness shorthand (``omnigent copilot``) to ``run --harness``, the
     way :func:`_run_bundled_agent` forwards ``polly``; an explicit ``--harness`` in
-    *run_args* is a usage error rather than a silent override."""
+    *run_args* is a usage error rather than a silent override.
+
+    An extras-gated harness (:func:`_extras_gated_harnesses`) imports its SDK lazily
+    on the first turn, so a launch without the SDK would boot a REPL whose first
+    message can only fail; it stops here and names the install instead. This holds
+    with ``--server`` too: the forwarded ``--harness`` makes :func:`_dispatch_run`
+    run the harness in this machine's runner, not on the server's hosts."""
     if any(arg == "--harness" or arg.startswith("--harness=") for arg in run_args):
         raise click.UsageError(
             f"`{cli_invocation()} {harness}` always uses the {harness} harness; drop "
             f"--harness, or use `{cli_invocation()} run --harness <name>` to pick another."
         )
+    gated = _extras_gated_harnesses().get(harness)
+    if gated is not None and not gated.installed():
+        params = _forwarded_run_params(run_args)
+        if params is not None and not _forwarded_run_requests_help(run_args, params):
+            raise _missing_harness_sdk_error(harness, gated)
     run.main(
         args=["--harness", harness, *run_args],
         prog_name="omnigent run",

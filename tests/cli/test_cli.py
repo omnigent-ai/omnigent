@@ -1443,11 +1443,23 @@ def test_bundled_agent_command_rejects_extra_positional_target(
     dispatch.assert_not_called()
 
 
+def _copilot_gate(installed: bool) -> dict[str, object]:
+    """An extras-gated roster whose copilot SDK predicate answers *installed*."""
+    from omnigent.cli import _ExtrasGatedHarness
+
+    return {
+        "copilot": _ExtrasGatedHarness(
+            "Copilot", "github-copilot-sdk", "copilot", lambda: installed
+        )
+    }
+
+
 def test_copilot_command_forwards_to_run_on_the_copilot_harness(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """``omnigent copilot`` dispatches ``run --harness copilot`` with pass-through
     flags intact and a canonical ``omnigent run --harness copilot`` resume prefix."""
+    monkeypatch.setattr("omnigent.cli._extras_gated_harnesses", lambda: _copilot_gate(True))
     result, dispatch = _invoke_bundled_agent_command(
         monkeypatch, ["copilot", "-p", "review the last commit", "--model", "m1"]
     )
@@ -1469,6 +1481,63 @@ def test_copilot_command_rejects_explicit_harness(monkeypatch: pytest.MonkeyPatc
     assert result.exit_code != 0
     assert "always uses the copilot harness" in result.output
     dispatch.assert_not_called()
+
+
+def test_copilot_command_without_sdk_names_the_extra_instead_of_launching(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A local ``omnigent copilot`` without the Copilot SDK stops before booting a
+    REPL whose first turn would fail on the lazy import, and names the install."""
+    monkeypatch.setattr("omnigent.cli._extras_gated_harnesses", lambda: _copilot_gate(False))
+    monkeypatch.setattr(
+        "omnigent.onboarding.extra_install.extra_install_command",
+        lambda extra: ["uv", "tool", "install", "--force", f"omnigent[databricks,{extra}]"],
+    )
+    result, dispatch = _invoke_bundled_agent_command(monkeypatch, ["copilot", "-p", "hello"])
+
+    assert result.exit_code != 0
+    dispatch.assert_not_called()
+    assert "Copilot's SDK (github-copilot-sdk) isn't installed" in result.output
+    assert "uv tool install --force 'omnigent[databricks,copilot]'" in result.output
+    assert "setup" in result.output
+
+
+@pytest.mark.parametrize(
+    "launch",
+    [
+        ["copilot", "--server", "https://omnigent.example.databricksapps.com"],
+        ["copilot", "agent.yaml", "--server", "https://omnigent.example.databricksapps.com"],
+    ],
+    ids=["shorthand-only", "positional-agent"],
+)
+def test_copilot_command_without_sdk_is_rejected_even_with_a_remote_server(
+    monkeypatch: pytest.MonkeyPatch, launch: list[str]
+) -> None:
+    """``--harness copilot`` makes ``run`` launch the harness in this machine's runner
+    even against a remote server, so the SDK check applies to every launch."""
+    monkeypatch.setattr("omnigent.cli._extras_gated_harnesses", lambda: _copilot_gate(False))
+    result, dispatch = _invoke_bundled_agent_command(monkeypatch, launch)
+
+    assert result.exit_code != 0
+    assert "Copilot's SDK (github-copilot-sdk) isn't installed" in result.output
+    dispatch.assert_not_called()
+
+
+def test_copilot_shorthand_forwards_a_real_help_request_without_the_sdk(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A forwarded ``--help`` never launches, so the SDK gate stays out of its way."""
+    from omnigent.cli import _run_harness_shorthand, run
+
+    monkeypatch.setattr("omnigent.cli._extras_gated_harnesses", lambda: _copilot_gate(False))
+    monkeypatch.setattr("omnigent.cli._load_effective_config", dict)
+    forwarded = Mock()
+    monkeypatch.setattr(run, "main", forwarded)
+
+    _run_harness_shorthand("copilot", ("--help",))
+
+    forwarded.assert_called_once()
+    assert forwarded.call_args.kwargs["args"] == ["--harness", "copilot", "--help"]
 
 
 def test_copilot_command_answers_help_and_is_rostered_as_a_harness() -> None:

@@ -1646,6 +1646,31 @@ def test_read_uv_tool_extras_from_receipt(tmp_path: Path, monkeypatch: pytest.Mo
     assert _read_uv_tool_extras() == ["all", "server"]
 
 
+def test_read_uv_tool_extras_collects_every_omnigent_requirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """``uv tool install --with "omnigent[x]" omnigent`` records several ``omnigent``
+    entries, the first without ``extras``; the extras of all of them count, without
+    duplicates."""
+    tool_dir = tmp_path / "omnigent"
+    bin_dir = tool_dir / "bin"
+    bin_dir.mkdir(parents=True)
+    (tool_dir / "uv-receipt.toml").write_text(
+        textwrap.dedent(
+            """
+            [tool]
+            requirements = [
+                { name = "omnigent" },
+                { name = "omnigent", extras = ["databricks"] },
+                { name = "omnigent", extras = ["copilot", "databricks"] },
+            ]
+            """
+        )
+    )
+    monkeypatch.setattr(sys, "executable", str(bin_dir / "python"))
+    assert _read_uv_tool_extras() == ["databricks", "copilot"]
+
+
 def test_read_uv_tool_extras_missing_receipt(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
