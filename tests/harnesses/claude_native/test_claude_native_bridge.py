@@ -11039,6 +11039,22 @@ _SETTINGS_PANEL_PANE = """\
    Type to filter · Enter/↓ to select · ↑ to tabs · Esc to clear
 """
 
+# The ``/permissions`` dialog's Allow tab with its selected row focused. The
+# framed search box above the ❯-led row is the composer's shape, and the
+# footer is a decision prompt's; only the tab hint tells it apart.
+_PERMISSIONS_LIST_PANE = """\
+❯ /permissions
+   Permissions  Recently denied   Allow   Ask   Deny   Auto mode   Workspace
+
+   Claude Code won't ask before using allowed tools.
+   ╭───────────────────────────────────────────────╮
+   │ ⌕ Search…                                     │
+   ╰───────────────────────────────────────────────╯
+   ❯ 1. Add a new rule…
+
+   ↑/↓ to navigate · Enter to select · ←/→ to switch · Esc to cancel
+"""
+
 # The details panel of a background shell, opened from the task indicator
 # below the input box. It replaces the input box, and its footer joins the
 # keys that close it into one hint: "Esc/Enter/Space to close".
@@ -11996,6 +12012,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         _SHELL_MODE_PANE,
         _REWIND_PANE,
         _SETTINGS_PANEL_PANE,
+        _PERMISSIONS_LIST_PANE,
         _TASK_DETAILS_PANE,
     ],
     ids=[
@@ -12005,6 +12022,7 @@ def test_an_effort_injection_with_no_dialog_completes_without_hanging(
         "shell-mode",
         "rewind",
         "settings-panel",
+        "permissions-dialog",
         "task-details-panel",
     ],
 )

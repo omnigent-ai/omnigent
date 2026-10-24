@@ -482,6 +482,20 @@ _AUTO_MODE_BILLING_CONSENT = re.compile(
 # casing has already drifted across releases ("Search prompts" →
 # "search prompts:").
 _HISTORY_SEARCH_FOOTER_PREFIXES = ("search prompts:", "no matching prompt:")
+# Claude Code's ``/permissions`` dialog reuses the decision prompts' footers and
+# the composer's framed search box. Its tells: the tab footer (questions never
+# offer tab switching) and the rule editor's headlines over an editor footer.
+_PERMISSIONS_DIALOG_TAB_FOOTER_HINTS = ("←/→ to switch", "esc to cancel")
+_PERMISSIONS_DIALOG_EDITOR_FOOTER_HINTS = ("enter to submit", "enter to confirm")
+# Every question footer offers navigation or selection; the rule editor's never does.
+_QUESTION_FOOTER_HINTS = ("to navigate", "to select")
+_PERMISSIONS_DIALOG_HEADLINE_RE = re.compile(
+    r"add (?:allow|ask|deny) permission rule"
+    r"|permission rules are a tool name"
+    r"|where should (?:this rule|these rules) be saved\?",
+    re.IGNORECASE,
+)
+_PERMISSIONS_DIALOG_SURFACE = "the /permissions dialog"
 # Surfaces a confirm Enter must never land on: they are never a slash command's
 # own confirmation, and their default answer commits something the person did
 # not ask for — the ``/model`` picker writes a new global default into
@@ -5768,8 +5782,14 @@ def native_input_ready(session_id: str, instance: TerminalInstance) -> bool:
 
 
 def _user_prompt_visible(pane: str) -> bool:
-    """Recognize a native decision dialog, excluding text above a mounted composer."""
+    """Recognize a native decision dialog, excluding text above a mounted composer.
+
+    Claude Code's own ``/permissions`` dialog shares the decision footers but
+    is not a question Claude asked; :func:`_restore_occupied_input` clears it.
+    """
     if not pane.strip() or _composer_row(pane) is not None:
+        return False
+    if _permissions_dialog_visible(pane):
         return False
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
@@ -5936,7 +5956,8 @@ def _restore_occupied_input(
     in two shapes, both reported by :func:`_occupying_surface`: an overlay
     drawn where the input box was (the ctrl+r prompt-history search, a
     hand-opened ``/model`` picker, the double-Escape rewind dialog, a
-    ``/config`` or ``/resume`` panel, a background task's details panel),
+    ``/config`` or ``/resume`` panel, the ``/permissions`` dialog, a
+    background task's details panel),
     or the box itself switched to another input mode (``!`` shell mode).
     Keystrokes injected into either
     do not become a chat message: the history search filters on the pasted
@@ -5967,7 +5988,9 @@ def _restore_occupied_input(
     Escape is spent on it — or before it is given up as unclearable — so a
     repaint artifact cannot draw one.
     A swallowed Escape is re-sent while the surface remains, spaced by
-    :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`. Best-effort: a
+    :data:`_OCCUPIED_INPUT_DISMISS_RETRY_INTERVAL_S`; the same retry backs
+    out of a nested screen, such as the ``/permissions`` rule editor, which
+    returns to its list before closing. Best-effort: a
     surface that outlives the dismissal window (*timeout_s*,
     :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S` by default) is left on screen
     and returned, so the caller's readiness gate or delivery verification
@@ -6069,12 +6092,13 @@ def _occupying_surface(pane: str) -> str | None:
     is drawn over the box; a row led by another mode's glyph means the
     box itself is not taking chat input.
 
-    One surface defeats that structural read: since Claude Code 2.1.212
+    Two surfaces defeat that structural read. Since Claude Code 2.1.212
     the ctrl+r prompt-history search rides the framed composer as its
     filter field, so the frame and ``❯`` glyph look exactly like a free
     input box while every keystroke filters history and Enter replays an
-    old prompt. Its footer (:func:`_history_search_footer_shown`) is the
-    only tell, so that one surface is read from the footer region.
+    old prompt; its footer (:func:`_history_search_footer_shown`) is the
+    only tell. The ``/permissions`` dialog is excluded the same way, before
+    the composer row is read (:func:`_permissions_dialog_visible`).
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: A short description for the log, e.g. ``"shell mode"``, or
@@ -6086,6 +6110,8 @@ def _occupying_surface(pane: str) -> str | None:
         return None
     if _history_search_footer_shown(pane):
         return "the prompt-history search"
+    if _permissions_dialog_visible(pane):
+        return _PERMISSIONS_DIALOG_SURFACE
     row = _composer_row(pane)
     if row is None:
         return _OVERLAY_SURFACE
@@ -6294,7 +6320,8 @@ def _claude_prompt_rendered(pane: str) -> bool:
     Since Claude Code 2.1.212 the ctrl+r history search rides the framed
     composer as its filter field, so the frame and glyph alone would read
     it as ready while a typed message filters history instead of sending;
-    its footer (:func:`_history_search_footer_shown`) rules it out.
+    its footer (:func:`_history_search_footer_shown`) rules it out, as does
+    :func:`_permissions_dialog_visible` for the ``/permissions`` dialog.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :returns: ``True`` when the chat input box appears mounted.
@@ -6302,7 +6329,7 @@ def _claude_prompt_rendered(pane: str) -> bool:
     row = _composer_row(pane)
     if row is None or not row.strip().startswith(_CLAUDE_PROMPT_GLYPH):
         return False
-    return not _history_search_footer_shown(pane)
+    return not _history_search_footer_shown(pane) and not _permissions_dialog_visible(pane)
 
 
 def _history_search_footer_shown(pane: str) -> bool:
@@ -6328,6 +6355,40 @@ def _history_search_footer_shown(pane: str) -> bool:
     # spell the footer out again.
     fragments = (re.split(r"\s{2,}", line.strip(), maxsplit=1)[0] for line in region)
     return " ".join(fragments).lower().startswith(_HISTORY_SEARCH_FOOTER_PREFIXES)
+
+
+def _permissions_dialog_visible(pane: str) -> bool:
+    """
+    Return whether Claude Code's ``/permissions`` dialog is on screen.
+
+    The dialog is a settings surface Escape dismisses, though its footers match
+    the decision prompts' and its search box mimics the composer. Rule lists are
+    recognized by the tab footer below the last box rule (within the last
+    :data:`_PROMPT_SCAN_TAIL_LINES` rows); the rule editor and save-location
+    screens by their headline over an "Enter to submit/confirm" footer that
+    carries no question navigation hint. Both require an Escape hint there.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: ``True`` when any ``/permissions`` screen holds the terminal.
+    """
+    lines = [line for line in pane.splitlines() if line.strip()]
+    if not lines:
+        return False
+    last_rule = max((i for i, line in enumerate(lines) if _is_box_rule(line)), default=None)
+    footer_start = max(
+        last_rule + 1 if last_rule is not None else 0, len(lines) - _PROMPT_SCAN_TAIL_LINES
+    )
+    footer = " ".join(" ".join(lines[footer_start:]).split()).lower()
+    if not _ESCAPE_DISMISS_HINT.search(footer):
+        return False
+    if all(hint in footer for hint in _PERMISSIONS_DIALOG_TAB_FOOTER_HINTS):
+        return True
+    if not any(hint in footer for hint in _PERMISSIONS_DIALOG_EDITOR_FOOTER_HINTS) or any(
+        hint in footer for hint in _QUESTION_FOOTER_HINTS
+    ):
+        return False
+    tail = " ".join(" ".join(lines[-_DIALOG_SCAN_TAIL_LINES:]).split())
+    return _PERMISSIONS_DIALOG_HEADLINE_RE.search(tail) is not None
 
 
 def _is_box_rule(line: str) -> bool:
