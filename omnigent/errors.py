@@ -648,6 +648,11 @@ _TRANSPORT_EXC_NAMES = frozenset(
 )
 
 
+# grpc-core's shutdown detail for cancelled in-flight calls; the real-grpcio
+# lease-release e2e pins it.
+_GOAWAY_CANCELLED_DETAILS = "Cancelling all calls"
+
+
 def _rpc_error_status_name(exc: BaseException) -> str | None:
     """Return the gRPC status name a failed call carries, or ``None``.
 
@@ -674,13 +679,27 @@ def _rpc_error_status_name(exc: BaseException) -> str | None:
 
 
 def is_cancelled_rpc_error(exc: BaseException) -> bool:
-    """Whether *exc* is a gRPC call terminated by its peer with ``CANCELLED``.
+    """Whether *exc* is a gRPC call cancelled by its peer or endpoint teardown.
+
+    Matches a status named ``CANCELLED``, or ``UNAVAILABLE`` whose details are
+    the GOAWAY text ``Cancelling all calls`` that an endpoint teardown (e.g. a
+    released channel lease) sends to in-flight calls. Both the status and the
+    details are read structurally (see :func:`_rpc_error_status_name`).
 
     :param exc: The exception to inspect.
-    :returns: ``True`` only for a peer-cancelled RPC error (matched
-        structurally, see :func:`_rpc_error_status_name`).
+    :returns: ``True`` only for a cancellation-shaped RPC error.
     """
-    return _rpc_error_status_name(exc) == "CANCELLED"
+    status_name = _rpc_error_status_name(exc)
+    if status_name == "CANCELLED":
+        return True
+    if status_name != "UNAVAILABLE":
+        return False
+    try:
+        details = getattr(exc, "details", None)
+        text = details() if callable(details) else None
+    except Exception:  # noqa: BLE001 — a details reader that itself fails is not a cancellation
+        return False
+    return isinstance(text, str) and text == _GOAWAY_CANCELLED_DETAILS
 
 
 def is_permission_denied_rpc_error(exc: BaseException) -> bool:
