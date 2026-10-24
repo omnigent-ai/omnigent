@@ -4,9 +4,12 @@ from __future__ import annotations
 
 import sys
 import threading
-from dataclasses import dataclass
+import uuid
+from dataclasses import dataclass, replace
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -25,6 +28,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests._helpers.polling import poll_until_async
 from tests.runner.conftest import (
     _build_app_for_spec,
     _FakeProcessManager,
@@ -32,6 +36,7 @@ from tests.runner.conftest import (
     _ScriptedHarnessClient,
 )
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+from tests.runner.native_helpers import _harness_spec
 
 
 @dataclass
@@ -357,6 +362,7 @@ class _EnsureCodexTerminalCase:
 async def test_create_session_terminal_ensure_routes_codex_native(
     case: _EnsureCodexTerminalCase,
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     """
     ``POST /resources/terminals`` routes a codex/main ensure request.
@@ -373,6 +379,17 @@ async def test_create_session_terminal_ensure_routes_codex_native(
     :returns: None.
     """
     sid = "ad2c1855c982b13e9c4df55b75d26ef8"
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(sid)
+    codex_native_bridge.write_bridge_state(
+        bridge_dir,
+        codex_native_bridge.CodexNativeBridgeState(
+            session_id=sid,
+            thread_id="thread_existing",
+            socket_path="ws://127.0.0.1:1",
+            codex_home=str(bridge_dir / "codex-home"),
+        ),
+    )
     auto_create_calls: list[str] = []
     auto_create_kwargs: list[dict[str, object]] = []
     launch_calls: list[str] = []
@@ -1047,6 +1064,152 @@ async def test_ensure_terminal_route_recreates_dead_registered_pane(
     assert auto_create_calls == [sid], (
         f"Expected _auto_create_claude_terminal to be called; got {auto_create_calls}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("backend_state", "recreated"),
+    [
+        ("missing", True),
+        ("failed_startup", True),
+        ("dead_backend", True),
+        ("dead_backend_close_failed", True),
+        ("unowned_dead_backend", False),
+        ("starting", False),
+        ("ready", False),
+        ("detached", False),
+        ("rotated", False),
+        ("foreign_bridge", True),
+    ],
+)
+async def test_message_recovers_a_live_codex_pane_with_no_backend(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    backend_state: str,
+    recreated: bool,
+) -> None:
+    """An API message checks the backend even when the auxiliary TUI is alive."""
+    from omnigent.runner.native import orchestration
+
+    session_id = uuid.uuid4().hex
+    source_session_id = uuid.uuid4().hex if backend_state == "rotated" else session_id
+    monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    bridge_dir = codex_native_bridge.prepare_bridge_dir(source_session_id)
+    if backend_state in (
+        "ready",
+        "detached",
+        "dead_backend",
+        "dead_backend_close_failed",
+        "unowned_dead_backend",
+        "rotated",
+        "foreign_bridge",
+    ):
+        codex_native_bridge.write_bridge_state(
+            bridge_dir,
+            codex_native_bridge.CodexNativeBridgeState(
+                session_id=uuid.uuid4().hex
+                if backend_state == "foreign_bridge"
+                else source_session_id,
+                thread_id="thread_retained",
+                socket_path="ws://127.0.0.1:1",
+                codex_home=str(bridge_dir / "codex-home"),
+            ),
+        )
+    if backend_state == "failed_startup":
+        codex_native_bridge.record_app_server_stopped(bridge_dir)
+    backend = None
+    if backend_state in (
+        "starting",
+        "ready",
+        "dead_backend",
+        "dead_backend_close_failed",
+        "unowned_dead_backend",
+        "rotated",
+    ):
+        backend = SimpleNamespace(
+            proc=SimpleNamespace(returncode=1 if "dead_backend" in backend_state else None),
+            bridge_dir=bridge_dir,
+            close=AsyncMock(),
+        )
+        monkeypatch.setitem(
+            orchestration._AUTO_CODEX_APP_SERVERS,
+            source_session_id,
+            backend,
+        )
+    monkeypatch.setattr(orchestration, "_AUTO_CODEX_BRIDGE_DIRS", {source_session_id: bridge_dir})
+
+    registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    close = AsyncMock(
+        side_effect=OSError("pane close failed")
+        if backend_state == "dead_backend_close_failed"
+        else None
+    )
+    monkeypatch.setattr(instance, "close", close)
+    with registry._lock:
+        registry._by_conversation[source_session_id] = {("codex", "main"): instance}
+        registry._instance_locks[(source_session_id, "codex", "main")] = threading.Lock()
+    app, manager = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=registry
+    )
+    resources = app.state.session_resource_registry
+    if backend_state != "unowned_dead_backend":
+        resources._terminal_roles[(source_session_id, "terminal_codex_main")] = (
+            CODEX_NATIVE_TERMINAL_ROLE
+        )
+    launches: list[str] = []
+
+    async def launch(
+        session_id: str, resource_registry: object, publish_event: object, **kwargs: object
+    ) -> SessionResourceView:
+        launches.append(session_id)
+        return SessionResourceView(
+            id="terminal_codex_main", type="terminal", session_id=session_id, name="recovered"
+        )
+
+    monkeypatch.setattr(orchestration, "_auto_create_codex_terminal", launch)
+    async with _runner_client(app) as client:
+        if backend_state == "rotated":
+            transferred = await client.post(
+                f"/v1/sessions/{source_session_id}/resources/terminals/terminal_codex_main/transfer",
+                json={"target_session_id": session_id},
+            )
+            assert transferred.status_code == 200, transferred.text
+            rejected_target = uuid.uuid4().hex
+            rejected = await client.post(
+                f"/v1/sessions/{source_session_id}/resources/terminals/terminal_codex_main/transfer",
+                json={"target_session_id": rejected_target},
+            )
+            assert rejected.status_code == 404, rejected.text
+            assert rejected_target not in orchestration._AUTO_CODEX_BRIDGE_DIRS
+            state = codex_native_bridge.read_bridge_state(bridge_dir)
+            assert state is not None
+            codex_native_bridge.write_bridge_state(
+                bridge_dir, replace(state, session_id=session_id)
+            )
+        response = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "role": "user",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+                "harness": "codex-native",
+                "content": [{"type": "input_text", "text": "Continue the task"}],
+            },
+        )
+        assert response.status_code == 202, response.text
+        await poll_until_async(lambda: bool(manager._client.posted_bodies), timeout_s=5.0)
+
+    assert launches == ([session_id] if recreated else [])
+    assert close.await_count == int(recreated)
+    if backend is not None:
+        assert backend.close.await_count == int(recreated)
+    if backend_state == "rotated":
+        assert registry.get(session_id, "codex", "main") is instance
+        assert orchestration._AUTO_CODEX_APP_SERVERS[source_session_id] is backend
+        assert session_id not in orchestration._AUTO_CODEX_APP_SERVERS
+        assert orchestration._AUTO_CODEX_BRIDGE_DIRS[source_session_id] == bridge_dir
+        assert orchestration._AUTO_CODEX_BRIDGE_DIRS[session_id] == bridge_dir
 
 
 @pytest.mark.asyncio

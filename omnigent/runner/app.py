@@ -143,7 +143,7 @@ from omnigent.runner.native import (
 )
 from omnigent.runner.native import orchestration as _native_runtime
 from omnigent.runner.native.interrupt import NativeInterruptRunner
-from omnigent.runner.native_controls import build_native_controls
+from omnigent.runner.native_controls import build_native_controls, retire_stopped_codex_backend
 from omnigent.runner.policy_proxy import _evaluate_policy_via_omnigent
 from omnigent.runner.proxy_mcp_manager import ProxyMcpManager
 from omnigent.runner.resource_registry import (
@@ -2097,7 +2097,7 @@ def create_runner_app(
                     session_id,
                     resp.status_code,
                 )
-        except Exception:  # best-effort, but surface it
+        except Exception:  # noqa: BLE001 -- best-effort, but surface it
             _logger.warning(
                 "legacy model_override fallback for %s failed; a model-pinned "
                 "first turn may respawn",
@@ -4051,7 +4051,7 @@ def create_runner_app(
                 conv_id,
                 extra={"session_id": conv_id},
             )
-        except Exception:  # best-effort: harness may have exited
+        except Exception:  # noqa: BLE001 -- best-effort: harness may have exited
             _logger.warning(
                 "Interrupt forward to harness failed for %s",
                 conv_id,
@@ -4794,7 +4794,7 @@ def create_runner_app(
                     _publish_event,
                     now=asyncio.get_running_loop().time(),
                 )
-            except Exception:  # best-effort observer; never fail the hook
+            except Exception:  # noqa: BLE001 -- best-effort observer; never fail the hook
                 _logger.warning(
                     "native file-change recording failed for session=%s",
                     _captured_session_id,
@@ -5280,6 +5280,21 @@ def create_runner_app(
             and name not in _spec_names
         )
 
+        if harness_name == "codex-native":
+            backend = _native_runtime._AUTO_CODEX_APP_SERVERS.get(conv)
+            if backend is not None and (
+                backend.proc is None or backend.proc.returncode is not None
+            ):
+                from omnigent.harnesses.codex_native.bridge import read_bridge_state
+
+                await retire_stopped_codex_backend(
+                    conv,
+                    read_bridge_state(backend.bridge_dir),
+                    backend.bridge_dir,
+                    backend,
+                    resource_registry=resource_registry,
+                    ensure_locks=_codex_terminal_ensure_locks,
+                )
         await _ensure_native_terminal_for_turn(conv, harness_name)
 
         startup_envelope = _fresh_session_init_envelope(conv)
@@ -7681,7 +7696,7 @@ def create_runner_app(
         if resource_registry is not None:
             try:
                 resource_registry.resync_session_statuses()
-            except Exception:  # best-effort; never block catch-up.
+            except Exception:  # noqa: BLE001 -- best-effort; never block catch-up.
                 _logger.warning(
                     "Session status resync failed after reconnect",
                     exc_info=True,

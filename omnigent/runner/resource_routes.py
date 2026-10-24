@@ -673,7 +673,9 @@ def register_resource_routes(
             ):
                 return
             resource = await resource_registry.get_terminal_resource(conv_id, terminal_id)
-            if resource is None or _is_runner_owned_codex_terminal(resource_registry, resource):
+            if resource is not None and _is_runner_owned_codex_terminal(
+                resource_registry, resource
+            ):
                 return
             # The terminal ensure rechecks ownership under its launch lock.
         elif instance is not None:
@@ -683,17 +685,14 @@ def register_resource_routes(
                 harness_name,
                 extra={"session_id": conv_id},
             )
-            # Re-check the registry before closing: a concurrent ensure/recreate
-            # path may have already replaced this entry with a live pane between
-            # our get() and now.  Only close if the registry still points at the
-            # same dead instance we just probed.
+            # Only retire the dead instance we probed, preserving a replacement.
             current = terminal_registry.get(conv_id, terminal_name, "main")
             if current is instance:
                 try:
                     await terminal_registry.close(conv_id, terminal_name, "main")
                 except asyncio.CancelledError:
                     raise
-                except Exception:  # cleanup is best-effort
+                except Exception:  # noqa: BLE001 -- cleanup is best-effort
                     _logger.warning(
                         "failed to close stale native pane for conv=%s; proceeding to re-create",
                         conv_id,
@@ -707,7 +706,7 @@ def register_resource_routes(
                     extra={"session_id": conv_id},
                 )
         _logger.info(
-            "native pane missing for conv=%s harness=%s; re-ensuring before turn (#1349)",
+            "native runtime unavailable for conv=%s harness=%s; re-ensuring before turn",
             conv_id,
             harness_name,
             extra={"session_id": conv_id},
@@ -855,6 +854,16 @@ def register_resource_routes(
                     }
                 },
             )
+        if (
+            resource_registry.terminal_resource_role(target_session_id, terminal_id)
+            == CODEX_NATIVE_TERMINAL_ROLE
+        ):
+            from omnigent.runner.native.orchestration import (
+                _AUTO_CODEX_BRIDGE_DIRS,
+                codex_native_bridge_dir,
+            )
+
+            _AUTO_CODEX_BRIDGE_DIRS[target_session_id] = codex_native_bridge_dir(session_id)
         return JSONResponse(
             status_code=200,
             content=session_resource_view_to_dict(resource),

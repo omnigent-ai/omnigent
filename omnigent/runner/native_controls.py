@@ -322,6 +322,58 @@ class NativeControls:
     teardown_session_terminals: Callable[[str], Coroutine[Any, Any, None]]
 
 
+async def retire_stopped_codex_backend(
+    conv_id: str,
+    state: CodexNativeBridgeState | None,
+    bridge_dir: Path,
+    failed_backend: CodexNativeAppServer | None,
+    *,
+    resource_registry: SessionResourceRegistry,
+    ensure_locks: dict[str, asyncio.Lock],
+) -> bool:
+    """Retire a stopped launch only while its backend, bridge, and terminal remain owned."""
+    from omnigent.entities.session_resources import terminal_resource_id
+    from omnigent.harnesses.codex_native.bridge import read_bridge_state
+    from omnigent.runner.native.orchestration import (
+        _AUTO_CODEX_APP_SERVERS,
+        teardown_codex_native_app_server,
+    )
+
+    registry = resource_registry.terminal_registry
+    if registry is None or (state is not None and state.session_id != conv_id):
+        return False
+    lock = ensure_locks.setdefault(conv_id, asyncio.Lock())
+    async with lock:
+        if (
+            resource_registry.terminal_resource_role(
+                conv_id, terminal_resource_id("codex", "main")
+            )
+            != CODEX_NATIVE_TERMINAL_ROLE
+            or read_bridge_state(bridge_dir) != state
+        ):
+            return False
+        backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+        if backend is None or backend is not failed_backend:
+            return False
+        if backend.bridge_dir != bridge_dir or (
+            backend.proc is not None and backend.proc.returncode is None
+        ):
+            return False
+        _logger.info(
+            "Recreating stopped owned Codex backend for session=%s",
+            conv_id,
+            extra={"session_id": conv_id},
+        )
+        await teardown_codex_native_app_server(conv_id)
+        try:
+            await registry.close(conv_id, "codex", "main")
+        except (OSError, RuntimeError):
+            _logger.warning(
+                "Could not close the stopped Codex terminal for session=%s", conv_id, exc_info=True
+            )
+        return True
+
+
 def build_native_controls(
     *,
     _active_turns: dict[str, asyncio.Task[None] | None],
@@ -432,49 +484,6 @@ def build_native_controls(
                 return state if state.session_id == conv_id else None
             await asyncio.sleep(_CODEX_SETTINGS_READY_POLL_S)
         return None
-
-    async def _close_unreachable_owned_codex(
-        conv_id: str,
-        state: CodexNativeBridgeState,
-        bridge_dir: Path,
-        failed_backend: CodexNativeAppServer | None,
-    ) -> bool:
-        """Retire the same stopped, owned launch whose listener refused this connection."""
-        from omnigent.entities.session_resources import terminal_resource_id
-        from omnigent.harnesses.codex_native.bridge import read_bridge_state
-        from omnigent.runner.native.orchestration import (
-            _AUTO_CODEX_APP_SERVERS,
-            teardown_codex_native_app_server,
-        )
-
-        registry = resource_registry.terminal_registry
-        if registry is None:
-            return False
-        lock = _codex_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock())
-        async with lock:
-            if (
-                resource_registry.terminal_resource_role(
-                    conv_id, terminal_resource_id("codex", "main")
-                )
-                != CODEX_NATIVE_TERMINAL_ROLE
-                or read_bridge_state(bridge_dir) != state
-            ):
-                return False
-            backend = _AUTO_CODEX_APP_SERVERS.get(conv_id)
-            if backend is None or backend is not failed_backend:
-                return False
-            if backend.bridge_dir != bridge_dir or (
-                backend.proc is not None and backend.proc.returncode is None
-            ):
-                return False
-            _logger.info(
-                "Recreating unreachable owned Codex backend before settings update for session=%s",
-                conv_id,
-                extra={"session_id": conv_id},
-            )
-            await teardown_codex_native_app_server(conv_id)
-            await registry.close(conv_id, "codex", "main")
-            return True
 
     async def _apply_codex_native_settings_update(
         conv_id: str,
@@ -588,7 +597,14 @@ def build_native_controls(
                 # No settings request was sent. Recreate this owned launch once,
                 # sharing the original readiness budget with cleanup and startup.
                 retired = await asyncio.wait_for(
-                    _close_unreachable_owned_codex(conv_id, state, bridge_dir, failed_backend),
+                    retire_stopped_codex_backend(
+                        conv_id,
+                        state,
+                        bridge_dir,
+                        failed_backend,
+                        resource_registry=resource_registry,
+                        ensure_locks=_codex_terminal_ensure_locks,
+                    ),
                     timeout=ready_deadline - asyncio.get_running_loop().time(),
                 )
                 if not retired:
@@ -662,7 +678,7 @@ def build_native_controls(
                         "detail": "Codex did not confirm the settings update in time.",
                     },
                 ), settings
-        except Exception as exc:  # surface app-server settings failures.
+        except Exception as exc:  # noqa: BLE001 -- surface app-server settings failures.
             _logger.warning(
                 "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",
                 conv_id,
@@ -987,7 +1003,7 @@ def build_native_controls(
             await asyncio.to_thread(
                 model_catalog_store.write_catalog, "codex-native", fingerprint, shaped
             )
-        except Exception:  # write-back is best-effort
+        except Exception:  # noqa: BLE001 -- write-back is best-effort
             _logger.debug(
                 "codex model-catalog write-back skipped",
                 exc_info=True,
@@ -1307,7 +1323,7 @@ def build_native_controls(
                 await asyncio.to_thread(
                     confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
                 )
-            except Exception:  # best-effort; the report reconciles
+            except Exception:  # noqa: BLE001 -- best-effort; the report reconciles
                 _logger.debug(
                     "late model-dialog watch errored for session=%s",
                     conv_id,
