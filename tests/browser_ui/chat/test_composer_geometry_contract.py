@@ -759,6 +759,52 @@ def test_composer_fits_available_space_while_resizing(
         assert document_width(page) <= width
 
 
+def test_long_btw_quick_answer_scrolls_to_its_end(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    chat = chat_session_contract
+    open_live(page, chat, DESKTOP)
+    answer_text = "\n".join(
+        f"{n}. Plan step {n}: check the next part of the rollout." for n in range(1, 41)
+    )
+    chat.emit(
+        {
+            "event": "session.btw_sidechat",
+            "data": {
+                "type": "session.btw_sidechat",
+                "conversation_id": chat.session_id,
+                "question": "/btw List 40 numbered lines about this plan",
+                "answer": answer_text,
+                "truncated": False,
+            },
+        }
+    )
+    heading = page.get_by_role("heading", name="Claude Quick Answer")
+    expect(heading).to_be_visible()
+    answer = heading.locator("xpath=../..").locator(".prose")
+    expect(answer.locator("li")).to_have_count(40)
+
+    # Hovering would scroll the answer into view programmatically, so wheel at its on-screen part.
+    rect = box(answer)
+    visible_top = max(rect["y"], 0)
+    visible_bottom = min(rect["y"] + rect["height"], DESKTOP["height"])
+    page.mouse.move(rect["x"] + rect["width"] / 2, (visible_top + visible_bottom) / 2)
+    scroll_top_before = answer.evaluate("el => el.scrollTop")
+    for _ in range(8):
+        page.mouse.wheel(0, 400)
+        page.wait_for_timeout(100)
+
+    expect(page.get_by_text("Plan step 40:", exact=False)).to_be_in_viewport(ratio=1)
+    expect(page.get_by_text("Press Esc to close", exact=True)).to_be_in_viewport(ratio=1)
+    # The answer scrolls internally while the panel's header, question and the composer stay put.
+    assert answer.evaluate("el => el.scrollHeight > el.clientHeight")
+    assert answer.evaluate("el => el.scrollTop") > scroll_top_before
+    question = page.get_by_text("/btw List 40 numbered lines about this plan", exact=True)
+    for surrounding in (heading, question, _input(page, "live")):
+        expect(surrounding).to_be_in_viewport(ratio=1)
+
+
 def test_composer_hides_native_scrollbar_without_disabling_scroll(
     page: Page,
     chat_session_contract: ChatSessionContract,
