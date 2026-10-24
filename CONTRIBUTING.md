@@ -515,6 +515,23 @@ not carry these labels yet; that does not mean it has been forgotten. The
 issue-link rule also applies only to PRs opened on or after that date, so you
 will not be asked to retrofit an issue onto an older PR.
 
+### Superseded pull requests
+
+When a trusted Resolve bot PR contains a line such as `Supersedes #123`, the
+older PR stays open until that replacement merges into the default branch.
+Cleanup then closes every PR named on a `Supersedes` line and leaves a link to
+the replacement. A daily sweep catches closures missed by the merge event.
+An old PR is not closed merely because it is old, or because an unmerged
+replacement exists. Reopening it after the replacement merged stops this
+cleanup from closing it again for the same replacement.
+
+Maintainers can preview the decisions in Actions → **Close Superseded PR** →
+**Run workflow**, with `dry_run` checked. Leave `replacement_pr` empty to scan
+open PRs, or enter one replacement PR number. The summary and
+`superseded-cleanup.json` artifact distinguish `would_close`, skipped and unknown
+cases. A dry run posts no comments and changes no PRs. A failed read stays
+unknown and is retried on the next run.
+
 ### Reopening a closed PR
 
 If automation closed your PR (as a duplicate, for example) and you think that

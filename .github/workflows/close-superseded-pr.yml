@@ -3,28 +3,71 @@ name: Close Superseded PR
 on:
   pull_request_target:
     types: [closed]
+  schedule:
+    - cron: "23 4 * * *"
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Report eligible closures without comments or PR updates
+        type: boolean
+        default: true
+      replacement_pr:
+        description: Optional replacement PR number; empty scans all open PRs
+        type: string
+        default: ""
 
 permissions: {}
 
+concurrency:
+  group: close-superseded-${{ github.repository }}
+  cancel-in-progress: false
+
 jobs:
   close-superseded:
-    if: github.event.pull_request.merged == true
+    if: >-
+      github.repository == 'omnigent-ai/omnigent' &&
+      (github.event_name != 'pull_request_target' || github.event.pull_request.merged == true)
     runs-on: ubuntu-latest
     permissions:
       contents: read
       issues: write
       pull-requests: write
-    timeout-minutes: 3
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: main
+          ref: ${{ github.event.repository.default_branch }}
           persist-credentials: false
           sparse-checkout: .github/workflows/close-superseded-pr.js
           sparse-checkout-cone-mode: false
       - uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+          REPLACEMENT_PR: ${{ inputs.replacement_pr }}
         with:
           retries: 3
           script: |
-            const script = require(".github/workflows/close-superseded-pr.js");
-            await script({ context, github });
+            const script = require("./.github/workflows/close-superseded-pr.js");
+            const rawNumber = process.env.REPLACEMENT_PR || "";
+            if (rawNumber && !/^[1-9][0-9]*$/.test(rawNumber)) {
+              throw new Error("replacement_pr must be a positive integer");
+            }
+            const report = await script({
+              context, github, dryRun: process.env.DRY_RUN !== "false",
+              replacementNumber: rawNumber ? Number(rawNumber) : null,
+            });
+            require("fs").writeFileSync(
+              require("path").join(process.env.RUNNER_TEMP, "superseded-cleanup.json"),
+              JSON.stringify(report, null, 2) + "\n",
+            );
+            await core.summary.addHeading("Superseded PR cleanup")
+              .addCodeBlock(JSON.stringify(report, null, 2), "json").write();
+            if (report.counts.unknown) core.setFailed("Some PRs could not be checked or closed; see the report.");
+      - name: Retain cleanup decisions
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: superseded-cleanup-${{ github.run_id }}-${{ github.run_attempt }}
+          path: ${{ runner.temp }}/superseded-cleanup.json
+          if-no-files-found: warn
+          retention-days: 14
