@@ -56,8 +56,10 @@ from omnigent.runner._entry import (
 )
 from omnigent.runner.identity import (
     RUNNER_AUTH_REJECTED_EXIT_CODE,
+    RUNNER_DELEGATED_AUTH_ENV_VAR,
     RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR,
     RUNNER_INTERACTIVE_SHELLS_ENV_VAR,
+    RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     RUNNER_TUNNEL_TOKEN_HEADER,
 )
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
@@ -1760,75 +1762,76 @@ def test_runner_databricks_auth_remints_on_401() -> None:
 
 
 @pytest.mark.asyncio
-async def test_runner_databricks_auth_end_to_end_through_mock_transport() -> None:
-    """End-to-end: a 302→/oidc/ becomes a 200 after the bearer refresh.
+@pytest.mark.parametrize("status", [302, 401, 403])
+@pytest.mark.parametrize("bootstrap", [False, True])
+@pytest.mark.parametrize("repaired", [False, True])
+async def test_runner_databricks_auth_end_to_end_through_mock_transport(
+    monkeypatch: pytest.MonkeyPatch, status: int, bootstrap: bool, repaired: bool
+) -> None:
+    """Rejection discards SDK caches so a repaired login is used on retry."""
+    from omnigent.inner.databricks_executor import _DatabricksBearerAuth
 
-    This is the integration-shaped variant of the unit tests above.
-    It exercises the actual ``httpx.AsyncClient`` send pipeline (auth
-    flow → transport → auth flow → transport) so a regression in how
-    the Auth class plugs into httpx is caught here, not just in
-    isolation. Mirrors the production flow:
-
-    1. Runner posts to ``/v1/sessions/{id}/mcp`` with stale bearer.
-    2. Omnigent front door bounces with ``302 → /oidc/...authorize``.
-    3. Runner re-mints, retries with fresh bearer, server returns 200.
-
-    Without the login-redirect branch in ``auth_flow``, step 3 never
-    happens and the call surfaces as a hard 302 to ``ProxyMcpManager``.
-
-    :returns: None.
-    """
-    minted_tokens: list[str] = []
+    server_url = "https://workspace.example.test"
+    token_cache = "stale-token"
+    resolutions: list[str] = []
     seen_authz: list[str] = []
 
-    def _factory() -> str:
-        """Mint sequential tokens so the server can tell stale from fresh.
+    class CachedConfig:
+        def __init__(self, token: str) -> None:
+            self.token = token
 
-        :returns: Token string ``tok-1``, ``tok-2``, ...
-        """
-        token = f"tok-{len(minted_tokens) + 1}"
-        minted_tokens.append(token)
-        return token
+        def authenticate(self) -> dict[str, str]:
+            return {"Authorization": f"Bearer {self.token}"}
 
-    def _handler(request: httpx.Request) -> httpx.Response:
-        """Reject the first bearer with a 302→OIDC; accept the second.
+    def resolve(profile: str | None = None) -> tuple[_DatabricksBearerAuth, str]:
+        resolutions.append(token_cache)
+        return _DatabricksBearerAuth(CachedConfig(token_cache)), server_url
 
-        :param request: Incoming httpx request from the client.
-        :returns: 302 on the first call, 200 on the second.
-        """
-        seen_authz.append(request.headers.get("authorization", ""))
-        if len(seen_authz) == 1:
-            return httpx.Response(
-                302,
-                headers={
-                    "Location": (
-                        "https://workspace.example.com/oidc/oauth2/v2.0/authorize?state=abc"
-                    ),
-                },
-            )
-        return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+    monkeypatch.setattr("omnigent.inner.databricks_executor._resolve_databricks_auth", resolve)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+    monkeypatch.delenv(RUNNER_DELEGATED_AUTH_ENV_VAR, raising=False)
+    monkeypatch.delenv(RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR, raising=False)
+    monkeypatch.delenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, raising=False)
+    if bootstrap:
+        monkeypatch.setenv(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "bootstrap-token")
+    factory = _make_auth_token_factory(server_url)
+    assert factory is not None
+    if bootstrap:
+        assert isinstance(factory, _InitialAuthTokenFactory)
+        assert factory.invalidate()
+    assert factory() == factory() == "stale-token"
+    assert resolutions == ["stale-token"]
 
-    transport = httpx.MockTransport(_handler)
+    def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal token_cache
+        authorization = request.headers.get("authorization", "")
+        seen_authz.append(authorization)
+        if authorization == "Bearer repaired-token":
+            return httpx.Response(200, json={"jsonrpc": "2.0", "id": 1, "result": {}})
+        if repaired:
+            token_cache = "repaired-token"
+        headers = {"Location": f"{server_url}/oidc/oauth2/v2.0/authorize"} if status == 302 else {}
+        return httpx.Response(status, headers=headers)
+
     async with httpx.AsyncClient(
-        base_url="http://ap.example.com",
-        auth=_RunnerDatabricksAuth(_factory),
-        transport=transport,
+        base_url=server_url,
+        auth=_RunnerDatabricksAuth(factory, server_url),
+        transport=httpx.MockTransport(handler),
     ) as client:
-        resp = await client.post(
+        response = await client.post(
             "/v1/sessions/conv_abc/mcp",
             json={"jsonrpc": "2.0", "id": 1, "method": "tools/list"},
         )
 
-    # 200 means the retry happened, the fresh bearer was accepted, and
-    # the caller (ProxyMcpManager in production) sees a normal success.
-    # If this assertion fails with status_code == 302, the auth flow
-    # is not re-minting on the login-redirect path — the original bug.
-    assert resp.status_code == 200
-    # The server saw two distinct bearers: the stale one, then the
-    # fresh one. Equal tokens here would mean the retry replayed the
-    # cached value instead of asking the factory for a new one.
-    assert seen_authz == ["Bearer tok-1", "Bearer tok-2"]
-    assert minted_tokens == ["tok-1", "tok-2"]
+    expected_token = "repaired-token" if repaired else "stale-token"
+    assert response.status_code == (200 if repaired else status)
+    assert seen_authz == ["Bearer stale-token", f"Bearer {expected_token}"]
+    assert resolutions == ["stale-token", expected_token]
+    assert factory() == expected_token
+    # The post-flow call must serve the cached credential, not re-resolve.
+    assert resolutions == ["stale-token", expected_token]
 
 
 def test_runner_tunnel_binding_token_from_env_returns_none_without_token(

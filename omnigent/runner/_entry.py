@@ -480,15 +480,14 @@ def _call_factory_with_declined(
 
 
 def _invalidate_auth_token_factory(factory: Callable[[], str | None]) -> bool:
-    """Invalidate a bootstrap token factory when it supports that operation.
+    """Discard a rejected bearer when its factory supports invalidation.
 
-    Ordinary token factories already return a fresh token on each call and
-    expose no invalidation hook. A host-bootstrap factory holds its initial
-    bearer until the server rejects it; invalidating switches the factory to
-    the runner's existing refreshable credential path.
+    Bootstrap and managed-mint factories discard their cached bearer. Local
+    auth discards the SDK's in-memory cache so the next lookup sees repaired
+    credentials without forcing a shared OAuth refresh.
 
     :param factory: Runner auth token factory.
-    :returns: ``True`` when a bootstrap token was invalidated.
+    :returns: ``True`` when cached credentials were invalidated.
     """
     invalidate = getattr(factory, "invalidate", None)
     if not callable(invalidate):
@@ -616,6 +615,64 @@ class _InitialAuthTokenFactory:
             return True
 
 
+class _LocalAuthTokenFactory:
+    """Reuse local credentials until the server rejects the cached SDK bearer."""
+
+    def __init__(self, server_url: str | None) -> None:
+        self._server_url = server_url
+        self._sdk_token_source: _ReusedDatabricksTokenSource | None = None
+        self._lock = threading.Lock()
+
+    def __call__(self) -> str | None:
+        with self._lock:
+            return self._current_token()
+
+    def invalidate(self) -> bool:
+        """Drop the in-memory SDK cache; rediscover credentials on the next call."""
+        with self._lock:
+            had_source = self._sdk_token_source is not None
+            self._sdk_token_source = None
+            return had_source
+
+    def _current_token(self) -> str | None:
+        # Check stored OIDC token first.
+        if self._server_url:
+            from omnigent.cli_auth import (
+                REFRESH_MIN_REMAINING_SECONDS,
+                load_token,
+                refresh_stored_token,
+            )
+
+            # Require enough remaining life that the token cannot lapse
+            # mid-handshake; a token inside that window falls through to
+            # the renewal path below rather than being used and rejected.
+            oidc_token = load_token(
+                self._server_url,
+                min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
+            )
+            if oidc_token:
+                return oidc_token
+            # Expired or near-lapse: renew from the login-issued refresh
+            # grant when one exists; this keeps an unattended host alive
+            # past session-JWT expiry across tunnel reconnects.
+            refreshed = refresh_stored_token(self._server_url)
+            if refreshed:
+                return refreshed
+            # Nothing to renew with: a near-expiry token that has NOT
+            # actually lapsed still authenticates, so prefer it over
+            # falling through to no credential at all.
+            still_valid = load_token(self._server_url)
+            if still_valid:
+                return still_valid
+        if self._sdk_token_source is None:
+            # Optional SDK imports must not prevent delegated/OIDC recovery or
+            # bypass the managed-mint fallback when the executor cannot load.
+            from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
+
+            self._sdk_token_source = _ReusedDatabricksTokenSource(self._server_url)
+        return self._sdk_token_source.current_token()
+
+
 def _make_auth_token_factory(
     server_url: str | None = None,
     *,
@@ -730,60 +787,12 @@ def _make_auth_token_factory(
         if _proxy_bearer is None:
             refused_binding_token = binding_token
 
-    sdk_token_source: _ReusedDatabricksTokenSource | None = None
-
-    def _factory() -> str | None:
-        """Return a fresh auth token.
-
-        Checks the stored OIDC token first (from ``omnigent login``),
-        then falls back to the reused Databricks SDK auth.
-
-        :returns: Bearer token string, or ``None`` if no credentials
-            are configured.
-        """
-        nonlocal sdk_token_source
-        # Check stored OIDC token first.
-        if resolved_server_url:
-            from omnigent.cli_auth import (
-                REFRESH_MIN_REMAINING_SECONDS,
-                load_token,
-                refresh_stored_token,
-            )
-
-            # Require enough remaining life that the token cannot lapse
-            # mid-handshake; a token inside that window falls through to
-            # the renewal path below rather than being used and rejected.
-            oidc_token = load_token(
-                resolved_server_url,
-                min_remaining_seconds=REFRESH_MIN_REMAINING_SECONDS,
-            )
-            if oidc_token:
-                return oidc_token
-            # Expired or near-lapse: renew from the login-issued refresh
-            # grant when one exists. This is what keeps an unattended host
-            # alive past session-JWT expiry — the tunnel rebuilds headers
-            # through this factory on every reconnect.
-            refreshed = refresh_stored_token(resolved_server_url)
-            if refreshed:
-                return refreshed
-            # Nothing to renew with: a near-expiry token that has NOT
-            # actually lapsed still authenticates, so prefer it over
-            # falling through to no credential at all.
-            still_valid = load_token(resolved_server_url)
-            if still_valid:
-                return still_valid
-        if sdk_token_source is None:
-            # Optional SDK imports must not prevent delegated/OIDC recovery or
-            # bypass the managed-mint fallback when the executor cannot load.
-            from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
-
-            sdk_token_source = _ReusedDatabricksTokenSource(resolved_server_url)
-        return sdk_token_source.current_token()
+    factory = _LocalAuthTokenFactory(resolved_server_url)
 
     # Probe once to check if a user credential is available.
     try:
-        if _factory() is not None:
-            return _factory
+        if factory() is not None:
+            return factory
     except (ValueError, OSError, ImportError):
         pass
 
