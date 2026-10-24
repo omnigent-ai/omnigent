@@ -401,6 +401,102 @@ async def test_native_in_flight_status_blocks_idle_shutdown_until_idle(status: s
 
 
 @pytest.mark.asyncio
+async def test_native_waiting_hold_is_bounded_but_running_is_not(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A terminal parked on user input stops holding the watchdog after the hold.
+
+    An unanswered dialog is not agent work, so it must not pin the runner
+    forever; a ``running`` turn is real work and is never bounded.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
+    conv_id = "conv_native_waiting_bounded"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, "waiting")
+        assert app.state.has_active_work() is True
+        await asyncio.sleep(0.1)
+        assert app.state.has_active_work() is False
+
+        await _post_status(client, conv_id, "running")
+        await asyncio.sleep(0.1)
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_native_waiting_hold_zero_keeps_it_unbounded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``0`` restores the old behavior: ``waiting`` holds the watchdog until it settles.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    from tests.runner.conftest import _runner_client
+
+    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0")
+    conv_id = "conv_native_waiting_unbounded"
+    app = await _native_app_with_session(conv_id)
+    async with _runner_client(app) as client:
+        created = await client.post("/v1/sessions", json={"session_id": conv_id, "agent_id": "ag"})
+        assert created.status_code == 201, created.text
+        await _post_status(client, conv_id, "waiting")
+        await asyncio.sleep(0.1)
+        assert app.state.has_active_work() is True
+
+
+@pytest.mark.asyncio
+async def test_claude_prompt_waiter_hold_is_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A queued-message prompt waiter stops holding the watchdog after the hold.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :returns: None.
+    """
+    monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", "0.05")
+    app = _scaffold_app()
+    waiter = asyncio.create_task(asyncio.sleep(3600))
+    app.state.claude_prompt_waiters["conv_unanswered_prompt"] = waiter
+    try:
+        assert app.state.has_active_work() is True
+        await asyncio.sleep(0.1)
+        assert app.state.has_active_work() is False
+    finally:
+        waiter.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await waiter
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [(None, 86400.0), ("", 86400.0), ("abc", 86400.0), ("-1", 86400.0), ("0", 0.0), ("30", 30.0)],
+)
+def test_resolve_human_wait_hold_s(
+    monkeypatch: pytest.MonkeyPatch, raw: str | None, expected: float
+) -> None:
+    """The hold honors the env var and falls back to one day on a bad value.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    :param raw: Env var value, e.g. ``"30"``; ``None`` leaves it unset.
+    :param expected: Resolved hold in seconds.
+    :returns: None.
+    """
+    from omnigent.runner.app import _resolve_human_wait_hold_s
+
+    if raw is None:
+        monkeypatch.delenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_RUNNER_HUMAN_WAIT_HOLD_S", raw)
+    assert _resolve_human_wait_hold_s() == expected
+
+
+@pytest.mark.asyncio
 async def test_native_failed_status_releases_idle_pin() -> None:
     """A native ``failed`` edge settles the turn for the watchdog."""
     from tests.runner.conftest import _runner_client
