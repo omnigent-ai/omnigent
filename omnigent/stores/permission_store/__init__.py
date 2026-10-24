@@ -153,6 +153,22 @@ class PermissionStore(ABC):
         ...
 
     @abstractmethod
+    def mark_logged_in(self, user_id: str, when_epoch_seconds: int) -> None:
+        """Stamp ``last_login_at`` on an existing user row.
+
+        The OIDC callback has no account store, so this is how a
+        sign-in through the identity provider records its time, the
+        same column :meth:`SqlAlchemyAccountStore.mark_logged_in`
+        bumps for password sign-ins. Callers ensure the row first with
+        :meth:`ensure_user`.
+
+        :param user_id: The user that signed in, e.g.
+            ``"alice@example.com"``.
+        :param when_epoch_seconds: Sign-in time as Unix epoch seconds.
+        """
+        ...
+
+    @abstractmethod
     def get_user(self, user_id: str) -> Account | None:
         """Read the target account and generation before an operation on another user."""
         ...
