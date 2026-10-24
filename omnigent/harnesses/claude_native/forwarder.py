@@ -129,9 +129,12 @@ _MAX_SEEN_DELTA_KEYS = 5000
 _SUBAGENT_IDLE_THRESHOLD_S = 5.0
 
 # Meta-file glob inside ``~/.claude/projects/<encoded>/<session>/subagents/``.
-# One per Claude Task-tool subagent; appears alongside the matching
-# ``agent-<id>.jsonl`` transcript.
+# One per Claude Task-tool subagent or in-process teammate; appears alongside
+# the matching ``agent-<id>.jsonl`` transcript.
 _SUBAGENT_META_GLOB = "agent-*.meta.json"
+# ``taskKind`` of an agent-team teammate running inside the lead's process. No
+# tool call spawns it, so its meta has no ``toolUseId``.
+_IN_PROCESS_TEAMMATE_TASK_KIND = "in_process_teammate"
 # Claude's built-in sub-agent spawn tool; its tool-use id is the ``toolUseId``
 # stamped into each ``agent-<id>.meta.json``. Reuse the router's canonical set so
 # both the current ``Agent`` name and the still-supported ``Task`` alias match.
@@ -1944,10 +1947,15 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     or malformed so the watcher can skip it gracefully and try again
     on the next tick.
 
+    An in-process teammate has no ``toolUseId``; it is returned with an
+    empty one. Fields are returned as written: ``name`` (the handle the
+    lead messages a teammate by) is not folded into the description here.
+
     :param meta_path: Path to ``agent-<id>.meta.json``.
     :returns: A dict with string-typed ``agentType``, ``description``,
-        and ``toolUseId``; or ``None`` when the file is missing /
-        malformed / missing any required key.
+        ``toolUseId`` (empty for a teammate) and ``name`` (empty when the
+        meta has none); or ``None`` when the file is missing / malformed /
+        missing any required key.
     """
     try:
         raw = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1963,11 +1971,15 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     if not isinstance(description, str):
         return None
     if not isinstance(tool_use_id, str) or not tool_use_id:
-        return None
+        if raw.get("taskKind") != _IN_PROCESS_TEAMMATE_TASK_KIND:
+            return None
+        tool_use_id = ""
+    name = raw.get("name")
     return {
         "agentType": agent_type,
         "description": description,
         "toolUseId": tool_use_id,
+        "name": name.strip() if isinstance(name, str) else "",
     }
 
 
@@ -2665,7 +2677,7 @@ def _subagent_own_spawn_tool_use_id(agent_jsonl_path: Path) -> str | None:
         agent_jsonl_path.name.removesuffix(".jsonl") + ".meta.json"
     )
     meta = _read_subagent_meta(meta_path)
-    return meta["toolUseId"] if meta is not None else None
+    return (meta["toolUseId"] or None) if meta is not None else None
 
 
 def _subagent_parents_by_tool_use(
@@ -2781,21 +2793,39 @@ async def _forward_available_subagents(
         if (sid := _subagent_id_from_meta_path(path)) not in updated.subagents
         and start_retry_tracker.retry_delay_s(f"subagent_start:{sid}") is None
     ]
+    candidate_metas: list[tuple[Path, dict[str, str]]] = []
+    for meta_path in candidate_meta_paths:
+        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
+        if meta is not None:
+            candidate_metas.append((meta_path, meta))
     parents_by_tool_use = (
         await asyncio.to_thread(
             _subagent_parents_by_tool_use,
             transcript_path,
             subagents_dir,
         )
-        if candidate_meta_paths
+        if any(meta["toolUseId"] for _, meta in candidate_metas)
         else {}
     )
     pending: list[tuple[Path, dict[str, str], str | None]] = []
-    for meta_path in candidate_meta_paths:
-        meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
-        if meta is None:
-            continue
+    for meta_path, meta in candidate_metas:
         tool_use_id = meta["toolUseId"]
+        if not tool_use_id:
+            # An in-process teammate belongs to the team lead (this session); its
+            # teamName is not consulted. The server requires a tool-use id, so stand
+            # in a stable one that no real spawn record can match, and label the
+            # child by the name the lead messages it by.
+            subagent_id = _subagent_id_from_meta_path(meta_path)
+            name, description = meta["name"], meta["description"]
+            teammate_meta = {
+                **meta,
+                "description": f"{name}: {description}"
+                if name and description
+                else name or description,
+                "toolUseId": f"teammate:{subagent_id}",
+            }
+            pending.append((meta_path, teammate_meta, None))
+            continue
         if tool_use_id not in parents_by_tool_use:
             # No transcript owns this spawn yet: the record is still mid-write, or
             # it resolved to two owners and was dropped as ambiguous. Either way we
