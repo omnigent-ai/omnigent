@@ -8,7 +8,7 @@ and opening the new terminal as a rail tab (its xterm renders in the rail's
 content slot). None of this needs an LLM turn — the user, not the agent,
 launches the shell — so these tests never send a chat message.
 
-Five behaviors are covered:
+Six behaviors are covered:
 
 1. **"+" → Shell launches and opens a shell.** Picking Shell creates a
    ``zsh`` shell that opens as a rail tab (``zsh · u-…``): its xterm
@@ -37,28 +37,37 @@ Five behaviors are covered:
 5. **A program's terminal queries are answered once.** tmux answers a query
    such as the cursor position itself; the browser terminal must not answer
    the copy control mode forwards, or the extra reply reaches the program as
-   typed input.
+   typed input. A query tmux leaves unanswered must still get the browser's.
 
-All use the function-scoped ``terminal_session`` fixture (registers the
-``zsh``-declaring agent and a runner-bound session), so each test gets an
-independent session.
+6. **PowerShell runs what the user types.** PowerShell asks for the cursor
+   position on every prompt, so a duplicate reply corrupts the next command.
+
+All but the PowerShell test use the function-scoped ``terminal_session``
+fixture (registers the ``zsh``-declaring agent and a runner-bound session);
+the PowerShell test uses ``pwsh_session``. Each test gets an independent
+session.
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import re
+import shutil
 import signal
+import subprocess
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from pathlib import Path
 
 import httpx
+import pytest
 from playwright.sync_api import Page, expect
 
 from tests._helpers.polling import poll_until
-from tests.e2e_ui.conftest import _server_state, open_right_rail
+from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
+from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, open_right_rail
 
 
 def _open_new_shell(page: Page) -> None:
@@ -587,22 +596,35 @@ def test_shell_wheel_scroll_reaches_mouse_tracking_program(
     )
 
 
-def _cursor_position_reports(log: Path) -> int:
+def _cursor_position_reports(log: Path, report: re.Pattern[bytes]) -> int:
     """Count the cursor position reports a shell program has read so far."""
-    return len(re.findall(rb"\x1b\[\d+;\d+R", log.read_bytes())) if log.exists() else 0
+    return len(report.findall(log.read_bytes())) if log.exists() else 0
 
 
+@pytest.mark.parametrize(
+    ("query", "report"),
+    [
+        # tmux answers this itself; the browser's copy would be a duplicate.
+        pytest.param("\\e[6n", re.compile(rb"\x1b\[\d+;\d+R"), id="answered-by-tmux"),
+        # No tmux answers the extended form; only the browser can.
+        pytest.param("\\e[?6n", re.compile(rb"\x1b\[\?\d+;\d+R"), id="answered-by-browser"),
+    ],
+)
 def test_shell_program_gets_one_reply_to_a_cursor_position_query(
-    page: Page, terminal_session: tuple[str, str], tmp_path: Path
+    page: Page,
+    terminal_session: tuple[str, str],
+    tmp_path: Path,
+    query: str,
+    report: re.Pattern[bytes],
 ) -> None:
-    """A program's cursor position query is answered by tmux alone.
+    """A program's cursor position query gets exactly one answer.
 
     PowerShell asks for the cursor position on every prompt. tmux answers, but
     control mode also forwards the raw query to the browser's xterm, and a
     second answer from there reaches the program as typed input: ``28;1R`` at
-    the prompt, corrupting the next command. Like the wheel test, a program in
-    the shell writes the query from a raw tty and records its stdin to an
-    absolute ``tmp_path`` file; exactly one report must arrive.
+    the prompt. A query tmux doesn't answer must still get the browser's. Like
+    the wheel test, a program writes the query from a raw tty and records its
+    stdin to an absolute ``tmp_path`` file.
     """
     base_url, session_id = terminal_session
     log = tmp_path / "replies.log"
@@ -616,16 +638,156 @@ def test_shell_program_gets_one_reply_to_a_cursor_position_query(
 
     textarea = terminal_view.locator("textarea.xterm-helper-textarea")
     textarea.focus()
-    page.keyboard.type(f"stty raw -echo; printf '\\e[6n'; cat > '{log}'")
+    page.keyboard.type(f"stty raw -echo; printf '{query}'; cat > '{log}'")
     page.keyboard.press("Enter")
 
-    poll_until(lambda: _cursor_position_reports(log) >= 1, timeout_s=15)
+    poll_until(lambda: _cursor_position_reports(log, report) >= 1, timeout_s=15)
     # A duplicate from the browser trails tmux's reply by a WebSocket round trip.
     page.wait_for_timeout(1_500)
-    reports = _cursor_position_reports(log)
+    reports = _cursor_position_reports(log, report)
     assert reports == 1, (
         f"expected one cursor position report, got {reports} (log: {log.read_bytes()[:200]!r})"
     )
+
+
+def _pwsh_agent_yaml(home: Path) -> str:
+    """An agent whose only declared terminal is PowerShell, kept out of the user's home.
+
+    :param home: Directory for PowerShell's config and PSReadLine history.
+    :returns: Agent YAML for a session bundle.
+    """
+    return f"""\
+name: pwsh_demo
+prompt: You are a terminal test assistant. Do not call tools.
+
+executor:
+  model: gpt-4o-mini
+  harness: openai-agents
+
+os_env:
+  type: caller_process
+  cwd: .
+  sandbox:
+    type: none
+
+terminals:
+  pwsh:
+    command: pwsh
+    args: ["-NoLogo", "-NoProfile"]
+    env:
+      XDG_CONFIG_HOME: "{home / "config"}"
+      XDG_DATA_HOME: "{home / "data"}"
+      POWERSHELL_TELEMETRY_OPTOUT: "1"
+      POWERSHELL_UPDATECHECK: "Off"
+    os_env:
+      type: caller_process
+      cwd: .
+      sandbox:
+        type: none
+"""
+
+
+@pytest.fixture
+def pwsh_session(
+    live_server: str,
+    tmp_path: Path,
+    tmp_path_factory: pytest.TempPathFactory,
+) -> Iterator[tuple[str, str]]:
+    """Create a runner-bound session whose agent declares only a PowerShell terminal.
+
+    Mirrors ``terminal_session``: respawns the shared runner if a prior test
+    killed it, and tears down any runner it respawned.
+
+    :returns: ``(base_url, session_id)``.
+    """
+    respawned_runner = _ensure_runner_online(live_server, tmp_path_factory)
+    bundle = bundle_files({"pwsh_demo.yaml": _pwsh_agent_yaml(tmp_path / "pwsh-home").encode()})
+    response = post_session_bundle(httpx.post, f"{live_server}/v1/sessions", bundle, timeout=10.0)
+    response.raise_for_status()
+    session_id = response.json()["session_id"]
+    bind_session_runner(
+        httpx.patch, live_server, session_id, str(_server_state["runner_id"]), timeout=10.0
+    )
+    try:
+        yield (live_server, session_id)
+    finally:
+        try:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+        finally:
+            if respawned_runner is not None:
+                respawned_runner.terminate()
+                try:
+                    respawned_runner.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    respawned_runner.kill()
+                    respawned_runner.wait(timeout=5)
+
+
+def _logged_lines(log: Path) -> list[str]:
+    """The lines a shell has appended to ``log`` so far."""
+    return log.read_text().splitlines() if log.exists() else []
+
+
+def _terminal_pane(base_url: str, session_id: str) -> str:
+    """The session terminal's screen, read from its tmux pane (xterm draws to a canvas)."""
+    rows = httpx.get(f"{base_url}/v1/sessions/{session_id}/resources", timeout=10.0).json()
+    terminal = next((row for row in rows.get("data", []) if row.get("type") == "terminal"), None)
+    if terminal is None:
+        return ""
+    meta = terminal["metadata"]
+    proc = subprocess.run(
+        ["tmux", "-S", meta["tmux_socket"], "capture-pane", "-t", meta["tmux_target"], "-p", "-J"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    return proc.stdout if proc.returncode == 0 else ""
+
+
+# GitHub's Ubuntu runners ship PowerShell, so CI always runs this test.
+@pytest.mark.skipif(
+    shutil.which("pwsh") is None and not os.environ.get("CI"),
+    reason="pwsh is not installed",
+)
+def test_pwsh_runs_each_typed_command(
+    page: Page, pwsh_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """Commands typed into PowerShell run as typed, prompt after prompt.
+
+    PowerShell's line editor asks for the cursor position on every prompt. A
+    second reply from the browser arrives as typed input: ``28;1R`` lands in
+    front of the next command and it fails. Each command appends a line to an
+    absolute ``tmp_path`` file (the shell and this test share a host), so a
+    corrupted command leaves its line missing.
+    """
+    assert shutil.which("pwsh"), "pwsh must be on PATH in CI; GitHub's Ubuntu runners ship it"
+    base_url, session_id = pwsh_session
+    log = tmp_path / "commands.log"
+
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_new_shell(page)
+
+    terminal_view = page.get_by_test_id("terminal-view").last
+    expect(terminal_view).to_be_visible(timeout=60_000)
+    expect(terminal_view).to_have_attribute("data-state", "connected", timeout=20_000)
+
+    # Input typed before PowerShell's first prompt can lose its Enter in startup.
+    poll_until(
+        lambda: re.search(r"^PS .*>", _terminal_pane(base_url, session_id), re.MULTILINE),
+        timeout_s=30,
+    )
+    textarea = terminal_view.locator("textarea.xterm-helper-textarea")
+    textarea.focus()
+    expected = [f"attempt-{n}" for n in range(1, 5)]
+    for line in expected:
+        page.keyboard.type(f"Add-Content -LiteralPath '{log}' -Value {line}")
+        page.keyboard.press("Enter")
+        # Type the next command only after this one has run, once per prompt.
+        with contextlib.suppress(AssertionError):
+            poll_until(lambda line=line: line in _logged_lines(log), timeout_s=15)
+
+    assert _logged_lines(log) == expected, f"PowerShell ran {_logged_lines(log)} of {expected}"
 
 
 def test_workspace_rail_preserves_outer_top_inset(

@@ -6,7 +6,8 @@
 //
 // Wire protocol (mirrors `omnigent/server/routes/terminal_attach.py`):
 //   - Server → client: binary pane output → `term.write`; text frames for
-//     JSON control messages (currently tmux clipboard writes).
+//     JSON control messages (tmux clipboard writes and the queries tmux
+//     answers itself).
 //   - Client → server: binary frames for keystrokes (`term.onData`);
 //     text frames for JSON control messages (currently only resize).
 
@@ -21,7 +22,7 @@ import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
-import { suppressTerminalQueryReplies } from "./TerminalQueryReplies";
+import { parseTmuxRepliesMessage, suppressRepliesTmuxSends } from "./TerminalQueryReplies";
 
 // Card background colors derived from the app's CSS palette.
 // Light: --card: oklch(1.000 0 0) = pure white.
@@ -643,7 +644,8 @@ export class TerminalSession {
   private readonly resizeObserver: ResizeObserver;
   private readonly dataDispose: { dispose: () => void };
   private readonly osc52Dispose: { dispose: () => void };
-  private readonly queryRepliesDispose: { dispose: () => void };
+  /** Drops xterm's replies to the queries tmux answers, once the runner lists them. */
+  private queryReplies: { dispose: () => void } | null = null;
   private readonly codexPalette: CodexTerminalPalette | null;
   private readonly onClipboardRequest?: TerminalClipboardListener;
   /** Whether this visible, interactive attach may write the local clipboard. */
@@ -737,8 +739,6 @@ export class TerminalSession {
     // Control mode forwards raw pane output. Consume pane OSC 52 so clipboard
     // writes can only arrive through validated tmux `clipboard-write` frames.
     this.osc52Dispose = this.term.parser.registerOscHandler(52, () => true);
-    // tmux answers the pane's queries; a second answer from here would arrive as typed input.
-    this.queryRepliesDispose = suppressTerminalQueryReplies(this.term);
     this.fit = new FitAddon();
     this.term.loadAddon(this.fit);
     // Turn bare URLs in terminal output into clickable links; xterm alone
@@ -811,6 +811,11 @@ export class TerminalSession {
         } else if (typeof ev.data === "string") {
           const text = parseTerminalClipboardMessage(ev.data);
           if (text !== null) this.requestClipboardWrite(text);
+          const tmuxAnswers = parseTmuxRepliesMessage(ev.data);
+          if (tmuxAnswers !== null) {
+            this.queryReplies?.dispose();
+            this.queryReplies = suppressRepliesTmuxSends(this.term, tmuxAnswers);
+          }
           // Unknown text frames stay ignored for protocol forward compatibility.
         }
       },
@@ -1018,7 +1023,7 @@ export class TerminalSession {
     this.resizeObserver.disconnect();
     this.dataDispose.dispose();
     this.osc52Dispose.dispose();
-    this.queryRepliesDispose.dispose();
+    this.queryReplies?.dispose();
     try {
       this.ws.close();
     } catch {
