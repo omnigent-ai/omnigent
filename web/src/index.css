@@ -845,6 +845,17 @@ html[data-electron-mac] .electron-drag-strip {
   height: var(--mac-titlebar-height);
   -webkit-app-region: drag;
 }
+/* Screens mounted outside the AppShell (login / register / setup / approve) render
+ * this strip (ElectronWindowDragStrip, mac shell only) so the frameless window stays
+ * draggable. Fixed so it rides the window; edge to edge, no title-bar cluster here. */
+html[data-electron-mac] .electron-standalone-drag-strip {
+  position: fixed;
+  inset: 0 0 auto 0;
+  height: var(--mac-titlebar-height);
+  -webkit-app-region: drag;
+  /* Keeps the strip from swallowing clicks; the geometric drag region still works. */
+  pointer-events: none;
+}
 /* Canvas clears the native title bar, including focus
  * and compact conversation states where the board is hidden. */
 html[data-electron-mac] .canvas-workspace {
