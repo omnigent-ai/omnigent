@@ -157,8 +157,16 @@ and `auth.session_cookie` is set:
 The refresh grant is stored per server origin, and the sign-in in progress is
 stored so it survives Android stopping the app while the browser is open. Both
 are encrypted with an Android Keystore key and never leave the device. Debug
-builds add **Debug Authentication** to the native server menu on these
-connections, with **Clear Session Cookie** and **Clear Refresh Token**.
+builds add a **Debug authentication** section to the sidebar server picker on
+these connections, with **Clear Session Cookie** and **Clear Refresh Token**.
+The section, and the picker's **Reload**, need a server whose web app renders
+them; an older server's picker shows neither.
+
+The floating server pill at the top of the screen appears only when a page
+doesn't load the sidebar picker (an older web build, a login redirect, or a
+broken page), as a way back to server selection. The pill is deprecated:
+removal is targeted for Android 0.3.0, once broken pages have a native
+recovery screen.
 
 ### Manual verification
 
@@ -180,14 +188,14 @@ that falls back to a Custom Tab.
    no `POST /oauth/token`.
 5. Start a sign-in, run `adb shell am kill ai.omnigent.android` while the browser
    is in front, then finish signing in: the app reopens signed in.
-6. **Debug Authentication → Clear Session Cookie**: the session renews silently
-   as soon as the page next calls the server. Clear it again and leave the app
-   at once: reopening it renews silently too.
-7. **Debug Authentication → Clear Refresh Token**, then **Clear Session Cookie**,
-   then reload: "Sign in to <host> to continue." with **Sign In**.
-8. Sign out from the web app's settings, the sidebar picker, and the native
-   menu: "You're signed out of <host>.", and a relaunch stays on the connect
-   screen.
+6. No floating server pill while signed in. In the sidebar server picker,
+   **Clear Session Cookie**: the session renews silently as soon as the page
+   next calls the server. Clear it again and leave the app at once: reopening
+   it renews silently too.
+7. In the sidebar server picker, **Clear Refresh Token**, then **Clear Session
+   Cookie**, then **Reload**: "Sign in to <host> to continue." with **Sign In**.
+8. Sign out from the web app's settings and the sidebar picker: "You're signed
+   out of <host>.", and a relaunch stays on the connect screen.
 9. An accounts-mode server, a header-mode server, an older OIDC server (ticket
    sign-in), a Databricks workspace, and a Databricks App behave as before.
 

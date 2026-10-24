@@ -107,10 +107,11 @@ prompt; and sign-out from the app's settings, **Sign Out** in the native server
 menu, and **Sign out of <server>** in the sidebar server picker.
 
 **Android:** Connect on the connect screen to an OIDC server; a server picked in
-the native server menu or the sidebar server picker; relaunching the app and
-notification taps on a signed-in server; **Sign In** on the "Sign in to <host>"
-prompt; and sign-out from the app's settings, **Sign Out** in the native server
-menu, and **Sign out of <server>** in the sidebar server picker.
+the sidebar server picker (or the native server menu, shown only on a page
+without the picker); relaunching the app and notification taps on a signed-in
+server; **Sign In** on the "Sign in to <host>" prompt; and sign-out from the
+app's settings and **Sign out of <server>** in the sidebar server picker. Debug
+builds list the authentication faults in the sidebar server picker.
 
 **Embedded API:** construct `create_app(auth_provider=...)` with the embedding
 application's provider and stores, then use its authenticated REST client to

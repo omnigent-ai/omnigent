@@ -123,6 +123,8 @@ interface NativeShellApi {
   signOutOfServer?: () => Promise<boolean>;
   /** Return to the shell's "connect to server" setup page. */
   openServerSetup?: () => void;
+  /** Run a debug authentication fault offered in `ServerPickerInfo.debugActions`. */
+  runAuthDebugAction?: (id: number) => void;
   /**
    * Drive the native Chat/Terminal bar's visibility (iOS). The web app owns
    * the truth and only ever pushes it hidden now that the switcher lives in
@@ -483,6 +485,10 @@ export interface ServerPickerInfo {
    * sign-in) and can sign it out. Absent on older shells.
    */
   canSignOut?: boolean;
+  /** Whether the picker offers "Reload" (Android, which has no other reload). */
+  offersReload?: boolean;
+  /** Debug-build authentication faults to offer, in order. Absent on other builds. */
+  debugActions?: AuthDebugAction[];
   /**
    * Names servers gave themselves in their manifest, origin → name. Display
    * only (a server can call itself anything), so show the host alongside.
@@ -498,6 +504,12 @@ export interface ServerPickerInfo {
    * pre-manifest baseline so callers never handle `undefined`.
    */
   serverManifest?: ServerManifest;
+}
+
+/** A debug authentication fault the shell can inject, e.g. "Clear Session Cookie". */
+export interface AuthDebugAction {
+  id: number;
+  label: string;
 }
 
 /**
@@ -1024,6 +1036,17 @@ export function openServerSetup(): void {
     native.openServerSetup();
   } catch (err) {
     console.warn("[nativeBridge] native openServerSetup failed:", err);
+  }
+}
+
+/** Ask the shell to inject a debug authentication fault from the picker payload. */
+export function runAuthDebugAction(id: number): void {
+  const native = nativeApi();
+  if (!native?.runAuthDebugAction) return;
+  try {
+    native.runAuthDebugAction(id);
+  } catch (err) {
+    console.warn("[nativeBridge] native runAuthDebugAction failed:", err);
   }
 }
 
