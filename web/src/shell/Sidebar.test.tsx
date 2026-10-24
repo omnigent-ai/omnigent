@@ -12,8 +12,9 @@ import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { useEffect } from "react";
+import { StrictMode, useEffect } from "react";
 import { GridSessionsProvider } from "@/grid/GridSessionsContext";
+import { markTurnEnded } from "@/hooks/runnerHealthFreshness";
 import * as readStateHooks from "@/hooks/useUnseenConversations";
 import { getOmnigentServerIdentity } from "@/lib/host";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
@@ -21,6 +22,7 @@ import { ARIA_MOD_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut"
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as PullRequestsModule from "@/hooks/usePullRequests";
+import type * as RunnerHealthModule from "@/hooks/RunnerHealthProvider";
 import {
   markConversationRead,
   markConversationSeen,
@@ -91,6 +93,49 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   ...(await importOriginal<typeof PullRequestsModule>()),
   usePullRequestInfo: usePullRequestInfoMock,
 }));
+
+// Per-session stream liveness the rows read (`runner_online` / `host_online`).
+// Unset ids read `undefined` ("not yet observed"), as with the real provider.
+const rowLiveness = vi.hoisted(() => {
+  const listeners = new Set<() => void>();
+  return {
+    runner: new Map<string, boolean>(),
+    host: new Map<string, boolean | null>(),
+    version: 0,
+    listeners,
+    /** Change a session's liveness and re-render subscribed rows, like the real provider. */
+    set(id: string, runner: boolean, host: boolean | null) {
+      this.runner.set(id, runner);
+      this.host.set(id, host);
+      this.version += 1;
+      for (const listener of listeners) listener();
+    },
+  };
+});
+vi.mock("@/hooks/RunnerHealthProvider", async (importOriginal) => {
+  const { useSyncExternalStore } = await import("react");
+  const subscribe = (listener: () => void) => {
+    rowLiveness.listeners.add(listener);
+    return () => rowLiveness.listeners.delete(listener);
+  };
+  const useVersion = () =>
+    useSyncExternalStore(
+      subscribe,
+      () => rowLiveness.version,
+      () => rowLiveness.version,
+    );
+  return {
+    ...(await importOriginal<typeof RunnerHealthModule>()),
+    useSessionRunnerOnline: (id: string | undefined) => {
+      useVersion();
+      return id ? rowLiveness.runner.get(id) : undefined;
+    },
+    useSessionHostOnline: (id: string | undefined) => {
+      useVersion();
+      return id ? rowLiveness.host.get(id) : undefined;
+    },
+  };
+});
 
 vi.mock("@/hooks/useSessionWorktrees", () => ({
   useSessionWorktrees: useSessionWorktreesMock,
@@ -296,6 +341,8 @@ function closeProjectsMenu() {
 }
 
 beforeEach(() => {
+  rowLiveness.runner.clear();
+  rowLiveness.host.clear();
   useConvMock.mockReset();
   useHostsMock.mockReset();
   useHostsMock.mockReturnValue({ data: [] });
@@ -1762,6 +1809,353 @@ describe("Sidebar failed session indicator", () => {
         expect(content).not.toHaveTextContent("Latest message is an error");
       },
     );
+  });
+});
+
+describe("Sidebar asleep (stopped runner) indicator", () => {
+  function stopped(id: string) {
+    rowLiveness.runner.set(id, false);
+    rowLiveness.host.set(id, true);
+  }
+
+  it("shows the asleep badge on an idle row whose runner is stopped on a live host", () => {
+    mockConversations([conv("conv_asleep", "Claude Code")]);
+    stopped("conv_asleep");
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_asleep/ }).closest("li")!;
+    const badge = within(row).getByTestId("session-state-badge");
+    expect(badge).toHaveAttribute("data-state", "asleep");
+    expect(badge).toHaveAttribute("aria-label", "Agent asleep — your next message restarts it");
+  });
+
+  it("keeps the running spinner when a stopped-runner row is running", () => {
+    mockConversations([conv("conv_run", "Claude Code", { status: "running" })]);
+    stopped("conv_run");
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_run/ }).closest("li")!;
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "running");
+  });
+
+  it("shows no badge when the runner is online or not yet observed", () => {
+    mockConversations([conv("conv_live", "Claude Code"), conv("conv_unknown", "Claude Code")]);
+    rowLiveness.runner.set("conv_live", true);
+    rowLiveness.host.set("conv_live", true);
+    renderSidebar();
+
+    for (const name of [/conv_live/, /conv_unknown/]) {
+      const row = screen.getByRole("link", { name }).closest("li")!;
+      expect(within(row).queryByTestId("session-state-badge")).toBeNull();
+    }
+  });
+
+  it("shows no badge when the host is down: resumability is not known on the row", () => {
+    mockConversations([conv("conv_hostdown", "Claude Code")]);
+    rowLiveness.runner.set("conv_hostdown", false);
+    rowLiveness.host.set("conv_hostdown", false);
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_hostdown/ }).closest("li")!;
+    expect(within(row).queryByTestId("session-state-badge")).toBeNull();
+  });
+
+  it("suppresses the moon during the startup grace and shows it for an older row", () => {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    mockConversations([
+      conv("conv_fresh", "Claude Code", { created_at: nowSeconds - 5 }),
+      conv("conv_old", "Claude Code", { created_at: nowSeconds - 600 }),
+    ]);
+    stopped("conv_fresh");
+    stopped("conv_old");
+    renderSidebar();
+
+    const fresh = screen.getByRole("link", { name: /conv_fresh/ }).closest("li")!;
+    expect(within(fresh).queryByTestId("session-state-badge")).toBeNull();
+    const old = screen.getByRole("link", { name: /conv_old/ }).closest("li")!;
+    expect(within(old).getByTestId("session-state-badge")).toHaveAttribute("data-state", "asleep");
+  });
+
+  it("shows the moon at once when a fresh row that was seen online goes offline", () => {
+    const nowSeconds = Math.floor(Date.now() / 1000);
+    mockConversations([conv("conv_crash", "Claude Code", { created_at: nowSeconds - 5 })]);
+    rowLiveness.set("conv_crash", true, true);
+    renderSidebar();
+    const row = screen.getByRole("link", { name: /conv_crash/ }).closest("li")!;
+    expect(within(row).queryByTestId("session-state-badge")).toBeNull();
+
+    act(() => rowLiveness.set("conv_crash", false, true));
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute("data-state", "asleep");
+  });
+
+  it("withholds the moon on the open row after a turn ends until a fresh sample; other rows are not gated", () => {
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
+    mockConversations([
+      conv("conv_open_gate", "Claude Code"),
+      conv("conv_other_gate", "Claude Code"),
+    ]);
+    stopped("conv_open_gate");
+    stopped("conv_other_gate");
+    markTurnEnded("conv_open_gate", Date.now());
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <QueryClientProvider client={qc}>
+        <SidebarDataProvider>
+          <TooltipProvider>
+            <MemoryRouter initialEntries={["/c/conv_open_gate"]}>
+              <Routes>
+                <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+              </Routes>
+            </MemoryRouter>
+          </TooltipProvider>
+        </SidebarDataProvider>
+      </QueryClientProvider>,
+    );
+
+    const open = screen.getByRole("link", { name: /conv_open_gate/ }).closest("li")!;
+    const other = screen.getByRole("link", { name: /conv_other_gate/ }).closest("li")!;
+    expect(within(open).queryByTestId("session-state-badge")).toBeNull();
+    expect(within(other).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "asleep",
+    );
+    vi.restoreAllMocks();
+  });
+
+  it("never renders the moon on the open row in the commit where its turn ends", () => {
+    vi.spyOn(Element.prototype, "scrollIntoView").mockImplementation(() => {});
+    mockConversations([conv("conv_turn_end", "Claude Code")]);
+    stopped("conv_turn_end");
+    useChatStore.setState({ conversationId: "conv_turn_end", status: "streaming" });
+    const errorSpy = vi.spyOn(console, "error").mockImplementation(() => {});
+    const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const { container } = render(
+      <StrictMode>
+        <QueryClientProvider client={qc}>
+          <SidebarDataProvider>
+            <TooltipProvider>
+              <MemoryRouter initialEntries={["/c/conv_turn_end"]}>
+                <Routes>
+                  <Route path="/c/:conversationId" element={<Sidebar open onClose={vi.fn()} />} />
+                </Routes>
+              </MemoryRouter>
+            </TooltipProvider>
+          </SidebarDataProvider>
+        </QueryClientProvider>
+      </StrictMode>,
+    );
+    const row = screen.getByRole("link", { name: /conv_turn_end/ }).closest("li")!;
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+
+    // Record every DOM insertion: a transient moon would show up here even if
+    // a later render removed it before paint.
+    const insertedStates: string[] = [];
+    const observer = new MutationObserver((records) => {
+      for (const record of records) {
+        record.addedNodes.forEach((node) => {
+          if (!(node instanceof Element)) return;
+          const badge = node.matches('[data-testid="session-state-badge"]')
+            ? node
+            : node.querySelector('[data-testid="session-state-badge"]');
+          if (badge) insertedStates.push(badge.getAttribute("data-state") ?? "");
+        });
+      }
+    });
+    observer.observe(container, { childList: true, subtree: true, attributes: true });
+    act(() => useChatStore.setState({ status: "idle" }));
+    insertedStates.push(
+      ...observer
+        .takeRecords()
+        .flatMap((record) => Array.from(record.addedNodes))
+        .filter((node): node is Element => node instanceof Element)
+        .map((node) => node.querySelector('[data-testid="session-state-badge"]'))
+        .filter((badge): badge is Element => badge !== null)
+        .map((badge) => badge.getAttribute("data-state") ?? ""),
+    );
+    observer.disconnect();
+
+    expect(insertedStates).not.toContain("asleep");
+    // No render-phase cross-component updates (React logs these via console.error).
+    const reactWarnings = errorSpy.mock.calls
+      .map((args) => args.map(String).join(" "))
+      .filter((message) => /Cannot update a component|while rendering/.test(message));
+    expect(reactWarnings).toEqual([]);
+    errorSpy.mockRestore();
+    expect(within(row).queryByTestId("session-state-badge")).toBeNull();
+    vi.restoreAllMocks();
+  });
+
+  it.each([
+    { level: null, text: "Agent asleep — your next message restarts it" },
+    { level: 1, text: "Agent asleep" },
+  ])("adds a muted asleep line to the row tooltip (permission $level)", async ({ level, text }) => {
+    mockConversations([conv("conv_tip_asleep", "Codex", { permission_level: level })]);
+    stopped("conv_tip_asleep");
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: /conv_tip_asleep/ }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByTestId("session-tooltip-content");
+    const note = within(tooltip).getByTestId("session-tooltip-asleep");
+    expect(note).toHaveTextContent(text);
+    expect(note).toHaveClass("text-muted-foreground");
+    expect(note.querySelector("svg.lucide-moon")).not.toBeNull();
+  });
+
+  it("adds the asleep line to the grouped-sidebar tooltip too", async () => {
+    mockConversations([conv("conv_tip_grouped", "Codex")]);
+    stopped("conv_tip_grouped");
+    renderGroupingSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: /conv_tip_grouped/ }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByTestId("session-tooltip-content");
+    expect(within(tooltip).getByTestId("session-tooltip-asleep")).toHaveTextContent(
+      "Agent asleep — your next message restarts it",
+    );
+    expect(within(tooltip).getByTestId("session-tooltip-location")).toBeInTheDocument();
+  });
+
+  it("omits the asleep tooltip line for a live row", async () => {
+    mockConversations([conv("conv_tip_live", "Codex")]);
+    rowLiveness.set("conv_tip_live", true, true);
+    renderSidebar();
+
+    fireEvent.pointerMove(screen.getByRole("link", { name: /conv_tip_live/ }), {
+      pointerType: "mouse",
+    });
+    const tooltip = await screen.findByTestId("session-tooltip-content");
+    expect(within(tooltip).queryByTestId("session-tooltip-asleep")).toBeNull();
+  });
+
+  it("shows the draft pencil, not the moon, on a stopped row with an unsent draft", () => {
+    mockConversations([conv("conv_draft_asleep", "Claude Code")]);
+    stopped("conv_draft_asleep");
+    setSessionDraft("conv_draft_asleep", { text: "unsent", files: [] });
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_draft_asleep/ }).closest("li")!;
+    expect(within(row).getByTestId("conversation-draft-indicator")).toBeInTheDocument();
+    expect(within(row).queryByTestId("session-state-badge")).toBeNull();
+  });
+
+  it("drops the restart promise for a read-only (level 1) viewer", () => {
+    mockConversations([conv("conv_viewer", "Claude Code", { permission_level: 1 })]);
+    stopped("conv_viewer");
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_viewer/ }).closest("li")!;
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute(
+      "aria-label",
+      "Agent asleep",
+    );
+  });
+
+  it("keeps the restart promise for a null permission level (full access) and an edit grant", () => {
+    mockConversations([
+      conv("conv_null_perm", "Claude Code", { permission_level: null }),
+      conv("conv_editor", "Claude Code", { permission_level: 2 }),
+    ]);
+    stopped("conv_null_perm");
+    stopped("conv_editor");
+    renderSidebar();
+
+    for (const name of [/conv_null_perm/, /conv_editor/]) {
+      const row = screen.getByRole("link", { name }).closest("li")!;
+      expect(within(row).getByTestId("session-state-badge")).toHaveAttribute(
+        "aria-label",
+        "Agent asleep — your next message restarts it",
+      );
+    }
+  });
+
+  it("shows unseen instead of asleep until the replies are read", () => {
+    const readState = vi
+      .spyOn(readStateHooks, "useConversationReadState")
+      .mockReturnValue({ unseen: true, explicitlyUnread: false });
+    try {
+      mockConversations([conv("conv_unread", "Claude Code")]);
+      stopped("conv_unread");
+      renderSidebar();
+
+      const row = screen.getByRole("link", { name: /conv_unread/ }).closest("li")!;
+      expect(within(row).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "unseen",
+      );
+    } finally {
+      readState.mockRestore();
+    }
+  });
+
+  it("shows starting instead of asleep on the bound session while a send wakes it", () => {
+    mockConversations([conv("conv_wake_asleep", "Claude Code")]);
+    stopped("conv_wake_asleep");
+    useChatStore.setState({ conversationId: "conv_wake_asleep", status: "streaming" });
+    renderSidebar();
+
+    const row = screen.getByRole("link", { name: /conv_wake_asleep/ }).closest("li")!;
+    expect(within(row).getByTestId("session-state-badge")).toHaveAttribute(
+      "data-state",
+      "starting",
+    );
+  });
+
+  describe("with Show > Updated", () => {
+    function seedShowUpdated() {
+      localStorage.setItem(
+        "omnigent:sidebar-view",
+        JSON.stringify({ grouping: "status", ordering: "created", show: ["updated"] }),
+      );
+    }
+    const updatedAt = () => Date.now() / 1000 - 120;
+
+    it("keeps the updated label and renders the moon immediately left of it", () => {
+      seedShowUpdated();
+      mockConversations([conv("conv_moon", "Codex", { updated_at: updatedAt() })]);
+      stopped("conv_moon");
+      renderGroupingSidebar();
+
+      const row = screen.getByText("conv_moon").closest("li")!;
+      const updated = within(row).getByTestId("session-row-updated");
+      expect(updated).toHaveTextContent("2m");
+      const badge = within(updated).getByTestId("session-state-badge");
+      expect(badge).toHaveAttribute("data-state", "asleep");
+      expect(updated.firstElementChild).toBe(badge);
+    });
+
+    it("shows the draft pencil, not the moon, with Show > Updated on", () => {
+      seedShowUpdated();
+      mockConversations([conv("conv_moon_draft", "Codex", { updated_at: updatedAt() })]);
+      stopped("conv_moon_draft");
+      setSessionDraft("conv_moon_draft", { text: "unsent", files: [] });
+      renderGroupingSidebar();
+
+      const row = screen.getByText("conv_moon_draft").closest("li")!;
+      expect(within(row).getByTestId("conversation-draft-indicator")).toBeInTheDocument();
+      expect(within(row).queryByTestId("session-state-badge")).toBeNull();
+    });
+
+    it("still replaces the label for other states such as running", () => {
+      seedShowUpdated();
+      mockConversations([
+        conv("conv_run2", "Codex", { status: "running", updated_at: updatedAt() }),
+      ]);
+      stopped("conv_run2");
+      renderGroupingSidebar();
+
+      const row = screen.getByText("conv_run2").closest("li")!;
+      expect(within(row).queryByTestId("session-row-updated")).toBeNull();
+      expect(within(row).getByTestId("session-state-badge")).toHaveAttribute(
+        "data-state",
+        "running",
+      );
+    });
   });
 });
 

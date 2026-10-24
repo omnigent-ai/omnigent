@@ -1,4 +1,4 @@
-import { AlertTriangleIcon, Loader2Icon, WifiOffIcon, XIcon } from "lucide-react";
+import { AlertTriangleIcon, Loader2Icon, MoonIcon, WifiOffIcon, XIcon } from "lucide-react";
 import { ConversationEmptyState } from "@/components/ai-elements/conversation";
 import { Message, MessageContent } from "@/components/ai-elements/message";
 import { ErrorBanner } from "@/components/blocks/StatusBlocks";
@@ -76,9 +76,15 @@ export function SandboxFailedIndicator({ status }: { status: SandboxStatus }) {
 export function ConnectionIndicator({
   liveness,
   onShowReconnectHelp,
+  composerReadOnly = false,
+  asleepConfirmed = true,
 }: {
   liveness: SessionLiveness;
   onShowReconnectHelp: () => void;
+  /** True when the composer cannot send, so a "next message restarts it" notice would mislead. */
+  composerReadOnly?: boolean;
+  /** False while the poll sample predates the last turn end, so a stale "asleep" must not show. */
+  asleepConfirmed?: boolean;
 }) {
   const terminalFirst = useTerminalFirst();
   const sandboxStatus = useChatStore((s) => s.sandboxStatus);
@@ -138,6 +144,36 @@ export function ConnectionIndicator({
     );
   }
 
+  // Idle-asleep: a quiet pre-send notice, shown whenever the chat surface with
+  // its composer is on screen (the terminal-first label alone does not hide
+  // it; the terminal view does). The next send flips liveness to `starting`
+  // ("Connecting…"). Same copy family as RunnerAsleepHint.
+  const terminalViewShown =
+    terminalFirst?.isTerminalFirst === true && terminalFirst.view === "terminal";
+  const showAsleepNotice =
+    !terminalViewShown &&
+    !composerReadOnly &&
+    ((liveness.kind === "runner_asleep" && asleepConfirmed) || liveness.kind === "host_asleep");
+  if (showAsleepNotice && (liveness.kind === "runner_asleep" || liveness.kind === "host_asleep")) {
+    return (
+      <div
+        data-testid="asleep-indicator"
+        role="status"
+        className={cn(
+          "mx-auto mb-4 flex w-full items-center justify-center gap-2 px-6 py-1.5 text-muted-foreground text-sm",
+          CHAT_COLUMN_WIDTH,
+        )}
+      >
+        <MoonIcon className="size-3.5 shrink-0" aria-hidden />
+        <span>
+          {liveness.kind === "runner_asleep"
+            ? "Agent is asleep — your next message will restart it."
+            : "Sandbox is asleep — your next message will start it."}
+        </span>
+      </div>
+    );
+  }
+
   // Terminal-first sessions: the Chat/Terminal switcher lives in the header
   // (ViewModeToggle) on every shell, iOS included — this band renders
   // nothing for them outside the unreachable states above.
@@ -163,9 +199,7 @@ export function ConnectionIndicator({
     );
   }
 
-  // `online`/`unknown` for a non-terminal-first session and
-  // `runner_asleep`/`host_asleep` for any session: status lives in the
-  // sidebar / the composer stays open, so render nothing here.
+  // `online`/`unknown` for a non-terminal-first session: nothing to show.
   return null;
 }
 
