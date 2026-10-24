@@ -1337,6 +1337,13 @@ def _codex_rejects_request_field(exc: CodexAppServerResponseError, field: str) -
     )
 
 
+def codex_rejects_method(exc: CodexAppServerResponseError, method: str) -> bool:
+    """Recognize a Codex app-server version that does not offer ``method``."""
+    return exc.code == -32601 or (
+        exc.code == -32600 and f"unknown variant `{method}`" in (exc.message or "")
+    )
+
+
 async def list_codex_model_options(
     client: CodexAppServerClient, *, include_hidden: bool = False
 ) -> list[_JsonObject]:
@@ -1784,9 +1791,7 @@ async def _read_codex_probe_default(client: CodexAppServerClient) -> str | None:
                 raise
             response = await client.request("config/read", {})
     except CodexAppServerResponseError as exc:
-        if exc.code not in {-32601, -32602} and not (
-            exc.code == -32600 and "unknown variant `config/read`" in (exc.message or "")
-        ):
+        if exc.code != -32602 and not codex_rejects_method(exc, "config/read"):
             raise
         _logger.info("Codex config/read unavailable; deferring to catalog default shaping")
         return None
