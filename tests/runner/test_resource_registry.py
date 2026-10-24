@@ -9,6 +9,7 @@ import os
 import shutil
 import sys
 import threading
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,8 @@ from unittest.mock import Mock
 import pytest
 
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
+from omnigent.harnesses.claude_native.bridge import bridge_dir_for_conversation_id
+from omnigent.harnesses.claude_native.mod_events import MOD_HEARTBEAT_MAX_AGE_S
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
@@ -36,6 +39,13 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
+from tests.harnesses.claude_native.mod_fixtures import (
+    append_event_record,
+    turn_complete_record,
+    turn_start_record,
+    write_mod_heartbeat,
+    write_server_state,
+)
 from tests.runner.helpers import make_test_terminal_instance
 
 
@@ -743,6 +753,9 @@ class _FakeStatusPoller:
         """Simulate the file reporting a new status."""
         self._on_status(status, blocked_on)
 
+    def note_pane_activity(self) -> None:
+        """The mod poller's pane-quiet bookkeeping; a no-op for this fake."""
+
 
 async def _observe_native_with_fake_poller(
     tmp_path: Path,
@@ -766,8 +779,15 @@ async def _observe_native_with_fake_poller(
         lambda _sid, status, _reason=None: statuses.append(status)
     )
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
-        del session_id, instance
+    def _fake_build(
+        *,
+        session_id: str,
+        instance: object,
+        on_status: object,
+        on_mod_status: object,
+        on_pane_status: object,
+    ) -> _FakeStatusPoller:
+        del session_id, instance, on_mod_status, on_pane_status
         poller = _FakeStatusPoller(on_status)
         pollers.append(poller)
         return poller
@@ -1039,6 +1059,94 @@ async def test_failed_hook_does_not_republish_stale_running_status(
     await asyncio.sleep(0)
     assert statuses == ["running"]
     assert not registry.session_turn_is_active(session_id)
+
+
+def _write_busy_status_file(status_file: Path, status: str, updated_at: int) -> None:
+    """Write a Claude status file and bump its mtime so the poller re-reads it."""
+    status_file.write_text(
+        json.dumps(
+            {
+                "pid": 123,
+                "sessionId": "claude-mod",
+                "kind": "interactive",
+                "status": status,
+                "statusUpdatedAt": updated_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+    bumped_ns = status_file.stat().st_mtime_ns + 1_000_000_000
+    os.utime(status_file, ns=(bumped_ns, bumped_ns))
+
+
+@pytest.mark.asyncio
+async def test_mod_turn_events_own_status_over_the_status_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A current mod heartbeat's turn events decide running and idle over the status file.
+
+    While the mod reports the turn open, the file's own idle is muted. The
+    mod's completion then settles the session.
+    """
+    session_id = "conv_mod_owns"
+    on_tick, statuses, _registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    _write_busy_status_file(status_file, "busy", 1000)
+    bridge = bridge_dir_for_conversation_id(session_id)
+    write_server_state(bridge, pid=77)
+    write_mod_heartbeat(bridge, server_pid=77, updated_at=time.time(), main_turn_id="t1")
+    append_event_record(bridge, turn_start_record("t1", at=time.time()))
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    _write_busy_status_file(status_file, "idle", 2000)
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    append_event_record(bridge, turn_complete_record("t1", at=time.time()))
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]  # idle waits out the grace period
+
+    async with asyncio.timeout(5):
+        while statuses[-1:] != ["idle"]:
+            on_tick()
+            await asyncio.sleep(0.05)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_stale_mod_heartbeat_hands_status_back_to_the_status_file(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Once the mod heartbeat goes stale, the status file decides again."""
+    session_id = "conv_mod_stale"
+    on_tick, statuses, _registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    _write_busy_status_file(status_file, "busy", 1000)
+    bridge = bridge_dir_for_conversation_id(session_id)
+    write_server_state(bridge, pid=77)
+    write_mod_heartbeat(bridge, server_pid=77, updated_at=time.time(), main_turn_id="t1")
+    append_event_record(bridge, turn_start_record("t1", at=time.time()))
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # The mod stops heartbeating while the file reports the turn finished.
+    write_mod_heartbeat(
+        bridge,
+        server_pid=77,
+        updated_at=time.time() - MOD_HEARTBEAT_MAX_AGE_S - 60,
+        main_turn_id="t1",
+    )
+    _write_busy_status_file(status_file, "idle", 2000)
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
 
 
 @pytest.mark.asyncio
@@ -1978,8 +2086,15 @@ async def test_blocked_reason_survives_pane_redraws(tmp_path: Path) -> None:
         lambda _sid, status, reason=None: edges.append((status, reason))
     )
 
-    def _fake_build(*, session_id: str, instance: object, on_status: object) -> _FakeStatusPoller:
-        del session_id, instance
+    def _fake_build(
+        *,
+        session_id: str,
+        instance: object,
+        on_status: object,
+        on_mod_status: object,
+        on_pane_status: object,
+    ) -> _FakeStatusPoller:
+        del session_id, instance, on_mod_status, on_pane_status
         poller = _FakeStatusPoller(on_status)
         pollers.append(poller)
         return poller

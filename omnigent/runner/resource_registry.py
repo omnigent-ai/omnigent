@@ -48,6 +48,7 @@ from omnigent.native.native_dispatch import resolve_hook_for_key
 from omnigent.server.feature_flags import Feature, resolve_feature_flags
 
 if TYPE_CHECKING:
+    from omnigent.harnesses.claude_native.mod_status import ModTurnStatusPoller
     from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
     from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
     from omnigent.inner.datamodel import OSEnvSpec, TerminalEnvSpec
@@ -513,7 +514,7 @@ class SessionResourceRegistry:
         self._published_session_status: dict[str, tuple[str, str | None]] = {}
         # Per-session pollers need re-arming after reconnects or forwarded
         # idle statuses because they keep their own edge/mtime baselines.
-        self._status_pollers: dict[str, SessionStatusPoller | ClaudeProgramStatusPoller] = {}
+        self._status_pollers: dict[str, ModTurnStatusPoller] = {}
         # Optional callback invoked on the event loop when a watched terminal
         # disappears unexpectedly. The callback receives the terminal's
         # lifecycle relationship so the runner can decide whether the owning
@@ -1471,15 +1472,15 @@ class SessionResourceRegistry:
         last_activity_emit: dict[str, float | None] = {"value": None}
 
         def _publish_status(
-            status: str, blocked_on: str | None = None, *, record_activity: bool = False
+            status: str,
+            blocked_on: str | None = None,
+            *,
+            record_activity: bool = False,
+            trace_source: str | None = None,
         ) -> None:
-            # Publish one running/idle edge: dedup against the last value,
-            # memo for exit classification, and hop to the loop (publishers
-            # are loop-only). Shared by the PTY edges and the claude-native
-            # structured-state poller so both go through the same dedup/memo. The
-            # dedup baseline lives on the registry, not this closure, so a
-            # forwarder's hook-derived edge resyncs it (see
-            # :meth:`note_external_session_status`).
+            # Shared dedup, exit memo, and loop hop for PTY, structured, and mod-turn edges.
+            # The dedup baseline lives on the registry, so a forwarder's hook-derived edge
+            # resyncs it (see :meth:`note_external_session_status`).
             if status_publisher is None:
                 return
             explicit_activity = record_activity and status in {"running", "waiting"}
@@ -1491,11 +1492,14 @@ class SessionResourceRegistry:
                 reader = getattr(instance, "program_status", None)
                 instance.lifecycle_trace.note_status(
                     status,
-                    "program_status"
-                    if record_activity and reader is not None and reader.status is not None
-                    else "claude_status_file"
-                    if record_activity
-                    else "pane_activity",
+                    trace_source
+                    or (
+                        "program_status"
+                        if record_activity and reader is not None and reader.status is not None
+                        else "claude_status_file"
+                        if record_activity
+                        else "pane_activity"
+                    ),
                 )
             # Pane repaints can be startup output, not a new agent turn.
             if not explicit_activity:
@@ -1507,8 +1511,8 @@ class SessionResourceRegistry:
             # activity badges and process-death detection.
             return status_poller is not None and status_poller.active
 
-        # Claude reports explicit state through OSC when opted in, with its
-        # sessions/<pid>.json file as fallback. Other roles retain pane inference.
+        # Mod turn events take precedence over Claude's explicit state (OSC when
+        # opted in, else its sessions/<pid>.json file). Other roles keep pane inference.
         status_poller = (
             self._build_claude_native_status_poller(
                 session_id=session_id,
@@ -1516,6 +1520,10 @@ class SessionResourceRegistry:
                 on_status=lambda status, blocked_on=None: _publish_status(
                     status, blocked_on, record_activity=True
                 ),
+                on_mod_status=lambda status, blocked_on=None: _publish_status(
+                    status, blocked_on, record_activity=True, trace_source="mod_turn_event"
+                ),
+                on_pane_status=lambda status, blocked_on=None: _publish_status(status, blocked_on),
             )
             if emit_status and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             else None
@@ -1575,6 +1583,8 @@ class SessionResourceRegistry:
         def _on_activity() -> None:
             with contextlib.suppress(Exception):
                 instance.lifecycle_trace.note_activity()
+            if status_poller is not None:
+                status_poller.note_pane_activity()
             # Runs on the watcher daemon thread; hop to the loop so the
             # loop-only publishers (queue.put_nowait) are touched safely.
             #
@@ -1695,12 +1705,20 @@ class SessionResourceRegistry:
         session_id: str,
         instance: TerminalInstance,
         on_status: Callable[[str, str | None], None],
-    ) -> SessionStatusPoller | ClaudeProgramStatusPoller:
-        """Prefer opted-in OSC reports, then Claude's PID/session file, then pane activity."""
+        on_mod_status: Callable[[str, str | None], None],
+        on_pane_status: Callable[[str, str | None], None],
+    ) -> ModTurnStatusPoller:
+        """Build the claude-native status chain.
+
+        Mod turn events come first. Below them sit the opted-in OSC report or
+        Claude's PID/session file, and the pane watcher handles the rest.
+        """
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_conversation_id,
+            bridge_dir_from_launch_args,
             read_claude_session_id,
         )
+        from omnigent.harnesses.claude_native.mod_status import ModTurnStatusPoller
         from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 
         bridge_dir = bridge_dir_for_conversation_id(session_id)
@@ -1716,19 +1734,37 @@ class SessionResourceRegistry:
                 return None
 
         reader = getattr(instance, "program_status", None)
-        fallback = SessionStatusPoller(
-            on_status=on_status,
-            pane_pid_getter=(
-                (lambda: reader.child_pid) if reader is not None else instance.pane_pid_sync
-            ),
-            session_id_getter=_session_id_getter,
-            omnigent_session_id=session_id,
-        )
-        if reader is not None:
-            from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
 
-            return ClaudeProgramStatusPoller(reader, fallback, on_status)
-        return fallback
+        def _build_structured(
+            on_structured_status: Callable[[str, str | None], None],
+        ) -> SessionStatusPoller | ClaudeProgramStatusPoller:
+            fallback = SessionStatusPoller(
+                on_status=on_structured_status,
+                pane_pid_getter=(
+                    (lambda: reader.child_pid) if reader is not None else instance.pane_pid_sync
+                ),
+                session_id_getter=_session_id_getter,
+                omnigent_session_id=session_id,
+            )
+            if reader is not None:
+                from omnigent.harnesses.claude_native.program_status import (
+                    ClaudeProgramStatusPoller,
+                )
+
+                return ClaudeProgramStatusPoller(reader, fallback, on_structured_status)
+            return fallback
+
+        return ModTurnStatusPoller(
+            # Same resolution as the billing-notice acknowledgement: the launch
+            # bridge is authoritative when the invocation names one.
+            bridge_dir=bridge_dir_from_launch_args(instance.args) or bridge_dir,
+            build_structured=_build_structured,
+            on_structured_status=on_status,
+            on_mod_status=on_mod_status,
+            on_pane_status=on_pane_status,
+            pane_quiet_s=_CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS,
+            session_id=session_id,
+        )
 
     async def _handle_terminal_exit(
         self,
