@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { toast } from "sonner";
 
-import { isArcaHost, readArcaHostId } from "@/lib/arcaHost";
+import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import { connectArcaHost, controlHost, getHostIdentity, isElectronShell } from "@/lib/nativeBridge";
 
 /** Reconnect this desktop's host directly; use the dialog for fallback and retry. */
@@ -64,6 +64,16 @@ export function useSessionReconnect({
         if (!result.canceled && !result.shownInConsole) {
           setError(result.error ?? "Couldn't reconnect Arca. Try again.");
         }
+        setDialogOpen(true);
+        return;
+      }
+      if (result.identity) writeArcaHostId(result.identity.hostId);
+      // The connect starts whichever Arca the user has now, and a session can
+      // still be bound to an older Arca host that the name match recognized.
+      if (result.identity && result.identity.hostId !== hostId) {
+        setError(
+          "Arca is online as a different host, so this session's host is still offline. Use Switch host to move the session.",
+        );
         setDialogOpen(true);
         return;
       }

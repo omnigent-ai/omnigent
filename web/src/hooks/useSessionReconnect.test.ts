@@ -2,7 +2,7 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 
-import { writeArcaHostId } from "@/lib/arcaHost";
+import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import { connectArcaHost, controlHost, getHostIdentity, isElectronShell } from "@/lib/nativeBridge";
 import type { ArcaConnectResult, HostActionResult, HostIdentity } from "@/lib/nativeBridge";
 import { useSessionReconnect } from "./useSessionReconnect";
@@ -193,6 +193,52 @@ describe("useSessionReconnect", () => {
       expect(getHostIdentity).not.toHaveBeenCalled();
       expect(controlHost).not.toHaveBeenCalled();
       expect(toast.success).toHaveBeenCalledWith("Arca is back online.");
+    },
+  );
+
+  it("reports success and remembers the host when Arca comes back as the session's host", async () => {
+    writeArcaHostId(null);
+    vi.mocked(connectArcaHost).mockResolvedValue({
+      ok: true,
+      identity: { serverUrl: "https://example.test", hostId: "arca-host" },
+    });
+    const { result } = renderHook(() =>
+      useSessionReconnect({ ...localSession, hostId: "arca-host", hostName: "e2e's arca" }),
+    );
+
+    await act(async () => {
+      await result.current.reconnect();
+    });
+
+    expect(result.current.dialogOpen).toBe(false);
+    expect(toast.success).toHaveBeenCalledExactlyOnceWith("Arca is back online.");
+    expect(readArcaHostId()).toBe("arca-host");
+  });
+
+  it.each([false, true])(
+    "keeps the dialog open when Arca comes back as a different host (already running: %s)",
+    async (alreadyRunning) => {
+      writeArcaHostId("previous-arca-host");
+      vi.mocked(connectArcaHost).mockResolvedValue({
+        ok: true,
+        alreadyRunning,
+        identity: { serverUrl: "https://example.test", hostId: "current-arca-host" },
+      });
+      const { result } = renderHook(() =>
+        useSessionReconnect({ ...localSession, hostId: "arca-host", hostName: "e2e's arca" }),
+      );
+
+      await act(async () => {
+        await result.current.reconnect();
+      });
+
+      expect(connectArcaHost).toHaveBeenCalledOnce();
+      expect(result.current.dialogOpen).toBe(true);
+      expect(result.current.arcaReconnect?.error).toMatch(/different host.*Switch host/);
+      expect(result.current.arcaReconnect?.reconnecting).toBe(false);
+      expect(toast.success).not.toHaveBeenCalled();
+      expect(toast.dismiss).toHaveBeenCalledWith("progress");
+      expect(readArcaHostId()).toBe("current-arca-host");
     },
   );
 
