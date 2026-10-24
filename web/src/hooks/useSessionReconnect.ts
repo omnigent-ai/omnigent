@@ -68,9 +68,7 @@ export function useSessionReconnect({
         return;
       }
       setDialogOpen(false);
-      toast.success(
-        result.alreadyRunning ? "Arca host is connected." : "Arca reconnect requested.",
-      );
+      toast.success(result.alreadyRunning ? "Arca is already online." : "Arca is back online.");
     } finally {
       if (inFlight.current === operation) {
         if (operation.progressToast !== undefined) toast.dismiss(operation.progressToast);
@@ -123,7 +121,7 @@ export function useSessionReconnect({
         return;
       }
       setDialogOpen(false);
-      toast.success("Host start requested.");
+      toast.success("This machine is back online.");
     } finally {
       if (inFlight.current === operation) {
         if (operation.progressToast !== undefined) toast.dismiss(operation.progressToast);

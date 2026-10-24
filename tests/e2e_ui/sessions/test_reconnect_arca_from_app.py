@@ -204,7 +204,7 @@ def test_desktop_reconnects_arca_from_current_chat(
     page.get_by_role("menuitem", name="Reconnect host", exact=True).click()
     expect(page.get_by_text("Reconnecting Arca…", exact=True)).to_be_visible()
     assert page.evaluate("window.__connectArcaCalls") == 1
-    expect(page.get_by_text("Arca reconnect requested.", exact=True)).not_to_be_visible()
+    expect(page.get_by_text("Arca is back online.", exact=True)).not_to_be_visible()
     page.wait_for_timeout(1500)
 
     host_state["online"] = True
@@ -212,7 +212,7 @@ def test_desktop_reconnects_arca_from_current_chat(
     expect(host_picker).to_have_attribute(
         "aria-label", re.compile(rf"{re.escape(host_name)}, online$")
     )
-    expect(page.get_by_text("Arca reconnect requested.", exact=True)).to_be_visible()
+    expect(page.get_by_text("Arca is back online.", exact=True)).to_be_visible()
     assert page.evaluate("window.__reconnectDialogShown") is False
     assert page.evaluate("window.__connectArcaCalls") == 1
     page.wait_for_timeout(1500)
@@ -251,5 +251,5 @@ def test_desktop_arca_reconnect_failure_offers_retry(
     page.evaluate("window.__finishArcaReconnect({ ok: true })")
     expect(dialog).not_to_be_visible()
     expect(host_picker).to_have_attribute("aria-label", re.compile(r"e2e's arca, online$"))
-    expect(page.get_by_text("Arca reconnect requested.", exact=True)).to_be_visible()
+    expect(page.get_by_text("Arca is back online.", exact=True)).to_be_visible()
     page.wait_for_timeout(1500)

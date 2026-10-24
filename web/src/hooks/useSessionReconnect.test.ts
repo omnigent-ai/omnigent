@@ -62,7 +62,7 @@ describe("useSessionReconnect", () => {
     });
     expect(result.current.dialogOpen).toBe(false);
     expect(result.current.localReconnect?.reconnecting).toBe(false);
-    expect(toast.success).toHaveBeenCalledWith("Host start requested.");
+    expect(toast.success).toHaveBeenCalledWith("This machine is back online.");
     expect(toast.dismiss).toHaveBeenCalledWith("progress");
   });
 
@@ -132,8 +132,23 @@ describe("useSessionReconnect", () => {
     });
     expect(result.current.dialogOpen).toBe(false);
     expect(result.current.arcaReconnect?.reconnecting).toBe(false);
-    expect(toast.success).toHaveBeenCalledWith("Arca reconnect requested.");
+    expect(toast.success).toHaveBeenCalledWith("Arca is back online.");
     expect(toast.dismiss).toHaveBeenCalledWith("progress");
+  });
+
+  it("reports an Arca host that was already running as already online", async () => {
+    writeArcaHostId("arca-host");
+    vi.mocked(connectArcaHost).mockResolvedValue({ ok: true, alreadyRunning: true });
+    const { result } = renderHook(() =>
+      useSessionReconnect({ ...localSession, hostId: "arca-host" }),
+    );
+
+    await act(async () => {
+      await result.current.reconnect();
+    });
+
+    expect(result.current.dialogOpen).toBe(false);
+    expect(toast.success).toHaveBeenCalledExactlyOnceWith("Arca is already online.");
   });
 
   it("ignores repeated reconnect actions while Arca starts", async () => {
@@ -177,7 +192,7 @@ describe("useSessionReconnect", () => {
       expect(result.current.dialogOpen).toBe(false);
       expect(getHostIdentity).not.toHaveBeenCalled();
       expect(controlHost).not.toHaveBeenCalled();
-      expect(toast.success).toHaveBeenCalledWith("Arca reconnect requested.");
+      expect(toast.success).toHaveBeenCalledWith("Arca is back online.");
     },
   );
 
