@@ -8250,6 +8250,18 @@
             "description": "Per-session subagent-routing switch, two-state: `\"on\"` routes subagent spawns, and `\"off\"` or `None` (unset) both leave them unrouted \u2014 the in-session \"Subagent routing\" row renders either as \"Default\". `None` on a row created before this became explicit inherits nothing. Stamped `\"on\"` at create for Smart Routing sessions; also set via `PATCH /v1/sessions/{id}`.",
             "title": "Subagent Routing Override"
           },
+          "task_summary": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "For sub-agent sessions, the generated task-derived label the Agents rail leads with, e.g. `\"Investigate auth token refresh\"`. `None` until the background generator writes it, and for top-level sessions.",
+            "title": "Task Summary"
+          },
           "terminal_launch_args": {
             "anyOf": [
               {

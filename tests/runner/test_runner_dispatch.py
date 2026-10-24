@@ -6802,6 +6802,7 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                         "title": "researcher:auth",
                         "tool": "researcher",
                         "session_name": "auth",
+                        "task_summary": "Audit the auth flow",
                     },
                     {
                         "id": "c2",
@@ -6841,13 +6842,22 @@ async def test_session_list_maps_children_and_skips_closed() -> None:
                 "sys_session_list", "{}", conversation_id="conv_parent", server_client=client
             )
         )
-    # c3 (explicitly closed despite its mixed-type label map), c5
-    # (legacy title tombstone), and c4
-    # (no colon) dropped; the ui:-added child surfaces under its bound
-    # agent + label.
+    # c3 (explicitly closed despite its mixed-type label map), c5 (legacy title
+    # tombstone) and c4 (no colon) dropped; the ui:-added child surfaces under
+    # its bound agent + label, and task_summary rides along from the child row.
     assert out["sub_agents"] == [
-        {"agent": "researcher", "title": "auth", "conversation_id": "c1"},
-        {"agent": "claude-native-ui", "title": "1", "conversation_id": "c2"},
+        {
+            "agent": "researcher",
+            "title": "auth",
+            "conversation_id": "c1",
+            "task_summary": "Audit the auth flow",
+        },
+        {
+            "agent": "claude-native-ui",
+            "title": "1",
+            "conversation_id": "c2",
+            "task_summary": None,
+        },
     ]
 
 
@@ -6902,8 +6912,13 @@ async def test_session_list_adds_main_and_siblings_for_child_caller() -> None:
     # No own children; gains main (its parent) + the sibling, with itself
     # excluded from the sibling list.
     assert out["sub_agents"] == [
-        {"agent": "main", "title": None, "conversation_id": "conv_main"},
-        {"agent": "researcher", "title": "auth", "conversation_id": "conv_sib"},
+        {"agent": "main", "title": None, "conversation_id": "conv_main", "task_summary": None},
+        {
+            "agent": "researcher",
+            "title": "auth",
+            "conversation_id": "conv_sib",
+            "task_summary": None,
+        },
     ]
 
 
@@ -8961,6 +8976,7 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
                     "reasoning_effort": "high",
                     "parent_session_id": "conv_parent",
                     "sub_agent_name": "researcher",
+                    "task_summary": "Investigate auth token refresh",
                     "llm_model": "anthropic/claude-sonnet-4-6",
                     "model_override": "claude-opus-4-8",
                     "workspace": "/repo",
@@ -9005,6 +9021,9 @@ async def test_sys_session_get_info_projects_metadata_and_runner_connectivity() 
         "cursor-native": False,
     }
     assert info["parent_session_id"] == "conv_parent"
+    # The generated label the Agents rail shows for this sub-agent, so
+    # the orchestrator can name it the way the panel does.
+    assert info["task_summary"] == "Investigate auth token refresh"
     # Effective model: the per-session override wins over the spec
     # default. "anthropic/claude-sonnet-4-6" here would mean the
     # override was ignored.

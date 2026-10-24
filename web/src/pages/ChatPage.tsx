@@ -260,6 +260,7 @@ import { ResumeWithDirectoryDialog } from "@/shell/ResumeWithDirectoryDialog";
 import { useSessionReconnect } from "@/hooks/useSessionReconnect";
 import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
+import { titleHandle, titleWithoutSentinel } from "@/shell/subagentLabel";
 import { effortLevelsForFamily, supportsEffortControl } from "@/lib/sessionCapabilities";
 import {
   CLAUDE_NATIVE_SWITCHABLE_PERMISSION_MODES,
@@ -2190,14 +2191,14 @@ function ComposerStatusLine() {
 
 /**
  * Resolve the sub-agent instance label for the composer's "Chatting with
- * sub-agent …" tray, mirroring the Agents rail's child-row label
- * (``childPrimaryLabel`` in ``SubagentsPanel``).
+ * sub-agent …" tray: the orchestrator-chosen handle (``titleHandle``), which
+ * the Agents rail's child-row label (``childPrimaryLabel``) also ends with
+ * after any generated task summary.
  *
  * The spawn tool seeds a sub-agent's title as ``"{tool}:{name}"`` (e.g.
  * ``"claude_code:check-account-eligibility"``), so the human instance name
- * is the suffix after the first ``":"``. User-added rows carry a reserved
- * ``"ui:<agent>:<name>"`` sentinel; the ``"ui:"`` marker is stripped first
- * so the suffix is still the human name. Falls back to the bare title,
+ * is the suffix after the first ``":"``; user-added rows carry a reserved
+ * ``"ui:"`` sentinel that is stripped first. Falls back to the bare title,
  * then the sub-agent type, then the bound agent name.
  *
  * @param session - The active session snapshot, or ``null`` while it loads
@@ -2219,18 +2220,14 @@ export function subAgentComposerLabel(
   // show the friendly nickname label ("Side chat") instead of that UUID suffix.
   const codexLabel = codexNativeSubagentLabel(session.labels);
   if (codexLabel) return codexLabel;
-  // Strip the user-added "ui:" sentinel so its "agent:name" suffix reads
-  // like an LLM-spawned title.
-  let title = session.title ?? null;
-  if (title?.startsWith("ui:")) title = title.slice(3);
-  if (title?.includes(":")) {
-    const suffix = title.split(":").slice(1).join(":");
-    if (suffix) return suffix;
-  }
+  const handle = titleHandle(session.title);
+  if (handle) return handle;
   // Last-resort display string: a sub-agent session always has a seeded
   // title in practice, so the final "sub-agent" only guards a degenerate
   // all-null snapshot (the tray still needs something to render).
-  return title ?? session.subAgentName ?? session.agentName ?? "sub-agent";
+  return (
+    titleWithoutSentinel(session.title) ?? session.subAgentName ?? session.agentName ?? "sub-agent"
+  );
 }
 
 /**
