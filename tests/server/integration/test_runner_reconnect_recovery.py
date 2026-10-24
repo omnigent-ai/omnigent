@@ -402,6 +402,192 @@ async def test_reconnect_skips_root_rebound_before_initialization(
             sessions._session_status_cache.pop(sid, None)
 
 
+@pytest.mark.parametrize("settles", [True, False])
+async def test_reconnect_rechecks_a_fresh_binding_the_refresh_has_not_seen(
+    app: FastAPI,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    settles: bool,
+) -> None:
+    import omnigent.server.app as server_app
+
+    monkeypatch.setattr(server_app, "_RECONNECT_BINDING_RECHECK_INTERVAL_S", 0.01)
+    monkeypatch.setattr(
+        server_app, "_RECONNECT_BINDING_RECHECK_DEADLINE_S", budget(2) if settles else 0.05
+    )
+    lagging, healthy = [_create_session(app, agent.id) for _ in range(2)]
+    store = app.state.runner_router._conversation_store
+    get_many = store.get_conversations
+    stale_reads = 0
+
+    def read_bindings(ids: list[str]) -> dict[str, Conversation]:
+        nonlocal stale_reads
+        rows = get_many(ids)
+        # A cached read still serves the runner this session was bound to before.
+        if lagging.id in rows and (not settles or stale_reads < 2):
+            stale_reads += 1
+            rows[lagging.id] = replace(rows[lagging.id], runner_id="previous-runner")
+        return rows
+
+    monkeypatch.setattr(store, "get_conversations", read_bindings)
+    requested: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    try:
+        async with _recover(app, monkeypatch, respond) as (relays, finished):
+            await asyncio.wait_for(finished.wait(), budget(5))
+            if settles:
+                assert stale_reads == 2
+                assert sorted(requested) == sorted([healthy.id, lagging.id])
+                assert lagging.id in relays
+                assert sessions._session_status_cache[lagging.id] == "idle"
+            else:
+                assert requested == [healthy.id]
+                assert lagging.id not in relays
+                assert sessions._session_status_cache[lagging.id] == "failed"
+            gave_up = [
+                record
+                for record in caplog.records
+                if record.levelno == logging.WARNING
+                and "still reads as bound elsewhere" in record.getMessage()
+            ]
+            assert bool(gave_up) is not settles
+    finally:
+        sessions._session_status_cache.pop(lagging.id, None)
+
+
+def _serve_stale_bindings(
+    monkeypatch: pytest.MonkeyPatch,
+    app: FastAPI,
+    lagging_id: str,
+    *,
+    stale_reads: int,
+    stale_runner: str = "previous-runner",
+    failing_read: int | None = None,
+) -> list[int]:
+    """Serve *stale_runner* for the session's first *stale_reads* refreshes; count reads."""
+    store = app.state.runner_router._conversation_store
+    get_many = store.get_conversations
+    reads = [0]
+
+    def read_bindings(ids: list[str]) -> dict[str, Conversation]:
+        if lagging_id in ids:
+            reads[0] += 1
+            if reads[0] == failing_read:
+                raise RuntimeError("binding store unavailable")
+        rows = get_many(ids)
+        if lagging_id in rows and reads[0] <= stale_reads:
+            rows[lagging_id] = replace(rows[lagging_id], runner_id=stale_runner)
+        return rows
+
+    monkeypatch.setattr(store, "get_conversations", read_bindings)
+    return reads
+
+
+async def test_reconnect_recovers_the_tree_of_an_idle_root_that_settles_late(
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A late-settled idle root is classified like the rest, so its interrupted child recovers."""
+    import omnigent.server.app as server_app
+
+    monkeypatch.setattr(server_app, "_RECONNECT_BINDING_RECHECK_INTERVAL_S", 0.01)
+    monkeypatch.setattr(server_app, "_RECONNECT_BINDING_RECHECK_DEADLINE_S", budget(2))
+    store = app.state.runner_router._conversation_store
+    root = store.create_conversation(agent_id=agent.id, runner_id=_RUNNER_ID)
+    store.set_session_live_status(root.id, "idle")
+    sessions._session_status_cache[root.id] = "idle"
+    child = store.create_conversation(
+        agent_id=agent.id,
+        runner_id="offline-runner",
+        kind="sub_agent",
+        parent_conversation_id=root.id,
+    )
+    store.set_session_live_status(child.id, "running")
+    _serve_stale_bindings(monkeypatch, app, root.id, stale_reads=2)
+    requested: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201, json={})
+
+    try:
+        async with _recover(app, monkeypatch, respond) as (relays, finished):
+            await asyncio.wait_for(finished.wait(), budget(5))
+            assert root.id in relays
+            assert requested[:1] == [root.id]
+            assert child.id in requested
+    finally:
+        for sid in (root.id, child.id):
+            sessions._session_status_cache.pop(sid, None)
+
+
+async def test_reconnect_recheck_outlasts_a_failed_binding_read(
+    app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One failed recheck read costs a round; the binding still settles on the next one."""
+    import omnigent.server.app as server_app
+
+    monkeypatch.setattr(server_app, "_RECONNECT_BINDING_RECHECK_INTERVAL_S", 0.01)
+    monkeypatch.setattr(server_app, "_RECONNECT_BINDING_RECHECK_DEADLINE_S", budget(2))
+    lagging = _create_session(app, agent.id)
+    reads = _serve_stale_bindings(monkeypatch, app, lagging.id, stale_reads=1, failing_read=2)
+    requested: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    try:
+        async with _recover(app, monkeypatch, respond) as (relays, finished):
+            await asyncio.wait_for(finished.wait(), budget(5))
+            assert reads[0] == 3
+            assert requested == [lagging.id]
+            assert lagging.id in relays
+    finally:
+        sessions._session_status_cache.pop(lagging.id, None)
+
+
+async def test_reconnect_recheck_drops_a_session_bound_to_an_online_runner(
+    app: FastAPI,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A row naming another runner that is online has really moved, so nothing waits for it."""
+    import omnigent.server.app as server_app
+
+    monkeypatch.setattr(server_app, "_RECONNECT_BINDING_RECHECK_INTERVAL_S", 0.01)
+    monkeypatch.setattr(server_app, "_RECONNECT_BINDING_RECHECK_DEADLINE_S", budget(30))
+    moved = _create_session(app, agent.id)
+    reads = _serve_stale_bindings(
+        monkeypatch, app, moved.id, stale_reads=1000, stale_runner="destination-runner"
+    )
+    router = app.state.runner_router
+    is_online = router.runner_is_online
+    monkeypatch.setattr(
+        router, "runner_is_online", lambda rid: rid == "destination-runner" or is_online(rid)
+    )
+    requested: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201)
+
+    try:
+        async with _recover(app, monkeypatch, respond) as (relays, finished):
+            await asyncio.wait_for(finished.wait(), budget(5))
+            assert reads[0] == 2
+            assert requested == []
+            assert moved.id not in relays
+            assert not any("bound elsewhere" in r.getMessage() for r in caplog.records)
+    finally:
+        sessions._session_status_cache.pop(moved.id, None)
+
+
 async def test_reconnecting_trees_share_store_budget_without_waiting_for_initialization(
     app: FastAPI, agent: Agent, monkeypatch: pytest.MonkeyPatch
 ) -> None:
