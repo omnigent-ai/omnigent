@@ -209,6 +209,7 @@ map an area, remove it here in the same change.
   `omnigent start`, `omnigent stop`,
   `omnigent server`, `omnigent attach`, `omnigent resume`, `omnigent session`,
   `omnigent import`
+- Verified speculative replicas: `omnigent speculate`
 - Bundled agents and the Copilot harness: `omnigent polly`, `omnigent debby`,
   `omnigent copilot`
 - Installing reusable agents: `omnigent agent`
