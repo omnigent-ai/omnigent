@@ -254,6 +254,39 @@ def test_login_profile_handles_ctrl_c(monkeypatch: pytest.MonkeyPatch) -> None:
     assert "cancelled oss" in out.getvalue()
 
 
+def test_login_profile_port_conflict_skips_login(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A reported port conflict prints the message, returns False, and never logs in."""
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", _run_returning(0, calls))
+    monkeypatch.setattr(
+        db_cfg_mod,
+        "databricks_login_port_conflict",
+        lambda _bin: "Port 8020 is busy [x]; upgrade.",
+    )
+    console, out = _console()
+
+    assert _login_profile(_CLI, _OSS, console) is False
+
+    assert calls == []
+    assert "Port 8020 is busy [x]; upgrade." in out.getvalue()
+
+
+def test_login_profile_no_conflict_proceeds(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Without a conflict the login runs as usual."""
+    from omnigent.onboarding import databricks_config as db_cfg_mod
+
+    calls: list[list[str]] = []
+    monkeypatch.setattr(subprocess, "run", _run_returning(0, calls))
+    monkeypatch.setattr(setup_mod.time, "sleep", lambda _s: None)
+    monkeypatch.setattr(db_cfg_mod, "databricks_login_port_conflict", lambda _bin: None)
+    console, _out = _console()
+
+    assert _login_profile(_CLI, _OSS, console) is True
+    assert len(calls) == 1
+
+
 # ── silent aliasing ──────────────────────────────────────────
 
 
