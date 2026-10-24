@@ -4,7 +4,7 @@
 
 import { ChevronRightIcon, CircleSlashIcon, Loader2Icon, XCircleIcon } from "lucide-react";
 import type { CSSProperties, ReactNode } from "react";
-import { useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import {
   CodeBlockActions,
   type CodeColorScheme,
@@ -12,6 +12,7 @@ import {
   CodeBlockContainer,
   CodeBlockContent,
 } from "@/components/ai-elements/code-block";
+import { useScopedConversationId } from "@/components/chat/conversationScope";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
 import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Badge } from "@/components/ui/badge";
@@ -44,6 +45,7 @@ import {
 } from "@/lib/toolValue";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
+import { useChatStore } from "@/store/chatStore";
 import {
   DIFF_TONE_CLASS,
   CodePanel,
@@ -120,7 +122,16 @@ interface ToolCardProps {
   startedAt?: number | null;
   /** Completed runtime in seconds. Undefined when historical data lacks timing. */
   duration?: number;
+  /** Persisted result item backing `output`, when there is one. */
+  resultItemId?: string;
+  /**
+   * Stored output length when `output` is only the preview a lean history
+   * page returned. Expanding the row fetches the result in full.
+   */
+  truncatedOutputLength?: number;
 }
+
+type OutputLoadState = "idle" | "loading" | "failed";
 
 export function ToolCard({
   name,
@@ -130,6 +141,8 @@ export function ToolCard({
   state,
   startedAt,
   duration,
+  resultItemId,
+  truncatedOutputLength,
 }: ToolCardProps) {
   const view = toolViewFor(name);
   const call = useMemo<ToolCall>(
@@ -153,8 +166,29 @@ export function ToolCard({
       : (resolveChatFilePath(title.filePath, root, home)?.path ?? null);
   const onBodyClick = openFile && linkPath ? () => openFile(linkPath) : undefined;
 
+  // A lean history page carries only the head of a long result; the rest is
+  // fetched once the reader opens the row, and the store swaps it in.
+  const isOutputPreview = truncatedOutputLength !== undefined && resultItemId !== undefined;
+  const conversationId = useScopedConversationId();
+  const loadToolOutput = useChatStore((s) => s.loadToolOutput);
+  const [outputLoad, setOutputLoad] = useState<OutputLoadState>("idle");
+  const loadFullOutput = useCallback(() => {
+    if (resultItemId === undefined) return;
+    setOutputLoad("loading");
+    loadToolOutput(resultItemId, conversationId ?? undefined).then(
+      () => setOutputLoad("idle"),
+      () => setOutputLoad("failed"),
+    );
+  }, [conversationId, loadToolOutput, resultItemId]);
+  const [open, setOpen] = useState(false);
+  // Also covers a row that is already open when a reconnect swaps a loaded
+  // result back to its preview. The store shares one request per item.
+  useEffect(() => {
+    if (open && isOutputPreview) loadFullOutput();
+  }, [open, isOutputPreview, loadFullOutput]);
+
   return (
-    <Collapsible defaultOpen={false} className="group not-prose w-full">
+    <Collapsible defaultOpen={false} onOpenChange={setOpen} className="group not-prose w-full">
       <ToolTriggerRow
         title={title}
         displayPath={linkPath}
@@ -168,8 +202,58 @@ export function ToolCard({
       {/* The whole body, code panels included, sits on the Interface font's caption step. */}
       <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 text-sm [&_code]:text-sm [&_pre]:text-sm data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
         <DefaultToolBody call={call} duration={displayDuration} view={view} />
+        {isOutputPreview && output !== null && (
+          <OutputPreviewNotice
+            shownChars={output.length}
+            totalChars={truncatedOutputLength}
+            loadState={outputLoad}
+            onRetry={loadFullOutput}
+          />
+        )}
       </CollapsibleContent>
     </Collapsible>
+  );
+}
+
+/** Footer under a lean page's output head while the full result loads. */
+function OutputPreviewNotice({
+  shownChars,
+  totalChars,
+  loadState,
+  onRetry,
+}: {
+  shownChars: number;
+  totalChars: number;
+  loadState: OutputLoadState;
+  onRetry: () => void;
+}) {
+  const shown = `Showing the first ${shownChars.toLocaleString()} of ${totalChars.toLocaleString()} characters`;
+  return (
+    <div
+      role="status"
+      className="flex flex-col gap-2 rounded-md border bg-muted/30 px-3 py-2 text-muted-foreground text-sm sm:flex-row sm:items-center sm:justify-between"
+    >
+      {loadState === "failed" ? (
+        <>
+          <span className="min-w-0">{shown}. The full output failed to load.</span>
+          <Button
+            className="w-fit"
+            onClick={onRetry}
+            size="xs"
+            type="button"
+            variant="outline"
+            componentId="diagnostics.tool.retry_full_output"
+          >
+            Retry
+          </Button>
+        </>
+      ) : (
+        <span className="flex min-w-0 items-center gap-2">
+          <Loader2Icon className="size-3.5 shrink-0 animate-spin" />
+          {shown}; loading the full output…
+        </span>
+      )}
+    </div>
   );
 }
 
@@ -430,6 +514,8 @@ export function ToolGroupSummary({ tools }: { tools: RenderItem[] }) {
                 state={item.state}
                 startedAt={item.startedAt}
                 duration={item.duration}
+                resultItemId={item.resultItemId}
+                truncatedOutputLength={item.truncatedOutputLength}
               />
             );
           }

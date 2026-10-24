@@ -540,6 +540,26 @@ describe("itemsToBlocks — tool calls", () => {
     expect(result.output).toBe("12:00:00 UTC");
   });
 
+  it("carries a lean page's stored output length onto the result block", () => {
+    const items: ConversationItem[] = [
+      functionCall("resp_1", "c1", "Read", { file_path: "/a" }),
+      {
+        ...functionCallOutput("resp_1", "c1", "head of the file"),
+        output_truncated: true,
+        output_length: 9000,
+      },
+      functionCall("resp_1", "c2", "Read", { file_path: "/b" }),
+      functionCallOutput("resp_1", "c2", "whole file"),
+    ];
+    const results = itemsToBlocks(items).filter(
+      (b): b is ToolResultBlock => b.type === "tool_result",
+    );
+    expect(results[0]).toMatchObject({ output: "head of the file", truncatedOutputLength: 9000 });
+    // A complete result carries no marker at all, so nothing downstream
+    // mistakes it for a preview.
+    expect(results[1]).not.toHaveProperty("truncatedOutputLength");
+  });
+
   it("multiple tool calls in one response_id stay flat (no bubble boundary)", () => {
     const items: ConversationItem[] = [
       userMessage("resp_1", "Read three files"),
@@ -648,6 +668,26 @@ describe("itemsToBlocks — answered question and plan cards", () => {
     expect(card.response?.content).toEqual({
       "Which library should we use?": "whatever you think",
     });
+  });
+
+  it("leaves a question whose answer is only a lean-page preview as a plain tool row", () => {
+    // A cut-off result could name the wrong choice; the row stays until the
+    // full output is fetched, rather than a card built from a prefix.
+    const answered = functionCallOutput(
+      "resp_1",
+      "c1",
+      'Your questions have been answered: "Which library should we use?"="date-fns", ',
+    );
+    const items: ConversationItem[] = [
+      userMessage("resp_1", "Pick for me"),
+      functionCall("resp_1", "c1", "AskUserQuestion", QUESTIONS, "fc_c1"),
+      { ...answered, output_truncated: true, output_length: 180 },
+    ];
+    expect(itemsToBlocks(items).map((b) => b.type)).toEqual([
+      "user_message",
+      "tool_group",
+      "tool_result",
+    ]);
   });
 
   it("leaves an unanswered question as a plain tool row", () => {

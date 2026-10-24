@@ -273,6 +273,8 @@ export interface ToolResultBlock {
   callId: string;
   agentName: string;
   output: string;
+  /** Stored output length when `output` is only the preview a lean history page returned. */
+  truncatedOutputLength?: number;
 }
 
 /** A provider-native tool output (web_search, mcp, etc.). */

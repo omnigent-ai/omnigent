@@ -58,7 +58,12 @@ import { clearAskUserQuestionDraft } from "@/lib/askUserQuestionDrafts";
 import { LIVE_ITEM_PREFIX, PENDING_FILE_PREFIX, structuredErrorFields } from "@/lib/blocks";
 import { BlockStream } from "@/lib/blockStream";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
-import { isMessageItem, type ConversationItem, type MessageItem } from "@/lib/conversationItems";
+import {
+  isFunctionCallOutputItem,
+  isMessageItem,
+  type ConversationItem,
+  type MessageItem,
+} from "@/lib/conversationItems";
 import { buildBubbles } from "@/lib/renderItems";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import {
@@ -75,6 +80,7 @@ import {
   createSession,
   getSessionSlim,
   getSessionUsage,
+  fetchSessionItem,
   fetchSessionItemsPage,
   HOST_OFFLINE_CODE,
   INITIAL_WINDOW_ITEMS,
@@ -1440,6 +1446,13 @@ export interface ChatActions {
    * or there is no active conversation / oldest-item cursor yet.
    */
   loadMoreHistory: (sessionId?: string) => Promise<void>;
+  /**
+   * Fetch a lean history page's tool result in full and swap it into
+   * `blocks`. `itemId` is the result item (`resultItemId` on the tool's
+   * render item). Concurrent calls for one item share a single request;
+   * a result already loaded is a no-op.
+   */
+  loadToolOutput: (itemId: string, sessionId?: string) => Promise<void>;
   /** Flash a bubble briefly; rapid calls reschedule so the latest target wins. */
   flashUserMessage: (itemId: string) => void;
   /** Queue an "@"-mention chip into the active composer from outside it. */
@@ -3923,7 +3936,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       (setterForState(conversationId)?.historyGeneration ?? historyGeneration) !==
         historyGeneration;
     try {
-      const { items, hasMore } = await fetchSessionItemsPage(conversationId, {
+      const { items, hasMore } = await fetchHistoryPage(conversationId, {
         olderThan: oldestItemId,
       });
       if (stale()) return;
@@ -3954,7 +3967,57 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       pageSet({ loadingMoreHistory: false, hasMoreHistory: false });
     }
   },
+
+  loadToolOutput: async (itemId, sessionId) => {
+    const conversationId = sessionId ?? get().conversationId;
+    if (!conversationId) return;
+    const current = setterForState(conversationId);
+    const block = current?.blocks.find((b) => b.type === "tool_result" && b.ctx.itemId === itemId);
+    if (
+      block === undefined ||
+      block.type !== "tool_result" ||
+      !("truncatedOutputLength" in block)
+    ) {
+      return;
+    }
+    const key = `${conversationId}:${itemId}`;
+    const inFlight = toolOutputLoads.get(key);
+    if (inFlight) return inFlight;
+    const load = (async () => {
+      const item = await fetchSessionItem(conversationId, itemId);
+      if (!isFunctionCallOutputItem(item)) return;
+      // Pinned like `loadMoreHistory`: the result belongs to this conversation
+      // even if the reader has switched away before it lands.
+      setterFor(conversationId)((s) => ({
+        blocks: s.blocks.map((b) => {
+          if (b.type !== "tool_result" || b.ctx.itemId !== itemId) return b;
+          const { truncatedOutputLength: _preview, ...full } = b;
+          return { ...full, output: item.output };
+        }),
+      }));
+    })().finally(() => {
+      toolOutputLoads.delete(key);
+    });
+    toolOutputLoads.set(key, load);
+    return load;
+  },
 }));
+
+// Full tool outputs in flight, keyed by `${conversationId}:${itemId}`, so a
+// row expanded twice (or two cards for one result) share one request.
+const toolOutputLoads = new Map<string, Promise<void>>();
+
+/**
+ * Transcript hydration asks for lean tool output: tool rows render collapsed,
+ * so a result is fetched in full only when the reader expands it
+ * (`loadToolOutput`). Tool output is most of a history page's bytes.
+ */
+function fetchHistoryPage(
+  sessionId: string,
+  options: { olderThan?: string; limit?: number; signal?: AbortSignal } = {},
+): Promise<SessionItemsPage> {
+  return fetchSessionItemsPage(sessionId, { ...options, toolOutput: "preview" });
+}
 
 // ── Store-action setter ──────────────────────────────────
 //
@@ -5288,7 +5351,7 @@ async function bindStream(
       ),
       withSnapshotRetries(id, (attempt) =>
         withReadTimeout(
-          (signal) => fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+          (signal) => fetchHistoryPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
           snapshotLoadDeadlineMs(attempt),
         ),
       ),
@@ -6185,7 +6248,7 @@ async function rehydrateWindowOnReconnect(
   let fresh: SessionItemsPage;
   try {
     fresh = await withReadTimeout((signal) =>
-      fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
+      fetchHistoryPage(id, { limit: INITIAL_WINDOW_ITEMS, signal }),
     );
   } catch {
     return "failed";
@@ -6319,7 +6382,7 @@ async function reconcileOnReconnect(
         client.setQueryData(["session", id], fresh);
         return fresh;
       }),
-      withReadTimeout((signal) => fetchSessionItemsPage(id, { signal })),
+      withReadTimeout((signal) => fetchHistoryPage(id, { signal })),
     ]);
   } catch {
     return "failed";
@@ -6355,7 +6418,7 @@ async function reconcileOnReconnect(
     let older: SessionItemsPage;
     try {
       older = await withReadTimeout((signal) =>
-        fetchSessionItemsPage(id, { olderThan: cursor, signal }),
+        fetchHistoryPage(id, { olderThan: cursor, signal }),
       );
     } catch (error) {
       // A cursor whose item was deleted can never be paged past. Stop the
