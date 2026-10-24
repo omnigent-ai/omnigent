@@ -23,6 +23,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_codex_config_effort,
     read_codex_config_model,
+    update_active_turn_id,
     write_bridge_startup_error,
     write_bridge_startup_timeout,
     write_bridge_state,
@@ -973,6 +974,151 @@ def test_goal_command_sets_goal_before_starting_objective_turn(
             },
         ),
     ]
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "live_injection"),
+    [(None, False), ("turn_existing", False), ("turn_existing", True)],
+    ids=["idle", "active-turn", "live-queue"],
+)
+def test_shell_input_runs_through_thread_shell_command(
+    active_turn_id: str | None,
+    live_injection: bool,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A web ``!command`` runs in Codex's shell instead of prompting the model."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+
+    class _ShellClient(_FakeCodexNativeClient):
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            response = await super().request(method, params)
+            if method == "thread/shellCommand" and active_turn_id is None:
+                # The forwarder records the shell's turn from turn/started.
+                update_active_turn_id(tmp_path, "turn_shell")
+            return response
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _ShellClient
+    )
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    if live_injection:
+        assert asyncio.run(executor.enqueue_session_message("main", "  !gcloud auth login\n"))
+    else:
+        events = _collect_turn_events(executor, "  !gcloud auth login\n")
+        assert [type(event) for event in events] == [TurnComplete]
+
+    assert _FakeCodexNativeClient.requests == [
+        ("thread/shellCommand", {"threadId": "thread_123", "command": "gcloud auth login"})
+    ]
+    # The ack carries no turn id; the executor leaves the recorded turn alone.
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == (active_turn_id or "turn_shell")
+
+
+def test_shell_input_waits_for_the_forwarder_to_record_its_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An idle bridge holds the injection lock until the shell's turn is recorded."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0.5)
+    _seed_bridge(tmp_path)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def run() -> list[Any]:
+        async def forwarder_records_turn() -> None:
+            await asyncio.sleep(0.1)
+            update_active_turn_id(tmp_path, "turn_shell")
+
+        recorder = asyncio.create_task(forwarder_records_turn())
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": [{"type": "input_text", "text": "!sleep 1"}]}],
+                [],
+                "",
+            )
+        ]
+        # A follow-up message sent right after the shell command steers the
+        # shell's turn instead of starting a second one.
+        assert await executor.enqueue_session_message("main", "and then?")
+        await recorder
+        return events
+
+    events = asyncio.run(run())
+    assert [type(event) for event in events] == [TurnComplete]
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == [
+        "thread/shellCommand",
+        "turn/steer",
+    ]
+    assert _FakeCodexNativeClient.requests[1][1]["expectedTurnId"] == "turn_shell"
+
+
+def test_shell_input_wait_for_its_turn_is_bounded(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A shell command whose turn is never observed still returns promptly."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    monkeypatch.setattr(codex_native_executor, "_SHELL_TURN_WAIT_SECONDS", 0.1)
+    _seed_bridge(tmp_path)
+
+    events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "!true")
+
+    assert [type(event) for event in events] == [TurnComplete]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
+@pytest.mark.parametrize(
+    ("text", "command"),
+    [
+        ("!printf '<%s>' foo\\ \n", "printf '<%s>' foo\\ "),
+        ("!cat <<EOF\nhi\nEOF\n", "cat <<EOF\nhi\nEOF"),
+        ("  !  ls -la  ", "ls -la  "),
+    ],
+    ids=["escaped-trailing-space", "heredoc", "padding"],
+)
+def test_shell_command_keeps_its_body(text: str, command: str) -> None:
+    assert (
+        codex_native_executor._shell_command_from_input_items([{"type": "text", "text": text}])
+        == command
+    )
+
+
+@pytest.mark.parametrize("text", ["!!not a command", "!", "!  \n", "say !hi"])
+def test_non_shell_bang_text_is_sent_as_a_prompt(
+    text: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Only a lone ``!command`` is shell input; anything else reaches the model."""
+    _FakeCodexNativeClient.requests = []
+    _FakeCodexNativeClient.created = []
+    _FakeCodexNativeClient.next_turn = 1
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient",
+        _FakeCodexNativeClient,
+    )
+    _seed_bridge(tmp_path)
+
+    _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), text)
+
+    assert [method for method, _params in _FakeCodexNativeClient.requests] == ["turn/start"]
 
 
 def test_overlong_goal_command_fails_clearly_without_reaching_app_server(

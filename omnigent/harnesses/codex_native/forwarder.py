@@ -8,6 +8,7 @@ import hashlib
 import json
 import logging
 import re
+import shlex
 import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Callable
@@ -530,6 +531,8 @@ class _CodexForwarderState:
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
+    # User shell commands whose input was mirrored at item start.
+    started_user_shell_items: set[str] = field(default_factory=set)
     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
     _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
     completed_plan_text_by_turn: dict[str, str] = field(default_factory=dict)
@@ -3174,6 +3177,10 @@ async def _handle_event(
             # ``item/completed`` guard below remains the backstop for the
             # resume-backfill path, which replays only ``item/completed``.
             await _ensure_user_message_posted(client, route_session_id, params, event_state)
+        elif isinstance(item, dict) and _user_shell_command(item) is not None:
+            if await _post_user_shell_input(client, route_session_id, params, item):
+                if event_state is not None and isinstance(item_id := item.get("id"), str):
+                    event_state.started_user_shell_items.add(item_id)
         elif isinstance(item, dict) and item.get("type") == "commandExecution":
             call_id = await _post_tool_call_item(client, route_session_id, params, item)
             if call_id is not None and event_state is not None:
@@ -4018,6 +4025,10 @@ async def _maybe_handle_delta_event(
         if not isinstance(delta, str):
             _logger.warning("Codex command output delta missing string delta: call_id=%s", call_id)
             return True
+        if forwarder_state is not None and call_id in forwarder_state.started_user_shell_items:
+            # A user shell command has no tool call to stream into; its output
+            # is mirrored whole when the item completes.
+            return True
         turn_id = _turn_id_from_payload(params)
         if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
             _logger.info("Codex forwarder ignored stale command output delta: turn_id=%s", turn_id)
@@ -4512,7 +4523,11 @@ def _is_model_output_item_event(method: str, params: _JsonObject) -> bool:
     if not isinstance(item, dict):
         return False
     item_type = item.get("type")
-    return isinstance(item_type, str) and item_type != "userMessage"
+    return (
+        isinstance(item_type, str)
+        and item_type != "userMessage"
+        and _user_shell_command(item) is None
+    )
 
 
 async def _post_mcp_startup(
@@ -5410,6 +5425,16 @@ async def _handle_completed_item_inner(
         return
     if item_type == "plan":
         await _post_plan_item(client, session_id, params, item, source_id=source_id)
+        return
+    if _user_shell_command(item) is not None:
+        await _post_user_shell_item(
+            client,
+            session_id,
+            params,
+            item,
+            forwarder_state=forwarder_state,
+            source_id=source_id,
+        )
         return
     if item_type in _REVIEW_MODE_ITEM_TYPES:
         await _post_review_mode_marker(client, session_id, params, item, source_id=source_id)
@@ -6481,6 +6506,111 @@ async def _post_tool_call_item(
         source_id=f"{source_id}:call",
     )
     return tool_call.call_id if posted else None
+
+
+def _user_shell_command(item: _JsonObject) -> str | None:
+    """
+    Return the command a person ran through Codex shell mode.
+
+    Codex reports the typed text wrapped as ``<shell> -lc '<command>'``; unwrap
+    it so the mirror matches the web ``!command`` that requested it.
+
+    :param item: Codex thread item, e.g. ``{"type": "commandExecution",
+        "source": "userShell", "command": "/bin/bash -lc 'ls -la'"}``.
+    :returns: The typed command, e.g. ``"ls -la"``, or ``None`` for any item
+        that is not a user shell command.
+    """
+    if item.get("type") != "commandExecution" or item.get("source") != "userShell":
+        return None
+    command = item.get("command")
+    if not isinstance(command, str) or not command:
+        return None
+    try:
+        argv = shlex.split(command)
+    except ValueError:
+        return command
+    if len(argv) == 3 and argv[1] in {"-c", "-lc"}:
+        return argv[2]
+    return command
+
+
+async def _post_user_shell_input(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+    item: _JsonObject,
+    *,
+    source_id: str | None = None,
+) -> bool:
+    """
+    Mirror a user shell command's input as a ``terminal_command`` item.
+
+    Persisting it settles the matching web ``!command`` pending input.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex ``item/started`` or ``item/completed`` params.
+    :param item: Codex user-shell ``commandExecution`` item.
+    :param source_id: Stable native item id; derived from ``params`` when omitted.
+    :returns: Whether the item was accepted by the server.
+    """
+    command = _user_shell_command(item)
+    if command is None:
+        return False
+    return await _post_external_item(
+        client,
+        session_id,
+        item_type="terminal_command",
+        item_data={"kind": "input", "input": command},
+        response_id=_response_id(params),
+        source_id=f"{source_id or _source_id(params, item)}:input",
+    )
+
+
+async def _post_user_shell_item(
+    client: httpx.AsyncClient,
+    session_id: str,
+    params: _JsonObject,
+    item: _JsonObject,
+    *,
+    forwarder_state: _CodexForwarderState | None,
+    source_id: str,
+) -> None:
+    """
+    Mirror one completed user shell command as ``terminal_command`` items.
+
+    The input half is posted here only when ``item/started`` did not already
+    post it (e.g. resume backfill); the output half carries the aggregated
+    output and any non-zero exit code.
+
+    :param client: HTTP client for Omnigent event posts.
+    :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
+    :param params: Codex ``item/completed`` params.
+    :param item: Codex user-shell ``commandExecution`` item.
+    :param forwarder_state: Optional state tracking inputs posted at item start.
+    :param source_id: Stable native item id used for server-side deduplication.
+    :returns: None.
+    """
+    item_id = item.get("id")
+    started = forwarder_state is not None and item_id in forwarder_state.started_user_shell_items
+    if started:
+        assert forwarder_state is not None
+        forwarder_state.started_user_shell_items.discard(item_id)
+    elif not await _post_user_shell_input(client, session_id, params, item, source_id=source_id):
+        return
+    tool_call = _codex_tool_call_from_item(item)
+    await _post_external_item(
+        client,
+        session_id,
+        item_type="terminal_command",
+        item_data={
+            "kind": "output",
+            "stdout": tool_call.output if tool_call is not None else "",
+            "stderr": None,
+        },
+        response_id=_response_id(params),
+        source_id=f"{source_id}:output",
+    )
 
 
 async def _post_tool_item(
