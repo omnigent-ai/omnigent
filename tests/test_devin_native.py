@@ -1105,6 +1105,59 @@ class TestUserConfigJsonc:
         assert _read_user_config(self._write(tmp_path, "{not json at all")) == {}
 
 
+@pytest.mark.parametrize(
+    ("server_url", "expected_trust_env"),
+    [
+        ("http://127.0.0.1:8787", False),
+        ("http://localhost:8787", False),
+        ("https://omnigents.example.databricksapps.com", True),
+    ],
+)
+def test_mirror_permission_request_bypasses_proxy_only_for_loopback(
+    monkeypatch: pytest.MonkeyPatch, server_url: str, expected_trust_env: bool
+) -> None:
+    """The approval mirror bypasses an ambient proxy only for a loopback relay."""
+    import httpx
+
+    from omnigent.harnesses.devin_native import hook as devin_hook
+
+    captured_trust_env: list[object] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object, trust_env: bool) -> None:
+            del headers, timeout
+            captured_trust_env.append(trust_env)
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, json: object = None) -> httpx.Response:
+            del json
+            return httpx.Response(
+                200,
+                text='{"hookSpecificOutput": {"decision": {"behavior": "allow"}}}',
+                request=httpx.Request("POST", url),
+            )
+
+    monkeypatch.setattr(devin_hook.httpx, "Client", _Client)
+    monkeypatch.setenv("_OMNIGENT_AUTH_HEADERS", json.dumps({"Authorization": "Bearer token"}))
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda server_url=None: lambda: "fresh",
+    )
+
+    verdict = devin_hook._mirror_permission_request(
+        {"hook_event_name": "PermissionRequest", "tool_name": "write"},
+        server_url=server_url,
+        session_id="conv_abc",
+    )
+    assert verdict == {"decision": "approve"}
+    assert captured_trust_env == [expected_trust_env]
+
+
 class TestPermissionRequestReauth:
     """Devin's approval card must survive the launch bearer expiring.
 
@@ -1126,7 +1179,9 @@ class TestPermissionRequestReauth:
         elicitation_ids: list[str] = []
 
         class _ScriptedClient:
-            def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            def __init__(
+                self, *, headers: dict[str, str], timeout: object, **_kwargs: object
+            ) -> None:
                 del timeout
                 self._headers = headers
 

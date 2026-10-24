@@ -42,6 +42,7 @@ from omnigent.native.native_policy_hook import (
     evaluation_response_to_hook_output,
     fail_closed_hook_output,
     hook_payload_to_evaluation_request,
+    is_loopback_url,
     policy_hook_reauth,
     policy_hook_request_headers,
     post_evaluate_with_retry,
@@ -213,9 +214,14 @@ def _mirror_permission_request(
     reauth = policy_hook_reauth(server_url, headers)
     # Identify the requesting harness and retain one id across an auth retry.
     body = {**payload, "_omnigent_elicitation_id": f"elicit_devin_{secrets.token_hex(16)}"}
+    trust_env = not is_loopback_url(url)
     try:
         for attempt in range(2):
-            with httpx.Client(headers=headers, timeout=timeout) as client:
+            with httpx.Client(
+                headers=headers,
+                timeout=timeout,
+                trust_env=trust_env,
+            ) as client:
                 response = client.post(url, json=body)
                 if attempt == 0 and _is_login_redirect_or_unauthorized(response):
                     refreshed = reauth()
