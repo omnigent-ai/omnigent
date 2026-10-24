@@ -1,8 +1,10 @@
-// Interactive 3D preview for STL / 3MF / OBJ files.
+// Interactive 3D preview for STL / 3MF / OBJ / glTF / GLB files.
 //
 // Mirrors the ImageViewer pattern in CodeViewer: it takes the already-fetched
 // FileContentResponse, decodes it via the shared `fileContentToBlob`, and
-// renders it. three.js is imported at this module's top level so the lazy
+// renders it. When the envelope is truncated (the file is past the server's
+// read cap), the full bytes come from the uncapped download stream instead.
+// three.js is imported at this module's top level so the lazy
 // dynamic import in CodeViewer keeps the whole 3D stack out of the main bundle
 // (same strategy as Monaco).
 //
@@ -16,23 +18,78 @@ import { OrbitControls } from "three/examples/jsm/controls/OrbitControls.js";
 import { STLLoader } from "three/examples/jsm/loaders/STLLoader.js";
 import { ThreeMFLoader } from "three/examples/jsm/loaders/3MFLoader.js";
 import { OBJLoader } from "three/examples/jsm/loaders/OBJLoader.js";
+import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
-import { type FileContentResponse, fileContentToBlob } from "@/hooks/useFileContent";
+import {
+  fetchWorkspaceFileBytes,
+  type FileContentResponse,
+  fileContentToBlob,
+} from "@/hooks/useFileContent";
 import {
   type ModelFormat,
   type ModelViewerTheme,
   getModelFormat,
   modelViewerTheme,
 } from "./codeViewerHelpers";
-import { TruncatedBanner } from "./TruncatedBanner";
 
 // What parseModel produces: the object to add to the scene, plus a handle to
 // the STL default material when we created one. The material handle lets the
-// theme-update effect recolor STL surfaces live; 3MF/OBJ carry their own
+// theme-update effect recolor STL surfaces live; other formats carry their own
 // materials, so we never touch those.
 interface ParsedModel {
   object: THREE.Object3D;
   stlMaterial: THREE.MeshStandardMaterial | null;
+}
+
+const GENERIC_MODEL_ERROR = "Unable to render 3D model.";
+const MODEL_SIZE_ERROR = "Model exceeds the 256 MiB preview limit — download it to view.";
+const EXTERNAL_GLTF_ERROR =
+  "This glTF references external files, which preview does not support yet — download it to view.";
+
+class ExternalGltfResourceError extends Error {
+  constructor() {
+    super(EXTERNAL_GLTF_ERROR);
+    this.name = "ExternalGltfResourceError";
+  }
+}
+
+interface GltfDocument {
+  buffers?: { uri?: unknown }[];
+  images?: { uri?: unknown }[];
+}
+
+function gltfDocument(buffer: ArrayBuffer): GltfDocument {
+  const view = new DataView(buffer);
+  let jsonBytes: Uint8Array;
+  if (buffer.byteLength >= 20 && view.getUint32(0, true) === 0x46546c67) {
+    const jsonLength = view.getUint32(12, true);
+    const jsonType = view.getUint32(16, true);
+    if (jsonType !== 0x4e4f534a || 20 + jsonLength > buffer.byteLength) {
+      throw new Error("Invalid GLB JSON chunk");
+    }
+    jsonBytes = new Uint8Array(buffer, 20, jsonLength);
+  } else {
+    jsonBytes = new Uint8Array(buffer);
+  }
+  return JSON.parse(new TextDecoder().decode(jsonBytes).replace(/^\uFEFF/, "")) as GltfDocument;
+}
+
+function assertSelfContainedGltf(buffer: ArrayBuffer): void {
+  const document = gltfDocument(buffer);
+  const references = [...(document.buffers ?? []), ...(document.images ?? [])];
+  if (references.some(({ uri }) => typeof uri === "string" && !/^data:/i.test(uri))) {
+    throw new ExternalGltfResourceError();
+  }
+}
+
+function modelErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.name === "WorkspaceFilePreviewTooLargeError") {
+    return MODEL_SIZE_ERROR;
+  }
+  if (error instanceof Error && error.name === "ExternalGltfResourceError") {
+    return EXTERNAL_GLTF_ERROR;
+  }
+  return GENERIC_MODEL_ERROR;
 }
 
 /**
@@ -40,20 +97,22 @@ interface ParsedModel {
  *
  * The `format` comes from the shared `getModelFormat` resolver — the same one
  * that decides dispatch — so the parser only ever sees a format the viewer was
- * routed for. STL and 3MF are parsed from an ArrayBuffer; OBJ is text. Each
- * loader's `parse` is synchronous and self-contained (no network), so a
- * truncated or malformed file throws here and the caller surfaces the error
- * state.
+ * routed for. STL and 3MF are parsed from an ArrayBuffer; OBJ and JSON glTF are
+ * text. The STL/3MF/OBJ loaders parse synchronously; GLTFLoader is
+ * callback-based, so it is wrapped in a promise and a malformed file rejects
+ * the same way the sync loaders throw — the caller surfaces the error state.
+ * GLB and self-contained glTF parse fully from the buffer. External glTF
+ * resources are not resolved through the workspace filesystem.
  *
  * STL carries no material, so we give it a theme-derived surface (`theme`);
  * the returned `stlMaterial` handle lets the caller recolor it on a theme
  * toggle without reparsing.
  */
-function parseModel(
+export async function parseModel(
   format: ModelFormat,
   buffer: ArrayBuffer,
   theme: ModelViewerTheme,
-): ParsedModel {
+): Promise<ParsedModel> {
   if (format === "stl") {
     const geometry = new STLLoader().parse(buffer);
     const material = new THREE.MeshStandardMaterial({
@@ -65,6 +124,19 @@ function parseModel(
   }
   if (format === "3mf") {
     return { object: new ThreeMFLoader().parse(buffer), stlMaterial: null };
+  }
+  if (format === "gltf") {
+    assertSelfContainedGltf(buffer);
+    const isGlb = buffer.byteLength >= 4 && new DataView(buffer).getUint32(0, true) === 0x46546c67;
+    const data = isGlb ? buffer : new TextDecoder().decode(buffer);
+    return new Promise((resolve, reject) => {
+      new GLTFLoader().parse(
+        data,
+        "",
+        (gltf) => resolve({ object: gltf.scene, stlMaterial: null }),
+        reject,
+      );
+    });
   }
   // OBJ is ASCII text.
   const text = new TextDecoder().decode(buffer);
@@ -132,10 +204,14 @@ function hasRenderableBounds(box: THREE.Box3): boolean {
  * three.js `isTexture` flag rather than `instanceof` (the loaders and the app
  * can hold different three copies).
  */
-function disposeMaterial(material: THREE.Material): void {
+function disposeMaterial(material: THREE.Material, disposedTextures: Set<THREE.Texture>): void {
   for (const value of Object.values(material)) {
     const texture = value as THREE.Texture | null;
-    if (texture?.isTexture) texture.dispose();
+    if (!texture?.isTexture || disposedTextures.has(texture)) continue;
+    disposedTextures.add(texture);
+    const sourceData = texture.source?.data as { close?: () => void } | undefined;
+    sourceData?.close?.();
+    texture.dispose();
   }
   material.dispose();
 }
@@ -145,14 +221,15 @@ function disposeMaterial(material: THREE.Material): void {
  * buffers backing them are released. three.js does not do this automatically.
  */
 function disposeObject(object: THREE.Object3D): void {
+  const disposedTextures = new Set<THREE.Texture>();
   object.traverse((child) => {
     const mesh = child as THREE.Mesh;
     mesh.geometry?.dispose();
     const material = mesh.material;
     if (Array.isArray(material)) {
-      material.forEach(disposeMaterial);
+      material.forEach((item) => disposeMaterial(item, disposedTextures));
     } else if (material) {
-      disposeMaterial(material);
+      disposeMaterial(material, disposedTextures);
     }
   });
 }
@@ -220,9 +297,17 @@ function teardownScene(res: SceneResources): void {
   }
 }
 
-export function ModelViewer({ data, path }: { data: FileContentResponse; path: string }) {
+export function ModelViewer({
+  data,
+  path,
+  conversationId,
+}: {
+  data: FileContentResponse;
+  path: string;
+  conversationId: string;
+}) {
   const containerRef = useRef<HTMLDivElement>(null);
-  const [errored, setErrored] = useState(false);
+  const [errorMessage, setErrorMessage] = useState<string | null>(null);
 
   // Theme comes from the app's shared next-themes source (same hook Monaco and
   // the terminal use). `mode` is a stable "light"|"dark" string, so the theme
@@ -250,23 +335,18 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
     // which is what lets an invalid → valid prop change recover.
     if (!container) return;
 
-    // A truncated model is a partial byte stream that won't parse into a valid
-    // mesh — skip the scene and go straight to the error UI.
-    if (data.truncated) {
-      setErrored(true);
-      return;
-    }
     // Same resolver used for dispatch, so a MIME-matched file with an unknown
     // extension still selects the right loader here.
     const format = getModelFormat(path, data.content_type);
     if (!format) {
-      setErrored(true);
+      setErrorMessage(GENERIC_MODEL_ERROR);
       return;
     }
 
-    setErrored(false);
+    setErrorMessage(null);
 
     let disposed = false;
+    const abortController = new AbortController();
     const res: SceneResources = {
       scene: new THREE.Scene(),
       renderer: null,
@@ -285,23 +365,29 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
     const theme = themeRef.current;
     const camera = new THREE.PerspectiveCamera(45, 1, 0.1, 1000);
 
-    const fail = () => {
+    const fail = (message = GENERIC_MODEL_ERROR) => {
       // Free anything created before the failure, then show the error UI. The
       // cleanup return also calls teardownScene, which is idempotent.
       teardownScene(res);
       if (resRef.current === res) resRef.current = null;
-      if (!disposed) setErrored(true);
+      if (!disposed) setErrorMessage(message);
     };
 
-    // fileContentToBlob handles both base64 (binary STL/3MF) and utf-8 (ASCII
-    // OBJ/STL); read it back as an ArrayBuffer for the loaders. This is async,
-    // so guard every step against the effect having been cleaned up.
-    fileContentToBlob(data)
-      .arrayBuffer()
-      .then((buffer) => {
+    const load = async () => {
+      try {
+        // The JSON envelope is sufficient for ordinary files. A truncated
+        // envelope means the model crossed the server read cap, so use the
+        // existing uncapped download stream instead.
+        const buffer = data.truncated
+          ? await fetchWorkspaceFileBytes(conversationId, path, { signal: abortController.signal })
+          : await fileContentToBlob(data).arrayBuffer();
         if (disposed) return;
 
-        const { object, stlMaterial } = parseModel(format, buffer, theme);
+        const { object, stlMaterial } = await parseModel(format, buffer, theme);
+        if (disposed) {
+          disposeObject(object);
+          return;
+        }
         res.stlMaterial = stlMaterial;
         // Validate BEFORE building the scene: an empty/degenerate model (e.g. a
         // comment-only OBJ) has no finite bounds and would render a blank
@@ -358,22 +444,21 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         };
         res.resizeObserver = new ResizeObserver(onResize);
         res.resizeObserver.observe(container);
-      })
-      .catch(() => {
-        fail();
-      });
+      } catch (error) {
+        fail(modelErrorMessage(error));
+      }
+    };
+    void load();
 
     return () => {
       disposed = true;
+      abortController.abort();
       teardownScene(res);
       if (resRef.current === res) resRef.current = null;
     };
-  }, [data, path]);
+  }, [data, path, conversationId]);
 
   const filename = path.split("/").pop() ?? path;
-  const errorMessage = data.truncated
-    ? "Model is too large to preview (truncated by the server)."
-    : "Unable to render 3D model.";
 
   const content = (
     // The container is ALWAYS mounted so its ref stays live — the error is an
@@ -386,7 +471,7 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
         aria-label={`3D preview of ${filename}`}
         className="absolute inset-0 cursor-grab active:cursor-grabbing"
       />
-      {errored && (
+      {errorMessage && (
         <div className="absolute inset-0 flex items-center justify-center bg-background/80 p-8 text-center text-muted-foreground text-ui">
           {errorMessage}
         </div>
@@ -394,11 +479,5 @@ export function ModelViewer({ data, path }: { data: FileContentResponse; path: s
     </div>
   );
 
-  if (!data.truncated) return <div className="flex h-full flex-col">{content}</div>;
-  return (
-    <div className="flex h-full flex-col">
-      <TruncatedBanner />
-      {content}
-    </div>
-  );
+  return <div className="flex h-full flex-col">{content}</div>;
 }
