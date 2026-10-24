@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from dataclasses import replace
 
@@ -150,7 +151,9 @@ def _resolve_profiles(values: list[str] | None) -> list[BenchProfile]:
         if separator and not model:
             raise ValueError(f"--harness {name!r} has an empty model override")
         profile = resolve_profile(name)
-        profiles.append(replace(profile, model=model) if separator else profile)
+        profiles.append(
+            replace(profile, model=model, label=f"{name}={model}") if separator else profile
+        )
     return profiles
 
 
@@ -199,6 +202,11 @@ def _all_own_auth_native(
 
 
 def main(argv: list[str] | None = None) -> int:
+    # Redirected stdio on Windows is cp1252, which can't encode the verdict glyphs.
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is not None and (stream.encoding or "").lower() != "utf-8":
+            reconfigure(encoding="utf-8", errors="replace")
     args = _parse_args(argv if argv is not None else sys.argv[1:])
 
     if args.list:
@@ -351,6 +359,7 @@ def _write_report(
         content = render_markdown(matrix, declared=declared)
     else:
         content = render_table(matrix, color=False, declared=declared)
+    os.makedirs(os.path.dirname(os.path.abspath(path)), exist_ok=True)
     with open(path, "w", encoding="utf-8") as fh:
         fh.write(content if content.endswith("\n") else content + "\n")
     print(f"report written to {path}", file=sys.stderr)

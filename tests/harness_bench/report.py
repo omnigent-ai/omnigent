@@ -46,8 +46,8 @@ def _harness_label(report: HarnessReport) -> str:
     """
     transport = report.transport
     if not transport:
-        return report.profile.harness
-    return f"{report.profile.harness} [{_TRANSPORT_LABEL.get(transport, transport)}]"
+        return report.profile.display_name
+    return f"{report.profile.display_name} [{_TRANSPORT_LABEL.get(transport, transport)}]"
 
 
 def _colorize(text: str, verdict: Verdict, color: bool) -> str:
@@ -167,9 +167,8 @@ def _note_lines(matrix: BenchMatrix) -> list[str]:
             continue  # whole-harness skip is listed separately
         for cell in report.cells:
             if cell.verdict in explain and cell.note and cell.note != _OFFLINE_NOTE:
-                lines.append(
-                    f"- {report.profile.harness} / {cell.title}: {cell.verdict.glyph} {cell.note}"
-                )
+                name = report.profile.display_name
+                lines.append(f"- {name} / {cell.title}: {cell.verdict.glyph} {cell.note}")
     return lines
 
 
@@ -242,7 +241,7 @@ def _drift_lines(matrix: BenchMatrix) -> list[str]:
         for cell in report.cells:
             if cell.is_drift:
                 lines.append(
-                    f"- `{report.profile.harness}` / {cell.title}: "
+                    f"- `{report.profile.display_name}` / {cell.title}: "
                     f"declared {cell.declared.glyph} ({cell.declared.name}), "
                     f"observed {cell.observed.glyph} ({cell.observed.name})"
                     + (f" — {cell.note}" if cell.note else "")
@@ -252,7 +251,9 @@ def _drift_lines(matrix: BenchMatrix) -> list[str]:
 
 def _skip_lines(matrix: BenchMatrix) -> list[str]:
     return [
-        f"- `{r.profile.harness}`: {r.skipped_reason}" for r in matrix.reports if r.skipped_reason
+        f"- `{r.profile.display_name}`: {r.skipped_reason}"
+        for r in matrix.reports
+        if r.skipped_reason
     ]
 
 
