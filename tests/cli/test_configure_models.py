@@ -1488,6 +1488,309 @@ def _databricks_add_menu_index() -> int:
     return next(i for i, o in enumerate(opts) if o.kind == DATABRICKS_KIND) + 1
 
 
+_WS_A = "https://workspace-a.cloud.databricks.com"
+_WS_B = "https://workspace-b.cloud.databricks.com"
+_WS_C = "https://workspace-c.cloud.databricks.com"
+
+
+def _drift_notice(ucode_host: str, profile: str, omni_host: str) -> str:
+    return (
+        f"⚠ Databricks: ucode now points at {ucode_host}, but Omnigent still uses "
+        f"the '{profile}' profile ({omni_host}). Reconfigure Databricks to follow ucode."
+    )
+
+
+def _seed_ucode_and_databrickscfg(
+    tmp_path, monkeypatch, *, cfg_profiles: dict[str, str], ucode_current: str | None
+) -> None:
+    """Point the Databricks + ucode readers at tmp files for drift tests.
+    Their paths are frozen from ``Path.home()`` at import time, so patch the
+    module path constants directly rather than redirecting ``$HOME``."""
+    import configparser
+    import json
+
+    cfg_path = tmp_path / ".databrickscfg"
+    parser = configparser.ConfigParser()
+    for profile, host in cfg_profiles.items():
+        parser[profile] = {"host": host, "auth_type": "databricks-cli"}
+    with cfg_path.open("w") as handle:
+        parser.write(handle)
+    monkeypatch.setattr("omnigent.onboarding.databricks_config._DATABRICKSCFG_PATH", cfg_path)
+
+    state_path = tmp_path / ".ucode" / "state.json"
+    monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_path)
+    if ucode_current is not None:
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        state_path.write_text(
+            json.dumps(
+                {
+                    "current_workspace": ucode_current,
+                    "workspaces": {ucode_current: {"workspace": ucode_current}},
+                }
+            )
+        )
+
+
+def test_databricks_drift_notice_flags_ucode_switch(tmp_path, monkeypatch) -> None:
+    """ucode on workspace B while the configured profile stays on workspace A
+    warns, naming both the switched workspace and the profile Omnigent uses."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": _WS_A}, ucode_current=_WS_B
+    )
+    config = {"providers": {"databricks": {"kind": "databricks", "profile": "ai_devtools"}}}
+
+    assert _databricks_workspace_drift_notice(config) == _drift_notice(
+        "workspace-b.cloud.databricks.com", "ai_devtools", "workspace-a.cloud.databricks.com"
+    )
+
+
+@pytest.mark.parametrize(
+    ("profile_host", "drifted"),
+    [
+        ("https://Workspace-A.cloud.databricks.com", False),
+        ("workspace-a.cloud.databricks.com", False),
+        ("https://workspace-a.cloud.databricks.com:443", False),
+        ("https://workspace-a.cloud.databricks.com/browse?o=1", False),
+        ("http://workspace-a.cloud.databricks.com", True),
+        ("https://workspace-a.cloud.databricks.com:8443", True),
+    ],
+)
+def test_databricks_drift_notice_compares_hosts_like_the_sdk(
+    tmp_path, monkeypatch, profile_host: str, drifted: bool
+) -> None:
+    """Host case, a missing https scheme, port 443 and a path do not count as
+    drift; a different scheme or port does."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": profile_host}, ucode_current=_WS_A
+    )
+    config = {"providers": {"databricks": {"kind": "databricks", "profile": "ai_devtools"}}}
+
+    assert (_databricks_workspace_drift_notice(config) is not None) is drifted
+
+
+def test_databricks_drift_notice_keeps_schemes_when_only_the_scheme_differs(
+    tmp_path, monkeypatch
+) -> None:
+    """A scheme-only drift names both full origins so the two hosts read differently."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    http_host = "http://workspace-a.cloud.databricks.com"
+    _seed_ucode_and_databrickscfg(
+        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": http_host}, ucode_current=_WS_A
+    )
+
+    assert _databricks_workspace_drift_notice(
+        {"providers": _DATABRICKS_PROVIDER}
+    ) == _drift_notice(_WS_A, "ai_devtools", http_host)
+
+
+def test_databricks_drift_notice_names_the_default_profile(tmp_path, monkeypatch) -> None:
+    """With several drifted Databricks profiles, the notice names the default one."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path,
+        monkeypatch,
+        cfg_profiles={"staging": _WS_C, "ai_devtools": _WS_A},
+        ucode_current=_WS_B,
+    )
+    config = {
+        "providers": {
+            "staging": {"kind": "databricks", "profile": "staging"},
+            "prod": {"kind": "databricks", "default": True, "profile": "ai_devtools"},
+        }
+    }
+
+    assert _databricks_workspace_drift_notice(config) == _drift_notice(
+        "workspace-b.cloud.databricks.com", "ai_devtools", "workspace-a.cloud.databricks.com"
+    )
+
+
+def test_databricks_drift_notice_silent_when_any_profile_matches(tmp_path, monkeypatch) -> None:
+    """No warning when ucode's current workspace matches a configured profile,
+    even though another configured profile points elsewhere."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path,
+        monkeypatch,
+        cfg_profiles={"staging": _WS_C, "ai_devtools": _WS_A},
+        ucode_current=_WS_A,
+    )
+    config = {
+        "providers": {
+            "staging": {"kind": "databricks", "profile": "staging"},
+            "databricks": {"kind": "databricks", "default": True, "profile": "ai_devtools"},
+        }
+    }
+
+    assert _databricks_workspace_drift_notice(config) is None
+
+
+def test_databricks_drift_notice_silent_without_configured_databricks(
+    tmp_path, monkeypatch
+) -> None:
+    """No warning when there is no configured Databricks profile to compare."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": _WS_A}, ucode_current=_WS_B
+    )
+
+    assert _databricks_workspace_drift_notice({"providers": {}}) is None
+
+
+def test_databricks_drift_notice_silent_without_ucode_state(tmp_path, monkeypatch) -> None:
+    """No warning when ucode has recorded no current workspace."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": _WS_A}, ucode_current=None
+    )
+    config = {"providers": {"databricks": {"kind": "databricks", "profile": "ai_devtools"}}}
+
+    assert _databricks_workspace_drift_notice(config) is None
+
+
+def test_overview_banner_warns_on_databricks_ucode_drift(
+    isolated_config, tmp_path, monkeypatch
+) -> None:
+    """The overview shows a warning-styled banner naming the switched workspace
+    when the configured Databricks profile and ucode's current workspace diverge."""
+    from omnigent.onboarding import interactive
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": _WS_A}, ucode_current=_WS_B
+    )
+    config_path = os.path.join(isolated_config, "config.yaml")
+    with open(config_path, "w") as f:
+        yaml.safe_dump(
+            {
+                "providers": {
+                    "databricks": {
+                        "kind": "databricks",
+                        "default": True,
+                        "profile": "ai_devtools",
+                    }
+                }
+            },
+            f,
+        )
+
+    real_select = interactive.select
+    overview_styles: list[object] = []
+
+    def _spy_select(title: str, options: list[str], **kwargs: object) -> int:
+        if title == "Configure harnesses":
+            overview_styles.append(kwargs.get("status_style"))
+        return real_select(title, options, **kwargs)
+
+    monkeypatch.setattr("omnigent.onboarding.interactive.select", _spy_select)
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+    assert result.exit_code == 0, result.output
+    expected = _drift_notice(
+        "workspace-b.cloud.databricks.com", "ai_devtools", "workspace-a.cloud.databricks.com"
+    )
+    rendered = " ".join(result.output.split())
+    assert expected in rendered, result.output
+    assert rendered.index(expected) < rendered.index("Configure harnesses")
+    assert overview_styles == ["bold yellow"]
+
+
+_DATABRICKS_PROVIDER = {
+    "databricks": {"kind": "databricks", "default": True, "profile": "ai_devtools"}
+}
+_KEY_PROVIDER = {
+    "anthropic": {
+        "kind": "key",
+        "default": True,
+        "anthropic": {
+            "base_url": "https://api.anthropic.com",
+            "api_key_ref": "keychain:anthropic",
+            "models": {"default": "claude-sonnet-4-6"},
+        },
+    }
+}
+
+
+_INVALID_UTF8_UCODE_STATE = b'{"current_workspace": "\xff"}'
+
+
+@pytest.mark.parametrize(
+    ("state_bytes", "cfg_bytes"),
+    [
+        pytest.param(_INVALID_UTF8_UCODE_STATE, None, id="state-invalid-utf8"),
+        pytest.param(
+            None, b"[ai_devtools]\nhost = https://a.example\n# \xff\n", id="profile-invalid-utf8"
+        ),
+        pytest.param(
+            None, b"[ai_devtools]\nhost = https://a.example/%zz\n", id="profile-bad-interpolation"
+        ),
+        pytest.param(
+            None, b"[ai_devtools]\nhost = https://[a.example\n", id="profile-invalid-ipv6-host"
+        ),
+        pytest.param(
+            None, b"[ai_devtools]\nhost = https://a.example:notaport\n", id="profile-invalid-port"
+        ),
+    ],
+)
+def test_databricks_drift_notice_skips_unreadable_inputs(
+    tmp_path, monkeypatch, state_bytes: bytes | None, cfg_bytes: bytes | None
+) -> None:
+    """Damaged ucode state or profile files skip the advisory warning instead of raising."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": _WS_A}, ucode_current=_WS_B
+    )
+    if state_bytes is not None:
+        (tmp_path / ".ucode" / "state.json").write_bytes(state_bytes)
+    if cfg_bytes is not None:
+        (tmp_path / ".databrickscfg").write_bytes(cfg_bytes)
+
+    assert _databricks_workspace_drift_notice({"providers": _DATABRICKS_PROVIDER}) is None
+
+
+@pytest.mark.skipif(
+    os.name != "posix" or os.geteuid() == 0, reason="needs POSIX directory permissions"
+)
+def test_databricks_drift_notice_skips_an_untraversable_ucode_dir(tmp_path, monkeypatch) -> None:
+    """A ``~/.ucode`` directory the user cannot enter skips the advisory instead of raising."""
+    from omnigent.cli_config import _databricks_workspace_drift_notice
+
+    _seed_ucode_and_databrickscfg(
+        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": _WS_A}, ucode_current=_WS_B
+    )
+    ucode_dir = tmp_path / ".ucode"
+    ucode_dir.chmod(0o000)
+    try:
+        assert _databricks_workspace_drift_notice({"providers": _DATABRICKS_PROVIDER}) is None
+    finally:
+        ucode_dir.chmod(0o700)
+
+
+def test_overview_opens_when_ucode_state_is_unreadable(
+    isolated_config, tmp_path, monkeypatch
+) -> None:
+    """A damaged ucode state file does not stop ``omni setup`` before the overview
+    renders, including for users without a Databricks provider."""
+    _seed_ucode_and_databrickscfg(
+        tmp_path, monkeypatch, cfg_profiles={"ai_devtools": _WS_A}, ucode_current=_WS_B
+    )
+    (tmp_path / ".ucode" / "state.json").write_bytes(_INVALID_UTF8_UCODE_STATE)
+    with open(os.path.join(isolated_config, "config.yaml"), "w") as f:
+        yaml.safe_dump({"providers": _KEY_PROVIDER}, f)
+
+    result = CliRunner().invoke(cli, ["setup", "--no-internal-beta"], input="q\n")
+
+    assert result.exit_code == 0, result.output
+    assert "Configure harnesses" in result.output
+
+
 def test_configure_harnesses_add_databricks_normalizes_url_and_persists(
     isolated_config, monkeypatch
 ) -> None:

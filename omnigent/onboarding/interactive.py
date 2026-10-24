@@ -129,6 +129,7 @@ def _render_menu(
     width: int,
     selectable: list[bool],
     status: str | None = None,
+    status_style: str = "bold green",
     max_visible: int | None = None,
     window_start: int = 0,
     compact: bool = False,
@@ -156,9 +157,11 @@ def _render_menu(
     :param selectable: Parallel to *options*; ``False`` marks a row as a
         non-selectable section header/separator.
     :param status: Optional transient status line (e.g. ``"✓ added X"``)
-        rendered green above the title. Being part of the frame, it is
+        rendered above the title. Being part of the frame, it is
         erased with the frame on ``clear_on_exit`` — so a re-rendering loop
         shows only the latest action's result, never an accumulating stack.
+    :param status_style: Rich style for the status line; defaults to a green
+        confirmation. Callers pass e.g. ``"bold yellow"`` for a warning.
     :returns: An ANSI-styled string ready for ``stdout.write()``.
     """
     buf = io.StringIO()
@@ -166,7 +169,7 @@ def _render_menu(
 
     render_console.print()
     if status:
-        render_console.print(Text(f"  {status}", style="bold green"))
+        render_console.print(Text(f"  {status}", style=status_style))
         render_console.print()
     render_console.print(Text(f"  {title}", style=f"bold {ACCENT}"))
     if not compact:
@@ -335,6 +338,8 @@ def _select_fallback(
     *,
     default: int,
     selectable: list[bool],
+    status: str | None = None,
+    status_style: str = "bold green",
 ) -> int:
     """Non-TTY numbered fallback for :func:`select`.
 
@@ -349,8 +354,14 @@ def _select_fallback(
     :param default: Zero-based index (into *options*) pre-selected; the
         prompt default is its position among the numbered rows.
     :param selectable: Parallel mask; ``False`` rows are unnumbered labels.
+    :param status: Optional status line printed above the title, e.g.
+        ``"✓ Added databricks"``.
+    :param status_style: Rich style for the status line, e.g. ``"bold yellow"``.
     :returns: The chosen zero-based index into *options*.
     """
+    if status:
+        console.print(Text(f"  {status}", style=status_style))
+        console.print()
     console.print(f"  [{ACCENT}]{title}[/]")
     # Map each printed number → original options index; print headers as
     # plain labels so the grouping is still visible in the fallback.
@@ -400,6 +411,7 @@ def select(
     selectable: list[bool] | None = None,
     clear_on_exit: bool = False,
     status: str | None = None,
+    status_style: str = "bold green",
     max_visible: int | None = None,
     compact: bool = False,
 ) -> int:
@@ -438,10 +450,13 @@ def select(
         multi-step interactive loop (re-rendering the menu after each
         action) doesn't pile up stale frames. No-op on the numbered
         fallback (nothing to erase).
-    :param status: Optional transient status line shown green above the
+    :param status: Optional transient status line shown above the
         title (part of the frame, so it clears with ``clear_on_exit``).
         Pass the prior action's result so a re-rendering loop shows only
-        the latest, never an accumulating stack. No-op on the fallback.
+        the latest, never an accumulating stack. The numbered fallback
+        prints it above the list.
+    :param status_style: Rich style for the status line; defaults to a green
+        confirmation. Pass e.g. ``"bold yellow"`` to render a warning.
     :param max_visible: Optional cap on visible rows. When set and the list
         is longer, the menu shows a scrolling viewport that follows the
         cursor (with "N more" markers) so a long flat list fits one screen
@@ -465,11 +480,15 @@ def select(
         raise ValueError("descriptions must match options length")
     mask = _normalize_selectable(options, selectable)
 
-    if not sys.stdin.isatty():
-        return _select_fallback(title, options, default=default, selectable=mask)
-
-    if IS_WINDOWS:
-        return _select_fallback(title, options, default=default, selectable=mask)
+    if not sys.stdin.isatty() or IS_WINDOWS:
+        return _select_fallback(
+            title,
+            options,
+            default=default,
+            selectable=mask,
+            status=status,
+            status_style=status_style,
+        )
 
     import termios
     import tty
@@ -504,6 +523,7 @@ def select(
             width=width,
             selectable=mask,
             status=status,
+            status_style=status_style,
             max_visible=max_visible,
             window_start=window_start[0],
             compact=compact,
@@ -519,7 +539,14 @@ def select(
         old_attrs = termios.tcgetattr(fd)
     except termios.error:
         # Cannot enter raw mode — degrade to the numbered fallback.
-        return _select_fallback(title, options, default=default, selectable=mask)
+        return _select_fallback(
+            title,
+            options,
+            default=default,
+            selectable=mask,
+            status=status,
+            status_style=status_style,
+        )
 
     try:
         _redraw()

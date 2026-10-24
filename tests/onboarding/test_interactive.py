@@ -15,6 +15,7 @@ so the tests that need one stand up a pty (see :func:`_select_over_pty`).
 from __future__ import annotations
 
 import io
+import os
 import sys
 
 import pytest
@@ -104,6 +105,47 @@ def test_select_uses_numbered_fallback_on_windows_tty(
     result = interactive.select("Pick one", ["alpha", "beta"])
 
     assert result == 1
+
+
+@pytest.mark.parametrize(
+    ("stdin_is_tty", "is_windows", "raw_mode_fails"),
+    [
+        pytest.param(False, False, False, id="non-tty"),
+        pytest.param(True, True, False, id="windows-tty"),
+        pytest.param(
+            True,
+            False,
+            True,
+            id="raw-mode-unavailable",
+            marks=pytest.mark.skipif(sys.platform == "win32", reason="termios is POSIX-only"),
+        ),
+    ],
+)
+def test_select_fallback_prints_status_above_title(
+    monkeypatch: pytest.MonkeyPatch,
+    stdin_is_tty: bool,
+    is_windows: bool,
+    raw_mode_fails: bool,
+) -> None:
+    """Numbered fallbacks keep the styled status line the raw-termios menu shows."""
+    from rich.console import Console
+
+    output = io.StringIO()
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    monkeypatch.setattr(interactive, "console", Console(file=output, force_terminal=True))
+    monkeypatch.setattr(sys.stdin, "isatty", lambda: stdin_is_tty)
+    monkeypatch.setattr(interactive, "IS_WINDOWS", is_windows)
+    _feed(monkeypatch, ["1"])
+
+    with open(os.devnull, "rb") as not_a_terminal:
+        if raw_mode_fails:
+            # tcgetattr raises termios.error for a stdin that is not a terminal.
+            monkeypatch.setattr(sys.stdin, "fileno", not_a_terminal.fileno)
+        interactive.select("Pick one", ["alpha"], status="⚠ drift", status_style="bold yellow")
+
+    out = output.getvalue()
+    assert "\x1b[1;33m  ⚠ drift" in out
+    assert out.index("⚠ drift") < out.index("Pick one")
 
 
 def test_select_fallback_reprompts_on_invalid_then_accepts(
@@ -482,6 +524,19 @@ def test_render_menu_compact_truncates_long_description_to_one_line() -> None:
 # ---------------------------------------------------------------------------
 # _count_terminal_lines
 # ---------------------------------------------------------------------------
+
+
+def test_render_menu_status_is_green_unless_a_style_is_given(monkeypatch) -> None:
+    """The status line keeps its green default; ``status_style`` overrides it."""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+    kwargs = {"descriptions": None, "width": 80, "selectable": [True, True]}
+    saved = interactive._render_menu("Pick", ["a", "b"], 0, status="✓ saved", **kwargs)
+    drift = interactive._render_menu(
+        "Pick", ["a", "b"], 0, status="⚠ drift", status_style="bold yellow", **kwargs
+    )
+    assert "\x1b[1;32m  ✓ saved" in saved
+    assert "\x1b[1;33m  ⚠ drift" in drift
+    assert "\x1b[1;32m  ⚠ drift" not in drift
 
 
 def test_count_terminal_lines_no_wrap() -> None:

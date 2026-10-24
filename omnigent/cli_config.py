@@ -1445,6 +1445,59 @@ def _credential_label(name: str, entry: ProviderEntry) -> str:
     )
 
 
+def _databricks_workspace_drift_notice(config: dict[str, Any]) -> str | None:  # type: ignore[explicit-any]
+    """Warn when ucode's current workspace differs from every configured
+    Databricks profile. Sessions route through the configured profile, not
+    ucode's current_workspace, so return ``None`` when they agree."""
+    import configparser
+    from urllib.parse import urlparse
+
+    from omnigent.onboarding.databricks_config import (
+        get_workspace_url_for_profile,
+        normalize_workspace_url,
+    )
+    from omnigent.onboarding.provider_config import DATABRICKS_KIND, load_providers
+    from omnigent.onboarding.ucode_state import read_current_ucode_state
+
+    def _comparable(url: str) -> str:
+        # Like the Databricks SDK: a bare host means https, and port 443 is implicit.
+        origin = normalize_workspace_url(url if "://" in url else f"https://{url}").lower()
+        # Reading .port raises ValueError for a malformed port.
+        return origin.removesuffix(":443") if urlparse(origin).port == 443 else origin
+
+    configured: list[tuple[str, bool, str]] = []
+    # Advisory only: unreadable or malformed ucode/profile files must not block setup.
+    try:
+        ucode_state = read_current_ucode_state()
+        if ucode_state is None or not ucode_state.workspace_url:
+            return None
+        ucode_url = _comparable(ucode_state.workspace_url)
+        for entry in load_providers(config).values():
+            if entry.kind != DATABRICKS_KIND or not entry.profile:
+                continue
+            host = get_workspace_url_for_profile(entry.profile)
+            if host:
+                configured.append((entry.profile, entry.default, _comparable(host)))
+    except (OSError, ValueError, configparser.Error):
+        return None
+    if not configured:
+        return None
+    if any(url == ucode_url for _profile, _default, url in configured):
+        return None
+
+    # With several drifted profiles, name the default one: sessions route through it.
+    profile, _default, omni_url = next((item for item in configured if item[1]), configured[0])
+
+    ucode_shown, omni_shown = ucode_url.split("://", 1)[-1], omni_url.split("://", 1)[-1]
+    if ucode_shown == omni_shown:
+        ucode_shown, omni_shown = ucode_url, omni_url
+    return (
+        f"⚠ Databricks: ucode now points at {ucode_shown}, but Omnigent still "
+        f"uses the '{profile}' profile ({omni_shown}). "
+        "Reconfigure Databricks to follow ucode."
+    )
+
+
 def _harness_credential_rows(config: dict[str, Any], family: str) -> list[_HarnessMenuRow]:  # type: ignore[explicit-any]
     """Build the level-2 rows: each credential serving *family*, then ``+ Add``.
 
@@ -4359,6 +4412,9 @@ def _run_configure_harnesses_interactive() -> None:
         selectable.append(True)
         row_target.append(_QUIT)
         descriptions.append("")
+        # Drift warning renders in the frame-level status slot so it clears
+        # once ucode and the configured Databricks profile agree again.
+        drift_notice = _databricks_workspace_drift_notice(config)
         idx = select(
             "Configure harnesses",
             options,
@@ -4366,6 +4422,8 @@ def _run_configure_harnesses_interactive() -> None:
             selectable=selectable,
             clear_on_exit=True,
             compact=True,
+            status=drift_notice,
+            status_style="bold yellow",
         )
         if idx < 0:  # Esc / q — exit
             return
