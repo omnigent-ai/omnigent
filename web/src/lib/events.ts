@@ -992,6 +992,28 @@ export interface UiOpenFileEvent {
 
 // ── Union type for all events ────────────────────────────
 
+/**
+ * `item.created_at` (epoch s) on events built from a persisted item — the
+ * same clock as the session snapshot's `updated_at`; absent when omitted.
+ */
+export interface PersistedItemStamp {
+  createdAt?: number;
+}
+
+/** Events built from a persisted `response.output_item.done` item. */
+export type OutputItemEvent = (
+  | ToolCall
+  | ToolResult
+  | NativeToolCall
+  | SlashCommand
+  | RoutingDecision
+  | TerminalCommandEvent
+  | MessageDone
+  | ReasoningDone
+  | ErrorEvent
+) &
+  PersistedItemStamp;
+
 export type StreamEvent =
   | ResponseCreated
   | ResponseQueued
@@ -1004,18 +1026,10 @@ export type StreamEvent =
   | ReasoningStarted
   | ReasoningDelta
   | ReasoningSummaryDelta
-  | ToolCall
-  | ToolResult
+  | OutputItemEvent
   | ToolOutputDelta
-  | NativeToolCall
-  | SlashCommand
-  | RoutingDecision
-  | TerminalCommandEvent
-  | MessageDone
-  | ReasoningDone
   | OutputFileDone
   | RetryEvent
-  | ErrorEvent
   | CompactionInProgress
   | CompactionCompleted
   | CompactionFailed

@@ -1415,6 +1415,43 @@ let queryClient: QueryClient | null = null;
 const streamEventRevisions = new Map<string, number>();
 conversationRegistry.subscribeDisposed((id) => streamEventRevisions.delete(id));
 
+// Server-clock (epoch s) markers compared by the periodic snapshot reconcile.
+const snapshotUpdatedAtS = new Map<string, number>();
+const newestItemCreatedAtS = new Map<string, number>();
+// Conversations whose snapshot showed a lifecycle edge the stream never
+// delivered; cleared once a snapshot is recorded with its items.
+const itemBackfillPending = new Set<string>();
+conversationRegistry.subscribeDisposed((id) => {
+  snapshotUpdatedAtS.delete(id);
+  newestItemCreatedAtS.delete(id);
+  itemBackfillPending.delete(id);
+});
+
+function noteItemCreatedAt(id: string, createdAt: number | undefined): void {
+  if (typeof createdAt !== "number" || createdAt <= 0) return;
+  if (createdAt > (newestItemCreatedAtS.get(id) ?? 0)) newestItemCreatedAtS.set(id, createdAt);
+}
+
+/** Record a processed session snapshot and the items fetched with it. */
+function noteSnapshot(id: string, session: Session, items: ConversationItem[] = []): void {
+  itemBackfillPending.delete(id);
+  if (session.updatedAt != null) {
+    snapshotUpdatedAtS.set(id, Math.max(session.updatedAt, snapshotUpdatedAtS.get(id) ?? 0));
+  }
+  for (const item of items) noteItemCreatedAt(id, item.created_at);
+}
+
+/**
+ * True when the snapshot clock advanced past every item this tab has seen.
+ * Second-granularity stamps can miss same-second appends.
+ */
+function transcriptAdvancedUnseen(id: string, session: Session): boolean {
+  const updatedAt = session.updatedAt;
+  const lastSnapshot = snapshotUpdatedAtS.get(id);
+  if (updatedAt == null || lastSnapshot === undefined || updatedAt <= lastSnapshot) return false;
+  return updatedAt > (newestItemCreatedAtS.get(id) ?? 0);
+}
+
 // Reconnects share a binding; only one usage request may hydrate it at a time.
 const sessionUsageHydrations = new WeakSet<AbortController>();
 const sessionUsageRevisions = new WeakMap<ConversationEntry, { cost: number; models: number }>();
@@ -4716,6 +4753,7 @@ async function bindStream(
     ]);
     if (isConversationDisposed(id)) return;
     const items = page.items;
+    noteSnapshot(id, session, items);
     const snapshotNativeMessageIds = nativeCompletedMessageIds(items);
     snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
 
@@ -5226,12 +5264,31 @@ async function reconcileLaunchStatus(id: string, set: Setter, get: Getter): Prom
   set((s) => (s.sandboxStatus === before ? launchSnapshotPatch(session, s) : {}));
 }
 
+/** Run `request` under a signal that the stream's teardown or the reconcile timeout aborts. */
+async function withReconcileDeadline<T>(
+  controller: AbortController,
+  request: (signal: AbortSignal) => Promise<T>,
+): Promise<T> {
+  const deadline = new AbortController();
+  const abort = () => deadline.abort();
+  controller.signal.addEventListener("abort", abort, { once: true });
+  const timeout = window.setTimeout(abort, ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS);
+  try {
+    return await request(deadline.signal);
+  } finally {
+    window.clearTimeout(timeout);
+    controller.signal.removeEventListener("abort", abort);
+  }
+}
+
 /**
  * Reconcile the visible conversation's lifecycle from its persisted snapshot.
  *
  * A stream pump can keep receiving heartbeats while missing a lifecycle event.
  * Periodically re-read durable status, discarding a snapshot if any semantic
- * stream event arrives during the fetch.
+ * stream event arrives during the fetch. When the snapshot shows transcript
+ * activity or a lifecycle edge the stream never delivered, backfill the items
+ * as a reconnect would.
  */
 async function reconcileActiveSessionStatus(
   id: string,
@@ -5249,23 +5306,13 @@ async function reconcileActiveSessionStatus(
   }
   const stateBeforeFetch = get();
   const revisionBeforeFetch = streamEventRevisions.get(id) ?? 0;
-  const snapshotController = new AbortController();
-  const abortSnapshot = () => snapshotController.abort();
-  controller.signal.addEventListener("abort", abortSnapshot, { once: true });
-  const snapshotTimeout = window.setTimeout(
-    abortSnapshot,
-    ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS,
-  );
   let session: Session;
   try {
     // This read must not join the shared React Query request: an older request
     // could have started before the live event this reconciliation follows.
-    session = await getSessionSlim(id, { signal: snapshotController.signal });
+    session = await withReconcileDeadline(controller, (signal) => getSessionSlim(id, { signal }));
   } catch {
     return;
-  } finally {
-    window.clearTimeout(snapshotTimeout);
-    controller.signal.removeEventListener("abort", abortSnapshot);
   }
   const current = get();
   if (
@@ -5293,16 +5340,23 @@ async function reconcileActiveSessionStatus(
     return blocks === null ? patch : { ...patch, blocks };
   });
   if (session.usageIncluded === false) void hydrateSessionUsage(id);
+  // No event arrived during the fetch, so a changed status is an edge the stream
+  // dropped, along with that turn's items.
+  if (session.status !== stateBeforeFetch.sessionStatus) itemBackfillPending.add(id);
+  const missedItems = itemBackfillPending.has(id) || transcriptAdvancedUnseen(id, session);
+  if (!missedItems) noteSnapshot(id, session);
   const ignored = nativePreviewTombstonesByController.get(controller);
-  if (
-    ignored &&
+  const previewInterrupted =
+    ignored !== undefined &&
     get().blocks.some(
       (block) =>
         isLiveProvisionalBlock(block) && block.type === "text_done" && block.previewInterrupted,
-    )
-  ) {
-    // Retry a missed final-item backfill on the existing status-reconcile cadence.
-    await reconcileOnReconnect(id, set, get, ignored);
+    );
+  if (missedItems || previewInterrupted) {
+    // Backfill items the open stream never carried, on the status-reconcile cadence.
+    await withReconcileDeadline(controller, (signal) =>
+      reconcileOnReconnect(id, set, get, ignored, { session, signal }),
+    );
   }
 }
 
@@ -5517,16 +5571,19 @@ async function rehydrateWindowOnReconnect(
   get: Getter,
   ignoredNativeMessageIds: Set<string>,
   launchBeforeFetch: ConversationState["mcpStartupLaunch"] | undefined,
+  applyStatus: boolean,
+  signal: AbortSignal | undefined,
 ): Promise<void> {
   // Pinned at entry (still the caller's generation — its guards just passed).
   const generation = get().historyGeneration;
   let fresh: SessionItemsPage;
   try {
-    fresh = await fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS });
+    fresh = await fetchSessionItemsPage(id, { limit: INITIAL_WINDOW_ITEMS, signal });
   } catch {
     return;
   }
   if (isConversationDisposed(id) || get().historyGeneration !== generation) return;
+  noteSnapshot(id, session, fresh.items);
   const snapshotNativeMessageIds = nativeCompletedMessageIds(fresh.items);
   snapshotNativeMessageIds.forEach((messageId) => ignoredNativeMessageIds.add(messageId));
   const freshBlocks = itemsToBlocks(fresh.items);
@@ -5549,7 +5606,9 @@ async function rehydrateWindowOnReconnect(
       windowBlocks,
       withoutRebuiltUserInputCards(tail, windowBlocks),
     );
-    const statusPatch = reconnectStatusPatch(session, s, launchBeforeFetch);
+    const statusPatch: Partial<ChatState> = applyStatus
+      ? reconnectStatusPatch(session, s, launchBeforeFetch)
+      : {};
     const blocks =
       reconcileElicitationBlocks(
         merged,
@@ -5600,14 +5659,19 @@ async function rehydrateWindowOnReconnect(
  * re-hydrate. Swallows fetch errors: a transient
  * failure just means the next reconnect retries. All writes are
  * `historyGeneration`-guarded so a window reset mid-fetch voids them.
+ * The periodic status reconcile passes the snapshot whose status it already
+ * applied, which is not re-applied here, and a signal bounding the item fetches.
  */
 async function reconcileOnReconnect(
   id: string,
   set: Setter,
   get: Getter,
   ignoredNativeMessageIds: Set<string> = new Set<string>(),
+  snapshot?: { session: Session; signal: AbortSignal },
 ): Promise<void> {
   if (queryClient === null) return;
+  const applyStatus = snapshot === undefined;
+  const signal = snapshot?.signal;
   const launchBeforeFetch = mcpStartupBeforeSnapshot(id, get());
   // Captured before any await: the ids rendered BEFORE the gap. The overlap
   // check below must not be satisfied by items the reconnected pump appends
@@ -5629,13 +5693,14 @@ async function reconcileOnReconnect(
   let page: SessionItemsPage;
   try {
     [session, page] = await Promise.all([
-      queryClient.fetchQuery({
-        queryKey: ["session", id],
-        queryFn: () => getSessionSlim(id),
-        staleTime: 0,
-        retry: false,
-      }),
-      fetchSessionItemsPage(id),
+      snapshot?.session ??
+        queryClient.fetchQuery({
+          queryKey: ["session", id],
+          queryFn: () => getSessionSlim(id),
+          staleTime: 0,
+          retry: false,
+        }),
+      fetchSessionItemsPage(id, { signal }),
     ]);
   } catch {
     return;
@@ -5657,7 +5722,7 @@ async function reconcileOnReconnect(
     if (!cursor) break;
     let older: SessionItemsPage;
     try {
-      older = await fetchSessionItemsPage(id, { olderThan: cursor });
+      older = await fetchSessionItemsPage(id, { olderThan: cursor, signal });
     } catch (error) {
       // A cursor whose item was deleted can never be paged past. Stop the
       // backfill with the gap still uncovered so the full rehydrate below
@@ -5684,6 +5749,8 @@ async function reconcileOnReconnect(
       get,
       ignoredNativeMessageIds,
       launchBeforeFetch,
+      applyStatus,
+      signal,
     );
     return;
   }
@@ -5702,7 +5769,7 @@ async function reconcileOnReconnect(
         ? withoutInterruptedNativePreviews(currentBlocks, ignoredNativeMessageIds)
         : currentBlocks;
     const patch: Partial<ChatState> = {
-      ...reconnectStatusPatch(session, s, launchBeforeFetch),
+      ...(applyStatus ? reconnectStatusPatch(session, s, launchBeforeFetch) : {}),
       // A gap-committed item can be a send whose POST died in the gap: it
       // retracts the draft, or marks it refused when the snapshot says the
       // runner rejected the forward (see `reconcileSendDraftWithSnapshot`).
@@ -5757,6 +5824,8 @@ async function reconcileOnReconnect(
     if (nextBlocks !== s.blocks) patch.blocks = nextBlocks;
     return patch;
   });
+  // Record only after the backfill applies; failure paths return so the next tick retries.
+  noteSnapshot(id, session, items);
 }
 
 // ── Presence idle reporting ─────────────────────────────────────────
@@ -8770,6 +8839,7 @@ async function* tapSessionEvents(
   for await (const event of events) {
     if (!isConversationDisposed(conversationId)) {
       streamEventRevisions.set(conversationId, (streamEventRevisions.get(conversationId) ?? 0) + 1);
+      if ("createdAt" in event) noteItemCreatedAt(conversationId, event.createdAt);
     }
     if (event.type === "session_status" || event.type === "session_interrupted") {
       beforeTurnEdge?.();

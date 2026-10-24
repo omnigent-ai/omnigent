@@ -122,6 +122,7 @@ describe("createSession", () => {
         agent_id: "agent_xyz",
         status: "idle",
         created_at: 1704067200,
+        updated_at: 1704067260,
         items: [],
       }),
     );
@@ -147,6 +148,7 @@ describe("createSession", () => {
       archived: false,
       status: "idle",
       createdAt: 1704067200,
+      updatedAt: 1704067260,
       title: null,
       items: [],
       queuedItems: undefined,
