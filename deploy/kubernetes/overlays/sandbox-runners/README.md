@@ -198,6 +198,22 @@ from it for both the launch-time clone and the agent's later `fetch` / `push`,
 writing nothing to disk — use HTTPS repository URLs. Details by provider match the
 [Modal git guide](../../../modal/README.md#git-credentials-private-repositories).
 
+**More than one git host.** The helper resolves the token *per host*, so a sandbox
+that talks to several hosts (e.g. `github.com` **and** a self-hosted Forgejo/Gitea)
+gives each its own token instead of sending one token to all of them. For a host
+`H`, a `GIT_TOKEN_<H>` / `GIT_USERNAME_<H>` pair — `<H>` is the host upper-cased with
+every non-alphanumeric byte turned into `_` — takes precedence over the shared
+`GIT_TOKEN` / `GIT_USERNAME`. For example, to authenticate `git.joyful.house`:
+
+```
+GIT_TOKEN_GIT_JOYFUL_HOUSE=<forgejo token>
+GIT_USERNAME_GIT_JOYFUL_HOUSE=<forgejo user>
+```
+
+`github.com` stays served by the per-user GitHub broker when the owner has GitHub
+connected. See [`deploy/docker/git-credential-omnigent`](../../../docker/git-credential-omnigent)
+for the exact resolution rules.
+
 ## Configuration (`sandbox-config.yaml`)
 
 | Key | Meaning |
