@@ -743,19 +743,9 @@ def _codex_model_upgrade_target(catalog: object, model: str) -> str | None:
     entry = _codex_model_catalog_entry(catalog, model)
     if entry is None:
         return None
-    upgrade_info = entry.get("upgradeInfo")
-    if isinstance(upgrade_info, dict):
-        target = upgrade_info.get("model") or upgrade_info.get("id")
-    else:
-        upgrade = entry.get("upgrade")
-        if isinstance(upgrade, dict):
-            target = upgrade.get("model") or upgrade.get("id")
-        else:
-            target = upgrade
-    if not isinstance(target, str):
-        return None
-    from omnigent.models.codex_model_vocabulary import comparable_model_id
+    from omnigent.models.codex_model_vocabulary import codex_upgrade_target, comparable_model_id
 
+    target = codex_upgrade_target(entry)
     if target and comparable_model_id(target) != comparable_model_id(model):
         return target
     return None

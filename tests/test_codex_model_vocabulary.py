@@ -11,6 +11,7 @@ from omnigent.models.codex_model_vocabulary import (
     clamp_spawn_effort,
     codex_reachable_model_slug,
     codex_spawn_model,
+    codex_upgrade_target,
     comparable_model_id,
 )
 from omnigent.util.reasoning_effort import clamp_effort_for_model
@@ -103,6 +104,29 @@ def test_every_extended_model_declares_a_ladder_and_a_fallback() -> None:
         assert EXTENDED_MODEL_EFFORTS.get(bare)
         fallback = EXTENDED_MODEL_DEFAULT_EFFORT.get(bare)
         assert fallback in EXTENDED_MODEL_EFFORTS[bare]
+
+
+@pytest.mark.parametrize(
+    ("row", "expected"),
+    [
+        ({"id": "gpt-5.5", "upgrade": "gpt-6-sol"}, "gpt-6-sol"),
+        ({"id": "gpt-5.5", "upgrade": {"model": "gpt-6-sol"}}, "gpt-6-sol"),
+        ({"id": "gpt-5.5", "upgrade": {"id": "gpt-6-sol"}}, "gpt-6-sol"),
+        ({"id": "gpt-5.5", "upgradeInfo": {"id": "gpt-6-sol"}}, "gpt-6-sol"),
+        # ``model/list``'s structured field wins over the legacy string.
+        (
+            {"id": "gpt-5.5", "upgrade": "gpt-5.6-sol", "upgradeInfo": {"model": "gpt-6-sol"}},
+            "gpt-6-sol",
+        ),
+        ({"id": "gpt-6-sol", "upgrade": None}, None),
+        ({"id": "gpt-6-sol", "upgrade": ""}, None),
+        ({"id": "gpt-6-sol"}, None),
+    ],
+)
+def test_codex_upgrade_target_reads_either_row_shape(
+    row: dict[str, object], expected: str | None
+) -> None:
+    assert codex_upgrade_target(row) == expected
 
 
 def test_comparable_model_id_folds_prefix_dots_and_case() -> None:

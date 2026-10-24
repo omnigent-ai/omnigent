@@ -284,6 +284,33 @@ def test_model_family_agrees_with_the_shared_token_rule(model: str, expected: st
         assert model_family_mismatch("codex", model) is None
 
 
+@pytest.mark.parametrize(
+    ("preferred", "expected"),
+    [
+        (["opus", "sonnet", "haiku"], ["haiku", "sonnet", "opus"]),
+        # Spellings of one model keep their host order, adjacent or not.
+        (
+            ["claude-sonnet-4-6", "claude-haiku-4-5", "claude-sonnet-4-6[1m]"],
+            ["claude-haiku-4-5", "claude-sonnet-4-6", "claude-sonnet-4-6[1m]"],
+        ),
+        (
+            ["claude-sonnet-4.6", "claude-haiku-4-5", "claude-sonnet-4-6"],
+            ["claude-haiku-4-5", "claude-sonnet-4.6", "claude-sonnet-4-6"],
+        ),
+        (
+            ["databricks-claude-opus-5", "claude-haiku-4-5", "claude-opus-5"],
+            ["claude-haiku-4-5", "databricks-claude-opus-5", "claude-opus-5"],
+        ),
+    ],
+)
+def test_routing_order_from_preference_reverses_models_not_spellings(
+    preferred: list[str], expected: list[str]
+) -> None:
+    from omnigent.server.smart_routing import routing_order_from_preference
+
+    assert routing_order_from_preference(preferred) == expected
+
+
 def test_catalog_models_for_harness_matches_worker_rows() -> None:
     from omnigent.server.smart_routing import catalog_models_for_harness
 
@@ -3046,6 +3073,40 @@ async def test_route_session_harness_skips_the_static_top_up_off_gateway() -> No
     # up from the static table.
     assert list(local.offered[0]) == ["claude-native"]
     assert not any(m.startswith("databricks-") for m in local.offered[0]["claude-native"])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("current", "judged"),
+    [
+        (
+            ["claude-sonnet-4-6", "claude-opus-5"],
+            ["claude-sonnet-4-6", "claude-opus-5"],
+        ),
+        # A harness with no current models offers the judge everything.
+        ([], ["claude-sonnet-4-6", "claude-opus-4-8", "claude-opus-5"]),
+    ],
+)
+async def test_route_session_harness_narrows_only_the_judges_menu(
+    current: list[str], judged: list[str]
+) -> None:
+    """A judge catalog narrows its harness; a statically topped-up one offers all."""
+    local = FakeRoutingClient(
+        RoutingResult(model="claude-opus-5", rationale="hard", harness="claude-native")
+    )
+    caps = FakeCaps(routing_client=local, routing_backends=RoutingBackends(local=local))
+    with patch("omnigent.runtime._globals._caps", new=caps):
+        harness, model, _verdict, error = await route_session_harness(
+            "hello",
+            harness_candidates=("claude-native", "codex-native"),
+            catalog={"claude-native": ["claude-sonnet-4-6", "claude-opus-4-8", "claude-opus-5"]},
+            judge_catalog={"claude-native": current},
+        )
+    assert error is None
+    assert (harness, model) == ("claude-native", "claude-opus-5")
+    assert local.offered == [
+        {"claude-native": judged, "codex-native": infer_models("codex-native")}
+    ]
 
 
 @pytest.mark.asyncio
