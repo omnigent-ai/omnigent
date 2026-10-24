@@ -1109,20 +1109,23 @@ describe("side-chat slash commands", () => {
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
 
-  it("routes a known skill through the slash_command path on an in-process harness", () => {
-    conversationRegistry
-      .acquire(childId)
-      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
-    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
-    renderPane(<SideChatPane childId={childId} />);
-    typeSlash("/review 123");
-    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
-    expect(sendSlashCommand).toHaveBeenCalledExactlyOnceWith("review", "123", "agent_side", {
-      pinnedConversationId: childId,
-    });
-    expect(send).not.toHaveBeenCalled();
-    expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
-  });
+  it.each(["idle", "running"] as const)(
+    "routes a known skill through the slash_command path on an in-process harness (%s)",
+    (sessionStatus) => {
+      conversationRegistry
+        .acquire(childId)
+        .setState({ sessionHarness: "claude-sdk", sessionStatus });
+      skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+      renderPane(<SideChatPane childId={childId} />);
+      typeSlash("/review 123");
+      fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+      expect(sendSlashCommand).toHaveBeenCalledExactlyOnceWith("review", "123", "agent_side", {
+        pinnedConversationId: childId,
+      });
+      expect(send).not.toHaveBeenCalled();
+      expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+    },
+  );
 
   it("prefers a multi-word skill over a built-in matching only its first word", () => {
     conversationRegistry
