@@ -992,6 +992,74 @@ async def test_local_import_id_collision_counts_as_already_imported(
     assert body["failures"] == []
 
 
+async def test_local_import_by_id_dedupes_on_host_reported_session_id(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An id the host resolves to an already-imported session counts as already imported."""
+    from omnigent.server.routes import imports as imports_module
+
+    SqlAlchemyAgentStore(db_uri).create(
+        builtin_agent_id("codex-native-ui"),
+        name="codex-native-ui",
+        bundle_location="builtin://codex-native-ui",
+    )
+    requested_ids: list[object] = []
+
+    async def _fake_stream(**kwargs: object):
+        requested_ids.append(kwargs.get("session_id"))
+        yield {
+            "external_session_id": "codex-thread-1",
+            "workspace": None,
+            "items": [
+                {
+                    "type": "message",
+                    "response_id": "codex:1",
+                    "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+                }
+            ],
+            "title": "Native thread",
+            "source": "codex",
+        }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            SqlAlchemyConversationStore(db_uri),
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    tallies: list[tuple[int, int, int]] = []
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        for session_id in ("codex-thread-1", "omnigent-session-1"):
+            resp = await c.post(
+                "/v1/imports/local",
+                json={
+                    "host_id": "host_0123456789abcdef0123456789abcdef",
+                    "source": "codex",
+                    "session_id": session_id,
+                },
+            )
+            assert resp.status_code == 200
+            body = resp.json()
+            tallies.append((body["imported"], body["already_imported"], body["failed"]))
+
+    assert requested_ids == ["codex-thread-1", "omnigent-session-1"]
+    assert tallies == [(1, 0, 0), (0, 1, 0)]
+
+
 @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])
 async def test_local_import_endpoints_redact_host_error(
     db_uri: str,

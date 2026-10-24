@@ -7,7 +7,7 @@ import os
 import re
 import sqlite3
 import subprocess
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from hashlib import sha256
 from pathlib import Path
 from typing import get_args
@@ -17,7 +17,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTranscriptItem,
     read_transcript_items_from_offset,
 )
-from omnigent.harnesses.codex_native.bridge import bridge_root
+from omnigent.harnesses.codex_native.bridge import bridge_root, read_bridge_state
 from omnigent.harnesses.codex_native.main import _CODEX_THREAD_ID_RE
 from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
 from omnigent.harnesses.kimi_native.forwarder import (
@@ -255,24 +255,48 @@ def _unique_paths(paths: Sequence[Path]) -> tuple[Path, ...]:
     return tuple(unique)
 
 
-def _codex_native_storage_homes() -> tuple[Path, ...]:
-    """Return private Codex homes under the producer's bridge root."""
+def _codex_native_bridge_dirs() -> tuple[Path, ...]:
+    """Return real bridge directories under the producer's bridge root."""
     root = bridge_root()
     try:
-        bridge_dirs = tuple(root.iterdir())
+        entries = tuple(root.iterdir())
     except OSError:
         return ()
-    homes: list[Path] = []
-    for bridge_dir in bridge_dirs:
+    bridge_dirs: list[Path] = []
+    for entry in entries:
         try:
-            if not bridge_dir.is_dir() or bridge_dir.is_symlink():
-                continue
-            codex_home = bridge_dir / "codex-home"
+            if entry.is_dir() and not entry.is_symlink():
+                bridge_dirs.append(entry)
+        except OSError:
+            continue
+    return tuple(bridge_dirs)
+
+
+def _codex_native_storage_homes() -> tuple[Path, ...]:
+    """Return private Codex homes under the producer's bridge root."""
+    homes: list[Path] = []
+    for bridge_dir in _codex_native_bridge_dirs():
+        codex_home = bridge_dir / "codex-home"
+        try:
             if codex_home.is_dir() and not codex_home.is_symlink():
                 homes.append(codex_home)
         except OSError:
             continue
     return tuple(homes)
+
+
+def _codex_native_thread_ids(omnigent_session_id: str) -> frozenset[str]:
+    """Return the Codex thread ids that native bridges record for an Omnigent session id."""
+    thread_ids: set[str] = set()
+    for bridge_dir in _codex_native_bridge_dirs():
+        try:
+            state = read_bridge_state(bridge_dir)
+        except (ValueError, RecursionError):
+            # The JSON decoder rejects oversized integers and deep nesting this way.
+            continue
+        if state is not None and state.session_id == omnigent_session_id:
+            thread_ids.add(state.thread_id)
+    return frozenset(thread_ids)
 
 
 def _codex_storage_homes(codex_home: Path | None = None) -> tuple[Path, ...]:
@@ -695,20 +719,20 @@ def _codex_response_item(
 
 
 def _find_codex_rollout_in_homes(
-    homes: Sequence[Path], session_id: str
-) -> tuple[Path, Path] | None:
-    """Return the newest matching Codex rollout and its containing home."""
-    selected: tuple[Path, Path] | None = None
+    homes: Sequence[Path], thread_ids: Collection[str]
+) -> tuple[Path, Path, str] | None:
+    """Return the newest matching Codex rollout, its home, and its thread id."""
+    selected: tuple[Path, Path, str] | None = None
     selected_mtime = 0.0
     for path, home, candidate_id in _codex_rollout_candidates(homes):
-        if candidate_id != session_id:
+        if candidate_id not in thread_ids:
             continue
         try:
             modified_at = path.stat().st_mtime
         except OSError:
             continue
         if selected is None or modified_at > selected_mtime:
-            selected = (path, home)
+            selected = (path, home, candidate_id)
             selected_mtime = modified_at
     return selected
 
@@ -805,11 +829,14 @@ def load_codex_session(
     *,
     codex_home: Path | None = None,
 ) -> LocalSessionImport:
-    """Load one Codex session from its local rollout JSONL file."""
-    selected = _find_codex_rollout_in_homes(_codex_storage_homes(codex_home), session_id)
+    """Load one Codex session by thread id, or by the Omnigent id of a native session."""
+    homes = _codex_storage_homes(codex_home)
+    selected = _find_codex_rollout_in_homes(homes, {session_id})
+    if selected is None and codex_home is None:
+        selected = _find_codex_rollout_in_homes(homes, _codex_native_thread_ids(session_id))
     if selected is None:
         raise SessionImportNotFoundError(f"Codex session {session_id!r} was not found")
-    rollout_path, home = selected
+    rollout_path, home, thread_id = selected
 
     # Past the size threshold, restart from each compaction boundary so the
     # import matches what the agent resumes with, dropping the pre-compaction
@@ -859,10 +886,10 @@ def load_codex_session(
         raise SessionImportNotFoundError(f"Codex session {session_id!r} has no importable history")
     return LocalSessionImport(
         source="codex",
-        external_session_id=session_id,
+        external_session_id=thread_id,
         workspace=workspace,
         items=tuple(items),
-        native_title=_codex_native_title(home, session_id),
+        native_title=_codex_native_title(home, thread_id),
     )
 
 

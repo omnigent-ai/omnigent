@@ -8826,7 +8826,7 @@ async def test_handle_import_local_all_streams_a_frame_per_session(
 async def test_handle_import_local_exact_id_does_not_list_sessions(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """An exact harness/id request loads that transcript without enumeration."""
+    """An exact request loads that transcript without enumeration and reports its loaded id."""
     from omnigent.host.frames import HostImportLocalDoneFrame, HostImportLocalSessionFrame
 
     host = _make_host_process()
@@ -8842,7 +8842,7 @@ async def test_handle_import_local_exact_id_does_not_list_sessions(
             data=SimpleNamespace(model_dump=lambda **_kw: {"role": "user"}),
         )
         return SimpleNamespace(
-            external_session_id=session_id,
+            external_session_id="thread-exact",
             workspace="/repo",
             items=[item],
             title="Exact session",
@@ -8875,7 +8875,7 @@ async def test_handle_import_local_exact_id_does_not_list_sessions(
     frames = [decode_host_frame(text) for text in sent]
     session_frames = [f for f in frames if isinstance(f, HostImportLocalSessionFrame)]
     done_frames = [f for f in frames if isinstance(f, HostImportLocalDoneFrame)]
-    assert [f.session.external_session_id for f in session_frames] == ["session-exact"]
+    assert [f.session.external_session_id for f in session_frames] == ["thread-exact"]
     assert session_frames[0].total == 1
     assert len(done_frames) == 1 and done_frames[0].status == "ok"
 
