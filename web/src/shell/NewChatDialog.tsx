@@ -233,6 +233,7 @@ import {
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
 import {
   isAcpHarnessAgent,
+  isHeadlessCliHarness,
   partitionAgentsByKind,
   selectableSessionAgents,
 } from "@/lib/agentGrouping";
@@ -2292,11 +2293,19 @@ export function NewChatLandingScreen() {
   // user's own agents stay under "Agents" even on a native harness, so one never
   // passes for a harness row (or for the Claude Code wrapper Smart Routing binds).
   const harnessEntries = useMemo(
-    () => agentList.filter((a) => !a.mine && (isNativeCodingAgent(a) || isAcpHarnessAgent(a))),
+    () =>
+      agentList.filter(
+        (a) =>
+          !a.mine && (isNativeCodingAgent(a) || isAcpHarnessAgent(a) || isHeadlessCliHarness(a)),
+      ),
     [agentList],
   );
   const agentEntries = useMemo(
-    () => agentList.filter((a) => a.mine || (!isNativeCodingAgent(a) && !isAcpHarnessAgent(a))),
+    () =>
+      agentList.filter(
+        (a) =>
+          a.mine || (!isNativeCodingAgent(a) && !isAcpHarnessAgent(a) && !isHeadlessCliHarness(a)),
+      ),
     [agentList],
   );
 

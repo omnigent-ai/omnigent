@@ -163,6 +163,16 @@ DEVIN_KEY = "devin"
 
 _DEVIN_INSTALL_HINT = "curl -fsSL https://cli.devin.ai/install.sh | bash"
 
+# Genie is Databricks' fork of the Codex CLI. Like Codex, it wraps a binary
+# called ``genie`` with no separate login command (authenticates via Databricks
+# profile / Unity Gateway). Binary-only readiness; no npm package.
+GENIE_KEY = "genie"
+
+_GENIE_INSTALL_HINT = (
+    "curl -fsSL https://github.com/databricks/genie-code-cli/releases/latest/download/install.sh"
+    " | bash"
+)
+
 # Anthropic recommends its native installer over ``npm install -g``: it writes
 # to a user-writable ``~/.local/bin`` and self-updates, so it sidesteps the
 # EACCES failure on a root-owned npm global prefix.
@@ -331,6 +341,14 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_command=("bash", "-c", _DEVIN_INSTALL_HINT),
         auth_hint="run `devin auth login` (Omnigent stores no Devin credential)",
     ),
+    GENIE_KEY: HarnessInstallSpec(
+        "Genie",
+        "genie",
+        package=None,
+        login_args=None,
+        install_hint=_GENIE_INSTALL_HINT,
+        install_command=("bash", "-c", _GENIE_INSTALL_HINT),
+    ),
 }
 
 
@@ -402,6 +420,9 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary through the catalog.
     "devin-native": DEVIN_KEY,
     "native-devin": DEVIN_KEY,
+    # Genie is Databricks' fork of Codex. The headless ``genie`` harness wraps
+    # the ``genie`` CLI and gates on the same binary as any future genie-native TUI.
+    GENIE_KEY: GENIE_KEY,
 }
 
 

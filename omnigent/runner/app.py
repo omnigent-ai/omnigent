@@ -8261,6 +8261,7 @@ def _build_spawn_env_from_spec(
             _build_codex_spawn_env,
             _build_copilot_spawn_env,
             _build_cursor_spawn_env,
+            _build_genie_spawn_env,
             _build_goose_spawn_env,
             _build_hermes_spawn_env,
             _build_kimi_spawn_env,
@@ -8274,6 +8275,13 @@ def _build_spawn_env_from_spec(
         elif harness == "codex":
             env = _build_codex_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
             env["HARNESS_CODEX_SKILLS_DIR"] = (
+                str(resource_registry.codex_skills_dir(session_id))
+                if resource_registry is not None and session_id is not None
+                else ""
+            )
+        elif harness == "genie":
+            env = _build_genie_spawn_env(effective_spec, cwd=cwd, workdir=workdir)
+            env["HARNESS_GENIE_SKILLS_DIR"] = (
                 str(resource_registry.codex_skills_dir(session_id))
                 if resource_registry is not None and session_id is not None
                 else ""

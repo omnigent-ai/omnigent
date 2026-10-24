@@ -39,6 +39,7 @@ from omnigent.onboarding import ambient, harness_install
 from omnigent.runtime.workflow import (
     _build_claude_sdk_spawn_env,
     _build_codex_spawn_env,
+    _build_genie_spawn_env,
     _build_goose_spawn_env,
     _build_hermes_spawn_env,
     _build_kimi_spawn_env,
@@ -2377,3 +2378,37 @@ def test_stale_login_cache_cannot_shadow_claude_sdk_fallback(
     assert env["HARNESS_CLAUDE_SDK_GATEWAY"] == "true"
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_BASE_URL"] == "https://anthropic.example.com/v1"
     assert env["HARNESS_CLAUDE_SDK_GATEWAY_AUTH_COMMAND"] == "printf %s sk-ant-secret"
+
+
+def test_genie_databricks_provider_threads_profile(
+    config_home: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """
+    A ``databricks``-kind default reaches the genie harness as its profile.
+
+    Without a genie builder the runner spawned genie with no
+    ``HARNESS_GENIE_*`` vars, so the executor picked the first
+    ``~/.databrickscfg`` profile and routed through the wrong workspace.
+    """
+    _write_config(
+        config_home,
+        {"providers": {"dbx": {"kind": "databricks", "default": True, "profile": "my-dbx"}}},
+    )
+    import omnigent.runtime.workflow as workflow_mod
+
+    monkeypatch.setattr(
+        workflow_mod,
+        "configure_agent_harness_with_ucode",
+        lambda env, profile, *, harness_type: None,
+    )
+    spec = _make_spec(harness="genie", model="databricks-gpt-5-4-mini")
+
+    env = _build_genie_spawn_env(spec, cwd=tmp_path / "ws", workdir=tmp_path / "bundle")
+
+    assert env["HARNESS_GENIE_GATEWAY"] == "true"
+    assert env["HARNESS_GENIE_DATABRICKS_PROFILE"] == "my-dbx"
+    assert env["HARNESS_GENIE_MODEL"] == "databricks-gpt-5-4-mini"
+    assert env["HARNESS_GENIE_CWD"] == str(tmp_path / "ws")
+    assert env["HARNESS_GENIE_BUNDLE_DIR"] == str(tmp_path / "bundle")
+    assert "HARNESS_GENIE_SKILLS_FILTER" in env
+    assert not any(key.startswith("HARNESS_CODEX_") for key in env)

@@ -446,6 +446,7 @@ def test_configured_harness_map_covers_all_spellings(
         "codex",
         "codex-native",
         "native-codex",
+        "genie",
         "openai-agents",
         "openai-agents-sdk",
         "open-responses",
@@ -574,10 +575,12 @@ def test_configured_harness_map_gates_only_cli_harnesses(
     # this group — it is now auth-aware like the other native CLI harnesses, so
     # its missing binary surfaces as ``"binary-missing"`` too. Pi is also here —
     # it reports the credential axis (no CLI login; its credential is a provider).
+    # Genie is binary-gated like codex (but with the genie binary, not codex's).
     for missing in (
         "codex",
         "codex-native",
         "native-codex",
+        "genie",
         "claude-native",
         "native-claude",
         "opencode-native",
@@ -748,6 +751,55 @@ def test_configured_harness_map_probes_codex_readiness_once(
     assert result["codex"] == "needs-auth"
     assert result["codex-native"] == "needs-auth"
     assert result["native-codex"] == "needs-auth"
+
+
+def test_genie_readiness_never_shares_the_codex_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """A missing genie binary must not mark Codex unavailable, or vice versa.
+
+    Genie is codex-family for model routing, but the readiness map caches every
+    codex-family spelling under one key probed with whichever spelling it meets
+    first; genie landing first made Codex report genie's "binary missing".
+    """
+    from omnigent.onboarding import harness_readiness
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.main._codex_auth_unavailable_reason",
+        lambda: None,
+    )
+    monkeypatch.setattr(
+        harness_readiness,
+        "_binary_availability_reason",
+        lambda key: "binary-missing" if key == "genie" else True,
+    )
+
+    result = configured_harness_map()
+
+    assert harness_readiness._is_codex_family_harness("genie") is False
+    assert result["genie"] == "binary-missing"
+    assert result["codex"] is True
+    assert result["codex-native"] is True
+
+
+@pytest.mark.parametrize(("installed", "expected"), [(False, False), (True, True)])
+def test_genie_quick_probe_agrees_with_picker_map(
+    monkeypatch: pytest.MonkeyPatch, installed: bool, expected: bool
+) -> None:
+    """``harness_is_configured`` gates genie on its binary, like the picker map.
+
+    The host's readiness loop re-probes unavailable harnesses with
+    ``harness_is_configured``; if it said True while the map said
+    "binary-missing", every tick looked like a fresh install and forced a
+    full readiness refresh.
+    """
+    from omnigent.onboarding import harness_readiness
+
+    monkeypatch.setattr(
+        harness_readiness,
+        "_binary_availability_reason",
+        lambda key: True if installed else "binary-missing",
+    )
+
+    assert harness_readiness.harness_is_configured("genie") is expected
 
 
 def test_configured_harness_map_runs_independent_probes_concurrently(

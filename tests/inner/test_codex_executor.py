@@ -4215,7 +4215,7 @@ def test_app_server_negotiates_direct_tools_from_server_version(
     """Only compatible servers receive the direct dynamic-tool setting."""
     monkeypatch.setattr(
         "omnigent.inner.codex_executor._codex_home_config_source_from_env",
-        lambda: tmp_path / "empty-config",
+        lambda *_args, **_kwargs: tmp_path / "empty-config",
     )
     monkeypatch.setattr(
         "omnigent.inner.codex_executor.populate_codex_skills_from_bundle",

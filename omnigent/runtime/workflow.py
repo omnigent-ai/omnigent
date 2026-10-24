@@ -159,7 +159,15 @@ _logger = logging.getLogger(__name__)
 
 
 AgentHarnessType = Literal[
-    "claude-sdk", "codex", "pi", "openai-agents-sdk", "antigravity", "kimi", "qwen", "goose"
+    "claude-sdk",
+    "codex",
+    "genie",
+    "pi",
+    "openai-agents-sdk",
+    "antigravity",
+    "kimi",
+    "qwen",
+    "goose",
 ]
 
 
@@ -213,6 +221,20 @@ _UCODE_HARNESS_CONFIGS: dict[AgentHarnessType, UcodeHarnessConfig] = {
         host_key="HARNESS_CODEX_GATEWAY_HOST",
         auth_key="HARNESS_CODEX_GATEWAY_AUTH_COMMAND",
         refresh_key="HARNESS_CODEX_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
+        catalog_family="openai",
+    ),
+    # Genie is Databricks' codex fork; same gateway transport as codex, its
+    # own ``HARNESS_GENIE_*`` env vars. ``agent_name="genie"`` means a host
+    # with no ucode ``genie`` agent simply skips ucode enrichment.
+    "genie": UcodeHarnessConfig(
+        agent_name="genie",
+        model_key="HARNESS_GENIE_MODEL",
+        base_url_key="HARNESS_GENIE_GATEWAY_BASE_URL",
+        base_url_family="codex",
+        base_urls_key=None,
+        host_key="HARNESS_GENIE_GATEWAY_HOST",
+        auth_key="HARNESS_GENIE_GATEWAY_AUTH_COMMAND",
+        refresh_key="HARNESS_GENIE_GATEWAY_AUTH_REFRESH_INTERVAL_MS",
         catalog_family="openai",
     ),
     "pi": UcodeHarnessConfig(
@@ -490,6 +512,7 @@ def _inject_ucode_agent_state(
 _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
     "claude-sdk": ANTHROPIC_FAMILY,
     "codex": OPENAI_FAMILY,
+    "genie": OPENAI_FAMILY,
     "openai-agents-sdk": OPENAI_FAMILY,
     # Antigravity is Gemini-native but routes generic-provider traffic over
     # the OpenAI-compatible wire (OpenRouter / LiteLLM / Databricks gateway),
@@ -508,6 +531,7 @@ _PROVIDER_HARNESS_FAMILY: dict[AgentHarnessType, str] = {
 _HARNESS_GATEWAY_FLAG: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_GATEWAY",
     "codex": "HARNESS_CODEX_GATEWAY",
+    "genie": "HARNESS_GENIE_GATEWAY",
     "pi": "HARNESS_PI_GATEWAY",
     "qwen": "HARNESS_QWEN_GATEWAY",
 }
@@ -528,6 +552,7 @@ _PI_FAMILY_KEY: dict[str, str] = {
 _HARNESS_DATABRICKS_PROFILE: dict[AgentHarnessType, str] = {
     "claude-sdk": "HARNESS_CLAUDE_SDK_DATABRICKS_PROFILE",
     "codex": "HARNESS_CODEX_DATABRICKS_PROFILE",
+    "genie": "HARNESS_GENIE_DATABRICKS_PROFILE",
     "pi": "HARNESS_PI_DATABRICKS_PROFILE",
     "openai-agents-sdk": "HARNESS_OPENAI_AGENTS_DATABRICKS_PROFILE",
     "qwen": "HARNESS_QWEN_DATABRICKS_PROFILE",
@@ -1549,6 +1574,53 @@ def _build_codex_spawn_env(
     if retry_payload is not None:
         env["HARNESS_CODEX_RETRY_POLICY"] = retry_payload
     _apply_harness_path_override(env, "codex")
+    return env
+
+
+def _build_genie_spawn_env(
+    spec: AgentSpec,
+    *,
+    cwd: Path | None = None,
+    workdir: Path | None = None,
+) -> dict[str, str]:
+    """
+    Build the env-var dict the genie harness wrap reads.
+
+    Same shape as :func:`_build_codex_spawn_env` (genie is Databricks' codex
+    fork), keyed by the ``HARNESS_GENIE_*`` vars in
+    ``omnigent/inner/genie_harness.py``. Without the provider's Databricks
+    profile here, the genie executor would fall back to the first
+    ``~/.databrickscfg`` profile and route through the wrong workspace. Codex's
+    dismissed-``config.toml`` provider handling has no genie equivalent.
+
+    :param spec: The agent spec.
+    :param cwd: Session workspace, threaded as ``HARNESS_GENIE_CWD``.
+    :param workdir: The bundle's on-disk path, threaded as
+        ``HARNESS_GENIE_BUNDLE_DIR`` so bundled skills are discovered.
+    :returns: A dict of env-var overrides for
+        :meth:`HarnessProcessManager.get_client(env=...)`.
+    """
+    env: dict[str, str] = {}
+    model = _resolve_spec_model(spec)
+    if model is not None:
+        env["HARNESS_GENIE_MODEL"] = model
+    provider = _resolve_provider_for_build(spec, harness_type="genie", for_launch=True)
+    if provider is not None:
+        configure_agent_harness_with_provider(env, provider, harness_type="genie")
+    env["HARNESS_GENIE_SKILLS_FILTER"] = json.dumps(spec.skills_filter)
+    if spec.name:
+        env["HARNESS_GENIE_AGENT_NAME"] = spec.name
+    if cwd is not None:
+        env["HARNESS_GENIE_CWD"] = str(cwd)
+    if workdir is not None:
+        env["HARNESS_GENIE_BUNDLE_DIR"] = str(workdir)
+    os_env_payload = _serialize_os_env(spec.os_env)
+    if os_env_payload is not None:
+        env["HARNESS_GENIE_OS_ENV"] = os_env_payload
+    retry_payload = _serialize_retry_policy(_resolve_retry_policy(spec))
+    if retry_payload is not None:
+        env["HARNESS_GENIE_RETRY_POLICY"] = retry_payload
+    _apply_harness_path_override(env, "genie")
     return env
 
 
