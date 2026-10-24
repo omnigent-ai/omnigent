@@ -17,6 +17,37 @@ import pytest
 from omnigent.native import _native_forwarder_health as health
 
 
+def test_native_child_activity_follows_rotation_and_ignores_previous_turn_end() -> None:
+    activity = health.NativeSubagentActivity("conv_native_activity")
+    try:
+        activity.note("thread_child", active=True, turn_id="turn_old")
+        activity.note("thread_child", active=True, turn_id="turn_new")
+        activity.note("thread_child", active=False, turn_id="turn_old")
+        assert health.has_active_subagents("conv_native_activity")
+        activity.move("conv_native_rotated")
+        assert not health.has_active_subagents("conv_native_activity")
+        assert health.has_active_subagents("conv_native_rotated")
+        activity.note("thread_child", active=False, turn_id="turn_new")
+        assert not health.has_active_subagents("conv_native_rotated")
+    finally:
+        activity.close()
+
+
+def test_old_native_forwarder_cannot_clear_or_move_replacement_child_activity() -> None:
+    old = health.NativeSubagentActivity("conv_native_replacement")
+    current = health.NativeSubagentActivity("conv_native_replacement")
+    try:
+        current.note("thread_current", active=True)
+        old.close()
+        old.move("conv_native_stale_rotation")
+        assert health.has_active_subagents("conv_native_replacement")
+        assert not health.has_active_subagents("conv_native_stale_rotation")
+    finally:
+        old.close()
+        current.close()
+    assert not health.has_active_subagents("conv_native_replacement")
+
+
 class _FakeClock:
     """Controllable monotonic clock so recency is tested over real intervals."""
 
