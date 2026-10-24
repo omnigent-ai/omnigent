@@ -2,10 +2,9 @@
 // composer's permission picker, separate from runtime approval presets.
 //
 // SCOPE: create-time only. A running codex session switches approval through
-// Codex's `/permissions` popup, which has no bypass row (bypass is a launch
-// flag) — see `@/lib/codexApprovalMode`. So the running-session picker keeps the
-// runtime presets (no bypass); this module never widens that surface, and
-// nothing here auto-enables bypass.
+// Codex's `/permissions` popup; its option list (including the bypass stance,
+// which the server delivers through the Full Access row) lives in
+// `@/lib/codexApprovalMode`. Nothing here auto-enables bypass.
 
 import {
   CODEX_NATIVE_APPROVAL_MODES,

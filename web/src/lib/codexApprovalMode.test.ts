@@ -3,19 +3,34 @@ import { describe, expect, it } from "vitest";
 import {
   CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY,
   CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS,
+  CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS,
   codexApprovalModeFromSession,
   codexApprovalModeLabel,
 } from "@/lib/codexApprovalMode";
 
 describe("codexApprovalMode", () => {
-  it("offers only the stances a running session can switch into, in popup order", () => {
-    // Read Only and the full-bypass sandbox stance are launch-only, so the
-    // runtime picker doesn't offer them.
+  it("offers the common live /permissions rows, in Codex's popup order", () => {
+    // Some Codex builds add "Read Only"; the core popup-row list keeps the
+    // always-present three, while the broader running-session picker adds
+    // "Read Only" and bypass below.
     expect(CODEX_NATIVE_RUNTIME_APPROVAL_PRESETS.map((m) => m.value)).toEqual([
       "ask-for-approval",
       "approve-for-me",
       "full-access",
     ]);
+  });
+
+  it("offers the full-bypass stance after the popup presets", () => {
+    // The running-session picker adds bypass as its last row, matching the
+    // create-time picker; the server delivers it via the Full Access row.
+    expect(CODEX_NATIVE_RUNTIME_PERMISSION_OPTIONS.map((m) => m.value)).toEqual([
+      "ask-for-approval",
+      "approve-for-me",
+      "full-access",
+      "read-only",
+      "bypass",
+    ]);
+    expect(codexApprovalModeLabel("bypass")).toBe("Bypass approvals & sandbox");
   });
 
   describe("codexApprovalModeLabel", () => {
@@ -52,11 +67,25 @@ describe("codexApprovalMode", () => {
       expect(codexApprovalModeFromSession({})).toBeNull();
       expect(codexApprovalModeFromSession(null)).toBeNull();
       expect(codexApprovalModeFromSession({ labels: {} })).toBeNull();
+    });
+
+    it("reflects an armed bypass label before any switch", () => {
+      // A bypass-launched session runs in bypass from its first turn; the
+      // pill must say so instead of showing an unset picker.
       expect(
         codexApprovalModeFromSession({
           labels: { "omnigent.codex_native.bypass_sandbox": "1" },
         }),
-      ).toBeNull();
+      ).toBe("bypass");
+      // A confirmed switch away from bypass outranks a stale armed label.
+      expect(
+        codexApprovalModeFromSession({
+          labels: {
+            "omnigent.codex_native.bypass_sandbox": "1",
+            [CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY]: "read-only",
+          },
+        }),
+      ).toBe("read-only");
     });
   });
 });
