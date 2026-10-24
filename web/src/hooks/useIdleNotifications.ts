@@ -24,8 +24,8 @@ import { useLoadedConversations } from "@/hooks/useSidebarData";
 // elicitations). That keeps it correct across reloads and counts sessions
 // that finished while the app was closed. A session is suppressed only while
 // the user is actively viewing it: the window is focused AND it's the open
-// conversation. Notifications follow the same rule — anything that needs
-// attention notifies, except the conversation you're actively looking at.
+// conversation (unless explicitly marked unread — see computeUnreadBadgeIds).
+// Notifications skip only the conversation you're actively looking at.
 //
 // Notifications are on by default — there's no settings toggle. In a plain
 // browser the Web Notifications API still requires a permission grant, so we
@@ -59,7 +59,11 @@ import {
   detectIdleTransitions,
   detectNewElicitations,
 } from "@/lib/idleTransitions";
-import { isConversationUnseen, useUnseenTick } from "@/hooks/useUnseenConversations";
+import {
+  isConversationUnseen,
+  isExplicitlyUnread,
+  useUnseenTick,
+} from "@/hooks/useUnseenConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
 
 const IDLE_BODY = "Agent finished and is ready for your input.";
@@ -113,11 +117,12 @@ function isWindowFocused(): boolean {
  * elicitations). It's recomputed from the conversation list every tick (no
  * accumulated state), so it survives reloads and counts sessions that
  * finished while the app was closed. The actively-viewed session is cleared
- * the moment the user views it.
+ * the moment the user views it, unless they explicitly marked it unread.
  *
  * :param activeConversationId: The conversation currently open in the UI, or
  *   undefined on a non-chat route, e.g. ``"conv_abc123"``. Used to suppress
- *   the notification/badge for the session the user is actively viewing.
+ *   the notification/badge for the session the user is actively viewing; the
+ *   badge still counts it once it's explicitly marked unread.
  */
 export function useIdleNotifications(activeConversationId?: string): void {
   const navigate = useNavigate();
@@ -215,17 +220,20 @@ export function useIdleNotifications(activeConversationId?: string): void {
     else void setBadgeCount(count);
   };
 
-  // Refocusing the window (focused on the open conversation) marks that
-  // conversation read: recompute from the latest list with windowFocused
-  // true, which drops the actively-viewed id from the count. The persistent
-  // last-seen baseline is advanced by ChatPage's `useMarkConversationSeen`,
-  // so the next data tick agrees with this immediate recompute.
+  // Refocusing drops the open conversation from the count unless it's explicitly unread.
+  // For a dropped one, ChatPage's `useMarkConversationSeen` advances the baseline to match.
   useEffect(() => {
     const onFocus = () => {
       windowFocusedRef.current = true;
       const convs = latestConversations.current;
       if (convs === null) return;
-      const next = computeUnreadBadgeIds(convs, activeIdRef.current, true, isConversationUnseen);
+      const next = computeUnreadBadgeIds(
+        convs,
+        activeIdRef.current,
+        true,
+        isConversationUnseen,
+        isExplicitlyUnread,
+      );
       pushBadge(next, convs);
     };
     const onBlur = () => {
@@ -262,6 +270,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
       activeIdRef.current,
       windowFocusedRef.current,
       isConversationUnseen,
+      isExplicitlyUnread,
     );
     pushBadge(next, convs);
     // pushBadge and the focus state are refs; rerun only when the map changes.
@@ -282,6 +291,7 @@ export function useIdleNotifications(activeConversationId?: string): void {
       activeConversationId,
       windowFocusedRef.current,
       isConversationUnseen,
+      isExplicitlyUnread,
     );
     pushBadge(unread, conversations);
 
