@@ -140,6 +140,47 @@ def session_title_instructions(config: Mapping[str, Any]) -> str | None:
     return value
 
 
+_runner_tunnel_binary_body_cache: tuple[Path, tuple[int, int, int, int], bool] | None = None
+
+
+def runner_tunnel_binary_request_body() -> bool:
+    """Cache successful kill-switch reads by metadata; retry failures without a rewrite."""
+    global _runner_tunnel_binary_body_cache
+    path = resolve_config_path()
+    if path is None:
+        _runner_tunnel_binary_body_cache = None
+        return True
+    path = path.absolute()
+    cached = _runner_tunnel_binary_body_cache
+    try:
+        stat = path.stat()
+        signature = (stat.st_mtime_ns, stat.st_ctime_ns, stat.st_size, stat.st_ino)
+        if cached is not None and cached[:2] == (path, signature):
+            return cached[2]
+        with open(path, encoding="utf-8") as handle:
+            data = yaml.safe_load(handle)
+    except FileNotFoundError:
+        _runner_tunnel_binary_body_cache = None
+        return True
+    except (OSError, yaml.YAMLError) as exc:
+        logger.warning("server config %s unreadable/invalid: %s — retrying kill switch", path, exc)
+        return cached[2] if cached is not None and cached[0] == path else True
+    if not isinstance(data, dict):
+        logger.warning("server config %s is not a mapping — retrying kill switch", path)
+        return cached[2] if cached is not None and cached[0] == path else True
+    raw = data.get("runner_tunnel_binary_request_body")
+    enabled = True
+    if isinstance(raw, bool):
+        enabled = raw
+    elif raw is not None:
+        logger.warning(
+            "server config runner_tunnel_binary_request_body must be a bool; using true"
+        )
+    _runner_tunnel_binary_body_cache = path, signature, enabled
+    logger.info("loaded server config from %s", path)
+    return enabled
+
+
 def _config_positive_int(key: str, default: int) -> int:
     """Read a positive-int setting from the server config, else *default*.
 
