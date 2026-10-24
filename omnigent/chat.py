@@ -82,6 +82,7 @@ from omnigent.session_host import get_session_host, route_session_request, set_s
 from omnigent.spec import load as load_spec
 from omnigent.spec._omnigent_compat import OMNIGENT_EXECUTOR_TYPE
 from omnigent.spec.parser import discover_host_skills
+from omnigent.spec.skill_sources import resolve_session_skills
 from omnigent.spec.types import AgentSpec, SkillSpec
 from omnigent.util.server_url import display_server_url
 
@@ -3738,27 +3739,22 @@ def _merge_host_skills(
     spec_path: Path,
 ) -> list[SkillSpec]:
     """
-    Merge bundled skills with host-scope skills for the REPL.
+    Merge bundled skills with the ones the session's harness exposes.
 
-    Discovers ``.claude/skills/`` and ``.agents/skills/`` walking
-    up from the agent root, deduplicates by name (bundled wins),
-    and returns the combined list.
+    Uses the web composer's resolver, searching the workspace before the
+    agent root (a temp directory when ``omnigent run --harness`` rewrites
+    the spec), so both composers offer the same commands.
 
     :param agent_spec: Parsed AgentSpec with ``.skills`` and
         ``.skills_filter``.
     :param spec_path: Path to the agent YAML or directory.
     :returns: Combined skill list, or empty list.
     """
-    bundled: list[SkillSpec] = agent_spec.skills or []
-    skills_filter = agent_spec.skills_filter
     agent_root = spec_path if spec_path.is_dir() else spec_path.parent
-    host = discover_host_skills(agent_root, skills_filter)
-    bundled_names = {s.name for s in bundled}
-    merged = list(bundled)
-    for hs in host:
-        if hs.name not in bundled_names:
-            merged.append(hs)
-    return merged
+    # Only a rewritten copy under a temp dir is a bundle boundary; the user's
+    # own agent directory sits inside the workspace and keeps its ancestor walk.
+    bundle_dir = agent_root if spec_path.resolve() in _MATERIALIZED_OVERRIDE_DIRS else None
+    return resolve_session_skills(agent_spec, (Path.cwd(), agent_root), bundle_dir)
 
 
 def _fallback_label(agent_path: Path) -> str:
