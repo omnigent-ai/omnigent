@@ -3554,7 +3554,7 @@ function ArchivedSection() {
                 <PopoverContent
                   {...settingsOverlayProps(ARCHIVED_SESSIONS_ENTRY, "projectFilter")}
                   align="start"
-                  className="min-w-(--radix-popover-trigger-width) w-auto max-w-80 gap-0 p-0"
+                  className="w-80 max-w-(--radix-popover-content-available-width) gap-0 p-0"
                 >
                   <Command shouldFilter={false} label="Search projects">
                     <CommandInput
