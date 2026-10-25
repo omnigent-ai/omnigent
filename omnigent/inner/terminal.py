@@ -1675,6 +1675,11 @@ class TerminalInstance:
         inner_str = shlex.join(inner_cmd)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
+        pane_command = [inner_str]
+        if IS_WINDOWS:
+            # A Windows tmux runs a joined command through cmd.exe, which does
+            # not understand POSIX quoting; the argv after "--" runs as given.
+            pane_command = ["--", *inner_cmd]
 
         option_commands = [
             *_tmux_managed_option_commands(
@@ -1727,7 +1732,7 @@ class TerminalInstance:
                         "24",
                         "-c",
                         host_cwd,
-                        inner_str,
+                        *pane_command,
                     ],
                     *pane_died_hook,
                 ]

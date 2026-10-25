@@ -2150,6 +2150,8 @@ async def _capture_launch_argv(
     monkeypatch: pytest.MonkeyPatch,
     *,
     keep_alive_after_exit: bool,
+    windows: bool = False,
+    args: list[str] | None = None,
 ) -> list[str]:
     """
     Launch a terminal with mocked tmux and return the single setup argv.
@@ -2157,6 +2159,8 @@ async def _capture_launch_argv(
     :param tmp_path: Temporary directory for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param keep_alive_after_exit: Value for the instance's opt-in flag.
+    :param windows: Whether the launch takes the Windows path.
+    :param args: Arguments of the pane program, e.g. ``["-c", "echo $HOME"]``.
     :returns: The flattened tmux launch argv.
     """
     captured: list[list[str]] = []
@@ -2172,6 +2176,7 @@ async def _capture_launch_argv(
         captured.append(list(cmd))
         return _SuccessfulProcess()
 
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", windows)
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
@@ -2186,11 +2191,36 @@ async def _capture_launch_argv(
         session_key="s1",
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
+        args=args or [],
         keep_alive_after_exit=keep_alive_after_exit,
     )
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
     return captured[0]
+
+
+def _new_session_command(cmd: list[str]) -> list[str]:
+    """
+    Return the ``new-session`` command from a flattened tmux launch argv.
+
+    :param cmd: Launch argv with commands joined by ``";"``.
+    :returns: The ``new-session`` command and its arguments.
+    """
+    session = cmd[cmd.index("new-session") :]
+    return session[: session.index(";")] if ";" in session else session
+
+
+async def test_launch_on_windows_passes_the_pane_program_as_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows tmux runs a joined pane command through cmd.exe, which ignores POSIX quoting."""
+    args = ["-c", "echo $HOME; (x) 'q' \"d\"", ""]
+
+    cmd = await _capture_launch_argv(
+        tmp_path, monkeypatch, keep_alive_after_exit=False, windows=True, args=args
+    )
+
+    assert _new_session_command(cmd)[-len(args) - 2 :] == ["--", "bash", *args]
 
 
 @pytest.mark.parametrize("launch_fails", [False, True])
