@@ -1295,6 +1295,12 @@ def _bridge_port_pool() -> tuple[int, ...]:
     return tuple(ports) if ports else DEFAULT_BRIDGE_PORT_POOL
 
 
+class _BridgeHTTPServer(ThreadingHTTPServer):
+    # On Windows SO_REUSEADDR lets a second server bind a port another one
+    # already serves, so two sessions' relays would share one pool port.
+    allow_reuse_address = not IS_WINDOWS
+
+
 def _start_bridge_http_server(
     handler_cls: type[BaseHTTPRequestHandler],
 ) -> tuple[ThreadingHTTPServer, str]:
@@ -1309,12 +1315,12 @@ def _start_bridge_http_server(
     httpd: ThreadingHTTPServer | None = None
     for port in _bridge_port_pool():
         try:
-            httpd = ThreadingHTTPServer((bind_host, port), handler_cls)
+            httpd = _BridgeHTTPServer((bind_host, port), handler_cls)
         except OSError:
             continue
         break
     if httpd is None:
-        httpd = ThreadingHTTPServer((bind_host, 0), handler_cls)
+        httpd = _BridgeHTTPServer((bind_host, 0), handler_cls)
     _, port = _http_server_host_port(httpd)
     return httpd, f"http://{advertised_host}:{port}"
 

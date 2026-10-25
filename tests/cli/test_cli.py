@@ -2652,20 +2652,25 @@ def test_server_with_explicit_port_does_not_check_canonical_server(
     assert bind_probes == [("127.0.0.1", 44770)]
 
 
-def test_server_command_explicit_occupied_port_fails() -> None:
+@pytest.mark.parametrize("listener_reuses_address", [False, True])
+def test_server_command_explicit_occupied_port_fails(listener_reuses_address: bool) -> None:
     """
     An explicit ``--port`` must fail instead of choosing a replacement.
 
     The test owns a real listening socket on a kernel-assigned port,
     then asks ``omnigent server`` for that exact port. The command
     must fail during preflight, before uvicorn or fallback-port logic
-    can start the server elsewhere.
+    can start the server elsewhere. The listener may set
+    ``SO_REUSEADDR``, as uvicorn does.
 
+    :param listener_reuses_address: Whether the listener sets ``SO_REUSEADDR``.
     :returns: None.
     """
     import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as listener:
+        if listener_reuses_address:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         listener.bind(("127.0.0.1", 0))
         listener.listen(1)
         port = int(listener.getsockname()[1])

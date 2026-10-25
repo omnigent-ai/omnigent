@@ -753,17 +753,21 @@ def test_pick_local_port_returns_preferred_when_free() -> None:
     assert local_server.pick_local_port(free_port) == free_port
 
 
-def test_pick_local_port_falls_back_when_preferred_taken() -> None:
+@pytest.mark.parametrize("listener_reuses_address", [False, True])
+def test_pick_local_port_falls_back_when_preferred_taken(listener_reuses_address: bool) -> None:
     """A bound preferred port forces a fallback to a different free port.
 
     Holding a listener on ``preferred`` makes its bind-test fail; the
     helper must return some OTHER, still-usable port rather than raising
     or returning the busy one — this is what lets the fallback never
     break daemon discovery (which keys off the pidfile, not the port).
+    The listener may set ``SO_REUSEADDR``, as uvicorn does.
     """
     import socket
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as taken:
+        if listener_reuses_address:
+            taken.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         taken.bind(("127.0.0.1", 0))
         taken.listen(1)
         busy_port = int(taken.getsockname()[1])

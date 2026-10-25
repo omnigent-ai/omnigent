@@ -14199,6 +14199,24 @@ async def test_relay_ports_draw_from_stable_pool_with_bind_retry(
                 second.close()
 
 
+def test_start_bridge_http_server_skips_a_pool_port_another_bridge_serves(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_BIND_HOST_ENV_VAR, "127.0.0.1")
+    with socket.socket() as probe:
+        probe.bind(("127.0.0.1", 0))
+        pool_port = int(probe.getsockname()[1])
+    monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, str(pool_port))
+    first, first_url = claude_native_bridge._start_bridge_http_server(BaseHTTPRequestHandler)
+    second, second_url = claude_native_bridge._start_bridge_http_server(BaseHTTPRequestHandler)
+    try:
+        assert first_url == f"http://127.0.0.1:{pool_port}"
+        assert second_url != first_url
+    finally:
+        first.server_close()
+        second.server_close()
+
+
 def test_bridge_port_pool_env_parsing(monkeypatch: pytest.MonkeyPatch) -> None:
     """The pool override accepts ports and inclusive ranges; junk is ignored."""
     monkeypatch.setenv(claude_native_bridge.BRIDGE_PORT_POOL_ENV_VAR, "28800-28802,29000")

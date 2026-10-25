@@ -4443,8 +4443,8 @@ def _bind_server_listener(host: str, port: int) -> Iterator[socket.socket]:
 
     Mirrors uvicorn's TCP bind shape closely enough for CLI preflight:
     IPv6 is selected when the host contains ``":"``, and
-    ``SO_REUSEADDR`` is set before bind. Passing this socket to uvicorn
-    avoids releasing the port during database and app initialization.
+    ``SO_REUSEADDR`` is set before bind except on Windows. Passing this socket
+    to uvicorn avoids releasing the port during database and app initialization.
 
     :param host: Interface to bind, e.g. ``"127.0.0.1"``.
     :param port: TCP port to bind, e.g. ``6767``.
@@ -4453,7 +4453,9 @@ def _bind_server_listener(host: str, port: int) -> Iterator[socket.socket]:
     """
     family = socket.AF_INET6 if ":" in host else socket.AF_INET
     with socket.socket(family=family, type=socket.SOCK_STREAM) as listener:
-        listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        # On Windows SO_REUSEADDR lets this listener bind a port another server listens on.
+        if not IS_WINDOWS:
+            listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         try:
             listener.bind((host, port))
         except OSError as exc:
