@@ -3536,7 +3536,6 @@ function ArchivedSection() {
                     type="button"
                     variant="outline"
                     role="combobox"
-                    aria-haspopup="listbox"
                     aria-expanded={projectFilterOpen}
                     id="archived-project-filter"
                     data-testid="archived-project-filter"
@@ -3555,7 +3554,7 @@ function ArchivedSection() {
                 <PopoverContent
                   {...settingsOverlayProps(ARCHIVED_SESSIONS_ENTRY, "projectFilter")}
                   align="start"
-                  className="w-(--radix-popover-trigger-width) gap-0 p-0"
+                  className="min-w-(--radix-popover-trigger-width) w-auto max-w-80 gap-0 p-0"
                 >
                   <Command shouldFilter={false} label="Search projects">
                     <CommandInput
@@ -3572,26 +3571,22 @@ function ArchivedSection() {
                       >
                         All projects
                       </CommandItem>
-                      {filteredProjectNames.length > 0 ? (
-                        filteredProjectNames.map((name) => (
-                          <CommandItem
-                            {...settingsRuntimeChoiceProps(
-                              ARCHIVED_SESSIONS_ENTRY,
-                              "projectFilter",
-                            )}
-                            key={name}
-                            value={projectToSelectValue(name)}
-                            data-testid={`archived-project-option-${name}`}
-                            onSelect={() => selectArchivedProject(name)}
-                          >
-                            <ProjectRowIcon icon={projectIcons.get(name)} />
-                            <span className="min-w-0 flex-1 truncate">{name}</span>
-                          </CommandItem>
-                        ))
-                      ) : (
-                        <p className="px-2 py-6 text-center text-ui">No projects found</p>
-                      )}
+                      {filteredProjectNames.map((name) => (
+                        <CommandItem
+                          {...settingsRuntimeChoiceProps(ARCHIVED_SESSIONS_ENTRY, "projectFilter")}
+                          key={name}
+                          value={projectToSelectValue(name)}
+                          data-testid={`archived-project-option-${name}`}
+                          onSelect={() => selectArchivedProject(name)}
+                        >
+                          <ProjectRowIcon icon={projectIcons.get(name)} />
+                          <span className="min-w-0 flex-1 truncate">{name}</span>
+                        </CommandItem>
+                      ))}
                     </CommandList>
+                    {filteredProjectNames.length === 0 && (
+                      <p className="px-2 py-6 text-center text-ui">No projects found</p>
+                    )}
                   </Command>
                 </PopoverContent>
               </Popover>
