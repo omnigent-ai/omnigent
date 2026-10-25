@@ -114,7 +114,8 @@ and steers messages while the agent is busy.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
-  untouched draft; user edits remain.
+  untouched draft; user edits remain. The "Something went wrong" card from the
+  failed POST clears once the delivered message appears, live or on reconnect.
 - `managed-first-input`: submitting a new managed session saves its first input
   and attachments before provisioning. Follow-ups sent during startup are saved
   in order too. They run even if the creating browser closes; reopening shows
@@ -526,6 +527,10 @@ Other connection providers alone do not enable the managed MCP picker.
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
   for the desktop entry point. The restore/delivery ordering and preservation of
   user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`.
+  `tests/e2e_ui/mobile/test_offline_send_failure_card.py::test_failure_card_clears_once_reconnect_recovers_the_delivered_send`
+  cuts the browser's network while the server holds the send for a runner
+  relaunch, then checks the failure card clears when the reconnect shows the
+  delivered turn.
 - **`managed-first-input`, new-session composer (own environments):**
   `tests/e2e_ui/start_session/test_managed_first_input_tab_close.py::test_managed_first_input_runs_after_browser_closes`
   closes the entire browser during provisioning, on both the creating replica
