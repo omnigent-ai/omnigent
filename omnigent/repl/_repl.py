@@ -215,7 +215,14 @@ class _SessionSnapshot(Protocol):
 # split the ``state: sleeping`` sync marker the e2e harness waits on
 # (tests/e2e/omnigent/_pexpect_harness.py). /quit discoverability is
 # served by the grouped ``/help`` output instead.
-WELCOME_HINTS = ["/help help", "Ctrl+O debug", "Ctrl+T show tools", "Esc cancel", "Ctrl+C exit"]
+WELCOME_HINTS = [
+    "/help help",
+    "Ctrl+G editor",
+    "Ctrl+O debug",
+    "Ctrl+T show tools",
+    "Esc cancel",
+    "Ctrl+C exit",
+]
 
 # Per-request item count for ``client.sessions.list_items``
 # pagination. Matches the server's

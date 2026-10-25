@@ -13,3 +13,10 @@ pip install omnigent-ui-sdk
 
 See the [omnigent repository](https://github.com/omnigent-ai/omnigent) for full
 documentation.
+
+## Editing prompts
+
+Press **Ctrl+G**, or **Ctrl+X** followed by **Ctrl+E**, to edit the current draft
+in your external editor (`VISUAL`, then `EDITOR`). Collapsed pastes are expanded
+for editing. Save and close the editor to return to the draft; press Enter when
+you are ready to send it. During history search, Ctrl+G still cancels the search.
