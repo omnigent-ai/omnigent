@@ -4140,7 +4140,8 @@ async def run_repl(
             if name in ("/?", "/exit"):
                 continue  # Skip aliases.
             lines.append(
-                f"  [{fmt.accent}]{name}[/{fmt.accent}]  [{fmt.muted}]{desc}[/{fmt.muted}]"
+                f"  [{fmt.accent}]{escape(str(name))}[/{fmt.accent}]  "
+                f"[{fmt.muted}]{escape(str(desc))}[/{fmt.muted}]"
             )
         host.output(Text.from_markup("\n".join(lines)))
 
@@ -4577,7 +4578,9 @@ async def run_repl(
             )
         except Exception as exc:  # noqa: BLE001 — REPL boundary: render the failure, stay alive
             host.output(
-                Text.from_markup(f"  [bold red]Failed to open {target_id[:16]}…: {exc}[/]")
+                Text.from_markup(
+                    f"  [bold red]Failed to open {target_id[:16]}…: {escape(str(exc))}[/]"
+                )
             )
             return
         await _attach_to_conversation(
@@ -4757,7 +4760,8 @@ async def run_repl(
                 _log.exception("Failed to resume conversation %s", resume_conversation_id)
                 host.output(
                     Text.from_markup(
-                        f"  [bold red]Failed to resume {resume_conversation_id[:16]}…: {exc}[/]"
+                        f"  [bold red]Failed to resume "
+                        f"{resume_conversation_id[:16]}…: {escape(str(exc))}[/]"
                     )
                 )
         # Hold a reference to the auto-send task for the lifetime of
@@ -5408,7 +5412,7 @@ async def _cmd_model(
         # actually authenticating the turn (matching routing), never a guess.
         config = effective_config_with_detected(load_config())
         for line in _build_model_readout_lines(config, harness, current):
-            host.output(Text.from_markup(f"  [{fmt.muted}]{line}[/{fmt.muted}]"))
+            host.output(Text.from_markup(f"  [{fmt.muted}]{escape(str(line))}[/{fmt.muted}]"))
 
     value = arg.strip()
     # Bare `/model` and the display keywords both just show the readout — never
@@ -5502,7 +5506,7 @@ async def _cmd_model(
     if "/" in target:
         warning = _model_validation_warning(target)
         if warning is not None:
-            host.output(Text.from_markup(f"  [dim]note: {warning}[/dim]"))
+            host.output(Text.from_markup(f"  [dim]note: {escape(str(warning))}[/dim]"))
 
     # set_model_override raises ValueError on empty-after-trim;
     # surface inline rather than letting it crash the REPL.
@@ -5511,7 +5515,7 @@ async def _cmd_model(
         if inspect.isawaitable(result):
             await result
     except ValueError as exc:
-        host.output(Text.from_markup(f"  [bold red]Invalid model: {exc}[/]"))
+        host.output(Text.from_markup(f"  [bold red]Invalid model: {escape(str(exc))}[/]"))
         return
 
     suffix = " (current response unchanged)" if session.is_streaming else ""
@@ -5539,7 +5543,9 @@ async def _start_new_conversation(
             await session.start_new_conversation()
         except Exception as exc:  # noqa: BLE001 — REPL boundary
             _log.exception("New conversation failed")
-            host.output(Text.from_markup(f"  [bold red]New conversation failed: {exc}[/]"))
+            host.output(
+                Text.from_markup(f"  [bold red]New conversation failed: {escape(str(exc))}[/]")
+            )
             return False
     else:
         session.reset()
@@ -5672,7 +5678,7 @@ async def _cmd_switch(
                 redraw_screen=True,
             )
         except Exception as exc:  # noqa: BLE001 — REPL UI boundary: render network/server errors as inline text so the REPL stays responsive instead of crashing
-            host.output(Text.from_markup(f"  [bold red]Error: {exc}[/]"))
+            host.output(Text.from_markup(f"  [bold red]Error: {escape(str(exc))}[/]"))
 
 
 async def _attach_to_conversation(
@@ -5866,7 +5872,7 @@ async def _cmd_fork(
     try:
         result = await client.sessions.fork(current_id, title=title)
     except Exception as exc:  # noqa: BLE001 — REPL UI boundary: render server errors inline
-        host.output(Text.from_markup(f"  [bold red]Fork failed: {exc}[/]"))
+        host.output(Text.from_markup(f"  [bold red]Fork failed: {escape(str(exc))}[/]"))
         return
 
     new_id = result["id"]
@@ -5913,7 +5919,7 @@ async def _cmd_history(
                     call_id_to_tool_metadata=call_id_to_tool_metadata,
                 )
         except Exception as exc:  # noqa: BLE001 — REPL UI boundary: surface server errors inline
-            host.output(Text.from_markup(f"  [bold red]Error: {exc}[/]"))
+            host.output(Text.from_markup(f"  [bold red]Error: {escape(str(exc))}[/]"))
         return
 
     if not session.current_response_id:
@@ -5934,7 +5940,7 @@ async def _cmd_history(
         else:
             host.output(Text.from_markup(f"  [{fmt.muted}]No conversation.[/{fmt.muted}]"))
     except Exception as exc:  # noqa: BLE001 — REPL UI boundary: render network/server errors as inline text so the REPL stays responsive instead of crashing
-        host.output(Text.from_markup(f"  [bold red]Error: {exc}[/]"))
+        host.output(Text.from_markup(f"  [bold red]Error: {escape(str(exc))}[/]"))
 
 
 # Coin bar rendering constants for /context.
@@ -6300,7 +6306,7 @@ async def _cmd_compact(
         if inspect.isawaitable(result):
             await result
     except Exception as exc:  # noqa: BLE001 — REPL boundary: keep prompt alive
-        host.output(Text.from_markup(f"  [bold red]Compaction failed: {exc}[/]"))
+        host.output(Text.from_markup(f"  [bold red]Compaction failed: {escape(str(exc))}[/]"))
 
 
 @_cmd("/context", "Show context window usage")
@@ -6355,7 +6361,11 @@ async def _cmd_context(
     else:
         result = await _fetch_context_items(session, client)
         if result.error is not None:
-            host.output(Text.from_markup(f"  [bold red]Error fetching history: {result.error}[/]"))
+            host.output(
+                Text.from_markup(
+                    f"  [bold red]Error fetching history: {escape(str(result.error))}[/]"
+                )
+            )
             return
         # count_tokens falls back to cl100k_base when agent_name isn't a
         # recognised LLM identifier — good enough for an estimate.
@@ -6379,7 +6389,9 @@ async def _cmd_cancel(
 
     resp = await session.cancel()
     if resp:
-        host.output(Text.from_markup(f"  [{fmt.warning}]Cancelled {resp.id}[/{fmt.warning}]"))
+        host.output(
+            Text.from_markup(f"  [{fmt.warning}]Cancelled {escape(str(resp.id))}[/{fmt.warning}]")
+        )
 
 
 def _build_github_issue_url(
@@ -7392,7 +7404,7 @@ async def _build_terminal_overview(
 
     conv_id, name, session = decoded
     parts: list[RenderableType] = []
-    parts.append(Text.from_markup(f"[bold]Terminal: {target.label}[/bold]"))
+    parts.append(Text.from_markup(f"[bold]Terminal: {escape(str(target.label))}[/bold]"))
     parts.append(
         Text.from_markup(
             f"  [{fmt.muted}]Owner conversation[/{fmt.muted}]: {conv_id}",
@@ -7414,7 +7426,7 @@ async def _build_terminal_overview(
         parts.append(
             Text.from_markup(
                 f"  [{fmt.error}]Failed to fetch conversation items: "
-                f"{type(exc).__name__}: {exc}[/{fmt.error}]",
+                f"{type(exc).__name__}: {escape(str(exc))}[/{fmt.error}]",
             ),
         )
         return Group(*parts)
@@ -7768,7 +7780,7 @@ async def _build_debug_overview(
 
     parts: list[RenderableType] = []
     header = target.label if target is not None else "main"
-    parts.append(Text.from_markup(f"[bold]Session: {header}[/bold]"))
+    parts.append(Text.from_markup(f"[bold]Session: {escape(str(header))}[/bold]"))
     parts.append(
         Text.from_markup(
             f"  [{fmt.muted}]Session ID[/{fmt.muted}]: {conv_id or '(no conversation yet)'}",
@@ -7818,7 +7830,8 @@ async def _build_debug_overview(
     if resolve_error is not None:
         parts.append(
             Text.from_markup(
-                f"  [{fmt.error}]Failed to resolve conversation: {resolve_error}[/{fmt.error}]",
+                f"  [{fmt.error}]Failed to resolve conversation: "
+                f"{escape(str(resolve_error))}[/{fmt.error}]",
             ),
         )
 
@@ -7869,12 +7882,14 @@ async def _build_debug_overview(
     if labels_error is not None:
         parts.append(
             Text.from_markup(
-                f"  [{fmt.error}]Labels fetch failed: {labels_error}[/{fmt.error}]",
+                f"  [{fmt.error}]Labels fetch failed: {escape(str(labels_error))}[/{fmt.error}]",
             ),
         )
     else:
         rendered = ", ".join(f"{k}={v}" for k, v in sorted(labels.items())) if labels else "(none)"
-        parts.append(Text.from_markup(f"  [{fmt.muted}]Labels[/{fmt.muted}]: {rendered}"))
+        parts.append(
+            Text.from_markup(f"  [{fmt.muted}]Labels[/{fmt.muted}]: {escape(str(rendered))}")
+        )
     parts.append(Text.from_markup(f"  [{fmt.muted}]Messages[/{fmt.muted}]: {len(items)}"))
     parts.append(Text(""))
 
@@ -7961,7 +7976,7 @@ def _render_overview_event(
             Text.from_markup(
                 f"[{fmt.accent}][{idx}][/{fmt.accent}] "
                 f"[bold]type[/bold]=tool_call_request "
-                f"[{fmt.muted}]name={name}[/{fmt.muted}]",
+                f"[{fmt.muted}]name={escape(str(name))}[/{fmt.muted}]",
             ),
         ]
         args = item.get("arguments")
@@ -7982,7 +7997,7 @@ def _render_overview_event(
             Text.from_markup(
                 f"[{fmt.accent}][{idx}][/{fmt.accent}] "
                 f"[bold]type[/bold]=tool_call_complete "
-                f"[{fmt.muted}]name={name}[/{fmt.muted}]",
+                f"[{fmt.muted}]name={escape(str(name))}[/{fmt.muted}]",
             ),
         ]
         status = item.get("status")
@@ -7995,7 +8010,9 @@ def _render_overview_event(
             if len(text) > 400:
                 preview += "…"
             for line in preview.split("\n"):
-                lines.append(Text.from_markup(f"    [{fmt.muted}]{line}[/{fmt.muted}]"))
+                lines.append(
+                    Text.from_markup(f"    [{fmt.muted}]{escape(str(line))}[/{fmt.muted}]")
+                )
         return lines
     if itype == "reasoning":
         # ``summary`` and ``content`` are both optional on
@@ -8014,7 +8031,9 @@ def _render_overview_event(
             text = str(summary)[:400]
             for line in text.split("\n"):
                 if line.strip():
-                    lines.append(Text.from_markup(f"    [{fmt.muted}]{line}[/{fmt.muted}]"))
+                    lines.append(
+                        Text.from_markup(f"    [{fmt.muted}]{escape(str(line))}[/{fmt.muted}]")
+                    )
         return lines
     # Unknown item type — surface it rather than silently dropping,
     # so new server-side types become visible instead of invisible.
@@ -8071,14 +8090,14 @@ def _render_overview_message_event(
     if role == "assistant":
         model = item.get("model")
         if isinstance(model, str) and model:
-            header += f" [{fmt.muted}]model={model}[/{fmt.muted}]"
+            header += f" [{fmt.muted}]model={escape(str(model))}[/{fmt.muted}]"
     lines: list[RenderableType] = [Text.from_markup(header)]
     preview = text[:400]
     if len(text) > 400:
         preview += "…"
     for line in preview.split("\n"):
         if line.strip():
-            lines.append(Text.from_markup(f"    [{fmt.muted}]{line}[/{fmt.muted}]"))
+            lines.append(Text.from_markup(f"    [{fmt.muted}]{escape(str(line))}[/{fmt.muted}]"))
     return lines
 
 
@@ -8271,7 +8290,9 @@ def _render_message_history_item(
         if not text.strip():
             return
         model = item.get("model", "")
-        host.output(Text.from_markup(f" [{fmt.assistant}]◆ {model}[/{fmt.assistant}]"))
+        host.output(
+            Text.from_markup(f" [{fmt.assistant}]◆ {escape(str(model))}[/{fmt.assistant}]")
+        )
         # Match the live stream's per-paragraph Markdown rendering
         # (see ``RichBlockFormatter._markdown_replace``): split on
         # blank-line paragraph boundaries, render each non-empty
