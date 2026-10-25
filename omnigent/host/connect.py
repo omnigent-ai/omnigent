@@ -520,6 +520,9 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "PYTHON_KEYRING_BACKEND",
         "TZ",
         "TERM",
+        # External-editor preferences for interactive agent CLIs.
+        "EDITOR",
+        "VISUAL",
         "TERMINFO",
         "TERMINFO_DIRS",
         "LANG",

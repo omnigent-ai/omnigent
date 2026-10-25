@@ -54,6 +54,9 @@ BASE_ALLOW_EXACT: frozenset[str] = frozenset(
         "HOME",
         "PATH",
         "TERM",
+        # External-editor preferences for interactive agent CLIs.
+        "EDITOR",
+        "VISUAL",
         "TMPDIR",
         "TMP",
         "TEMP",
