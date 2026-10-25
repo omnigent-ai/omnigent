@@ -94,10 +94,7 @@ export function useSandboxModelOptions(
   });
 }
 
-/**
- * Preview a launching sandbox's catalog until the session is bound to a host,
- * while a model pick is only saved for the launch to read.
- */
+/** Preview a launching sandbox's provider catalog until the session is bound to a host. */
 export function useSandboxLaunchModelOptions(
   launch: SandboxStatus | null,
   hostId: string | null,
@@ -105,8 +102,9 @@ export function useSandboxLaunchModelOptions(
   agentId: string | null,
   enabled: boolean,
 ): NativeModelOption[] | undefined {
+  // The host is bound by `connecting`, before the session snapshot shows it.
   const provider =
-    launch !== null && launch.stage !== "failed" && hostId === null
+    launch !== null && launch.stage !== "failed" && launch.stage !== "connecting" && hostId === null
       ? (launch.provider ?? null)
       : null;
   const info = useServerInfo();

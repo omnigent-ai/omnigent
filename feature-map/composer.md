@@ -334,8 +334,9 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_highlights_the_reported_model`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_alias_selection_persists`.
   A launching sandbox's provider catalog (Claude, Codex, and Pi) and its
-  replacement by the session's own catalog:
+  replacement by the host's or the session's own catalog:
   `tests/browser_ui/chat/test_model_catalog.py::test_launching_sandbox_offers_its_provider_catalog`,
+  `tests/browser_ui/chat/test_model_catalog.py::test_bound_host_catalog_replaces_the_launch_preview`,
   `tests/browser_ui/chat/test_model_catalog.py::test_session_catalog_replaces_the_launch_preview`
 - **`model-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_model_flows_prelaunch.py::test_claude_default_entry_names_the_true_default`,

@@ -262,19 +262,16 @@ describe("useSandboxLaunchModelOptions", () => {
         }),
     );
 
-  it.each(["claude-native", "codex-native", "pi-native"])(
-    "previews a launching sandbox's models for %s before it has a host",
-    async (harness) => {
-      serve();
-      const { result } = render({ harness });
-      await waitFor(() => expect(result.current).toEqual(previewRows));
-      expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
-        `/v1/sandbox-providers/agent_sandbox/harnesses/${harness}/model-options?agent_id=ag_1`,
-      );
-    },
-  );
+  it("previews a launching sandbox's models before it has a host", async () => {
+    serve();
+    const { result } = render({ harness: "codex-native" });
+    await waitFor(() => expect(result.current).toEqual(previewRows));
+    expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
+      "/v1/sandbox-providers/agent_sandbox/harnesses/codex-native/model-options?agent_id=ag_1",
+    );
+  });
 
-  it.each(["action_required", "cloning", "starting", "connecting"] as const)(
+  it.each(["action_required", "cloning", "starting"] as const)(
     "keeps the launch's provider through the %s stage",
     async (stage) => {
       serve();
@@ -293,6 +290,11 @@ describe("useSandboxLaunchModelOptions", () => {
       hostId: null,
     },
     { name: "a launch bound to its host", launch: provisioning, hostId: "host_1" },
+    {
+      name: "a launch starting its runner",
+      launch: { stage: "connecting", provider: "agent_sandbox" },
+      hostId: null,
+    },
     { name: "a session without a launch", launch: null, hostId: "host_1" },
   ])("leaves $name to the session's own sources", async ({ launch, hostId }) => {
     serve();
@@ -355,6 +357,22 @@ describe("useSandboxLaunchModelOptions", () => {
       serve();
       await act(() => vi.advanceTimersByTimeAsync(15_000));
       await waitFor(() => expect(result.current).toEqual(previewRows));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps the last good rows when a refresh fails", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      serve();
+      const { result } = render();
+      await waitFor(() => expect(result.current).toEqual(previewRows));
+      fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
+      await act(() => vi.advanceTimersByTimeAsync(15_000));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      await settle();
+      expect(result.current).toEqual(previewRows);
     } finally {
       vi.useRealTimers();
     }

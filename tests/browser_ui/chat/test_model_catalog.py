@@ -231,16 +231,25 @@ def test_launching_sandbox_offers_its_provider_catalog(
     expect(rows.nth(0)).to_contain_text("Opus via gateway")
     expect(rows.nth(1)).to_contain_text("Sonnet via gateway")
     session_path = f"/v1/sessions/{chat.session_id}"
-    with page.expect_response(
-        lambda response: (
-            response.request.method == "PATCH"
-            and urlparse(response.url).path == session_path
-            and response.status == 200
-        )
-    ) as patch_info:
-        page.locator('[data-model-id="gateway/sonnet"]').click()
+    for model_id in ("gateway/sonnet", "gateway/opus"):
+        row = page.locator(f'[data-model-id="{model_id}"]')
+        if not row.is_visible():
+            _open_models(page)
+        # No runner exists to confirm the first pick, so the rows stay usable.
+        expect(row).not_to_have_attribute("aria-disabled", "true", timeout=5_000)
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "PATCH"
+                and urlparse(response.url).path == session_path
+                and response.status == 200
+            )
+        ):
+            row.click()
     # Saved for the launch to read.
-    assert patch_info.value.request.post_data_json == {"model_override": "gateway/sonnet"}
+    assert chat.session_patches == [
+        {"model_override": "gateway/sonnet"},
+        {"model_override": "gateway/opus"},
+    ]
 
 
 def test_session_catalog_replaces_the_launch_preview(
@@ -269,6 +278,42 @@ def test_session_catalog_replaces_the_launch_preview(
         {
             "event": "session.model_options",
             "data": {"type": "session.model_options", "conversation_id": chat.session_id},
+        }
+    )
+    expect(page.locator('[data-model-id="gateway/opus"]')).to_have_count(0)
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "opus")
+    expect(rows.nth(1)).to_have_attribute("data-model-id", "haiku")
+
+
+def test_bound_host_catalog_replaces_the_launch_preview(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Once the launch binds its host, the host's catalog replaces the preview."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    _open_models(page)
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "gateway/opus")
+
+    # The host lists its catalog while the session's own catalog is still empty.
+    chat.models = [
+        model_option("opus", display_name="Opus (host)"),
+        model_option("haiku", display_name="Haiku (host)"),
+    ]
+    chat.update_session(host_id=chat.host_id, model_options=[])
+    chat.emit(
+        {
+            "event": "session.sandbox_status",
+            "data": {
+                "type": "session.sandbox_status",
+                "conversation_id": chat.session_id,
+                "stage": "connecting",
+                "provider": "agent_sandbox",
+            },
         }
     )
     expect(page.locator('[data-model-id="gateway/opus"]')).to_have_count(0)

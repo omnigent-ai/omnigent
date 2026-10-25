@@ -908,6 +908,8 @@ export function ChatPage() {
     preLaunchOptions.length > 0
       ? preLaunchOptions
       : sessionModelOptions;
+  const modelsFromLaunchPreview =
+    sandboxPreviewOptions !== undefined && codexModelOptions === sandboxPreviewOptions;
 
   // The session is unreachable and a message can't wake it: the host is
   // offline (host-bound) or it isn't host-bound and the runner is down.
@@ -1203,6 +1205,7 @@ export function ChatPage() {
       codexModelOptions={codexModelOptions}
       inferenceConfigured={activeSession?.inferenceConfigured}
       inferenceError={activeSession?.inferenceError}
+      modelsFromLaunchPreview={modelsFromLaunchPreview}
       modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
@@ -1363,6 +1366,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
+  /** The rows are a launching sandbox's preview, so a pick has no runner to confirm it. */
+  modelsFromLaunchPreview?: boolean;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -1528,6 +1533,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   codexModelOptions,
   inferenceConfigured,
   inferenceError,
+  modelsFromLaunchPreview,
   modelLabelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
@@ -1844,6 +1850,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             codexModelOptions={codexModelOptions}
             inferenceConfigured={inferenceConfigured}
             inferenceError={inferenceError}
+            modelsFromLaunchPreview={modelsFromLaunchPreview}
             modelLabelOptions={modelLabelOptions}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
@@ -1972,6 +1979,8 @@ interface ComposerProps {
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
+  /** The rows are a launching sandbox's preview, so a pick has no runner to confirm it. */
+  modelsFromLaunchPreview?: boolean;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -2334,6 +2343,7 @@ function ComposerImpl(
     codexModelOptions,
     inferenceConfigured,
     inferenceError,
+    modelsFromLaunchPreview,
     modelLabelOptions = codexModelOptions,
     showCodexPlanMode,
     showClaudePermissionMode = false,
@@ -4223,6 +4233,7 @@ function ComposerImpl(
                   codexModelOptions={codexModelOptions}
                   inferenceConfigured={inferenceConfigured}
                   inferenceError={inferenceError}
+                  modelsFromLaunchPreview={modelsFromLaunchPreview}
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
@@ -4863,6 +4874,7 @@ function SessionHarnessPicker({
   codexModelOptions,
   inferenceConfigured,
   inferenceError,
+  modelsFromLaunchPreview,
   modelLabelOptions,
   modelLabelHostId,
   costRoutingEligible,
@@ -4883,6 +4895,7 @@ function SessionHarnessPicker({
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
+  modelsFromLaunchPreview?: boolean;
   modelLabelOptions: readonly NativeModelOption[];
   modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
@@ -4986,7 +4999,8 @@ function SessionHarnessPicker({
       const store = useChatStore.getState();
       const sourceSessionId = store.conversationId;
       await store.setModel(modelId, {
-        expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+        expectConfirmation:
+          (modelPickerKind === "claude" || modelPickerKind === "codex") && !modelsFromLaunchPreview,
       });
       if (useChatStore.getState().conversationId !== sourceSessionId) return;
       if (
