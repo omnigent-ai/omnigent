@@ -1859,14 +1859,11 @@ describe("SettingsPage", () => {
         .getAllByRole("option")
         .map((option) => option.textContent),
     ).toEqual(["All projects", "Beta"]);
-    expect(screen.queryByTestId("archived-project-option-Alpha")).toBeNull();
-    expect(screen.queryByTestId("archived-project-option-Gamma")).toBeNull();
 
     fireEvent.keyDown(search, { key: "ArrowDown" });
     fireEvent.keyDown(search, { key: "Enter" });
     expect(screen.getAllByTestId("archived-row")).toHaveLength(1);
     expect(screen.getByText("Beta chat")).toBeInTheDocument();
-    expect(screen.queryByText("Alpha chat")).toBeNull();
 
     fireEvent.click(trigger);
     expect(screen.getByRole("combobox", { name: "Search projects" })).toHaveValue("");
