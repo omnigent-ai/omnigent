@@ -214,13 +214,19 @@ def default_shell_argv(command: str) -> list[str]:
 #: Interactive shells we honor from ``$SHELL`` for a user terminal. Anything
 #: outside this set (or a ``$SHELL`` that doesn't resolve on PATH) falls back to
 #: bash for a predictable pane.
-_KNOWN_INTERACTIVE_SHELLS = frozenset({"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh"})
+_KNOWN_INTERACTIVE_SHELLS = frozenset(
+    {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "pwsh", "powershell", "cmd"}
+)
 
 #: Mainstream interactive shells we proactively offer as launch choices (the
 #: "New shell" picker), in display order. The user's ``$SHELL`` is always
 #: offered first regardless (see :func:`installed_interactive_shells`); this is
 #: the set of well-known alternatives we surface beyond it.
 _OFFERED_INTERACTIVE_SHELLS = ("bash", "zsh", "fish")
+
+#: The Windows counterpart of :data:`_OFFERED_INTERACTIVE_SHELLS`; ``bash`` is
+#: Git Bash when Git's ``bin`` comes first on ``PATH``.
+_OFFERED_WINDOWS_INTERACTIVE_SHELLS = ("pwsh", "powershell", "cmd", "bash")
 
 
 def normalize_interactive_shells(shells: object) -> list[str]:
@@ -296,8 +302,7 @@ def default_interactive_shell() -> str:
     :returns: A shell basename such as ``"zsh"``, ``"fish"``, or ``"bash"``.
     """
     if IS_WINDOWS:
-        # Native tmux/PTY terminals are unsupported on Windows anyway.
-        return "bash"
+        return "pwsh" if _resolve_interactive_shell("pwsh") else "powershell"
 
     shell = os.environ.get("SHELL", "").strip()
     name = os.path.basename(shell)
@@ -326,12 +331,8 @@ def installed_interactive_shells() -> list[str]:
     :returns: Basenames such as ``["zsh", "bash", "fish"]`` — the default first.
     """
     ordered = [default_interactive_shell()]
-    if IS_WINDOWS:
-        # Native tmux/PTY terminals are unsupported on Windows anyway; the lone
-        # bash default from above is all we can meaningfully offer.
-        return ordered
-
-    for name in _OFFERED_INTERACTIVE_SHELLS:
+    offered = _OFFERED_WINDOWS_INTERACTIVE_SHELLS if IS_WINDOWS else _OFFERED_INTERACTIVE_SHELLS
+    for name in offered:
         if name not in ordered and _resolve_interactive_shell(name):
             ordered.append(name)
     return ordered
