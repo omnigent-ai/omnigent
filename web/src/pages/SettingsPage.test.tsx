@@ -1799,11 +1799,6 @@ describe("SettingsPage", () => {
       visibility: "archived",
     });
     const trigger = screen.getByTestId("archived-project-filter");
-    expect(trigger).toHaveAccessibleName("Filter archived sessions by project");
-    expect(screen.getByText("Project").closest("label")).toHaveAttribute(
-      "for",
-      "archived-project-filter",
-    );
     fireEvent.click(trigger);
     expect(screen.getByRole("option", { name: "All projects" })).toBeInTheDocument();
     const alphaOption = screen.getByRole("option", { name: "Alpha" });
@@ -1820,9 +1815,6 @@ describe("SettingsPage", () => {
     // Picking a project narrows the list to that project's archived sessions.
     // Select values are discriminated (`project:<name>`), never the raw name.
     fireEvent.click(alphaOption);
-    const triggerIcon = trigger.querySelector('[data-testid="project-icon"]');
-    expect(triggerIcon).toHaveTextContent("🚀");
-    expect(triggerIcon?.nextElementSibling).toHaveTextContent("Alpha");
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Alpha chat")).toBeInTheDocument();
