@@ -235,6 +235,7 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useSandboxSessionModelOptions } from "@/hooks/useSandboxModelOptions";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { buildFusionSections } from "@/components/composer/fusionSections";
@@ -875,16 +876,38 @@ export function ChatPage() {
       hostProbeHarness !== null &&
       sessionModelOptions.length === 0,
   );
-  // Identity-stable on purpose: substitute only when the host rows actually
-  // exist, else keep the store's own array reference — a fresh [] here would
-  // re-render every options consumer (composer, gear, agent-info popover) on
-  // each streaming/liveness tick.
+  // A managed sandbox has no host to probe while it launches or sleeps, so
+  // fall back to its provider's preview for the harnesses sandboxes run.
+  const sandboxPreviewHarness =
+    fallbackPickerKind === "claude"
+      ? "claude-native"
+      : fallbackPickerKind === "codex"
+        ? "codex-native"
+        : fallbackPickerKind === "pi"
+          ? "pi-native"
+          : null;
+  const sandboxPreviewOptions = useSandboxSessionModelOptions(
+    { hostId: activeSession?.hostId ?? null, agentId: activeSession?.agentId ?? null },
+    sandboxStatus,
+    sandboxPreviewHarness,
+    !activeSession?.inferenceConfigured &&
+      sandboxPreviewHarness !== null &&
+      sessionModelOptions.length === 0,
+  );
+  const preLaunchOptions =
+    hostProbeOptions != null && hostProbeOptions.length > 0
+      ? hostProbeOptions
+      : sandboxPreviewOptions;
+  // Identity-stable on purpose: substitute only when the pre-launch rows
+  // actually exist, else keep the store's own array reference — a fresh []
+  // here would re-render every options consumer (composer, gear, agent-info
+  // popover) on each streaming/liveness tick.
   const codexModelOptions =
     !activeSession?.inferenceConfigured &&
     sessionModelOptions.length === 0 &&
-    hostProbeOptions != null &&
-    hostProbeOptions.length > 0
-      ? hostProbeOptions
+    preLaunchOptions != null &&
+    preLaunchOptions.length > 0
+      ? preLaunchOptions
       : sessionModelOptions;
 
   // The session is unreachable and a message can't wake it: the host is

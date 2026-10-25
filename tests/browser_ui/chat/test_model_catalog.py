@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
@@ -159,3 +161,78 @@ def test_picker_open_and_selection_do_not_refetch_catalog_or_session(
     assert patch_info.value.request.post_data_json == {"model_override": "alternate"}
     assert chat.session_patches == [{"model_override": "alternate"}]
     assert unexpected_gets == []
+
+
+@pytest.mark.parametrize(
+    ("harness", "wrapper"),
+    [
+        ("claude-native", "claude-code-native-ui"),
+        ("codex-native", "codex-native-ui"),
+        ("pi-native", "pi-native-ui"),
+    ],
+)
+def test_launching_sandbox_offers_its_provider_catalog(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    harness: str,
+    wrapper: str,
+) -> None:
+    """Before its sandbox has a host, a session offers the provider's preview rows."""
+    chat = chat_session_contract
+    chat.contract.json(
+        "/v1/info",
+        {
+            "accounts_enabled": False,
+            "single_user": True,
+            "needs_setup": False,
+            "managed_sandboxes_enabled": True,
+            "sandbox_provider": "agent_sandbox",
+            "sandbox_providers": ["agent_sandbox"],
+            "sandbox_provider_capabilities": {"agent_sandbox": {"default_models": True}},
+        },
+    )
+    chat.contract.json(
+        f"/v1/sandbox-providers/agent_sandbox/harnesses/{harness}/model-options",
+        {
+            "configured": False,
+            "models": [
+                model_option("gateway/opus", display_name="Opus via gateway"),
+                model_option("gateway/sonnet", display_name="Sonnet via gateway"),
+            ],
+            "configuration_revision": None,
+            "provider_label": "Gateway",
+            "default_model": None,
+            "status": "ready",
+        },
+    )
+    chat.set_catalog(harness=harness, models=[], selected_model="")
+    chat.set_health(runner_online=False, host_online=True)
+    chat.update_session(
+        created_at=time.time(),
+        host_id=None,
+        workspace=None,
+        llm_model=None,
+        labels={"omnigent.wrapper": wrapper},
+        sandbox_status={"stage": "provisioning", "provider": "agent_sandbox"},
+    )
+    page.goto(chat.url)
+    expect(page.get_by_test_id("runner-starting-indicator").first).to_contain_text(
+        "Provisioning sandbox"
+    )
+    _open_models(page)
+
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_contain_text("Opus via gateway")
+    expect(rows.nth(1)).to_contain_text("Sonnet via gateway")
+    session_path = f"/v1/sessions/{chat.session_id}"
+    with page.expect_response(
+        lambda response: (
+            response.request.method == "PATCH"
+            and urlparse(response.url).path == session_path
+            and response.status == 200
+        )
+    ) as patch_info:
+        page.locator('[data-model-id="gateway/sonnet"]').click()
+    # The launch reads the saved pick when it starts the harness.
+    assert patch_info.value.request.post_data_json == {"model_override": "gateway/sonnet"}
