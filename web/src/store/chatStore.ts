@@ -158,6 +158,7 @@ import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
   taskNotificationMarkerContent,
+  withoutAttachedMarkers,
 } from "@/lib/systemMessage";
 import {
   isNativeTerminalSession as isNativeTerminalSessionFn,
@@ -5543,12 +5544,15 @@ async function rehydrateWindowOnReconnect(
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const freshItemIds = new Set(fresh.items.map((it) => it.id));
-  const gapBlocks = freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId));
+  const gapUserTexts = committedUserTextsOf(
+    freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
+  );
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
     const currentBlocks = withoutDeliveredSendFailureCards(
       withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
-      gapBlocks,
+      freshItemIds,
+      gapUserTexts,
       session,
     );
     const tail = currentBlocks.filter((b) => {
@@ -5754,8 +5758,13 @@ async function reconcileOnReconnect(
       }
       nextBlocks =
         at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
-      nextBlocks = withoutDeliveredSendFailureCards(nextBlocks, unseen, session);
     }
+    nextBlocks = withoutDeliveredSendFailureCards(
+      nextBlocks,
+      snapshotItemIds,
+      committedUserTextsOf(unseen),
+      session,
+    );
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
     // was auto-cleared. Items can't resupply these (elicitations are
@@ -7354,35 +7363,36 @@ function reconcileSendDraftWithSnapshot(
 }
 
 /**
- * Drop the failure cards of unanswered sends that `committed` delivers.
+ * Drop the failure cards of unanswered sends that have since committed.
  *
  * A send commits under its stable id, except on a native terminal: the mirror
- * has its own id and may prepend markers, so a committed message ending in the
- * send's text is its delivery. Only new commits count, as an older message can
- * say the same thing. A send the snapshot records the runner refusing keeps
- * its card.
+ * has its own id and prepends markers for uploads, so a new message whose text
+ * is otherwise the send's delivers it, one send per message. Older messages
+ * don't count, as they can say the same thing. A send the snapshot records the
+ * runner refusing keeps its card.
  *
  * @param blocks - The conversation's blocks.
- * @param committed - Newly committed blocks: a live input, or a snapshot's gap.
- * @param snapshot - The snapshot `committed` came from, if any.
+ * @param committedIds - Ids of items known committed.
+ * @param newUserTexts - Normalized texts of user messages new since the cards.
+ * @param snapshot - The snapshot that supplied the commits, if any.
  * @returns `blocks` itself when no card is dropped.
  */
 function withoutDeliveredSendFailureCards(
   blocks: AnyBlock[],
-  committed: AnyBlock[],
+  committedIds: ReadonlySet<string>,
+  newUserTexts: readonly string[],
   snapshot?: Session,
 ): AnyBlock[] {
-  const committedIds = new Set(committed.map((block) => block.ctx.itemId));
-  const committedTexts = committedUserTextsOf(committed);
+  const unclaimedTexts = newUserTexts.map(withoutAttachedMarkers);
   const kept = blocks.filter((block) => {
     const send = block.type === "error" ? block.unansweredSend : undefined;
     if (send === undefined) return true;
     if (snapshot !== undefined && snapshotRefusesSend(snapshot, send.stableId)) return true;
-    const { stableId, text } = send;
-    const delivered =
-      committedIds.has(stableId) ||
-      (text !== undefined && committedTexts.some((committedText) => committedText.endsWith(text)));
-    return !delivered;
+    if (committedIds.has(send.stableId)) return false;
+    const claimed = send.text === undefined ? -1 : unclaimedTexts.indexOf(send.text);
+    if (claimed === -1) return true;
+    unclaimedTexts.splice(claimed, 1);
+    return false;
   });
   return kept.length === blocks.length ? blocks : kept;
 }
@@ -8251,9 +8261,25 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation({ startupPending: false });
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
-      // before it (re)populates the composer with an already-sent prompt.
+      // before it (re)populates the composer with an already-sent prompt,
+      // and drop the send's failure card.
       if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
-      applyToConversation((s) => retractDeliveredSendDraft(s, new Set([event.itemId]), "consumed"));
+      applyToConversation((s) => {
+        const committedIds = new Set([event.itemId]);
+        // A late copy of an item already shown is not a new message.
+        const content = hasCommittedItem(s.blocks, event.itemId)
+          ? null
+          : userContentFromEvent(event);
+        const blocks = withoutDeliveredSendFailureCards(
+          s.blocks,
+          committedIds,
+          content === null ? [] : [messageContentText(content)],
+        );
+        return {
+          ...retractDeliveredSendDraft(s, committedIds, "consumed"),
+          ...(blocks === s.blocks ? {} : { blocks }),
+        };
+      });
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.
       if (event.isMeta === true && userContentFromEvent(event) === null) return;
@@ -8411,13 +8437,6 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
           ],
         };
-      });
-      // The committed message can be an unanswered send arriving after all.
-      applyToConversation((s) => {
-        const committed = s.blocks.findLast((block) => block.ctx.itemId === event.itemId);
-        if (committed === undefined) return {};
-        const blocks = withoutDeliveredSendFailureCards(s.blocks, [committed]);
-        return blocks === s.blocks ? {} : { blocks };
       });
       return;
     case "slash_command":
