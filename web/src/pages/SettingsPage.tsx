@@ -3028,11 +3028,6 @@ function projectToSelectValue(project: string | undefined): string {
   return project === undefined ? ALL_PROJECTS_VALUE : PROJECT_VALUE_PREFIX + project;
 }
 
-function selectValueToProject(value: string): string | undefined {
-  if (value === ALL_PROJECTS_VALUE) return undefined;
-  return value.slice(PROJECT_VALUE_PREFIX.length);
-}
-
 function dateGroupLabel(timestampSec: number, now: Date = new Date()): string {
   const date = new Date(timestampSec * 1000);
   const startOfToday = new Date(now.getFullYear(), now.getMonth(), now.getDate());
@@ -3189,8 +3184,8 @@ function ArchivedSection() {
     if (!open) setProjectSearch("");
   }
 
-  function selectArchivedProject(value: string) {
-    setProject(selectValueToProject(value));
+  function selectArchivedProject(nextProject: string | undefined) {
+    setProject(nextProject);
     handleProjectFilterOpenChange(false);
   }
 
@@ -3304,7 +3299,7 @@ function ArchivedSection() {
                   <CommandList>
                     <CommandItem
                       value={ALL_PROJECTS_VALUE}
-                      onSelect={() => selectArchivedProject(ALL_PROJECTS_VALUE)}
+                      onSelect={() => selectArchivedProject(undefined)}
                     >
                       All projects
                     </CommandItem>
@@ -3314,7 +3309,7 @@ function ArchivedSection() {
                           key={name}
                           value={projectToSelectValue(name)}
                           data-testid={`archived-project-option-${name}`}
-                          onSelect={() => selectArchivedProject(projectToSelectValue(name))}
+                          onSelect={() => selectArchivedProject(name)}
                         >
                           <ProjectRowIcon icon={projectIcons.get(name)} />
                           <span className="min-w-0 flex-1 truncate">{name}</span>
