@@ -49,6 +49,7 @@ import {
   ArchiveRestoreIcon,
   AlertTriangleIcon,
   BotIcon,
+  ChevronDownIcon,
   DownloadIcon,
   FileDiffIcon,
   FilesIcon,
@@ -90,6 +91,8 @@ import { PaletteChip, PaletteSwatchPreview } from "@/components/theme/Appearance
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Switch } from "@/components/ui/switch";
+import { Command, CommandInput, CommandItem, CommandList } from "@/components/ui/command";
+import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
 import {
   Select,
   SelectContent,
@@ -3088,6 +3091,8 @@ function ImportSection() {
 function ArchivedSection() {
   // `undefined` = all projects; a name scopes the list to that project.
   const [project, setProject] = useState<string | undefined>(undefined);
+  const [projectFilterOpen, setProjectFilterOpen] = useState(false);
+  const [projectSearch, setProjectSearch] = useState("");
   const [retentionDays, setRetentionDays] = useState<number | null>(() => readRetentionDays());
   const [deleteExpiredOpen, setDeleteExpiredOpen] = useState(false);
   const bulkDelete = useBulkDeleteConversations();
@@ -3174,6 +3179,20 @@ function ArchivedSection() {
   // blank, orphaned value while the refetch settles.
   const items =
     project && !projectNames.includes(project) ? [project, ...projectNames] : projectNames;
+  const normalizedProjectSearch = projectSearch.trim().toLowerCase();
+  const filteredProjectNames = normalizedProjectSearch
+    ? items.filter((name) => name.toLowerCase().includes(normalizedProjectSearch))
+    : items;
+
+  function handleProjectFilterOpenChange(open: boolean) {
+    setProjectFilterOpen(open);
+    if (!open) setProjectSearch("");
+  }
+
+  function selectArchivedProject(value: string) {
+    setProject(selectValueToProject(value));
+    handleProjectFilterOpenChange(false);
+  }
 
   // ── Bulk selection ──
   const [selectionMode, setSelectionMode] = useState(false);
@@ -3250,34 +3269,64 @@ function ArchivedSection() {
             <label htmlFor="archived-project-filter" className="text-ui text-muted-foreground">
               Project
             </label>
-            <Select
-              value={projectToSelectValue(project)}
-              onValueChange={(value) => setProject(selectValueToProject(value))}
-            >
-              <SelectTrigger
-                id="archived-project-filter"
-                aria-label="Filter archived sessions by project"
-                data-testid="archived-project-filter"
-                className="w-56"
-              >
-                <SelectValue className="min-w-0 flex-1" />
-              </SelectTrigger>
-              <SelectContent position="popper" align="start" className="max-w-80">
-                <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
-                {items.map((name) => (
-                  <SelectItem
-                    key={name}
-                    value={projectToSelectValue(name)}
-                    data-testid={`archived-project-option-${name}`}
-                    textValue={name}
-                    className="*:[span]:last:min-w-0"
-                  >
-                    <ProjectRowIcon icon={projectIcons.get(name)} />
-                    <span className="min-w-0 flex-1 truncate">{name}</span>
-                  </SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+            <Popover open={projectFilterOpen} onOpenChange={handleProjectFilterOpenChange}>
+              <PopoverTrigger asChild>
+                <Button
+                  type="button"
+                  variant="outline"
+                  role="combobox"
+                  aria-haspopup="listbox"
+                  aria-expanded={projectFilterOpen}
+                  aria-label="Filter archived sessions by project"
+                  id="archived-project-filter"
+                  data-testid="archived-project-filter"
+                  className="w-56 justify-between gap-1.5 px-2.5"
+                >
+                  <span className="flex min-w-0 flex-1 items-center gap-1.5 truncate">
+                    {project && <ProjectRowIcon icon={projectIcons.get(project)} />}
+                    <span className="truncate">{project ?? "All projects"}</span>
+                  </span>
+                  <ChevronDownIcon
+                    aria-hidden="true"
+                    className="size-4 shrink-0 text-muted-foreground"
+                  />
+                </Button>
+              </PopoverTrigger>
+              <PopoverContent align="start" className="w-(--radix-popover-trigger-width) gap-0 p-0">
+                <Command shouldFilter={false} label="Search projects">
+                  <CommandInput
+                    autoFocus
+                    aria-label="Search projects"
+                    placeholder="Search projects…"
+                    value={projectSearch}
+                    onValueChange={setProjectSearch}
+                  />
+                  <CommandList>
+                    <CommandItem
+                      value={ALL_PROJECTS_VALUE}
+                      onSelect={() => selectArchivedProject(ALL_PROJECTS_VALUE)}
+                    >
+                      All projects
+                    </CommandItem>
+                    {filteredProjectNames.length > 0 ? (
+                      filteredProjectNames.map((name) => (
+                        <CommandItem
+                          key={name}
+                          value={projectToSelectValue(name)}
+                          data-testid={`archived-project-option-${name}`}
+                          onSelect={() => selectArchivedProject(projectToSelectValue(name))}
+                        >
+                          <ProjectRowIcon icon={projectIcons.get(name)} />
+                          <span className="min-w-0 flex-1 truncate">{name}</span>
+                        </CommandItem>
+                      ))
+                    ) : (
+                      <p className="px-2 py-6 text-center text-ui">No projects found</p>
+                    )}
+                  </CommandList>
+                </Command>
+              </PopoverContent>
+            </Popover>
           </div>
         )}
         {!selectionMode && archived.length > 0 && (

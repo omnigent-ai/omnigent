@@ -179,9 +179,8 @@ vi.mock("@/hooks/useConversations", async () => {
   };
 });
 // Radix Select uses a portal + pointer events jsdom can't drive; stub it to a
-// native <select> so tests can drive both the color-theme dropdown and the
-// archived project filter. The real page puts data-testid on SelectTrigger,
-// so the stub lifts it from the trigger child onto the native <select>.
+// native <select> for the color-theme dropdown and archived retention control.
+// The archived project picker uses its real searchable popover below.
 vi.mock("@/components/ui/select", async () => {
   const { Children, isValidElement } = await import("react");
   const SelectTrigger = ({ children }: { children?: ReactNode }) => children;
@@ -1799,22 +1798,31 @@ describe("SettingsPage", () => {
       project: undefined,
       visibility: "archived",
     });
-    const select = screen.getByTestId("archived-project-filter");
-    expect(within(select).getByRole("option", { name: "All projects" })).toBeInTheDocument();
-    const alphaOption = within(select).getByRole("option", { name: "Alpha" });
+    const trigger = screen.getByTestId("archived-project-filter");
+    expect(trigger).toHaveAccessibleName("Filter archived sessions by project");
+    expect(screen.getByText("Project").closest("label")).toHaveAttribute(
+      "for",
+      "archived-project-filter",
+    );
+    fireEvent.click(trigger);
+    expect(screen.getByRole("option", { name: "All projects" })).toBeInTheDocument();
+    const alphaOption = screen.getByRole("option", { name: "Alpha" });
     const alphaIcon = alphaOption.querySelector('[data-testid="project-icon"]');
     expect(alphaIcon).toHaveTextContent("🚀");
     expect(alphaIcon).toHaveAttribute("aria-hidden", "true");
     expect(alphaIcon?.nextElementSibling).toHaveTextContent("Alpha");
 
-    const betaOption = within(select).getByRole("option", { name: "Beta" });
+    const betaOption = screen.getByRole("option", { name: "Beta" });
     const betaIcon = betaOption.querySelector('svg[aria-hidden="true"]');
     expect(betaIcon).toBeInTheDocument();
     expect(betaIcon?.nextElementSibling).toHaveTextContent("Beta");
 
     // Picking a project narrows the list to that project's archived sessions.
     // Select values are discriminated (`project:<name>`), never the raw name.
-    fireEvent.change(select, { target: { value: "project:Alpha" } });
+    fireEvent.click(alphaOption);
+    const triggerIcon = trigger.querySelector('[data-testid="project-icon"]');
+    expect(triggerIcon).toHaveTextContent("🚀");
+    expect(triggerIcon?.nextElementSibling).toHaveTextContent("Alpha");
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Alpha chat")).toBeInTheDocument();
@@ -1826,13 +1834,50 @@ describe("SettingsPage", () => {
     });
 
     // Back to "All projects" restores the full list.
-    fireEvent.change(select, { target: { value: "all" } });
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByRole("option", { name: "All projects" }));
     expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
     expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
       includeArchived: true,
       project: undefined,
       visibility: "archived",
     });
+  });
+
+  it("searches archived project options and filters rows to a match", () => {
+    mocks.projectNames = ["Alpha", "Beta", "Gamma"];
+    mocks.conversations = [
+      conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
+      conv("conv_b", { archived: true, title: "Beta chat", labels: { omni_project: "Beta" } }),
+    ];
+    renderPage("/settings/archived");
+
+    const trigger = screen.getByTestId("archived-project-filter");
+    fireEvent.click(trigger);
+    const search = screen.getByRole("combobox", { name: "Search projects" });
+    expect(document.activeElement).toBe(search);
+    fireEvent.change(search, { target: { value: "missing" } });
+    expect(screen.getByText("No projects found")).toBeVisible();
+    expect(screen.getByRole("option", { name: "All projects" })).toBeVisible();
+
+    fireEvent.change(search, { target: { value: "bEt" } });
+
+    expect(
+      within(screen.getByRole("listbox"))
+        .getAllByRole("option")
+        .map((option) => option.textContent),
+    ).toEqual(["All projects", "Beta"]);
+    expect(screen.queryByTestId("archived-project-option-Alpha")).toBeNull();
+    expect(screen.queryByTestId("archived-project-option-Gamma")).toBeNull();
+
+    fireEvent.keyDown(search, { key: "ArrowDown" });
+    fireEvent.keyDown(search, { key: "Enter" });
+    expect(screen.getAllByTestId("archived-row")).toHaveLength(1);
+    expect(screen.getByText("Beta chat")).toBeInTheDocument();
+    expect(screen.queryByText("Alpha chat")).toBeNull();
+
+    fireEvent.click(trigger);
+    expect(screen.getByRole("combobox", { name: "Search projects" })).toHaveValue("");
   });
 
   it("hides the project filter when no archived session belongs to a project", () => {
@@ -1858,11 +1903,12 @@ describe("SettingsPage", () => {
     ];
     renderPage("/settings/archived");
 
-    const select = screen.getByTestId("archived-project-filter");
+    const trigger = screen.getByTestId("archived-project-filter");
     // Drop Alpha's only session so the filtered fetch returns nothing, then
     // pick Alpha (still an option because it's in the scanned name set).
     mocks.conversations = [];
-    fireEvent.change(select, { target: { value: "project:Alpha" } });
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("archived-project-option-Alpha"));
     expect(screen.getByText("No archived sessions in this project.")).toBeInTheDocument();
   });
 
@@ -1874,9 +1920,10 @@ describe("SettingsPage", () => {
     mocks.conversations = [conv("p1", { archived: true, title: "Page-one chat" })];
     renderPage("/settings/archived");
 
-    const select = screen.getByTestId("archived-project-filter");
+    const trigger = screen.getByTestId("archived-project-filter");
     // Gamma is offered even though no Gamma row is in the loaded page.
-    expect(within(select).getByRole("option", { name: "Gamma" })).toBeInTheDocument();
+    fireEvent.click(trigger);
+    expect(screen.getByRole("option", { name: "Gamma" })).toBeInTheDocument();
   });
 
   it("treats a project literally named __all__ as a real project, not the clear-filter sentinel", () => {
@@ -1887,10 +1934,11 @@ describe("SettingsPage", () => {
     ];
     renderPage("/settings/archived");
 
-    const select = screen.getByTestId("archived-project-filter");
+    const trigger = screen.getByTestId("archived-project-filter");
     // Picking the "__all__" project must FILTER to it (discriminated value
     // `project:__all__`), not clear the filter.
-    fireEvent.change(select, { target: { value: "project:__all__" } });
+    fireEvent.click(trigger);
+    fireEvent.click(screen.getByTestId("archived-project-option-__all__"));
     const rows = screen.getAllByTestId("archived-row");
     expect(rows).toHaveLength(1);
     expect(within(rows[0]).getByText("Edge chat")).toBeInTheDocument();
