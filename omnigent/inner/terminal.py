@@ -920,7 +920,8 @@ def reap_orphaned_terminals() -> int:
         if claim is None or not owner_claim.owner_is_gone(claim, process_alive=_process_alive):
             continue
         socket_path = entry / "tmux.sock"
-        had_socket = socket_path.exists()
+        # A Windows tmux may name its server by this path without creating a file.
+        had_socket = socket_path.exists() or IS_WINDOWS
         if had_socket:
             try:
                 result = subprocess.run(
@@ -1990,7 +1991,7 @@ class TerminalInstance:
         # observe a failure. A private socket can still belong to a live tmux
         # server (or a remain-on-exit pane), so cleanup must not trust that
         # advisory flag before issuing kill-server.
-        if self.running or self.socket_path.exists():
+        if self.running or self.socket_path.exists() or IS_WINDOWS:
             with contextlib.suppress(RuntimeError):
                 await self._tmux("kill-server")
         self.running = False

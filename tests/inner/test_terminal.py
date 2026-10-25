@@ -914,12 +914,23 @@ async def test_async_idle_watcher_treats_confirmation_start_failure_as_unknown(
 
 
 @pytest.mark.asyncio
-async def test_close_kills_tmux_when_socket_exists_after_running_cleared(tmp_path: Path) -> None:
-    """Cleanup kills a surviving tmux server even after a watcher marked it dead."""
+@pytest.mark.parametrize(("windows", "socket_file"), [(False, True), (True, False)])
+async def test_close_kills_tmux_when_server_may_survive_after_running_cleared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    windows: bool,
+    socket_file: bool,
+) -> None:
+    """Cleanup kills a surviving tmux server even after a watcher marked it dead.
+
+    A Windows tmux keeps no socket file, so the socket path cannot show it.
+    """
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", windows)
     private_dir = tmp_path / "terminal"
     private_dir.mkdir()
     socket_path = private_dir / "tmux.sock"
-    socket_path.touch()
+    if socket_file:
+        socket_path.touch()
     instance = TerminalInstance(
         name="runtime",
         session_key="main",
@@ -3290,6 +3301,8 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
 
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
     monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    monkeypatch.setattr(terminal_mod, "_process_alive", terminal_mod._proc.process_alive)
     monkeypatch.setattr(
         terminal_mod,
         "subprocess",
@@ -3310,12 +3323,17 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
     assert unmarked_dir.exists()
 
 
+@pytest.mark.parametrize(("windows", "socket_file"), [(False, True), (True, False)])
 def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    windows: bool,
+    socket_file: bool,
 ) -> None:
     """
     A dead-owner instance with a socket gets ``tmux kill-server``.
+
+    A Windows tmux names its server by the socket path but keeps no file there.
 
     Removing the dir alone leaves the detached tmux server running on
     the unlinked socket — the actual resource leak — so the sweep must
@@ -3339,9 +3357,12 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
         "subprocess",
         SimpleNamespace(run=_record_run, TimeoutExpired=TimeoutError),
     )
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", windows)
+    monkeypatch.setattr(terminal_mod, "_process_alive", terminal_mod._proc.process_alive)
     dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-dead2", _dead_pid())
     socket_path = dead_dir / "tmux.sock"
-    socket_path.touch()
+    if socket_file:
+        socket_path.touch()
 
     reaped = terminal_mod.reap_orphaned_terminals()
 
@@ -3412,6 +3433,10 @@ def test_reap_orphaned_terminals_logs_reap_when_socket_is_already_gone(
     """
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
     monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    # A socket file is how a POSIX tmux shows its server; psutil's liveness check
+    # runs on every platform.
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    monkeypatch.setattr(terminal_mod, "_process_alive", terminal_mod._proc.process_alive)
     kill_calls: list[list[str]] = []
     monkeypatch.setattr(
         terminal_mod,
