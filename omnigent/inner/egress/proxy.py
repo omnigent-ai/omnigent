@@ -174,7 +174,9 @@ async def _open_upstream(
     if p and (p.scheme != "http" or not p.hostname):  # https:// would need TLS-in-TLS
         logger.error("Unsupported upstream proxy scheme %r; connecting directly", p.scheme)
         p = None
-    if not p or urllib.request.proxy_bypass_environment(f"{host}:{port}", proxies):
+    # Missing from typeshed stubs; present at runtime.
+    bypass = urllib.request.proxy_bypass_environment  # type: ignore[missing-attribute]
+    if not p or bypass(f"{host}:{port}", proxies):
         return await asyncio.open_connection(
             connect_host, port, ssl=ssl_ctx, server_hostname=host if ssl_ctx else None
         )
