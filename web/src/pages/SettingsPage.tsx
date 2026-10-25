@@ -3260,15 +3260,17 @@ function ArchivedSection() {
                 data-testid="archived-project-filter"
                 className="w-56"
               >
-                <SelectValue className="min-w-0 flex-1" />
+                <SelectValue className="min-w-0 flex-1 [&_[data-radix-select-item-text]]:min-w-0 [&_[data-radix-select-item-text]]:flex-1" />
               </SelectTrigger>
-              <SelectContent position="popper" align="start">
+              <SelectContent position="popper" align="start" className="max-w-80">
                 <SelectItem value={ALL_PROJECTS_VALUE}>All projects</SelectItem>
                 {items.map((name) => (
                   <SelectItem
                     key={name}
                     value={projectToSelectValue(name)}
                     data-testid={`archived-project-option-${name}`}
+                    textValue={name}
+                    className="*:[span]:last:min-w-0"
                   >
                     <ProjectRowIcon icon={projectIcons.get(name)} />
                     <span className="min-w-0 flex-1 truncate">{name}</span>
