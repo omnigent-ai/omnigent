@@ -26,12 +26,15 @@ export const ROLES: readonly RoleDefinition[] = [
 ];
 
 export const AGENT_ROLES: readonly AgentRoleId[] = ["pm", "architect", "developer", "reviewer", "qa", "devops"];
-/** Default agent harness per role: Developer/QA on Claude, Architect/PM on Codex, DevOps on Gemini (agy), Reviewing Developer on Copilot. */
+/**
+ * Default agent harness per role: Developer/QA on Claude, Architect/PM on Codex, DevOps on Gemini, Reviewing Developer on Copilot.
+ * Gemini runs through the agy CLI (`antigravity-native`); plain `agy` is Omnigent's alias for the SDK harness, which needs an extra package.
+ */
 export const DEFAULT_ROLE_HARNESSES: Readonly<Record<AgentRoleId, string>> = {
   developer: "claude-sdk",
   architect: "codex",
   pm: "codex",
-  devops: "agy",
+  devops: "antigravity-native",
   qa: "claude-sdk",
   reviewer: "copilot",
 };

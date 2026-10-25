@@ -8,6 +8,7 @@ import {
   PROBLEM_TITLES,
   classifyFailure,
   harnessReadiness,
+  installCommand,
   recommendedActions,
   type FailureDetail,
   type ProblemCategory,
@@ -60,6 +61,8 @@ export interface DiagnoseInput {
 export /** Omnigent's own remediation wins, then the harness's setup step, then the office's advice. */
 function remediationFor(category: ProblemCategory, failure: FailureDetail | null, steps: SetupStep[]): string | null {
   if (failure?.remediation) return failure.remediation;
+  const command = category === "harness_setup" && failure ? installCommand(failure.message) : null;
+  if (command) return `Install the harness: run \`${command}\` where Omnigent runs, then restart the role.`;
   if (category === "auth" || category === "harness_setup") {
     const step = steps.find((entry) => entry.kind === (category === "auth" ? "auth" : "install") && entry.command);
     if (step?.command) return `${step.title ?? "Set up the harness"}: run \`${step.command}\` on the host.`;

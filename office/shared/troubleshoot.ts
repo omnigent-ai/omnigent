@@ -161,7 +161,14 @@ const RATE_LIMIT_TEXT = /rate[_ -]?limit|too many requests|\b429\b|overloaded|tr
 const AUTH_TEXT =
   /\b401\b|\b403\b|unauthori[sz]ed|forbidden|invalid (api )?key|api key|not (logged|signed) in|sign[_ -]?in|log ?in required|reauth|expired (token|credentials|session)|authenticat/i;
 const CONTEXT_TEXT = /context[_ ]length|context window|too many tokens|prompt is too long|request too large|maximum context/i;
-const SETUP_TEXT = /not configured|not installed|binary[_ -]missing|command not found|no such file|on path|update (it|the cli)|too old/i;
+const SETUP_TEXT =
+  /not configured|not installed|binary[_ -]missing|command not found|no such file|on path|update (it|the cli)|too old|requires the .+ package|install it with/i;
+const INSTALL_COMMAND = /install it with:?\s*(.+?)\s*$/i;
+
+/** The install command a harness error spells out, e.g. "Install it with: uv tool install …". */
+export function installCommand(message: string): string | null {
+  return INSTALL_COMMAND.exec(message)?.[1]?.replace(/[.`]+$/, "") || null;
+}
 const UPSTREAM_TEXT = /\b50[234]\b|timed? ?out|temporar|unavailable|connection (reset|refused|closed)|ECONNRESET|stream (ended|closed)/i;
 
 const CODE_CATEGORIES: Record<string, ProblemCategory> = {

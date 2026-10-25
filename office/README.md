@@ -47,7 +47,7 @@ The office never starts Omnigent. Configure it with environment variables:
 ### SDLC workflow
 
 Choose the SDLC theme in the New room dialog (roles default to Developer and QA on
-Claude, Architect and PM on Codex, DevOps on Gemini via `agy`, and Reviewing Developer
+Claude, Architect and PM on Codex, DevOps on Gemini via the agy CLI (`antigravity-native`), and Reviewing Developer
 on Copilot; an optional harness overrides all roles), or assign
 it later from inside an unthemed room. The room's host and folder (picked by
 browsing the host) are stored in the Omnigent project config (`host_id`,

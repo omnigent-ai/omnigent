@@ -22,7 +22,7 @@ describe("roleAgentSpec", () => {
   it("defaults each role to its own harness unless overridden", () => {
     const harnessOf = (role: AgentRoleId, runtime: BranchRuntime = { runnerId: "r" }) =>
       (roleAgentSpec({ role, projectName: "Shop", runtime, mcpUrl: "http://x", mcpToken: "t" }).executor as { config: { harness: string } }).config.harness;
-    expect(AGENT_ROLES.map((role) => harnessOf(role))).toEqual(["codex", "codex", "claude-sdk", "copilot", "claude-sdk", "agy"]);
+    expect(AGENT_ROLES.map((role) => harnessOf(role))).toEqual(["codex", "codex", "claude-sdk", "copilot", "claude-sdk", "antigravity-native"]);
     expect(harnessOf("pm", { harness: "claude-sdk", runnerId: "r" })).toBe("claude-sdk");
     expect(harnessOf("pm", { harness: "claude-sdk", roleHarnesses: { pm: "copilot" }, runnerId: "r" })).toBe("copilot");
   });

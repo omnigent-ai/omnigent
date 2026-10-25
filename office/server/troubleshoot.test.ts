@@ -91,6 +91,19 @@ describe("diagnoseRole", () => {
     expect(problem?.remediation).toBe("Set up authentication: run `codex login` on the host.");
   });
 
+  it("turns a missing harness package into a setup problem with its install command", () => {
+    const message =
+      "inner executor error: AntigravityExecutor requires the 'google-antigravity' package. Install it with: uv tool install --with 'omnigent[antigravity]' omnigent --force";
+    const { problem } = diagnoseRole(
+      input({ harness: "antigravity", session: session("conv_dev", { status: "failed" }), failedDetail: { code: "RuntimeError", message } }),
+    );
+    expect(problem?.category).toBe("harness_setup");
+    expect(problem?.actions[0]).toBe("switch_harness");
+    expect(problem?.remediation).toBe(
+      "Install the harness: run `uv tool install --with 'omnigent[antigravity]' omnigent --force` where Omnigent runs, then restart the role.",
+    );
+  });
+
   it("shows host loss as offline and a missing session as gone, never as progress", () => {
     expect(diagnoseRole(input({ session: session("conv_dev", { host_online: false, status: "running" }) })).problem?.category).toBe("host_offline");
     expect(diagnoseRole(input({ session: null })).problem?.category).toBe("missing");
