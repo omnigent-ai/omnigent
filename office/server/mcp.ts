@@ -152,10 +152,26 @@ export function officeTools(workflow: WorkflowService): ToolDefinition[] {
       handle: (caller, args) => workflow.recordDecision(caller, args),
     },
     {
+      name: "office_interview_plan",
+      description:
+        "PM only. Add questions to the current interview's agenda without asking them. List the whole agenda first; " +
+        "questions added later are shown to the PO as newly added follow-ups.",
+      inputSchema: { type: "object", properties: { questions: { type: "array", items: { type: "string" } } }, required: ["questions"] },
+      handle: (caller, args) => workflow.planInterview(caller, args),
+    },
+    {
       name: "office_interview_ask",
-      description: "PM only. Ask the PO one interview question. Refused while a previous question is unanswered.",
-      inputSchema: { type: "object", properties: { question: { type: "string" } }, required: ["question"] },
+      description:
+        "PM only. Ask the PO one interview question: pass a planned questionId, or question text (an unplanned question " +
+        "is added as a follow-up). Refused while a previous question is unanswered.",
+      inputSchema: { type: "object", properties: { questionId: { type: "string" }, question: { type: "string" } } },
       handle: (caller, args) => workflow.askInterview(caller, args),
+    },
+    {
+      name: "office_interview_skip",
+      description: "PM only. Drop a planned question that earlier answers made unnecessary.",
+      inputSchema: { type: "object", properties: { questionId: { type: "string" }, reason: { type: "string" } }, required: ["questionId", "reason"] },
+      handle: (caller, args) => workflow.skipInterview(caller, args),
     },
     {
       name: "office_post_update",

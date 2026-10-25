@@ -103,7 +103,7 @@ export function RoomView({ room, allRooms, serverNow, placementWaiting, onExit, 
   const selectedWorker = workers.find((worker) => worker.id === selectedWorkerId) ?? null;
   const explanation = explainRank(room, allRooms, serverNow, placementWaiting);
   const pendingWorkflow = workflowRequests(branchView);
-  const openQuestion = branchView?.interviews.find((question) => question.answer === null) ?? null;
+  const openQuestion = branchView?.interviews.find((question) => question.status === "asked") ?? null;
   const humanTasks = (branchView?.tasks ?? []).filter((task) => task.status === "blocked" && task.responsible.includes("po"));
   const nothingPending = requests.length === 0 && pendingWorkflow.length === 0 && !openQuestion && humanTasks.length === 0;
 

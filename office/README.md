@@ -72,6 +72,13 @@ allows only that command; Omnigent's runtime policies still apply, and the
 approval ends when its task completes. Messages the office relays between
 agents carry recorded stable ids and never count as human interactions.
 
+A PM interview has an agenda: the PM plans its questions first
+(`office_interview_plan`), asks one at a time, adds follow-ups, and skips
+questions earlier answers made unnecessary. The room shows a progress bar split
+into answered, awaiting your answer, to be answered, newly added (follow-ups not
+yet asked), and skipped. Starting a new interview skips the previous one's
+unasked questions.
+
 Task status, the board, gates, interview questions, decisions, and the event
 feed persist in `office-state.json`, so work continues with the browser closed
 and survives a service restart.

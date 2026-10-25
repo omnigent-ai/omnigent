@@ -8,6 +8,9 @@
   --ok: #3fa34d;
   --warn: #f2c14e;
   --danger: #d7263d;
+  --interview-upcoming: #8a83a3;
+  --interview-added: #4ea1d3;
+  --interview-skipped: #4a4560;
   color-scheme: dark;
   font-family: "Courier New", ui-monospace, monospace;
 }
@@ -422,3 +425,19 @@ select {
   margin: 0;
   padding: 0;
 }
+
+.interview-progress-bar { display: flex; height: 14px; border: 1px solid var(--panel-border); background: var(--bg); }
+.interview-segment { display: block; min-width: 4px; }
+.interview-segment + .interview-segment { border-left: 2px solid var(--bg); }
+.interview-segment-answered { background: var(--ok); }
+.interview-segment-awaiting { background: var(--warn); }
+.interview-segment-upcoming { background: var(--interview-upcoming); }
+.interview-segment-added { background: var(--interview-added); }
+.interview-segment-skipped { background: repeating-linear-gradient(45deg, var(--interview-skipped) 0 3px, var(--bg) 3px 6px); }
+.interview-legend { list-style: none; display: flex; flex-wrap: wrap; gap: 4px 12px; padding: 0; margin: 6px 0; }
+.interview-swatch { display: inline-block; width: 10px; height: 10px; vertical-align: middle; }
+.interview-agenda li { margin-bottom: 4px; }
+.interview-pill-answered { border-color: var(--ok); }
+.interview-pill-awaiting { border-color: var(--warn); }
+.interview-pill-added { border-color: var(--interview-added); }
+.pill { display: inline-block; border: 1px solid var(--panel-border); border-radius: 8px; padding: 0 6px; font-size: 0.8em; }

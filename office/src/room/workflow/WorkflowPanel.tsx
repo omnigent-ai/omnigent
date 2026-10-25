@@ -4,6 +4,8 @@ import type { BranchView, Requirement } from "../../../shared/workflowTypes.ts";
 import { OfficeApiError, officeApi } from "../../api.ts";
 import { useRuntimeOptions } from "../../capabilities.ts";
 import { DictationButton } from "../../Dictation.tsx";
+import { interviewSegment, INTERVIEW_SEGMENTS } from "../../../shared/interviewProgress.ts";
+import { InterviewProgressBar } from "./InterviewProgressBar.tsx";
 
 interface WorkflowPanelProps {
   view: BranchView;
@@ -136,7 +138,11 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
   const [notice, setNotice] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
   const dictationAvailable = useRuntimeOptions()?.dictationAvailable ?? false;
-  const open = view.interviews.find((question) => question.answer === null) ?? null;
+  const open = view.interviews.find((question) => question.status === "asked") ?? null;
+  const current = view.currentInterview;
+  const agenda = current ? view.interviews.filter((question) => question.interviewId === current.id) : [];
+  const segmentLabel = (question: (typeof agenda)[number]) =>
+    INTERVIEW_SEGMENTS.find((segment) => segment.id === interviewSegment(question))?.label ?? "";
 
   const run = async (action: () => Promise<unknown>, success: string) => {
     setBusy(true);
@@ -154,7 +160,21 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
 
   return (
     <section aria-label="PM interview" className="workflow-section">
-      <h3>PM interview</h3>
+      <h3>PM interview{current?.topic ? `: ${current.topic}` : ""}</h3>
+      {current ? <InterviewProgressBar questions={agenda} /> : null}
+      {agenda.length ? (
+        <details>
+          <summary>Interview agenda</summary>
+          <ol className="interview-agenda">
+            {agenda.map((question) => (
+              <li key={question.id}>
+                {question.question} <span className={`pill interview-pill-${interviewSegment(question)}`}>{segmentLabel(question)}</span>
+                {question.skipReason ? <span className="muted small"> ({question.skipReason})</span> : null}
+              </li>
+            ))}
+          </ol>
+        </details>
+      ) : null}
       {open ? (
         <form
           onSubmit={(event) => {
@@ -191,12 +211,12 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
           </button>
         </form>
       )}
-      {view.interviews.some((question) => question.answer !== null) ? (
+      {view.interviews.some((question) => question.status === "answered") ? (
         <details>
-          <summary>Previous questions</summary>
+          <summary>Answered questions</summary>
           <ol>
             {view.interviews
-              .filter((question) => question.answer !== null)
+              .filter((question) => question.status === "answered")
               .map((question) => (
                 <li key={question.id}>
                   <strong>{question.question}</strong>

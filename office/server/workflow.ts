@@ -29,6 +29,7 @@ import type {
   GateArtifact,
   GateRequest,
   InterviewQuestion,
+  InterviewRound,
   Requirement,
   RequirementsBoard,
   RoleSessionLink,
@@ -162,6 +163,28 @@ export class WorkflowService {
     this.notifier = options.notifier;
     this.mcpUrl = options.mcpUrl;
     this.clock = options.clock;
+    this.migrateInterviews();
+  }
+
+  /** Questions saved before interview agendas existed become one interview per branch. */
+  private migrateInterviews(): void {
+    const legacy = Object.values(this.state.interviews).filter((question) => !question.interviewId);
+    if (legacy.length === 0) return;
+    for (const question of legacy) {
+      let round = Object.values(this.state.interviewRounds).find((entry) => entry.branchId === question.branchId && entry.topic === "");
+      if (!round) {
+        round = { id: newId("interview"), branchId: question.branchId, topic: "", startedAt: question.askedAt ?? 0, endedAt: null };
+        this.state.interviewRounds[round.id] = round;
+      }
+      Object.assign(question, {
+        interviewId: round.id,
+        status: question.answer === null ? "asked" : "answered",
+        origin: "plan",
+        addedAt: question.askedAt ?? 0,
+        skipReason: null,
+      });
+    }
+    this.save();
   }
 
   private get state(): WorkflowState {
@@ -229,7 +252,7 @@ export class WorkflowService {
       if (branch.projectId !== projectId) continue;
       count += Object.values(this.state.gates).filter((gate) => gate.branchId === branch.id && gate.status === "pending").length;
       count += Object.values(this.state.proposals).filter((proposal) => proposal.branchId === branch.id && proposal.status === "pending").length;
-      count += Object.values(this.state.interviews).filter((question) => question.branchId === branch.id && question.answer === null).length;
+      count += Object.values(this.state.interviews).filter((question) => question.branchId === branch.id && question.status === "asked").length;
       count += Object.values(this.state.tasks).filter(
         (task) => task.branchId === branch.id && task.status === "blocked" && task.responsible.includes("po"),
       ).length;
@@ -266,7 +289,8 @@ export class WorkflowService {
       tasks: byBranch(this.state.tasks).sort((left, right) => left.createdAt - right.createdAt),
       gates: byBranch(this.state.gates).sort((left, right) => right.createdAt - left.createdAt),
       events: this.state.events.filter((event) => event.branchId === branchId).slice(-100).reverse(),
-      interviews: byBranch(this.state.interviews).sort((left, right) => left.askedAt - right.askedAt),
+      interviews: byBranch(this.state.interviews).sort((left, right) => left.addedAt - right.addedAt),
+      currentInterview: this.currentInterview(branchId),
       decisions: byBranch(this.state.decisions).sort((left, right) => right.at - left.at),
     };
   }
@@ -639,10 +663,12 @@ export class WorkflowService {
     const question = this.state.interviews[questionId];
     if (!question || question.branchId !== branchId) throw new WorkflowError(404, "question_not_found", "No such question");
     const answer = text(answerInput, "answer", { max: 10_000 });
-    if (question.answer !== null) {
+    if (question.status === "answered") {
       if (question.answer === answer) return { view: this.view(branchId), text: "", sessionId: null };
       throw new WorkflowError(409, "already_decided", "This question was already answered.");
     }
+    if (question.status !== "asked") throw new WorkflowError(409, "not_asked", "The PM has not asked this question yet.");
+    question.status = "answered";
     question.answer = answer;
     question.answeredAt = this.clock();
     this.recordEvent(branchId, "po", "interview_answered", `PO answered: ${question.question}`);
@@ -660,17 +686,35 @@ export class WorkflowService {
     return this.persistentLink(branchId, COORDINATOR_ROLE)?.sessionId ?? null;
   }
 
+  /** Start a new interview: unasked questions of the previous one are skipped. */
   interviewKickoff(branchId: string, topic: unknown): { sessionId: string; text: string } {
     this.branch(branchId);
     const sessionId = this.coordinatorSession(branchId);
     if (!sessionId) throw new WorkflowError(409, "no_coordinator", "The PM is not running.");
     const focus = text(topic, "topic", { required: false, max: 2000 });
+    const open = this.openQuestion(branchId);
+    if (open) throw new WorkflowError(409, "question_pending", `Answer the PM's open question first: ${open.question}`);
+    const now = this.clock();
+    const previous = this.currentInterview(branchId);
+    if (previous) {
+      previous.endedAt = now;
+      for (const question of this.roundQuestions(previous.id)) {
+        if (question.status === "planned") Object.assign(question, { status: "skipped", skipReason: "A new interview was started." });
+      }
+    }
+    const round: InterviewRound = { id: newId("interview"), branchId, topic: focus, startedAt: now, endedAt: null };
+    this.state.interviewRounds[round.id] = round;
+    this.recordEvent(branchId, "po", "interview_started", focus ? `PO started an interview: ${focus}` : "PO started an interview.");
+    this.save();
     return {
       sessionId,
       text:
         "Please interview me about the requirements" +
         (focus ? ` for: ${focus}` : "") +
-        ". Ask exactly one question at a time with office_interview_ask, wait for my answer, then propose board updates with office_board_propose.",
+        ". First list every question you plan to ask with office_interview_plan. Then ask them one at a time with " +
+        "office_interview_ask (pass the planned questionId) and wait for my answer. Add follow-up questions with " +
+        "office_interview_plan as they come up, skip ones my answers made unnecessary with office_interview_skip, " +
+        "and propose board updates with office_board_propose.",
     };
   }
 
@@ -782,7 +826,8 @@ export class WorkflowService {
       })),
       yourTasks: mine,
       gates: view.gates.map((gate) => ({ id: gate.id, gate: gate.gate, taskId: gate.taskId, status: gate.status, feedback: gate.feedback, operation: gate.operation })),
-      pendingInterviewQuestion: view.interviews.find((question) => question.answer === null)?.question ?? null,
+      pendingInterviewQuestion: this.openQuestion(caller.branch.id)?.question ?? null,
+      interview: this.interviewAgenda(caller.branch.id),
       recentDecisions: view.decisions.slice(0, 10),
       matrix: SDLC_MATRIX.map((entry) => ({ taskType: entry.id, title: entry.title, assignments: entry.assignments })),
     };
@@ -1107,23 +1152,111 @@ export class WorkflowService {
     return { decisionId: decision.id };
   }
 
-  async askInterview(caller: McpCaller, args: Record<string, unknown>): Promise<Record<string, unknown>> {
-    this.requireCoordinator(caller);
-    const open = Object.values(this.state.interviews).find((question) => question.branchId === caller.branch.id && question.answer === null);
-    if (open) throw new WorkflowError(409, "question_pending", `Wait for the PO to answer: ${open.question}`);
+  private currentInterview(branchId: string): InterviewRound | null {
+    const rounds = Object.values(this.state.interviewRounds).filter((round) => round.branchId === branchId && round.endedAt === null);
+    return rounds.sort((left, right) => right.startedAt - left.startedAt)[0] ?? null;
+  }
+
+  private roundQuestions(interviewId: string): InterviewQuestion[] {
+    return Object.values(this.state.interviews)
+      .filter((question) => question.interviewId === interviewId)
+      .sort((left, right) => left.addedAt - right.addedAt);
+  }
+
+  private openQuestion(branchId: string): InterviewQuestion | undefined {
+    return Object.values(this.state.interviews).find((question) => question.branchId === branchId && question.status === "asked");
+  }
+
+  /** The PM may also interview without a PO kickoff; that starts an untitled interview. */
+  private ensureInterview(branchId: string): InterviewRound {
+    const current = this.currentInterview(branchId);
+    if (current) return current;
+    const round: InterviewRound = { id: newId("interview"), branchId, topic: "", startedAt: this.clock(), endedAt: null };
+    this.state.interviewRounds[round.id] = round;
+    return round;
+  }
+
+  /** The first questions of an interview are its agenda; later ones are follow-ups. */
+  private nextOrigin(round: InterviewRound): InterviewQuestion["origin"] {
+    return this.roundQuestions(round.id).length === 0 ? "plan" : "added";
+  }
+
+  private addQuestion(round: InterviewRound, questionText: string, origin: InterviewQuestion["origin"]): InterviewQuestion {
     const question: InterviewQuestion = {
       id: newId("question"),
-      branchId: caller.branch.id,
-      question: text(args.question, "question", { max: 2000 }),
-      askedAt: this.clock(),
+      branchId: round.branchId,
+      interviewId: round.id,
+      question: questionText,
+      status: "planned",
+      origin,
+      addedAt: this.clock(),
+      askedAt: null,
       answer: null,
       answeredAt: null,
+      skipReason: null,
     };
     this.state.interviews[question.id] = question;
+    return question;
+  }
+
+  /** Interview agenda for the PM's board snapshot. */
+  private interviewAgenda(branchId: string): Record<string, unknown> | null {
+    const round = this.currentInterview(branchId);
+    if (!round) return null;
+    return {
+      interviewId: round.id,
+      topic: round.topic,
+      questions: this.roundQuestions(round.id).map(({ id, question, status, origin }) => ({ id, question, status, origin })),
+    };
+  }
+
+  planInterview(caller: McpCaller, args: Record<string, unknown>): Record<string, unknown> {
+    this.requireCoordinator(caller);
+    const questions = stringList(args.questions, "questions");
+    if (questions.length === 0) throw new WorkflowError(400, "invalid_input", "questions must list at least one question");
+    const round = this.ensureInterview(caller.branch.id);
+    const existing = new Set(this.roundQuestions(round.id).filter((entry) => entry.status !== "skipped").map((entry) => entry.question));
+    const origin = this.nextOrigin(round);
+    const added = [...new Set(questions)].filter((entry) => !existing.has(entry)).map((entry) => this.addQuestion(round, entry.slice(0, 2000), origin));
+    if (added.length) {
+      this.recordEvent(caller.branch.id, "pm", "interview_planned", `PM planned ${added.length} interview question${added.length === 1 ? "" : "s"}.`);
+    }
+    this.save();
+    return { interviewId: round.id, added: added.map(({ id, question, origin }) => ({ id, question, origin })) };
+  }
+
+  async askInterview(caller: McpCaller, args: Record<string, unknown>): Promise<Record<string, unknown>> {
+    this.requireCoordinator(caller);
+    const open = this.openQuestion(caller.branch.id);
+    if (open) throw new WorkflowError(409, "question_pending", `Wait for the PO to answer: ${open.question}`);
+    const round = this.ensureInterview(caller.branch.id);
+    const planned = this.roundQuestions(round.id).filter((entry) => entry.status === "planned");
+    let question: InterviewQuestion | undefined;
+    if (args.questionId) {
+      question = planned.find((entry) => entry.id === args.questionId);
+      if (!question) throw new WorkflowError(404, "question_not_found", "No planned question with that id in the current interview.");
+    } else {
+      const questionText = text(args.question, "question", { max: 2000 });
+      question = planned.find((entry) => entry.question === questionText) ?? this.addQuestion(round, questionText, this.nextOrigin(round));
+    }
+    question.status = "asked";
+    question.askedAt = this.clock();
     this.recordEvent(caller.branch.id, "pm", "interview_question", `PM asks: ${question.question}`);
     this.save();
     this.attention(caller.branch, "PM interview question", question.question);
     return { questionId: question.id, note: "The answer will arrive as a message from the PO." };
+  }
+
+  skipInterview(caller: McpCaller, args: Record<string, unknown>): Record<string, unknown> {
+    this.requireCoordinator(caller);
+    const question = this.state.interviews[String(args.questionId ?? "")];
+    if (!question || question.branchId !== caller.branch.id) throw new WorkflowError(404, "question_not_found", "No such question");
+    if (question.status !== "planned") throw new WorkflowError(409, "not_planned", "Only a question that has not been asked can be skipped.");
+    question.status = "skipped";
+    question.skipReason = text(args.reason, "reason", { max: 1000 });
+    this.recordEvent(caller.branch.id, "pm", "interview_skipped", `PM skipped: ${question.question} (${question.skipReason})`);
+    this.save();
+    return { questionId: question.id, status: question.status };
   }
 
   postUpdate(caller: McpCaller, args: Record<string, unknown>): Record<string, unknown> {

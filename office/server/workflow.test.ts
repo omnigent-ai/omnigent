@@ -3,7 +3,9 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { interviewProgress } from "../shared/interviewProgress.ts";
 import type { AgentRoleId } from "../shared/sdlcTheme.ts";
+import type { InterviewQuestion } from "../shared/workflowTypes.ts";
 import { StateStore } from "./stateStore.ts";
 import { type McpCaller, type WorkflowOmnigent, WorkflowError, WorkflowService } from "./workflow.ts";
 
@@ -318,6 +320,45 @@ describe("WorkflowService", () => {
     expect(answer.sessionId).toBe(pm.link.sessionId);
     await expect(workflow.answerInterview(branchId, questionId, "Admins")).rejects.toMatchObject({ code: "already_decided" });
     await workflow.askInterview(pm, { question: "What else?" });
+  });
+
+  it("tracks an interview agenda: planned, asked, answered, added, and skipped questions", async () => {
+    const branchId = await assign();
+    const pm = caller(branchId, "pm");
+    workflow.interviewKickoff(branchId, "checkout");
+    const plan = workflow.planInterview(pm, { questions: ["Who pays?", "Which cards?", "Refunds?", "Who pays?"] }) as {
+      added: { id: string; origin: string }[];
+    };
+    expect(plan.added.map((entry) => entry.origin)).toEqual(["plan", "plan", "plan"]);
+    await expect(workflow.answerInterview(branchId, plan.added[0].id, "Early")).rejects.toMatchObject({ code: "not_asked" });
+    await workflow.askInterview(pm, { questionId: plan.added[0].id });
+    await workflow.answerInterview(branchId, plan.added[0].id, "Shoppers");
+    workflow.planInterview(pm, { questions: ["Guest checkout?"] });
+    workflow.skipInterview(pm, { questionId: plan.added[2].id, reason: "Out of scope" });
+    await workflow.askInterview(pm, { question: "Which currency?" });
+    const view = workflow.view(branchId);
+    const agenda = view.interviews.filter((question) => question.interviewId === view.currentInterview?.id);
+    expect(interviewProgress(agenda).counts).toEqual({ answered: 1, awaiting: 1, upcoming: 1, added: 1, skipped: 1 });
+    expect(workflow.pendingHumanRequests("proj")).toBe(1);
+
+    // A new interview skips the previous interview's unasked questions.
+    await workflow.answerInterview(branchId, agenda.find((question) => question.status === "asked")!.id, "EUR");
+    workflow.interviewKickoff(branchId, "shipping");
+    const previous = store.state.workflow.interviews;
+    expect(Object.values(previous).filter((question) => question.status === "planned")).toHaveLength(0);
+    expect(workflow.view(branchId).currentInterview?.topic).toBe("shipping");
+  });
+
+  it("upgrades interview questions saved before agendas existed", async () => {
+    const branchId = await assign();
+    const legacy = (id: string, answer: string | null) =>
+      ({ id, branchId, question: id, askedAt: NOW, answer, answeredAt: answer ? NOW : null }) as unknown as InterviewQuestion;
+    store.state.workflow.interviews = { old_answered: legacy("old_answered", "Yes"), old_open: legacy("old_open", null) };
+    workflow = build();
+    const view = workflow.view(branchId);
+    expect(view.interviews.map((question) => question.status)).toEqual(["answered", "asked"]);
+    expect(view.interviews.every((question) => question.interviewId === view.currentInterview?.id)).toBe(true);
+    await workflow.answerInterview(branchId, "old_open", "Now answered");
   });
 
   it("stops every role immediately and rolls a role over with a recorded handoff", async () => {

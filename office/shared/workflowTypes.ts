@@ -151,13 +151,34 @@ export interface WorkflowEvent {
   taskId: string | null;
 }
 
+/** One PO interview: the PM's agenda of questions on a topic. */
+export interface InterviewRound {
+  id: string;
+  branchId: string;
+  topic: string;
+  startedAt: number;
+  /** Set when a later interview replaces this one. */
+  endedAt: number | null;
+}
+
+/**
+ * `planned`: on the agenda, not yet asked. `asked`: waiting for the PO.
+ * `origin: "added"` marks questions added after the agenda was first set.
+ */
+export type InterviewQuestionStatus = "planned" | "asked" | "answered" | "skipped";
+
 export interface InterviewQuestion {
   id: string;
   branchId: string;
+  interviewId: string;
   question: string;
-  askedAt: number;
+  status: InterviewQuestionStatus;
+  origin: "plan" | "added";
+  addedAt: number;
+  askedAt: number | null;
   answer: string | null;
   answeredAt: number | null;
+  skipReason: string | null;
 }
 
 export interface CoordinatorDecision {
@@ -178,6 +199,7 @@ export interface WorkflowState {
   gates: Record<string, GateRequest>;
   events: WorkflowEvent[];
   interviews: Record<string, InterviewQuestion>;
+  interviewRounds: Record<string, InterviewRound>;
   decisions: Record<string, CoordinatorDecision>;
   /** Item ids of messages the office relayed for agents; never human interactions. */
   relayedItemIds: string[];
@@ -193,6 +215,7 @@ export function emptyWorkflowState(): WorkflowState {
     gates: {},
     events: [],
     interviews: {},
+    interviewRounds: {},
     decisions: {},
     relayedItemIds: [],
   };
@@ -208,5 +231,7 @@ export interface BranchView {
   gates: GateRequest[];
   events: WorkflowEvent[];
   interviews: InterviewQuestion[];
+  /** The latest interview, whose questions the progress bar shows. */
+  currentInterview: InterviewRound | null;
   decisions: CoordinatorDecision[];
 }
