@@ -59,8 +59,8 @@ class ScheduledTask:
         host runner should start. ``None`` only for legacy or invalid rows.
     :param base_branch: Reserved legacy column; scheduled tasks currently do
         not create git worktrees at fire time.
-    :param execution_target: Reserved legacy column; scheduled tasks currently
-        run only on ``"connected_host"``.
+    :param execution_target: ``"connected_host"`` for a pinned host, or
+        ``"managed_sandbox"`` for a fresh sandbox per occurrence.
     :param host_id: Specific connected host to run on. ``None`` only for legacy
         or invalid rows.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
@@ -95,6 +95,9 @@ class ScheduledTask:
     last_run_conversation_id: str | None = None
     updated_at: int | None = None
     account_generation: str | None = None
+    next_run_at: int | None = None
+    project_id: str | None = None
+    delegation_ref: str | None = None
 
 
 @dataclass
@@ -106,9 +109,11 @@ class ScheduledTaskRun:
     :param id: UUID primary key (bare 32-char hex string, no dashes).
     :param scheduled_task_id: The task this run belongs to (a bare 32-char hex
         UUID string).
-    :param status: Lifecycle state — one of ``"scheduled"``, ``"running"``,
+    :param status: Lifecycle state — one of ``"scheduled"``, ``"starting"``, ``"running"``,
         ``"succeeded"``, ``"failed"``, ``"skipped"``.
-    :param scheduled_at: Unix epoch seconds the firing was scheduled for.
+    :param scheduled_at: Unix epoch seconds the fire worker began handling this
+        firing, stamped before dispatch. Not the nominal recurrence time the run
+        was due at, which is not recorded.
     :param conversation_id: Conversation created by this firing, or ``None``
         before dispatch / after the conversation is deleted.
     :param fired_at: Unix epoch seconds dispatch began, or ``None``.
@@ -129,3 +134,7 @@ class ScheduledTaskRun:
     finished_at: int | None = None
     error: str | None = None
     error_code: str | None = None
+    workspace_id: int = 0
+    trigger_key: str | None = None
+    host_id: str | None = None
+    lease_expires_at: int | None = None

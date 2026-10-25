@@ -28,7 +28,11 @@ import httpx
 import pytest
 from fastapi import FastAPI
 
-from omnigent.entities.session_resources import SessionResourceView, terminal_resource_view
+from omnigent.entities.session_resources import (
+    SessionResourceView,
+    terminal_resource_id,
+    terminal_resource_view,
+)
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
     bridge_dir_for_bridge_id,
@@ -37,8 +41,10 @@ from omnigent.harnesses.claude_native.bridge import (
 from omnigent.inner.datamodel import TerminalEnvSpec
 from omnigent.runner import create_runner_app
 from omnigent.runner.native import ResolvedSpec
+from omnigent.runner.native import orchestration as native_runtime
 from omnigent.spec.types import AgentSpec, ExecutorSpec, MCPServerConfig, ToolsConfig
-from omnigent.terminals import TerminalListEntry
+from omnigent.terminals import TerminalListEntry, TerminalRegistry
+from omnigent.terminals.pane_reaper import PaneRef
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient, _sse
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
 
@@ -389,6 +395,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_history",
         "sys_session_get_info",
         "sys_session_rename",
+        "ui_open_file",
         "sys_agent_list",
         "sys_agent_get",
         "sys_agent_download",
@@ -410,6 +417,8 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "conversation_id" in tools_by_name["sys_session_get_history"]["parameters"]["properties"]
     )
     assert "path" in tools_by_name["sys_os_read"]["parameters"]["properties"]
+    assert tools_by_name["ui_open_file"]["parameters"]["required"] == ["path"]
+    assert tools_by_name["ui_open_file"]["parameters"]["additionalProperties"] is False
     # A url + token prove the localhost relay HTTP server actually started
     # (start_tool_relay bound a socket), not just that a file was written.
     assert info["url"].startswith("http://127.0.0.1:")
@@ -468,6 +477,98 @@ async def test_repeated_terminal_launch_keeps_single_relay(relay_env: _RelayEnv)
         f"second launch rebound the relay ({first_url!r} -> {second_url!r}); "
         f"the idempotency guard did not hold"
     )
+
+
+class _ReapableStubResourceRegistry(_StubResourceRegistry):
+    """Stub with a terminal registry, so the runner wires its idle pane reaper."""
+
+    def __init__(self, tmp_path: Path) -> None:
+        super().__init__(tmp_path)
+        self.terminal_registry = TerminalRegistry()  # type: ignore[assignment]
+
+    async def close_terminal(self, session_id: str, terminal_id: str) -> bool:
+        """The stub launched no pane, so there is nothing to close."""
+        del session_id, terminal_id
+        return True
+
+
+@pytest.mark.asyncio
+async def test_idle_pane_reap_closes_comment_relay(tmp_path: Path) -> None:
+    """Reaping an idle pane closes its relay; the next launch starts a fresh one."""
+    app = create_runner_app(
+        resource_registry=_ReapableStubResourceRegistry(tmp_path),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    reaper = app.state.native_pane_reaper
+    assert reaper is not None
+    session_id = f"conv_{uuid.uuid4().hex[:12]}"
+    bridge_dir = bridge_dir_for_bridge_id(session_id)
+    prepare_bridge_dir(session_id, workspace=tmp_path)
+    relay_file = bridge_dir / _TOOL_RELAY_FILE
+    pane = PaneRef(
+        session_id, terminal_resource_id("claude", "main"), "claude", tmp_path / "tmux.sock"
+    )
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as client:
+        try:
+            resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
+            assert resp.status_code == 200, resp.text
+            relay_url = json.loads(relay_file.read_text())["url"]
+
+            await reaper._reap(pane)
+            # A surviving relay keeps a listening socket per reaped session
+            # until the session is deleted, exhausting the runner's descriptors.
+            assert not relay_file.exists(), "tool_relay.json survived the idle reap"
+            with pytest.raises(httpx.ConnectError):
+                async with httpx.AsyncClient() as probe:
+                    await probe.get(relay_url, timeout=2.0)
+
+            resp = await _launch_terminal(client, session_id, bridge_inject_dir=True)
+            assert resp.status_code == 200, resp.text
+            # The relay binds from a fixed port range, so the new one may reuse the port.
+            async with httpx.AsyncClient() as probe:
+                await probe.get(json.loads(relay_file.read_text())["url"], timeout=2.0)
+        finally:
+            with contextlib.suppress(httpx.HTTPError):
+                await client.delete(f"/v1/sessions/{session_id}")
+            shutil.rmtree(bridge_dir, ignore_errors=True)
+
+
+@pytest.mark.asyncio
+async def test_claude_launch_starts_the_comment_relay(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Every Claude launch starts the relay, including the Terminal view's re-create
+    of a reaped pane, which runs no turn that would start it."""
+    launched: list[str] = []
+    relay_starts: list[str] = []
+
+    async def launch(session_id: str, *args: object, **kwargs: object) -> str:
+        del args, kwargs
+        launched.append(session_id)
+        if session_id == "conv_launch_fails":
+            raise RuntimeError("tmux launch failed")
+        return "terminal view"
+
+    async def ensure_comment_relay(session_id: str, **kwargs: object) -> None:
+        del kwargs
+        relay_starts.append(session_id)
+
+    monkeypatch.setattr(native_runtime, "_auto_create_claude_terminal", launch)
+    for session_id in ("conv_relaunched", "conv_launch_fails"):
+        ctx = native_runtime.NativeLaunchContext(
+            session_id=session_id,
+            resource_registry=_StubResourceRegistry(tmp_path),  # type: ignore[arg-type]
+            publish_event=lambda *_args: None,
+            server_client=NullServerClient(),  # type: ignore[arg-type]
+            ensure_comment_relay=ensure_comment_relay,
+        )
+        with contextlib.suppress(RuntimeError):
+            await native_runtime._launch_claude(ctx)
+    await asyncio.gather(*native_runtime._CLAUDE_RELAY_START_TASKS)
+
+    assert launched == ["conv_relaunched", "conv_launch_fails"]
+    assert relay_starts == ["conv_relaunched"], "the relay must start only after a launch"
 
 
 @pytest.mark.asyncio

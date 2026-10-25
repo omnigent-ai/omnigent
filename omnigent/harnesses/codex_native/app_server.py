@@ -186,6 +186,23 @@ _MIN_REMOTE_RESUME_PERMISSION_GUARD_CODEX_VERSION = (0, 154, 0)
 _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
+class CodexAppServerSilentStartTimeout(RuntimeError):
+    """Readiness timed out while the app-server process was alive but never listened.
+
+    Carries the timeout message; ``start()`` respawns the process once and
+    turns a second occurrence into a plain ``RuntimeError``.
+    """
+
+    def __init__(
+        self, message: str, recent_stderr_bytes: int, last_error_type: str | None = None
+    ) -> None:
+        super().__init__(message)
+        # Bytes in the bounded ``recent_stderr`` tail, not the total emitted.
+        self.recent_stderr_bytes = recent_stderr_bytes
+        # Class name of the last failed probe, e.g. ``"ConnectionRefusedError"``.
+        self.last_error_type = last_error_type
+
+
 @dataclass(frozen=True)
 class _CodexModelDiscoveryProcess:
     """Short-lived Codex process plus its bounded stderr drain."""
@@ -463,7 +480,7 @@ def _sync_codex_developer_instructions(
     existing = config_path.read_text(encoding="utf-8") if config_path.exists() else ""
     try:
         document = tomlkit.parse(existing) if existing else tomlkit.document()
-    except Exception:  # noqa: BLE001 - title metadata must never block Codex startup.
+    except Exception:  # title metadata must never block Codex startup.
         _logger.warning(
             "Could not synchronize native Codex agent instructions: invalid private config",
             exc_info=True,
@@ -1834,7 +1851,7 @@ async def _codex_launch_catalog(
     try:
         if launch is None:
             launch = await asyncio.to_thread(resolve_native_codex_launch, model=None)
-    except Exception:  # noqa: BLE001 — a broken provider config means no catalog
+    except Exception:  # a broken provider config means no catalog
         _logger.warning("codex catalog: launch shape resolution failed", exc_info=True)
         return None
     fingerprint = codex_catalog_fingerprint(launch, codex_path=codex_path)
@@ -2052,6 +2069,56 @@ class CodexNativeAppServer:
     certificate_failure: CertificateFailure | None = field(default=None, init=False)
     _stderr_diagnostics: CodexStderrDiagnostics | None = field(default=None, init=False)
 
+    async def _spawn_app_server_process(self, resolved_listen: str) -> None:
+        """
+        Spawn one app-server attempt, for the initial launch or a silent-start respawn.
+
+        :param resolved_listen: Resolved listen URL (unix:// or ws://).
+        :returns: None.
+        """
+        self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
+        tagged_argv0 = (
+            f"{Path(self.codex_path).name} "
+            f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
+        )
+        argv = _build_native_codex_app_server_argv(
+            tagged_argv0=tagged_argv0,
+            listen_url=resolved_listen,
+            config_overrides=self.config_overrides,
+        )
+        proc_env = codex_app_server_diagnostic_env(
+            {**self.env, "CODEX_HOME": str(self.codex_home)}
+        )
+        self.process_owner_lock = acquire_codex_native_process_owner_lock()
+        try:
+            self.proc = await asyncio.create_subprocess_exec(
+                *argv,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.PIPE,
+                env=proc_env,
+                cwd=str(self.cwd),
+                executable=self.codex_path,
+                **_proc.spawn_kwargs(),
+            )
+        except BaseException:
+            if self.process_owner_lock is not None:
+                self.process_owner_lock.close()
+                self.process_owner_lock = None
+            raise
+        if self.process_owner_lock is not None:
+            register_codex_native_process(
+                pid=self.proc.pid,
+                pgid=_process_group_id(self.proc),
+                session_tag=self.process_registry_tag,
+                owner_lock_path=self.process_owner_lock.path,
+            )
+        self.recent_stderr = []
+        self.stderr_task = asyncio.create_task(
+            self._stderr_loop(),
+            name="codex-native-app-server-stderr",
+        )
+
     async def start(self) -> None:
         """
         Start the Codex app-server and wait for the socket.
@@ -2225,48 +2292,7 @@ class CodexNativeAppServer:
         effort_catalog_transport = self.listen_url or str(self.socket_path)
         _effort_catalog_cache.pop(effort_catalog_transport, None)
         _effort_catalog_misses.pop(effort_catalog_transport, None)
-        self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
-        tagged_argv0 = (
-            f"{Path(self.codex_path).name} "
-            f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
-        )
-        argv = _build_native_codex_app_server_argv(
-            tagged_argv0=tagged_argv0,
-            listen_url=resolved_listen,
-            config_overrides=self.config_overrides,
-        )
-        proc_env = codex_app_server_diagnostic_env(
-            {**self.env, "CODEX_HOME": str(self.codex_home)}
-        )
-        self.process_owner_lock = acquire_codex_native_process_owner_lock()
-        try:
-            self.proc = await asyncio.create_subprocess_exec(
-                *argv,
-                stdin=asyncio.subprocess.DEVNULL,
-                stdout=asyncio.subprocess.DEVNULL,
-                stderr=asyncio.subprocess.PIPE,
-                env=proc_env,
-                cwd=str(self.cwd),
-                executable=self.codex_path,
-                **_proc.spawn_kwargs(),
-            )
-        except BaseException:
-            if self.process_owner_lock is not None:
-                self.process_owner_lock.close()
-                self.process_owner_lock = None
-            raise
-        if self.process_owner_lock is not None:
-            register_codex_native_process(
-                pid=self.proc.pid,
-                pgid=_process_group_id(self.proc),
-                session_tag=self.process_registry_tag,
-                owner_lock_path=self.process_owner_lock.path,
-            )
-        self.recent_stderr = []
-        self.stderr_task = asyncio.create_task(
-            self._stderr_loop(),
-            name="codex-native-app-server-stderr",
-        )
+        await self._spawn_app_server_process(resolved_listen)
         # Ordering invariant: hooks.json is written before the spawn above,
         # and the trust handshake must complete before the first turn — codex
         # resolves trust when it dispatches a hook, so trust landing after the
@@ -2281,7 +2307,39 @@ class CodexNativeAppServer:
         # blocking session creation (fail-open). ``BaseException`` on the
         # outer guard so a cancellation mid-trust still tears down.
         try:
-            startup_client = await self._wait_until_ready()
+            try:
+                startup_client = await self._wait_until_ready()
+            except CodexAppServerSilentStartTimeout as silent:
+                # A loaded host can leave a fresh app-server silent; a second spawn
+                # listens. It must reuse the transport: callers captured the listen
+                # URL before start() and hand it to the TUI, forwarder and bridge.
+                with contextlib.suppress(Exception):  # diagnostics never block recovery
+                    _logger.warning(
+                        "Codex app-server never listened and is still running "
+                        "(recent_stderr_bytes=%d); respawning it once on the same transport",
+                        silent.recent_stderr_bytes,
+                        extra=self._startup_snapshot_event(
+                            "codex_app_server_silent_start_respawn",
+                            silent,
+                            recent_stderr_bytes=silent.recent_stderr_bytes,
+                            last_error_type=silent.last_error_type,
+                        ),
+                    )
+                await self.close()
+                # Diagnostics from a process that never served must not fail
+                # the replacement's turns.
+                self.certificate_failure = None
+                clear_certificate_failure(self.bridge_dir)
+                if resolved_listen.startswith("unix://"):
+                    with contextlib.suppress(FileNotFoundError):
+                        self.socket_path.unlink()
+                await self._spawn_app_server_process(resolved_listen)
+                # The second spawn gets its own full readiness budget; a second
+                # silent timeout is final.
+                try:
+                    startup_client = await self._wait_until_ready()
+                except CodexAppServerSilentStartTimeout as second:
+                    raise RuntimeError(str(second)) from second
             try:
                 # Standalone CLI launches may have no shared catalog snapshot.
                 # Correct their copied defaults before a TUI creates its thread.
@@ -2315,7 +2373,7 @@ class CodexNativeAppServer:
                                 ),
                                 timeout=_EFFORT_REPAIR_WRITE_TIMEOUT_SECONDS,
                             )
-                    except Exception:  # noqa: BLE001 - the local write below still repairs it
+                    except Exception:  # the local write below still repairs it
                         _logger.warning(
                             "Could not persist supported Codex reasoning effort at startup",
                             exc_info=True,
@@ -2334,7 +2392,7 @@ class CodexNativeAppServer:
             finally:
                 try:
                     await startup_client.close()
-                except Exception:  # noqa: BLE001 - a dead control socket cannot undo trust
+                except Exception:  # a dead control socket cannot undo trust
                     _logger.warning("Could not close Codex startup client", exc_info=True)
         except BaseException as exc:
             if isinstance(exc, Exception):
@@ -2342,22 +2400,32 @@ class CodexNativeAppServer:
             await self.close()
             raise
 
-    def _log_startup_failure_snapshot(self, exc: Exception) -> None:
-        """Record the owned child's state before ``close()`` discards it."""
+    def _startup_snapshot_event(
+        self, event_name: str, exc: Exception, **attributes: object
+    ) -> dict[str, object]:
+        """Build a debug event carrying the owned child's state before ``close()`` discards it."""
         diagnostics: dict[str, object]
         try:
             diagnostics = collect_codex_startup_diagnostics(self)
         except Exception as diagnostics_error:  # noqa: BLE001 - never replace the startup error
             diagnostics = {"diagnostics_error_type": type(diagnostics_error).__name__}
-        failure_event = debug_event("codex_app_server_start_failed", session_id=self.session_id)
-        failure_event["attributes"] = {
+        event = debug_event(event_name, session_id=self.session_id)
+        event["attributes"] = {
             "harness": "codex-native",
             "phase": "app_server_startup",
             "exception_type": type(exc).__name__,
             **diagnostics,
+            **attributes,
         }
+        return event
+
+    def _log_startup_failure_snapshot(self, exc: Exception) -> None:
+        """Record the owned child's state before ``close()`` discards it."""
         with contextlib.suppress(Exception):
-            _logger.warning("Codex app-server startup failed before cleanup", extra=failure_event)
+            _logger.warning(
+                "Codex app-server startup failed before cleanup",
+                extra=self._startup_snapshot_event("codex_app_server_start_failed", exc),
+            )
 
     async def _trust_policy_hooks(self, *, client: CodexAppServerClient | None = None) -> None:
         """
@@ -2401,7 +2469,7 @@ class CodexNativeAppServer:
             if self.router_hooks_registered:
                 try:
                     await trust_codex_router_hooks(client.request, cwd=str(self.cwd))
-                except Exception:  # noqa: BLE001 - routing trust never blocks startup
+                except Exception:  # routing trust never blocks startup
                     _logger.warning(
                         "codex subagent-routing hook trust failed; routing will not be enforced",
                         exc_info=True,
@@ -2425,7 +2493,7 @@ class CodexNativeAppServer:
                             len(still_untrusted),
                             ", ".join(still_untrusted),
                         )
-                except Exception:  # noqa: BLE001 - trust-all never blocks startup
+                except Exception:  # trust-all never blocks startup
                     _logger.warning(
                         "codex hook trust-all failed; the startup hook-review screen "
                         "may appear on resume",
@@ -2511,7 +2579,7 @@ class CodexNativeAppServer:
             _terminate_process_tree(self.proc)
             try:
                 await asyncio.wait_for(self.proc.wait(), timeout=5.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 _kill_process_tree(self.proc)
                 await self.proc.wait()
         if self.process_registry_tag is not None:
@@ -2549,8 +2617,10 @@ class CodexNativeAppServer:
         flight when it expires is not interrupted.
 
         :returns: Connected app-server client. The caller owns it.
-        :raises RuntimeError: If the app-server exits or never
-            becomes ready within ``_APP_SERVER_READY_TIMEOUT_SECONDS``.
+        :raises CodexAppServerSilentStartTimeout: If the budget expires while
+            the process is still alive and never listened; ``start()``
+            respawns it once.
+        :raises RuntimeError: If the app-server exits early.
         """
         deadline = asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
         last_error: Exception | None = None
@@ -2583,12 +2653,24 @@ class CodexNativeAppServer:
                     with contextlib.suppress(Exception):
                         await client.close()
                 await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+
         detail = " | ".join((self.recent_stderr or [])[-5:])
         target = self.listen_url or f"unix://{self.socket_path}"
-        raise RuntimeError(
+        message = (
             f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
             f"Codex app-server at {target}: {last_error}; stderr={detail}"
         )
+        # Still running but never listened: start() can respawn it once.
+        if self.proc is not None and self.proc.returncode is None:
+            recent_stderr_bytes = sum(
+                len(line.encode("utf-8")) for line in (self.recent_stderr or [])
+            )
+            raise CodexAppServerSilentStartTimeout(
+                message,
+                recent_stderr_bytes,
+                type(last_error).__name__ if last_error is not None else None,
+            )
+        raise RuntimeError(message)
 
     async def _stderr_loop(self) -> None:
         """
@@ -3267,9 +3349,12 @@ def _databricks_launch_materialization(
     """
     Resolve the Databricks-profile routing pieces of a Codex launch.
 
-    Uses the profile's own host so the gateway base URL matches the token
-    the profile-pinned auth command mints; a ``DATABRICKS_HOST`` override in
-    the runner env must not point the base URL at another workspace.
+    Uses the profile's own host, so a ``DATABRICKS_HOST`` override in the
+    runner env must not point the launch at another workspace. The gateway
+    and auth come from ucode state for that host when present (see
+    :func:`_databricks_codex_gateway`). Model discovery still uses the
+    profile's credentials; ucode state is keyed by the same host, so both
+    see that workspace's catalog.
 
     :param model: Optional explicit model pin; ``None`` resolves the
         catalog default.
@@ -3284,15 +3369,47 @@ def _databricks_launch_materialization(
         raise CodexDatabricksProfileMissingError(profile)
     host = host.rstrip("/")
     resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
+    base_url, auth_command, auth_refresh_interval_ms = _databricks_codex_gateway(host, profile)
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
             model=resolved_model,
-            base_url=_databricks_codex_base_url(host),
-            auth_command=_databricks_codex_auth_command(host, profile),
+            base_url=base_url,
+            auth_command=auth_command,
+            auth_refresh_interval_ms=auth_refresh_interval_ms,
         ),
         model=resolved_model,
         host=host,
     )
+
+
+def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | None]:
+    """
+    Return the Codex gateway base URL, auth command and refresh cadence for *host*.
+
+    ucode state is the source of truth for the gateway and auth; the
+    profile-derived gateway is the fallback.
+
+    :param host: Databricks workspace host, e.g. ``"https://example.databricks.com"``.
+    :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
+    :returns: ucode's ``codex`` entry for *host* when it names both a base URL and
+        an auth command, else the profile-derived gateway with the default cadence.
+    """
+    from omnigent.onboarding.ucode_state import read_ucode_state
+
+    try:
+        workspace_state = read_ucode_state(host)
+    except (OSError, ValueError):  # unreadable ucode state keeps the profile path
+        # Host logging mirrors WARNINGs to the terminal; frames are debug-only.
+        _logger.warning(
+            "native-codex: could not read ucode state for %r",
+            host,
+            exc_info=_logger.isEnabledFor(logging.DEBUG),
+        )
+        workspace_state = None
+    agent = workspace_state.agent("codex") if workspace_state is not None else None
+    if agent is not None and agent.base_url and agent.auth_command:
+        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms
+    return _databricks_codex_base_url(host), _databricks_codex_auth_command(host, profile), None
 
 
 # DATABRICKS-PATCH(codex-live-model-discovery)
@@ -3356,7 +3473,7 @@ def _resolve_databricks_codex_model(
         # simply fails the listing and drops to the ucode-state fallback below,
         # which is already keyed by ``host``.
         servable = discover_databricks_codex_models(host, creds.token)
-    except Exception as exc:  # noqa: BLE001 — cached ucode state is the launch fallback
+    except Exception as exc:  # cached ucode state is the launch fallback
         # Recoverable fallback; frames are debug-only so a TTY-mirrored
         # host console stays concise.
         _logger.warning(
@@ -3372,7 +3489,7 @@ def _resolve_databricks_codex_model(
             workspace_state = read_ucode_state(host)
             if workspace_state is not None:
                 servable = tuple(workspace_state.codex_models)
-        except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
+        except Exception:  # the bundled catalog is the last resort
             _logger.warning(
                 "native-codex: could not read ucode state for %r", profile, exc_info=True
             )
@@ -3629,7 +3746,8 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
     """Inference base URL a resolved launch pins, or None when it defers to Codex's own login.
 
     Mirrors how the launch is actually applied: the Databricks-profile branch of
-    :func:`build_native_codex_app` derives the base URL from the profile host,
+    :func:`build_native_codex_app` takes the base URL from ucode state for the
+    profile host, else derives it from that host (:func:`_databricks_codex_gateway`),
     while a generic provider carries it inside the generated
     ``model_providers.…`` config override.
 
@@ -3644,7 +3762,7 @@ def native_codex_launch_base_url(launch: NativeCodexLaunch) -> str | None:
         host = _databricks_gateway_host(launch.profile)
         if not host:
             return None
-        return _databricks_codex_base_url(host.rstrip("/"))
+        return _databricks_codex_gateway(host.rstrip("/"), launch.profile)[0]
     for override in launch.config_overrides:
         _, sep, table = override.partition("=")
         if not sep or not override.startswith("model_providers."):

@@ -61,7 +61,9 @@ dependencies = [
     # a 0600 file when no keyring backend is available (e.g. headless).
     "keyring>=24,<26",
     # Decode and validate public branding assets before serving them.
-    "pillow>=12.2,<13",
+    # uv.lock pins 13.0.0 for its security fixes; the floor stays at 12.2 so
+    # installs behind a package-age cooldown mirror still resolve until 13 ages in.
+    "pillow>=12.2,<14",
     # Round-trip (comment/format-preserving) TOML editing of the user's
     # ~/.codex/config.toml when removing a Databricks provider
     # (omnigent/onboarding/ucode_cleanup.py). stdlib tomllib is read-only.
@@ -109,7 +111,9 @@ dependencies = [
     # omnigent/inner/egress/ca.py). Required as a real fallback on uv /
     # python-build-standalone interpreters whose OpenSSL has no default cert
     # path; previously only transitive, pinned here now that we import it.
-    "certifi>=2023.7",
+    # 2026.10.19 drops the roots behind the compromised eMudhra intermediates.
+    # custom-lint: disable-next=young-dependency-floor -- CA security fix; proxy serves it
+    "certifi>=2026.10.19",
     # Protobuf schema for the AI-gateway routing API
     # (omnigent/api/routing/v1/routing.proto).
     # Previously only a transitive dep; declared directly now that we ship a proto.
@@ -146,7 +150,7 @@ cockroachdb = [
 # `all` carries dependencies moved out of the default install that internal
 # CI / dev workflows still exercise.
 all = [
-    "databricks-sdk>=0.56.0,<1",
+    "databricks-sdk[sandbox]>=0.153,<1",
     "opentelemetry-sdk>=1.20,<2",
     "opentelemetry-exporter-otlp-proto-grpc>=1.20,<2",
     "opentelemetry-exporter-otlp-proto-http>=1.20,<2",
@@ -207,7 +211,7 @@ openshell = ["openshell>=0.1.0,<1"]
 # `sandbox.provider: kubernetes`). The launcher module ships in the base
 # package and imports the official client lazily, so only users of the
 # provider need this extra.
-kubernetes = ["kubernetes>=36,<37"]
+kubernetes = ["kubernetes>=36,<38"]
 # Vault Transit backend for the credential store's SecretCipher — the
 # non-AWS alternative to the built-in KMS cipher (selected by
 # OMNIGENT_CREDENTIAL_VAULT_KEY). hvac is imported lazily, like boto3, so
@@ -294,9 +298,9 @@ slack = [
 # when the URI is Postgres but this driver is absent.
 postgres = ["psycopg[binary]>=3.1,<4"]
 databricks = [
-    # Floor matches what core code was tested against when the SDK was a
-    # default dependency (it moved here from `dependencies` above).
-    "databricks-sdk>=0.56.0,<1",
+    # 0.153 is the first SDK with streaming Sandbox command execution; the
+    # `sandbox` extra adds the grpcio it runs over.
+    "databricks-sdk[sandbox]>=0.153,<1",
     "opentelemetry-distro>=0,<1",
     # Databricks uses a Postgres control plane (Lakebase); reuse the single
     # psycopg pin from the `postgres` extra so the two never drift.
@@ -425,13 +429,12 @@ default-groups = []
 # shared dependencies like databricks-sdk.
 #   cwsandbox:  protobuf<7 (cwsandbox itself)
 #   modal:      protobuf<7 (modal itself)
-#   databricks: protobuf<7 (databricks-sdk>=0.56 caps at <7.0)
 #   lint group: protobuf<7 (grpcio-tools<=1.81.1 requires protobuf<7) — only
-#               conflicts with antigravity, not with cwsandbox/modal/databricks
+#               conflicts with antigravity, not with cwsandbox/modal
+# `databricks` needs no entry: databricks-sdk>=0.153 accepts protobuf 7.
 conflicts = [
     [{ extra = "antigravity" }, { extra = "cwsandbox" }],
     [{ extra = "antigravity" }, { extra = "modal" }],
-    [{ extra = "antigravity" }, { extra = "databricks" }],
     [{ group = "lint" }, { extra = "antigravity" }],
 ]
 
@@ -462,6 +465,7 @@ include = ["omnigent*"]
 "omnigent.resources.examples" = ["*.yaml", "*.sh", "debby/**/*", "polly/**/*"]
 "omnigent.resources.pi" = ["*.cjs"]
 "omnigent.resources.pi_native" = ["*.js", "*.cjs"]
+"omnigent.resources.pi_gateway" = ["*.js"]
 "omnigent.resources.scripts" = ["*.sh"]
 # include UI assets in build, plus the static API-only landing page served
 # at "/" when no web UI bundle is present
@@ -552,11 +556,7 @@ ignore_errors = true
 
 [tool.ruff]
 line-length = 99
-# NOTE: kept at py310 even though requires-python is >=3.12. Bumping this to
-# py312 makes ruff's UP041 rewrite `asyncio.TimeoutError` -> `TimeoutError`
-# (aliased since 3.11) across the whole codebase — a separate, out-of-scope
-# migration that belongs in its own cleanup PR.
-target-version = "py310"
+target-version = "py312"
 # Vendored upstream code — not ours to restyle.
 #  - ``omnigent/inner/databricks_mcps/google``: Google MCP server source.
 #  - ``assistant-ui/``: assistant-ui.com React/Python suite imported as a
@@ -568,6 +568,9 @@ extend-exclude = [
     "omnigent/api/**/*_pb2.py",
     "omnigent/api/**/*_pb2.pyi",
 ]
+
+[tool.ruff.format]
+docstring-code-format = true
 
 [tool.ruff.lint]
 # ``E``/``F``  — pycodestyle + pyflakes baseline
@@ -587,6 +590,12 @@ extend-exclude = [
 #                tasks, unused noqa, ...)
 select = ["E", "F", "I", "UP", "ARG", "BLE", "B", "SIM", "RET", "C4", "PIE", "DTZ", "LOG", "RUF"]
 ignore = [
+    # Preserve runtime type-alias, enum, and generic semantics. These rewrites
+    # need compatibility review rather than automatic syntax modernization.
+    "UP040",
+    "UP042",
+    "UP046",
+    "UP047",
     # ARG003 (unused class-method args): too noisy on ABC-subclass signatures
     # where the arg is required by the interface contract.
     "ARG003",
@@ -654,9 +663,6 @@ known-first-party = ["omnigent"]
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
 "omnigent/runtime/**/*.py" = [
-    "ARG001", "ARG002", "BLE001", "B008", "RUF012",
-]
-"omnigent/terminals/**/*.py" = [
     "ARG001", "ARG002", "BLE001", "B008", "RUF012",
 ]
 "omnigent/tools/**/*.py" = [

@@ -373,6 +373,7 @@ from omnigent.server.schemas import (
     ElicitationResult,
     ErrorDetail,
     NativeModelOption,
+    NativeUsageBaseline,
     SessionCreateInput,
     SessionCreateMetadata,
     SessionEventInput,
@@ -1448,6 +1449,15 @@ def _build_session_response(
     # both read the same numbers.
     display_usage = subtree_usage if subtree_usage is not None else (conv.session_usage or {})
     harness = _resolve_harness(conv, agent_store=agent_store, agent_cache=agent_cache)
+    native_usage_baseline = None
+    if harness == "pi-native":
+        own_usage = conv.session_usage or {}
+        cached = int(own_usage.get("cache_read_input_tokens", 0) or 0)
+        native_usage_baseline = NativeUsageBaseline(
+            cumulative_input_tokens=int(own_usage.get("input_tokens", 0) or 0) + cached,
+            cumulative_output_tokens=int(own_usage.get("output_tokens", 0) or 0),
+            cumulative_cache_read_input_tokens=cached,
+        )
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
     labels = labels_with_closed_status(_labels_for_viewer(conv.labels, viewer_id), conv.title)
@@ -1504,6 +1514,7 @@ def _build_session_response(
         # Per-model breakdown over the same subtree usage. None (omitted)
         # when no per-model usage was recorded.
         usage_by_model=_usage_by_model_for_display(display_usage),
+        native_usage_baseline=native_usage_baseline,
         last_task_error=last_task_error,
         external_session_id=conv.external_session_id,
         terminal_launch_args=conv.terminal_launch_args,
@@ -3648,23 +3659,22 @@ async def _enrich_terminal_status_with_subagent_output(
     if status == "failed":
         context = normalize_failure_context(data.get("failure_context"))
         context.setdefault("failure_source", "external_status")
-        wire_detail = data.get("output")
+        wire_detail = data.get("failure_detail")
         if not isinstance(wire_detail, str) or not wire_detail.strip():
-            wire_detail = data.get("failure_detail")
+            wire_detail = data.get("output")
         for key, value in provider_error_context_from_text(wire_detail).items():
             context.setdefault(key, value)
         data = {**data, "failure_context": context}
     current_turn_only = status == "failed" or data.get("turn_outcome") == "cancelled"
+    failure_detail = data.get("failure_detail") if status == "failed" else None
+    if isinstance(failure_detail, str) and failure_detail.strip():
+        context.setdefault("detail_source", "external_status_failure_detail")
+        return {**data, "output": failure_detail.strip()}
     existing = data.get("output")
     if current_turn_only and isinstance(existing, str) and existing.strip():
         if status == "failed":
             context.setdefault("detail_source", "external_status_output")
         return data
-    # The store's latest assistant text can be prose that preceded the error.
-    failure_detail = data.get("failure_detail") if status == "failed" else None
-    if isinstance(failure_detail, str) and failure_detail.strip():
-        context.setdefault("detail_source", "external_status_failure_detail")
-        return {**data, "output": failure_detail.strip()}
     raw_response_id = data.get("response_id") if current_turn_only else None
     response_id = raw_response_id if isinstance(raw_response_id, str) and raw_response_id else None
     output = await asyncio.to_thread(
@@ -4088,6 +4098,8 @@ async def _mark_runner_sessions_offline_once(
                 if _intentional_stop_sessions.get(conv.id) == stopped_runner_id:
                     _intentional_stop_sessions.pop(conv.id, None)
             continue
+        turn_id = _session_active_response_cache.get(conv.id)
+        decision_stop_runner_id = _intentional_stop_sessions.get(conv.id)
         if not await _runner_disconnect_requires_failure(
             conv.id,
             conversation_store,
@@ -4097,7 +4109,32 @@ async def _mark_runner_sessions_offline_once(
             error_code=error.code,
         ):
             continue
-        turn_id = _session_active_response_cache.get(conv.id)
+        decision_status = _session_status_cache.get(conv.id)
+        binding_unavailable = False
+        try:
+            binding = await asyncio.to_thread(conversation_store.get_runner_liveness, conv.id)
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Cannot confirm runner ownership for %s during offline sweep",
+                conv.id,
+                exc_info=True,
+                extra={"session_id": conv.id},
+            )
+            binding_unavailable = True
+            binding = None
+        # A status read or ownership check can yield to a replacement turn or Stop.
+        if (
+            _runner_relay_tasks.get(conv.id) is not handle
+            or _session_active_response_cache.get(conv.id) != turn_id
+            or _intentional_stop_sessions.get(conv.id) != decision_stop_runner_id
+            or _session_status_cache.get(conv.id) != decision_status
+        ):
+            continue
+        if binding_unavailable:
+            retry.append(conv)
+            continue
+        if binding is None or binding[0] != conv.runner_id:
+            continue
         _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
         await record_subagent_activity(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
@@ -4634,6 +4671,7 @@ async def _maybe_relaunch_managed_sandbox(
                 conversation_store=conversation_store,
                 host_store=host_store,
                 app_state=app_state,
+                provider=host.sandbox_provider,
             )
         else:
             _kick_managed_relaunch(
@@ -5265,7 +5303,7 @@ def _kick_managed_relaunch(
     tracker.begin(session_id)
     # Seed the relaunch's progress indicator immediately — the user is
     # typically watching the session page when "wake the sandbox" runs.
-    _publish_sandbox_status(session_id, "provisioning")
+    _publish_sandbox_status(session_id, "provisioning", provider=host.sandbox_provider)
     agent_store = getattr(app_state, "agent_store", None)
     if agent_store is None:
         _logger.warning(
@@ -5302,6 +5340,7 @@ def _kick_managed_wake(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    provider: str | None = None,
 ) -> None:
     """
     Spawn the background wake for a dormant resumable host.
@@ -5319,6 +5358,7 @@ def _kick_managed_wake(
         conversation_store=conversation_store,
         host_store=host_store,
         app_state=app_state,
+        provider=provider,
     )
 
 
@@ -5331,6 +5371,7 @@ def _kick_managed_wake_impl(
     conversation_store: ConversationStore,
     host_store: HostStore,
     app_state: Any,
+    provider: str | None = None,
 ) -> None:
     """
     Register and spawn the background WAKE for a dormant resumable host.
@@ -5349,6 +5390,8 @@ def _kick_managed_wake_impl(
     :param conversation_store: Store holding the session row.
     :param host_store: Persistent host registrations.
     :param app_state: ``request.app.state`` — supplies the registries.
+    :param provider: The dormant host's sandbox provider, e.g. ``"arclet"``,
+        which the seeded launch status names.
     """
     _logger.info(
         "Managed host %s (session %s) is dormant but resumable; waking in background",
@@ -5360,7 +5403,7 @@ def _kick_managed_wake_impl(
     # Seed the progress indicator immediately — the user is watching the
     # session page when the wake fires (the composer let them send into a
     # host_asleep session).
-    _publish_sandbox_status(session_id, "provisioning")
+    _publish_sandbox_status(session_id, "provisioning", provider=provider)
     wake_agent_store = getattr(app_state, "agent_store", None)
     if wake_agent_store is None:
         _logger.warning(
@@ -5449,7 +5492,7 @@ async def _run_managed_wake(
         _publish_sandbox_status(session_id, "failed", reason)
         return
 
-    def _on_stage(stage: str) -> None:
+    def _on_stage(stage: str, details: str | None = None) -> None:
         """Relay the wake's launch-pipeline stage to the session's progress surface.
 
         Without it the wake shows the single ``"provisioning"`` band that
@@ -5457,8 +5500,11 @@ async def _run_managed_wake(
         is already re-execing. resume_managed_host may invoke this from the
         worker thread its ``start_host`` runs on; ``_publish_sandbox_status`` is
         thread-safe.
+
+        :param stage: The stage just entered, e.g. ``"starting"``.
+        :param details: What the user needs to do, for ``"action_required"``.
         """
-        _publish_sandbox_status(session_id, stage)
+        _publish_sandbox_status(session_id, stage, details=details)
 
     try:
         # Wake the same sandbox in place; resume_managed_host is single-flight
@@ -5620,6 +5666,7 @@ async def _ensure_runner_session_initialized(
     *,
     suppress_recovery_turn: bool = False,
     require_success: bool = False,
+    trigger: str = "session_ensure",
 ) -> bool:
     """
     Drive — and wait for — the runner's session-init handshake.
@@ -5680,6 +5727,7 @@ async def _ensure_runner_session_initialized(
                 runner_client,
                 timeout=_RUNNER_SESSION_INIT_TIMEOUT_S,
                 suppress_recovery_turn=suppress_recovery_turn,
+                trigger=trigger,
             )
         else:
             from omnigent.version import VERSION
@@ -6518,14 +6566,22 @@ async def _native_turn_catalog(
     :param runner_client: HTTP client pointed at the bound runner, used to
         replace a stale pre-launch catalog with the launch-exact one.
         ``None`` serves whatever is cached.
+    A pi-native pane is the same story: ``setModel`` resolves only its own
+    registry's ``provider/id`` spellings (what the extension pushed as
+    ``external_model_options``), never the runner's ``databricks-*`` catalog.
+
     :returns: Model ids, or ``None`` when the session is not a native
         terminal with a known vocabulary (the caller keeps its own
         candidate resolution).
     """
-    if conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY) != _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+    wrapper = conv.labels.get(_CLAUDE_NATIVE_WRAPPER_LABEL_KEY)
+    if wrapper == _PI_NATIVE_WRAPPER_LABEL_VALUE:
+        options = _pushed_model_options_cache.get(session_id)
+    elif wrapper == _CLAUDE_NATIVE_WRAPPER_LABEL_VALUE:
+        await _refresh_stale_native_model_options(session_id, runner_client)
+        options = _model_options_cache.get(session_id)
+    else:
         return None
-    await _refresh_stale_native_model_options(session_id, runner_client)
-    options = _model_options_cache.get(session_id)
     if not options:
         return None
     # ``model`` is optional on a picker row and ``model_dump(exclude_none=True)``
@@ -8174,6 +8230,45 @@ _NATIVE_TERMINAL_ENSURE_RECONNECT_GRACE_S: float = 30.0
 # failure. ``waiting`` counts because the turn's background work (shells,
 # sub-agents) outlives the turn and dies with the runner.
 _MID_TURN_STATUSES = ("running", "waiting")
+# A laptop that sleeps or loses its network takes its runner with it and often
+# resumes the turn hours later, so a turn interrupted that way waits this long.
+HOST_OFFLINE_HOLD_S: float = 24 * 3600.0
+# How often a host-offline hold re-checks whether the host came back.
+HOST_OFFLINE_RECHECK_S: float = 60.0
+
+# Set at app startup: whether a lost relay's turn is being held by the
+# runner's disconnect task because its host went offline too.
+_relay_turn_held_for_host: Callable[[str, str], Awaitable[bool]] | None = None
+
+
+def set_relay_host_offline_probe(probe: Callable[[str, str], Awaitable[bool]] | None) -> None:
+    """
+    Register how a relay learns its runner's turns wait for an offline host.
+
+    :param probe: Called with ``(runner_id, session_id)``; ``None`` clears it.
+    :returns: None.
+    """
+    global _relay_turn_held_for_host
+    _relay_turn_held_for_host = probe
+
+
+async def _host_row_offline(host_store: HostStore | None, host_id: str) -> bool | None:
+    """
+    Report whether a user-run host's row shows it offline on every replica.
+
+    :param host_store: Persistent host registrations, or ``None`` without hosts.
+    :param host_id: The host to check.
+    :returns: ``True`` for a stale non-sandbox host; ``False`` when it is live,
+        managed, or missing; ``None`` when its row can't be read.
+    """
+    if host_store is None:
+        return False
+    try:
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+    except Exception:  # noqa: BLE001 — an unreadable row proves nothing
+        _logger.warning("Host lookup failed for host=%s", host_id, exc_info=True)
+        return None
+    return host is not None and host.sandbox_provider is None and not host_is_live(host)
 
 
 class _RelayTransportLost(Exception):
@@ -8669,6 +8764,12 @@ async def _relay_runner_stream(
                 session_id, conversation_store, outage_runner_id
             ):
                 decision = "rebound"
+            elif (
+                _relay_turn_held_for_host is not None
+                and outage_runner_id is not None
+                and await _relay_turn_held_for_host(outage_runner_id, session_id)
+            ):
+                decision = "held_host_offline"
             elif await _runner_disconnect_requires_failure(
                 session_id, conversation_store, origin="runner_disconnected_mid_turn"
             ):
@@ -8739,6 +8840,9 @@ async def _relay_runner_stream(
                     outage_runner_id,
                     extra={"session_id": session_id},
                 )
+            elif decision == "held_host_offline":
+                # The disconnect task holds the turn; the reconnect restarts the relay.
+                pass
             elif decision == "idle_no_failure":
                 # No evidence of an interrupted turn. Liveness drives the
                 # reconnect affordance; preserve status and prior error labels.
@@ -9800,7 +9904,7 @@ async def _ensure_runner_relay_ready_impl(
             handle.ready.wait(),
             timeout=_RUNNER_RELAY_READY_TIMEOUT_S,
         )
-    except asyncio.TimeoutError as exc:
+    except TimeoutError as exc:
         if handle.task.done():
             raise OmnigentError(
                 "Runner stream relay exited before becoming ready",
@@ -13051,7 +13155,7 @@ async def _run_runner_status_probe(
                 ),
                 timeout=_RUNNER_STATUS_PROBE_TIMEOUT_S,
             )
-        except asyncio.TimeoutError:
+        except TimeoutError:
             failure = f"no answer within {_RUNNER_STATUS_PROBE_TIMEOUT_S:g}s"
         except (httpx.HTTPError, ConnectionError) as exc:
             failure = f"{type(exc).__name__}: {exc}"

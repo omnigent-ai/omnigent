@@ -157,6 +157,7 @@ export type RenderItem =
       } | null;
       allowAllEdits?: boolean;
       allowAutoMode?: boolean;
+      permissionDirectories?: string[];
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
       agyPermission?: AgyPermission | null;
@@ -1679,6 +1680,7 @@ function buildAssistantItems(
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
         allowAutoMode: b.allowAutoMode,
+        permissionDirectories: b.permissionDirectories,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,
         agyPermission: b.agyPermission,

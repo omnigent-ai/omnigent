@@ -57,6 +57,11 @@ NO_CAPABILITIES = {
     "base_remote_selection": False,
     "line_counts": False,
     "linked_pr_diff": False,
+    "label_editing": False,
+    "merging": False,
+    "reviewer_editing": False,
+    "details_editing": False,
+    "attachment_uploads": False,
 }
 # Keys of the panel's end-to-end info fixture, less GitHub's legacy fields.
 INFO_KEYS = {"object", "available", "branch", "base_ref", "repo", "pr"}
@@ -1475,6 +1480,10 @@ def test_module_instance_handles_unsupported_actions(tmp_path: Path) -> None:
     assert PULL_REQUESTS.pr_from_object({"url": PR_URL}) is None
     assert PULL_REQUESTS.mcp_prs("create_pull_request", {}, {}) is None
     PULL_REQUESTS.on_inferred_pr(str(tmp_path), reference())
+    with pytest.raises(ValueError, match="labels is not supported"):
+        PULL_REQUESTS.repo_labels(str(tmp_path), reference())
+    with pytest.raises(ValueError, match="labels is not supported"):
+        PULL_REQUESTS.edit_labels(str(tmp_path), reference(), add=["bug"], remove=[])
 
 
 def test_importing_the_facet_loads_neither_httpx_nor_the_rest_client() -> None:

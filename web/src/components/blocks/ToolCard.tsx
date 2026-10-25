@@ -16,25 +16,37 @@ import {
   WrapTextIcon,
   XCircleIcon,
 } from "lucide-react";
-import type { ReactNode } from "react";
+import type { CSSProperties, ReactNode } from "react";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   CodeBlock,
   CodeBlockActions,
+  type CodeColorScheme,
+  type CodeLanguage,
+  CodeBlockContainer,
+  CodeBlockContent,
   CodeBlockHeader,
   CodeBlockTitle,
 } from "@/components/ai-elements/code-block";
+import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
+import { dropTrailingPartialEscape, showControlCharacters, stripAnsi } from "@/lib/ansi";
+import { type ShellOutputFormat, parseShellToolOutput } from "@/lib/shellToolOutput";
+import { terminalSurfaceStyle } from "@/lib/terminalPalette";
 import { iconForTool } from "@/lib/toolIcon";
 import {
   type ToolRunCall,
   type ToolTitle,
   formatToolRunLabel,
   formatToolTitle,
+  shellCommandPreview,
+  shellToolCall,
+  splitEnvPrefix,
 } from "@/lib/toolTitle";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
@@ -174,6 +186,7 @@ export function ToolCard({
   duration,
 }: ToolCardProps) {
   const title = useMemo(() => formatToolTitle(name, args, argsSummary), [name, args, argsSummary]);
+  const shellCall = useMemo(() => shellToolCall(name, args), [name, args]);
   const inputJson = useMemo(() => JSON.stringify(args, null, 2), [args]);
   const formattedOutput = useMemo(
     () => (output === null ? null : prettyPrintIfJson(output)),
@@ -202,17 +215,31 @@ export function ToolCard({
         onBodyClick={onBodyClick}
       />
       <CollapsibleContent className="mt-1 ml-2 space-y-2 border-l pl-3 py-1 data-[state=closed]:fade-out-0 data-[state=open]:fade-in-0 data-[state=closed]:animate-out data-[state=open]:animate-in">
-        <CodePanel
-          title="Parameters"
-          text={inputJson}
-          copyText={inputJson}
-          copyLabel="Copy parameters"
-        />
-        {formattedOutput !== null && <OutputSection output={formattedOutput} />}
-        {formattedOutput === null && state === "input-available" && (
-          <ToolPendingOutput duration={displayDuration} />
+        {shellCall !== null ? (
+          <ShellTerminalPanel
+            command={shellCall.command}
+            outputFormat={shellCall.outputFormat}
+            argsCwd={typeof args.cwd === "string" && args.cwd.length > 0 ? args.cwd : null}
+            inputJson={inputJson}
+            output={output}
+            state={state}
+          />
+        ) : (
+          <>
+            <CodePanel
+              title="Parameters"
+              text={inputJson}
+              copyText={inputJson}
+              copyLabel="Copy parameters"
+            />
+            {formattedOutput !== null && <OutputSection output={formattedOutput} />}
+            {formattedOutput === null && state === "input-available" && (
+              <ToolPendingOutput duration={displayDuration} />
+            )}
+          </>
         )}
-        {formattedOutput === null &&
+        {shellCall === null &&
+          output === null &&
           (state === "output-error" || state === "cancelled" || state === "no-output") && (
             <EmptyOutputState state={state} />
           )}
@@ -317,31 +344,7 @@ function ToolTriggerRow({
       <span className="min-w-0 flex-1 truncate">
         {title.verb !== null && <span className="font-semibold text-foreground">{title.verb}</span>}
         {title.verb !== null && title.body.length > 0 && " "}
-        {onBodyClick ? (
-          // Use <span role="link"> instead of <button> to avoid nesting
-          // interactive elements — CollapsibleTrigger already renders as
-          // a <button>, and nested buttons are invalid HTML.
-          <span
-            role="link"
-            tabIndex={0}
-            className="underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
-            onClick={(e) => {
-              e.stopPropagation();
-              onBodyClick();
-            }}
-            onKeyDown={(e) => {
-              if (e.key === "Enter" || e.key === " ") {
-                e.preventDefault(); // prevent Space from triggering parent button's click via keyup
-                e.stopPropagation();
-                onBodyClick();
-              }
-            }}
-          >
-            {title.body}
-          </span>
-        ) : (
-          title.body
-        )}
+        <ToolTitleBody title={title} onBodyClick={onBodyClick} />
       </span>
       {duration !== undefined && (
         <span className="shrink-0 tabular-nums opacity-70">{formatToolDuration(duration)}</span>
@@ -349,6 +352,265 @@ function ToolTriggerRow({
       <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
     </CollapsibleTrigger>
   );
+}
+
+/** The dynamic part of a trigger row: a shell command, a linked file path, or plain text. */
+function ToolTitleBody({ title, onBodyClick }: { title: ToolTitle; onBodyClick?: () => void }) {
+  if (title.isShellCommand === true) return <ShellCommandLine command={title.body} />;
+  if (!onBodyClick) return title.body;
+  return (
+    // Use <span role="link"> instead of <button> to avoid nesting
+    // interactive elements — CollapsibleTrigger already renders as
+    // a <button>, and nested buttons are invalid HTML.
+    <span
+      role="link"
+      tabIndex={0}
+      className="underline decoration-dotted underline-offset-2 hover:text-foreground transition-colors cursor-pointer"
+      onClick={(e) => {
+        e.stopPropagation();
+        onBodyClick();
+      }}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault(); // prevent Space from triggering parent button's click via keyup
+          e.stopPropagation();
+          onBodyClick();
+        }
+      }}
+    >
+      {title.body}
+    </span>
+  );
+}
+
+/** Collapsed-row command: a script's first line, and a count of the rest. */
+function ShellCommandLine({ command }: { command: string }) {
+  const { firstLine, moreLines } = shellCommandPreview(command);
+  const { env, rest } = splitEnvPrefix(firstLine);
+  return (
+    // Only the command truncates, so the line count stays visible.
+    <span className="inline-flex max-w-full items-baseline font-mono text-[0.92em]">
+      <span className="min-w-0 truncate">
+        {env.length > 0 && <span className="opacity-60">{env}</span>}
+        <span>{rest}</span>
+      </span>
+      {moreLines > 0 && (
+        <>
+          {" "}
+          <span className="ml-1.5 shrink-0 font-sans opacity-60">
+            +{moreLines} {moreLines === 1 ? "line" : "lines"}
+          </span>
+        </>
+      )}
+    </span>
+  );
+}
+
+/**
+ * Expanded view for shell tools: the working directory, `$ command`, and
+ * the output in one terminal-like block, with exit status in the footer.
+ * The raw argument JSON stays one click away for debugging.
+ */
+function ShellTerminalPanel({
+  command,
+  outputFormat,
+  argsCwd,
+  inputJson,
+  output,
+  state,
+}: {
+  command: string;
+  outputFormat: ShellOutputFormat;
+  /** Working directory from the call's arguments (Codex sends one). */
+  argsCwd: string | null;
+  inputJson: string;
+  output: string | null;
+  state: ToolState;
+}) {
+  const [wrap, setWrap] = useState(true);
+  const [showRaw, setShowRaw] = useState(false);
+  const terminalIsDark = useTerminalIsDark();
+  const appIsDark = useResolvedThemeMode() === "dark";
+  // The terminal theme setting can pin the scheme the app is not in; repaint
+  // just this block then, and otherwise keep the app's own palette.
+  let pinnedScheme: CodeColorScheme | undefined;
+  if (terminalIsDark !== appIsDark) pinnedScheme = terminalIsDark ? "dark" : "light";
+  const parsed = useMemo(
+    () => (output === null ? null : parseShellToolOutput(output, outputFormat)),
+    [output, outputFormat],
+  );
+  const rawOutput = useMemo(
+    () => (output === null ? null : showControlCharacters(prettyPrintIfJson(output))),
+    [output],
+  );
+  const hasOutput = parsed !== null && parsed.text.length > 0;
+  // sys_os_shell reports its working directory in the result instead.
+  const cwd = argsCwd ?? parsed?.cwd ?? null;
+  // With no cwd line the actions sit with the command: floated so only its
+  // first line wraps around them, or on a sticky row when lines do not wrap or
+  // the card is too narrow to share a line. Only classes change, so focus stays.
+  const actionsBesideCommand = cwd === null;
+  const actions = (
+    <CodeBlockActions className="my-0 mr-0 ml-auto shrink-0 gap-1 @max-[480px]/shell:-ml-1">
+      <WrapTextButton onToggle={() => setWrap((value) => !value)} wrap={wrap} />
+      <CopyTextButton label="Copy command" caption="command" text={command} />
+      {hasOutput && (
+        <CopyTextButton label="Copy output" caption="output" text={stripAnsi(parsed.text)} />
+      )}
+      <Button
+        aria-pressed={showRaw}
+        className={cn("h-6 px-1.5 text-muted-foreground", showRaw && "text-foreground")}
+        onClick={() => setShowRaw((value) => !value)}
+        size="xs"
+        type="button"
+        variant="ghost"
+        componentId="diagnostics.tool.toggle_raw_parameters"
+      >
+        Raw
+      </Button>
+    </CodeBlockActions>
+  );
+  return (
+    <div className="space-y-2">
+      <CodeBlockContainer
+        language="bash"
+        data-testid="shell-tool-terminal"
+        data-terminal-theme={terminalIsDark ? "dark" : "light"}
+        className="@container/shell"
+        style={pinnedScheme === undefined ? undefined : terminalSurfaceStyle(terminalIsDark)}
+      >
+        {cwd !== null && (
+          // On a narrow card the folder takes its own line and the actions wrap below
+          // it, left-aligned with the text.
+          <div className="flex flex-wrap items-center justify-between gap-x-2 gap-y-1 px-3 pt-1.5">
+            <span
+              className="min-w-0 truncate font-mono text-muted-foreground text-xs @max-[480px]/shell:basis-full"
+              title={cwd}
+            >
+              {cwd}
+            </span>
+            {actions}
+          </div>
+        )}
+        {/* The `$` prompt is a pseudo-element so selecting or copying the command skips it. */}
+        <div className={SHELL_COMMAND_LINES_CLASS} style={SHELL_PROMPT_STYLE}>
+          <CodeBlockContent
+            code={command}
+            language="bash"
+            wrap={wrap}
+            colorScheme={pinnedScheme}
+            className={cn(
+              TERMINAL_PRE_CLASS,
+              actionsBesideCommand && wrap ? "pt-2 pb-1 @max-[480px]/shell:pt-1" : "pt-1 pb-1",
+            )}
+            leading={
+              actionsBesideCommand ? (
+                <div
+                  className={
+                    wrap
+                      ? "float-right mt-1.5 mr-3 -mb-1 ml-2 @max-[480px]/shell:float-none @max-[480px]/shell:m-0 @max-[480px]/shell:flex @max-[480px]/shell:px-3 @max-[480px]/shell:pt-1.5"
+                      : "sticky left-0 flex justify-end px-3 pt-1.5 @max-[480px]/shell:justify-start"
+                  }
+                >
+                  {actions}
+                </div>
+              ) : undefined
+            }
+          />
+        </div>
+        {hasOutput && (
+          <OutputSection
+            output={parsed.text}
+            renderPanel={(text) => (
+              <CodeBlockContent
+                code={dropTrailingPartialEscape(text)}
+                language="ansi"
+                wrap={wrap}
+                colorScheme={pinnedScheme}
+                className={cn(TERMINAL_PRE_CLASS, "pt-0 pb-2")}
+              />
+            )}
+          />
+        )}
+        {parsed !== null && !hasOutput && (
+          <div className="px-3 pb-2 font-mono text-muted-foreground text-xs">(no output)</div>
+        )}
+        <ShellStatus
+          state={state}
+          exitCode={parsed?.exitCode ?? null}
+          timedOut={parsed?.timedOut ?? false}
+          outputRecorded={output !== null}
+        />
+      </CodeBlockContainer>
+      {showRaw && (
+        <>
+          <CodePanel
+            title="Parameters"
+            text={inputJson}
+            copyText={inputJson}
+            copyLabel="Copy parameters"
+          />
+          {rawOutput !== null && (
+            <OutputSection
+              output={rawOutput}
+              language={outputFormat === "sys-os-json" ? "json" : "text"}
+            />
+          )}
+        </>
+      )}
+    </div>
+  );
+}
+
+// A non-breaking space keeps the prompt on the same line as the first word.
+const SHELL_PROMPT_STYLE = { "--shell-prompt": '"$\u00a0"' } as CSSProperties;
+
+// One prompt for the whole script, like a pasted block in a terminal. Wrapped
+// text indents past it so it doesn't read as a new line.
+const SHELL_COMMAND_LINES_CLASS =
+  "[&_code>span]:pl-[2ch] [&_code>span]:-indent-[2ch] [&_code>span:first-child]:before:font-semibold [&_code>span:first-child]:before:text-muted-foreground [&_code>span:first-child]:before:content-[var(--shell-prompt)]";
+
+// Command and output share the panel's own background so the block reads as
+// one continuous terminal surface instead of stacked code panels.
+const TERMINAL_PRE_CLASS = "px-3 !bg-transparent dark:!bg-transparent";
+
+/** Status line under the output; omitted when there is nothing to report. */
+function ShellStatus({
+  state,
+  exitCode,
+  timedOut,
+  outputRecorded,
+}: {
+  state: ToolState;
+  exitCode: number | null;
+  timedOut: boolean;
+  /** Whether the call recorded any output string, even an empty one. */
+  outputRecorded: boolean;
+}) {
+  let status: ReactNode;
+  if (state === "input-available") {
+    status = (
+      <span className="flex items-center gap-1.5 text-muted-foreground">
+        <Loader2Icon className="size-3 animate-spin text-info" />
+        running
+      </span>
+    );
+  } else if (timedOut) {
+    status = <span className="text-destructive">timed out</span>;
+  } else if (exitCode !== null) {
+    status = (
+      <span className={exitCode === 0 ? "text-success" : "text-destructive"}>exit {exitCode}</span>
+    );
+  } else if (state === "output-error") {
+    status = <span className="text-destructive">failed</span>;
+  } else if (state === "cancelled") {
+    status = <span className="text-muted-foreground">cancelled</span>;
+  } else if (state === "no-output" && !outputRecorded) {
+    status = <span className="text-muted-foreground">no output recorded</span>;
+  } else {
+    return null;
+  }
+  return <div className="px-3 pb-2 font-mono text-xs tabular-nums">{status}</div>;
 }
 
 /**
@@ -387,18 +649,20 @@ function CodePanel({
   text,
   copyText,
   copyLabel,
+  language = "json",
 }: {
   title: string;
   text: string;
   copyText: string;
   copyLabel: string;
+  language?: CodeLanguage;
 }) {
   // Soft-wrap long lines by default so the panel never needs horizontal
   // scrolling to read; the toggle restores the scrolling view for when
   // column alignment matters (same affordance as chat code blocks).
   const [wrap, setWrap] = useState(true);
   return (
-    <CodeBlock code={text} language="json" wrap={wrap}>
+    <CodeBlock code={text} language={language} wrap={wrap}>
       <CodeBlockHeader>
         <CodeBlockTitle className="min-w-0">
           <span className="truncate font-medium uppercase tracking-wide">{title}</span>
@@ -435,7 +699,17 @@ function WrapTextButton({ wrap, onToggle }: { wrap: boolean; onToggle: () => voi
   );
 }
 
-function OutputSection({ output }: { output: string }) {
+function OutputSection({
+  output,
+  renderPanel,
+  language,
+}: {
+  output: string;
+  /** Renders the (possibly truncated) text; defaults to a titled Output panel. */
+  renderPanel?: (text: string) => ReactNode;
+  /** Highlighting for the default Output panel; JSON unless set. */
+  language?: CodeLanguage;
+}) {
   const [isExpanded, setIsExpanded] = useState(false);
   useEffect(() => setIsExpanded(false), [output]);
 
@@ -453,7 +727,17 @@ function OutputSection({ output }: { output: string }) {
           (!canExpand || isExpanded) && "max-h-[36rem] overflow-auto",
         )}
       >
-        <CodePanel title="Output" text={preview.text} copyText={output} copyLabel="Copy output" />
+        {renderPanel ? (
+          renderPanel(preview.text)
+        ) : (
+          <CodePanel
+            title="Output"
+            text={preview.text}
+            copyText={output}
+            copyLabel="Copy output"
+            language={language}
+          />
+        )}
         {canExpand && !isExpanded && (
           <div className="pointer-events-none absolute inset-x-px bottom-px h-16 rounded-b-md bg-gradient-to-t from-background to-transparent" />
         )}
@@ -521,9 +805,11 @@ function EmptyOutputState({ state }: { state: "output-error" | "cancelled" | "no
 interface CopyTextButtonProps {
   text: string;
   label: string;
+  /** Visible text next to the icon, for when several copy buttons sit together. */
+  caption?: string;
 }
 
-function CopyTextButton({ text, label }: CopyTextButtonProps) {
+function CopyTextButton({ text, label, caption }: CopyTextButtonProps) {
   const [isCopied, setIsCopied] = useState(false);
   const timeoutRef = useRef<number | null>(null);
 
@@ -561,14 +847,15 @@ function CopyTextButton({ text, label }: CopyTextButtonProps) {
       <TooltipTrigger asChild>
         <Button
           aria-label={isCopied ? "Copied" : label}
-          className="size-6 text-muted-foreground"
+          className={cn("text-muted-foreground", caption ? "h-6 gap-1 px-1.5" : "size-6")}
           onClick={copyToClipboard}
-          size="icon-xs"
+          size={caption ? "xs" : "icon-xs"}
           type="button"
           variant="ghost"
           componentId="diagnostics.tool.copy"
         >
           <Icon className="size-3.5" />
+          {caption}
         </Button>
       </TooltipTrigger>
       <TooltipContent>{isCopied ? "Copied" : label}</TooltipContent>

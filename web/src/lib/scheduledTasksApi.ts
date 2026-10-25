@@ -23,7 +23,7 @@ export type ScheduledTaskExecutionTarget = "connected_host" | "managed_sandbox";
 
 /** Terminal + in-flight statuses a single run can hold. */
 export type ScheduledTaskRunStatus =
-  "scheduled" | "running" | "succeeded" | "failed" | "skipped" | "incomplete";
+  "scheduled" | "starting" | "running" | "succeeded" | "failed" | "skipped" | "incomplete";
 
 /**
  * A scheduled task, camelCased from the server's `_to_response` shape. The
@@ -62,7 +62,7 @@ export interface ScheduledTask {
   lastRunAt: number | null;
   /**
    * Status of the task's MOST RECENT run (`succeeded` / `failed` / `skipped` /
-   * `running` / `scheduled` / `incomplete`), or `null` when the task has never
+   * `starting` / `running` / `scheduled` / `incomplete`), or `null` when the task has never
    * run. Server-computed from the latest run row so the list can show a
    * completion badge without a per-row `/runs` fetch.
    */

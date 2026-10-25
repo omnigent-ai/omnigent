@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import weakref
 from collections.abc import Callable, Iterator
 from pathlib import Path
 from types import SimpleNamespace
@@ -38,6 +39,7 @@ from omnigent.host.connect import (
 )
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    LAUNCH_HANDLER_FAILED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -4057,10 +4059,12 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
         "AWS_SECRET_ACCESS_KEY": "aws-secret",
         "SOME_RANDOM_VAR": "x",
         "OMNIGENT_CLAUDE_SDK_NO_SANDBOX": "1",
+        "OMNIGENT_CLAUDE_CODE_ENTRYPOINT": "gateway-client",
         "KUBECONFIG": "/home/alice/.kube/config",
         "SSH_AUTH_SOCK": "/private/tmp/com.apple.launchd.7Qk/Listeners",
         "BROWSER": "www-browser",
         "CLAUDE_CODE_SKIP_BEDROCK_AUTH": "1",
+        "OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL": "sonnet",
         "OMNIGENT_DATABRICKS_EXTRA_HEADERS": '{"x-databricks-route-hint": "instance-abc"}',
         "OMNIGENT_LOG_LEVEL": "DEBUG",
         "OMNIGENT_LOG_TO_STDERR": "1",
@@ -4111,6 +4115,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # must reach the runner without also forcing
     # ``OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_CLAUDE_SDK_NO_SANDBOX``.
     assert env["OMNIGENT_CLAUDE_SDK_NO_SANDBOX"] == "1"
+    # The claude-sdk harness sends this as the Claude CLI entrypoint.
+    assert env["OMNIGENT_CLAUDE_CODE_ENTRYPOINT"] == "gateway-client"
     # KUBECONFIG is a filesystem path (not a secret) — kubectl, helm, k9s
     # need it to resolve the user's cluster contexts and namespaces.
     assert env["KUBECONFIG"] == "/home/alice/.kube/config"
@@ -4124,6 +4130,8 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # CLAUDE_CODE_SKIP_BEDROCK_AUTH disables AWS SigV4 auth for LiteLLM
     # proxies — a non-secret boolean, same rationale as CLAUDE_CODE_USE_BEDROCK.
     assert env["CLAUDE_CODE_SKIP_BEDROCK_AUTH"] == "1"
+    # The runner's background-title service reads this model override.
+    assert env["OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL"] == "sonnet"
     # Opaque request-routing headers forward host→runner so the runner's tunnel
     # and server callbacks reach the same server instance the host registered on
     # (without the operator also listing it in OMNIGENT_RUNNER_ENV_PASSTHROUGH).
@@ -4386,12 +4394,13 @@ def test_build_runner_env_passthrough_survives_remote_daemon_hop(
 
 
 @pytest.mark.parametrize("server_url", [None, "https://example.databricksapps.com"])
-def test_forge_config_paths_survive_daemon_and_runner_hops(
+def test_host_settings_survive_daemon_and_runner_hops(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, server_url: str | None
 ) -> None:
     from omnigent.cli import _build_host_daemon_env
 
     selectors = {
+        "OMNIGENT_HOST_SANDBOX_BACKEND": "phoenix-kubernetes",
         "GLAB_CONFIG_DIR": str(tmp_path / "glab"),
         "GH_CONFIG_DIR": str(tmp_path / "gh"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
@@ -5635,6 +5644,52 @@ def test_build_connect_headers_retains_auth_factory(
     assert token_calls == [1, 1, 1]
 
 
+@pytest.mark.parametrize("status", [401, 403, "redirect", 503])
+@pytest.mark.parametrize("login_repaired", [False, True])
+async def test_rejected_host_bearer_rediscovers_repaired_credentials(
+    monkeypatch: pytest.MonkeyPatch, status: int | str, login_repaired: bool
+) -> None:
+    """Auth refusals discard the resolver; an outage keeps its warm cache."""
+    import omnigent.runner._entry as entry_mod
+
+    credential = "rejected-token"
+    resolved: list[str] = []
+
+    def make_factory(*, server_url: str | None = None) -> Callable[[], str]:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        resolved.append(credential)
+        cached = credential
+        return lambda: cached
+
+    rejection = (
+        InvalidURI("https://example.test/oidc/authorize", "scheme isn't ws or wss")
+        if status == "redirect"
+        else _invalid_status(status)
+    )
+    spy = _ConnectSpy([rejection, rejection])
+    _patch_connect(monkeypatch, spy)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", make_factory)
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    host = _host()
+    host._ever_connected = True
+    with pytest.raises(type(rejection)):
+        await host._connect_and_serve()
+
+    if login_repaired:
+        credential = "repaired-token"
+    with pytest.raises(type(rejection)):
+        await host._connect_and_serve()
+
+    auth_rejected = status != 503
+    expected_token = credential if auth_rejected else "rejected-token"
+    assert [call["additional_headers"]["Authorization"] for call in spy.calls] == [
+        "Bearer rejected-token",
+        f"Bearer {expected_token}",
+    ]
+    assert resolved == (["rejected-token", credential] if auth_rejected else ["rejected-token"])
+
+
 def test_build_connect_headers_slice_key_only_on_workspace_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -6655,6 +6710,71 @@ def test_run_host_process_mirrors_structured_logs_on_foreground_tty(
         )
 
     configure_logging.assert_called_once_with("host", log_to_stderr=True)
+
+
+@pytest.mark.parametrize("failing_step", [None, "startup", "serve", "exit"])
+def test_run_host_process_prints_to_its_terminal_through_a_writer_thread(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    failing_step: str | None,
+) -> None:
+    """The host prints through terminal writers and restores its streams, even if a step fails."""
+    from omnigent import process_logging
+    from omnigent.host import connect as connect_mod
+    from omnigent.host import crash_reporting
+    from omnigent.process_logging import TerminalWriter
+
+    monkeypatch.setattr(process_logging, "_shared_terminal_writers", {})
+    monkeypatch.setattr(process_logging, "_live_terminal_writers", weakref.WeakSet())
+    monkeypatch.setattr(process_logging, "_threaded_terminal_mirrors", 0)
+    original_streams = (sys.stdout, sys.stderr)
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
+    monkeypatch.setattr(sys.stderr, "isatty", lambda: True)
+    streams_while_serving: list[tuple[object, object]] = []
+
+    def serve(*_args: object, **_kwargs: object) -> bool:
+        streams_while_serving.append((sys.stdout, sys.stderr))
+        print("✓ Connected as 'test-host'")
+        if failing_step == "serve":
+            raise KeyboardInterrupt
+        return False
+
+    def fail(message: str) -> None:
+        raise RuntimeError(message)
+
+    monkeypatch.setattr(connect_mod, "_serve_host_until_exit", serve)
+    configure_logging = patch(
+        "omnigent.host.connect.configure_process_logging", return_value=tmp_path / "host.log"
+    )
+    expected_error: contextlib.AbstractContextManager[object] = contextlib.nullcontext()
+    if failing_step == "startup":
+        configure_logging = patch(
+            "omnigent.host.connect.configure_process_logging",
+            side_effect=lambda *_a, **_k: fail("logging setup failed"),
+        )
+        expected_error = pytest.raises(RuntimeError, match="logging setup failed")
+    elif failing_step == "serve":
+        expected_error = pytest.raises(KeyboardInterrupt)
+    elif failing_step == "exit":
+
+        def fail_restore() -> None:
+            fail("signal handler restore failed")
+
+        monkeypatch.setattr(crash_reporting, "install_host_signal_handlers", lambda: fail_restore)
+        expected_error = pytest.raises(RuntimeError, match="signal handler restore failed")
+    with configure_logging, expected_error:
+        run_host_process(
+            server_url="https://app.example.databricks.com",
+            config_path=tmp_path / "config.yaml",
+        )
+
+    assert (sys.stdout, sys.stderr) == original_streams
+    if failing_step != "startup":
+        [(stdout, stderr)] = streams_while_serving
+        assert isinstance(stdout, TerminalWriter)
+        assert isinstance(stderr, TerminalWriter)
+        assert "✓ Connected as 'test-host'\n" in capsys.readouterr().out
 
 
 def test_run_host_process_keys_its_tunnel_from_the_launch_config(
@@ -7754,6 +7874,176 @@ async def test_runner_status_settles_after_unsuccessful_launch(
             await asyncio.gather(query, return_exceptions=True)
 
 
+async def test_launch_handler_failure_still_answers_the_server(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unexpected fault owes the server a result before it propagates.
+
+    Silence is not read as a failure: the server waits out its launch-result
+    timeout, treats that as a slow host, and only fails the turn after the
+    runner-connect wait as a generically unavailable runner, with the real
+    reason left behind in the host log.
+    """
+    host = _make_host_process()
+    ws = _CollectingWs()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_handler_failed",
+        binding_token="token_handler_failed",
+        workspace="/w",
+        session_id="session_handler_failed",
+    )
+
+    async def _raise(_frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        raise RuntimeError("unsearchable CLI fallback directory")
+
+    monkeypatch.setattr(host, "_handle_launch", _raise)
+
+    # Propagating is intended: the frame task logs the traceback, which is the
+    # only diagnostic an unexpected fault leaves.
+    with pytest.raises(RuntimeError, match="unsearchable CLI fallback directory"):
+        await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+
+    results = [decode_host_frame(raw) for raw in ws.sent]
+    launch_results = [
+        result for result in results if isinstance(result, HostLaunchRunnerResultFrame)
+    ]
+    assert len(launch_results) == 1, f"expected exactly one launch result, sent: {ws.sent}"
+    assert launch_results[0].request_id == frame.request_id
+    assert launch_results[0].status == "failed"
+    assert launch_results[0].error_code == LAUNCH_HANDLER_FAILED_ERROR_CODE
+    assert "unsearchable CLI fallback directory" in (launch_results[0].error or "")
+    # Status queries park on this future, so it has to settle on the raising
+    # path too or they wait for a launch that already failed.
+    assert all(
+        pending.done() for futures in host._pending_runner_launches.values() for pending in futures
+    )
+
+
+async def test_launch_handler_failure_is_attributed_to_the_host(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A code with no mapping of its own must not unattribute a host fault."""
+    host = _make_host_process()
+    ws = _CollectingWs()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_attribution",
+        binding_token="token_attribution",
+        workspace="/w",
+        session_id="session_attribution",
+    )
+
+    async def _raise(_frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(host, "_handle_launch", _raise)
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        with pytest.raises(RuntimeError):
+            await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+
+    failure = next(
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_launch_failed"
+    )
+    assert failure.attributes["error_code"] == LAUNCH_HANDLER_FAILED_ERROR_CODE
+    assert failure.attributes["error_category"] == "host"
+    assert failure.attributes["error_phase"] == "runner_launch"
+    assert failure.attributes["error_impact"] == "blocking"
+
+
+async def test_launch_handler_fault_after_spawn_leaves_the_launch_unanswered(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A fault after the spawn must not tell the server no runner is coming.
+
+    Servers may terminate the launch or revoke its binding on a failed result,
+    so answering "failed" here could fail a turn whose runner still connects.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    ws = _CollectingWs()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_fault_after_spawn",
+        binding_token="token_fault_after_spawn",
+        workspace=str(workspace),
+        session_id="session_fault_after_spawn",
+    )
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "10"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    def _raise_after_spawn(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("fault after the runner was spawned")
+
+    # Raised once the runner is registered, i.e. a live runner may connect.
+    monkeypatch.setattr(host, "_watch_runner_connect", _raise_after_spawn)
+
+    try:
+        with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
+            with pytest.raises(RuntimeError, match="fault after the runner was spawned"):
+                await host._dispatch_host_frame(ws, frame)  # type: ignore[arg-type]
+
+        assert token_bound_runner_id(frame.binding_token) in host._runners, (
+            "the test must fault after the runner was spawned"
+        )
+        launch_results = [
+            result
+            for result in (decode_host_frame(raw) for raw in ws.sent)
+            if isinstance(result, HostLaunchRunnerResultFrame)
+        ]
+        assert launch_results == [], (
+            f"a post-spawn fault must not be answered as a failed launch, sent: {ws.sent}"
+        )
+        assert not host._spawned_launch_requests
+        assert all(
+            pending.done()
+            for futures in host._pending_runner_launches.values()
+            for pending in futures
+        )
+    finally:
+        _cleanup_host(host)
+
+
+async def test_launch_handler_fault_survives_a_lost_answer(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel that drops the answer must not also drop the fault's traceback."""
+    host = _make_host_process()
+    frame = HostLaunchRunnerFrame(
+        request_id="req_lost_answer",
+        binding_token="token_lost_answer",
+        workspace="/w",
+        session_id="session_lost_answer",
+    )
+
+    class _ClosedWs:
+        async def send(self, data: str) -> None:
+            raise ConnectionClosedError(None, None)
+
+    async def _raise(_frame: HostLaunchRunnerFrame) -> HostLaunchRunnerResultFrame:
+        raise RuntimeError("the real launch fault") from PermissionError("denied")
+
+    monkeypatch.setattr(host, "_handle_launch", _raise)
+
+    # ConnectionClosed would be logged only at debug level as a dropped frame;
+    # the launch fault has to reach the frame task's traceback logging instead.
+    with pytest.raises(RuntimeError, match="the real launch fault") as raised:
+        await host._dispatch_host_frame(_ClosedWs(), frame)  # type: ignore[arg-type]
+    # The underlying cause is often the actual diagnostic; it must survive.
+    assert isinstance(raised.value.__cause__, PermissionError)
+
+
 async def test_stop_frame_never_overtakes_launch(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -8083,6 +8373,14 @@ async def test_launch_harness_probe_runs_off_the_event_loop(
 
     monkeypatch.setattr("omnigent.host.connect.harness_is_configured", _record_thread)
 
+    hint_thread_ids: list[int] = []
+
+    def hint(harness):
+        hint_thread_ids.append(threading.get_ident())
+        return "run omni setup"
+
+    monkeypatch.setattr("omnigent.host.connect.harness_setup_hint", hint)
+
     result = await host._handle_launch(
         HostLaunchRunnerFrame(
             request_id="req_probe_thread",
@@ -8093,6 +8391,7 @@ async def test_launch_harness_probe_runs_off_the_event_loop(
     )
 
     assert result.error_code == HARNESS_NOT_CONFIGURED_ERROR_CODE
+    assert hint_thread_ids and loop_thread_id not in hint_thread_ids
     assert probe_thread_ids, "the harness probe should still run"
     assert loop_thread_id not in probe_thread_ids, (
         "harness readiness probe ran on the event loop thread"
@@ -9038,6 +9337,302 @@ async def test_github_pr_update_reports_lock_contention_on_host(
     assert registry.path.read_bytes() == before
     assert host._handle_fs_write(frame).status == "ok"
     assert (target in {entry.url for entry in registry.list()}) == (action == "attach")
+
+
+def test_github_label_ops_are_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host lists and edits a tracked PR's labels when the runner is offline."""
+    from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    calls: list[list[str]] = []
+    bug = {"name": "bug", "color": "d73a4a", "description": None}
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(argv)
+        return 0, json.dumps([{**bug, "color": "D73A4A"}]), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    try:
+        listed = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="labels",
+                op="github_labels",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url},
+            )
+        )
+        edited = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="labels-update",
+                op="github_labels_update",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "add": ["bug"], "session_id": "untrusted"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert listed.status == "ok", listed
+    assert listed.payload == {"object": "list", "data": [bug], "has_more": False}
+    assert edited.status == "ok", edited
+    assert edited.payload == {"object": "session.github.pr_labels", "labels": [bug]}
+    assert calls[1][-3:] == ["repos/example/one/issues/42/labels", "-f", "labels[]=bug"]
+
+
+def test_github_merge_ops_are_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host reads merge options and merges a tracked PR when the runner is offline."""
+    from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    calls: list[list[str]] = []
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(argv)
+        if argv[:2] == ["repo", "view"]:
+            return (
+                0,
+                json.dumps({"viewerDefaultMergeMethod": "REBASE", "rebaseMergeAllowed": True}),
+                "",
+            )
+        return 0, "", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    try:
+        options = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="merge-options",
+                op="github_merge_options",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url},
+            )
+        )
+        merged = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="merge",
+                op="github_merge",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={
+                    "pr_url": url,
+                    "merge_method": "rebase",
+                    "expected_head": "a" * 40,
+                    "session_id": "untrusted",
+                },
+            )
+        )
+        disabled = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="disable-auto-merge",
+                op="github_disable_auto_merge",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "session_id": "untrusted"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert disabled.status == "ok", disabled
+    assert calls[2][-1] == "--disable-auto"
+    assert options.status == "ok", options
+    assert options.payload == {
+        "object": "session.github.merge_options",
+        "methods": ["rebase"],
+        "default": "rebase",
+    }
+    assert merged.status == "ok", merged
+    assert merged.payload == {"object": "session.github.pr_merge", "pr_url": url}
+    assert calls[1][:2] == ["pr", "merge"]
+    assert calls[1][-3:] == ["--rebase", "--match-head-commit", "a" * 40]
+
+
+def test_github_reviewer_ops_are_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host lists review candidates and requests reviews when the runner is offline."""
+    from omnigent.host.frames import HostFsRequestFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    calls: list[list[str]] = []
+    users = {"nodes": [{"login": "octocat", "name": ""}], "pageInfo": {"hasNextPage": False}}
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        calls.append(argv)
+        if argv[:2] == ["api", "graphql"]:
+            return 0, json.dumps({"data": {"repository": {"assignableUsers": users}}}), ""
+        if argv[:2] == ["pr", "view"]:
+            requests = [{"__typename": "User", "login": "octocat"}]
+            return 0, json.dumps({"reviewRequests": requests, "latestReviews": []}), ""
+        return 0, "[]", ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    octocat = {"login": "octocat", "kind": "user"}
+    try:
+        listed = host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="reviewers",
+                op="github_reviewers",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url},
+            )
+        )
+        edited = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="reviewers-update",
+                op="github_reviewers_update",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "add": [octocat], "session_id": "untrusted"},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert listed.status == "ok", listed
+    assert listed.payload == {
+        "object": "list",
+        "data": [{**octocat, "name": None}],
+        "has_more": False,
+    }
+    assert edited.status == "ok", edited
+    assert edited.payload == {
+        "object": "session.github.pr_reviewers",
+        "reviewers": [{**octocat, "state": "PENDING"}],
+    }
+    assert calls[2][-3:] == [
+        "repos/example/one/pulls/42/requested_reviewers",
+        "-f",
+        "reviewers[]=octocat",
+    ]
+
+
+def test_github_details_update_is_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host renames the PR when the runner is offline, as the session's tracked PR."""
+    from omnigent.host.frames import HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    sent: list[dict[str, str]] = []
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        sent.append(json.loads(Path(argv[argv.index("--input") + 1]).read_text()))
+        return 0, json.dumps({"title": "Renamed", "body": "Body"}), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    try:
+        edited = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="details-update",
+                op="github_details_update",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "title": " Renamed ", "body": None},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert edited.status == "ok", edited
+    assert edited.payload == {
+        "object": "session.github.pr_details",
+        "title": "Renamed",
+        "body": "Body",
+    }
+    assert sent == [{"title": "Renamed"}]
+
+
+def test_github_attachment_upload_is_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host decodes the tunnelled file and uploads it when the runner is offline."""
+    import base64
+
+    from omnigent.host.frames import HostFsResultFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+    uploaded: list[bytes] = []
+    asset = "https://github.com/user-attachments/assets/1234"
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if argv[-2:] == ["--jq", ".id"]:
+            return 0, "7", ""
+        uploaded.append(Path(argv[argv.index("--input") + 1]).read_bytes())
+        return 0, json.dumps({"url": asset}), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+
+    def write(content: str) -> HostFsResultFrame:
+        return host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="attachment",
+                op="github_attachment_upload",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "name": "shot.png", "content_base64": content},
+            )
+        )
+
+    try:
+        ok = write(base64.b64encode(png).decode())
+        garbled = write("not base64!")
+    finally:
+        _cleanup_host(host)
+
+    assert ok.status == "ok", ok
+    assert ok.payload["url"] == asset
+    assert uploaded == [png]
+    assert (garbled.status, garbled.error_status) == ("error", 400)
+    assert "base64" in garbled.error
 
 
 def test_fs_search_reuses_the_changed_files_snapshot_across_requests(

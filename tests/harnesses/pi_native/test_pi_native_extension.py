@@ -10,6 +10,28 @@ from pathlib import Path
 import pytest
 
 
+def test_pi_native_extension_js_unit_suite() -> None:
+    """Run the Node unit suite for the pi-native bridge extension."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension unit tests")
+    script = (
+        Path(__file__).resolve().parents[3]
+        / "omnigent"
+        / "resources"
+        / "pi_native"
+        / "omnigent_pi_native_extension.test.js"
+    )
+    result = subprocess.run(
+        [node, str(script)],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stdout + "\n" + result.stderr
+
+
 def test_delivery_cap_drops_followup_without_failed_session_status(
     tmp_path: Path,
 ) -> None:
@@ -164,47 +186,53 @@ def _run_extension_script(node: str, extension_path: Path, script: str) -> None:
 
 
 def _usage_test_preamble() -> str:
-    """Shared Node harness: load the extension with a mocked fetch + Pi.
-
-    Exposes ``postedEvents`` (parsed request bodies), ``handlers`` (the
-    registered Pi event handlers), and a ``ctx`` stub.
-    """
+    """Load the extension with a real checkpoint directory and mocked Pi/HTTP edges."""
     return r"""
 const assert = require("assert").strict;
+const fs = require("fs");
 const path = require("path");
-
 const extensionPath = process.argv[1];
-const configPath = path.join(require("os").tmpdir(), `pi-usage-${process.pid}.json`);
-require("fs").writeFileSync(
-  configPath,
-  JSON.stringify({
-    serverUrl: "http://omnigent.test",
-    sessionId: "session-1",
-    authHeaders: { authorization: "Bearer test" },
-  }),
-);
+const root = fs.mkdtempSync(path.join(require("os").tmpdir(), "pi-usage-"));
+process.on("exit", () => fs.rmSync(root, { recursive: true, force: true }));
+const bridgeDir = path.join(root, "bridge");
+const inboxDir = path.join(root, "inbox");
+fs.mkdirSync(bridgeDir);
+fs.mkdirSync(inboxDir);
+const statePath = path.join(bridgeDir, "cumulative_usage.json");
+const configPath = path.join(root, "config.json");
+fs.writeFileSync(configPath, JSON.stringify({
+  serverUrl: "http://omnigent.test", sessionId: "session-1", bridgeDir, inboxDir,
+  authHeaders: { authorization: "Bearer test" },
+}));
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
-
 const postedEvents = [];
 global.fetch = async (_url, request) => {
   postedEvents.push(JSON.parse(request.body));
   return { ok: true };
 };
 global.setInterval = () => ({ fakeInterval: true });
-
-const handlers = {};
-const pi = {
-  registerCommand() {},
-  on(eventName, handler) {
-    handlers[eventName] = handler;
-  },
+function launchExtension() {
+  delete require.cache[require.resolve(extensionPath)];
+  const handlers = {};
+  require(extensionPath)({
+    registerCommand() {},
+    on(name, handler) { handlers[name] = handler; },
+  });
+  return handlers;
+}
+const handlers = launchExtension();
+const ctx = {
+  sessionManager: { getSessionId: () => "native-session-1" },
+  ui: { setTitle() {}, setStatus() {}, notify() {} },
 };
-require(extensionPath)(pi);
-
-const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
-
 function usageEvents() {
   return postedEvents.filter((e) => e.type === "external_session_usage");
+}
+async function recordUsage(handlers, timestamp, input, output) {
+  await handlers.message_end({ message: {
+    role: "assistant", model: "databricks-claude-sonnet-4-6", timestamp,
+    usage: { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output },
+  }}, ctx);
 }
 """
 
@@ -434,6 +462,91 @@ def test_distinct_messages_with_identical_usage_are_not_collapsed(
     _run_extension_script(node, extension_path, script)
 
 
+@pytest.mark.parametrize(
+    "baseline_source",
+    ["local", "server", "matching-local", "stale-local", "corrupt-local", "unreported-local"],
+)
+def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
+    """A fresh extension restores its checkpoint before accumulating the next turn."""
+    script = (
+        _usage_test_preamble()
+        + "\nconst baselineSource = "
+        + json.dumps(baseline_source)
+        + ";\n"
+        + r"""
+(async () => {
+
+  await handlers.session_start({}, ctx);
+  await recordUsage(handlers, 1000, 150000, 30000);
+  const saved = JSON.parse(fs.readFileSync(statePath));
+  assert.equal(saved.cumulative_input_tokens, 150000);
+  assert.equal(saved.cumulative_output_tokens, 30000);
+  if (baselineSource !== "local") {
+    const cfg = JSON.parse(fs.readFileSync(configPath));
+    cfg.usageBaseline = { ...saved };
+    delete cfg.usageBaseline.model;
+    if (baselineSource === "unreported-local") {
+      cfg.usageBaseline.cumulative_input_tokens = 100000;
+      cfg.usageBaseline.cumulative_output_tokens = 20000;
+    }
+    fs.writeFileSync(configPath, JSON.stringify(cfg));
+    if (baselineSource === "server") fs.unlinkSync(statePath);
+    if (baselineSource === "corrupt-local") fs.writeFileSync(statePath, "{bad-json");
+    if (baselineSource === "stale-local") {
+      fs.writeFileSync(statePath, JSON.stringify({cumulative_input_tokens: 100000}));
+    }
+  }
+  postedEvents.length = 0;
+  const resumed = launchExtension();
+  await resumed.session_start({}, ctx);
+  await recordUsage(resumed, 2000, 900, 250);
+  const reasserts = baselineSource === "local" || baselineSource === "unreported-local";
+  assert.deepEqual(usageEvents().map(({data}) => [
+    data.cumulative_input_tokens, data.cumulative_output_tokens, data.model,
+  ]), [
+    ...(reasserts ? [[150000, 30000, "databricks-claude-sonnet-4-6"]] : []),
+    [150900, 30250, "databricks-claude-sonnet-4-6"],
+  ]);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_session_start_readiness_not_blocked_by_hung_usage_post() -> None:
+    """Readiness and inbox polling precede a stalled checkpoint POST."""
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+
+  fs.writeFileSync(statePath, JSON.stringify({
+    cumulative_input_tokens: 150000, cumulative_output_tokens: 30000,
+    cumulative_cache_read_input_tokens: 0, model: "databricks-claude-sonnet-4-6",
+  }));
+  let usagePostAttempted = false;
+  let polling = false;
+  global.setInterval = () => { polling = true; return {}; };
+  global.fetch = async (_url, request) => {
+    if (JSON.parse(request.body).type === "external_session_usage") {
+      usagePostAttempted = true;
+      return new Promise(() => {});
+    }
+    return { ok: true };
+  };
+  handlers.session_start({}, ctx).catch(error => { console.error(error); process.exit(1); });
+  await new Promise(resolve => setImmediate(resolve));
+  assert.ok(usagePostAttempted);
+  assert.ok(fs.existsSync(path.join(bridgeDir, "input_ready")));
+  assert.ok(polling);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 def test_agent_end_dedupes_real_shaped_messages_by_timestamp(
     tmp_path: Path,
 ) -> None:
@@ -486,6 +599,52 @@ def test_agent_end_dedupes_real_shaped_messages_by_timestamp(
 """
     )
     _run_extension_script(node, extension_path, script)
+
+
+def test_restore_ignores_malformed_persisted_state() -> None:
+    """A truncated checkpoint does not contaminate the next usage report."""
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+
+  fs.writeFileSync(statePath, "{not-json");
+  await handlers.session_start({}, ctx);
+  assert.equal(usageEvents().length, 0);
+  await recordUsage(handlers, 1000, 500, 100);
+  assert.deepEqual(usageEvents().map(({data}) => [
+    data.cumulative_input_tokens, data.cumulative_output_tokens,
+  ]), [[500, 100]]);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_restore_never_lowers_a_higher_live_total() -> None:
+    """A stale checkpoint cannot lower the live cumulative total."""
+    script = (
+        _usage_test_preamble()
+        + r"""
+(async () => {
+
+  await handlers.session_start({}, ctx);
+  await recordUsage(handlers, 1000, 150000, 30000);
+  fs.writeFileSync(statePath, JSON.stringify({
+    cumulative_input_tokens: 100000, cumulative_output_tokens: 20000,
+    cumulative_cache_read_input_tokens: 0, model: "databricks-claude-sonnet-4-6",
+  }));
+  await handlers.session_start({}, ctx);
+  await recordUsage(handlers, 2000, 500, 100);
+  const data = usageEvents().at(-1).data;
+  assert.equal(data.cumulative_input_tokens, 150500);
+  assert.equal(data.cumulative_output_tokens, 30100);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
 
 
 def _extension_path() -> Path:
@@ -1168,7 +1327,7 @@ global.fetch = async (url, _request) => {
   if (typeof url === "string" && url.indexOf("/policies/evaluate") !== -1) {
     policyUrls.push(url);
   }
-  return { ok: true, async json() { return {}; } };
+  return { ok: true, text: async () => "{}" };
 };
 global.setInterval = () => ({ fakeInterval: true });
 
@@ -1281,7 +1440,7 @@ let mcpCallCount = 0;
 global.fetch = async (url, request) => {
   if (typeof url === "string" && url.indexOf("/policies/evaluate") !== -1) {
     // The server-side ASK park collapses to a hard ALLOW after the human approves.
-    return { ok: true, async json() { return { result: "POLICY_ACTION_ALLOW" }; } };
+    return { ok: true, text: async () => JSON.stringify({ result: "POLICY_ACTION_ALLOW" }) };
   }
   // /mcp proxy.
   mcpCallCount += 1;
@@ -1752,7 +1911,10 @@ let lastRetryBody = null;
 global.fetch = async (url, request) => {
   if (typeof url === "string" && url.indexOf("/policies/evaluate") !== -1) {
     // The human declined → the ASK park collapses to DENY.
-    return { ok: true, async json() { return { result: "POLICY_ACTION_DENY", reason: "nope" }; } };
+    return {
+      ok: true,
+      text: async () => JSON.stringify({ result: "POLICY_ACTION_DENY", reason: "nope" }),
+    };
   }
   mcpCallCount += 1;
   if (mcpCallCount === 1) {
@@ -2486,7 +2648,7 @@ function makeJsonResponse(obj, status) {
   return {
     ok: status === undefined || (status >= 200 && status < 300),
     status: status === undefined ? 200 : status,
-    json: async () => obj,
+    text: async () => JSON.stringify(obj),
   };
 }
 
@@ -2813,25 +2975,26 @@ def test_policy_transport_error_fails_closed(tmp_path: Path) -> None:
     _run_policy_node_script(_extension_path(), tmp_path, body)
 
 
-def test_policy_server_5xx_fails_closed(tmp_path: Path) -> None:
-    """A persistent 5xx response fails CLOSED once the transient budget is spent.
-
-    A 5xx is transient (retried, re-attaching), but if it never clears the
-    gate cannot produce a verdict, so PHASE_TOOL_CALL fails closed rather than
-    proceeding.
-    """
-    body = r"""
+@pytest.mark.parametrize("status", [403, 404, 405, 503])
+def test_policy_http_error_fails_closed(tmp_path: Path, status: int) -> None:
+    """HTTP errors block tools; only transient server errors are retried."""
+    body = (
+        "const status = "
+        + str(status)
+        + r""";
 (async () => {
-  responders = new Array(64).fill((_b) => makeJsonResponse({}, 503));
+  responders = new Array(64).fill((_b) => makeJsonResponse({}, status));
   const verdict = await runToolCall();
   assert.equal(verdict && verdict.block, true, JSON.stringify(verdict));
   assert.match(verdict.reason, /failing closed/);
-  assert.ok(evalBodies.length >= 2, "expected retries, got " + evalBodies.length);
+  assert.ok(status >= 500 ? evalBodies.length >= 2 : evalBodies.length === 1,
+    "unexpected attempt count: " + evalBodies.length);
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
 });
 """
+    )
     _run_policy_node_script(_extension_path(), tmp_path, body)
 
 
@@ -2868,7 +3031,7 @@ def test_policy_malformed_body_fails_closed(tmp_path: Path) -> None:
     body = r"""
 (async () => {
   responders = [
-    (_b) => ({ ok: true, status: 200, json: async () => { throw new Error("bad json"); } }),
+    (_b) => ({ ok: true, status: 200, text: async () => "not json" }),
   ];
   const verdict = await runToolCall();
   assert.equal(verdict && verdict.block, true, JSON.stringify(verdict));
@@ -3203,6 +3366,154 @@ def test_inbox_model_change_unknown_model_posts_error(tmp_path: Path) -> None:
   const errs = errorItems();
   assert.equal(errs.length, 1, JSON.stringify(posted));
   assert.match(errs[0].data.item_data.message, /not available/);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_input_waits_for_inbox_model_change_to_settle(tmp_path: Path) -> None:
+    """A routed web turn runs on the routed model, not the old one.
+
+    The executor queues ``model_change`` then ``user_message``; the poller
+    fires the switch without awaiting it, and Pi's ``setModel`` only commits
+    after an async auth check. The ``input`` handler must hold the message's
+    turn until that switch settles.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let committed = null;
+  pi.setModel = async (model) => {
+    setModelCalls.push(model);
+    await sleep(150); // Pi's checkAuth before agent.state.model is set
+    committed = model.id;
+    return true;
+  };
+  await handlers.session_start({}, ctx);
+  const file = path.join(inboxDir, "000-model.json");
+  fs.writeFileSync(
+    file,
+    JSON.stringify({ id: "m1", type: "model_change", model: "databricks-claude-opus-4-1" }),
+  );
+  while (fs.existsSync(file)) await sleep(10);
+  assert.equal(committed, null); // still in flight
+  await handlers.input({ text: "routed turn", source: "extension" }, ctx);
+  assert.equal(committed, "databricks-claude-opus-4-1");
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_tui_prompt_routes_once_via_route_turn(tmp_path: Path) -> None:
+    """A prompt typed in the Pi TUI asks route-turn once and applies the pick.
+
+    Web messages (``source: "extension"``) were routed server-side and must
+    not be routed again; slash commands are not prompts; and once the server
+    answered, later prompts skip the round trip.
+    """
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  const routeCalls = [];
+  global.fetch = async (url, request) => {
+    const body = JSON.parse(request.body);
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls.push({ url, body });
+      return {
+        ok: true,
+        json: async () => ({
+          action: "route",
+          model: "omnigent/databricks-claude-opus-4-1",
+          terminal: false,
+        }),
+      };
+    }
+    posted.push(body);
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  await handlers.input({ text: "from the web", source: "extension" }, ctx);
+  await handlers.input({ text: "/model", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 0);
+
+  await handlers.input({ text: "fix the bug", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 1);
+  assert.equal(
+    routeCalls[0].url,
+    "http://omnigent.test/v1/sessions/session-1/hooks/route-turn",
+  );
+  assert.deepEqual(routeCalls[0].body, {
+    harness: "pi-native",
+    prompt: "fix the bug",
+    model: "omnigent/databricks-claude-sonnet-4-6",
+  });
+  assert.deepEqual(setModelCalls.map((m) => m.id), ["databricks-claude-opus-4-1"]);
+
+  await handlers.input({ text: "next prompt", source: "interactive" }, ctx);
+  assert.equal(routeCalls.length, 1);
+  finish();
+})().catch((error) => {
+  finish();
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
+"""
+    )
+    _run_extension_script(node, _extension_path(), script)
+
+
+def test_tui_prompt_route_turn_failure_fails_open(tmp_path: Path) -> None:
+    """An unreachable route-turn leaves the model alone and is not retried."""
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required for the pi-native extension e2e test")
+
+    script = (
+        _MODEL_SWITCH_HARNESS
+        + r"""
+(async () => {
+  let routeCalls = 0;
+  global.fetch = async (url, request) => {
+    if (url.endsWith("/hooks/route-turn")) {
+      routeCalls += 1;
+      throw new Error("ECONNREFUSED");
+    }
+    posted.push(JSON.parse(request.body));
+    return { ok: true };
+  };
+  await handlers.session_start({}, ctx);
+  await handlers.input({ text: "one", source: "interactive" }, ctx);
+  await handlers.input({ text: "two", source: "interactive" }, ctx);
+  assert.equal(routeCalls, 1);
+  assert.equal(setModelCalls.length, 0);
+  // The user's prompt is still mirrored to Omnigent.
+  assert.ok(
+    posted.some(
+      (e) => e.type === "external_conversation_item" && e.data.item_data.role === "user",
+    ),
+  );
   finish();
 })().catch((error) => {
   finish();
@@ -3772,7 +4083,6 @@ def test_native_auth_errors_are_correlated_and_redacted(tmp_path: Path) -> None:
         + "\nconst authDir = "
         + json.dumps(str(tmp_path))
         + r""";
-const fs = require("fs");
 const crypto = require("crypto");
 process.env.OMNIGENT_PI_NATIVE_AUTH_DIR = authDir;
 const id = crypto.createHash("sha256").update("omnigent").digest("hex").slice(0, 16);

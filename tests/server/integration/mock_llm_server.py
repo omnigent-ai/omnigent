@@ -34,7 +34,9 @@ Usage::
 
     python tests/server/integration/mock_llm_server.py 9999
 
-Configuration via ``POST /mock/configure``::
+Configuration via ``POST /mock/configure``:
+
+.. code-block:: json
 
     {
         "key": "mock-model",
@@ -822,6 +824,8 @@ class QueuedResponse:
     """
 
     text: str = "Mock LLM response"
+    # Optional Chat wire content blocks, including provider-specific metadata.
+    chat_content: list[dict[str, object]] | None = None
     tool_calls: list[dict[str, str]] | None = None
     native_items: list[dict] | None = None
     block: bool = False
@@ -1344,6 +1348,11 @@ async def create_chat_completion(
                     "name": tc.get("name", ""),
                     "arguments": tc.get("arguments", "{}"),
                 },
+                **(
+                    {"thoughtSignature": tc["thoughtSignature"]}
+                    if "thoughtSignature" in tc
+                    else {}
+                ),
             }
             for tc in qr.tool_calls
         ]
@@ -1351,7 +1360,8 @@ async def create_chat_completion(
         else None
     )
     finish_reason = "tool_calls" if cc_tool_calls else "stop"
-    cc_message: dict[str, object] = {"role": "assistant", "content": text or None}
+    content = qr.chat_content if qr.chat_content is not None else text or None
+    cc_message: dict[str, object] = {"role": "assistant", "content": content}
     if cc_tool_calls:
         cc_message["tool_calls"] = cc_tool_calls
     resp_id = _response_id()
@@ -1374,7 +1384,7 @@ async def create_chat_completion(
         "usage": cc_usage,
     }
     if parsed.get("stream"):
-        delta: dict[str, object] = {"role": "assistant", "content": text or None}
+        delta: dict[str, object] = {"role": "assistant", "content": content}
         if cc_tool_calls:
             delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(cc_tool_calls)]
         chunk = {
@@ -1511,6 +1521,7 @@ async def configure(request: Request) -> dict[str, object]:
             queue.responses.append(
                 QueuedResponse(
                     text=entry.get("text", "Mock LLM response"),
+                    chat_content=entry.get("chat_content"),
                     tool_calls=entry.get("tool_calls"),
                     native_items=entry.get("native_items"),
                     block=entry.get("block", False),

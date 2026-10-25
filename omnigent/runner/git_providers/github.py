@@ -15,6 +15,7 @@ from omnigent.runner.git_providers import (
     ProviderCapabilities,
     PullRequestAuth,
     PullRequestFacet,
+    ReviewerRef,
     ShellPrOp,
     ShellSegment,
     github_observer,
@@ -28,6 +29,11 @@ _CAPABILITIES = ProviderCapabilities(
     base_remote_selection=True,
     line_counts=True,
     linked_pr_diff=True,
+    label_editing=True,
+    merging=True,
+    reviewer_editing=True,
+    details_editing=True,
+    attachment_uploads=True,
 )
 
 
@@ -146,6 +152,95 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         github_resource._set_preference(root, reference, account=account, remote=remote)
+
+    def repo_labels(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """List the repository's labels with ``gh label list``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._repo_labels(root, reference)
+
+    def edit_labels(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        add: Sequence[str],
+        remove: Sequence[str],
+    ) -> dict[str, Any]:
+        """Add and remove the PR's labels through GitHub's issue labels API."""
+        from omnigent.runner import github_resource
+
+        return github_resource._edit_labels(root, reference, add=add, remove=remove)
+
+    def merge_options(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """Read the repository's allowed merge methods with ``gh repo view``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._merge_options(root, reference)
+
+    def merge(
+        self, root: str, reference: PullRequestRef, *, merge_method: str, expected_head: str
+    ) -> dict[str, Any]:
+        """Merge the PR with ``gh pr merge --match-head-commit``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._merge_pr(
+            root, reference, merge_method=merge_method, expected_head=expected_head
+        )
+
+    def disable_auto_merge(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """Turn off auto-merge with ``gh pr merge --disable-auto``."""
+        from omnigent.runner import github_resource
+
+        return github_resource._disable_auto_merge(root, reference)
+
+    def review_candidates(self, root: str, reference: PullRequestRef) -> dict[str, Any]:
+        """List the repository's assignable users and its teams."""
+        from omnigent.runner import github_resource
+
+        return github_resource._review_candidates(root, reference)
+
+    def edit_reviewers(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        add: Sequence[ReviewerRef],
+        remove: Sequence[ReviewerRef],
+    ) -> dict[str, Any]:
+        """Request and withdraw reviews through GitHub's requested reviewers API."""
+        from omnigent.runner import github_resource
+
+        return github_resource._edit_reviewers(root, reference, add=add, remove=remove)
+
+    def edit_details(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        title: str | None,
+        body: str | None,
+    ) -> dict[str, Any]:
+        """Update the title and description through GitHub's pull requests API."""
+        from omnigent.runner import github_resource
+
+        return github_resource._edit_details(root, reference, title=title, body=body)
+
+    def upload_attachment(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        name: str,
+        content_type: str,
+        content: bytes,
+    ) -> dict[str, Any]:
+        """Upload through GitHub's user attachments endpoint, as ``gh --attach`` does."""
+        from omnigent.runner import github_resource
+
+        return github_resource._upload_attachment(
+            root, reference, name=name, content_type=content_type, content=content
+        )
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``gh pr`` or ``gh api`` segment."""

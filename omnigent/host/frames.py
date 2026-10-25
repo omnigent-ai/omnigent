@@ -25,12 +25,16 @@ from dataclasses import dataclass, field
 from enum import Enum
 from os import PathLike
 from typing import Any, NoReturn
+from urllib.parse import urlsplit
 
 from pydantic import ValidationError
 
 from omnigent.harness_availability import HarnessAvailability, is_harness_availability
 from omnigent.host.harness_startup import HarnessStartup
-from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+from omnigent.inner.native_attachments import (
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
+    CAP_FILESYSTEM_ATTACHMENTS,
+)
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 
@@ -45,6 +49,12 @@ HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 # does not exist on the host (e.g. the worktree was deleted). Shared by the
 # daemon (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
+
+# when the host's launch handler raised before any runner process was spawned
+# (a post-spawn fault is not reported as a failure). Unlike the codes above
+# this is not a categorical refusal: the server cannot describe the cause from
+# its own state, so it stays a generic failure.
+LAUNCH_HANDLER_FAILED_ERROR_CODE = "launch_handler_failed"
 
 # Separates the summary of ``HostRunnerExitedFrame.error`` from the runner's log
 # tail, whose last line the server keeps when it shortens the report for storage.
@@ -69,6 +79,7 @@ CAP_MCP_REGISTRY = "mcp_registry"
 HOST_CAPABILITIES: list[str] = [
     CAP_CODEX_SIDE_CHAT,
     CAP_FILESYSTEM_ATTACHMENTS,
+    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
     CAP_PLUGINS,
     CAP_SKILL_CONTENT,
     CAP_MCP_TOOLS,
@@ -981,15 +992,24 @@ class HostFsWriteFrame:
     The read counterpart (:class:`HostFsRequestFrame`) is read-only by design;
     this carries the small set of writes the host can serve when the session's
     runner is offline — currently the pull request panel's account/base
-    preference (``op="github_set_preference"``) and PR attach/remove
-    (``op="github_prs_update"``), for every git provider; the op names are
+    preference (``op="github_set_preference"``), PR attach/remove
+    (``op="github_prs_update"``), label edits (``op="github_labels_update"``),
+    reviewer edits (``op="github_reviewers_update"``), title and description edits
+    (``op="github_details_update"``), description attachment uploads
+    (``op="github_attachment_upload"``, the file base64-encoded in
+    ``content_base64``), merges (``op="github_merge"``),
+    and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
+    provider; the op names are
     stable wire ids. The host runs the mutation against
     ``workspace`` and replies with the same :class:`HostFsResultFrame` a read
     would, so the result transport and correlation are shared.
 
     :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
-    :param op: Write op name — ``"github_set_preference"`` or
-        ``"github_prs_update"``.
+    :param op: Write op name — ``"github_set_preference"``,
+        ``"github_prs_update"``, ``"github_labels_update"``,
+        ``"github_reviewers_update"``, ``"github_details_update"``,
+        ``"github_attachment_upload"``, ``"github_merge"``, or
+        ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.
     :param session_id: Session id, for parity with the read frame.
     :param params: Operation-specific arguments, e.g.
@@ -1107,7 +1127,7 @@ class HostMcpServersFrame:
 
 @dataclass
 class HostMcpServersResultFrame:
-    """Host → server: MCP server names and metadata, never env, args, or URLs."""
+    """Host → server: MCP server metadata and account state; no env, args, or server URLs."""
 
     request_id: str
     status: str
@@ -2895,7 +2915,42 @@ def _decode_skills_result(msg: _JsonObject) -> HostSkillsResultFrame:
 
 
 _MCP_SERVER_FIELDS = ("name", "harness", "transport", "scope")
-_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id")
+_MCP_SERVER_OPTIONAL_FIELDS = ("plugin", "url_host", "source_id", "managed")
+#: Account states a host may report. Anything else is dropped rather than rejected, so a
+#: newer host reporting a state this build does not know degrades to "no state reported".
+MCP_AUTH_STATUSES = ("connected", "sign_in_required")
+
+
+def mcp_account_fields(auth_status: object, sign_in_url: object) -> dict[str, str]:
+    """Validate one server's reported account state, the only account data hosts send.
+
+    Shared by the reporting host and the decoding server, so the rule lives in one place.
+
+    :param auth_status: Reported state; only :data:`MCP_AUTH_STATUSES` survive.
+    :param sign_in_url: Reported sign-in page; kept only while sign-in is due and only
+        when it is an absolute ``http(s)`` URL a browser can open.
+    :returns: The fields to publish, empty when nothing valid was reported.
+    """
+    if auth_status not in MCP_AUTH_STATUSES:
+        return {}
+    fields = {"auth_status": str(auth_status)}
+    if auth_status == "sign_in_required" and isinstance(sign_in_url, str):
+        if any(ch.isspace() or ord(ch) < 0x20 or ord(ch) == 0x7F for ch in sign_in_url):
+            return fields
+        try:
+            parts = urlsplit(sign_in_url)
+        except ValueError:
+            return fields
+        # Credentials in the URL would be published to the browser and sit in the
+        # DOM, so a page that carries them is not worth opening.
+        if (
+            parts.scheme in ("http", "https")
+            and parts.hostname
+            and not parts.username
+            and not parts.password
+        ):
+            fields["sign_in_url"] = sign_in_url
+    return fields
 
 
 def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
@@ -2912,6 +2967,7 @@ def _decode_mcp_servers_result(msg: _JsonObject) -> HostMcpServersResultFrame:
             value = _optional_nullable_str(server, key)
             if value is not None:
                 summary[key] = value
+        summary.update(mcp_account_fields(server.get("auth_status"), server.get("sign_in_url")))
         servers.append(summary)
     return HostMcpServersResultFrame(
         request_id=_required_str(msg, "request_id"),

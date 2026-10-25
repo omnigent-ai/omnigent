@@ -159,6 +159,8 @@ describe("external chat link clicks", () => {
     "javascript:invalid",
     "javascript:12",
     "javascript:example.md:12",
+    "javascript:12-18",
+    "javascript:example.md:12-18",
     "data:text/plain,invalid",
     "vbscript:invalid",
   ])("never follows a sanitized %s URL", (href) => {
