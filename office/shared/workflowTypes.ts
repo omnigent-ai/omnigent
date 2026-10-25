@@ -2,13 +2,17 @@
 // part of every record so additional theme branches need no migration.
 
 import type { AgentRoleId, GateType, RoleId } from "./sdlcTheme.ts";
+import type { RoleHealth } from "./troubleshoot.ts";
 
 export type ThemeId = "sdlc";
 export type BranchStatus = "active" | "background" | "paused" | "archived";
 
 /** How the office launches role sessions on the connected Omnigent. */
 export interface BranchRuntime {
-  harness: string;
+  /** Overrides every role's harness; omit to use the per-role defaults. */
+  harness?: string;
+  /** Per-role harness overrides. */
+  roleHarnesses?: Partial<Record<AgentRoleId, string>>;
   model?: string;
   /** Per-role model overrides, e.g. a stronger model for the Architect. */
   roleModels?: Partial<Record<AgentRoleId, string>>;
@@ -43,6 +47,15 @@ export interface RoleSessionLink {
   /** Set when the role rolled over to a new session through a recorded handoff. */
   retiredAt: number | null;
   handoffFromSessionId: string | null;
+}
+
+export interface RoleStartFailure {
+  branchId: string;
+  role: AgentRoleId;
+  harness: string;
+  at: number;
+  code: string;
+  message: string;
 }
 
 export interface Requirement {
@@ -203,6 +216,8 @@ export interface WorkflowState {
   decisions: Record<string, CoordinatorDecision>;
   /** Item ids of messages the office relayed for agents; never human interactions. */
   relayedItemIds: string[];
+  /** Latest failure to start each role, keyed `${branchId}:${role}`; cleared when it starts. */
+  roleStartFailures: Record<string, RoleStartFailure>;
 }
 
 export function emptyWorkflowState(): WorkflowState {
@@ -218,6 +233,7 @@ export function emptyWorkflowState(): WorkflowState {
     interviewRounds: {},
     decisions: {},
     relayedItemIds: [],
+    roleStartFailures: {},
   };
 }
 
@@ -234,4 +250,6 @@ export interface BranchView {
   /** The latest interview, whose questions the progress bar shows. */
   currentInterview: InterviewRound | null;
   decisions: CoordinatorDecision[];
+  /** Per-role diagnosis, added when the room loads the branch. */
+  health?: RoleHealth[];
 }

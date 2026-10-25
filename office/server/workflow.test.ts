@@ -1,59 +1,15 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { gunzipSync } from "node:zlib";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { interviewProgress } from "../shared/interviewProgress.ts";
 import type { AgentRoleId } from "../shared/sdlcTheme.ts";
 import type { InterviewQuestion } from "../shared/workflowTypes.ts";
+import { FakeOmnigent } from "./fakeOmnigent.ts";
 import { StateStore } from "./stateStore.ts";
-import { type McpCaller, type WorkflowOmnigent, WorkflowError, WorkflowService } from "./workflow.ts";
+import { type McpCaller, WorkflowError, WorkflowService } from "./workflow.ts";
 
 const NOW = 1_800_000_000;
-
-class FakeOmnigent implements WorkflowOmnigent {
-  sessions: { id: string; metadata: Record<string, unknown>; spec: Record<string, unknown> }[] = [];
-  messages: { sessionId: string; text: string; stableId?: string }[] = [];
-  policies: { sessionId: string; id: string; name: string; expression: string }[] = [];
-  interrupted: string[] = [];
-  operations: string[] = [];
-
-  async createBundledSession(bundle: Buffer, metadata: Record<string, unknown>) {
-    const tar = gunzipSync(bundle);
-    const size = parseInt(tar.subarray(124, 135).toString("ascii"), 8);
-    const spec = JSON.parse(tar.subarray(512, 512 + size).toString("utf8")) as Record<string, unknown>;
-    const id = `conv_${this.sessions.length + 1}`;
-    this.sessions.push({ id, metadata, spec });
-    this.operations.push(`create:${id}`);
-    return { session_id: id };
-  }
-  async bindRunner(sessionId: string) {
-    this.operations.push(`bind:${sessionId}`);
-  }
-  async sendMessage(sessionId: string, text: string, stableId?: string) {
-    this.messages.push({ sessionId, text, stableId });
-    return { queued: true };
-  }
-  async interrupt(sessionId: string) {
-    this.interrupted.push(sessionId);
-  }
-  async addSessionPolicy(sessionId: string, name: string, expression: string) {
-    const id = `pol_${this.policies.length + 1}`;
-    this.policies.push({ sessionId, id, name, expression });
-    this.operations.push(`policy+:${name}`);
-    return { id };
-  }
-  async deleteSessionPolicy(sessionId: string, policyId: string) {
-    this.policies = this.policies.filter((policy) => !(policy.sessionId === sessionId && policy.id === policyId));
-    this.operations.push(`policy-:${policyId}`);
-  }
-  async listProjects() {
-    return [{ id: "proj", name: "Shop" }];
-  }
-  sessionPolicies(sessionId: string) {
-    return this.policies.filter((policy) => policy.sessionId === sessionId);
-  }
-}
 
 const RUNTIME = { harness: "openai-agents", runnerId: "runner_1" };
 
@@ -125,8 +81,35 @@ describe("WorkflowService", () => {
     await expect(workflow.assignTheme("proj", { runtime: RUNTIME })).rejects.toMatchObject({ code: "theme_already_assigned" });
   });
 
-  it("requires a host or runner for role sessions", async () => {
+  it("requires a host (with workspace) or runner for role sessions", async () => {
     await expect(workflow.assignTheme("proj", { runtime: { harness: "claude-native" } })).rejects.toMatchObject({ code: "invalid_runtime" });
+    await expect(workflow.assignTheme("proj", { runtime: { harness: "claude-native", hostId: "host_1" } })).rejects.toMatchObject({
+      code: "invalid_runtime",
+    });
+  });
+
+  it("recovers a missing PM coordinator using the project's configured workspace", async () => {
+    let failFirst = true;
+    const origCreate = omnigent.createBundledSession.bind(omnigent);
+    omnigent.createBundledSession = async (bundle, metadata) => {
+      if (failFirst) {
+        failFirst = false;
+        throw new Error("workspace required when host_id is set");
+      }
+      return origCreate(bundle, metadata);
+    };
+    omnigent.listProjects = async () => [{ id: "proj", name: "Shop", config: { host_id: "host_1", workspace: "/repo/shop" } }];
+    await expect(workflow.assignTheme("proj", { runtime: { hostId: "host_1", workspace: "/repo/shop" } })).rejects.toMatchObject({
+      code: "coordinator_start_failed",
+    });
+    const branchId = workflow.activeBranch("proj")!.id;
+    delete store.state.workflow.branches[branchId].runtime.workspace;
+    expect(workflow.coordinatorSession(branchId)).toBeNull();
+
+    const sessionId = await workflow.ensureCoordinator(branchId);
+    expect(sessionId).toBe("conv_1");
+    expect(store.state.workflow.branches[branchId].runtime.workspace).toBe("/repo/shop");
+    expect(omnigent.sessions[0].metadata).toMatchObject({ host_id: "host_1", workspace: "/repo/shop" });
   });
 
   it("creates tasks from the matrix and enforces the task contract", async () => {
@@ -359,6 +342,52 @@ describe("WorkflowService", () => {
     expect(view.interviews.map((question) => question.status)).toEqual(["answered", "asked"]);
     expect(view.interviews.every((question) => question.interviewId === view.currentInterview?.id)).toBe(true);
     await workflow.answerInterview(branchId, "old_open", "Now answered");
+  });
+
+  it("records why a role could not start and clears it once the role starts", async () => {
+    const branchId = await assign();
+    const create = omnigent.createBundledSession.bind(omnigent);
+    omnigent.createBundledSession = async () => {
+      throw Object.assign(new Error("Harness 'copilot' is not configured on the target host"), { code: "harness_not_configured" });
+    };
+    await expect(workflow.rolloverRole(branchId, "reviewer", "")).rejects.toThrow("not configured");
+    expect(workflow.roleStartFailure(branchId, "reviewer")).toMatchObject({ code: "harness_not_configured", harness: "openai-agents" });
+    omnigent.createBundledSession = create;
+    await workflow.rolloverRole(branchId, "reviewer", "");
+    expect(workflow.roleStartFailure(branchId, "reviewer")).toBeNull();
+  });
+
+  it("switches roles to another harness and restarts the running ones with a handoff", async () => {
+    const branchId = await assign();
+    const oldPm = caller(branchId, "pm").link.sessionId;
+    store.state.workflow.branches[branchId].runtime.roleModels = { pm: "claude-opus", qa: "claude-haiku" };
+    await workflow.switchRoleHarness(branchId, ["pm", "qa"], "codex", "", "Claude quota is spent.");
+    const runtime = store.state.workflow.branches[branchId].runtime;
+    expect(runtime.roleHarnesses).toMatchObject({ pm: "codex", qa: "codex" });
+    expect(runtime.roleModels).toEqual({});
+    const newPm = caller(branchId, "pm").link.sessionId;
+    expect(newPm).not.toBe(oldPm);
+    expect((omnigent.sessions.at(-1)?.spec.executor as { config: { harness: string } }).config.harness).toBe("codex");
+    // QA never started, so it simply starts on the new harness later.
+    expect(omnigent.sessions).toHaveLength(2);
+    await expect(workflow.switchRoleHarness(branchId, [], "codex", "", "")).rejects.toMatchObject({ code: "invalid_role" });
+  });
+
+  it("tells a restarted PM about the interview it was running", async () => {
+    const branchId = await assign();
+    const pm = caller(branchId, "pm");
+    workflow.interviewKickoff(branchId, "checkout");
+    expect(workflow.interviewAwaitingCoordinator(branchId)?.reason).toContain("not planned or asked");
+    const plan = workflow.planInterview(pm, { questions: ["Who pays?", "Which cards?"] }) as { added: { id: string }[] };
+    await workflow.askInterview(pm, { questionId: plan.added[0].id });
+    expect(workflow.interviewAwaitingCoordinator(branchId)).toBeNull();
+    await workflow.rolloverRole(branchId, "pm", "The harness crashed.");
+    const brief = omnigent.messages.at(-1)?.text ?? "";
+    expect(brief).toContain('An interview about "checkout" is in progress.');
+    expect(brief).toContain("The PO has not answered yet: Who pays?");
+    expect(brief).toContain(`${plan.added[1].id}: Which cards?`);
+    await workflow.answerInterview(branchId, plan.added[0].id, "Shoppers");
+    expect(workflow.interviewAwaitingCoordinator(branchId)?.reason).toContain("has not asked the next one");
   });
 
   it("stops every role immediately and rolls a role over with a recorded handoff", async () => {

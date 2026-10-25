@@ -51,7 +51,7 @@ export function ThemeSetup({ room, onAssigned }: ThemeSetupProps) {
             {error}
           </p>
         ) : null}
-        <button type="submit" className="primary" disabled={busy || !draft.harness || (!hostId && !draft.runnerId.trim())}>
+        <button type="submit" className="primary" disabled={busy || ((!(hostId && workspace.trim())) && !draft.runnerId.trim())}>
           {busy ? "Starting the PM…" : "Assign SDLC"}
         </button>
       </form>

@@ -9,6 +9,7 @@ import { ApprovalDialog, type ApprovalRequest } from "./ApprovalDialog.tsx";
 import { RoomCanvas } from "./RoomCanvas.tsx";
 import { MAX_DESKS, buildRoomLayout } from "./roomLayout.ts";
 import { WorkerPanel } from "./WorkerPanel.tsx";
+import { openProblems, problemAnchor } from "./workflow/AgentProblems.tsx";
 import { ThemeSetup } from "./workflow/ThemeSetup.tsx";
 import { WorkflowPanel } from "./workflow/WorkflowPanel.tsx";
 import { type WorkflowRequest, WorkflowRequestDialog } from "./workflow/WorkflowRequestDialog.tsx";
@@ -105,7 +106,9 @@ export function RoomView({ room, allRooms, serverNow, placementWaiting, onExit, 
   const pendingWorkflow = workflowRequests(branchView);
   const openQuestion = branchView?.interviews.find((question) => question.status === "asked") ?? null;
   const humanTasks = (branchView?.tasks ?? []).filter((task) => task.status === "blocked" && task.responsible.includes("po"));
-  const nothingPending = requests.length === 0 && pendingWorkflow.length === 0 && !openQuestion && humanTasks.length === 0;
+  const problems = branchView ? openProblems(branchView) : [];
+  const nothingPending =
+    requests.length === 0 && pendingWorkflow.length === 0 && !openQuestion && humanTasks.length === 0 && problems.length === 0;
 
   return (
     <div className="room-view">
@@ -160,6 +163,23 @@ export function RoomView({ room, allRooms, serverNow, placementWaiting, onExit, 
         <section aria-label="Requests needing your decision" className="requests">
           {nothingPending ? <p className="muted">No requests need your attention.</p> : null}
           <ul>
+            {problems.map((entry) => (
+              <li key={`problem:${entry.sessionId ?? entry.role}`}>
+                <button
+                  type="button"
+                  className="request-button request-problem"
+                  onClick={() => {
+                    if (!branchView) return;
+                    const card = document.getElementById(problemAnchor(branchView.branch.id, entry));
+                    card?.scrollIntoView({ block: "center" });
+                    card?.focus();
+                  }}
+                >
+                  ⚠ {roleTitle(entry.role)}
+                  {entry.temporary ? " (temporary)" : ""} is stuck: {entry.problem?.title}
+                </button>
+              </li>
+            ))}
             {pendingWorkflow.map((request) => (
               <li key={request.kind === "gate" ? request.gate.id : request.proposal.id}>
                 <button type="button" className="request-button" onClick={() => setOpenWorkflowRequest(request)}>

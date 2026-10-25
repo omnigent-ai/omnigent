@@ -399,8 +399,8 @@ select {
 .workflow-section { border: 2px solid var(--line, #3a3f55); padding: 8px 12px; background: rgba(0, 0, 0, 0.15); }
 .workflow-section h3 { margin: 0 0 6px; }
 .workflow-section label { display: block; margin: 4px 0; }
-.workflow-section input:not([type="checkbox"]), .workflow-section textarea, .theme-setup input:not([type="checkbox"]), .theme-setup select,
-.approval-dialog input:not([type="checkbox"]), .approval-dialog select { width: 100%; box-sizing: border-box; }
+.workflow-section input:not([type="checkbox"]):not([type="radio"]), .workflow-section textarea, .theme-setup input:not([type="checkbox"]):not([type="radio"]), .theme-setup select,
+.approval-dialog input:not([type="checkbox"]):not([type="radio"]), .approval-dialog select { width: 100%; box-sizing: border-box; }
 .theme-setup { border: 2px dashed var(--line, #3a3f55); padding: 12px; margin-top: 12px; }
 .theme-setup label, .theme-setup fieldset, .approval-dialog label, .approval-dialog fieldset { display: block; margin: 6px 0; }
 .capability-table { border-collapse: collapse; margin: 8px 0; font-size: 0.85em; }
@@ -441,3 +441,15 @@ select {
 .interview-pill-awaiting { border-color: var(--warn); }
 .interview-pill-added { border-color: var(--interview-added); }
 .pill { display: inline-block; border: 1px solid var(--panel-border); border-radius: 8px; padding: 0 6px; font-size: 0.8em; }
+
+.agent-problems { border-color: var(--danger); }
+.agent-problem-list { list-style: none; padding: 0; margin: 0; }
+.agent-problem { border: 2px solid var(--danger); padding: 8px; margin-bottom: 8px; }
+.agent-problem:focus { outline: 3px solid var(--warn); }
+.agent-problem h4 { margin: 0 0 4px; }
+.agent-problem-dismissed { border-color: var(--panel-border); opacity: 0.8; }
+.agent-problem-detail { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 10em; overflow: auto; }
+.agent-problem-actions { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.agent-problem-schedule { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; }
+.request-problem { border-color: var(--danger); }
+.link-button { background: none; border: none; color: var(--warn); text-decoration: underline; cursor: pointer; padding: 0 4px; }

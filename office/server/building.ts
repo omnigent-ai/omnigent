@@ -2,7 +2,7 @@
 // mediates the session actions the office exposes.
 
 import type { BuildingSnapshot, Priority, RoomSettingsPatch, RoomSummary } from "../shared/types.ts";
-import { mergeScan, scanSession } from "./activity.ts";
+import { mergeScan, scanSession, type SessionScan } from "./activity.ts";
 import { OmnigentError, type OmnigentClient, type OmnigentSessionListItem } from "./omnigentClient.ts";
 import { silentNotifier, type Notifier } from "./notifier.ts";
 import type { ApprovalDecision, StateStore } from "./stateStore.ts";
@@ -35,6 +35,7 @@ export class BuildingService {
   private lastRefreshMs = 0;
   private inFlight: Promise<BuildingSnapshot> | null = null;
   private workflow: WorkflowService | null = null;
+  private problemCount: (projectId: string) => number = () => 0;
   private readonly notifier: Notifier;
   /** Pending Omnigent requests per session at the last refresh, to notify only on new ones. */
   private pendingSeen: Map<string, number> | null = null;
@@ -53,6 +54,20 @@ export class BuildingService {
 
   attachWorkflow(workflow: WorkflowService): void {
     this.workflow = workflow;
+  }
+
+  /** Source of the per-room count of agent problems the PO has not dismissed. */
+  attachProblemCounts(count: (projectId: string) => number): void {
+    this.problemCount = count;
+  }
+
+  /** A session from the latest refresh, or null when Omnigent no longer lists it. */
+  session(sessionId: string): OmnigentSessionListItem | null {
+    return this.sessions.find((session) => session.id === sessionId) ?? null;
+  }
+
+  sessionScan(sessionId: string): SessionScan | undefined {
+    return this.store.state.sessions[sessionId];
   }
 
   /** Return a recent snapshot, refreshing from Omnigent when it is stale. */
@@ -161,6 +176,7 @@ export class BuildingService {
       pendingRequestCount:
         sessions.reduce((total, session) => total + session.pending_elicitations_count, 0) +
         (this.workflow?.pendingHumanRequests(project.id) ?? 0),
+      agentProblemCount: this.problemCount(project.id),
       workerCount: sessions.length,
       activeWorkerCount: sessions.filter((session) => session.status === "running" || session.status === "launching").length,
     };
@@ -194,6 +210,7 @@ export class BuildingService {
     const hostId = typeof input.hostId === "string" ? input.hostId.trim() : "";
     const workspace = typeof input.workspace === "string" ? input.workspace.trim() : "";
     if (workspace && !hostId) throw new OfficeRequestError(400, "invalid_workspace", "Choose the host the folder is on.");
+    if (hostId && !workspace) throw new OfficeRequestError(400, "invalid_workspace", "Choose a folder on the host.");
     if (hostId) config.host_id = hostId;
     if (workspace) config.workspace = workspace;
     const project = await this.client.createProject(name, config);

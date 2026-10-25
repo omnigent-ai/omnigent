@@ -52,12 +52,12 @@ function drawRoomPreview(context: CanvasRenderingContext2D, rect: Rect, room: Ro
   context.font = "11px monospace";
   const priorityMark = room.priority === "critical" ? "‼ Critical" : room.priority === "high" ? "↑ High" : "";
   context.fillText(`${room.workerCount} worker${room.workerCount === 1 ? "" : "s"} ${priorityMark}`, rect.x + 8, rect.y + 26);
-  if (room.pendingRequestCount > 0) {
-    // Attention flag
+  if (room.pendingRequestCount > 0 || room.agentProblemCount > 0) {
+    // Attention flag; red while an agent is stuck.
     const flagX = rect.x + rect.width - 30;
     context.fillStyle = "#2b2b2b";
     context.fillRect(flagX, rect.y + 6, 3, 30);
-    context.fillStyle = "#f2c14e";
+    context.fillStyle = room.agentProblemCount > 0 ? "#d7263d" : "#f2c14e";
     context.fillRect(flagX + 3, rect.y + 6, 20, 14);
     context.fillStyle = "#1f1f1f";
     context.font = "bold 12px monospace";
@@ -218,6 +218,12 @@ export function BuildingView({ placement, rooms, onEnterRoom, onNewRoom, elevato
                     ? ", 1 request needs your attention"
                     : room.pendingRequestCount > 1
                       ? `, ${room.pendingRequestCount} requests need your attention`
+                      : ""
+                }${
+                  room.agentProblemCount === 1
+                    ? ", 1 agent is stuck"
+                    : room.agentProblemCount > 1
+                      ? `, ${room.agentProblemCount} agents are stuck`
                       : ""
                 }`}
                 disabled={entering !== null}

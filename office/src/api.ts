@@ -2,6 +2,7 @@
 // and never sees Omnigent credentials.
 
 import type { GateType } from "../shared/sdlcTheme.ts";
+import type { ScheduledRetry } from "../shared/troubleshoot.ts";
 import type { BuildingSnapshot, RoomSettingsPatch } from "../shared/types.ts";
 import type { BranchRuntime, BranchView, Requirement } from "../shared/workflowTypes.ts";
 
@@ -30,13 +31,16 @@ export interface HostOption {
   name?: string;
   status?: string;
   sandbox_provider?: string | null;
-  configured_harnesses?: string[] | null;
+  /** Harness id to readiness: true, false, "needs-auth", "binary-missing", or "version-too-low". */
+  configured_harnesses?: Record<string, unknown> | null;
 }
 
 export interface RuntimeOptions {
   hosts: { hosts?: HostOption[] };
   harnesses: { data?: HarnessOption[] };
   dictationAvailable: boolean;
+  /** The connected Omnigent's address, for opening a session in its own UI. */
+  omnigentUrl?: string;
 }
 
 export interface PendingElicitation {
@@ -159,4 +163,15 @@ export const officeApi = {
   stopBranch: (branchId: string) => call<{ stopped: number; failed: string[] }>(`/branches/${branchId}/stop`, { method: "POST", body: {} }),
   rollover: (branchId: string, role: string, reason: string) =>
     call<BranchView>(`/branches/${branchId}/roles/${role}/rollover`, { method: "POST", body: { reason } }),
+  recoverSession: (branchId: string, sessionId: string, action: "continue" | "recover" | "nudge" | "stop") =>
+    call<{ result: string }>(`/branches/${branchId}/sessions/${encodeURIComponent(sessionId)}/recover`, { method: "POST", body: { action } }),
+  scheduleRetry: (branchId: string, sessionId: string, minutes: number | null, repeat: boolean) =>
+    call<{ retry: ScheduledRetry | null }>(`/branches/${branchId}/sessions/${encodeURIComponent(sessionId)}/retry-schedule`, {
+      method: "POST",
+      body: { minutes, repeat },
+    }),
+  dismissProblem: (branchId: string, subject: string, key: string) =>
+    call<{ dismissed: boolean }>(`/branches/${branchId}/problems/dismiss`, { method: "POST", body: { subject, key } }),
+  switchHarness: (branchId: string, roles: string[], harness: string, model: string, reason: string) =>
+    call<BranchView>(`/branches/${branchId}/roles/switch-harness`, { method: "POST", body: { roles, harness, model, reason } }),
 };

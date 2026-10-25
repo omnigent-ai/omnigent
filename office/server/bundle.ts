@@ -3,6 +3,7 @@
 
 import { gzipSync } from "node:zlib";
 import {
+  DEFAULT_ROLE_HARNESSES,
   RUNTIME_GATE_PATTERNS,
   RUNTIME_GATE_TOOLS,
   ROLE_BRIEFS,
@@ -98,8 +99,12 @@ export function roleInstructions(options: Pick<RoleBundleOptions, "role" | "proj
   return lines.join("\n");
 }
 
+export function roleHarness(runtime: BranchRuntime, role: AgentRoleId): string {
+  return runtime.roleHarnesses?.[role] ?? runtime.harness ?? DEFAULT_ROLE_HARNESSES[role];
+}
+
 export function roleAgentSpec(options: RoleBundleOptions): Record<string, unknown> {
-  const executor: Record<string, unknown> = { config: { harness: options.runtime.harness } };
+  const executor: Record<string, unknown> = { config: { harness: roleHarness(options.runtime, options.role) } };
   const model = options.runtime.roleModels?.[options.role] ?? options.runtime.model;
   if (model) executor.model = model;
   return {

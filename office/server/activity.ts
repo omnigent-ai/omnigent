@@ -1,6 +1,8 @@
 // Meaningful-interaction discovery: the latest human-authored message in a
 // session, found by paging its history newest-first.
 
+import type { FailureDetail } from "../shared/troubleshoot.ts";
+
 export interface WireItem {
   id: string;
   type: string;
@@ -26,6 +28,8 @@ export interface SessionScan {
   latestHumanAt: number | null;
   /** True when the scan found the latest human message or reached the start of history. */
   complete: boolean;
+  /** The error the latest turn ended with, or null when a later item followed it. */
+  lastTurnError?: FailureDetail | null;
 }
 
 export const MAX_SCAN_PAGES = 5;
@@ -41,6 +45,31 @@ export function isHumanMessage(item: WireItem): boolean {
   );
 }
 
+// Transcript metadata that neither ends nor continues a turn.
+const NEUTRAL_ITEM_TYPES = new Set(["reasoning", "compaction", "resource_event", "routing_decision", "slash_command", "terminal_command"]);
+
+/** The error banner that ended the latest turn, from a newest-first page. */
+export function latestTurnError(items: WireItem[]): FailureDetail | null {
+  for (const item of items) {
+    if (item.type === "error") {
+      if (item.level === "info") continue;
+      const text = (value: unknown) => (typeof value === "string" && value ? value : undefined);
+      return {
+        code: text(item.code) ?? "unknown_error",
+        message: text(item.message) ?? "The turn failed without a message.",
+        source: text(item.source),
+        title: text(item.title),
+        cause: text(item.cause),
+        remediation: text(item.remediation),
+        at: typeof item.created_at === "number" ? item.created_at : undefined,
+      };
+    }
+    if (NEUTRAL_ITEM_TYPES.has(item.type) || item.is_meta === true) continue;
+    return null;
+  }
+  return null;
+}
+
 export async function scanSession(
   sessionId: string,
   updatedAt: number,
@@ -49,8 +78,10 @@ export async function scanSession(
   isRelayed: (itemId: string) => boolean = () => false,
 ): Promise<SessionScan> {
   let after: string | null = null;
+  let lastTurnError: FailureDetail | null = null;
   for (let page = 0; page < maxPages; page++) {
     const result = await fetchPage(sessionId, after);
+    if (page === 0) lastTurnError = latestTurnError(result.data);
     // Messages the office relayed between agents are user-role items but not human input.
     const human = result.data.find((item) => isHumanMessage(item) && !isRelayed(item.id));
     if (human) {
@@ -59,14 +90,15 @@ export async function scanSession(
         latestHumanItemId: human.id,
         latestHumanAt: human.created_at as number,
         complete: true,
+        lastTurnError,
       };
     }
     if (!result.has_more || result.data.length === 0) {
-      return { scannedUpdatedAt: updatedAt, latestHumanItemId: null, latestHumanAt: null, complete: true };
+      return { scannedUpdatedAt: updatedAt, latestHumanItemId: null, latestHumanAt: null, complete: true, lastTurnError };
     }
     after = result.last_id ?? result.data[result.data.length - 1].id;
   }
-  return { scannedUpdatedAt: updatedAt, latestHumanItemId: null, latestHumanAt: null, complete: false };
+  return { scannedUpdatedAt: updatedAt, latestHumanItemId: null, latestHumanAt: null, complete: false, lastTurnError };
 }
 
 /**
@@ -82,5 +114,6 @@ export function mergeScan(previous: SessionScan | undefined, next: SessionScan):
     latestHumanItemId: previous.latestHumanItemId,
     latestHumanAt: previous.latestHumanAt,
     complete: previous.complete || next.complete,
+    lastTurnError: next.lastTurnError,
   };
 }

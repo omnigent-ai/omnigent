@@ -46,7 +46,9 @@ The office never starts Omnigent. Configure it with environment variables:
 
 ### SDLC workflow
 
-Choose the SDLC theme and its agent harness in the New room dialog, or assign
+Choose the SDLC theme in the New room dialog (roles default to Developer and QA on
+Claude, Architect and PM on Codex, DevOps on Gemini via `agy`, and Reviewing Developer
+on Copilot; an optional harness overrides all roles), or assign
 it later from inside an unthemed room. The room's host and folder (picked by
 browsing the host) are stored in the Omnigent project config (`host_id`,
 `workspace`) and are where role sessions run. Assigning SDLC creates a theme
@@ -83,6 +85,36 @@ Task status, the board, gates, interview questions, decisions, and the event
 feed persist in `office-state.json`, so work continues with the browser closed
 and survives a service restart.
 
+### Troubleshooting agents
+
+The office diagnoses every role session from what Omnigent already reports: a
+`failed` status with its `last_task_error`, an error banner that ended the latest
+turn, an offline host, a deleted session, a role that could not start, a turn with
+no new activity for 15 minutes, and a PM that went idle mid-interview for 2
+minutes. Failures are grouped by Omnigent's error code, then by the provider's
+message: spent quota or budget, rate limit, sign-in, harness setup, harness or
+runtime crash, temporary model error, and an over-long conversation.
+
+A stuck role is listed under "Requests needing your decision" and in an "Agent
+problems" card with Omnigent's error verbatim, the cause and fix it reports (or
+the harness's own setup command), and actions in recommended order:
+
+- **Continue the turn** resends the turn, as Omnigent's own retry does.
+- **Reconnect runtime** relaunches a lost runner (`retry_session`).
+- **Remind the agent** tells it what it was asked to do.
+- **Retry later** retries once, or repeatedly until it recovers, from the
+  service, so it works with the browser closed.
+- **Switch harness** moves the role, or every role on the failing harness, to
+  another harness (and model) and restarts it with a handoff; the dialog shows
+  each harness's readiness on the host.
+- **Restart with handoff**, **Start the role**, **Stop the turn**, **Open in
+  Omnigent**, and **Ignore this problem** (until the next failure).
+
+A stuck agent turns the room's flag red, lists the room under "Needs your
+attention", and sends one desktop notification per failure. Every action is
+recorded in the event feed. A restarted PM's handoff includes the interview it
+takes over.
+
 ### State ownership
 
 | State | Owner |
@@ -109,6 +141,9 @@ and survives a service restart.
 | Role sessions with instructions and tools | Bundled `POST /v1/sessions` (session-scoped agent, MCP server, guardrails) | — |
 | Workflow gate enforcement | `POST/DELETE /v1/sessions/{id}/policies` with `cel_policy` | Policies cannot be edited in place, so approvals replace them |
 | Dictation | `WS /v1/dictation/stream`, proxied by the office | Transcribed by the connected Omnigent server, not a browser cloud service |
+| Agent failures | Session `status`, `last_task_error`, `error` items, `host_online` | Polled; a turn's error is read from the newest history page when the session changes |
+| Recovering a turn | `retry_session` event; a continuation message | A message to a failed session starts a new turn rather than resuming the old one |
+| Harness readiness | `GET /v1/hosts` `configured_harnesses`, `GET /v1/harnesses` `setup_steps` | Unknown for runner-only rooms; only common aliases are mapped |
 | Per-harness support | `GET /v1/harnesses` capabilities, shown when assigning a theme | Unsupported resume falls back to a recorded role handoff |
 | Theme switching | — | Not implemented; branch ids are reserved in every record |
 
@@ -120,6 +155,9 @@ and survives a service restart.
   `office_board_get` rather than from the repository.
 - Runtime gate patterns cover shell commands and named GitHub merge tools;
   other tools that merge or deploy are mediated only by Omnigent's own policies.
+- Failure grouping falls back to matching the provider's message text when
+  Omnigent reports a generic code, so an unusual message may show as "The agent's
+  turn failed".
 
 ## Test
 

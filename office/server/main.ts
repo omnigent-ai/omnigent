@@ -11,6 +11,7 @@ import { MCP_PATH, createOfficeHandler, createUpgradeHandler } from "./http.ts";
 import { desktopNotifier, silentNotifier } from "./notifier.ts";
 import { OmnigentClient } from "./omnigentClient.ts";
 import { StateStore } from "./stateStore.ts";
+import { TroubleshootService } from "./troubleshoot.ts";
 import { WorkflowService } from "./workflow.ts";
 
 const environment = process.env;
@@ -37,10 +38,13 @@ const workflow = new WorkflowService({
   clock: () => Math.floor(Date.now() / 1000),
 });
 building.attachWorkflow(workflow);
+const troubleshooter = new TroubleshootService({ building, workflow, client, store, notifier, clock: () => Math.floor(Date.now() / 1000) });
+building.attachProblemCounts((projectId) => troubleshooter.problemCount(projectId));
 const handler = createOfficeHandler({
   building,
   workflow,
   client,
+  troubleshooter,
   allowedPorts: [port, devServerPort],
   staticDir: existsSync(join(staticDir, "index.html")) ? staticDir : null,
 });
@@ -60,3 +64,9 @@ server.listen(port, "127.0.0.1", () => {
 setInterval(() => {
   void building.getSnapshot(true);
 }, 60_000).unref();
+
+// Notice failing agents and run scheduled retries while no browser is open.
+void troubleshooter.tick();
+setInterval(() => {
+  void troubleshooter.tick();
+}, 20_000).unref();

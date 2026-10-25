@@ -19,6 +19,7 @@ function room(projectId: string, overrides: Partial<RoomSummary> = {}): RoomSumm
     projectId,
     name: projectId,
     theme: null,
+    agentProblemCount: 0,
     createdAt: NOW - 100 * DAY,
     priority: "normal",
     keepUpstairs: false,

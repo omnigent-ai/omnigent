@@ -28,7 +28,9 @@ export function NewRoomDialog({ onClose, onCreated }: NewRoomDialogProps) {
     if (dialog && !dialog.open) dialog.showModal?.();
   }, []);
 
-  const sdlcReady = theme === "none" || (Boolean(draft.harness) && (Boolean(hostId) || Boolean(draft.runnerId.trim())));
+  const hostFolderReady = !hostId || Boolean(workspace.trim());
+  const sdlcReady =
+    theme === "none" ? hostFolderReady : (Boolean(hostId) && Boolean(workspace.trim())) || Boolean(draft.runnerId.trim());
 
   const create = async () => {
     setBusy(true);

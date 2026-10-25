@@ -146,6 +146,7 @@ describe("BuildingService", () => {
     const room = (await service.getSnapshot(true)).rooms.find((entry) => entry.projectId === projectId);
     expect(room).toMatchObject({ name: "Shop", hostId: "host_1", workspace: "/repo/shop" });
     await expect(service.createRoom({ name: "No host", workspace: "/repo" })).rejects.toMatchObject({ code: "invalid_workspace" });
+    await expect(service.createRoom({ name: "No folder", hostId: "host_1" })).rejects.toMatchObject({ code: "invalid_workspace" });
   });
 
   it("keeps the last known building when Omnigent is unreachable", async () => {

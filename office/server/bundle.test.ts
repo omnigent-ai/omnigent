@@ -1,5 +1,7 @@
 import { gunzipSync } from "node:zlib";
 import { describe, expect, it } from "vitest";
+import { AGENT_ROLES, type AgentRoleId } from "../shared/sdlcTheme.ts";
+import type { BranchRuntime } from "../shared/workflowTypes.ts";
 import { gatePolicyExpression, roleAgentSpec, tarGzip } from "./bundle.ts";
 
 describe("tarGzip", () => {
@@ -17,6 +19,14 @@ describe("tarGzip", () => {
 });
 
 describe("roleAgentSpec", () => {
+  it("defaults each role to its own harness unless overridden", () => {
+    const harnessOf = (role: AgentRoleId, runtime: BranchRuntime = { runnerId: "r" }) =>
+      (roleAgentSpec({ role, projectName: "Shop", runtime, mcpUrl: "http://x", mcpToken: "t" }).executor as { config: { harness: string } }).config.harness;
+    expect(AGENT_ROLES.map((role) => harnessOf(role))).toEqual(["codex", "codex", "claude-sdk", "copilot", "claude-sdk", "agy"]);
+    expect(harnessOf("pm", { harness: "claude-sdk", runnerId: "r" })).toBe("claude-sdk");
+    expect(harnessOf("pm", { harness: "claude-sdk", roleHarnesses: { pm: "copilot" }, runnerId: "r" })).toBe("copilot");
+  });
+
   it("gives each role its brief, the office MCP server, and the runtime blast-radius policy", () => {
     const spec = roleAgentSpec({
       role: "devops",

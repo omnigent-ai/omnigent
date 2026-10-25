@@ -23,6 +23,8 @@ export interface RoomSummary {
   /** False when some session history could not be scanned far enough. */
   historyComplete: boolean;
   pendingRequestCount: number;
+  /** Failing or stuck agents the PO has not dismissed. */
+  agentProblemCount: number;
   workerCount: number;
   activeWorkerCount: number;
 }

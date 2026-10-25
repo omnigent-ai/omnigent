@@ -18,7 +18,8 @@ export function emptySdlcDraft(): SdlcDraft {
 
 /** The runtime fields the draft owns; host and folder are set by the caller. */
 export function sdlcRuntime(draft: SdlcDraft): Omit<BranchRuntime, "hostId" | "workspace"> {
-  const runtime: Omit<BranchRuntime, "hostId" | "workspace"> = { harness: draft.harness };
+  const runtime: Omit<BranchRuntime, "hostId" | "workspace"> = {};
+  if (draft.harness.trim()) runtime.harness = draft.harness.trim();
   if (draft.model.trim()) runtime.model = draft.model.trim();
   if (draft.runnerId.trim()) runtime.runnerId = draft.runnerId.trim();
   const overrides = Object.fromEntries(Object.entries(draft.roleModels).filter(([, value]) => value?.trim()));
@@ -53,12 +54,11 @@ export function SdlcFields({ draft, onChange }: { draft: SdlcDraft; onChange: (d
   return (
     <>
       <label>
-        Agent harness{" "}
+        Agent harness (optional, overrides every role){" "}
         <input
-          required
           list="harness-options"
           value={draft.harness}
-          placeholder="e.g. claude-sdk"
+          placeholder="Per-role defaults"
           onChange={(event) => update({ harness: event.target.value.trim() })}
         />
         <datalist id="harness-options">

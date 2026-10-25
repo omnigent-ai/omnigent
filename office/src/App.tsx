@@ -99,7 +99,7 @@ export function App() {
   const sortedRooms = [...(snapshot?.rooms ?? [])].sort(compareRooms);
   const query = search.trim().toLowerCase();
   const matches = query ? sortedRooms.filter((room) => room.name.toLowerCase().includes(query)) : [];
-  const attention = sortedRooms.filter((room) => room.pendingRequestCount > 0);
+  const attention = sortedRooms.filter((room) => room.pendingRequestCount > 0 || room.agentProblemCount > 0);
 
   return (
     <div className="app">
@@ -145,7 +145,13 @@ export function App() {
               {attention.map((room) => (
                 <li key={room.projectId}>
                   <button type="button" onClick={() => setOpenRoomId(room.projectId)}>
-                    ⚑ {room.name} — {room.pendingRequestCount} request{room.pendingRequestCount === 1 ? "" : "s"}
+                    {room.agentProblemCount > 0 ? "⚠" : "⚑"} {room.name} —{" "}
+                    {[
+                      room.pendingRequestCount ? `${room.pendingRequestCount} request${room.pendingRequestCount === 1 ? "" : "s"}` : "",
+                      room.agentProblemCount ? `${room.agentProblemCount} stuck agent${room.agentProblemCount === 1 ? "" : "s"}` : "",
+                    ]
+                      .filter(Boolean)
+                      .join(", ")}
                     {snapshot && isBasementEligible(room, snapshot.serverNow) ? " (basement)" : ""}
                   </button>
                 </li>

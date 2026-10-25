@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { type ItemsPage, type WireItem, isHumanMessage, mergeScan, scanSession } from "./activity.ts";
+import { type ItemsPage, type WireItem, isHumanMessage, latestTurnError, mergeScan, scanSession } from "./activity.ts";
 
 const human = (id: string, at: number): WireItem => ({ id, type: "message", role: "user", created_at: at });
 const agent = (id: string, at: number): WireItem => ({ id, type: "message", role: "assistant", created_at: at });
@@ -31,7 +31,7 @@ describe("scanSession", () => {
   it("pages newest-first until it finds the latest human message", async () => {
     const source = pagedFetch([[agent("a3", 30), agent("a2", 20)], [human("h1", 10), agent("a0", 5)]]);
     const scan = await scanSession("conv", 99, source.fetch);
-    expect(scan).toEqual({ scannedUpdatedAt: 99, latestHumanItemId: "h1", latestHumanAt: 10, complete: true });
+    expect(scan).toEqual({ scannedUpdatedAt: 99, latestHumanItemId: "h1", latestHumanAt: 10, complete: true, lastTurnError: null });
     expect(source.calls).toEqual([null, "a2"]);
   });
 
@@ -45,6 +45,34 @@ describe("scanSession", () => {
     const pages = Array.from({ length: 4 }, (_, index) => [agent(`a${index}`, index)]);
     const scan = await scanSession("conv", 1, pagedFetch(pages).fetch, 2);
     expect(scan.complete).toBe(false);
+  });
+});
+
+describe("latestTurnError", () => {
+  const error = (id: string, at: number, extra: Partial<WireItem> = {}): WireItem => ({
+    id,
+    type: "error",
+    created_at: at,
+    source: "llm",
+    code: "rate_limit_exceeded",
+    message: "429 Too Many Requests",
+    ...extra,
+  });
+
+  it("reports the error that ended the latest turn, skipping metadata items", () => {
+    const found = latestTurnError([{ id: "r", type: "reasoning" }, error("e", 30, { remediation: "Wait a minute" }), agent("a", 20)]);
+    expect(found).toEqual({ code: "rate_limit_exceeded", message: "429 Too Many Requests", source: "llm", title: undefined, cause: undefined, remediation: "Wait a minute", at: 30 });
+  });
+
+  it("clears once later output or a new message follows, and ignores informational banners", () => {
+    expect(latestTurnError([agent("a", 40), error("e", 30)])).toBeNull();
+    expect(latestTurnError([human("h", 40), error("e", 30)])).toBeNull();
+    expect(latestTurnError([error("notice", 40, { level: "info" }), agent("a", 30)])).toBeNull();
+  });
+
+  it("is recorded by the scan from the newest page", async () => {
+    const scan = await scanSession("conv", 5, pagedFetch([[error("e", 30), human("h", 10)]]).fetch);
+    expect(scan.lastTurnError?.code).toBe("rate_limit_exceeded");
   });
 });
 

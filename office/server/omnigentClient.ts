@@ -206,6 +206,14 @@ export class OmnigentClient {
     return this.request("/v1/info");
   }
 
+  /** Reconnect or relaunch a session's runner without adding transcript input. */
+  async retrySession(sessionId: string): Promise<{ recovered?: boolean; recovery?: string }> {
+    return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
+      method: "POST",
+      body: { type: "retry_session", data: {} },
+    });
+  }
+
   async interrupt(sessionId: string): Promise<unknown> {
     return this.request(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
       method: "POST",

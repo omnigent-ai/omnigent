@@ -5,11 +5,32 @@ import { OfficeApiError, officeApi } from "../../api.ts";
 import { useRuntimeOptions } from "../../capabilities.ts";
 import { DictationButton } from "../../Dictation.tsx";
 import { interviewSegment, INTERVIEW_SEGMENTS } from "../../../shared/interviewProgress.ts";
+import { READINESS_LABELS, type RoleHealth } from "../../../shared/troubleshoot.ts";
+import { AgentProblems, problemAnchor } from "./AgentProblems.tsx";
 import { InterviewProgressBar } from "./InterviewProgressBar.tsx";
 
 interface WorkflowPanelProps {
   view: BranchView;
   onChanged: () => void;
+}
+
+const HEALTH_LABELS: Record<RoleHealth["state"], string> = {
+  working: "working",
+  waiting_human: "waiting on you",
+  idle: "idle",
+  problem: "has a problem",
+  not_started: "not started",
+};
+
+/** The role's own (persistent) session health, if the room loaded it. */
+function roleHealth(view: BranchView, role: string): RoleHealth | undefined {
+  return view.health?.find((entry) => entry.role === role && !entry.temporary);
+}
+
+function focusProblem(view: BranchView, entry: RoleHealth): void {
+  const card = document.getElementById(problemAnchor(view.branch.id, entry));
+  card?.scrollIntoView({ block: "center" });
+  card?.focus();
 }
 
 function formatTime(epochSeconds: number): string {
@@ -143,6 +164,8 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
   const agenda = current ? view.interviews.filter((question) => question.interviewId === current.id) : [];
   const segmentLabel = (question: (typeof agenda)[number]) =>
     INTERVIEW_SEGMENTS.find((segment) => segment.id === interviewSegment(question))?.label ?? "";
+  const pm = roleHealth(view, "pm");
+  const waitingOnPm = Boolean(current) && !open && (agenda.length === 0 || agenda.some((question) => question.status === "planned"));
 
   const run = async (action: () => Promise<unknown>, success: string) => {
     setBusy(true);
@@ -175,6 +198,20 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
           </ol>
         </details>
       ) : null}
+      {waitingOnPm ? (
+        pm?.problem && !pm.dismissed ? (
+          <p className="error-text" role="status">
+            ⚠ The PM can't continue the interview: {pm.problem.title}.{" "}
+            <button type="button" onClick={() => focusProblem(view, pm)}>
+              See how to fix it
+            </button>
+          </p>
+        ) : (
+          <p className="muted" role="status">
+            {pm?.state === "working" ? "The PM is preparing its next question…" : "Waiting for the PM to ask its next question."}
+          </p>
+        )
+      ) : null}
       {open ? (
         <form
           onSubmit={(event) => {
@@ -201,7 +238,7 @@ function Interview({ view, onChanged }: WorkflowPanelProps) {
         <form
           onSubmit={(event) => {
             event.preventDefault();
-            void run(() => officeApi.startInterview(view.branch.id, topic), "The PM will ask its first question shortly.");
+            void run(() => officeApi.startInterview(view.branch.id, topic), "Interview started; the PM was asked to plan its questions.");
           }}
         >
           <label htmlFor="interview-topic">Interview topic (optional)</label>
@@ -243,6 +280,19 @@ function Tasks({ view, onChanged }: WorkflowPanelProps) {
             <div>
               <strong>{task.title}</strong> <span className="state-pill">{task.status.replace("_", " ")}</span>
             </div>
+            {task.status !== "done" && task.status !== "cancelled"
+              ? task.responsible
+                  .map((role) => roleHealth(view, role))
+                  .filter((entry): entry is RoleHealth => Boolean(entry?.problem && !entry.dismissed))
+                  .map((entry) => (
+                    <p key={entry.role} className="error-text small">
+                      ⚠ Waiting on the {roleTitle(entry.role)}, who is stuck: {entry.problem?.title}.{" "}
+                      <button type="button" onClick={() => focusProblem(view, entry)}>
+                        See how to fix it
+                      </button>
+                    </p>
+                  ))
+              : null}
             <div className="muted small">
               {matrixRow(task.taskType)?.title ?? task.taskType} · R: {task.responsible.map(roleTitle).join(", ")} · A: {roleTitle(task.accountable)}
               {task.gate ? ` · ${GATE_TITLES[task.gate]} gate` : ""}
@@ -298,23 +348,35 @@ function Roles({ view, onChanged }: WorkflowPanelProps) {
       <ul>
         {AGENT_ROLES.map((role) => {
           const links = live.filter((link) => link.role === role);
+          const hasPersistent = links.some((link) => !link.temporary);
+          const health = roleHealth(view, role);
+          const notReady = health && health.harnessReadiness !== "ready" && health.harnessReadiness !== "unknown";
           return (
             <li key={role}>
-              {roleTitle(role)}: {links.length ? `${links.length} session${links.length > 1 ? "s" : ""}` : "not started"}{" "}
-              {links.some((link) => !link.temporary) ? (
+              {roleTitle(role)}: {links.length ? `${links.length} session${links.length > 1 ? "s" : ""}` : "not started"}
+              {health ? ` · ${health.harness}` : ""}
+              {health && health.state !== "not_started" && health.state !== "problem" ? ` · ${HEALTH_LABELS[health.state]}` : ""}
+              {notReady ? <span className="error-text small"> · {health.harness} on this host: {READINESS_LABELS[health.harnessReadiness]}</span> : null}
+              {health?.problem && !health.dismissed ? (
+                <button type="button" className="link-button" onClick={() => focusProblem(view, health)}>
+                  {" · "}
+                  ⚠ {health.problem.title}
+                </button>
+              ) : null}{" "}
+              {hasPersistent || role === "pm" ? (
                 <button
                   type="button"
                   onClick={() =>
                     void officeApi
-                      .rollover(view.branch.id, role, "PO restarted the role.")
+                      .rollover(view.branch.id, role, hasPersistent ? "PO restarted the role." : "PO started the role.")
                       .then(() => {
-                        setNotice(`${roleTitle(role)} restarted with a recorded handoff.`);
+                        setNotice(hasPersistent ? `${roleTitle(role)} restarted with a recorded handoff.` : `${roleTitle(role)} started.`);
                         onChanged();
                       })
                       .catch((caught: Error) => setNotice(caught.message))
                   }
                 >
-                  Restart with handoff
+                  {hasPersistent ? "Restart with handoff" : "Start PM"}
                 </button>
               ) : null}
             </li>
@@ -341,6 +403,7 @@ function Roles({ view, onChanged }: WorkflowPanelProps) {
 export function WorkflowPanel({ view, onChanged }: WorkflowPanelProps) {
   return (
     <div className="workflow-panel">
+      <AgentProblems view={view} onChanged={onChanged} />
       <BoardEditor view={view} onChanged={onChanged} />
       <Interview view={view} onChanged={onChanged} />
       <Tasks view={view} onChanged={onChanged} />

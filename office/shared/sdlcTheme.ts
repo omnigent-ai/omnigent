@@ -26,6 +26,16 @@ export const ROLES: readonly RoleDefinition[] = [
 ];
 
 export const AGENT_ROLES: readonly AgentRoleId[] = ["pm", "architect", "developer", "reviewer", "qa", "devops"];
+/** Default agent harness per role: Developer/QA on Claude, Architect/PM on Codex, DevOps on Gemini (agy), Reviewing Developer on Copilot. */
+export const DEFAULT_ROLE_HARNESSES: Readonly<Record<AgentRoleId, string>> = {
+  developer: "claude-sdk",
+  architect: "codex",
+  pm: "codex",
+  devops: "agy",
+  qa: "claude-sdk",
+  reviewer: "copilot",
+};
+
 export const COORDINATOR_ROLE: AgentRoleId = "pm";
 
 export function roleTitle(role: RoleId): string {

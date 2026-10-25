@@ -30,6 +30,7 @@ import type {
   GateRequest,
   InterviewQuestion,
   InterviewRound,
+  RoleStartFailure,
   Requirement,
   RequirementsBoard,
   RoleSessionLink,
@@ -39,7 +40,7 @@ import type {
   WorkflowState,
   WorkflowTask,
 } from "../shared/workflowTypes.ts";
-import { gatePolicyExpression, roleBundle } from "./bundle.ts";
+import { gatePolicyExpression, roleBundle, roleHarness } from "./bundle.ts";
 import type { Notifier } from "./notifier.ts";
 import type { StateStore } from "./stateStore.ts";
 
@@ -65,7 +66,7 @@ export interface WorkflowOmnigent {
   interrupt(sessionId: string): Promise<unknown>;
   addSessionPolicy(sessionId: string, name: string, expression: string): Promise<{ id: string }>;
   deleteSessionPolicy(sessionId: string, policyId: string): Promise<void>;
-  listProjects(): Promise<{ id: string; name: string }[]>;
+  listProjects(): Promise<{ id: string; name: string; config?: { host_id?: string; workspace?: string } }[]>;
 }
 
 /** Persisted link fields the browser never sees. */
@@ -343,9 +344,13 @@ export class WorkflowService {
     return this.view(branch.id);
   }
 
-  private async projectName(projectId: string): Promise<string> {
+  private async project(projectId: string): Promise<{ id: string; name: string; config?: { host_id?: string; workspace?: string } } | undefined> {
     const projects = await this.omnigent.listProjects();
-    return projects.find((entry) => entry.id === projectId)?.name ?? projectId;
+    return projects.find((entry) => entry.id === projectId);
+  }
+
+  private async projectName(projectId: string): Promise<string> {
+    return (await this.project(projectId))?.name ?? projectId;
   }
 
   async ensureRoleSession(
@@ -358,7 +363,13 @@ export class WorkflowService {
       const existing = this.persistentLink(branch.id, role);
       if (existing) return existing;
     }
-    const name = projectName ?? (await this.projectName(branch.projectId));
+    const needProject = !projectName || (Boolean(branch.runtime.hostId) && !branch.runtime.workspace);
+    const project = needProject ? await this.project(branch.projectId) : undefined;
+    const name = projectName ?? project?.name ?? branch.projectId;
+    if (branch.runtime.hostId && !branch.runtime.workspace && project?.config?.workspace) {
+      branch.runtime.workspace = project.config.workspace;
+      this.save();
+    }
     const mcpToken = randomBytes(24).toString("hex");
     const bundle = roleBundle({
       role,
@@ -383,8 +394,21 @@ export class WorkflowService {
     };
     if (branch.runtime.hostId) metadata.host_id = branch.runtime.hostId;
     if (branch.runtime.workspace) metadata.workspace = branch.runtime.workspace;
-    const created = await this.omnigent.createBundledSession(bundle, metadata);
-    if (branch.runtime.runnerId) await this.omnigent.bindRunner(created.session_id, branch.runtime.runnerId);
+    const failureKey = `${branch.id}:${role}`;
+    let created: { session_id: string };
+    try {
+      created = await this.omnigent.createBundledSession(bundle, metadata);
+      if (branch.runtime.runnerId) await this.omnigent.bindRunner(created.session_id, branch.runtime.runnerId);
+    } catch (error) {
+      // Kept so the room can say why the role is missing instead of looking idle.
+      const harness = roleHarness(branch.runtime, role);
+      const code = (error as { code?: string }).code ?? "role_start_failed";
+      this.state.roleStartFailures[failureKey] = { branchId: branch.id, role, harness, at: this.clock(), code, message: (error as Error).message };
+      this.recordEvent(branch.id, "office", "role_start_failed", `${roleTitle(role)} could not start on ${harness}: ${(error as Error).message}`);
+      this.save();
+      throw error;
+    }
+    delete this.state.roleStartFailures[failureKey];
     const link: StoredRoleSession = {
       branchId: branch.id,
       role,
@@ -686,6 +710,13 @@ export class WorkflowService {
     return this.persistentLink(branchId, COORDINATOR_ROLE)?.sessionId ?? null;
   }
 
+  async ensureCoordinator(branchId: string): Promise<string> {
+    const existing = this.coordinatorSession(branchId);
+    if (existing) return existing;
+    const link = await this.ensureRoleSession(this.branch(branchId), COORDINATOR_ROLE);
+    return link.sessionId;
+  }
+
   /** Start a new interview: unasked questions of the previous one are skipped. */
   interviewKickoff(branchId: string, topic: unknown): { sessionId: string; text: string } {
     this.branch(branchId);
@@ -766,7 +797,76 @@ export class WorkflowService {
       tasks.length ? "Open tasks:" : "No open tasks.",
       ...tasks.map((task) => `- ${task.id} [${task.status}] ${task.title}`),
     ];
+    const interview = role === COORDINATOR_ROLE ? this.currentInterview(branch.id) : null;
+    if (interview) {
+      const questions = this.roundQuestions(interview.id);
+      const open = questions.find((question) => question.status === "asked");
+      const planned = questions.filter((question) => question.status === "planned");
+      lines.push(
+        `An interview${interview.topic ? ` about "${interview.topic}"` : ""} is in progress.`,
+        open ? `The PO has not answered yet: ${open.question} (wait for the answer; do not ask it again).` : "No question is waiting for the PO.",
+        planned.length ? "Planned questions still to ask:" : "No planned questions remain.",
+        ...planned.map((question) => `- ${question.id}: ${question.question}`),
+      );
+    }
     return lines.join("\n");
+  }
+
+  /** Move roles to another harness (and optionally model), restarting each with a handoff. */
+  async switchRoleHarness(branchId: string, rolesInput: unknown, harnessInput: unknown, modelInput: unknown, reasonInput: unknown): Promise<BranchView> {
+    const branch = this.branch(branchId);
+    const roles = Array.isArray(rolesInput) ? [...new Set(rolesInput.filter(isAgentRole))] : [];
+    if (roles.length === 0) throw new WorkflowError(400, "invalid_role", "Choose at least one role to switch.");
+    const harness = text(harnessInput, "harness", { max: 100 });
+    const model = text(modelInput, "model", { required: false, max: 200 });
+    const reason = text(reasonInput, "reason", { required: false, max: 2000 }) || "PO switched the harness.";
+    branch.runtime.roleHarnesses = { ...branch.runtime.roleHarnesses };
+    branch.runtime.roleModels = { ...branch.runtime.roleModels };
+    for (const role of roles) {
+      const from = roleHarness(branch.runtime, role);
+      branch.runtime.roleHarnesses[role] = harness;
+      // A model name rarely carries across providers, so the old override is dropped.
+      if (model) branch.runtime.roleModels[role] = model;
+      else delete branch.runtime.roleModels[role];
+      this.recordEvent(branchId, "po", "harness_switched", `${roleTitle(role)} moved from ${from} to ${harness}${model ? ` (${model})` : ""}: ${reason}`);
+    }
+    this.save();
+    const failures: string[] = [];
+    for (const role of roles) {
+      // Roles that never started pick up the new harness when the PM first dispatches to them.
+      if (!this.persistentLink(branchId, role) && role !== COORDINATOR_ROLE) continue;
+      await this.rolloverRole(branchId, role, `${reason} Now running on ${harness}.`).catch((error: Error) => failures.push(`${roleTitle(role)}: ${error.message}`));
+    }
+    if (failures.length) throw new WorkflowError(502, "switch_incomplete", `Harness saved, but some roles did not restart. ${failures.join("; ")}`);
+    return this.view(branchId);
+  }
+
+  /** Branches whose role sessions are watched for failures. */
+  activeBranches(): ThemeBranch[] {
+    return Object.values(this.state.branches).filter((branch) => branch.status !== "archived");
+  }
+
+  roleStartFailure(branchId: string, role: AgentRoleId): RoleStartFailure | null {
+    return this.state.roleStartFailures[`${branchId}:${role}`] ?? null;
+  }
+
+  /** Record a PO recovery action in the room's event feed. */
+  logRecovery(branchId: string, summary: string): void {
+    this.branch(branchId);
+    this.recordEvent(branchId, "po", "recovery", summary);
+    this.save();
+  }
+
+  /** The PM's interview is waiting on the PM: it has nothing open for the PO but has not finished. */
+  interviewAwaitingCoordinator(branchId: string): { since: number; reason: string } | null {
+    const interview = this.currentInterview(branchId);
+    if (!interview) return null;
+    const questions = this.roundQuestions(interview.id);
+    if (questions.some((question) => question.status === "asked")) return null;
+    if (questions.length === 0) return { since: interview.startedAt, reason: "The PM has not planned or asked any interview questions yet." };
+    if (!questions.some((question) => question.status === "planned")) return null;
+    const lastAnswer = Math.max(interview.startedAt, ...questions.map((question) => question.answeredAt ?? 0), ...questions.map((question) => question.addedAt));
+    return { since: lastAnswer, reason: "The PM has planned questions left but has not asked the next one." };
   }
 
   async completeTaskAsPo(branchId: string, taskId: string, summaryInput: unknown): Promise<BranchView> {
@@ -1275,12 +1375,20 @@ function publicLink(link: StoredRoleSession): RoleSessionLink {
 export function normalizeRuntime(value: unknown): BranchRuntime {
   if (!value || typeof value !== "object") throw new WorkflowError(400, "invalid_runtime", "runtime is required");
   const record = value as Record<string, unknown>;
-  const harness = text(record.harness, "runtime.harness", { max: 100 });
+  const harness = text(record.harness, "runtime.harness", { required: false, max: 100 });
   const optional = (field: string) => text(record[field], `runtime.${field}`, { required: false, max: 1000 }) || undefined;
-  const runtime: BranchRuntime = { harness };
+  const runtime: BranchRuntime = {};
+  if (harness) runtime.harness = harness;
   for (const field of ["model", "hostId", "workspace", "runnerId"] as const) {
     const entry = optional(field);
     if (entry) runtime[field] = entry;
+  }
+  if (record.roleHarnesses && typeof record.roleHarnesses === "object") {
+    const roleHarnesses: Partial<Record<AgentRoleId, string>> = {};
+    for (const [role, value] of Object.entries(record.roleHarnesses as Record<string, unknown>)) {
+      if (isAgentRole(role) && typeof value === "string" && value.trim()) roleHarnesses[role] = value.trim().slice(0, 100);
+    }
+    if (Object.keys(roleHarnesses).length) runtime.roleHarnesses = roleHarnesses;
   }
   if (record.roleModels && typeof record.roleModels === "object") {
     const roleModels: Partial<Record<AgentRoleId, string>> = {};
@@ -1291,6 +1399,9 @@ export function normalizeRuntime(value: unknown): BranchRuntime {
   }
   if (!runtime.hostId && !runtime.runnerId) {
     throw new WorkflowError(400, "invalid_runtime", "Choose a host (and workspace) for the role sessions.");
+  }
+  if (runtime.hostId && !runtime.workspace) {
+    throw new WorkflowError(400, "invalid_runtime", "Choose a workspace folder on the host for the role sessions.");
   }
   return runtime;
 }

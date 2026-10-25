@@ -10,6 +10,7 @@ import { OfficeRequestError, type BuildingService } from "./building.ts";
 import { proxyDictation } from "./dictationProxy.ts";
 import { handleMcpMessage, officeTools } from "./mcp.ts";
 import { OmnigentError, type OmnigentClient } from "./omnigentClient.ts";
+import type { TroubleshootService } from "./troubleshoot.ts";
 import { WorkflowError, normalizeRuntime, type WorkflowService } from "./workflow.ts";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "[::1]"]);
@@ -88,6 +89,8 @@ export interface OfficeHandlerOptions {
   building: BuildingService;
   workflow: WorkflowService;
   client: OmnigentClient;
+  /** Absent in tests that do not exercise agent troubleshooting. */
+  troubleshooter?: TroubleshootService;
   /** Ports the browser may use to reach the office (service and dev server). */
   allowedPorts: number[];
   staticDir: string | null;
@@ -96,7 +99,12 @@ export interface OfficeHandlerOptions {
 type RouteHandler = (params: string[], request: IncomingMessage) => Promise<unknown>;
 
 export function createOfficeHandler(options: OfficeHandlerOptions) {
-  const { building, workflow, client, allowedPorts, staticDir } = options;
+  const { building, workflow, client, troubleshooter, allowedPorts, staticDir } = options;
+
+  const requireTroubleshooter = (): TroubleshootService => {
+    if (!troubleshooter) throw new OfficeRequestError(503, "unavailable", "Troubleshooting is not available.");
+    return troubleshooter;
+  };
   const tools = officeTools(workflow);
 
   /** Send the PO's own words to a session; these count as human interactions. */
@@ -147,7 +155,7 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
           client.listHarnesses().catch(() => ({ data: [] })),
           client.info().catch((): Record<string, unknown> => ({})),
         ]);
-        return { hosts, harnesses, dictationAvailable: info.dictation_available === true };
+        return { hosts, harnesses, dictationAvailable: info.dictation_available === true, omnigentUrl: client.baseUrl };
       },
     },
     {
@@ -155,7 +163,10 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
       pattern: /^\/office\/api\/rooms\/([^/]+)\/branch$/,
       handle: async ([projectId]) => {
         const branch = workflow.activeBranch(projectId);
-        return { branch: branch ? workflow.view(branch.id) : null };
+        if (!branch) return { branch: null };
+        // A diagnosis failure must not hide the workflow it is meant to rescue.
+        const health = troubleshooter ? await troubleshooter.health(branch.id).catch(() => []) : [];
+        return { branch: { ...workflow.view(branch.id), health } };
       },
     },
     {
@@ -199,9 +210,10 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
       pattern: /^\/office\/api\/branches\/([^/]+)\/interview$/,
       handle: async ([branchId], request) => {
         const body = await readJsonBody(request);
+        await workflow.ensureCoordinator(branchId);
         const kickoff = workflow.interviewKickoff(branchId, body.topic);
         await sendAsPo(kickoff.sessionId, kickoff.text);
-        return workflow.view(branchId);
+        return afterWorkflowChange(workflow.view(branchId));
       },
     },
     {
@@ -233,6 +245,39 @@ export function createOfficeHandler(options: OfficeHandlerOptions) {
       handle: async ([branchId, role], request) => {
         const body = await readJsonBody(request);
         return afterWorkflowChange(await workflow.rolloverRole(branchId, role, body.reason));
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/sessions\/([^/]+)\/recover$/,
+      handle: async ([branchId, sessionId], request) => {
+        const body = await readJsonBody(request);
+        return requireTroubleshooter().act(branchId, sessionId, body.action);
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/sessions\/([^/]+)\/retry-schedule$/,
+      handle: async ([branchId, sessionId], request) => {
+        const body = await readJsonBody(request);
+        return requireTroubleshooter().scheduleRetry(branchId, sessionId, body.minutes ?? null, body.repeat);
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/problems\/dismiss$/,
+      handle: async ([branchId], request) => {
+        const body = await readJsonBody(request);
+        await requireTroubleshooter().dismiss(branchId, body.subject, body.key);
+        return { dismissed: true };
+      },
+    },
+    {
+      method: "POST",
+      pattern: /^\/office\/api\/branches\/([^/]+)\/roles\/switch-harness$/,
+      handle: async ([branchId], request) => {
+        const body = await readJsonBody(request);
+        return afterWorkflowChange(await workflow.switchRoleHarness(branchId, body.roles, body.harness, body.model, body.reason));
       },
     },
     {
