@@ -50,19 +50,22 @@ def _all_clis_installed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.mark.parametrize("harness", sorted(NATIVE_HARNESSES))
-def test_native_terminal_harness_unavailable_on_windows(
+def test_native_terminal_harness_readiness_does_not_depend_on_windows(
     monkeypatch: pytest.MonkeyPatch,
     harness: str,
 ) -> None:
+    """A Windows host runs native terminals through a Windows tmux, so its readiness is
+    the CLI's own, as on any other host."""
     _all_clis_installed(monkeypatch)
     import omnigent._platform as _plat
 
-    monkeypatch.setattr(_plat, "IS_WINDOWS", True)
-    monkeypatch.setattr(readiness, "IS_WINDOWS", True)
+    readiness_by_platform = {}
+    for windows in (False, True):
+        monkeypatch.setattr(_plat, "IS_WINDOWS", windows)
+        monkeypatch.setattr(readiness, "IS_WINDOWS", windows)
+        readiness_by_platform[windows] = readiness.configured_harness_map().get(harness)
 
-    result = readiness.configured_harness_map()
-
-    assert result.get(harness) is not True
+    assert readiness_by_platform[True] == readiness_by_platform[False]
 
 
 def test_sdk_harnesses_remain_available_on_windows(

@@ -3462,6 +3462,26 @@ def test_reap_orphaned_terminals_logs_reap_when_socket_is_already_gone(
     assert "already gone" in reap_logs[0]
 
 
+@pytest.mark.parametrize("windows", [False, True])
+def test_create_terminal_instance_routes_copies_through_the_bridge_off_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    windows: bool,
+) -> None:
+    """The copy helper's bridge listens on an AF_UNIX socket, which Python on
+    Windows lacks."""
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", windows)
+    spec = TerminalEnvSpec(
+        command="bash", os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path))
+    )
+
+    created = create_terminal_instance(name="bash", session_key="s1", spec=spec)
+
+    assert (created.instance._clipboard_bridge is None) is windows
+
+
 @pytest.mark.skipif(
     sys.platform not in ("linux", "darwin"),
     reason="sandbox backends only resolve on Linux (bwrap) or macOS (seatbelt)",

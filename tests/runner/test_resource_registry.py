@@ -17,6 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
@@ -58,7 +59,12 @@ from tests.runner.helpers import make_test_terminal_instance
 async def test_claude_program_status_real_launch_and_fallback(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str, sandbox_type: str
 ) -> None:
-    """Exercise startup negotiation, raw PTY transport, status arbitration and cleanup."""
+    """Exercise startup negotiation, raw PTY transport, status arbitration and cleanup.
+
+    Windows has no POSIX pty for the status relay, so there every protocol takes
+    the session-file fallback.
+    """
+    relayed = protocol != "disabled" and not IS_WINDOWS
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     if protocol == "disabled":
         monkeypatch.setenv("OMNIGENT_FEATURES", "-claude_osc_status")
@@ -68,15 +74,21 @@ async def test_claude_program_status_real_launch_and_fallback(
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config))
     peer = tmp_path / "peer.py"
     peer.write_text(
-        "import os,sys,tty\n"
-        "tty.setraw(0)\n"
+        "import os,sys\n"
+        "if os.name=='nt':\n"
+        " import msvcrt\n"
+        " read=lambda:msvcrt.getwch().encode()\n"
+        "else:\n"
+        " import tty\n"
+        " tty.setraw(0)\n"
+        " read=lambda:os.read(0,1)\n"
         "if sys.argv[1]=='osc':\n"
         " os.write(1,b'\\x1b]7501;?\\x1b\\\\\\x1b[c')\n"
         " reply=b''\n"
-        " while not reply.endswith(b'\\x1b\\\\'): reply+=os.read(0,1)\n"
+        " while not reply.endswith(b'\\x1b\\\\'): reply+=read()\n"
         " assert reply.startswith(b'\\x1b]7501;?')\n"
         " reply=b''\n"
-        " while not reply.endswith(b'c'): reply+=os.read(0,1)\n"
+        " while not reply.endswith(b'c'): reply+=read()\n"
         " os.write(1,b'\\x1b]7501;state=working:app=claude-code\\x07')\n"
         "reports={b'b':b'state=blocked:kind=permission',b'd':b'state=done',"
         "b'i':b'state=idle',b'e':b'state=error',b'w':b'state=working',"
@@ -84,7 +96,7 @@ async def test_claude_program_status_real_launch_and_fallback(
         "b'o':b'state=idle:app=other',b'a':b'state=clear:app=other',"
         "b'y':b'state=clear:id=child'}\n"
         "while True:\n"
-        " key=os.read(0,1)\n"
+        " key=read()\n"
         " if key==b'q': break\n"
         " if key==b'r':\n"
         "  open(sys.argv[2],'w').write(str(tuple(os.get_terminal_size())))\n"
@@ -100,7 +112,7 @@ async def test_claude_program_status_real_launch_and_fallback(
     )
     spec = TerminalEnvSpec(
         command=sys.executable,
-        args=[str(peer), protocol, str(tmp_path / "size")],
+        args=[str(peer), protocol if relayed else "fallback", str(tmp_path / "size")],
         os_env=OSEnvSpec(
             type="caller_process",
             cwd=str(tmp_path),
@@ -125,7 +137,7 @@ async def test_claude_program_status_real_launch_and_fallback(
         instance = terminals.get("osc-test", "claude", "main")
         assert instance is not None
         reader = instance.program_status
-        if protocol == "disabled":
+        if not relayed:
             assert reader is None
             status_pid = instance.pane_pid_sync()
             assert status_pid is not None
@@ -146,7 +158,7 @@ async def test_claude_program_status_real_launch_and_fallback(
                 assert await instance.is_alive(), instance.last_exit_text()
                 await instance.send(keys="r")
                 await asyncio.sleep(0.05)
-        if protocol != "osc":
+        if protocol != "osc" or not relayed:
             assert reader is None or reader.status is None
             status_file.write_text(json.dumps({"kind": "interactive", "status": "idle"}))
             await wait_status("idle")
@@ -215,13 +227,17 @@ async def test_claude_program_status_real_launch_and_fallback(
         (None, None, None),
     ],
 )
+@pytest.mark.parametrize("windows", [False, True])
 async def test_program_status_respects_flag_and_claude_role(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     role: str | None,
     features: str | None,
     expected: str | None,
+    windows: bool,
 ) -> None:
+    # The status relay runs the CLI in a POSIX pty, which Windows lacks.
+    monkeypatch.setattr("omnigent.runner.resource_registry.IS_WINDOWS", windows)
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     if features is not None:
         monkeypatch.setenv("OMNIGENT_FEATURES", features)
@@ -242,7 +258,7 @@ async def test_program_status_respects_flag_and_claude_role(
     await registry.launch_required_terminal(
         "flag-test", "agent", "main", TerminalEnvSpec(), resource_role=role
     )
-    assert seen == [expected]
+    assert seen == [None if windows else expected]
 
 
 @dataclass

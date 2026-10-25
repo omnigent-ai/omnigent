@@ -28,6 +28,7 @@ from typing import TYPE_CHECKING, Literal
 
 from cachetools import TTLCache
 
+from omnigent._platform import IS_WINDOWS
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.pagination import PagedList
 from omnigent.entities.session_resources import (
@@ -1271,6 +1272,8 @@ class SessionResourceRegistry:
             {"program_status_app": "claude-code"}
             if resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
             and self._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS)
+            # The status relay runs the CLI in a POSIX pty.
+            and not IS_WINDOWS
             else {}
         )
         try:

@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 from omnigent._platform import IS_WINDOWS
-from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
@@ -2793,12 +2792,6 @@ def create_terminal_instance(
     :returns: A :class:`TerminalCreateResult` carrying the new instance
         and the resolved cwd to pass to ``launch()``.
     """
-    if IS_WINDOWS:
-        raise RuntimeError(
-            "Native terminal harnesses (tmux/PTY) are not supported on Windows. "
-            f"Run an SDK-based harness via `{cli_invocation()} run <agent.yaml>` (e.g. the "
-            "claude-sdk, cursor, copilot, or codex harness) or use the web UI."
-        )
     _require_supported_tmux()
 
     # Create the instance's private directory.
@@ -2907,6 +2900,8 @@ def create_terminal_instance(
         tmux_start_on_attach=spec.tmux_start_on_attach,
         keep_alive_after_exit=spec.keep_alive_after_exit,
     )
-    instance._clipboard_bridge = TerminalClipboardBridge(private_dir, socket_path)
+    # The copy helper needs AF_UNIX sockets, which Python on Windows lacks.
+    if not IS_WINDOWS:
+        instance._clipboard_bridge = TerminalClipboardBridge(private_dir, socket_path)
 
     return TerminalCreateResult(instance=instance, cwd=cwd)
