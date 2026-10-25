@@ -6,6 +6,8 @@ import base64
 import hashlib
 import logging
 import re
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -385,12 +387,32 @@ def test_materialize_cache_refuses_symlinked_destination(
         assert not outside.exists()
 
 
-def test_materialize_cache_refuses_symlinked_attachments_dir(tmp_path: Path) -> None:
-    """A symlinked attachments directory is refused rather than written through."""
+@pytest.mark.parametrize(
+    "link",
+    [
+        "symlink",
+        pytest.param(
+            "junction",
+            marks=pytest.mark.skipif(
+                sys.platform != "win32", reason="junctions are a Windows link"
+            ),
+        ),
+    ],
+)
+def test_materialize_cache_refuses_symlinked_attachments_dir(tmp_path: Path, link: str) -> None:
+    """A linked attachments directory is refused rather than written through."""
     elsewhere = tmp_path.parent / f"{tmp_path.name}-elsewhere"
     elsewhere.mkdir()
     attachment_cache_dir(tmp_path).parent.mkdir(parents=True, exist_ok=True)
-    (attachment_cache_dir(tmp_path)).symlink_to(elsewhere, target_is_directory=True)
+    if link == "symlink":
+        attachment_cache_dir(tmp_path).symlink_to(elsewhere, target_is_directory=True)
+    else:
+        # A junction needs no symlink privilege on Windows.
+        subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(attachment_cache_dir(tmp_path)), str(elsewhere)],
+            check=True,
+            capture_output=True,
+        )
 
     assert materialize_attachment(_zip_block(), tmp_path) is None
     assert list(elsewhere.iterdir()) == []
