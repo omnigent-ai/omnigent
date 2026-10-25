@@ -125,11 +125,7 @@ describe("markdown links to workspace files", () => {
     expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12, endLine: 18 });
     fireEvent.contextMenu(screen.getByRole("button", { name: "notes" }));
     fireEvent.click(screen.getByRole("menuitem", { name: "Copy link" }));
-    await waitFor(() =>
-      expect(copyText).toHaveBeenCalledWith(
-        `${window.location.origin}/c/conv_1?file=docs%2Fnotes.md&line=12&endLine=18`,
-      ),
-    );
+    await waitFor(() => expect(copyText).toHaveBeenCalledWith("docs/notes.md#L12-L18"));
   });
 
   it("offers file preview, browser tab and copy actions scoped to the viewer conversation", async () => {
@@ -142,14 +138,14 @@ describe("markdown links to workspace files", () => {
 
     fireEvent.contextMenu(link);
     fireEvent.click(screen.getByRole("menuitem", { name: "Copy link" }));
-    const expected = `${window.location.origin}/omni/c/conv_1?file=docs%2Fnotes.md&line=12&column=3`;
-    await waitFor(() => expect(copyText).toHaveBeenCalledWith(expected));
+    await waitFor(() => expect(copyText).toHaveBeenCalledWith("docs/notes.md#L12C3"));
 
     const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
     const popupDocument = document.implementation.createHTMLDocument();
     vi.spyOn(window, "open").mockReturnValue({ opener: window, document: popupDocument } as Window);
     fireEvent.contextMenu(link);
     fireEvent.click(screen.getByRole("menuitem", { name: "Open in browser tab" }));
+    const expected = `${window.location.origin}/omni/c/conv_1?file=docs%2Fnotes.md&line=12&column=3`;
     expect(click.mock.instances[0]).toHaveProperty("href", expected);
   });
 

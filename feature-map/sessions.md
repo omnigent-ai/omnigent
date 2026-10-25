@@ -358,8 +358,10 @@ create or select a closable Browser soft tab automatically.
 **Chat links:** in a full conversation or the side-chat workspace tab, right-click
 a website or reachable file link. Choose **Open in Omnigent**, **Open in browser
 tab** (web) or **Open in default browser** (desktop), or **Copy link**. A file's
-browser and copy actions use its conversation's file-preview URL, retaining any
-cited line and column. Explicit choices leave the ordinary-click preference as is.
+browser action uses its conversation's file-preview URL. **Copy link** copies the
+displayed target, retaining any cited line and column; **Copy path** copies the
+host path without the citation. Explicit choices leave the ordinary-click
+preference as is.
 
 **Desktop recent sessions:** hold Control and press Tab to open the five most
 recent sessions. Continue pressing Tab (or Shift+Tab) to cycle, release Control

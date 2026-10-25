@@ -249,11 +249,13 @@ function githubPullRequest(href: string | undefined): string | null {
 function ChatLinkMenu({
   children,
   href,
+  copyHref = href,
   openInApp,
   path,
 }: {
   children: React.ReactElement;
   href: string;
+  copyHref?: string;
   path?: string;
   openInApp?: () => void;
 }) {
@@ -286,7 +288,7 @@ function ChatLinkMenu({
         </ContextMenuItem>
         <ContextMenuItem
           onSelect={() => {
-            void copyText(href).then(
+            void copyText(copyHref).then(
               () => showToast("Link copied"),
               () => showToast("Could not copy the link. Please try again."),
             );
@@ -545,7 +547,12 @@ function WorkspaceFileLink({
   if (citation.column) url.searchParams.set("column", String(citation.column));
   if (citation.endLine) url.searchParams.set("endLine", String(citation.endLine));
   return (
-    <ChatLinkMenu href={url.toString()} openInApp={openWorkspaceFile} path={copyPath}>
+    <ChatLinkMenu
+      href={url.toString()}
+      copyHref={path}
+      openInApp={openWorkspaceFile}
+      path={copyPath}
+    >
       {link}
     </ChatLinkMenu>
   );

@@ -262,7 +262,7 @@ def test_external_link_click_opens_the_rendered_target(
 
 
 @pytest.mark.parametrize("surface", ["full-chat", "side-chat"])
-def test_file_link_context_menu_opens_and_copies_the_viewer_url(
+def test_file_link_context_menu_opens_viewer_and_copies_target(
     page: Page, chat_session_contract: ChatSessionContract, tmp_path: Path, surface: str
 ) -> None:
     chat = chat_session_contract
@@ -323,8 +323,8 @@ def test_file_link_context_menu_opens_and_copies_the_viewer_url(
     expect(page.get_by_role("menuitem", name="Open in browser tab")).to_be_enabled()
     page.screenshot(path=str(tmp_path / f"file-link-menu-{surface}.png"))
     page.get_by_role("menuitem", name="Copy link", exact=True).click()
+    assert page.evaluate("navigator.clipboard.readText()") == "report.md#L12"
     expected = f"{chat.url}?file=report.md&line=12"
-    assert page.evaluate("navigator.clipboard.readText()") == expected
     link.click(button="right")
     with page.expect_popup() as opened:
         page.get_by_role("menuitem", name="Open in browser tab").click()
