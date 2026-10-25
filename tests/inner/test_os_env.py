@@ -669,3 +669,30 @@ def test_close_stops_the_helper_and_releases_its_spawner_thread(
         assert not thread.is_alive()
     os_env.close()
     assert asyncio.run(os_env.shell("true")) == {"error": "OS environment helper is closed"}
+
+
+def test_windows_os_env_helper_starts_without_sandbox_tmpdir(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``sandbox: none`` environment runs a shell through Windows config delivery.
+
+    Without an active sandbox the helper must create its own scratch directory
+    for the Windows config file, then remove it on close.
+    """
+    monkeypatch.setattr("omnigent.inner.os_env.IS_WINDOWS", True)
+
+    os_env = create_os_environment(
+        OSEnvSpec(type="caller_process", sandbox=OSEnvSandboxSpec(type="none"))
+    )
+    assert isinstance(os_env, CallerProcessOSEnvironment)
+    try:
+        result = asyncio.run(os_env.shell("echo degraded-mode-shell-ok"))
+        created = os_env._helper._tmpdir
+        assert created is not None and created.exists()
+    finally:
+        os_env.close()
+
+    assert "degraded-mode-shell-ok" in result.get("stdout", "")
+    assert result.get("exit_code") == 0
+    assert os_env._helper._tmpdir is None
+    assert not created.exists()
