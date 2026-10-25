@@ -12,7 +12,7 @@ name: E2E Tests
 #                       runs entirely against the in-process mock LLM (no
 #                       secrets), so fork PRs run it directly here just like
 #                       ci.yml, with no fork-e2e/** mirror (#802 removed the
-#                       credential setup). The four shard checks are required by
+#                       credential setup). The eight shard checks are required by
 #                       merge-ready.yml.
 
 on:
@@ -23,22 +23,25 @@ on:
     # (rerun-security-gate-run.yml falls back to this trigger). The concurrency
     # group key isolates label events so they never cancel a code-push run.
     types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
-    paths-ignore:
-      - 'web/**'
-      - 'docs/**'
-      - 'designs/**'
-      - 'CHANGELOG.md'
-      - 'tests/browser_ui/**'
-      - 'tests/e2e_ui/**'
-      - 'tests/scripts/**'
-      - 'tests/github/**'
-      - '.github/scripts/polly-review-*.py'
-      - '.github/workflows/polly-review*.yml'
-      - '.github/workflows/*.js'
+    paths:
+      - '**'
+      - '!web/**'
+      - 'web/package.json'
+      - 'web/electron/package.json'
+      - '!docs/**'
+      - '!designs/**'
+      - '!CHANGELOG.md'
+      - '!tests/browser_ui/**'
+      - '!tests/e2e_ui/**'
+      - '!tests/scripts/**'
+      - '!tests/github/**'
+      - '!.github/scripts/polly-review-*.py'
+      - '!.github/workflows/polly-review*.yml'
+      - '!.github/workflows/*.js'
   workflow_dispatch:
     inputs:
       parallelism:
-        description: "Number of pytest workers per shard (-n flag). Default 2 keeps per-shard concurrency low so the 4 shards * 2 workers = 8 concurrent gateway calls stays below the nightly's pain point (20 concurrent triggered 429s)."
+        description: "Number of pytest workers per shard (-n flag). Default 2 runs up to 16 workers across 8 shards."
         required: false
         default: "2"
 
@@ -74,11 +77,14 @@ jobs:
       (github.event.action != 'labeled' && github.event.action != 'unlabeled') ||
       github.event.label.name == 'skip-security-scan'
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Shard matrix (e2e-shard-matrix.sh, shared with e2e-ui.yml). Fork PRs run by
   # default; draft PRs resolve to an empty matrix.
   setup:
-    name: E2E scope
+    name: E2E coverage scope
     needs: gate
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -105,19 +111,18 @@ jobs:
           EVENT_NAME: ${{ github.event_name }}
           IS_DRAFT: ${{ github.event.pull_request.draft }}
           RUN_TESTS: ${{ steps.scope.outputs.e2e }}
-          NUM_SHARDS: ${{ steps.scope.outputs.dependency == 'true' && '2' || '4' }}
+          NUM_SHARDS: "8"
         run: bash .github/scripts/ci/e2e-shard-matrix.sh
 
   e2e:
     # Sharded matrix: each shard runs ~1/N of the set, under the wallclock
-    # budget where CrowdStrike kills long jobs (#426). max-parallel:4 runs
+    # budget where CrowdStrike kills long jobs (#426). max-parallel:8 runs
     # all shards concurrently so one wedged shard can't block the others.
-    # -n 2 per shard => 4 x 2 = 8 concurrent gateway calls, below the
-    # nightly's 429 pain point; drop -n before max-parallel if rate-limited.
+    # Two pytest workers per shard allow up to 16 concurrent test workers.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
-    # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
+    # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: setup
+    if: needs.setup.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     # Job-level cap (composite-action run steps can't set timeout-minutes):
     # ~30 min of tests + setup, replacing the old per-step 30-min backstop.
@@ -125,7 +130,7 @@ jobs:
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
       fail-fast: false
-      max-parallel: 4
+      max-parallel: 8
       # Shards from `setup` (deterministic node-ID split); [] when skipped.
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
@@ -141,7 +146,6 @@ jobs:
       - name: Run e2e suite
         uses: ./.github/actions/e2e-run
         with:
-          dependency_smoke: ${{ needs.setup.outputs.dependency }}
           shard_id: ${{ matrix.shard_id }}
           num_shards: ${{ matrix.num_shards }}
           parallelism: ${{ github.event.inputs.parallelism || '2' }}

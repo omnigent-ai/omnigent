@@ -190,7 +190,11 @@ def test_claude_not_gateway_backed_for_managed_non_databricks_url(
     assert claude_gateway_inference_backed() is False
 
 
-def test_codex_gateway_backed_for_databricks_profile(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_codex_gateway_backed_for_databricks_profile(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Any
+) -> None:
+    # A profile launch's base URL is read from ucode state first; keep it empty here.
+    monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", tmp_path / "state.json")
     monkeypatch.setattr(
         codex_native_app_server,
         "_databricks_gateway_host",
@@ -416,6 +420,28 @@ def test_launch_base_url_extracts_generated_databricks_override() -> None:
     launch = NativeCodexLaunch(config_overrides=overrides, model=None, profile=None)
 
     assert native_codex_launch_base_url(launch) == _GATEWAY_CODEX_URL
+
+
+def test_launch_base_url_follows_ucode_state_for_a_profile_launch(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Any,
+) -> None:
+    """A profile launch reports ucode's gateway when ucode configured the profile's host."""
+    host = "https://example.cloud.databricks.com"
+    ucode_url = "https://ucode-gateway.example.com/codex/v1"
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(f"[oss]\nhost = {host}\nauth_type = databricks-cli\n", encoding="utf-8")
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    state_path = tmp_path / "ucode-state.json"
+    monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_path)
+    launch = NativeCodexLaunch(config_overrides=[], model=None, profile="oss")
+
+    assert native_codex_launch_base_url(launch) == f"{host}/ai-gateway/codex/v1"
+
+    codex = {"base_url": ucode_url, "auth_command": "ug auth-token --profile ug-oauth-example"}
+    state_path.write_text(json.dumps({"workspaces": {host: {"agents": {"codex": codex}}}}))
+
+    assert native_codex_launch_base_url(launch) == ucode_url
 
 
 def test_launch_base_url_none_for_cli_config_provider_name_only(

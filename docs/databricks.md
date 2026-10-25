@@ -34,6 +34,11 @@ section starts with a short context paragraph, then the concrete
 commands. If you already use both, skim the quick start at the top of
 each section.
 
+To connect the local Antigravity CLI (`omni agy`) to Databricks model services,
+see [Native agy credentials and gateways](native-agy-gateways.md#databricks).
+That route requires the workspace's native Gemini API; a model exposed only
+through the OpenAI Responses API is not sufficient.
+
 ## What you get
 
 When omnigent runs on Databricks with the four integration points

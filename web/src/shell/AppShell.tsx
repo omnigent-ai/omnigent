@@ -1,7 +1,8 @@
 import { useLoadedConversations } from "@/hooks/useSidebarData";
-import { GridSessionsProvider } from "@/grid/GridSessionsContext";
+import { GridSessionsProvider, useGridSessions } from "@/grid/GridSessionsContext";
 import { GridWorkspace } from "@/grid/GridWorkspace";
 import {
+  type ComponentProps,
   type CSSProperties,
   lazy,
   Suspense,
@@ -34,7 +35,7 @@ import { useSeedReadState } from "@/hooks/useUnseenConversations";
 import { useIOSViewportLock } from "@/hooks/useIOSViewportLock";
 import { readFilesPanelPreferences, writeFilesPanelPreferences } from "@/lib/filesPanelPreferences";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
-import { derivePermissionLevel, isEditorLevel, isOwnerLevel } from "@/lib/permissionsApi";
+import { derivePermissionLevel, isOwnerLevel } from "@/lib/permissionsApi";
 import {
   isAndroidShell,
   isElectronShell,
@@ -85,19 +86,16 @@ import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
 import { browserViewOwnerId, openAgentBrowserTab } from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
-  findAgentTerminal,
-  inventoryTerminals,
   isAgentTerminalKey,
   PANEL_NO_TERMINAL_KEY,
   terminalTabKey,
+  terminalDisplayLabel,
   useCreateTerminal,
   useDeleteTerminal,
-  useTerminals,
 } from "@/hooks/useTerminals";
-import {
-  useWorkspaceChangedFiles,
-  useWorkspaceEnvironment,
-} from "@/hooks/useWorkspaceChangedFiles";
+import { useWorkspaceResources } from "./useWorkspaceResources";
+import { useUiOpenFile } from "@/hooks/useUiOpenFile";
+import { citedFilePosition } from "./filePositionState";
 import { cn } from "@/lib/utils";
 import {
   isNativeWrapper as isNativeWrapperLabel,
@@ -225,6 +223,12 @@ export function AppShell() {
       <AppShellImpl />
     </GridSessionsProvider>
   );
+}
+
+// Reads grid context here so pane focus changes don't re-render the whole shell.
+function GridSessionMain(props: ComponentProps<"main">) {
+  const grids = useGridSessions();
+  return <main {...props} data-grid-session={grids?.enabled ? grids.conversationId : undefined} />;
 }
 
 function AppShellImpl() {
@@ -400,17 +404,17 @@ function AppShellImpl() {
   const citationPath = searchParams.get("file");
   const citationLine = searchParams.get("line");
   const citationColumn = searchParams.get("column");
+  const citationEndLine = searchParams.get("endLine");
   // Keep URL requests stable across viewer remounts, just like citation clicks.
   const urlNavigation = useMemo(() => {
-    const line = Number(citationLine);
-    const column = Number(citationColumn);
-    if (!citationPath || !Number.isSafeInteger(line) || line < 1) return undefined;
-    return {
-      conversationId,
-      path: citationPath,
-      position: { line, ...(Number.isSafeInteger(column) && column > 0 ? { column } : {}) },
-    };
-  }, [conversationId, citationPath, citationLine, citationColumn]);
+    const position = citedFilePosition({
+      line: Number(citationLine),
+      column: Number(citationColumn),
+      endLine: Number(citationEndLine),
+    });
+    if (!citationPath || !position) return undefined;
+    return { conversationId, path: citationPath, position };
+  }, [conversationId, citationPath, citationLine, citationColumn, citationEndLine]);
   const filePosition =
     fileNavigation?.conversationId === conversationId && fileNavigation?.path === selectedFilePath
       ? fileNavigation.position
@@ -553,15 +557,6 @@ function AppShellImpl() {
   // the runner is auto-creating the terminal. Surfaced via
   // TerminalFirstContext below.
   const terminalPending = useChatStore((s) => s.terminalPending);
-  // Read the conversation's terminals here too so the FAB's dropdown
-  // can show/hide its "Terminals" entry and route a click to the first
-  // terminal. The hook is react-query-backed and dedup'd with the rail.
-  // reconcileWhilePending: self-heals if the live resource.created SSE was
-  // missed (see UseTerminalsOptions for the why).
-  const { terminals } = useTerminals(serverConversationId ?? null, {
-    reconcileWhilePending: terminalPending,
-  });
-  const agentTerminal = useMemo(() => findAgentTerminal(terminals), [terminals]);
 
   const debugMode = useDebugMode();
   // Reuse sidebar rows; the active-session snapshot covers sessions outside its cache.
@@ -655,6 +650,21 @@ function AppShellImpl() {
     [activeConv?.labels, activeSession?.labels],
   );
   const terminalFirst = sessionLabels["omnigent.ui"] === "terminal";
+  const {
+    terminals,
+    agentTerminal,
+    openTerminals,
+    environmentQuery,
+    showFilesPanel,
+    changedCount,
+    isChangedPath,
+  } = useWorkspaceResources({
+    sessionId: serverConversationId,
+    permissionLevel: activeSession?.permissionLevel ?? activeConv?.permission_level ?? null,
+    shareWorkspaceFiles: activeSession?.shareWorkspaceFiles,
+    terminalFirst,
+    terminalPending,
+  });
   const isClaudeNative = sessionLabels["omnigent.wrapper"] === "claude-code-native-ui";
   // Native-CLI wrapper of either family. Keys harness behavior gates
   // (composer slash commands, `/model`); terminal-first SDK sessions
@@ -806,21 +816,6 @@ function AppShellImpl() {
   // vendor pane is excluded from the inventory like the SDK REPL (see
   // ``inventoryTerminals``).
   const hideTerminalsTab = isClaudeNativeSubagent;
-  // Inventory view of the terminal list for the rail tab, its badge,
-  // and the mobile menu. The pill surfaces (``terminalsAvailable``,
-  // ``setView``) keep the full ``terminals`` list so the agent's own
-  // terminal stays openable through the Terminal pill.
-  const railTerminals = useMemo(
-    () => inventoryTerminals(terminals, terminalFirst),
-    [terminals, terminalFirst],
-  );
-  // Shell soft tabs are 1:1 with the session's shell inventory: every shell —
-  // whether the user opened it or the agent spawned it — is its own tab, and a
-  // shell that goes away (killed via a tab close, closed by the agent, or the
-  // runner emptied the list) drops from ``railTerminals`` and takes its tab with
-  // it. The agent's own control terminal is excluded by ``inventoryTerminals``
-  // (it lives behind the connection pill, not as a shell tab).
-  const openTerminals = useMemo(() => railTerminals.map((t) => terminalTabKey(t)), [railTerminals]);
   const deleteTerminalMutation = useDeleteTerminal(conversationId ?? "");
   // Tab key awaiting a close confirmation, or null. Closing a tab kills the
   // terminal, so a user-initiated close routes through a confirm modal first.
@@ -929,26 +924,6 @@ function AppShellImpl() {
   // a one-entry list, not a dead end).
   const agentCount = childSessions.length + 1;
 
-  // Whether this viewer may browse the workspace at all. Edit-level and up
-  // always can; a view-only collaborator only when the owner opted into
-  // sharing the session's files (share_workspace_files) — otherwise a read
-  // grant shares the conversation, not the raw filesystem (which routinely
-  // holds secrets), and the server refuses those reads. Reads the KNOWN level
-  // (snapshot, else sidebar row) and stays permissive while it's unresolved,
-  // so an owner never sees a flash of hidden files; the server gate is what
-  // actually protects the bytes.
-  const canBrowseWorkspace =
-    isEditorLevel(activeSession?.permissionLevel ?? activeConv?.permission_level ?? null) ||
-    activeSession?.shareWorkspaceFiles === true;
-  // Hide the files panel entirely when the agent spec has no os_env, or when
-  // this viewer may not browse the workspace. Probe the default environment
-  // resource instead of the root filesystem listing: it is enough to prove
-  // availability without paying for directory contents. The probe is disabled
-  // for a non-browsing viewer so it never fires a request the server refuses.
-  const environmentQuery = useWorkspaceEnvironment(serverConversationId, {
-    enabled: canBrowseWorkspace,
-  });
-  const showFilesPanel = canBrowseWorkspace && environmentQuery.data?.available !== false;
   // Per-tab availability for the right workspace rail — the single source
   // of truth shared by the tab-fallback effect below, the rail's mount
   // gate, and the header's collapse toggle, so they can never disagree.
@@ -1111,25 +1086,6 @@ function AppShellImpl() {
       unsubDismiss?.();
     };
   }, [boundAgentId]);
-
-  // Build a stable Set of agent-changed file paths so the FileViewer context
-  // can tell BlockRenderer which inline code spans are real workspace files.
-  // We use the changed-files list (not the flat top-level directory listing)
-  // because it contains full relative paths like `web/src/shell/Foo.tsx`.
-  // Disabled for a viewer who may not browse the workspace: the server refuses
-  // the read, so the fetch would only 403.
-  const changedFilesQuery = useWorkspaceChangedFiles(serverConversationId, {
-    enabled: canBrowseWorkspace,
-  });
-  const changedFilePaths = useMemo(
-    () => new Set(changedFilesQuery.data?.data.map((f) => f.path) ?? []),
-    [changedFilesQuery.data],
-  );
-  const changedCount = changedFilesQuery.data?.data.length ?? 0;
-  const isChangedPath = useCallback(
-    (path: string) => changedFilePaths.has(path),
-    [changedFilePaths],
-  );
 
   // Persist the Chat/TUI toggle position per-conversation so leaving and
   // re-entering a native session restores the view the user chose instead of
@@ -1407,7 +1363,7 @@ function AppShellImpl() {
 
   const commitFileNavigation = useCallback(
     (path: string, options?: OpenFileOptions) => {
-      const position = options?.line ? { line: options.line, column: options.column } : undefined;
+      const position = citedFilePosition(options);
       setSelectedFilePath(path);
       setFileNavigation({ conversationId, path, position });
       // A file and a shell tab can't both own the rail's content slot —
@@ -1458,6 +1414,8 @@ function AppShellImpl() {
           else next.delete("line");
           if (position?.column != null) next.set("column", String(position.column));
           else next.delete("column");
+          if (position?.endLine != null) next.set("endLine", String(position.endLine));
+          else next.delete("endLine");
           return next;
         },
         { replace: true },
@@ -1486,6 +1444,8 @@ function AppShellImpl() {
     [commitFileNavigation],
   );
 
+  useUiOpenFile(serverConversationId, showFilesPanel, openFileViewer);
+
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
   // ``navigate`` — which is bound to the live ``locationPathname`` — rather
@@ -1499,6 +1459,7 @@ function AppShellImpl() {
         next.delete("comment");
         next.delete("line");
         next.delete("column");
+        next.delete("endLine");
         return next;
       },
       { replace: true },
@@ -1847,6 +1808,7 @@ function AppShellImpl() {
               params.delete("comment");
               params.delete("line"); // stale citation belongs to the closed file
               params.delete("column");
+              params.delete("endLine");
               return params;
             },
             { replace: true },
@@ -2582,8 +2544,8 @@ function AppShellImpl() {
                       // can create the first one). Desktop rail tab stays gated
                       // on an existing shell (railTabsAvailable.terminals).
                       showShellsTab:
-                        !hideTerminalsTab && (railTerminals.length > 0 || agentSupportsShells),
-                      terminalsLength: railTerminals.length,
+                        !hideTerminalsTab && (openTerminals.length > 0 || agentSupportsShells),
+                      terminalsLength: openTerminals.length,
                       debugMode,
                       changedCount,
                       subagentsWorking,
@@ -2598,13 +2560,13 @@ function AppShellImpl() {
                     }}
                   />
                 )}
-                <main
+                <GridSessionMain
                   className="relative flex min-h-0 min-w-0 flex-1 flex-col"
                   data-shell-header={extensionOwnsHeader ? "hidden" : "visible"}
                   data-session-id={conversationId}
                 >
                   <Outlet />
-                </main>
+                </GridSessionMain>
 
                 {/* Debug-mode execution-logs rail — desktop only, hidden when a
               push panel is open (the panel itself becomes the focus). Only
@@ -2816,7 +2778,7 @@ function AppShellImpl() {
               if (terminalPendingClose === null) return null;
               const info = terminals.find((t) => terminalTabKey(t) === terminalPendingClose);
               if (!info) return null;
-              return info.session ? `${info.name} · ${info.session}` : info.name;
+              return terminalDisplayLabel(info);
             })()}
             onConfirm={confirmCloseTerminal}
             onCancel={() => setTerminalPendingClose(null)}

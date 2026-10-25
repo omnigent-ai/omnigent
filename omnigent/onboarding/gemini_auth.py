@@ -14,7 +14,9 @@ with ``modelProvider: "gemini"`` in its settings.
        "expiry_date": …, "id_token": "eyJ…", "scope": "…", "token_type": "Bearer"}
 
 - Linux writes ``~/.gemini/antigravity-cli/antigravity-oauth-token`` — the OAuth
-  object **nested under** ``token`` (verified live against agy 1.0.10)::
+  object **nested under** ``token`` (verified live against agy 1.0.10):
+
+  .. code-block:: json
 
       {"auth_method": "oauth",
        "token": {"access_token": "ya29.…", "refresh_token": "1//0g…",

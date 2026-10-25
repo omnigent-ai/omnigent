@@ -10,6 +10,7 @@ import shutil
 import subprocess
 import sys
 import threading
+import tomllib
 import zipfile
 from collections.abc import Iterator
 from functools import partial
@@ -18,7 +19,6 @@ from pathlib import Path
 from types import ModuleType
 
 import pytest
-import tomllib
 
 _ROOT = Path(__file__).resolve().parents[2]
 _DEPLOY_PY = _ROOT / "deploy" / "databricks" / "deploy.py"

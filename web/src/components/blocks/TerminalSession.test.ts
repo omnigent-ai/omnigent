@@ -154,10 +154,21 @@ describe("resolveTerminalWorkspaceFileLink", () => {
     ["file:///home/u/ws/src/app.ts:42:7", "src/app.ts", 42],
     ["file:///home/u/ws/src/app.ts#L43", "src/app.ts", 43],
     ["file:///home/u/ws/src/app.ts#L44C3", "src/app.ts", 44],
-    ["file:///home/u/ws/src/app.ts#L45-L50", "src/app.ts", 45],
     ["file:///home/u/ws/Design%20Notes.md#L46", "Design Notes.md", 46],
   ])("resolves %s", (uri, path, line) => {
     expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toEqual({ path, line });
+  });
+
+  it.each([
+    ["file:///home/u/ws/src/app.ts#L45-L50", 45, 50],
+    ["file:///home/u/ws/src/app.ts:45-50", 45, 50],
+    ["file:///home/u/ws/src/app.ts:50-45", 50, undefined],
+  ])("carries the cited range of %s", (uri, line, endLine) => {
+    expect(resolveTerminalWorkspaceFileLink(uri, ROOT, HOME)).toStrictEqual({
+      path: "src/app.ts",
+      line,
+      ...(endLine ? { endLine } : {}),
+    });
   });
 
   it.each([

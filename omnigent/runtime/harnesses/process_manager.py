@@ -1036,7 +1036,7 @@ class HarnessProcessManager:
                 entry.client.post(cancel_url, json={"type": "interrupt"}),
                 timeout=timeout_s,
             )
-        except (httpx.HTTPError, asyncio.TimeoutError):
+        except (TimeoutError, httpx.HTTPError):
             _logger.exception(
                 "harness cancel forward failed: conversation_id=%s harness_response_id=%s",
                 conversation_id,

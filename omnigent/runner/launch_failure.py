@@ -339,6 +339,9 @@ _MODEL_UNAVAILABLE_MARKER = "issue with the selected model"
 # `404 {"type":"error","error":{"type":"not_found_error","message":"model: <id>"}}`.
 _ANTHROPIC_MODEL_NOT_FOUND = re.compile(r'"message"\s*:\s*"model:\s*[^"\s]+"', re.IGNORECASE)
 _NOT_FOUND_STATUS = re.compile(r"\b404\b|not_found_error", re.IGNORECASE)
+# Claude Code's stop category when its hook carries no error text, e.g.
+# "Claude Code ended the turn with an API error (model_not_found)."
+_CLAUDE_STOP_MODEL_NOT_FOUND = re.compile(r"API error \(model_not_found\)", re.IGNORECASE)
 # OpenAI's rejection of an unknown or inaccessible model id; the prose form must
 # name the model so other "does not exist" resource errors stay unlabeled.
 _OPENAI_MODEL_NOT_FOUND = re.compile(
@@ -350,6 +353,8 @@ _OPENAI_MODEL_NOT_FOUND = re.compile(
 
 def _is_model_unavailable(message: str) -> bool:
     if _MODEL_UNAVAILABLE_MARKER in message.lower():
+        return True
+    if _CLAUDE_STOP_MODEL_NOT_FOUND.search(message):
         return True
     if _OPENAI_MODEL_NOT_FOUND.search(message):
         return True

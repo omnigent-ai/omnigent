@@ -213,6 +213,10 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
 ) -> None:
     client, runner_id, requests = pi_fork_rig
     spec = _materialize_pi_agent_spec(tmp_path)
+    instructions = "OMNI_PI_FORK_ROLE act as the chief of staff."
+    spec.write_text(
+        spec.read_text().replace("Pi is running in the session terminal.", instructions)
+    )
     created = post_session_bundle(
         client.post,
         "/v1/sessions",
@@ -269,6 +273,9 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
         _wait(lambda: items_with_reply(fork_id, "FORK-RESUME-OK"))
 
         assert len(requests) == 3
+        assert all(
+            json.dumps(request.get("system")).count(instructions) == 1 for request in requests
+        )
         history = requests[-1]["messages"]
         uses, results = [], []
         previous_uses: list[str] = []

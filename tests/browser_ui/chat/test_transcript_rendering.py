@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
+from tests.browser_ui.chat._geometry_helpers import open_live, settled_geometry
 from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
 
 _CODE_BODY = '[data-streamdown="code-block-body"]'
@@ -304,3 +305,94 @@ def test_external_link_falls_back_inside_a_popup_blocked_host(
     expect(page).to_have_url(host_url)
     assert len(page.context.pages) == 1
     assert any(frame.url == _TARGET for frame in page.frames)
+
+
+_CLOSING_LINE = "Short closing line for turn 2."
+_DRAG_POINTS = """(line, releaseAt) => {
+    const content = line.closest('.chat-conversation-content');
+    let list = line;
+    while (list.parentElement !== content) list = list.parentElement;
+    let row = line;
+    while (row.parentElement !== list) row = row.parentElement;
+    const text = line.getBoundingClientRect();
+    const y = text.top + text.height / 2;
+    const start = [text.left + 1, y];
+    if (releaseAt === 'right_margin') {
+        const scroller = line.closest('[role="log"] > div').getBoundingClientRect();
+        return {start, end: [(list.getBoundingClientRect().right + scroller.right) / 2, y]};
+    }
+    const next = row.nextElementSibling.getBoundingClientRect();
+    return {start, end: [text.left + 40, (row.getBoundingClientRect().bottom + next.top) / 2]};
+}"""
+
+
+def _seed_pull_request_reviews(chat: ChatSessionContract) -> None:
+    chronological: list[dict] = []
+    for turn in (1, 2, 3):
+        response_id = f"selection-response-{turn}"
+        pull_requests = "\n".join(
+            f"- [#{turn}0{number} Update docs](https://github.com/example/repo/pull/{turn}0{number})"
+            for number in (1, 2, 3)
+        )
+        reply = (
+            f"Turn {turn} summary: I checked the open pull requests for the review queue "
+            "and wrote down what each one changes so you can decide which to merge first."
+            f"\n\n{pull_requests}\n\nShort closing line for turn {turn}."
+        )
+        chronological += [
+            message_item(
+                f"selection-user-{turn}",
+                "user",
+                f"Check the open pull requests, round {turn}",
+                response_id=response_id,
+            ),
+            message_item(
+                f"selection-assistant-{turn}", "assistant", reply, response_id=response_id
+            ),
+        ]
+    chat.set_items(list(reversed(chronological)))
+
+
+@pytest.mark.parametrize("release_at", ["right_margin", "gap_below_message"])
+def test_single_line_drag_selects_only_that_line(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    release_at: str,
+) -> None:
+    """A drag released beside or below a line does not extend the selection to other turns."""
+    chat = chat_session_contract
+    _seed_pull_request_reviews(chat)
+    open_live(page, chat)
+    line = page.get_by_text(_CLOSING_LINE, exact=True)
+    line.scroll_into_view_if_needed()
+    expect(line).to_be_visible()
+    settled_geometry(page)
+
+    points = line.evaluate(_DRAG_POINTS, release_at)
+    page.mouse.move(*points["start"])
+    page.mouse.down()
+    page.mouse.move(*points["end"], steps=12)
+    page.mouse.up()
+
+    assert page.evaluate("() => window.getSelection().toString()").strip() == _CLOSING_LINE
+
+
+def test_virtualized_transcript_returns_after_losing_layout(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Restoring a zero-size transcript keeps its current virtual rows visible."""
+    chat = chat_session_contract
+    chat.seed_transcript(60)
+    open_live(page, chat)
+    newest_reply = page.get_by_text("Turn 60 response with", exact=False)
+    expect(newest_reply).to_be_visible(timeout=20_000)
+
+    transcript = page.locator('[role="log"]')
+    for _ in range(2):
+        transcript.evaluate("element => { element.style.display = 'none'; }")
+        expect(transcript).to_be_hidden()
+        page.wait_for_timeout(100)  # Let ResizeObserver record the zero-size viewport.
+        transcript.evaluate("element => { element.style.display = ''; }")
+        page.wait_for_timeout(150)  # Let restored layout observers settle.
+        expect(newest_reply).to_be_visible(timeout=5_000)

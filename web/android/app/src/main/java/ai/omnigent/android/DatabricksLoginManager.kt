@@ -27,15 +27,13 @@ internal class DatabricksLoginManager(
         pending.begin(attempt)
         val redirect = configuration.redirectUri
         return try {
-            AuthTabIntent
-                .Builder()
-                .build()
-                .launch(
-                    launcher,
-                    Uri.parse(attempt.authorizationUri.toString()),
-                    redirect.host,
-                    redirect.path,
-                )
+            val authTab = AuthTabIntent.Builder().build()
+            val authorizationUri = Uri.parse(attempt.authorizationUri.toString())
+            if (configuration.isPrivateRedirect) {
+                authTab.launch(launcher, authorizationUri, redirect.scheme)
+            } else {
+                authTab.launch(launcher, authorizationUri, redirect.host, redirect.path)
+            }
             true
         } catch (_: Throwable) {
             pending.clear()

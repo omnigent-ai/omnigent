@@ -1,5 +1,14 @@
 import { SelectionPopup } from "./SelectionPopup";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type KeyboardEvent,
+} from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
@@ -27,6 +36,7 @@ import {
   ChatComposer,
   ComposerFeedbackRow,
   ComposerSendButton,
+  type ComposerKeyIntent,
 } from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
@@ -44,8 +54,14 @@ import { Button } from "@/components/ui/button";
 import {
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
+  restoredSendDraftUnchanged,
+  takeFailedSendDraft,
+  type SideChatComposerDraft,
   useChatStore,
 } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
@@ -58,7 +74,7 @@ import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
-import { serializeReplyDraft } from "@/lib/replyDraft";
+import { appendReplyQuote, removeReplyQuote, serializeReplyDraft } from "@/lib/replyDraft";
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
@@ -366,7 +382,7 @@ export function SideChatPane({
             onReply={(text) => {
               useChatStore.getState().updateSideChatComposer(childId, (current) => ({
                 ...current,
-                quotes: [...(current.quotes ?? []), text],
+                ...appendReplyQuote(current, text),
               }));
             }}
           />
@@ -443,8 +459,76 @@ function SideChatComposer({
   const { text, files } = composer ?? EMPTY_SIDE_CHAT_COMPOSER;
   const updateComposer = useChatStore((s) => s.updateSideChatComposer);
   const clearComposer = useChatStore((s) => s.clearSideChatComposer);
+  const info = useServerInfo();
+  const attachmentPolicy = info === "loading" ? null : (info.filesystem_attachments ?? null);
+  useEffect(() => {
+    if (info === "loading") return;
+    const current = useChatStore.getState().sideChatComposers[childId];
+    if (!current) return;
+    const { accepted, errors } = validateAttachments(current.files, attachmentPolicy);
+    if (errors.length === 0) return;
+    updateComposer(childId, (draft) => ({ ...draft, files: accepted }));
+    errors.forEach((message) => toast.error(message));
+  }, [attachmentPolicy, childId, info, updateComposer]);
+  const { failedSendDraft, restoredSendDraft } = useConversationEntryState(
+    fullSession ? childId : null,
+  );
+  useEffect(() => {
+    if (!fullSession || !failedSendDraft) return;
+    const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
+    const failed = takeFailedSendDraft(
+      childId,
+      !!(current.text.trim() || current.files.length || current.quotes?.length),
+    );
+    if (!failed) return;
+    const { accepted, errors } = validateAttachments(failed.files, attachmentPolicy);
+    errors.forEach((message) => toast.error(message));
+    updateComposer(childId, () => ({ text: failed.text, files: accepted }));
+    // Track the displayed draft for delivery; filtered files require a fresh send ID.
+    const entry = conversationRegistry.peek(childId)!;
+    const restored = entry.getState().restoredSendDraft;
+    if (restored)
+      entry.setState({
+        restoredSendDraft: { ...restored, files: accepted, replyDraft: undefined },
+        pendingRetryStableId: errors.length > 0 ? null : entry.getState().pendingRetryStableId,
+      });
+  }, [fullSession, childId, failedSendDraft, updateComposer, attachmentPolicy]);
+  useEffect(() => {
+    if (!fullSession || !restoredSendDraft?.delivered) return;
+    const entry = conversationRegistry.peek(childId);
+    const restored = entry?.getState().restoredSendDraft;
+    if (!restored?.delivered || restored.conversationId !== childId) return;
+    const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
+    entry!.setState({ restoredSendDraft: null });
+    if (current.quotes?.length) return;
+    if (
+      restoredSendDraftUnchanged(
+        restored,
+        restored.stableId,
+        current.text,
+        current.files,
+        undefined,
+      )
+    )
+      clearComposer(childId);
+  }, [fullSession, childId, restoredSendDraft, clearComposer]);
   const setText = useCallback(
     (next: string) => updateComposer(childId, (current) => ({ ...current, text: next })),
+    [childId, updateComposer],
+  );
+  const [activeTextId, setActiveTextId] = useState<string | null>(null);
+  const editText = useCallback(
+    (id: string | null, next: string) =>
+      updateComposer(childId, (current) =>
+        id === null
+          ? { ...current, text: next }
+          : {
+              ...current,
+              quotes: current.quotes?.map((quote) =>
+                quote.id === id ? { ...quote, before: next } : quote,
+              ),
+            },
+      ),
     [childId, updateComposer],
   );
   const setFiles = useCallback(
@@ -454,10 +538,50 @@ function SideChatComposer({
   );
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const tailTextareaRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const voiceSnapshotRef = useRef("");
-  const dictation = useDictationInsert(text, setText, textareaRef);
-  useAutoGrowTextarea(textareaRef, text);
+  const voiceEditsRef = useRef(
+    new Map<string | null, { before: string; after: string; quoteIds: Set<string> }>(),
+  );
+  const reconcileVoiceEdits = useCallback((current: SideChatComposerDraft) => {
+    for (const [id, edit] of voiceEditsRef.current) {
+      // Appending a quote moves the old tail into that quote's preceding text.
+      const targetId =
+        id ?? current.quotes?.find((item) => !edit.quoteIds.has(item.id))?.id ?? null;
+      const value =
+        targetId === null
+          ? current.text
+          : current.quotes?.find((item) => item.id === targetId)?.before;
+      if (value !== edit.after || targetId !== id) voiceEditsRef.current.delete(id);
+      if (value === edit.after && targetId !== id) voiceEditsRef.current.set(targetId, edit);
+    }
+  }, []);
+  // Manual edits and merged reply fields relinquish dictation's undo ownership.
+  useLayoutEffect(() => {
+    reconcileVoiceEdits(composer ?? EMPTY_SIDE_CHAT_COMPOSER);
+  }, [composer, reconcileVoiceEdits]);
+  const activeText = composer?.quotes?.find((quote) => quote.id === activeTextId)?.before ?? text;
+  const setActiveText = useCallback(
+    (next: string) => {
+      const current =
+        useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
+      reconcileVoiceEdits(current);
+      const before =
+        activeTextId === null
+          ? current.text
+          : current.quotes?.find((item) => item.id === activeTextId)?.before;
+      if (before === undefined) return;
+      const previous = voiceEditsRef.current.get(activeTextId);
+      voiceEditsRef.current.set(activeTextId, {
+        before: previous?.before ?? before,
+        after: next,
+        quoteIds: previous?.quoteIds ?? new Set(current.quotes?.map((item) => item.id)),
+      });
+      editText(activeTextId, next);
+    },
+    [activeTextId, childId, editText, reconcileVoiceEdits],
+  );
+  const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
 
   // This tab's seeded text: on a pending tab the "Ask in side chat" selection
   // to QUOTE, on a live tab the `/side` question to SEND.
@@ -465,16 +589,15 @@ function SideChatComposer({
   const quote = pending ? draft : undefined;
   const quotes = [
     ...(quote === undefined ? [] : [{ id: "seed", before: "", text: quote }]),
-    ...(composer?.quotes ?? []).map((selection, index) => ({
-      id: String(index),
-      before: "",
-      text: selection,
-    })),
+    ...(composer?.quotes ?? []),
   ];
+  useAutoGrowTextarea(tailTextareaRef, text, quotes.length ? Infinity : 10);
   const autoSend = pending ? undefined : draft;
   useEffect(() => {
-    if (quote !== undefined || composer?.quotes?.length) textareaRef.current?.focus();
-  }, [quote, composer?.quotes]);
+    setActiveTextId(null);
+    textareaRef.current = tailTextareaRef.current;
+    if (quote !== undefined || composer?.quotes?.length) tailTextareaRef.current?.focus();
+  }, [quote, composer?.quotes?.length]);
   // Re-read the labels so a side chat the server just sealed turns read-only.
   const refreshLabels = useCallback(
     () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
@@ -498,7 +621,24 @@ function SideChatComposer({
   }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels]);
 
   const ready = pending ? !starting : agentId !== null;
-  const canSend = text.trim().length > 0 || (!pending && files.length > 0);
+  const canSend =
+    serializeReplyDraft({ quotes, text }).trim().length > 0 || (!pending && files.length > 0);
+  const addFiles = (incoming: File[]) => {
+    const { accepted, errors } = validateAttachments(incoming, attachmentPolicy);
+    errors.forEach((message) => toast.error(message));
+    if (accepted.length) setFiles((current) => [...current, ...accepted]);
+  };
+  const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const pasted = clipboardFiles(event.clipboardData);
+    if (!pasted.length) return;
+    event.preventDefault();
+    if (!ready) return;
+    if (pending) {
+      toast.error("Send a text question to start the side chat before attaching files.");
+      return;
+    }
+    addFiles(pasted);
+  };
   // Slash suggestions mirror the main composer: the session's skills plus /help.
   // Other built-ins (/model, /compact, …) act on the main session and stay out.
   const isMobile = useIsMobileViewport();
@@ -613,12 +753,12 @@ function SideChatComposer({
   const submit = () => {
     const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
     if (pending) {
-      if (trimmed.length === 0 || starting || !onStart) return;
+      if (!canSend || starting || !onStart) return;
       // Keep the text so a failed fork can be retried without re-typing.
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
-    if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
+    if (busy || !canSend || agentId === null) return;
     // On in-process harnesses /help and skills resolve locally; native TUIs
     // (claude-native, codex-native) read the text themselves, and a quote or
     // attachment is always an ordinary message.
@@ -666,6 +806,19 @@ function SideChatComposer({
     ).finally(refreshLabels);
   };
 
+  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => {
+    if (slashCompletion.handleKey(event, intent)) return;
+    if (intent.shouldSubmitFromKeyboard) {
+      event.preventDefault();
+      submit();
+    }
+  };
+  const focusText = (id: string | null, input: HTMLTextAreaElement) => {
+    setActiveTextId(id);
+    textareaRef.current = input;
+    dictation.noteFocus();
+  };
+
   return (
     <>
       {!pending && (
@@ -673,11 +826,11 @@ function SideChatComposer({
           ref={fileInputRef}
           type="file"
           multiple
-          accept="image/*,application/pdf,text/*,application/json"
+          accept={attachmentAccept(attachmentPolicy)}
           className="hidden"
           onChange={(event) => {
             if (event.target.files) {
-              setFiles((prev) => [...prev, ...Array.from(event.target.files ?? [])]);
+              addFiles(Array.from(event.target.files));
               event.target.value = "";
             }
           }}
@@ -691,7 +844,7 @@ function SideChatComposer({
       <ChatComposer
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         input={{
-          ref: textareaRef,
+          ref: tailTextareaRef,
           value: text,
           onChange: (event) => {
             if (commandNotice !== null) setCommandNotice(null);
@@ -699,19 +852,18 @@ function SideChatComposer({
             setText(event.target.value);
           },
           onSelect: (event) => slashCompletion.onSelectionChange(event.currentTarget),
-          onFocus: () => setInputFocused(true),
+          onFocus: (event) => {
+            setInputFocused(true);
+            focusText(null, event.currentTarget);
+          },
           // Menu rows preventDefault on mousedown so selecting one keeps focus.
           onBlur: () => setInputFocused(false),
           placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
           disabled: !ready,
           "data-testid": "side-chat-input",
-          onKeyDown: (event, intent) => {
-            if (slashCompletion.handleKey(event, intent)) return;
-            if (intent.shouldSubmitFromKeyboard) {
-              event.preventDefault();
-              submit();
-            }
-          },
+          onKeyDown: handleKeyDown,
+          onPaste,
+          className: quotes.length ? "max-h-none overflow-y-hidden" : undefined,
         }}
         slots={{
           beforeInput: slashCompletion.open ? (
@@ -730,17 +882,21 @@ function SideChatComposer({
             quotes.length === 0 ? undefined : (
               <ReplyDraftBlocks
                 quotes={quotes}
-                activeTextId={null}
-                showTextInputs={false}
+                activeTextId={activeTextId}
                 keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
                 disabled={!ready}
-                inputFor={() => ({})}
+                inputFor={(replyQuote) => ({
+                  onChange: (event) => editText(replyQuote.id, event.target.value),
+                  onFocus: (event) => focusText(replyQuote.id, event.currentTarget),
+                  onKeyDown: handleKeyDown,
+                  onPaste,
+                })}
                 onRemove={(id) => {
                   if (id === "seed") clearSideChatDraft(childId);
                   else
                     updateComposer(childId, (current) => ({
                       ...current,
-                      quotes: current.quotes?.filter((_, index) => String(index) !== id),
+                      ...removeReplyQuote({ ...current, quotes: current.quotes ?? [] }, id),
                     }));
                 }}
               />
@@ -769,10 +925,15 @@ function SideChatComposer({
               <ComposerMicButton
                 className="size-8 md:size-7"
                 disabled={!ready}
-                onVoiceStart={() => {
-                  voiceSnapshotRef.current = text;
+                onVoiceStart={() => voiceEditsRef.current.clear()}
+                onVoiceDiscard={() => {
+                  reconcileVoiceEdits(
+                    useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER,
+                  );
+                  const edits = [...voiceEditsRef.current];
+                  voiceEditsRef.current.clear();
+                  for (const [id, edit] of edits) editText(id, edit.before);
                 }}
-                onVoiceDiscard={() => setText(voiceSnapshotRef.current)}
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
               />

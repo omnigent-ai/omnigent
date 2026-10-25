@@ -23,10 +23,9 @@ installed-but-unconfigured one without spawning a subprocess.
 
 from __future__ import annotations
 
+import tomllib
 from pathlib import Path
 from urllib.parse import urlparse
-
-import tomllib
 
 from omnigent.harnesses.kimi_native.credentials import resolve_user_kimi_home
 

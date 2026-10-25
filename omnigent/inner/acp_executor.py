@@ -757,7 +757,7 @@ class AcpExecutor(Executor):
         await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError as exc:
+        except TimeoutError as exc:
             self._pending.pop(req_id, None)
             # asyncio.TimeoutError carries no message, so a caller reporting it
             # by str() would surface a blank failure. Name the stalled call.
@@ -1944,7 +1944,7 @@ class AcpExecutor(Executor):
                 notification = await asyncio.wait_for(
                     self._queue.get(), timeout=min(remaining, 2.0)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
             method = notification.get("method", "")

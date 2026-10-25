@@ -40,6 +40,11 @@ from typing import Any, Protocol, TypeAlias, cast
 from packaging.version import InvalidVersion, Version
 
 from omnigent._platform import resolve_cli_binary
+from omnigent.databricks_ai_gateway import (
+    CODEX_AGENT,
+    is_databricks_ai_gateway_url,
+    with_gateway_attribution,
+)
 from omnigent.errors import HarnessTransportClosedError
 from omnigent.harnesses.codex_egress import (
     CERTIFICATE_FAILURE_CODE,
@@ -593,7 +598,7 @@ async def _codex_cli_version_text(codex_path: str) -> str | None:
         stdout, _ = await asyncio.wait_for(
             proc.communicate(), timeout=_CODEX_VERSION_PROBE_TIMEOUT_SECONDS
         )
-    except asyncio.TimeoutError:
+    except TimeoutError:
         with suppress(ProcessLookupError):
             proc.kill()
         with suppress(Exception):
@@ -1302,6 +1307,8 @@ def materialize_codex_provider_config(
 
     Built-in provider tables (e.g. ``[model_providers.amazon-bedrock]``) stay
     untouched: Codex rejects unsupported fields there by discarding the whole config.
+    Custom providers on a Databricks Unity Gateway also get the gateway's
+    usage-attribution ``http_headers``.
 
     :param codex_home: Private session ``CODEX_HOME`` directory.
     :param config_overrides: Pending Codex config override strings.
@@ -1366,6 +1373,12 @@ def materialize_codex_provider_config(
         provider_config["stream_max_retries"] = policy.max_retries
         if policy.timeout_per_request_s is not None:
             provider_config["stream_idle_timeout_ms"] = int(policy.timeout_per_request_s * 1000)
+        base_url = provider_config.get("base_url")
+        if isinstance(base_url, str) and is_databricks_ai_gateway_url(base_url):
+            headers = provider_config.get("http_headers")
+            provider_config["http_headers"] = with_gateway_attribution(
+                headers if isinstance(headers, Mapping) else None, CODEX_AGENT, base_url
+            )
 
     fd, tmp_name = tempfile.mkstemp(prefix="config.toml.", dir=str(codex_home))
     try:
@@ -3111,7 +3124,7 @@ class _CodexAppServerSession:
 
                 try:
                     await trust_codex_router_hooks(self._request, cwd=self._cwd or os.getcwd())
-                except Exception:  # noqa: BLE001 - never block session startup
+                except Exception:  # never block session startup
                     logger.warning(
                         "codex subagent-routing hook trust failed; "
                         "routing will not be enforced for this session",
@@ -3214,7 +3227,7 @@ class _CodexAppServerSession:
                         terminate_tree=_terminate_process_tree,
                         kill_tree=_kill_process_tree,
                     )
-                except Exception:  # noqa: BLE001 - cleanup must continue
+                except Exception:  # cleanup must continue
                     logger.warning("Codex worker cleanup failed", exc_info=True)
                     reaped = False
                 if not reaped:
@@ -3281,7 +3294,7 @@ class _CodexAppServerSession:
                     self._worker_launch_close_task = None
                     try:
                         launch_close_task.result()
-                    except Exception:  # noqa: BLE001 - cleanup must continue
+                    except Exception:  # cleanup must continue
                         logger.warning("Codex worker launch cleanup failed", exc_info=True)
                         cleanup_complete = False
                     else:
@@ -3389,7 +3402,7 @@ class _CodexAppServerSession:
             await signer.wait()
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - any signer failure invalidates the worker
+        except Exception:  # any signer failure invalidates the worker
             logger.debug("model signer watcher failed", exc_info=True)
         self._signer_exited = True
         if not self._closing and self._proc is not None:
@@ -3420,7 +3433,7 @@ class _CodexAppServerSession:
                 await signer.close()
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 - cleanup state records failure
+            except Exception:  # cleanup state records failure
                 logger.warning("model signer close failed", exc_info=True)
             else:
                 if self._signer is signer:
@@ -3522,7 +3535,7 @@ class _CodexAppServerSession:
                 return final_response
             try:
                 message = await asyncio.wait_for(self._events.get(), timeout=remaining)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 return final_response
             if isinstance(message, HarnessTransportClosedError):
                 # A completed turn remains successful when its process exits.

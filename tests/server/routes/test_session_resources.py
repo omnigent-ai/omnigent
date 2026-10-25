@@ -43,6 +43,8 @@ from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.host_store import HostStore
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
 from tests.server.routes.test_shell_permission_gate import _StubPermissionStore
 
 
@@ -739,8 +741,11 @@ async def test_list_session_resources_local_fallback_lists_default(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("stable_id", [None, "a" * 32, "private-invalid-id"])
 async def test_claude_native_message_forwards_to_runner_without_persisting(
     client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+    stable_id: str | None,
 ) -> None:
     """
     Claude-native web-chat input is runner injection, not Omnigent persistence.
@@ -750,6 +755,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
     the web UI render a non-terminal-originated user message.
     """
     fake_runner = _FakeRunnerClient(payload={})
+    caplog.set_level(logging.INFO)
     set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
     set_runner_client(fake_runner)  # type: ignore[arg-type]
 
@@ -759,6 +765,7 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
             "type": "message",
             "data": {
                 "role": "user",
+                **({"stable_id": stable_id} if stable_id is not None else {}),
                 "content": [{"type": "input_text", "text": "hello claude"}],
             },
         },
@@ -804,9 +811,28 @@ async def test_claude_native_message_forwards_to_runner_without_persisting(
                 "pending_id": body["pending_id"],
                 "delivery_attempt_id": forwarded["delivery_attempt_id"],
                 "input_enqueued_at_ms": forwarded["input_enqueued_at_ms"],
+                **(
+                    {"stable_id": stable_id, "input_stable_id": stable_id}
+                    if stable_id == "a" * 32
+                    else {}
+                ),
             },
         ),
     ]
+    received = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_received"
+    ]
+    assert len(received) == 1
+    assert received[0].session_id == "64a784c3aa907d1774f44313546947c6"
+    attrs = received[0].attributes
+    assert attrs["input_received_at_ms"] <= forwarded["input_enqueued_at_ms"]
+    assert attrs.get("input_stable_id") == (stable_id if stable_id == "a" * 32 else None)
+    assert "hello claude" not in json.dumps(attrs)
+    assert "private-invalid-id" not in json.dumps(attrs)
+    lifecycle = [getattr(record, "event_name", None) for record in caplog.records]
+    assert lifecycle.index("native_input_received") < lifecycle.index("native_input_enqueued")
 
 
 @pytest.mark.asyncio
@@ -2573,12 +2599,14 @@ async def test_copy_refuses_a_workspace_file_for_a_harness_without_a_workspace(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("recorded_type", [False, True], ids=["default-type", "recorded-gz"])
 async def test_copy_spends_the_child_workspace_quota(
     file_client: httpx.AsyncClient,
     file_conv_store: _ConversationStore,
     file_store: Any,
     artifact_store: _InMemoryArtifactStore,
     monkeypatch: pytest.MonkeyPatch,
+    recorded_type: bool,
 ) -> None:
     """Copies count against the child's workspace quota, like uploads."""
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
@@ -2591,7 +2619,19 @@ async def test_copy_spends_the_child_workspace_quota(
         CLAUDE_NATIVE_CODING_AGENT.presentation_labels
     )
     first = _seed_parent_zip(file_store, artifact_store, "first.zip")
-    second = _seed_parent_zip(file_store, artifact_store, "second.zip")
+    if recorded_type:
+        # Counted by its recorded delivery, since .gz isn't a default extension.
+        stored = file_store.create(
+            session_id="b460374fc8e697b296708f52dc9d8179",
+            filename="second.gz",
+            bytes=2,
+            content_type="application/gzip",
+            source_metadata={"delivery": "filesystem"},
+        )
+        artifact_store.put(stored.id, b"\x1f\x8b")
+        second = stored.id
+    else:
+        second = _seed_parent_zip(file_store, artifact_store, "second.zip")
     url = "/v1/sessions/405bfe154d5c0e795a2b87021bc897bf/resources/files:copy"
     source = "b460374fc8e697b296708f52dc9d8179"
 
@@ -2633,6 +2673,43 @@ async def test_native_forward_leaves_a_workspace_file_for_the_runner(
     )
     assert forwarded["content"] == [zip_block]
     assert "File reference resolution failed" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_native_forward_drops_client_delivery_claims(
+    file_client: httpx.AsyncClient,
+) -> None:
+    """Only an upload's stored record can mark a file for filesystem delivery."""
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    fake_runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    set_runner_client(fake_runner)  # type: ignore[arg-type]
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("notes.txt", b"hello", "text/plain")},
+    )
+    assert upload.status_code == 201, upload.text
+    content = [
+        {"type": "input_file", "file_id": upload.json()["id"], "delivery": "filesystem"},
+        {
+            "type": "input_file",
+            "filename": "inline.txt",
+            "file_data": "data:text/plain;base64,aGk=",
+            "delivery": "filesystem",
+        },
+    ]
+
+    resp = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+
+    assert resp.status_code == 202, resp.text
+    forwarded = next(
+        body for path, body in fake_runner.post_json_calls if path.endswith("/events")
+    )
+    assert len(forwarded["content"]) == 2
+    assert all("delivery" not in block for block in forwarded["content"])
 
 
 @pytest.mark.asyncio
@@ -3175,6 +3252,162 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github",
     ) in fake_runner.calls
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "resource, added",
+    [("labels", "bug"), ("reviewers", {"login": "octocat", "kind": "user"})],
+)
+async def test_github_pr_edit_relays_the_runner_refusal(
+    client: httpx.AsyncClient, resource: str, added: object
+) -> None:
+    """A provider refusal keeps the runner's status and message for the panel."""
+    from omnigent.runner import github_resource
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    path = f"/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/{resource}"
+    detail = f"The GitHub account on the host cannot edit this pull request's {resource}."
+    fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    timeouts: list[float | None] = []
+    proxy_get, proxy_post = fake_runner.get, fake_runner.post
+
+    async def get(url: str, *, params: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_get(url, params=params, timeout=timeout)
+
+    async def post(url: str, *, json: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_post(url, json=json, timeout=timeout)
+
+    fake_runner.get, fake_runner.post = get, post  # type: ignore[method-assign]
+
+    resp = await client.post(
+        path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "add": [added]}
+    )
+    malformed = await client.post(path, json={"add": [added]})
+    await client.get(path, params={"pr_url": "https://github.com/acme/widgets/pull/17"})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == detail
+    assert malformed.status_code == 400
+    # The server and the host tunnel both outwait the runner's label request budget.
+    assert timeouts == [routes_resources._PR_EDIT_PROXY_TIMEOUT_S] * 2
+    assert github_resource._PR_EDIT_REQUEST_SECONDS < routes_resources._PR_EDIT_PROXY_TIMEOUT_S
+    assert github_resource._PR_EDIT_REQUEST_SECONDS < _host_filesystem._FS_TIMEOUT_S
+    assert fake_runner.post_json_calls == [
+        (path, {"pr_url": "https://github.com/acme/widgets/pull/17", "add": [added], "remove": []})
+    ]
+
+
+@pytest.mark.asyncio
+async def test_github_attachment_forwards_the_bytes_and_relays_the_refusal(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file's raw bytes reach the runner with the PR and name, under the upload wait."""
+    from omnigent.runner import github_resource
+    from omnigent.server.routes.sessions import routes_resources
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/attachments"
+    pr_url = "https://github.com/acme/widgets/pull/17"
+    asset = {
+        "object": "session.github.pr_attachment",
+        "url": "https://github.com/user-attachments/assets/1",
+    }
+    fake_runner = _FakeRunnerClient()
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    forwarded: list[tuple[str, dict[str, str], bytes, float | None]] = []
+    answers = [httpx.Response(200, json=asset), httpx.Response(400, json={"detail": "No push"})]
+
+    async def post(
+        url: str,
+        *,
+        params: dict[str, str],
+        content: bytes,
+        headers: dict[str, str],
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        assert headers == {"Content-Type": "application/octet-stream"}
+        forwarded.append((url, params, content, timeout))
+        return answers.pop(0)
+
+    fake_runner.post = post  # type: ignore[method-assign]
+    upload = {"file": ("shot.png", b"\x89PNG-bytes", "image/png")}
+
+    uploaded = await client.post(path, data={"pr_url": pr_url}, files=upload)
+    refused = await client.post(path, data={"pr_url": pr_url}, files=upload)
+    monkeypatch.setattr(routes_resources, "_MAX_PR_ATTACHMENT_BYTES", 4)
+    oversized = await client.post(path, data={"pr_url": pr_url}, files=upload)
+
+    assert (uploaded.status_code, uploaded.json()) == (200, asset)
+    assert (refused.status_code, refused.json()["detail"]) == (400, "No push")
+    assert oversized.status_code == 413
+    assert (
+        forwarded
+        == [
+            (
+                path,
+                {"pr_url": pr_url, "name": "shot.png"},
+                b"\x89PNG-bytes",
+                routes_resources._PR_ATTACHMENT_PROXY_TIMEOUT_S,
+            )
+        ]
+        * 2
+    )
+    assert (
+        github_resource._ATTACHMENT_REQUEST_SECONDS
+        < routes_resources._PR_ATTACHMENT_PROXY_TIMEOUT_S
+    )
+
+
+def test_pr_attachments_fit_one_tunnel_frame() -> None:
+    """The largest attachment, base64-encoded, fits a runner or host tunnel frame.
+
+    A bigger frame is refused with close code 1009, which drops every request on
+    that tunnel. The host's ``websockets.connect`` uses the same 100 MB limit.
+    """
+    from omnigent.runner import pr_resource
+    from omnigent.server.routes.sessions import routes_resources
+    from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+
+    largest = routes_resources._MAX_PR_ATTACHMENT_BYTES
+    assert largest == pr_resource._MAX_VIDEO_ATTACHMENT_BYTES
+    encoded_length = 4 * -(-largest // 3)  # base64's exact output length
+    assert encoded_length < RUNNER_TUNNEL_MAX_MESSAGE_BYTES * 0.95
+
+
+@pytest.mark.asyncio
+async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
+    """A refused merge keeps the runner's status and message, with the PR edit wait."""
+    from omnigent.server.routes.sessions import routes_resources
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/merge"
+    detail = "The pull request's branch changed since the panel loaded."
+    fake_runner = _FakeRunnerClient(responses={path: (400, {"detail": detail})})
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    timeouts: list[float | None] = []
+    proxy_post = fake_runner.post
+
+    async def post(url: str, *, json: Any = None, timeout: float | None = None) -> httpx.Response:
+        timeouts.append(timeout)
+        return await proxy_post(url, json=json, timeout=timeout)
+
+    fake_runner.post = post  # type: ignore[method-assign]
+    body = {
+        "pr_url": "https://github.com/acme/widgets/pull/17",
+        "merge_method": "merge",
+        "expected_head": "a" * 40,
+    }
+
+    resp = await client.post(path, json={**body, "admin": True})
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == detail
+    assert timeouts == [routes_resources._PR_EDIT_PROXY_TIMEOUT_S]
+    # Only the known fields are forwarded.
+    assert fake_runner.post_json_calls == [(path, body)]
 
 
 @pytest.mark.asyncio
@@ -3984,13 +4217,16 @@ async def test_filesystem_write_proxies_to_runner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_wake", [False, True])
-async def test_filesystem_save_reconnects_runner_on_live_host(
+@pytest.mark.parametrize("operation", ["save", "download"])
+async def test_filesystem_operation_reconnects_runner_on_live_host(
     client: httpx.AsyncClient,
     app: FastAPI,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fail_first_wake: bool,
+    operation: str,
 ) -> None:
-    """Save (or Retry after a failed wake) reconnects before forwarding the edit."""
+    """Save and Download reconnect before forwarding, including Retry after a failed wake."""
     from dataclasses import replace
     from types import SimpleNamespace
 
@@ -4011,7 +4247,19 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
         HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="save-host"),
         owner=None,
     )
-    fake_runner = _FakeRunnerClient(payload=_fs_write_payload())
+    payload = bytes(range(256))
+    (tmp_path / "download.bin").write_bytes(payload)
+    runner = FastAPI()
+    runner_calls: list[tuple[str, str]] = []
+
+    @runner.api_route(_FS_ROUTE, methods=["GET", "PUT"], response_model=None)
+    async def _serve(request: Request) -> FileResponse | JSONResponse:
+        runner_calls.append((request.method, request.url.path))
+        if request.method == "GET":
+            assert request.query_params["download"] == "true"
+            return FileResponse(tmp_path / "download.bin", filename="download.bin")
+        return JSONResponse(_fs_write_payload())
+
     connected = False
 
     class _SleepingRouter(_FakeRunnerRouter):
@@ -4023,14 +4271,12 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
             assert conversation is not None and conversation.runner_id == "runner_new"
             return super().client_for_session_resources(session_id, conversation=conversation)
 
-    router = _SleepingRouter(fake_runner)
-    set_runner_router(router)  # type: ignore[arg-type]
     attempts = 0
 
     async def _launch(*_args: Any, **_kwargs: Any) -> Any:
         nonlocal connected, attempts
         attempts += 1
-        assert fake_runner.calls == []
+        assert runner_calls == []
         if fail_first_wake and attempts == 1:
             raise OmnigentError("wake timed out", code=ErrorCode.RUNNER_UNAVAILABLE)
         # Recovery replaces the row: forwarding with the old binding would fail.
@@ -4055,22 +4301,32 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
     url = f"/v1/sessions/{session_id}/resources/environments/default/filesystem/new.txt"
     body = {"content": "edited without a chat message", "encoding": "utf-8"}
 
-    if fail_first_wake:
-        failed = await client.put(url, json=body)
-        assert failed.status_code == 503
-        assert fake_runner.calls == []
+    method = "PUT" if operation == "save" else "GET"
+    request_kwargs = {"json": body} if operation == "save" else {"params": {"download": "true"}}
+    async with _runner_app_client(runner) as fake_runner:
+        set_runner_router(_SleepingRouter(fake_runner))  # type: ignore[arg-type]
+        if fail_first_wake:
+            failed = await client.request(method, url, **request_kwargs)
+            assert failed.status_code == 503
+            assert failed.json()["error"]["message"] == "wake timed out"
+            assert runner_calls == []
 
-    response = await client.put(url, json=body)
-    assert response.status_code == 200
-    assert fake_runner.calls == [("PUT", url)]
+        response = await client.request(method, url, **request_kwargs)
+    assert response.status_code == 200, response.text
+    if operation == "download":
+        assert response.content == payload
+        assert response.headers["content-disposition"] == 'attachment; filename="download.bin"'
+    assert runner_calls == [(method, url)]
     assert attempts == (2 if fail_first_wake else 1)
     assert store.appended_items == []
 
 
 @pytest.mark.asyncio
-async def test_filesystem_save_authorizes_before_reconnecting(
+@pytest.mark.parametrize("operation", ["save", "download"])
+async def test_filesystem_operation_authorizes_before_reconnecting(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ) -> None:
     """An invalid session must not trigger runner recovery."""
     from unittest.mock import AsyncMock
@@ -4079,9 +4335,11 @@ async def test_filesystem_save_authorizes_before_reconnecting(
 
     wake = AsyncMock()
     monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
-    response = await client.put(
-        "/v1/sessions/missing/resources/environments/default/filesystem/new.txt",
-        json={"content": "hello", "encoding": "utf-8"},
+    url = "/v1/sessions/missing/resources/environments/default/filesystem/new.txt"
+    response = (
+        await client.put(url, json={"content": "hello", "encoding": "utf-8"})
+        if operation == "save"
+        else await client.get(url, params={"download": "true"})
     )
     assert response.status_code == 404
     wake.assert_not_awaited()
@@ -6187,7 +6445,7 @@ async def test_claude_native_cancelled_mirror_still_settles_its_held_entries(
 
     try:
         request = asyncio.create_task(persist())
-        await asyncio.to_thread(store.first_append_started.wait, 5)
+        assert await asyncio.to_thread(store.first_append_started.wait, budget(5))
         request.cancel()
         with pytest.raises(asyncio.CancelledError):
             await request
@@ -6199,10 +6457,15 @@ async def test_claude_native_cancelled_mirror_still_settles_its_held_entries(
         assert pending_inputs.resolve_matching_text(sid, "still here?").matched is None
 
         store.release_first_append.set()
-        for _attempt in range(200):
-            if not pending_inputs.snapshot_for(sid):
-                break
-            await asyncio.sleep(0.01)
+        # Settlement precedes title seeding and publication of the final receipt.
+        await poll_until_async(
+            lambda: any(
+                event.get("type") == "session.input.consumed"
+                and event["data"]["cleared_pending_id"] == matched
+                for _conversation_id, event in published
+            ),
+            timeout_s=budget(5),
+        )
 
         assert pending_inputs.snapshot_for(sid) == []
         assert [item.type for item in store.appended_items] == ["message", "error", "message"]
@@ -9002,8 +9265,7 @@ class _OfflineRunnerClient:
         del params, timeout
         raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
 
-    async def post(self, url: str, *, json: Any = None, timeout: float | None = None) -> Any:
-        del json, timeout
+    async def post(self, url: str, **_kwargs: Any) -> Any:
         raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
 
 
@@ -9611,6 +9873,9 @@ async def test_sibling_environment_routes_are_not_gzipped(
         ("/changes", "github_changes"),
         ("/diff", "github_pr_diff"),
         ("/diff/new.py", "github_diff"),
+        ("/labels", "github_labels"),
+        ("/merge-options", "github_merge_options"),
+        ("/reviewers", "github_reviewers"),
     ],
 )
 async def test_selected_pr_reaches_offline_host(
@@ -9661,31 +9926,166 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
     assert captured["params"] == {"url": url, "action": "attach", "session_id": _OFFLINE_SESSION}
 
 
+@pytest.mark.parametrize(
+    "resource,body,op,params",
+    [
+        ("/labels", {"remove": ["bug"]}, "github_labels_update", {"add": [], "remove": ["bug"]}),
+        (
+            "/reviewers",
+            {"remove": [{"login": "octocat", "kind": "user"}]},
+            "github_reviewers_update",
+            {"add": [], "remove": [{"login": "octocat", "kind": "user"}]},
+        ),
+        (
+            "/details",
+            {"title": "Renamed"},
+            "github_details_update",
+            {"title": "Renamed", "body": None},
+        ),
+        (
+            "/merge",
+            {"merge_method": "squash", "expected_head": "a" * 40},
+            "github_merge",
+            {"merge_method": "squash", "expected_head": "a" * 40},
+        ),
+        ("/disable-auto-merge", {"extra": True}, "github_disable_auto_merge", {}),
+    ],
+)
+async def test_pr_edit_reaches_offline_host(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    body: dict[str, Any],
+    op: str,
+    params: dict[str, Any],
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    captured: dict[str, Any] = {}
+    result = {"object": "session.github.result"}
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return result
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    url = "https://github.com/example/second/pull/42"
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github{resource}",
+        json={"pr_url": url, **body},
+    )
+    assert response.status_code == 200, response.text
+    assert response.json() == result
+    assert captured["op"] == op
+    assert captured["session_id"] == _OFFLINE_SESSION
+    assert captured["params"] == {"pr_url": url, **params}
+
+
 @pytest.mark.asyncio
-async def test_copy_new_type_refuses_old_runtime(
+async def test_pr_attachment_reaches_offline_host_base64_encoded(
+    offline_env_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the runner offline the file crosses the host tunnel, within the frame limit."""
+    import base64
+
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    captured: list[dict[str, Any]] = []
+    asset = {
+        "object": "session.github.pr_attachment",
+        "url": "https://github.com/user-attachments/assets/1",
+    }
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.append(kwargs)
+        return asset
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    path = f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/attachments"
+    url = "https://github.com/example/second/pull/42"
+    upload = {"file": ("shot.png", b"\x89PNG-bytes", "image/png")}
+
+    uploaded = await offline_env_client.post(path, data={"pr_url": url}, files=upload)
+
+    assert (uploaded.status_code, uploaded.json()) == (200, asset), uploaded.text
+    [call] = captured
+    assert call["op"] == "github_attachment_upload"
+    assert call["timeout"] == routes_resources._PR_ATTACHMENT_PROXY_TIMEOUT_S
+    params = call["params"]
+    assert (params["pr_url"], params["name"]) == (url, "shot.png")
+    assert base64.b64decode(params["content_base64"]) == b"\x89PNG-bytes"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("filename", "host_tier", "status"),
+    [
+        ("archive.zip", "none", 409),
+        ("archive.zip", "attachments", 200),
+        ("trace.gz", "attachments", 409),
+        ("trace.gz", "current", 200),
+    ],
+    ids=[
+        "default-type-needs-attachments",
+        "default-type-on-attachments-host",
+        "recorded-type-needs-delivery",
+        "recorded-type-on-current-host",
+    ],
+)
+async def test_copy_requires_the_hosts_attachment_support(
     file_client: httpx.AsyncClient,
     file_app: FastAPI,
     file_conv_store: _ConversationStore,
     file_store: Any,
     artifact_store: _InMemoryArtifactStore,
+    filename: str,
+    host_tier: str,
+    status: int,
 ) -> None:
-    """A capable harness on an old host cannot receive a copied binary file."""
+    """A copy into a capable harness still needs a host that can deliver the file."""
     from omnigent.harness_plugins import CLAUDE_NATIVE_CODING_AGENT
+    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
 
     child = "405bfe154d5c0e795a2b87021bc897bf"
     parent = "b460374fc8e697b296708f52dc9d8179"
     file_conv_store._conversations[child].labels.update(
         CLAUDE_NATIVE_CODING_AGENT.presentation_labels
     )
-    file_app.state.host_registry.get("host_files").hello.capabilities = []
-    file_id = _seed_parent_zip(file_store, artifact_store, "archive.zip")
+    file_app.state.host_registry.get("host_files").hello.capabilities = {
+        "none": [],
+        "attachments": [CAP_FILESYSTEM_ATTACHMENTS],
+        "current": HOST_CAPABILITIES,
+    }[host_tier]
+    if filename.endswith(".zip"):
+        file_id = _seed_parent_zip(file_store, artifact_store, filename)
+        source_metadata = None
+    else:
+        # Outside the default extensions, so only the record marks it for disk.
+        source_metadata = {"delivery": "filesystem"}
+        stored = file_store.create(
+            session_id=parent,
+            filename=filename,
+            bytes=2,
+            content_type="application/gzip",
+            source_metadata=source_metadata,
+        )
+        artifact_store.put(stored.id, b"\x1f\x8b")
+        file_id = stored.id
+
     response = await file_client.post(
         f"/v1/sessions/{child}/resources/files:copy",
         json={"source_session_id": parent, "file_ids": [file_id]},
     )
-    assert response.status_code == 409, response.text
-    assert file_store.list(child).data == []
+
+    assert response.status_code == status, response.text
     assert file_store.get(file_id, session_id=parent) is not None
+    if status == 200:
+        copied = file_store.get(response.json()["mapping"][file_id]["new_id"], session_id=child)
+        assert copied is not None
+        assert copied.source_metadata == source_metadata
+    else:
+        assert file_store.list(child).data == []
 
 
 @pytest.mark.asyncio
@@ -9731,6 +10131,70 @@ async def test_native_send_rechecks_runtime_after_upload(
     assert "Update Omnigent" in response.text
     assert runner.post_json_calls == []
     assert len(file_conv_store.appended_items) == 1 + int(retained_history)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("retained_history", "host_has_attachments", "status"),
+    [(False, True, 409), (True, True, 202), (True, False, 409)],
+)
+async def test_native_send_requires_delivery_support_for_new_types(
+    file_client: httpx.AsyncClient,
+    file_app: FastAPI,
+    file_conv_store: _ConversationStore,
+    retained_history: bool,
+    host_has_attachments: bool,
+    status: int,
+) -> None:
+    """Only a file sent now needs the runtime to deliver types beyond the defaults.
+
+    A recorded file in retained history still needs filesystem attachment support.
+    """
+    from omnigent.entities import MessageData
+    from omnigent.inner.native_attachments import (
+        CAP_FILESYSTEM_ATTACHMENTS,
+        FilesystemAttachmentPolicy,
+    )
+
+    session_id = "64a784c3aa907d1774f44313546947c6"
+    runner = _FakeRunnerClient(payload={})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    set_runner_client(runner)  # type: ignore[arg-type]
+    file_app.state.filesystem_attachment_policy = lambda: FilesystemAttachmentPolicy(
+        all_types=True
+    )
+    upload = await file_client.post(
+        f"/v1/sessions/{session_id}/resources/files",
+        files={"file": ("trace.gz", b"\x1f\x8b", "application/gzip")},
+    )
+    assert upload.status_code == 201, upload.text
+    content = [{"type": "input_file", "file_id": upload.json()["id"]}]
+    if retained_history:
+        file_conv_store.appended_items.append(
+            ConversationItem(
+                id="f" * 32,
+                type="message",
+                status="completed",
+                response_id="e" * 32,
+                created_at=1,
+                data=MessageData(role="user", content=content),
+            )
+        )
+        content = [{"type": "input_text", "text": "Read the attached trace again"}]
+    file_app.state.host_registry.get("host_files").hello.capabilities = (
+        [CAP_FILESYSTEM_ATTACHMENTS] if host_has_attachments else []
+    )
+    response = await file_client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "message", "data": {"role": "user", "content": content}},
+    )
+    assert response.status_code == status, response.text
+    if status == 202:
+        assert runner.post_json_calls
+    else:
+        assert runner.post_json_calls == []
+        if not retained_history:
+            assert "this file type" in response.text
 
 
 @pytest.mark.asyncio

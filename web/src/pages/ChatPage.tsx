@@ -23,6 +23,7 @@ import {
   useMemo,
   useRef,
   useState,
+  useSyncExternalStore,
 } from "react";
 import { BotIcon, WandSparklesIcon, FileTextIcon, Loader2Icon, XIcon } from "lucide-react";
 import { Tooltip, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
@@ -88,7 +89,7 @@ import { PROJECT_LABEL_KEY } from "@/lib/sessionListCache";
 import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import { modelConfigurationSourceRows } from "@/lib/modelConfigurationSource";
 import {
-  committedItemProvesDelivery,
+  takeFailedSendDraft,
   composerAttachmentKey,
   consumePendingInitialPrompt,
   holdsInitialDraft,
@@ -130,6 +131,7 @@ import {
 import { useMentionBrowser } from "@/hooks/useMentionBrowser";
 import { getSessionDraft, promoteSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import {
+  appendReplyQuote,
   restoreReplyDraft,
   serializeReplyDraft,
   snapshotReplyDraft,
@@ -199,8 +201,16 @@ import { useMarkConversationSeen } from "@/hooks/useUnseenConversations";
 import { useFileDropTarget } from "@/hooks/useFileDropTarget";
 import { useComposerAttachments } from "@/hooks/useComposerAttachments";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
+import { isBrandHarness, useHostMcpServers, type HostMcpServer } from "@/hooks/useHarnessInventory";
+import { useMcpRegistryCatalog, useRegistrySignIn } from "@/hooks/useMcpRegistry";
+import {
+  getSessionHost,
+  sessionRoutingHostId,
+  subscribeSessionHostChanges,
+} from "@/lib/sessionHost";
 import { HostBadge } from "@/components/HostBadge";
 import {
+  type McpServerRow,
   BUILTIN_SLASH_COMMANDS,
   isSlashCommandText,
   matchSlashCommandInvocation,
@@ -225,6 +235,7 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
+import { useSandboxLaunchModelOptions } from "@/hooks/useSandboxModelOptions";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { buildFusionSections } from "@/components/composer/fusionSections";
@@ -261,6 +272,7 @@ import {
   codexApprovalModeLabel,
 } from "@/lib/codexApprovalMode";
 import { isCodexNativeSession } from "@/lib/codexPlanMode";
+import { isPermissionModeCycleKey, nextCycledPermissionMode } from "@/lib/permissionModeCycle";
 import { getCliServerUrl } from "@/lib/host";
 import { useOmnigentAnalytics } from "@/lib/analyticsEmit";
 import { GoalDialog, CommandGoalDialog, GoalStatusPill, useGoalState } from "@/components/goal";
@@ -331,6 +343,12 @@ export function isSubagentRoutingEligible(
 ): boolean {
   return smartRoutingEnabled(serverInfo) && isSubagentRoutingSession(session);
 }
+
+/** How often `/mcp` re-reads the host inventory while a server waits on a sign-in. */
+const HOST_MCP_SIGN_IN_POLL_MS = 5_000;
+
+/** Only an http(s) page is ever opened from a host's sign-in report. */
+const HOST_SIGN_IN_URL_RE = /^https?:\/\//i;
 
 // Leading whitespace + the command token, so the composer overlay can tint
 // just the `/command` or `$skill` and leave args in the default color.
@@ -858,17 +876,40 @@ export function ChatPage() {
       hostProbeHarness !== null &&
       sessionModelOptions.length === 0,
   );
-  // Identity-stable on purpose: substitute only when the host rows actually
-  // exist, else keep the store's own array reference — a fresh [] here would
-  // re-render every options consumer (composer, gear, agent-info popover) on
-  // each streaming/liveness tick.
+  // A launching sandbox has no host to probe until it is bound, so fall back to
+  // its provider's preview for the harnesses sandboxes run.
+  const sandboxPreviewHarness =
+    fallbackPickerKind === "claude"
+      ? "claude-native"
+      : fallbackPickerKind === "codex"
+        ? "codex-native"
+        : fallbackPickerKind === "pi"
+          ? "pi-native"
+          : null;
+  const sandboxPreviewOptions = useSandboxLaunchModelOptions(
+    sandboxStatus,
+    activeSession?.hostId ?? null,
+    sandboxPreviewHarness,
+    activeSession?.agentId ?? null,
+    !activeSession?.inferenceConfigured &&
+      sandboxPreviewHarness !== null &&
+      sessionModelOptions.length === 0,
+  );
+  const preLaunchOptions =
+    hostProbeOptions != null && hostProbeOptions.length > 0
+      ? hostProbeOptions
+      : sandboxPreviewOptions;
+  // Keep the store's array reference unless pre-launch rows exist: a fresh []
+  // would re-render every options consumer on each streaming/liveness tick.
   const codexModelOptions =
     !activeSession?.inferenceConfigured &&
     sessionModelOptions.length === 0 &&
-    hostProbeOptions != null &&
-    hostProbeOptions.length > 0
-      ? hostProbeOptions
+    preLaunchOptions != null &&
+    preLaunchOptions.length > 0
+      ? preLaunchOptions
       : sessionModelOptions;
+  const modelsFromLaunchPreview =
+    sandboxPreviewOptions !== undefined && codexModelOptions === sandboxPreviewOptions;
 
   // The session is unreachable and a message can't wake it: the host is
   // offline (host-bound) or it isn't host-bound and the runner is down.
@@ -893,10 +934,12 @@ export function ChatPage() {
     urlConvId,
     conversationsData !== undefined,
   );
+  const reconnectHostId = activeSession?.hostId ?? activeConv?.host_id ?? null;
   const { reconnect, dialogOpen, setDialogOpen, localReconnect, arcaReconnect } =
     useSessionReconnect({
       sessionId: urlConvId ?? null,
-      hostId: activeSession?.hostId ?? activeConv?.host_id ?? null,
+      hostId: reconnectHostId,
+      hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
       isOwner: isOwnerLevel(permissionLevel),
     });
 
@@ -1139,6 +1182,7 @@ export function ChatPage() {
       isWorking={isWorking}
       showsWorking={showsWorking}
       runnerOnline={runnerOnline}
+      lastTaskError={failedSessionLastError(activeSession)}
       liveness={liveness}
       agentsError={agentsError}
       disabled={!agentId || agentsError !== null}
@@ -1161,6 +1205,7 @@ export function ChatPage() {
       codexModelOptions={codexModelOptions}
       inferenceConfigured={activeSession?.inferenceConfigured}
       inferenceError={activeSession?.inferenceError}
+      modelsFromLaunchPreview={modelsFromLaunchPreview}
       modelLabelOptions={sessionModelOptions}
       showCodexPlanMode={shouldShowCodexPlanModeControl(capabilitySource)}
       showClaudePermissionMode={shouldShowPermissionModeControl(capabilitySource)}
@@ -1283,6 +1328,8 @@ interface MainAgentSurfaceProps {
    * this is false and uses it to show the stopped-harness resume state.
    */
   runnerOnline: boolean | undefined;
+  /** Active session's last task error when it has failed; forwarded to MainTerminalView so the stopped-terminal state shows why. */
+  lastTaskError?: Session["lastTaskError"];
   /** Derived open-session liveness — drives the reconnect hint/banner. */
   liveness: SessionLiveness;
   agentsError: unknown;
@@ -1319,6 +1366,8 @@ interface MainAgentSurfaceProps {
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
+  /** The rows are a launching sandbox's preview, so a pick has no runner to confirm it. */
+  modelsFromLaunchPreview?: boolean;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -1345,6 +1394,17 @@ interface MainAgentSurfaceProps {
   subAgentLabel: string | null;
   /** The session's ``omnigent.wrapper`` label; see ``ComposerProps``. */
   wrapperLabel: string | null;
+}
+
+/**
+ * The failure cause to surface on a session's terminal/stopped UI, or null.
+ * Only a failed session exposes it, mirroring the chat error pill; a stale
+ * error left on a session that has since recovered stays hidden.
+ */
+export function failedSessionLastError(
+  session: Pick<Session, "status" | "lastTaskError"> | null | undefined,
+): Session["lastTaskError"] | null {
+  return session?.status === "failed" ? (session.lastTaskError ?? null) : null;
 }
 
 /**
@@ -1450,6 +1510,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   isWorking,
   showsWorking,
   runnerOnline,
+  lastTaskError,
   liveness,
   agentsError,
   disabled,
@@ -1472,6 +1533,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
   codexModelOptions,
   inferenceConfigured,
   inferenceError,
+  modelsFromLaunchPreview,
   modelLabelOptions,
   showCodexPlanMode,
   showClaudePermissionMode = false,
@@ -1710,10 +1772,12 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
           initialTerminalKey={isActive ? terminalFirst?.terminalViewKey : null}
           visible={isShown}
           runnerOnline={isActive ? runnerOnline : undefined}
+          lastTaskError={isActive ? lastTaskError : undefined}
           onResume={isActive ? handleTerminalResume : undefined}
           sandboxOffline={isActive && liveness.kind === "host_asleep"}
           onSurfaceElement={isActive ? setTerminalSurfaceEl : undefined}
           readOnly={entry.readOnly}
+          splittable
         />
         {isShown && (
           <ConnectionIndicator liveness={liveness} onShowReconnectHelp={onShowReconnectHelp} />
@@ -1750,16 +1814,20 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             sandboxLaunching={sandboxLaunching}
             spacerMeasureRef={spacerMeasureRef}
           />
-          {/* Floating reply button — scoped to the conversation container. */}
-          <SelectionPopup
-            containerRef={conversationRef}
-            onReply={(text) => composerRef.current?.appendReplyQuote(text)}
-            onAskInSideChat={
-              supportsSideChat(selectionSessionHarness)
-                ? (text) => composerRef.current?.startSideChat(text)
-                : undefined
-            }
-          />
+          {/* Floating reply button — scoped to the conversation container.
+          Withheld when the composer refuses quotes (read-only grant or a
+          structurally non-interactive session), as SideChatPane does. */}
+          {!isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason) && (
+            <SelectionPopup
+              containerRef={conversationRef}
+              onReply={(text) => composerRef.current?.appendReplyQuote(text)}
+              onAskInSideChat={
+                supportsSideChat(selectionSessionHarness)
+                  ? (text) => composerRef.current?.startSideChat(text)
+                  : undefined
+              }
+            />
+          )}
 
           <Composer
             ref={composerRef}
@@ -1782,6 +1850,7 @@ const MainAgentSurface = memo(function MainAgentSurfaceImpl({
             codexModelOptions={codexModelOptions}
             inferenceConfigured={inferenceConfigured}
             inferenceError={inferenceError}
+            modelsFromLaunchPreview={modelsFromLaunchPreview}
             modelLabelOptions={modelLabelOptions}
             showCodexPlanMode={showCodexPlanMode}
             showClaudePermissionMode={showClaudePermissionMode}
@@ -1910,6 +1979,8 @@ interface ComposerProps {
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
+  /** The rows are a launching sandbox's preview, so a pick has no runner to confirm it. */
+  modelsFromLaunchPreview?: boolean;
   /** Session catalog for display labels; host-probe rows remain menu-only. */
   modelLabelOptions?: readonly NativeModelOption[];
   /** Show the Codex Plan-mode toggle. */
@@ -2007,12 +2078,16 @@ export function buildSlashCommandMap(
   showSide = false,
   skillPrefix: "/" | "$" = "/",
   supportsModelReset = false,
+  showMcp = false,
+  showClear = false,
 ): Record<string, string> {
   const m: Record<string, string> = {};
   for (const [name, description] of Object.entries(BUILTIN_SLASH_COMMANDS)) {
     if (name === "/effort" && !showEffort) continue;
     if (name === "/model" && !showModel) continue;
     if (name === "/compact" && !showCompact) continue;
+    if (name === "/mcp" && !showMcp) continue;
+    if (name === "/clear" && !showClear) continue;
     // /btw is a Claude Code CLI built-in — only offer it on claude-native.
     if (name === "/btw" && !showBtw) continue;
     // /side is a Codex CLI built-in (ephemeral fork) — only offer it on codex-native.
@@ -2212,6 +2287,19 @@ function SubagentComposerTray({ label }: { label: string }) {
 }
 
 /**
+ * Whether the composer refuses input: a read-only grant or a structurally
+ * non-interactive session. A temporary send block keeps the level-1 fallback
+ * of a still-starting client-only conversation editable.
+ */
+export function isComposerReadOnly(
+  permissionLevel: number | null,
+  readOnlyReason: string | null,
+  sendDisabledReason: string | null,
+): boolean {
+  return readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
+}
+
+/**
  * Pill above the composer tallying running background tasks (a dev server, a
  * background shell, a sub-agent), shown independently of the "Working…" shimmer.
  *
@@ -2255,6 +2343,7 @@ function ComposerImpl(
     codexModelOptions,
     inferenceConfigured,
     inferenceError,
+    modelsFromLaunchPreview,
     modelLabelOptions = codexModelOptions,
     showCodexPlanMode,
     showClaudePermissionMode = false,
@@ -2369,8 +2458,7 @@ function ComposerImpl(
   // is structurally non-interactive (``readOnlyReason``). The
   // structural reason takes priority for the placeholder text since it
   // explains *why* this specific row can't receive input.
-  const isReadOnly =
-    readOnlyReason !== null || (permissionLevel === 1 && sendDisabledReason === null);
+  const isReadOnly = isComposerReadOnly(permissionLevel, readOnlyReason, sendDisabledReason);
   // A pending elicitation addressed to this session parks the turn
   // server-side (the runner blocks on the verdict Future), so a message
   // sent now would sit queued and unread until the card is answered —
@@ -2394,6 +2482,7 @@ function ComposerImpl(
   // Harness/agent identity shown in the status tray below the card, separate
   // from the composer's read-only model/effort label.
   const sessionHarness = useChatStore((s) => s.sessionHarness);
+  const nativeTerminalSession = useChatStore((s) => s.isNativeTerminalSession);
   const subAgentName = useChatStore((s) => s.subAgentName);
   const brainHarnessLabels = useBrainHarnessLabels();
   const harnessLabel = composerHarnessLabel(
@@ -2418,7 +2507,7 @@ function ComposerImpl(
   const conversationId = useChatStore((s) => s.conversationId);
   const queuedMessages = useChatStore((s) => s.queuedMessages);
   const sessionStatus = useChatStore((s) => s.sessionStatus);
-  const flushBoundAgentId = useChatStore((s) => s.boundAgentId);
+  const boundAgentId = useChatStore((s) => s.boundAgentId);
   const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
   const dequeueMessage = useChatStore((s) => s.dequeueMessage);
   const steerMessage = useChatStore((s) => s.steerMessage);
@@ -2441,7 +2530,7 @@ function ComposerImpl(
     sessionStatus,
     queuedMessages,
     conversationId,
-    flushBoundAgentId,
+    boundAgentId,
     unreachable,
     maybeFlushQueuedHead,
   ]);
@@ -2451,6 +2540,43 @@ function ComposerImpl(
   // A send held while the host was offline goes out once the host is back.
   useReleaseHostHeldSends(composerSessionId);
   const { session: composerSession } = useSession(composerSessionId);
+  const mcpPanelRequested = composerSessionId !== null && value.trim() === "/mcp";
+  const nativeMcpHarness = nativeCodingAgentForHarness(sessionHarness)?.key;
+  const hostMcpHarness =
+    nativeMcpHarness !== undefined && isBrandHarness(nativeMcpHarness) ? nativeMcpHarness : null;
+  const inheritedHostId = useSyncExternalStore(subscribeSessionHostChanges, () =>
+    composerSessionId === null ? null : getSessionHost(composerSessionId),
+  );
+  const hostMcpRoutingId =
+    sessionRoutingHostId(composerSession?.hostId, composerSession?.labels) ?? inheritedHostId;
+  // Poll while a host server awaits sign-in: the user completes it elsewhere.
+  const hostMcpQuery = useHostMcpServers(
+    hostMcpRoutingId,
+    mcpPanelRequested && hostMcpHarness !== null,
+    useCallback(
+      (servers: HostMcpServer[] | undefined) =>
+        servers?.some(
+          (server) =>
+            server.harness === hostMcpHarness && server.auth_status === "sign_in_required",
+        )
+          ? HOST_MCP_SIGN_IN_POLL_MS
+          : false,
+      [hostMcpHarness],
+    ),
+  );
+  const hostMcpStatus =
+    hostMcpHarness === null
+      ? undefined
+      : hostMcpRoutingId === null
+        ? "Host MCP servers unavailable: this session has no known host."
+        : hostMcpQuery.isLoading
+          ? "Loading MCP servers…"
+          : hostMcpQuery.isError
+            ? "Couldn’t load MCP servers from this session’s host."
+            : undefined;
+  const mcpSettingsHref =
+    `/settings/harnesses${nativeMcpHarness ? `/${sessionHarness}` : ""}` +
+    (hostMcpRoutingId ? `?host=${encodeURIComponent(hostMcpRoutingId)}` : "");
   const composerBranch = useChatStore((s) => s.gitBranch);
   const claudePermissionMode = useChatStore((s) => s.claudePermissionMode);
   const codexApprovalMode = useChatStore((s) => s.codexApprovalMode);
@@ -2503,8 +2629,26 @@ function ComposerImpl(
         claudePermissionMode)
       : claudePermissionModeLabel(claudePermissionMode)
     : codexApprovalModeLabel(codexApprovalMode);
-  const changePermission = async (mode: string) => {
-    if (isReadOnly || unreachable || configBusyRef.current) return;
+  const selectedPermissionMode = showClaudePermissionMode
+    ? claudePermissionMode
+    : codexApprovalMode;
+  const permissionControlInteractive =
+    (showClaudePermissionMode || showCodexApprovalMode) &&
+    !isReadOnly &&
+    !unreachable &&
+    isOwnerLevel(permissionLevel);
+  // After a Shift+Tab press that didn't land (refused, downgraded or failed),
+  // the next press continues past that mode instead of retrying it.
+  const cycleCursorRef = useRef<{ sessionId: string | null; from: string; past: string } | null>(
+    null,
+  );
+  const currentPermissionMode = (): string => {
+    const state = useChatStore.getState();
+    return showClaudePermissionMode ? state.claudePermissionMode : state.codexApprovalMode;
+  };
+  /** Applies *mode*; resolves whether the session landed on it. */
+  const changePermission = async (mode: string): Promise<boolean> => {
+    if (isReadOnly || unreachable || configBusyRef.current) return false;
     configBusyRef.current = true;
     setConfigBusy(true);
     const sourceSessionId = useChatStore.getState().conversationId;
@@ -2512,13 +2656,50 @@ function ComposerImpl(
       const store = useChatStore.getState();
       if (showClaudePermissionMode) await store.setClaudePermissionMode(mode);
       else if (showCodexApprovalMode) await store.setCodexApprovalMode(mode);
+      if (useChatStore.getState().conversationId !== sourceSessionId) return false;
+      // The store reconciles to the mode the server confirms the session reached.
+      const landed = currentPermissionMode() === mode;
+      if (landed) cycleCursorRef.current = null;
+      return landed;
     } catch (error) {
       if (useChatStore.getState().conversationId === sourceSessionId)
         setCommandError(error instanceof Error ? error.message : "Unable to change permissions");
+      return false;
     } finally {
       configBusyRef.current = false;
       setConfigBusy(false);
     }
+  };
+  // Leaving a mode the chip can't switch back to (e.g. Codex read-only) stays a menu pick.
+  const isSwitchableMode = (mode: string) =>
+    permissionOptions.some((option) => option.value === mode);
+  const nextFromSelected =
+    permissionControlInteractive && !configBusy && isSwitchableMode(selectedPermissionMode)
+      ? nextCycledPermissionMode(permissionOptions, selectedPermissionMode)
+      : null;
+  /** Shift+Tab: step to the next permission mode. Returns whether it took the key. */
+  const cyclePermissionMode = (): boolean => {
+    if (!permissionControlInteractive) return false;
+    // Hold the key while a change is in flight so focus doesn't jump away.
+    if (configBusyRef.current) return true;
+    const sessionId = useChatStore.getState().conversationId;
+    // Read the store, not the render: a change may have landed since the last render.
+    const selected = currentPermissionMode();
+    if (!isSwitchableMode(selected)) return false;
+    const cursor = cycleCursorRef.current;
+    const resume = cursor?.sessionId === sessionId && cursor.from === selected ? cursor.past : null;
+    const resumed =
+      resume === null
+        ? null
+        : nextCycledPermissionMode(permissionOptions, resume, new Set([selected]));
+    // With nothing else to move to, retry the failed mode.
+    const next = resumed ?? nextCycledPermissionMode(permissionOptions, selected);
+    if (next === null) return false;
+    void changePermission(next).then((landed) => {
+      if (!landed && useChatStore.getState().conversationId === sessionId)
+        cycleCursorRef.current = { sessionId, from: currentPermissionMode(), past: next };
+    });
+    return true;
   };
   useEffect(() => setGoalDialogOpen(false), [conversationId]);
   const { goal, setGoal: setGoalState } = useGoalState(
@@ -2579,6 +2760,7 @@ function ComposerImpl(
     onPaste,
     clearError,
     clear: clearAttachments,
+    accept: fileAccept,
   } = useComposerAttachments({
     onAccepted: () => {
       dirtyRef.current = true;
@@ -2677,6 +2859,9 @@ function ComposerImpl(
   // for claude-sdk, whose runner sends /compact to the live SDK client to
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
+  // /clear runs the harness's own /clear in the session terminal, which moves
+  // the terminal onto a fresh session the view then follows.
+  const showClear = sessionHarness === "claude-native" || sessionHarness === "codex-native";
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -2697,6 +2882,8 @@ function ComposerImpl(
         showSide,
         skillPrefix,
         supportsModelReset,
+        composerSessionId !== null,
+        showClear,
       ),
     [
       skills,
@@ -2707,6 +2894,8 @@ function ComposerImpl(
       showSide,
       skillPrefix,
       supportsModelReset,
+      composerSessionId,
+      showClear,
     ],
   );
   const slashCommandNames = useMemo(() => Object.keys(slashCommands), [slashCommands]);
@@ -2855,49 +3044,19 @@ function ComposerImpl(
     // conversation's draft and wrongly conclude the user is mid-sentence,
     // dropping the failed message on the way back to the session it failed in.
     if (settledConversationId !== conversationId) return;
-    // The send may have proven delivered since the render that scheduled this
-    // effect: its committed item landed under the send's stable id (see
-    // `retractDeliveredSendDraft`), so restoring now would prime a duplicate.
-    // Not so for a send the server refused: its item is persisted too, but the
-    // runner never took it, so the text must come back for a resend.
-    if (committedItemProvesDelivery(useChatStore.getState().blocks, failedSendDraft)) {
-      useChatStore.setState({ failedSendDraft: null });
-      return;
-    }
-    useChatStore.setState({
-      failedSendDraft: null,
-      pendingRetryStableId: failedSendDraft.stableId ?? null,
-    });
-    // The user started something new while the send was in flight — their
-    // in-progress text wins over a clobbering restore.
-    if (valueRef.current.trim() !== "" || filesRef.current.length > 0) {
-      useChatStore.setState({ pendingRetryStableId: null });
-      return;
-    }
-    pendingFailedSendRestore.current = failedSendDraft.stableId
-      ? { stableId: failedSendDraft.stableId, draft }
+    // Re-check live delivery and preserve any newer input before consuming the failure.
+    const failed = takeFailedSendDraft(
+      failedSendDraft.conversationId,
+      valueRef.current.trim() !== "" || filesRef.current.length > 0,
+    );
+    if (!failed) return;
+    pendingFailedSendRestore.current = failed.stableId
+      ? { stableId: failed.stableId, draft }
       : null;
-    replaceText(failedSendDraft.text, failedSendDraft.replyDraft);
+    replaceText(failed.text, failed.replyDraft);
     textareaRef.current = tailTextareaRef.current;
     dirtyRef.current = true;
-    if (failedSendDraft.files.length > 0)
-      attachmentsRef.current.replaceFiles(failedSendDraft.files);
-    // Remember what was restored: if the "failed" send proves delivered (its
-    // stable id shows up as a committed item), the retraction effect below
-    // empties the composer instead of priming a duplicate send.
-    if (failedSendDraft.stableId) {
-      useChatStore.setState({
-        restoredSendDraft: {
-          conversationId: failedSendDraft.conversationId,
-          stableId: failedSendDraft.stableId,
-          text: failedSendDraft.text,
-          files: failedSendDraft.files,
-          replyDraft: failedSendDraft.replyDraft,
-          serverRefused: failedSendDraft.serverRefused,
-          delivered: false,
-        },
-      });
-    }
+    if (failed.files.length > 0) attachmentsRef.current.replaceFiles(failed.files);
     if (!isMobileRef.current) textareaRef.current?.focus();
   }, [failedSendDraft, conversationId, settledConversationId, replaceText, draft]);
 
@@ -2943,6 +3102,26 @@ function ComposerImpl(
         setValue("");
         setCommandError(null);
         onNewSession();
+        return true;
+      }
+      case "/clear": {
+        if (!showClear) {
+          setCommandError("/clear is not supported for this agent type");
+          return true;
+        }
+        if (arg) {
+          setCommandError("/clear does not accept arguments");
+          return true;
+        }
+        dirtyRef.current = true;
+        setValue("");
+        setCommandError(null);
+        void useChatStore
+          .getState()
+          .clearContext()
+          .catch((err: unknown) => {
+            setCommandError(err instanceof Error ? err.message : "Clear failed");
+          });
         return true;
       }
       case "/compact": {
@@ -3089,6 +3268,9 @@ function ComposerImpl(
         setCommandError(lines.join("\n"));
         return true;
       }
+      case "/mcp":
+        if (arg) setCommandError("Usage: /mcp");
+        return true;
       case "/help": {
         const lines = Object.entries(slashCommands).map(([name, desc]) => `${name} — ${desc}`);
         setCommandError(lines.join("\n"));
@@ -3110,6 +3292,11 @@ function ComposerImpl(
 
   // Skills insert at the caret; Enter/click executes standalone no-argument built-ins.
   const applyMenuSelection = (cmd: string) => {
+    if (cmd === "/mcp" && !slashCompletion.inline) {
+      setValue("/mcp");
+      dirtyRef.current = true;
+      return;
+    }
     if (slashCompletion.inline || slashCommandsWithArgs.has(cmd)) {
       completeMenuSelection(cmd);
     } else {
@@ -3129,11 +3316,107 @@ function ComposerImpl(
     [skills, skillPrefix],
   );
   const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
+  const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
+  const composerServerInfo = useServerInfo();
+  const registryEnabled =
+    composerServerInfo !== "loading" && !!composerServerInfo.enabled_connections?.includes("mcp");
+  const hasRegistryServers =
+    registryEnabled &&
+    (selectedAgent?.mcp_servers ?? []).some((server) => server.transport === "registry");
+  // Load account state only while `/mcp` shows registry rows.
+  const registryCatalog = useMcpRegistryCatalog(mcpPanelRequested && hasRegistryServers);
+  const registrySignIn = useRegistrySignIn(registryCatalog.refresh);
+  const { signIn: signInToRegistryService, clearError: clearRegistrySignInError } = registrySignIn;
+  const onMcpSignIn = useCallback(
+    (name: string) => {
+      const service = registryCatalog.services.find((s) => s.id === name);
+      if (service) void signInToRegistryService(service);
+    },
+    [registryCatalog.services, signInToRegistryService],
+  );
+  // Both can be true at once (an unreachable host and an unreadable catalog).
+  const mcpServersStatus =
+    [
+      hostMcpStatus,
+      hasRegistryServers && registryCatalog.error
+        ? "Couldn’t check MCP service connections."
+        : undefined,
+    ]
+      .filter(Boolean)
+      .join(" ") || undefined;
+  const mcpServers = useMemo(() => {
+    const byName = new Map<string, McpServerRow>(
+      (hostMcpQuery.data ?? [])
+        .filter((server) => server.harness === hostMcpHarness)
+        .map((server) => [
+          server.name,
+          {
+            name: server.name,
+            description:
+              [server.plugin && `${server.plugin} plugin`, server.url_host]
+                .filter(Boolean)
+                .join(" · ") || undefined,
+            connection:
+              server.auth_status === "connected"
+                ? "connected"
+                : server.auth_status === "sign_in_required"
+                  ? "sign-in-required"
+                  : undefined,
+            // No URL means the state is still worth showing, with nothing to click.
+            // The scheme is enforced host-side and again at the frame decoder; this
+            // is the last gate before it becomes an href.
+            signIn: HOST_SIGN_IN_URL_RE.test(server.sign_in_url ?? "")
+              ? { kind: "url", url: server.sign_in_url! }
+              : undefined,
+          },
+        ]),
+    );
+    const catalogLoaded = !registryCatalog.loading && !registryCatalog.error;
+    for (const server of selectedAgent?.mcp_servers ?? []) {
+      // A shared name is not a shared endpoint, so an agent server claims none of
+      // the host's account state: its Sign in could point at the wrong service.
+      const row: McpServerRow = {
+        name: server.name,
+        description: server.description ?? byName.get(server.name)?.description,
+      };
+      // Only a read from this open: a stale row would offer a needless popup.
+      if (hasRegistryServers && server.transport === "registry" && catalogLoaded) {
+        const service = registryCatalog.services.find((s) => s.id === server.name);
+        if (service) {
+          row.description = service.description || row.description;
+          row.connection = service.connected ? "connected" : "sign-in-required";
+          if (!service.connected) {
+            // A token or workspace URL has to be typed, which the panel has no room for.
+            row.signIn =
+              service.auth === "bearer" || service.auth === "databricks"
+                ? { kind: "settings", href: "/settings/mcp" }
+                : { kind: "inline" };
+          }
+        } else {
+          row.connection = "unavailable";
+        }
+      }
+      byName.set(server.name, row);
+    }
+    return [...byName.values()];
+  }, [
+    hasRegistryServers,
+    hostMcpHarness,
+    hostMcpQuery.data,
+    registryCatalog.error,
+    registryCatalog.loading,
+    registryCatalog.services,
+    selectedAgent?.mcp_servers,
+  ]);
+
+  const slashCompletionCommands = mcpPanelRequested
+    ? { "/mcp": BUILTIN_SLASH_COMMANDS["/mcp"]! }
+    : slashCommands;
 
   // Complete the token at the caret; inline suggestions only insert skills.
   const slashCompletion = useSlashCompletion({
     text: value,
-    commands: slashCommands,
+    commands: slashCompletionCommands,
     skills: skillCommands,
     labels: skillLabels,
     textareaRef,
@@ -3147,6 +3430,12 @@ function ComposerImpl(
     onTabComplete: completeMenuSelection,
     clearText: () => setValue(""),
   });
+  const showMcpServers = mcpPanelRequested && !slashCompletion.inline;
+  // Clear on both edges: a popup that rejects after the panel closes would
+  // otherwise greet the next open with a stale message.
+  useEffect(() => {
+    clearRegistrySignInError();
+  }, [showMcpServers, clearRegistrySignInError]);
 
   // Auto-grow the textarea from 1 row up to 10 rows, then let it scroll.
   // Growth stays in the flex column so the transcript viewport ends where the
@@ -3200,7 +3489,7 @@ function ComposerImpl(
       if (target?.parentId === sourceId) {
         store.updateSideChatComposer(target.childId, (current) => ({
           ...current,
-          quotes: [...(current.quotes ?? []), selectedText],
+          ...appendReplyQuote(current, selectedText),
         }));
       } else {
         store.openSideChatWithDraft(newPendingSideChatId(), selectedText, sourceId);
@@ -3449,6 +3738,11 @@ function ComposerImpl(
     // submission.
     if (slashCompletion.handleKey(e, { shouldPreferSendOverCompletion })) return;
 
+    if (isPermissionModeCycleKey(e) && cyclePermissionMode()) {
+      e.preventDefault();
+      return;
+    }
+
     // Mobile Enter behavior takes precedence over this desktop preference:
     // software-keyboard Enter inserts a newline and Send remains an explicit tap.
     if (shouldSubmitFromKeyboard) {
@@ -3553,7 +3847,7 @@ function ComposerImpl(
         ref={fileInputRef}
         type="file"
         multiple
-        accept="image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3"
+        accept={fileAccept}
         className="hidden"
         onChange={(e) => {
           if (e.target.files) {
@@ -3671,6 +3965,7 @@ function ComposerImpl(
             if (backdropRef.current) backdropRef.current.scrollTop = e.currentTarget.scrollTop;
           },
           "aria-label": "Message the agent",
+          "aria-keyshortcuts": nextFromSelected === null ? undefined : "Shift+Tab",
           placeholder: composerLockedByBtw
             ? "Side chat open — press Esc to close"
             : readOnlyReason !== null
@@ -3740,6 +4035,17 @@ function ComposerImpl(
                   labels={slashCompletion.labels}
                   skillsStatus={skillsStatus}
                   onRetrySkills={() => void refreshSkills()}
+                  showMcpServers={showMcpServers}
+                  mcpServers={mcpServers}
+                  mcpServersStatus={mcpServersStatus}
+                  mcpSettingsHref={mcpSettingsHref}
+                  onMcpSignIn={onMcpSignIn}
+                  mcpAuthorizingName={registrySignIn.authorizing}
+                  mcpSignInError={
+                    registrySignIn.error
+                      ? { name: registrySignIn.error.id, message: registrySignIn.error.message }
+                      : null
+                  }
                 />
               )}
               {/* "@"-file-mention browser — native coding-agent sessions only.
@@ -3892,13 +4198,9 @@ function ComposerImpl(
                   label="Permission mode"
                   value={permissionLabel || "Permission mode"}
                   harness={sessionHarness}
-                  selectedValue={
-                    showClaudePermissionMode ? claudePermissionMode : codexApprovalMode
-                  }
+                  selectedValue={selectedPermissionMode}
                   options={permissionOptions}
-                  disabled={
-                    isReadOnly || unreachable || configBusy || !isOwnerLevel(permissionLevel)
-                  }
+                  disabled={!permissionControlInteractive || configBusy}
                   disabledReason={
                     isOwnerLevel(permissionLevel)
                       ? undefined
@@ -3931,9 +4233,11 @@ function ComposerImpl(
                   codexModelOptions={codexModelOptions}
                   inferenceConfigured={inferenceConfigured}
                   inferenceError={inferenceError}
+                  modelsFromLaunchPreview={modelsFromLaunchPreview}
                   modelLabelOptions={modelLabelOptions}
                   modelLabelHostId={composerSession?.hostId}
                   costRoutingEligible={costRoutingEligible}
+                  modelPickWakesSession={nativeTerminalSession && runnerOnline === false}
                   // Config changes persist server-side and apply on the next
                   // wake/turn (the runner forward is best-effort), so the gear
                   // stays live wherever a message could be sent — including
@@ -4570,9 +4874,11 @@ function SessionHarnessPicker({
   codexModelOptions,
   inferenceConfigured,
   inferenceError,
+  modelsFromLaunchPreview,
   modelLabelOptions,
   modelLabelHostId,
   costRoutingEligible,
+  modelPickWakesSession,
   disabled,
   openNonce = 0,
 }: {
@@ -4589,15 +4895,19 @@ function SessionHarnessPicker({
   codexModelOptions: readonly NativeModelOption[];
   inferenceConfigured?: boolean;
   inferenceError?: string | null;
+  modelsFromLaunchPreview?: boolean;
   modelLabelOptions: readonly NativeModelOption[];
   modelLabelHostId: string | null | undefined;
   costRoutingEligible: boolean;
+  /** A model pick must first wake this native session's runner, which can take a while. */
+  modelPickWakesSession: boolean;
   disabled: boolean;
   openNonce?: number;
 }) {
   const isMobile = useIsMobileViewport();
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
+  const [startingSession, setStartingSession] = useState(false);
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
@@ -4669,10 +4979,11 @@ function SessionHarnessPicker({
     setMenuOpen(false);
     setConfigOpen(false);
   }, [conversationId]);
-  const apply = async (change: () => Promise<unknown>) => {
+  const apply = async (change: () => Promise<unknown>, wakesSession = false) => {
     if (disabled || busyRef.current || pendingModelChange !== null) return;
     busyRef.current = true;
     setBusy(true);
+    setStartingSession(wakesSession);
     try {
       await change();
     } catch {
@@ -4680,6 +4991,7 @@ function SessionHarnessPicker({
     } finally {
       busyRef.current = false;
       setBusy(false);
+      setStartingSession(false);
     }
   };
   const selectModel = (modelId: string | null) =>
@@ -4687,7 +4999,8 @@ function SessionHarnessPicker({
       const store = useChatStore.getState();
       const sourceSessionId = store.conversationId;
       await store.setModel(modelId, {
-        expectConfirmation: modelPickerKind === "claude" || modelPickerKind === "codex",
+        expectConfirmation:
+          (modelPickerKind === "claude" || modelPickerKind === "codex") && !modelsFromLaunchPreview,
       });
       if (useChatStore.getState().conversationId !== sourceSessionId) return;
       if (
@@ -4702,7 +5015,7 @@ function SessionHarnessPicker({
         useChatStore.getState().conversationId === sourceSessionId
       )
         await store.setCostControlMode("off");
-    });
+    }, modelPickWakesSession);
   // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
   // baked in, so it carries no separate reasoning effort.
   const composerFusionOption = fusionOption(modelOptions);
@@ -4715,9 +5028,18 @@ function SessionHarnessPicker({
       await store.setModel(modelUid, { expectConfirmation: false });
       if (useChatStore.getState().conversationId !== sourceSessionId) return;
       if (selectedEffort !== null) await store.setEffort(null);
-    });
+    }, modelPickWakesSession);
   const configContent = (
     <>
+      {startingSession && (
+        <div
+          className="px-2 py-1 text-xs whitespace-normal text-muted-foreground"
+          role="status"
+          data-testid="composer-agent-starting-session"
+        >
+          Starting the session to switch models…
+        </div>
+      )}
       {costRoutingEligible && showModels && (
         <>
           <DropdownMenuItem

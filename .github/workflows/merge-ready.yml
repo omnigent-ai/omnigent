@@ -1,9 +1,10 @@
 name: Merge Ready
+run-name: "${{ github.event_name == 'workflow_dispatch' && format('Merge Ready #{0} ({1})', inputs.pr, inputs.sha) || '' }}"
 
 # Posts the "Merge Ready" commit status on the PR head SHA -- the single
-# required branch-protection check, backed by the REQUIRED list inside
-# this workflow. Triggers: `/merge` comment (write-access commenter only),
-# `pull_request_target` labeled (acts only with `automerge`),
+# readiness branch-protection check, separate from Maintainer Approval.
+# Triggers: `/merge` comment (write-access commenter only),
+# `pull_request_target` label changes,
 # `workflow_run` on CI completion (same-repo AND fork PRs -- ctx resolves the
 # PR from the head SHA), and `workflow_dispatch` (programmatic/manual
 # re-evaluation of one PR). Posted via the REST API (not the job's implicit
@@ -20,14 +21,15 @@ name: Merge Ready
 # (branch protection has enforce_admins=false).
 
 on:
-  # `labeled` only; `workflow_run` re-evaluates on CI completion for all PRs
+  # Label changes refresh automatic dependency eligibility; workflow_run
+  # re-evaluates on CI completion for all PRs
   # (same-repo and fork -- ctx resolves the PR from the head SHA).
   # pull_request_target (not pull_request) so this workflow always runs from
   # main -- a PR cannot modify the gate logic by editing this file.
   pull_request_target:
-    types: [labeled]
+    types: [labeled, unlabeled]
   workflow_run:
-    workflows: [PR Template, CI, Lint, Docker build, E2E UI Tests, E2E Tests, Integration Tests, UI Snapshot, web Tests, Android Bundle]
+    workflows: [PR Template, CI, Lint, Docker build, E2E UI Tests, E2E Tests, Integration Tests, UI Snapshot, web Tests, Android Bundle, Security Scan, Trivy CVE Scan, Windows (native), Maintainer Approval]
     types: [completed]
   check_run:
     types: [completed]
@@ -62,18 +64,28 @@ jobs:
       checks: read
       actions: read         # evaluate-checks.sh reads GET /actions/runs to classify missing checks
       statuses: write
-    # Fire on automerge label adds, PR CI workflow_run completions (same-repo
-    # and fork), DCO check_run completions, `/merge` comments, or a
+    # Fire on gate label changes, CI/approval completions (same-repo and fork),
+    # DCO check_run completions, `/merge` comments, or a
     # workflow_dispatch re-eval. Runs with no open PR (push to main, etc.) are
     # dropped by the ctx step.
     if: >-
       (
         github.event_name == 'pull_request_target' &&
-        github.event.label.name == 'automerge'
+        (
+          github.event.label.name == 'automerge' ||
+          github.event.label.name == 'hold-automerge' ||
+          github.event.label.name == 'skip-security-scan'
+        )
       ) ||
       (
         github.event_name == 'workflow_run' &&
-        github.event.workflow_run.event == 'pull_request'
+        (
+          github.event.workflow_run.event == 'pull_request' ||
+          (
+            github.event.workflow_run.name == 'Maintainer Approval' &&
+            github.event.workflow_run.event == 'pull_request_target'
+          )
+        )
       ) ||
       (
         github.event_name == 'check_run' &&
@@ -93,13 +105,19 @@ jobs:
         )
       )
     runs-on: ubuntu-latest
-    timeout-minutes: 5
+    timeout-minutes: 10
     steps:
       - name: Check out scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: main             # trusted gate scripts; never the PR head
-          sparse-checkout: .github/scripts/merge-ready
+          sparse-checkout: |
+            .github/scripts/merge-ready
+            .github/scripts/maintainer_approval.py
+            .github/scripts/dependabot_automerge.py
+            .github/scripts/dependabot_policy.py
+            .github/dependabot-automerge.json
+          sparse-checkout-cone-mode: false
           persist-credentials: false
 
       - name: Resolve PR + head SHA
@@ -172,15 +190,23 @@ jobs:
           echo "pr=$PR"   >> "$GITHUB_OUTPUT"
           echo "sha=$SHA" >> "$GITHUB_OUTPUT"
 
-      - name: Read PR labels
+      - name: Read PR labels and author
         id: labels
         if: steps.ctx.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           PR: ${{ steps.ctx.outputs.pr }}
+          DEPENDABOT_AUTOMERGE_MODE: ${{ vars.DEPENDABOT_AUTOMERGE_MODE || 'report' }}
         run: |
-          NAMES=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name')
+          PULL=$(gh api "repos/$REPO/pulls/$PR")
+          NAMES=$(jq -r '.labels[].name' <<<"$PULL")
+          AUTHOR=$(jq -r '.user.login' <<<"$PULL")
+          if [[ "$AUTHOR" == 'dependabot[bot]' && "$DEPENDABOT_AUTOMERGE_MODE" == 'merge' ]]; then
+            echo "dependency_required=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "dependency_required=false" >> "$GITHUB_OUTPUT"
+          fi
           if echo "$NAMES" | grep -qx "automerge"; then
             echo "automerge=true" >> "$GITHUB_OUTPUT"
           else
@@ -216,6 +242,34 @@ jobs:
           SHA: ${{ steps.ctx.outputs.sha }}
         run: bash .github/scripts/merge-ready/evaluate-checks.sh
 
+      - name: Install trusted policy parser
+        id: parser
+        if: steps.ctx.outputs.skip != 'true' && steps.labels.outputs.dependency_required == 'true'
+        continue-on-error: true
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dependabot-policy-env"
+          "$RUNNER_TEMP/dependabot-policy-env/bin/pip" install --disable-pip-version-check --only-binary=:all: PyYAML==6.0.3
+          echo "$RUNNER_TEMP/dependabot-policy-env/bin" >> "$GITHUB_PATH"
+
+      - name: Evaluate dependency reports
+        id: dependency
+        if: >-
+          steps.ctx.outputs.skip != 'true' &&
+          steps.labels.outputs.dependency_required == 'true'
+        continue-on-error: true
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ steps.ctx.outputs.pr }}
+          EXPECTED_HEAD: ${{ steps.ctx.outputs.sha }}
+          DEPENDABOT_AUTOMERGE_MODE: ${{ vars.DEPENDABOT_AUTOMERGE_MODE || 'report' }}
+        run: |
+          python3 .github/scripts/maintainer_approval.py \
+            --repository "$REPO" --pr-number "$PR" \
+            --trusted-author 'omni-resolve-agent[bot]' \
+            --trusted-successor 'omni-resolve-agent[bot]' \
+            --check-dependency-reports
+
       - name: Compute gate outcome
         id: gate
         if: >-
@@ -224,18 +278,18 @@ jobs:
         env:
           EVAL: ${{ steps.eval.outcome }}
           FAILED: ${{ steps.eval.outputs.failed }}
+          DEPENDENCY_EVAL: ${{ steps.dependency.outcome }}
+          DEPENDENCY_REQUIRED: ${{ steps.labels.outputs.dependency_required }}
+          POST_RED: ${{ steps.eligible.outputs.post_red }}
         run: bash .github/scripts/merge-ready/compute-gate.sh
 
-      # Skipped when post_red is false AND gate is red: leaves prior
-      # status untouched so partial CI doesn't paint red.
+      # Dependency failures always revoke an earlier green status, including
+      # native auto-merge PRs without the automerge label.
       - name: Post Merge Ready status on PR head SHA
         if: >-
           steps.ctx.outputs.skip != 'true' &&
           steps.eligible.outputs.run == 'true' &&
-          (
-            steps.eligible.outputs.post_red == 'true' ||
-            steps.gate.outputs.state == 'success'
-          )
+          steps.gate.outputs.post_status == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO:     ${{ github.repository }}

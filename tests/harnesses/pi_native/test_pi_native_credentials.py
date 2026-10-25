@@ -21,6 +21,7 @@ import pytest
 from omnigent.harnesses.pi_native import auth_command
 from omnigent.harnesses.pi_native import credentials as creds
 from omnigent.inner._proc import process_alive
+from omnigent.onboarding.providers import ModelInfo
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 
 
@@ -60,6 +61,7 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
         return "https://wkspc.example.com/"
 
     monkeypatch.setattr(databricks_executor, "_read_databrickscfg_host", _host)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -104,6 +106,7 @@ def test_databricks_unresolvable_credentials_sets_warning(
         raise OSError("refresh token is invalid")
 
     monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -111,6 +114,49 @@ def test_databricks_unresolvable_credentials_sets_warning(
     assert provider.credential_warning is not None
     assert "demo-staging" in provider.credential_warning
     assert "databricks auth login" in provider.credential_warning
+
+
+def test_databricks_sdk_probe_failure_with_working_auth_command_has_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK probe fails but Pi's apiKey command mints a token -> no false warning.
+
+    The SDK rejects a ``databricks`` wrapper shim on PATH that the apiKey
+    command runs fine, so the command decides whether the session works.
+    """
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    def _boom(profile: str | None):
+        raise OSError("databricks-sdk could not mint a token")
+
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+    commands: list[str] = []
+
+    def _auth(command: str) -> str:
+        commands.append(command)
+        return "cmd-tok"
+
+    monkeypatch.setattr(creds, "_run_auth_command", _auth)
+    fetched: list[tuple[str, str]] = []
+
+    def _fetch(host: str, token: str):
+        fetched.append((host, token))
+        return [], [], [], []
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _fetch)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is None
+    assert commands == [provider.api_key.removeprefix("!")]
+    assert fetched == [("https://wkspc.example.com", "cmd-tok")]
 
 
 def test_databricks_model_list_failure_has_no_warning(
@@ -962,7 +1008,54 @@ def test_to_models_config_shape() -> None:
     assert entry["api"] == "anthropic-messages"
     assert entry["apiKey"] == "!get-token"
     assert entry["authHeader"] is True
-    assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
+    assert entry["models"] == [
+        {
+            "id": "databricks-claude-sonnet-4-6",
+            "reasoning": True,
+            "compat": {"forceAdaptiveThinking": True},
+        }
+    ]
+
+
+def test_to_models_config_attributes_unity_gateway_providers() -> None:
+    """Gateway providers name Pi and Omnigent (plus ug for ug's own headers)."""
+    ug_provider: creds._PiProviderPayload = {
+        "baseUrl": "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1",
+        "apiKey": "!get-token",
+        "api": "openai-responses",
+        "models": [{"id": "system.ai.gpt-5-5"}],
+        "headers": {"User-Agent": "ucode/0.1.0 pi/0.80.0"},
+    }
+    other_provider: creds._PiProviderPayload = {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": "sk-test",
+        "api": "openai-completions",
+        "models": [{"id": "qwen/qwen3"}],
+    }
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://dbc-1.cloud.databricks.com/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="system.ai.claude-sonnet-5",
+        api_key="!get-token",
+        auth_header=True,
+        additional_providers={"ug-openai": ug_provider, "other": other_provider},
+    )
+
+    providers = provider.to_models_config()["providers"]
+
+    assert providers["omnigent"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
+    assert providers["ug-openai"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 pi/0.80.0",
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert "headers" not in providers["other"]
+    # The configured payload is shared across renders, so it stays unstamped.
+    assert ug_provider["headers"] == {"User-Agent": "ucode/0.1.0 pi/0.80.0"}
 
 
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
@@ -1995,6 +2088,7 @@ def test_model_override_beats_databricks_default(monkeypatch: pytest.MonkeyPatch
         "_read_databrickscfg_host",
         lambda profile: "https://wkspc.example.com/",
     )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(
         model="databricks-claude-opus-4-7", config_loader=_databricks_config
@@ -3924,6 +4018,7 @@ def test_connect_broker_managed_host_resolves_without_configured_provider(
             agent=lambda name: SimpleNamespace(model="system.ai.claude-sonnet-4-6")
         ),
     )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}})
 
@@ -4294,9 +4389,6 @@ def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
                 id="databricks-claude-fable-5-1", family="claude", metadata=capable
             ),
             model_catalog.ModelEntry(
-                id="databricks-gpt-6-luna", family="openai", metadata=capable
-            ),
-            model_catalog.ModelEntry(
                 id="databricks-gemini-3-8-flash", family="other", metadata=capable
             ),
             model_catalog.ModelEntry(
@@ -4310,6 +4402,14 @@ def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
         )
 
     monkeypatch.setattr(model_catalog, "catalog_model_entries", _catalog)
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_models",
+        lambda provider: (
+            [ModelInfo(name="gpt-6-luna", provider="openai", supports_reasoning=True)]
+            if provider == "openai"
+            else []
+        ),
+    )
 
     class _MockTransport(httpx.BaseTransport):
         def handle_request(self, request: httpx.Request) -> httpx.Response:

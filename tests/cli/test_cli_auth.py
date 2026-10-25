@@ -349,6 +349,50 @@ def test_store_databricks_org_id_preserves_session_token(token_dir) -> None:
     assert load_databricks_org_id(server) == "123"
 
 
+def test_pinned_org_id_wins_over_stored_record(token_dir, monkeypatch) -> None:
+    """A daemon pinned to one workspace ignores later ``?o=`` launches' records."""
+    from omnigent.cli_auth import (
+        PINNED_DATABRICKS_ORG_ENV_VAR,
+        databricks_request_headers,
+        load_databricks_org_id,
+        pin_databricks_org_id,
+        store_databricks_org_id,
+    )
+
+    server = "https://example.databricks.com/api/2.0/omnigent"
+    store_databricks_org_id(server, "222")
+    pin_databricks_org_id(server, "111")
+
+    assert load_databricks_org_id(server) == "111"
+    assert load_databricks_org_id(f"{server}/") == "111"
+    assert databricks_request_headers(server)["X-Databricks-Org-Id"] == "111"
+
+    monkeypatch.delenv(PINNED_DATABRICKS_ORG_ENV_VAR)
+    assert load_databricks_org_id(server) == "222"
+
+
+def test_pinned_org_id_never_applies_to_another_server(token_dir, monkeypatch) -> None:
+    """A pin is server-scoped, so another server keeps its own stored selector."""
+    from omnigent.cli_auth import (
+        PINNED_DATABRICKS_ORG_ENV_VAR,
+        databricks_request_headers,
+        load_databricks_org_id,
+        store_databricks_org_id,
+    )
+
+    other = "https://other.databricks.com/api/2.0/omnigent"
+    store_databricks_org_id(other, "333")
+    monkeypatch.setenv(
+        PINNED_DATABRICKS_ORG_ENV_VAR, "https://example.databricks.com/api/2.0/omnigent?o=111"
+    )
+
+    assert load_databricks_org_id(other) == "333"
+    assert databricks_request_headers(other)["X-Databricks-Org-Id"] == "333"
+    assert load_databricks_org_id("https://example.databricks.com/other") is None
+    monkeypatch.setenv(PINNED_DATABRICKS_ORG_ENV_VAR, "https://[?o=111")
+    assert load_databricks_org_id(other) == "333"
+
+
 def test_store_token_preserves_databricks_org_id(token_dir) -> None:
     """Refreshing a login session must retain remembered routing."""
     from omnigent.cli_auth import (

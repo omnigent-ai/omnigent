@@ -786,6 +786,16 @@ def _bench_policy_allow(_event: dict) -> dict:  # type: ignore[type-arg]
     return {"result": "allow"}
 
 
+# Loaded only by the isolated benchmark server's policy_modules config.
+POLICY_REGISTRY = [
+    {
+        "handler": "dev.benchmarks.omnigent.journeys._bench_policy_allow",
+        "kind": "callable",
+        "name": "Benchmark allow",
+    }
+]
+
+
 _POLICY_EVALUATE_PAYLOAD = {
     "event": {
         "type": "PHASE_TOOL_CALL",
@@ -856,10 +866,7 @@ async def _setup_policy_evaluate_session(env: BenchEnvironment) -> str:
 
     # Warm the spec + policy caches — the measured iteration is steady-state.
     for _ in range(2):
-        await env.client.post(
-            f"/v1/sessions/{session_id}/policies/evaluate",
-            json=_POLICY_EVALUATE_PAYLOAD,
-        )
+        await _measure_policy_evaluate(env, session_id)
 
     return session_id
 
@@ -872,6 +879,8 @@ async def _measure_policy_evaluate(env: BenchEnvironment, ctx: JourneyContext) -
         json=_POLICY_EVALUATE_PAYLOAD,
     )
     resp.raise_for_status()
+    if resp.json().get("result") != "POLICY_ACTION_ALLOW":
+        raise RuntimeError(f"Benchmark policy did not allow the tool call: {resp.text}")
 
 
 # ── CLI startup (omnigent polly against the local bench server) ──────────────

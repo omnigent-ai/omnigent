@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+import io
+import json
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -11,7 +13,7 @@ import click
 import httpx
 import pytest
 from omnigent_client import OmnigentError as ClientOmnigentError
-from omnigent_client import PaginatedList, QueryResult
+from omnigent_client import PaginatedList, QueryResult, RegisteredAgent, SessionsNamespace
 
 import omnigent.chat as chat_module
 from omnigent.chat import (
@@ -33,6 +35,7 @@ from omnigent.chat import (
     _query_sessions_once,
     _raise_server_failed,
     _remote_headers,
+    _require_registered_agent,
     _spec_used_families,
     _start_local_server,
     _validate_agent_spec,
@@ -41,6 +44,7 @@ from omnigent.chat import (
     run_chat,
 )
 from omnigent.cli import _build_resume_parts
+from omnigent.cli_diagnostics import suppresses_recovery_hint
 from omnigent.inner.databricks_executor import DatabricksCredentials
 from omnigent.models.model_resolver import ModelResolutionError
 from omnigent.spec import load as load_spec
@@ -889,6 +893,7 @@ def test_chat_remote_prompt_uses_one_shot_not_repl(
         session_bundle_filename: str = "agent.tar.gz",
         resume_conversation_id: str | None = None,
         auto_open_conversation: bool = False,
+        registered_agent: RegisteredAgent | None = None,
     ) -> None:
         """Record one-shot query inputs."""
         del (
@@ -896,6 +901,7 @@ def test_chat_remote_prompt_uses_one_shot_not_repl(
             session_bundle_filename,
             resume_conversation_id,
             auto_open_conversation,
+            registered_agent,
         )
         calls["one_shot"] = (
             base_url,
@@ -1828,6 +1834,602 @@ def test_pick_agent_reports_unreachable_server_as_click_error(
     assert server_url in message
     # The advice differs for a stopped local server vs a bad remote target.
     assert expected_hint in message
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+# ── agent discovery on a server without sessions ─────────────────────
+
+
+def _agents_page(
+    names: list[str], *, has_more: bool = False, last_id: str | None = None
+) -> dict[str, object]:
+    """One ``GET /v1/agents`` page listing *names*."""
+    return {
+        "data": [{"id": f"ag_{name}", "name": name} for name in names],
+        "has_more": has_more,
+        "last_id": last_id,
+    }
+
+
+def _serve_listings(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    agent_pages: list[dict[str, object]],
+    user_pages: list[dict[str, object]] | None = None,
+    user_status: int = 200,
+) -> list[tuple[str, object]]:
+    """Answer only successive ``GET /v1/agents`` pages.
+
+    ``scope=user`` requests get *user_pages* (none by default), or fail with
+    *user_status*; they aren't recorded.
+
+    :returns: The ``(route, after-cursor)`` pairs requested, in order.
+    """
+    requests: list[tuple[str, object]] = []
+    pages = iter(agent_pages)
+    user = iter(user_pages or [])
+
+    def _get(url: str, **kwargs: object) -> SimpleNamespace:
+        route = url.rsplit("/v1/", 1)[1]
+        assert route == "agents", f"Unexpected discovery request: {url}"
+        params = kwargs.get("params")
+        if isinstance(params, dict) and params.get("scope") == "user":
+            if user_status >= 400:
+                response = httpx.Response(user_status, request=httpx.Request("GET", url))
+                return SimpleNamespace(raise_for_status=response.raise_for_status, json=dict)
+            page = next(user, {"data": [], "has_more": False})
+            return SimpleNamespace(raise_for_status=lambda: None, json=lambda: page)
+        requests.append((route, params.get("after") if isinstance(params, dict) else None))
+        body = next(pages)
+        return SimpleNamespace(raise_for_status=lambda: None, json=lambda: body)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+    return requests
+
+
+def test_pick_agent_offers_registered_agents_when_no_sessions_exist(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A fresh catalog supplies identity and harness without reading session history."""
+    requests = _serve_listings(
+        monkeypatch,
+        agent_pages=[
+            {"data": [{"name": "scribe", "id": "ag_scribe", "harness": "openai-agents"}]}
+        ],
+    )
+
+    selected = _pick_agent("http://127.0.0.1:6767")
+
+    assert selected.name == "scribe"
+    assert selected.id == "ag_scribe"
+    assert selected.harness == "openai-agents"
+    assert requests == [("agents", None)]
+    assert "Agent: scribe" in capsys.readouterr().out
+
+
+def test_pick_agent_follows_agent_listing_pages(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Agents past the first ``GET /v1/agents`` page are still discovered."""
+    requests = _serve_listings(
+        monkeypatch,
+        agent_pages=[
+            _agents_page(["coder"], has_more=True, last_id="ag_coder"),
+            _agents_page(["scribe"]),
+        ],
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("http://127.0.0.1:6767", interactive=False)
+
+    assert "coder, scribe" in str(excinfo.value)
+    assert requests == [("agents", None), ("agents", "ag_coder")]
+
+
+def test_pick_agent_rejects_a_stalled_agent_listing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Claiming more agents without a usable cursor is an error, not a partial list."""
+    _serve_listings(
+        monkeypatch,
+        agent_pages=[
+            _agents_page(["first"], has_more=True, last_id="ag_first"),
+            _agents_page(["coder"], has_more=True, last_id="ag_first"),
+        ],
+    )
+
+    with pytest.raises(click.ClickException, match="no usable cursor"):
+        _pick_agent("http://127.0.0.1:6767")
+
+
+def test_require_registered_agent_stops_paging_once_the_name_is_found(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An explicit ``--agent`` on the first page does not walk the rest of the registry."""
+    requests = _serve_listings(
+        monkeypatch,
+        agent_pages=[_agents_page(["scribe"], has_more=True, last_id="ag_scribe")],
+    )
+
+    assert _require_registered_agent("http://127.0.0.1:6767", "scribe").id == "ag_scribe"
+
+    assert requests == [("agents", None)]
+
+
+def test_pick_agent_headless_error_summarizes_a_long_registry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The candidate list in the headless error is capped instead of printing every name."""
+    names = [f"agent-{i:02d}" for i in range(25)]
+    _serve_listings(monkeypatch, agent_pages=[_agents_page(names)])
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("http://127.0.0.1:6767", interactive=False)
+
+    message = str(excinfo.value)
+    assert "agent-19" in message
+    assert "agent-20" not in message
+    assert "(and 5 more)" in message
+
+
+@pytest.mark.parametrize("scope", [None, "user"])
+def test_pick_agent_rejects_malformed_listing_rows(
+    monkeypatch: pytest.MonkeyPatch, scope: str | None
+) -> None:
+    """A valid survivor must not auto-select when discovery is incomplete."""
+    rows = [{"name": "scribe", "id": "ag_s"}, {}]
+    page = {"data": rows, "has_more": False, "last_id": None}
+    _serve_listings(
+        monkeypatch,
+        agent_pages=[page] if scope is None else [_agents_page([])],
+        user_pages=[page] if scope == "user" else None,
+    )
+
+    with pytest.raises(click.ClickException, match="malformed agent"):
+        _pick_agent("http://127.0.0.1:6767", quiet=True)
+
+
+@pytest.mark.parametrize("kwargs", [{"interactive": False}, {"quiet": True}])
+def test_pick_agent_headless_with_several_agents_asks_for_agent_flag(
+    monkeypatch: pytest.MonkeyPatch, kwargs: dict[str, bool]
+) -> None:
+    """Headless ``-p`` cannot answer a menu: it fails naming the agents and ``--agent``.
+
+    The stale-host hint is withheld because ``omnigent stop`` cannot help here.
+    """
+    requests = _serve_listings(monkeypatch, agent_pages=[_agents_page(["coder", "scribe"])])
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("http://127.0.0.1:6767", **kwargs)
+
+    message = str(excinfo.value)
+    assert "--agent <name>" in message
+    assert "coder, scribe" in message
+    assert suppresses_recovery_hint(excinfo.value)
+    assert requests == [("agents", None)]
+
+
+def test_pick_agent_without_registered_agents_is_a_clean_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """No sessions and no registered agents name the real remedy, hint withheld."""
+    _serve_listings(monkeypatch, agent_pages=[_agents_page([])])
+
+    with pytest.raises(click.ClickException, match="No agents are registered") as excinfo:
+        _pick_agent("http://127.0.0.1:6767")
+
+    assert suppresses_recovery_hint(excinfo.value)
+    assert "agent add" in str(excinfo.value)
+
+
+def test_require_registered_agent_rejects_an_unknown_name(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A typo'd ``--agent`` is a clean error listing the registered agents."""
+    _serve_listings(monkeypatch, agent_pages=[_agents_page(["coder", "scribe"])])
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _require_registered_agent("http://127.0.0.1:6767", "scrbe")
+
+    message = str(excinfo.value)
+    assert "'scrbe' is not registered" in message
+    assert "coder, scribe" in message
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("initial_message", "expected_interactive"),
+    [
+        (None, True),  # REPL: a menu is fine
+        ("hi", False),  # headless one-shot on a new session: never prompt
+    ],
+)
+def test_chat_with_server_only_prompts_for_an_agent_when_it_can(
+    monkeypatch: pytest.MonkeyPatch,
+    initial_message: str | None,
+    expected_interactive: bool,
+) -> None:
+    """A headless one-shot that starts a new session never blocks on the agent menu."""
+    picked: dict[str, bool] = {}
+
+    def _fake_pick(
+        base_url: str, *, quiet: bool = False, interactive: bool = True
+    ) -> chat_module._AgentChoice:
+        picked["interactive"] = interactive
+        return chat_module._AgentChoice(id="ag_scribe", name="scribe", source="server")
+
+    monkeypatch.setattr(chat_module, "_pick_agent", _fake_pick)
+    monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", lambda **_kw: False)
+    dispatched: dict[str, object] = {}
+    monkeypatch.setattr(chat_module, "_run_one_shot", lambda **kwargs: dispatched.update(kwargs))
+    monkeypatch.setattr(
+        chat_module, "_run_repl", lambda *_args, **kwargs: dispatched.update(kwargs)
+    )
+
+    chat_module._chat_with_server(
+        "http://127.0.0.1:6767",
+        None,
+        initial_message=initial_message,
+        resume_conversation_id=None,
+    )
+
+    assert picked["interactive"] is expected_interactive
+    selected = dispatched["registered_agent"]
+    assert isinstance(selected, RegisteredAgent) and selected.id == "ag_scribe"
+
+
+def _resume_lookup(body: dict[str, object]) -> Callable[..., dict[str, object]]:
+    """Fake ``_discovery_get`` that records the requested path and answers *body*."""
+    seen: list[str] = []
+
+    def _get(
+        base_url: str, path: str, params: dict[str, object], **_kw: object
+    ) -> dict[str, object]:
+        seen.append(path)
+        return body
+
+    _get.seen = seen  # type: ignore[attr-defined]
+    return _get
+
+
+def test_chat_with_server_resume_uses_the_sessions_own_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Resuming never asks for an agent: the session already has one."""
+    monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", lambda **_kw: False)
+    lookup = _resume_lookup({"id": "conv_1", "agent_name": "nessie"})
+    monkeypatch.setattr(chat_module, "_discovery_get", lookup)
+
+    def _must_not_pick(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("agent discovery ran on resume")
+
+    monkeypatch.setattr(chat_module, "_pick_agent", _must_not_pick)
+    captured: dict[str, object] = {}
+    monkeypatch.setattr(chat_module, "_run_one_shot", lambda **kw: captured.update(kw))
+
+    chat_module._chat_with_server(
+        "http://127.0.0.1:6767", None, initial_message="hi", resume_conversation_id="conv_1"
+    )
+
+    assert lookup.seen == ["/v1/sessions/conv_1"]  # type: ignore[attr-defined]
+    assert captured["agent_name"] == "nessie"
+    assert captured["resume_conversation_id"] == "conv_1"
+
+
+def test_chat_with_server_resume_quotes_the_session_id_in_the_lookup_path(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session id with URL-significant characters still addresses the sessions route."""
+    monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", lambda **_kw: False)
+    lookup = _resume_lookup({"id": "conv/odd?x", "agent_name": "nessie"})
+    monkeypatch.setattr(chat_module, "_discovery_get", lookup)
+    monkeypatch.setattr(chat_module, "_run_one_shot", lambda **_kw: None)
+
+    chat_module._chat_with_server(
+        "http://127.0.0.1:6767", None, initial_message="hi", resume_conversation_id="conv/odd?x"
+    )
+
+    assert lookup.seen == ["/v1/sessions/conv%2Fodd%3Fx"]  # type: ignore[attr-defined]
+
+
+def test_chat_with_server_headless_resume_without_session_agent_is_a_clear_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A headless resume whose session reports no agent must not point at --agent.
+
+    ``--agent`` is rejected together with ``--resume``, so the generic discovery
+    error would send the user to a flag combination the CLI forbids.
+    """
+    monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", lambda **_kw: False)
+    monkeypatch.setattr(chat_module, "_discovery_get", _resume_lookup({"id": "conv_1"}))
+
+    def _must_not_pick(*_args: object, **_kwargs: object) -> str:
+        raise AssertionError("agent discovery ran on a headless resume")
+
+    monkeypatch.setattr(chat_module, "_pick_agent", _must_not_pick)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        chat_module._chat_with_server(
+            "http://127.0.0.1:6767", None, initial_message="hi", resume_conversation_id="conv_1"
+        )
+
+    message = str(excinfo.value)
+    assert "Session conv_1" in message and "does not report its agent" in message
+    assert "--resume conv_1" in message
+    assert "pass --agent" not in message
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+def test_chat_with_server_headless_resume_reports_a_failed_session_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A session that cannot be read (here: 404) names that failure, not legacy advice."""
+    monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", lambda **_kw: False)
+
+    def _get(url: str, **_kwargs: object) -> SimpleNamespace:
+        request = httpx.Request("GET", url)
+        response = httpx.Response(404, request=request)
+
+        def _raise() -> None:
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+
+        return SimpleNamespace(raise_for_status=_raise, json=dict)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        chat_module._chat_with_server(
+            "http://127.0.0.1:6767", None, initial_message="hi", resume_conversation_id="conv_1"
+        )
+
+    message = str(excinfo.value)
+    assert "Session conv_1 lookup failed" in message
+    assert "/v1/sessions/conv_1" in message and "404" in message
+    assert "does not report its agent" not in message
+
+
+@pytest.mark.parametrize("session_agent", ["uploaded-only", None])
+def test_chat_with_server_fork_uses_source_not_catalog(
+    monkeypatch: pytest.MonkeyPatch,
+    session_agent: str | None,
+) -> None:
+    """Forking uses the source snapshot even if the catalog is broken or ambiguous."""
+    requests: list[str] = []
+    dispatched: dict[str, object] = {}
+
+    def _get(url: str, **_kwargs: object) -> httpx.Response:
+        requests.append(url)
+        if url.endswith("/v1/sessions/conv_source"):
+            return httpx.Response(
+                200,
+                request=httpx.Request("GET", url),
+                json={"id": "conv_source", "agent_name": session_agent, "host_id": "host_source"},
+            )
+        raise AssertionError(f"Fork must not query the catalog: {url}")
+
+    def _repl(_base_url: str, agent_name: str, *_args: object, **kwargs: object) -> None:
+        dispatched.update(agent_name=agent_name, **kwargs)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+    monkeypatch.setattr(chat_module, "_run_repl", _repl)
+
+    chat_module._chat_with_server("http://127.0.0.1:6767", None, fork_session_id="conv_source")
+
+    assert requests == ["http://127.0.0.1:6767/v1/sessions/conv_source"]
+    assert dispatched["agent_name"] == (session_agent or "agent")
+    assert dispatched["fork_session_id"] == "conv_source"
+    assert chat_module.get_session_host("conv_source") == "host_source"
+    assert dispatched["registered_agent"] is None
+
+
+def test_chat_with_server_interactive_resume_without_session_agent_offers_the_menu(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """In the REPL a session that reports no agent still falls back to the agent menu."""
+    monkeypatch.setattr(chat_module, "_redirect_native_resume_if_needed", lambda **_kw: False)
+    monkeypatch.setattr(chat_module, "_discovery_get", _resume_lookup({"id": "conv_1"}))
+    picked: dict[str, bool] = {}
+
+    def _fake_pick(
+        base_url: str, *, quiet: bool = False, interactive: bool = True
+    ) -> chat_module._AgentChoice:
+        picked["interactive"] = interactive
+        return chat_module._AgentChoice(id="ag_scribe", name="scribe", source="server")
+
+    monkeypatch.setattr(chat_module, "_pick_agent", _fake_pick)
+    monkeypatch.setattr(chat_module, "_run_repl", lambda *_args, **_kw: None)
+
+    chat_module._chat_with_server(
+        "http://127.0.0.1:6767", None, initial_message=None, resume_conversation_id="conv_1"
+    )
+
+    assert picked["interactive"] is True
+
+
+@pytest.mark.parametrize("answer", ["scribe", "2"], ids=["name", "index"])
+def test_pick_agent_menu_accepts_a_name_or_index(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str], answer: str
+) -> None:
+    """The catalog menu accepts a name or index and preserves the selected identity."""
+    page = {
+        "data": [
+            {"id": "ag_coder", "name": "coder", "harness": "codex"},
+            {"id": "ag_scribe", "name": "scribe", "harness": "openai-agents"},
+        ]
+    }
+    _serve_listings(monkeypatch, agent_pages=[page])
+    monkeypatch.setattr("sys.stdin", io.StringIO(f"{answer}\n"))
+
+    picked = _pick_agent("http://127.0.0.1:6767")
+    assert picked.id == "ag_scribe"
+    assert picked.name == "scribe"
+
+    out = capsys.readouterr().out
+    assert "Available agents" in out and "2. scribe (server, openai-agents)" in out
+
+
+@pytest.mark.parametrize(
+    ("status", "expected_hint"),
+    [
+        (401, "Sign in with `omnigent login https://example.databricks.com/omnigent`"),
+        (403, "ask the server administrator to grant access"),
+        (404, None),
+        (500, None),
+    ],
+)
+def test_pick_agent_reports_a_failed_listing_as_a_cli_error(
+    status: int,
+    expected_hint: str | None,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog errors retain HTTP context and offer status-specific recovery."""
+    failing_route = "/v1/agents"
+    server_url = "https://example.databricks.com/api/2.0/omnigent"
+
+    def _get(url: str, **_kwargs: object) -> SimpleNamespace:
+        assert url.endswith(failing_route)
+        request = httpx.Request("GET", url)
+        response = httpx.Response(status, request=request)
+
+        def _raise() -> None:
+            raise httpx.HTTPStatusError("not found", request=request, response=response)
+
+        return SimpleNamespace(raise_for_status=_raise, json=dict)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent(server_url)
+
+    message = str(excinfo.value)
+    assert "Agent discovery failed" in message
+    assert failing_route in message and f"HTTP {status}" in message
+    assert "https://example.databricks.com/omnigent" in message
+    assert "/api/2.0/omnigent" not in message
+    if expected_hint is not None:
+        assert expected_hint in message
+    if status != 401:
+        assert "login" not in message
+    assert isinstance(excinfo.value.__cause__, httpx.HTTPStatusError)
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+@pytest.mark.parametrize(
+    ("body", "detail"),
+    [
+        (ValueError("not json"), "non-JSON body"),
+        (["not", "an", "object"], "unexpected body shape"),
+        ({"data": None}, "unexpected body shape"),
+    ],
+)
+def test_pick_agent_reports_an_unusable_agent_listing_as_a_cli_error(
+    monkeypatch: pytest.MonkeyPatch, body: object, detail: str
+) -> None:
+    """A 200 with a non-JSON or non-object body is a discovery error, not a crash."""
+
+    def _get(url: str, **_kwargs: object) -> SimpleNamespace:
+        assert url.endswith("/v1/agents")
+
+        def _json() -> object:
+            if isinstance(body, Exception):
+                raise body
+            return body
+
+        return SimpleNamespace(raise_for_status=lambda: None, json=_json)
+
+    monkeypatch.setattr(chat_module.httpx, "get", _get)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("http://127.0.0.1:6767")
+
+    message = str(excinfo.value)
+    assert "/v1/agents" in message and detail in message
+    assert "No agents are registered" not in message
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+def test_run_prompt_url_target_runs_the_requested_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The headless entry point can name the agent instead of discovering one."""
+    selected = chat_module._AgentChoice(id="ag_scribe", name="scribe", source="server")
+    monkeypatch.setattr(chat_module, "_require_registered_agent", lambda _base_url, name: selected)
+    captured: dict[str, object] = {}
+
+    def _fake_headless(
+        base_url: str, agent_name: str, _tool_handler: object, **kwargs: object
+    ) -> None:
+        captured["base_url"] = base_url
+        captured["agent_name"] = agent_name
+        captured.update(kwargs)
+
+    monkeypatch.setattr(chat_module, "_run_headless_prompt", _fake_headless)
+
+    chat_module.run_prompt("http://127.0.0.1:6767/", None, prompt="hi", agent_name="scribe")
+
+    assert captured == {
+        "base_url": "http://127.0.0.1:6767",
+        "agent_name": "scribe",
+        "prompt": "hi",
+        "registered_agent": selected,
+    }
+
+
+def test_run_chat_checks_agent_flag_against_the_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``--agent`` is validated before connecting, then starts the session as given."""
+    checked: dict[str, str] = {}
+
+    selected = chat_module._AgentChoice(id="ag_scribe", name="scribe", source="server")
+
+    def _fake_require(base_url: str, agent_name: str) -> chat_module._AgentChoice:
+        checked["base_url"] = base_url
+        checked["agent_name"] = agent_name
+        return selected
+
+    captured: dict[str, object] = {}
+
+    def _capture(base_url: str, _tool_handler: object, **kwargs: object) -> None:
+        captured.update(kwargs)
+
+    monkeypatch.setattr(chat_module, "_require_registered_agent", _fake_require)
+    monkeypatch.setattr(chat_module, "_chat_with_server", _capture)
+
+    run_chat("http://127.0.0.1:6767/", None, prompt="hi", agent_name="scribe")
+
+    assert checked == {"base_url": "http://127.0.0.1:6767", "agent_name": "scribe"}
+    assert captured["agent_name"] == "scribe"
+    assert captured["initial_message"] == "hi"
+    assert captured["registered_agent"] is selected
+
+
+@pytest.mark.parametrize(
+    "entry_point",
+    [
+        lambda target: run_chat(target, None, agent_name="scribe"),
+        lambda target: chat_module.run_prompt(target, None, prompt="hi", agent_name="scribe"),
+    ],
+    ids=["run_chat", "run_prompt"],
+)
+def test_agent_name_is_rejected_for_a_local_agent_path(
+    tmp_path: Path, entry_point: Callable[[str], None]
+) -> None:
+    """``--agent`` picks a server-registered agent; a local YAML already is the agent."""
+    with pytest.raises(click.ClickException, match="--agent"):
+        entry_point(str(tmp_path / "agent.yaml"))
+
+
+async def test_query_sessions_once_without_online_runner_is_a_cli_error() -> None:
+    """A remote one-shot with no runner to adopt fails as a CLI error, not a crash."""
+    client = SimpleNamespace(sessions=_LaunchSessions(hosts=[]))
+
+    with pytest.raises(click.ClickException, match="no online runner") as excinfo:
+        await _query_sessions_once(
+            client=client,  # type: ignore[arg-type]
+            agent_name="scribe",
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+        )
+
+    assert suppresses_recovery_hint(excinfo.value)
 
 
 # ── OMNIGENT_MODEL env-var fallback ───────────────────
@@ -2579,6 +3181,71 @@ def test_materialize_bundle_overrides_brain_harness(
         _cleanup_materialized_override_bundle(materialized)
 
 
+@pytest.mark.parametrize("source_kind", ["file", "directory"])
+@pytest.mark.parametrize(
+    "instruction_kind",
+    ["sibling", "nested", "single-line", "empty", "inline", "missing", "outside"],
+)
+def test_materialize_override_bundle_preserves_instructions(
+    tmp_path: Path, source_kind: str, instruction_kind: str
+) -> None:
+    import yaml
+
+    root = tmp_path / "agent"
+    root.mkdir()
+    (root / "prompts").mkdir()
+    marker = {
+        "single-line": "agent.yaml",
+        "empty": "",
+    }.get(instruction_kind, "Resolved instructions from the source directory.\n")
+    (root / "AGENTS.md").write_text(marker)
+    (root / "prompts" / "system.md").write_text(marker)
+    (tmp_path / "outside.md").write_text("Do not read outside the agent directory.")
+    instructions = {
+        "sibling": "AGENTS.md",
+        "nested": "prompts/system.md",
+        "single-line": "AGENTS.md",
+        "empty": "AGENTS.md",
+        "inline": "Inline instructions.\nSecond line.",
+        "missing": "missing.md",
+        "outside": "../outside.md",
+    }[instruction_kind]
+    raw = {
+        "name": "instruction-materialization",
+        "instructions": instructions,
+        "executor": {"harness": "openai-agents", "model": "mock-model"},
+    }
+    if source_kind == "directory":
+        raw["spec_version"] = 1
+        raw["executor"] = {
+            "type": "omnigent",
+            "model": "mock-model",
+            "config": {"harness": "openai-agents"},
+        }
+    else:
+        raw["prompt"] = "Instructions must take precedence over this placeholder."
+    source_file = root / ("agent.yaml" if source_kind == "file" else "config.yaml")
+    original = yaml.safe_dump(raw)
+    source_file.write_text(original)
+    source = source_file if source_kind == "file" else root
+
+    materialized = _materialize_override_bundle(source, ChatOverrides(model="mock-overridden"))
+    try:
+        spec = load_spec(materialized)
+        expected = (
+            marker
+            if instruction_kind in ("sibling", "nested", "single-line", "empty")
+            else instructions
+        )
+        if source_kind == "file" and instruction_kind == "single-line":
+            expected += "\n"
+        assert spec.instructions == expected
+        assert spec.executor.model == "mock-overridden"
+        assert source_file.read_text() == original
+    finally:
+        _cleanup_materialized_override_bundle(materialized)
+
+
 def test_materialize_override_bundle_bakes_openai_env_auth_for_daemon_runner(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -3136,6 +3803,14 @@ def test_build_resume_parts_strips_resume() -> None:
         parts = _build_resume_parts()
     assert "--resume" not in parts
     assert "conv_old" not in parts
+
+
+def test_build_resume_parts_strips_agent() -> None:
+    """``--agent`` is dropped from the resume hint; the resumed session has its agent."""
+    ctx = _make_run_context(server="https://example.com", agent="scribe")
+    with ctx:
+        parts = _build_resume_parts()
+    assert parts == ["omnigent", "run", "--server", "https://example.com"]
 
 
 def test_build_resume_parts_includes_harness_and_model() -> None:
@@ -4781,3 +5456,685 @@ def test_cursor_native_resume_never_drives_an_omnigent_turn(
     )
 
     assert redirected["session_id"] == "conv_abc123"
+
+
+# ---------------------------------------------------------------------------
+# Host launch, user agents, resume by harness, escaped names
+# ---------------------------------------------------------------------------
+
+
+def _local_host(monkeypatch: pytest.MonkeyPatch, host_id: str | None) -> None:
+    import omnigent.host.identity as identity
+
+    local = SimpleNamespace(host_id=host_id, name="me.local") if host_id else None
+    monkeypatch.setattr(identity, "load_host_identity_if_present", lambda *_a, **_kw: local)
+
+
+class _LaunchSessions:
+    """Sessions stub for a one-shot turn on a server with no online runner."""
+
+    def __init__(
+        self,
+        *,
+        online_runner: str | None = None,
+        hosts: list[object] | None = None,
+        stop_error: Exception | None = None,
+    ) -> None:
+        from omnigent_client import LaunchHost
+
+        self._online_runner = online_runner
+        default: list[object] = [LaunchHost("host_local", "me.local")]
+        self._hosts: list[object] = hosts if hosts is not None else default
+        self._stop_error = stop_error
+        self._base = "http://srv"
+        self._http = SimpleNamespace(headers={})
+        self.events: list[tuple[str, dict[str, object]]] = []
+        self.created: dict[str, object] = {}
+        self.bound: list[str] = []
+
+    async def resolve_agent(self, _name: str) -> SimpleNamespace:
+        return SimpleNamespace(id="id_scribe", harness="claude-sdk")
+
+    async def resolve_online_runner(self, **_kwargs: object) -> str | None:
+        return self._online_runner
+
+    async def list_launch_hosts(self, **_kwargs: object) -> list[object]:
+        return self._hosts
+
+    async def create_from_agent_id(self, agent_id: str, **kwargs: object) -> SimpleNamespace:
+        self.created = dict(kwargs, agent_id=agent_id)
+        return SimpleNamespace(id="conv_new")
+
+    async def bind_runner(self, session_id: str, *, runner_id: str) -> SimpleNamespace:
+        self.bound.append(runner_id)
+        return SimpleNamespace(id=session_id)
+
+    async def post_event(self, session_id: str, event: dict[str, object]) -> dict[str, object]:
+        self.events.append((session_id, event))
+        if self._stop_error is not None:
+            raise self._stop_error
+        return {"queued": False}
+
+
+def _launch_turn(
+    sessions: _LaunchSessions,
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    query: Callable[[str], Awaitable[QueryResult]] | None = None,
+    on_session_ready: Callable[[str], None] | None = None,
+) -> str | None:
+    async def _reply(_prompt: str) -> QueryResult:
+        return QueryResult(text="pong")
+
+    monkeypatch.setattr("omnigent_client.SessionsChat", _fake_sessions_chat_cls(query or _reply))
+    client = SimpleNamespace(
+        sessions=sessions,
+        files=SimpleNamespace(for_session=lambda _sid: SimpleNamespace(upload=None, get=None)),
+        _fetch_agent_tools=lambda *_a, **_kw: [],
+    )
+    return asyncio.run(
+        chat_module._query_sessions_once(
+            client=client,  # type: ignore[arg-type]
+            agent_name="scribe",
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+            on_session_ready=on_session_ready,
+        )
+    )
+
+
+_STOP = {"type": "stop_session", "data": {}}
+
+
+@pytest.mark.parametrize("online_runner", [None, "runner_existing"])
+def test_one_shot_uses_selected_catalog_id_without_resolving_the_name_again(
+    monkeypatch: pytest.MonkeyPatch,
+    online_runner: str | None,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Both host launch and runner adoption use the selected identity and harness."""
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions(online_runner=online_runner)
+    harnesses: list[str | None] = []
+
+    async def _unexpected_lookup(_name: str) -> RegisteredAgent:
+        raise AssertionError("the catalog identity must not be resolved by name again")
+
+    async def _resolve_runner(*, harness: str | None, **_kwargs: object) -> str | None:
+        harnesses.append(harness)
+        return online_runner
+
+    async def _turn(**_kwargs: object) -> str:
+        return "pong"
+
+    monkeypatch.setattr(sessions, "resolve_agent", _unexpected_lookup)
+    monkeypatch.setattr(sessions, "resolve_online_runner", _resolve_runner)
+    monkeypatch.setattr(chat_module, "_run_bound_turn", _turn)
+    selected = RegisteredAgent(id="ag_selected", harness="openai-agents")
+
+    result = asyncio.run(
+        _query_sessions_once(
+            client=SimpleNamespace(sessions=sessions),  # type: ignore[arg-type]
+            agent_name="reviewer",
+            registered_agent=selected,
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+        )
+    )
+
+    assert result == "pong"
+    assert sessions.created["agent_id"] == "ag_selected"
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert ("Waiting for this machine to start your agent..." in output.err) == (
+        online_runner is None
+    )
+    assert harnesses == ["openai-agents"]
+    assert sessions.created.get("host_id") == ("host_local" if online_runner is None else None)
+    assert sessions.bound == ([] if online_runner is None else [online_runner])
+    assert sessions.events == ([("conv_new", _STOP)] if online_runner is None else [])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("token", [None, "test-token"])
+@pytest.mark.parametrize("sharded", [False, True])
+async def test_one_shot_host_launch_routes_actual_http_requests(
+    monkeypatch: pytest.MonkeyPatch, token: str | None, sharded: bool
+) -> None:
+    """Creation, session reads and cleanup use the selected host, even without token auth."""
+    _local_host(monkeypatch, "host_local")
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1" if sharded else "0")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", "host_unrelated")
+    monkeypatch.setattr(chat_module, "_read_databrickscfg", lambda *_args: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda *_args: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda *_args: None)
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_org_id", lambda *_args: None)
+    if token:
+        monkeypatch.setenv(chat_module._REMOTE_AUTH_TOKEN_ENV, token)
+    else:
+        monkeypatch.delenv(chat_module._REMOTE_AUTH_TOKEN_ENV, raising=False)
+    base_url = "http://srv"
+    requests: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        path = request.url.path
+        if path == "/v1/runners":
+            return httpx.Response(200, json={"data": []})
+        if path == "/v1/hosts":
+            return httpx.Response(
+                200,
+                json={"hosts": [{"host_id": "host_local", "name": "me", "status": "online"}]},
+            )
+        assert request.headers.get("X-Databricks-Omnigent-Slice-Key") == (
+            "host_local" if sharded else None
+        )
+        assert request.headers.get("Authorization") == (f"Bearer {token}" if token else None)
+        if path == "/v1/sessions":
+            assert json.loads(request.content)["host_id"] == "host_local"
+            return httpx.Response(
+                201,
+                json={
+                    "id": "conv_routed",
+                    "agent_id": "ag_s",
+                    "host_id": "host_local",
+                    "status": "idle",
+                    "created_at": 0,
+                },
+            )
+        if path == "/v1/sessions/conv_routed/events":
+            assert json.loads(request.content) == _STOP
+            return httpx.Response(200, json={"queued": False})
+        assert path == "/v1/sessions/conv_routed"
+        return httpx.Response(
+            200,
+            json={"id": "conv_routed", "agent_id": "ag_s", "status": "idle", "created_at": 0},
+        )
+
+    async def turn(*, client: object, bound: object, **_kwargs: object) -> str:
+        await sessions.get("conv_routed")
+        return "pong"
+
+    monkeypatch.setattr(chat_module, "_run_bound_turn", turn)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        headers=chat_module._server_headers(),
+        auth=chat_module._server_auth(server_url=base_url, session_id=None),
+        event_hooks={"request": [chat_module.route_session_request]},
+    ) as http:
+        sessions = SessionsNamespace(http, base_url)
+        result = await _query_sessions_once(
+            client=SimpleNamespace(sessions=sessions),  # type: ignore[arg-type]
+            agent_name="scribe",
+            registered_agent=RegisteredAgent(id="ag_s", harness=None),
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+        )
+    assert result == "pong"
+    assert [f"{request.method} {request.url.path}" for request in requests] == [
+        "GET /v1/runners",
+        "GET /v1/hosts",
+        "POST /v1/sessions",
+        "GET /v1/sessions/conv_routed",
+        "POST /v1/sessions/conv_routed/events",
+    ]
+
+
+@pytest.mark.parametrize(
+    "failure", [httpx.ReadTimeout, httpx.WriteTimeout, httpx.ConnectTimeout, httpx.PoolTimeout]
+)
+def test_one_shot_host_launch_timeout_is_a_clean_cli_error(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    failure: type[httpx.TimeoutException],
+) -> None:
+    """An uncertain launch reports its host without leaking transport details or retrying."""
+    _local_host(monkeypatch, "host_local")
+    monkeypatch.setattr(chat_module, "_server_headers", lambda **_kwargs: {})
+    monkeypatch.setattr(chat_module, "_server_auth", lambda **_kwargs: None)
+    requests: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/v1/runners":
+            return httpx.Response(200, json={"data": []})
+        if request.url.path == "/v1/hosts":
+            return httpx.Response(
+                200, json={"hosts": [{"host_id": "host_local", "status": "online"}]}
+            )
+        assert request.url.path == "/v1/sessions"
+        raise failure("private transport details", request=request)
+
+    client = chat_module.OmnigentClient("http://127.0.0.1")
+    monkeypatch.setattr(client._http, "_transport", httpx.MockTransport(handler))
+    monkeypatch.setattr(chat_module, "OmnigentClient", lambda **_kwargs: client)
+    with pytest.raises(SystemExit) as excinfo:
+        chat_module._run_headless_prompt(
+            "http://127.0.0.1",
+            "scribe",
+            None,
+            prompt="hi",
+            registered_agent=RegisteredAgent(id="ag_s", harness=None),
+        )
+
+    assert excinfo.value.code == 1
+    output = capsys.readouterr()
+    assert output.out == ""
+    assert "Error: Timed out" in output.err and "host 'host_local'" in output.err
+    assert output.err.index("Waiting for this machine to start your agent...") < output.err.index(
+        "Error: Timed out"
+    )
+    assert "POST /v1/sessions" in output.err
+    if failure in (httpx.ConnectTimeout, httpx.PoolTimeout):
+        assert "request was not sent" in output.err and "retry" in output.err
+        assert "may still complete" not in output.err
+    else:
+        assert "may still complete" in output.err and "before retrying" in output.err
+    assert "private transport details" not in output.err and "Traceback" not in output.err
+    assert requests == ["GET /v1/runners", "GET /v1/hosts", "POST /v1/sessions"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "expected_error"),
+    [(404, "no online runner"), (500, "GET /v1/hosts failed.*HTTP 500")],
+)
+async def test_one_shot_host_listing_failure_is_a_clean_cli_error(
+    status_code: int, expected_error: str
+) -> None:
+    """Only an unsupported hosts route should produce no-runner advice."""
+    requests: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(f"{request.method} {request.url.path}")
+        if request.url.path == "/v1/runners":
+            return httpx.Response(200, json={"data": []})
+        assert request.url.path == "/v1/hosts"
+        return httpx.Response(status_code, json={"detail": "lookup failed"})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as http:
+        with pytest.raises(click.ClickException, match=expected_error) as excinfo:
+            await _query_sessions_once(
+                client=SimpleNamespace(sessions=SessionsNamespace(http, "http://srv")),  # type: ignore[arg-type]
+                agent_name="scribe",
+                registered_agent=RegisteredAgent(id="ag_s", harness=None),
+                tool_handler=None,
+                prompt="hi",
+                session_bundle=None,
+                session_bundle_filename="agent.tar.gz",
+                runner_id=None,
+            )
+
+    assert suppresses_recovery_hint(excinfo.value)
+    if status_code != 404:
+        assert "host --server" not in str(excinfo.value)
+    assert requests == ["GET /v1/runners", "GET /v1/hosts"]
+
+
+def test_one_shot_stop_failure_keeps_the_reply(monkeypatch: pytest.MonkeyPatch) -> None:
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions(stop_error=ClientOmnigentError("gone"))
+
+    assert _launch_turn(sessions, monkeypatch) == "pong"
+    assert sessions.events == [("conv_new", _STOP)]
+
+
+def test_one_shot_with_only_other_machines_hosts_names_them(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Another machine can't use this directory as its workspace, so say so."""
+    from omnigent_client import LaunchHost
+
+    _local_host(monkeypatch, None)
+    sessions = _LaunchSessions(hosts=[LaunchHost("host_dev", "devbox.local")])
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _launch_turn(sessions, monkeypatch)
+
+    assert "devbox.local" in str(excinfo.value) and "host --server" in str(excinfo.value)
+    assert suppresses_recovery_hint(excinfo.value)
+    assert sessions.created == {}
+
+
+class _StopAtBind(Exception):
+    """Ends ``_query_sessions_once`` once the runner bind is observed."""
+
+
+def _resume_client(snapshot: SimpleNamespace, seen: dict[str, object]) -> SimpleNamespace:
+    async def _resolve_agent(name: str) -> SimpleNamespace:
+        seen["resolved"] = name
+        return SimpleNamespace(id="id_scribe", harness="claude-sdk")
+
+    async def _get(session_id: str) -> SimpleNamespace:
+        return snapshot
+
+    async def _online_runner(**kwargs: object) -> str:
+        seen["harness"] = kwargs.get("harness")
+        return "runner_1"
+
+    async def _bind_runner(session_id: str, *, runner_id: str) -> None:
+        raise _StopAtBind
+
+    return SimpleNamespace(
+        sessions=SimpleNamespace(
+            resolve_agent=_resolve_agent,
+            get=_get,
+            resolve_online_runner=_online_runner,
+            bind_runner=_bind_runner,
+        )
+    )
+
+
+def _resume_once(client: SimpleNamespace, agent_name: str) -> None:
+    asyncio.run(
+        chat_module._query_sessions_once(
+            client=client,  # type: ignore[arg-type]
+            agent_name=agent_name,
+            tool_handler=None,
+            prompt="hi",
+            session_bundle=None,
+            session_bundle_filename="agent.tar.gz",
+            runner_id=None,
+            resume_conversation_id="conv_x",
+        )
+    )
+
+
+@pytest.mark.parametrize(
+    ("harness", "agent_name", "expected_calls"),
+    [
+        ("claude-sdk", "uploaded", {"harness": "claude-sdk"}),
+        (None, "scribe", {"resolved": "scribe", "harness": "claude-sdk"}),
+        (["claude-sdk"], "scribe", {"resolved": "scribe", "harness": "claude-sdk"}),
+    ],
+    ids=["snapshot-harness", "missing-harness", "malformed-harness"],
+)
+def test_resume_one_shot_uses_the_sessions_harness_or_agent(
+    harness: object, agent_name: str, expected_calls: dict[str, str]
+) -> None:
+    """Use an uploaded session's harness directly, or resolve its own agent as fallback."""
+    seen: dict[str, object] = {}
+    snapshot = SimpleNamespace(id="conv_x", harness=harness, agent_name=agent_name)
+
+    with pytest.raises(_StopAtBind):
+        _resume_once(_resume_client(snapshot, seen), agent_name=agent_name)
+
+    assert seen == expected_calls
+
+
+def test_resume_one_shot_without_runner_fails_cleanly() -> None:
+    """Resuming never launches a runner itself; without one it says so, as before."""
+
+    async def _no_runner(**_kwargs: object) -> None:
+        return None
+
+    snapshot = SimpleNamespace(id="conv_x", harness="claude-sdk", agent_name="scribe")
+    client = _resume_client(snapshot, {})
+    client.sessions.resolve_online_runner = _no_runner
+
+    with pytest.raises(click.ClickException, match="no online runner"):
+        _resume_once(client, agent_name="scribe")
+
+
+@pytest.mark.parametrize(
+    "failure", [LookupError("missing"), ClientOmnigentError("listing failed")]
+)
+def test_resume_one_shot_harness_lookup_failure_refuses_runner_adoption(
+    failure: Exception,
+) -> None:
+    """A failed harness lookup must never select an arbitrary online runner."""
+    seen: dict[str, object] = {}
+    snapshot = SimpleNamespace(id="conv_x", harness=None, agent_name="scribe")
+    client = _resume_client(snapshot, seen)
+
+    async def _listing_fails(_name: str) -> object:
+        raise failure
+
+    client.sessions.resolve_agent = _listing_fails
+
+    with pytest.raises(click.ClickException, match="Cannot determine the harness") as excinfo:
+        _resume_once(client, agent_name="scribe")
+
+    assert excinfo.value.__cause__ is failure
+    assert seen == {}
+
+
+@pytest.mark.parametrize("snapshot_agent_name", [None, "scribe"])
+@pytest.mark.parametrize("harness", [None, "", " ", ["claude-sdk"]])
+def test_resume_one_shot_without_a_usable_harness_refuses_runner_adoption(
+    snapshot_agent_name: str | None,
+    harness: object,
+) -> None:
+    seen: dict[str, object] = {}
+    snapshot = SimpleNamespace(id="conv_x", harness=harness, agent_name=snapshot_agent_name)
+    client = _resume_client(snapshot, seen)
+
+    async def _no_harness(_name: str) -> RegisteredAgent:
+        seen["resolved"] = _name
+        return RegisteredAgent(id="ag_scribe", harness=harness)  # type: ignore[arg-type]
+
+    client.sessions.resolve_agent = _no_harness
+
+    with pytest.raises(click.ClickException, match="Cannot determine the harness"):
+        _resume_once(client, agent_name="scribe")
+
+    assert seen == ({"resolved": "scribe"} if snapshot_agent_name else {})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("listing_status", [200, 500])
+async def test_resume_old_snapshot_fails_before_runner_requests(listing_status: int) -> None:
+    """Decode an old server snapshot and refuse an unavailable harness at the HTTP boundary."""
+    requests: list[str] = []
+
+    def _respond(request: httpx.Request) -> httpx.Response:
+        requests.append(request.url.path)
+        if request.url.path == "/v1/sessions/conv_x":
+            return httpx.Response(
+                200,
+                json={
+                    "id": "conv_x",
+                    "agent_id": "ag_uploaded",
+                    "agent_name": "uploaded",
+                    "status": "idle",
+                    "created_at": 0,
+                },
+            )
+        assert request.url.path == "/v1/agents", request.url
+        return httpx.Response(listing_status, json={"data": [], "has_more": False})
+
+    async with httpx.AsyncClient(transport=httpx.MockTransport(_respond)) as http:
+        client = SimpleNamespace(sessions=SessionsNamespace(http, "http://localhost:6767"))
+        with pytest.raises(click.ClickException, match="Cannot determine the harness") as excinfo:
+            await _query_sessions_once(
+                client=client,  # type: ignore[arg-type]
+                agent_name="uploaded",
+                tool_handler=None,
+                prompt="hi",
+                session_bundle=None,
+                session_bundle_filename="agent.tar.gz",
+                runner_id=None,
+                resume_conversation_id="conv_x",
+            )
+
+    assert suppresses_recovery_hint(excinfo.value)
+    assert requests[0] == "/v1/sessions/conv_x"
+    assert requests[1:] and set(requests[1:]) == {"/v1/agents"}
+
+
+def test_one_shot_unknown_agent_is_a_clean_cli_error() -> None:
+    async def _resolve_agent(name: str) -> object:
+        raise LookupError(f"No agent named {name!r} is registered on this server.")
+
+    client = SimpleNamespace(sessions=SimpleNamespace(resolve_agent=_resolve_agent))
+
+    with pytest.raises(click.ClickException, match="No agent named") as excinfo:
+        asyncio.run(
+            chat_module._query_sessions_once(
+                client=client,  # type: ignore[arg-type]
+                agent_name="ghost",
+                tool_handler=None,
+                prompt="hi",
+                session_bundle=None,
+                session_bundle_filename="agent.tar.gz",
+                runner_id=None,
+            )
+        )
+
+    assert suppresses_recovery_hint(excinfo.value)
+
+
+def test_require_registered_agent_accepts_a_user_agent(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``omnigent agent add`` installs a user agent; ``--agent`` must accept it."""
+    _serve_listings(
+        monkeypatch,
+        agent_pages=[_agents_page(["scribe"])],
+        user_pages=[_agents_page(["mine"])],
+    )
+
+    selected = chat_module._require_registered_agent("http://127.0.0.1:6799", "mine")
+    assert selected.id == "ag_mine" and selected.source == "user"
+
+
+def test_pick_agent_offers_user_agents_on_a_fresh_server(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve_listings(
+        monkeypatch,
+        agent_pages=[_agents_page(["scribe"])],
+        user_pages=[_agents_page(["mine"])],
+    )
+
+    with pytest.raises(click.ClickException) as excinfo:
+        _pick_agent("http://127.0.0.1:6799", interactive=False)
+
+    assert "scribe" in str(excinfo.value) and "mine" in str(excinfo.value)
+
+
+def test_pick_agent_prefers_server_agent_over_same_named_user_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    server_agent = {"id": "ag_server", "name": "scribe", "harness": "claude-sdk"}
+    user_agent = {"id": "ag_user", "name": "scribe", "harness": "openai-agents"}
+    _serve_listings(
+        monkeypatch,
+        agent_pages=[{"data": [server_agent]}],
+        user_pages=[{"data": [user_agent]}],
+    )
+
+    selected = _pick_agent("http://127.0.0.1:6799", interactive=False)
+
+    assert selected.id == "ag_server"
+    assert selected.harness == "claude-sdk"
+    assert selected.source == "server"
+
+
+def test_user_agent_listing_problems_fall_back_to_server_agents(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An unsupported or forbidden user catalog does not hide usable server agents."""
+    page = _agents_page(["scribe"])
+    _serve_listings(monkeypatch, agent_pages=[page, page], user_status=404)
+
+    assert (
+        chat_module._require_registered_agent("http://127.0.0.1:6799", "scribe").id == "ag_scribe"
+    )
+    assert _pick_agent("http://127.0.0.1:6799", interactive=False).id == "ag_scribe"
+
+
+def test_user_catalog_failure_cannot_silently_auto_select_a_server_agent(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed user catalog is not evidence that only one agent is available."""
+    _serve_listings(monkeypatch, agent_pages=[_agents_page(["scribe"])], user_status=500)
+    with pytest.raises(click.ClickException, match="Agent discovery failed"):
+        _pick_agent("http://127.0.0.1:6799", quiet=True)
+
+
+_EVIL = "evil\x1b[2J\x1b]0;pwned\x07"
+
+
+def test_agent_names_are_escaped_in_errors_and_the_picker(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Server-supplied names can't inject terminal control sequences."""
+    page = _agents_page([_EVIL, "scribe"])
+    _serve_listings(monkeypatch, agent_pages=[page, page, page])
+
+    with pytest.raises(click.ClickException) as ambiguous:
+        _pick_agent("http://127.0.0.1:6799", interactive=False)
+    with pytest.raises(click.ClickException) as unknown:
+        chat_module._require_registered_agent("http://127.0.0.1:6799", "nope\x1b[2J")
+    monkeypatch.setattr(chat_module.click, "prompt", lambda *_a, **_kw: "2")
+    _pick_agent("http://127.0.0.1:6799")
+    picker = capsys.readouterr().out
+
+    for text in (str(ambiguous.value), str(unknown.value), picker):
+        assert "\x1b" not in text
+        assert "\\x1b" in text
+
+
+# ---------------------------------------------------------------------------
+# Cleanup ordering, user-agent listing and messages
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("stage", "failure_type"),
+    [("turn", RuntimeError), ("turn", KeyboardInterrupt), ("session-ready", KeyboardInterrupt)],
+    ids=["turn-error", "turn-interrupt", "session-ready-interrupt"],
+)
+def test_one_shot_stops_the_launched_runner_on_failure(
+    monkeypatch: pytest.MonkeyPatch, stage: str, failure_type: type[BaseException]
+) -> None:
+    """Cleanup runs after turn errors, turn interrupts, and session-ready interrupts."""
+    _local_host(monkeypatch, "host_local")
+    sessions = _LaunchSessions()
+    failure = failure_type("injected failure")
+
+    async def _fail_turn(_prompt: str) -> QueryResult:
+        raise failure
+
+    def _fail_ready(_session_id: str) -> None:
+        raise failure
+
+    with pytest.raises(failure_type, match="injected failure") as excinfo:
+        _launch_turn(
+            sessions,
+            monkeypatch,
+            query=_fail_turn if stage == "turn" else None,
+            on_session_ready=_fail_ready if stage == "session-ready" else None,
+        )
+
+    assert excinfo.value is failure
+    assert sessions.events == [("conv_new", _STOP)]
+
+
+def test_require_registered_agent_with_failing_user_listing_reports_discovery_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A failed lookup must not misreport an installed user agent as unregistered."""
+    _serve_listings(monkeypatch, agent_pages=[_agents_page(["scribe"])], user_status=500)
+
+    with pytest.raises(click.ClickException) as excinfo:
+        chat_module._require_registered_agent("http://127.0.0.1:6799", "mine")
+
+    assert "HTTP 500" in str(excinfo.value)
+    assert "not registered" not in str(excinfo.value)
+
+
+def test_user_agents_follow_the_listing_cursor(monkeypatch: pytest.MonkeyPatch) -> None:
+    _serve_listings(
+        monkeypatch,
+        agent_pages=[_agents_page(["scribe"])],
+        user_pages=[_agents_page(["a"], has_more=True, last_id="ag_a"), _agents_page(["b"])],
+    )
+
+    assert chat_module._require_registered_agent("http://127.0.0.1:6799", "b").id == "ag_b"

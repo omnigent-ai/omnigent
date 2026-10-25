@@ -441,3 +441,24 @@ def test_prune_orphaned_bridge_dirs_only_removes_dead_owners(
     assert not dead_dir.exists()
     assert live_dir.exists()
     assert unmarked_dir.exists()
+
+
+def test_write_agent_instructions_replaces_symlink_and_clears_stale_text(tmp_path: Path) -> None:
+    target = tmp_path / "unrelated.md"
+    target.write_text("unchanged")
+    path = tmp_path / "agent_instructions.md"
+    path.symlink_to(target)
+    instructions = "  Authored role. π\nKeep whitespace.  "
+
+    assert pi_native_bridge.write_agent_instructions(tmp_path, instructions) == path
+    assert not path.is_symlink()
+    assert target.read_text() == "unchanged"
+    assert path.read_text() == instructions
+    assert stat.S_IMODE(path.stat().st_mode) == 0o600
+    assert not list(tmp_path.glob(".*.tmp"))
+
+    assert pi_native_bridge.write_agent_instructions(tmp_path, "Updated role") == path
+    assert path.read_text() == "Updated role"
+    assert pi_native_bridge.write_agent_instructions(tmp_path, None) is None
+    assert not path.exists()
+    assert pi_native_bridge.write_agent_instructions(tmp_path, None) is None

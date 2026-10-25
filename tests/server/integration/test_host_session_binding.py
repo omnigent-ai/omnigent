@@ -10,6 +10,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import Mock
 
 import pytest
@@ -41,6 +42,7 @@ from omnigent.server.managed_hosts import (
 )
 from omnigent.server.routes.host_tunnel import create_host_tunnel_router
 from omnigent.server.routes.hosts import create_hosts_router
+from omnigent.server.startup_inputs import STARTUP_LABEL
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -156,7 +158,8 @@ async def test_launch_runner_writes_host_id_and_runner_id(
     async def _respond_launched() -> None:
         """Respond to the launch frame from the host."""
         for _ in range(20):
-            output = await comm.receive_output(timeout=2.0)
+            # Binding writes finish before the launch frame; allow for CI database latency.
+            output = await comm.receive_output(timeout=10.0)
             if output["type"] != "websocket.send":
                 continue
             frame = decode_host_frame(output["text"])
@@ -882,6 +885,7 @@ async def test_managed_create_returns_during_provision_and_message_rendezvouses(
         "stage": "provisioning",
         "error": None,
         "provider": "modal",
+        "details": None,
     }
 
     message_resp = await env.client.post(
@@ -1019,6 +1023,7 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
         "stage": "provisioning",
         "error": None,
         "provider": "modal",
+        "details": None,
     }
 
     # Tail live progress at the layer the SSE endpoint reads it from.
@@ -1074,6 +1079,89 @@ async def test_managed_launch_progress_surfaces_on_snapshot_and_stream(
     assert snapshot_after.status_code == 200, snapshot_after.text
     assert snapshot_after.json()["sandbox_status"] is None
     del tunnels
+
+
+async def test_managed_launch_action_required_reaches_snapshot_and_stream(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launch that needs the user to act reports ``action_required`` with
+    what to do: the live stream and the snapshot carry those details until
+    the launch moves on.
+    """
+    from fastapi import HTTPException
+
+    from omnigent.runtime import session_stream
+    from omnigent.server.managed_hosts import SandboxStageObserver
+
+    env = managed_session_env
+    details = "Refresh your dbcert on your laptop."
+    subscribed = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def _launch_needing_action(*, on_stage: SandboxStageObserver, **_: object) -> None:
+        """Stand in for a deployment's launch that finds the user has to act."""
+        await subscribed.wait()
+        # Details only belong to action_required; the publisher drops them elsewhere.
+        on_stage("provisioning", "Not shown for this stage.")
+        on_stage("action_required", details)
+        await finish.wait()
+        raise HTTPException(status_code=502, detail="managed sandbox launch failed: test over")
+
+    monkeypatch.setattr(
+        "omnigent.server.managed_hosts.launch_managed_host", _launch_needing_action
+    )
+    agent = await create_test_agent(env.client, name="managed-action-required-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    reports: list[dict[str, Any]] = []
+
+    async def _tail_reports() -> None:
+        """Collect sandbox_status events after subscribing, through the first action_required."""
+        async for event in session_stream.subscribe(
+            session_id, ready_event={"type": "_test_subscribed"}
+        ):
+            if event.get("type") == "_test_subscribed":
+                subscribed.set()
+            elif event.get("type") == "session.sandbox_status":
+                reports.append(event)
+                if event["stage"] == "action_required":
+                    return
+
+    try:
+        await asyncio.wait_for(_tail_reports(), timeout=10.0)
+        snapshot = await env.client.get(f"/v1/sessions/{session_id}")
+        assert snapshot.status_code == 200, snapshot.text
+        assert snapshot.json()["sandbox_status"] == {
+            "stage": "action_required",
+            "error": None,
+            "provider": "modal",
+            "details": details,
+        }
+    finally:
+        finish.set()
+    assert [(r["stage"], r["details"]) for r in reports] == [
+        ("provisioning", None),
+        ("action_required", details),
+    ]
+
+    # Let the stand-in launch settle as failed so no launch task outlives the test.
+    deadline = asyncio.get_running_loop().time() + 10.0
+    while asyncio.get_running_loop().time() < deadline:
+        settled = await env.client.get(f"/v1/sessions/{session_id}")
+        if (settled.json()["sandbox_status"] or {}).get("stage") == "failed":
+            break
+        await asyncio.sleep(0.05)
+    else:
+        raise AssertionError("the stand-in launch never settled as failed")
+    # Each report replaces the last, so the failure no longer carries the details.
+    assert settled.json()["sandbox_status"]["details"] is None
 
 
 async def test_subagent_session_reuses_managed_sandbox_runner(
@@ -1334,8 +1422,8 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
     calls: list[str] = []
 
     def _finish_wake(**kwargs: object) -> None:
-        del kwargs
-        calls.append("wake")
+        # The wake gets the host's provider, which its seeded launch status names.
+        calls.append(f"wake {kwargs['provider']}")
         tracker.begin(conv.id)
         tracker.finish(conv.id)
 
@@ -1356,7 +1444,7 @@ async def test_resumable_managed_wake_ignores_stale_db_liveness(
             conversation_store=conv_store,
         )
     assert exc.value.code == ErrorCode.WRONG_REPLICA
-    assert calls == ["wake"]
+    assert calls == ["wake islo"]
 
 
 async def test_resumable_managed_wake_drops_fresh_local_tunnels_when_provider_paused(
@@ -1492,7 +1580,7 @@ async def test_managed_wake_fails_when_runner_never_reconnects(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
 
     await sessions_module._run_managed_wake(
@@ -1562,7 +1650,7 @@ async def test_managed_launch_fails_when_runner_never_connects(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
     monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
 
@@ -1637,7 +1725,7 @@ async def test_managed_launch_fails_and_tears_down_when_harness_not_configured(
     monkeypatch.setattr(
         sessions_module,
         "_publish_sandbox_status",
-        lambda _sid, stage, error=None: stages.append((stage, error)),
+        lambda _sid, stage, error=None, details=None: stages.append((stage, error)),
     )
     monkeypatch.setattr("omnigent.server.managed_hosts.terminate_managed_host", _fake_terminate)
 
@@ -1747,12 +1835,10 @@ async def test_cancel_managed_launch_tasks_returns_while_provision_parked(
     """
     Shutdown teardown does not hang on an in-flight managed provision.
 
-    The lifespan teardown calls ``cancel_managed_launch_tasks`` to
-    stop background launches; with a provision parked on the fake's
-    gate (a slow provider call), the cancel must settle the task and
-    return promptly rather than waiting the provision out — a rolling
-    deploy must not block on Modal. Without the cancellation hook,
-    this test fails at the ``wait_for`` (nothing settles the task).
+    With a provision parked on the fake's gate (a slow provider call),
+    the default teardown does not wait for the launch to bind: it
+    cancels the task and returns promptly rather than waiting the
+    provision out.
     """
     import threading
 
@@ -1770,13 +1856,169 @@ async def test_cancel_managed_launch_tasks_returns_while_provision_parked(
     )
     assert resp.status_code == 201, resp.text
 
-    # The launch is gate-held mid-provision. The teardown hook must
-    # return well inside the provision's duration (the gate would hold
-    # it 30s) — 5s is the generosity bound, not an expectation.
+    # The gate would hold the provision 30s; 5s is the generosity bound.
     await asyncio.wait_for(cancel_managed_launch_tasks(), timeout=5.0)
 
     # Release the gate so the provision worker thread exits cleanly.
     gate.set()
+
+
+async def test_lifespan_shutdown_drains_for_the_configured_time(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The deployment's ``sandbox.shutdown_drain_s`` is what server shutdown waits."""
+    drains: list[float] = []
+
+    async def record_drain(drain_s: float = 0.0) -> None:
+        drains.append(drain_s)
+
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.cancel_managed_launch_tasks", record_drain
+    )
+    artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
+    app = create_app(
+        agent_store=SqlAlchemyAgentStore(db_uri),
+        file_store=SqlAlchemyFileStore(db_uri),
+        conversation_store=SqlAlchemyConversationStore(db_uri),
+        artifact_store=artifact_store,
+        agent_cache=AgentCache(artifact_store=artifact_store, cache_dir=tmp_path / "cache"),
+        host_store=HostStore(db_uri),
+        sandbox_config=parse_sandbox_config(
+            {
+                "provider": "modal",
+                "server_url": "https://managed-test.example.com",
+                "modal": {"image": "docker.io/test/omnigent-host:latest"},
+                "shutdown_drain_s": 7,
+            }
+        ),
+    )
+    async with app.router.lifespan_context(app):
+        assert drains == []
+    assert drains == [7.0]
+
+
+async def test_shutdown_waits_for_an_in_flight_launch_to_bind_its_host(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    Shutdown lets a mid-provision launch bind its session to the host.
+
+    Once bound, whichever replica the host tunnels to starts the runner
+    and delivers the session's saved messages; cancelled before the
+    bind, the session would belong to no host and never start.
+    """
+    import threading
+
+    from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    loop = asyncio.get_running_loop()
+    gate = threading.Event()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Spawn the fake sandbox host when the launcher 'starts' it."""
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    fake = FakeSandboxLauncher(provision_gate=gate, on_host_start=_start_fake_sandbox_host)
+    install_fake_modal_launcher(monkeypatch, fake)
+
+    agent = await create_test_agent(env.client, name="managed-shutdown-drain-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+
+    shutdown = asyncio.create_task(cancel_managed_launch_tasks(drain_s=15.0))
+    await asyncio.sleep(0.3)
+    assert not shutdown.done()
+    gate.set()
+    await asyncio.wait_for(shutdown, timeout=15.0)
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.host_id is not None
+    assert conv.labels.get(STARTUP_LABEL) != "failed"
+    for future in host_futures:
+        future.cancel()
+
+
+async def test_shutdown_cancelling_the_bind_write_keeps_the_session_startable(
+    managed_session_env: ManagedSessionEnv,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A drain that ends while the bind is being written does not fail the session.
+
+    The write still lands, so the host's replica must still find the
+    session's startup pending; a "failed" startup would never be resumed.
+    """
+    import threading
+
+    from omnigent.server.routes.sessions import cancel_managed_launch_tasks
+
+    env = managed_session_env
+    monkeypatch.setattr("omnigent.server.managed_hosts.MANAGED_HOST_ONLINE_TIMEOUT_S", 10)
+    loop = asyncio.get_running_loop()
+    host_futures: list[asyncio.Future[ApplicationCommunicator]] = []
+
+    def _start_fake_sandbox_host(invocation: HostStartInvocation) -> None:
+        """Spawn the fake sandbox host when the launcher 'starts' it."""
+        future = asyncio.run_coroutine_threadsafe(
+            _fake_sandbox_host(
+                env.app, invocation.host_id, invocation.host_name, invocation.token
+            ),
+            loop,
+        )
+        host_futures.append(asyncio.wrap_future(future, loop=loop))
+
+    install_fake_modal_launcher(
+        monkeypatch, FakeSandboxLauncher(on_host_start=_start_fake_sandbox_host)
+    )
+    writing = threading.Event()
+    release = threading.Event()
+    set_host_id = env.conv_store.set_host_id
+
+    def slow_set_host_id(*args: Any, **kwargs: Any) -> Any:
+        writing.set()
+        release.wait(timeout=10)
+        return set_host_id(*args, **kwargs)
+
+    monkeypatch.setattr(env.conv_store, "set_host_id", slow_set_host_id)
+
+    agent = await create_test_agent(env.client, name="managed-shutdown-bind-race-agent")
+    resp = await env.client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_type": "managed"},
+    )
+    assert resp.status_code == 201, resp.text
+    session_id = resp.json()["id"]
+    await asyncio.wait_for(asyncio.to_thread(writing.wait, 10), timeout=15)
+
+    shutdown = asyncio.create_task(cancel_managed_launch_tasks(drain_s=0.2))
+    await asyncio.sleep(0.5)
+    # Past the drain, shutdown still waits for the bind write to land.
+    assert not shutdown.done()
+    release.set()
+    await asyncio.wait_for(shutdown, timeout=15)
+
+    conv = env.conv_store.get_conversation(session_id)
+    assert conv is not None and conv.host_id is not None
+    assert conv.labels.get(STARTUP_LABEL) == "pending"
+    for future in host_futures:
+        future.cancel()
 
 
 async def test_managed_session_deleted_during_provision_terminates_sandbox(
