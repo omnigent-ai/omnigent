@@ -215,9 +215,11 @@ import {
   useBulkArchiveConversations,
   useBulkDeleteConversations,
   useConversations,
+  useProjects,
   useStopAndDeleteConversation,
 } from "@/hooks/useConversations";
 import { conversationDisplayLabel } from "@/shell/sidebarNav";
+import { ProjectRowIcon } from "@/shell/ProjectPicker";
 import { absoluteTime } from "@/lib/relativeTime";
 import { useNavigate } from "@/lib/routing";
 import { useSettingsRoute } from "@/shell/settingsNav";
@@ -3358,6 +3360,11 @@ function ArchivedSection() {
   // whose sessions sit on later pages.
   const namesQuery = useArchivedProjectNames();
   const projectNames = useMemo(() => namesQuery.data ?? [], [namesQuery.data]);
+  const projectsQuery = useProjects();
+  const projectIcons = useMemo(
+    () => new Map((projectsQuery.data ?? []).map(({ name, icon }) => [name, icon])),
+    [projectsQuery.data],
+  );
 
   // A picked project can vanish from the option set for good (its last
   // archived session deleted or restored, possibly by another client). Once
@@ -3518,7 +3525,7 @@ function ArchivedSection() {
                   data-testid="archived-project-filter"
                   className="w-56"
                 >
-                  <SelectValue />
+                  <SelectValue className="min-w-0 flex-1" />
                 </SelectTrigger>
                 <SelectContent
                   {...settingsOverlayProps(ARCHIVED_SESSIONS_ENTRY, "projectFilter")}
@@ -3533,7 +3540,8 @@ function ArchivedSection() {
                       value={projectToSelectValue(name)}
                       data-testid={`archived-project-option-${name}`}
                     >
-                      {name}
+                      <ProjectRowIcon icon={projectIcons.get(name)} />
+                      <span className="min-w-0 flex-1 truncate">{name}</span>
                     </SelectItem>
                   ))}
                 </SelectContent>
