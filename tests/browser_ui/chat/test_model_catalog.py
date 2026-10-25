@@ -163,22 +163,8 @@ def test_picker_open_and_selection_do_not_refetch_catalog_or_session(
     assert unexpected_gets == []
 
 
-@pytest.mark.parametrize(
-    ("harness", "wrapper"),
-    [
-        ("claude-native", "claude-code-native-ui"),
-        ("codex-native", "codex-native-ui"),
-        ("pi-native", "pi-native-ui"),
-    ],
-)
-def test_launching_sandbox_offers_its_provider_catalog(
-    page: Page,
-    chat_session_contract: ChatSessionContract,
-    harness: str,
-    wrapper: str,
-) -> None:
-    """Before its sandbox has a host, a session offers the provider's preview rows."""
-    chat = chat_session_contract
+def _serve_launching_sandbox(chat: ChatSessionContract, *, harness: str, wrapper: str) -> None:
+    """Back a native session whose sandbox is provisioning and has no host yet."""
     chat.contract.json(
         "/v1/info",
         {
@@ -215,6 +201,25 @@ def test_launching_sandbox_offers_its_provider_catalog(
         labels={"omnigent.wrapper": wrapper},
         sandbox_status={"stage": "provisioning", "provider": "agent_sandbox"},
     )
+
+
+@pytest.mark.parametrize(
+    ("harness", "wrapper"),
+    [
+        ("claude-native", "claude-code-native-ui"),
+        ("codex-native", "codex-native-ui"),
+        ("pi-native", "pi-native-ui"),
+    ],
+)
+def test_launching_sandbox_offers_its_provider_catalog(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    harness: str,
+    wrapper: str,
+) -> None:
+    """Before its sandbox has a host, a session offers the provider's preview rows."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness=harness, wrapper=wrapper)
     page.goto(chat.url)
     expect(page.get_by_test_id("runner-starting-indicator").first).to_contain_text(
         "Provisioning sandbox"
@@ -234,5 +239,39 @@ def test_launching_sandbox_offers_its_provider_catalog(
         )
     ) as patch_info:
         page.locator('[data-model-id="gateway/sonnet"]').click()
-    # The launch reads the saved pick when it starts the harness.
+    # Saved for the launch to read.
     assert patch_info.value.request.post_data_json == {"model_override": "gateway/sonnet"}
+
+
+def test_session_catalog_replaces_the_launch_preview(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """The session's own catalog wins over the provider preview once it resolves."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    _open_models(page)
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "gateway/opus")
+
+    chat.set_catalog(
+        harness="claude-native",
+        models=[
+            model_option("opus", display_name="Opus (session)", is_default=True),
+            model_option("haiku", display_name="Haiku (session)"),
+        ],
+        selected_model="opus",
+    )
+    chat.emit(
+        {
+            "event": "session.model_options",
+            "data": {"type": "session.model_options", "conversation_id": chat.session_id},
+        }
+    )
+    expect(page.locator('[data-model-id="gateway/opus"]')).to_have_count(0)
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "opus")
+    expect(rows.nth(1)).to_have_attribute("data-model-id", "haiku")

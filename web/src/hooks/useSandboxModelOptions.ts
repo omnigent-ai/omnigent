@@ -1,6 +1,5 @@
 import { useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useCallback, useMemo } from "react";
-import { useHosts } from "@/hooks/useHosts";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { authenticatedFetch, getCurrentUserId } from "@/lib/identity";
 import type { NativeModelOption, SandboxStatus } from "@/lib/types";
@@ -86,56 +85,42 @@ export function useSandboxModelOptions(
   agentId: string | null,
   user: string | null,
   enabled: boolean,
-  { poll = true }: { poll?: boolean } = {},
 ) {
   const active = enabled && provider !== null && harness !== null;
   return useQuery({
     ...sandboxModelOptionsQuery(provider ?? "", harness ?? "", agentId, user),
     enabled: active,
-    refetchInterval: active && poll ? SELECTED_PREVIEW_POLL_MS : false,
+    refetchInterval: active ? SELECTED_PREVIEW_POLL_MS : false,
   });
 }
 
 /**
- * Preview a managed session's sandbox catalog while no host can list models.
- *
- * A launching sandbox binds its host only once that host connects, and a
- * stopped one has no tunnel, so neither the runner nor the host can answer
- * for minutes. The launch status, or else the offline sandbox host the
- * session is bound to, names the provider; its preview offers the rows the
- * new-session picker did. A pick saves to the session, where the launch
- * reads it.
+ * Preview a launching sandbox's catalog until the session is bound to a host,
+ * while a model pick is only saved for the launch to read.
  */
-export function useSandboxSessionModelOptions(
-  session: { hostId: string | null; agentId: string | null },
+export function useSandboxLaunchModelOptions(
   launch: SandboxStatus | null,
+  hostId: string | null,
   harness: string | null,
+  agentId: string | null,
   enabled: boolean,
 ): NativeModelOption[] | undefined {
-  // A failed launch is not launching; its session falls back to the bound host.
-  const launchProvider =
-    launch !== null && launch.stage !== "failed" ? (launch.provider ?? null) : null;
-  const { data: hosts } = useHosts({
-    includeSandbox: true,
-    enabled: enabled && launchProvider === null && session.hostId !== null,
-  });
-  const host = hosts?.find((row) => row.host_id === session.hostId);
   const provider =
-    launchProvider ?? (host?.status === "offline" ? (host.sandbox_provider ?? null) : null);
+    launch !== null && launch.stage !== "failed" && hostId === null
+      ? (launch.provider ?? null)
+      : null;
   const info = useServerInfo();
   // A bound inference profile already gives the session its saved catalog.
   const offered =
     provider !== null &&
     info !== "loading" &&
     info.sandbox_provider_capabilities?.[provider]?.default_models === true;
-  // An open session page can sit on a stopped sandbox for hours; don't poll.
   const { data } = useSandboxModelOptions(
     provider,
     harness,
-    session.agentId,
+    agentId,
     getCurrentUserId(),
     enabled && offered,
-    { poll: false },
   );
   return enabled && offered && data?.status === "ready" ? data.models : undefined;
 }

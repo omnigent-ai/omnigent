@@ -235,7 +235,7 @@ import {
   smartRoutingSourceFor,
 } from "@/lib/smartRoutingAvailability";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
-import { useSandboxSessionModelOptions } from "@/hooks/useSandboxModelOptions";
+import { useSandboxLaunchModelOptions } from "@/hooks/useSandboxModelOptions";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
 import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
 import { buildFusionSections } from "@/components/composer/fusionSections";
@@ -876,8 +876,8 @@ export function ChatPage() {
       hostProbeHarness !== null &&
       sessionModelOptions.length === 0,
   );
-  // A managed sandbox has no host to probe while it launches or sleeps, so
-  // fall back to its provider's preview for the harnesses sandboxes run.
+  // A launching sandbox has no host to probe until it is bound, so fall back to
+  // its provider's preview for the harnesses sandboxes run.
   const sandboxPreviewHarness =
     fallbackPickerKind === "claude"
       ? "claude-native"
@@ -886,10 +886,11 @@ export function ChatPage() {
         : fallbackPickerKind === "pi"
           ? "pi-native"
           : null;
-  const sandboxPreviewOptions = useSandboxSessionModelOptions(
-    { hostId: activeSession?.hostId ?? null, agentId: activeSession?.agentId ?? null },
+  const sandboxPreviewOptions = useSandboxLaunchModelOptions(
     sandboxStatus,
+    activeSession?.hostId ?? null,
     sandboxPreviewHarness,
+    activeSession?.agentId ?? null,
     !activeSession?.inferenceConfigured &&
       sandboxPreviewHarness !== null &&
       sessionModelOptions.length === 0,
@@ -898,10 +899,8 @@ export function ChatPage() {
     hostProbeOptions != null && hostProbeOptions.length > 0
       ? hostProbeOptions
       : sandboxPreviewOptions;
-  // Identity-stable on purpose: substitute only when the pre-launch rows
-  // actually exist, else keep the store's own array reference — a fresh []
-  // here would re-render every options consumer (composer, gear, agent-info
-  // popover) on each streaming/liveness tick.
+  // Keep the store's array reference unless pre-launch rows exist: a fresh []
+  // would re-render every options consumer on each streaming/liveness tick.
   const codexModelOptions =
     !activeSession?.inferenceConfigured &&
     sessionModelOptions.length === 0 &&

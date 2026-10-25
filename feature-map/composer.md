@@ -32,7 +32,7 @@ and steers messages while the agent is busy.
   model, and keeps the selection. Ctrl+Shift+M opens it in both composers.
   States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model),
-  a managed sandbox that is launching or stopped (its provider's default catalog).
+  a managed sandbox launching before its host is bound (its provider's default catalog).
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
@@ -157,10 +157,10 @@ and steers messages while the agent is busy.
   dial, distinct from the new-session composer's effort choice.
 - Press Ctrl+Shift+M (Ctrl on every platform) to open the model picker without
   the gear; press Ctrl+Shift+L to focus the message box.
-- In a native session on a managed sandbox, open the model picker while it shows
-  **Provisioning sandbox…**, or while its sandbox is stopped: it lists the
-  provider's default catalog, the rows the new-session picker offered, until the
-  session's own catalog arrives. A pick is saved for the launch.
+- In a new native session on a managed sandbox, open the model picker while it
+  shows **Provisioning sandbox…**: it lists the provider's default catalog, the
+  rows the new-session picker offered, until the session's host or its own
+  catalog can answer. A pick is saved for the launch.
 - For a Codex session, open the Terminal view and change effort there, then
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
@@ -333,8 +333,10 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_updates_after_delayed_catalog`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_highlights_the_reported_model`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_alias_selection_persists`.
-  A launching sandbox's provider catalog (Claude, Codex, and Pi):
-  `tests/browser_ui/chat/test_model_catalog.py::test_launching_sandbox_offers_its_provider_catalog`
+  A launching sandbox's provider catalog (Claude, Codex, and Pi) and its
+  replacement by the session's own catalog:
+  `tests/browser_ui/chat/test_model_catalog.py::test_launching_sandbox_offers_its_provider_catalog`,
+  `tests/browser_ui/chat/test_model_catalog.py::test_session_catalog_replaces_the_launch_preview`
 - **`model-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_model_flows_prelaunch.py::test_claude_default_entry_names_the_true_default`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`

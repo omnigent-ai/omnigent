@@ -6,11 +6,10 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { authenticatedFetch } from "@/lib/identity";
 import type { SandboxStatus } from "@/lib/types";
-import type { Host } from "./useHosts";
 import {
   sandboxModelOptionsKey,
   useSandboxModelOptions,
-  useSandboxSessionModelOptions,
+  useSandboxLaunchModelOptions,
   useSandboxUnsupportedAgents,
 } from "./useSandboxModelOptions";
 
@@ -192,7 +191,7 @@ describe("useSandboxUnsupportedAgents", () => {
   });
 });
 
-describe("useSandboxSessionModelOptions", () => {
+describe("useSandboxLaunchModelOptions", () => {
   const previewRows = [
     { id: "gateway/opus", displayName: "Opus", isDefault: false },
     { id: "gateway/gpt", displayName: "GPT", isDefault: false },
@@ -216,37 +215,24 @@ describe("useSandboxSessionModelOptions", () => {
   };
   const provisioning: SandboxStatus = { stage: "provisioning", provider: "agent_sandbox" };
 
-  function sandboxHost(overrides: Partial<Host> = {}): Host {
-    return {
-      host_id: "host_1",
-      name: "sandbox",
-      owner: "alice",
-      status: "offline",
-      sandbox_provider: "lakebox",
-      ...overrides,
-    };
-  }
-
-  /** Serve the host list and every provider preview; other URLs fail loudly. */
-  function serve({ hosts = [], preview = ready }: { hosts?: Host[]; preview?: object } = {}) {
-    fetchMock.mockImplementation(async (url) => {
-      if (String(url) === "/v1/hosts") return new Response(JSON.stringify({ hosts }));
-      if (String(url).startsWith("/v1/sandbox-providers/")) {
-        return new Response(JSON.stringify(preview));
-      }
-      return new Response(JSON.stringify({ detail: `unexpected ${String(url)}` }), { status: 500 });
-    });
+  /** Serve every provider preview; other URLs fail loudly. */
+  function serve(preview: object = ready) {
+    fetchMock.mockImplementation(async (url) =>
+      String(url).startsWith("/v1/sandbox-providers/")
+        ? new Response(JSON.stringify(preview))
+        : new Response(JSON.stringify({ detail: `unexpected ${String(url)}` }), { status: 500 }),
+    );
   }
 
   function render({
-    hostId = null,
     launch = provisioning,
+    hostId = null,
     harness = "claude-native",
     enabled = true,
     info = managedInfo,
   }: {
-    hostId?: string | null;
     launch?: SandboxStatus | null;
+    hostId?: string | null;
     harness?: string;
     enabled?: boolean;
     info?: ServerInfo | "loading";
@@ -254,7 +240,7 @@ describe("useSandboxSessionModelOptions", () => {
     const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const hook = renderHook(
       ({ active }: { active: boolean }) =>
-        useSandboxSessionModelOptions({ hostId, agentId: "ag_1" }, launch, harness, active),
+        useSandboxLaunchModelOptions(launch, hostId, harness, "ag_1", active),
       {
         initialProps: { active: enabled },
         wrapper: ({ children }: { children: ReactNode }) => (
@@ -267,7 +253,6 @@ describe("useSandboxSessionModelOptions", () => {
     return { client, ...hook };
   }
 
-  const requested = () => fetchMock.mock.calls.map(([url]) => String(url));
   // Gives a wrongly enabled query time to start before asserting it didn't.
   const settle = () =>
     act(
@@ -283,9 +268,9 @@ describe("useSandboxSessionModelOptions", () => {
       serve();
       const { result } = render({ harness });
       await waitFor(() => expect(result.current).toEqual(previewRows));
-      expect(requested()).toEqual([
+      expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
         `/v1/sandbox-providers/agent_sandbox/harnesses/${harness}/model-options?agent_id=ag_1`,
-      ]);
+      );
     },
   );
 
@@ -293,45 +278,25 @@ describe("useSandboxSessionModelOptions", () => {
     "keeps the launch's provider through the %s stage",
     async (stage) => {
       serve();
-      const { result } = render({ hostId: "host_1", launch: { stage, provider: "lakebox" } });
+      const { result } = render({ launch: { stage, provider: "lakebox" } });
       await waitFor(() => expect(result.current).toEqual(previewRows));
-      // The launch names the provider, so the host list is not read.
-      expect(requested()).toEqual([
+      expect(fetchMock).toHaveBeenCalledExactlyOnceWith(
         "/v1/sandbox-providers/lakebox/harnesses/claude-native/model-options?agent_id=ag_1",
-      ]);
+      );
     },
   );
 
-  it("previews a stopped sandbox from the host the session is bound to", async () => {
-    serve({ hosts: [sandboxHost()] });
-    const { result } = render({ hostId: "host_1", launch: null });
-    await waitFor(() => expect(result.current).toEqual(previewRows));
-    expect(requested()).toEqual([
-      "/v1/hosts",
-      "/v1/sandbox-providers/lakebox/harnesses/claude-native/model-options?agent_id=ag_1",
-    ]);
-  });
-
-  it.each([
-    { name: "an online sandbox host", host: sandboxHost({ status: "online" }) },
-    { name: "an offline connected host", host: sandboxHost({ sandbox_provider: null }) },
-    { name: "a different host", host: sandboxHost({ host_id: "host_2" }) },
-  ])("leaves $name to the host probe", async ({ host }) => {
-    serve({ hosts: [host] });
-    const { client, result } = render({ hostId: "host_1", launch: null });
-    await waitFor(() =>
-      expect(client.getQueryData(["hosts", { includeSandbox: true }])).toEqual([host]),
-    );
-    await settle();
-    expect(result.current).toBeUndefined();
-    expect(requested()).toEqual(["/v1/hosts"]);
-  });
-
-  it("does not preview a failed launch", async () => {
-    serve();
-    const { result } = render({
+  it.each<{ name: string; launch: SandboxStatus | null; hostId: string | null }>([
+    {
+      name: "a failed launch",
       launch: { stage: "failed", provider: "agent_sandbox", error: "quota exceeded" },
-    });
+      hostId: null,
+    },
+    { name: "a launch bound to its host", launch: provisioning, hostId: "host_1" },
+    { name: "a session without a launch", launch: null, hostId: "host_1" },
+  ])("leaves $name to the session's own sources", async ({ launch, hostId }) => {
+    serve();
+    const { result } = render({ launch, hostId });
     await settle();
     expect(result.current).toBeUndefined();
     expect(fetchMock).not.toHaveBeenCalled();
@@ -369,13 +334,31 @@ describe("useSandboxSessionModelOptions", () => {
     "offers no rows for a %s preview",
     async (status) => {
       const preview = { ...ready, models: [], status };
-      serve({ preview });
+      serve(preview);
       const { client, result } = render();
       const key = sandboxModelOptionsKey("agent_sandbox", "claude-native", "ag_1", "alice");
       await waitFor(() => expect(client.getQueryData(key)).toEqual(preview));
       expect(result.current).toBeUndefined();
     },
   );
+
+  it("recovers a launch's rows after an unavailable preview or a failed request", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    try {
+      serve({ ...ready, models: [], status: "unavailable" });
+      const { result } = render();
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(1));
+      fetchMock.mockResolvedValue(new Response("{}", { status: 503 }));
+      await act(() => vi.advanceTimersByTimeAsync(15_000));
+      await waitFor(() => expect(fetchMock).toHaveBeenCalledTimes(2));
+      expect(result.current).toBeUndefined();
+      serve();
+      await act(() => vi.advanceTimersByTimeAsync(15_000));
+      await waitFor(() => expect(result.current).toEqual(previewRows));
+    } finally {
+      vi.useRealTimers();
+    }
+  });
 
   it("drops the preview once the caller disables it", async () => {
     serve();
@@ -388,22 +371,9 @@ describe("useSandboxSessionModelOptions", () => {
 
   it("requests nothing while disabled", async () => {
     serve();
-    const { result } = render({ hostId: "host_1", enabled: false });
+    const { result } = render({ enabled: false });
     await settle();
     expect(result.current).toBeUndefined();
     expect(fetchMock).not.toHaveBeenCalled();
-  });
-
-  it("asks once instead of polling while the session waits", async () => {
-    vi.useFakeTimers({ shouldAdvanceTime: true });
-    try {
-      serve();
-      const { result } = render();
-      await waitFor(() => expect(result.current).toEqual(previewRows));
-      await act(() => vi.advanceTimersByTimeAsync(60_000));
-      expect(fetchMock).toHaveBeenCalledTimes(1);
-    } finally {
-      vi.useRealTimers();
-    }
   });
 });
