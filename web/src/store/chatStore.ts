@@ -2912,18 +2912,29 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
+      // A delivered send needs no card. One the server never answered may still
+      // arrive, so its card names the send for the commit that retracts it.
+      const sentText = failGet().isNativeTerminalSession ? messageContentText(content) : "";
+      const failureCard: ErrorBlock | null = deliveredDespiteFailure
+        ? null
+        : {
+            ...makeClientErrorBlock(message, code),
+            ...(serverRefused
+              ? {}
+              : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
+          };
       if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
           finalizeActive(failSet, "failed", message, null);
-        } else if (!callerHandlesError) {
+        } else if (!callerHandlesError && failureCard !== null) {
           // No response bubble to carry the failure — the turn never started
           // (e.g. the runner never came online, so POST /events 503'd). Append
           // a standalone error block so the user sees WHY nothing happened
           // instead of being left on a silent, empty composer. Skipped when the
           // caller owns the error UX (it surfaces the failure elsewhere).
-          failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+          failSet((s) => ({ blocks: [...s.blocks, failureCard] }));
         }
         failSet({
           status: "idle",
@@ -2938,8 +2949,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // to see. Surface it WITHOUT touching the turn lifecycle: finalizeActive
         // would fail a live response, and settling status would end a turn that
         // is still running. Skipped when the caller owns the error UX.
-        if (!callerHandlesError) {
-          failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+        if (!callerHandlesError && failureCard !== null) {
+          failSet((s) => ({ blocks: [...s.blocks, failureCard] }));
         }
       }
     } finally {
@@ -5532,9 +5543,14 @@ async function rehydrateWindowOnReconnect(
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const freshItemIds = new Set(fresh.items.map((it) => it.id));
+  const gapBlocks = freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId));
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
-    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
+    const currentBlocks = withoutDeliveredSendFailureCards(
+      withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
+      gapBlocks,
+      session,
+    );
     const tail = currentBlocks.filter((b) => {
       if (b.ctx.itemId) return !preGapIds.has(b.ctx.itemId);
       // Elicitation/error blocks aren't items, so the fresh fetch can't recreate them.
@@ -5738,6 +5754,7 @@ async function reconcileOnReconnect(
       }
       nextBlocks =
         at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
+      nextBlocks = withoutDeliveredSendFailureCards(nextBlocks, unseen, session);
     }
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
@@ -7337,6 +7354,40 @@ function reconcileSendDraftWithSnapshot(
 }
 
 /**
+ * Drop the failure cards of unanswered sends that `committed` delivers.
+ *
+ * A send commits under its stable id, except on a native terminal: the mirror
+ * has its own id and may prepend markers, so a committed message ending in the
+ * send's text is its delivery. Only new commits count, as an older message can
+ * say the same thing. A send the snapshot records the runner refusing keeps
+ * its card.
+ *
+ * @param blocks - The conversation's blocks.
+ * @param committed - Newly committed blocks: a live input, or a snapshot's gap.
+ * @param snapshot - The snapshot `committed` came from, if any.
+ * @returns `blocks` itself when no card is dropped.
+ */
+function withoutDeliveredSendFailureCards(
+  blocks: AnyBlock[],
+  committed: AnyBlock[],
+  snapshot?: Session,
+): AnyBlock[] {
+  const committedIds = new Set(committed.map((block) => block.ctx.itemId));
+  const committedTexts = committedUserTextsOf(committed);
+  const kept = blocks.filter((block) => {
+    const send = block.type === "error" ? block.unansweredSend : undefined;
+    if (send === undefined) return true;
+    if (snapshot !== undefined && snapshotRefusesSend(snapshot, send.stableId)) return true;
+    const { stableId, text } = send;
+    const delivered =
+      committedIds.has(stableId) ||
+      (text !== undefined && committedTexts.some((committedText) => committedText.endsWith(text)));
+    return !delivered;
+  });
+  return kept.length === blocks.length ? blocks : kept;
+}
+
+/**
  * Build the committed user-message content from a consumed event,
  * preserving optimistic file blocks the native transcript drops.
  *
@@ -8360,6 +8411,13 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
             committedUserBlock(event.itemId, eventContent, undefined, event.createdBy),
           ],
         };
+      });
+      // The committed message can be an unanswered send arriving after all.
+      applyToConversation((s) => {
+        const committed = s.blocks.findLast((block) => block.ctx.itemId === event.itemId);
+        if (committed === undefined) return {};
+        const blocks = withoutDeliveredSendFailureCards(s.blocks, [committed]);
+        return blocks === s.blocks ? {} : { blocks };
       });
       return;
     case "slash_command":

@@ -6115,7 +6115,10 @@ describe("chatStore — delivered-but-unacked send", () => {
   // A network failure on the send POST only proves the acknowledgement was lost;
   // the committed item arriving under the send's stable id proves delivery.
 
-  it("retracts the failed-send draft when its message commits under the send's stable id", async () => {
+  const errorCards = () =>
+    useChatStore.getState().blocks.filter((block): block is ErrorBlock => block.type === "error");
+
+  it("retracts the failed-send draft and card when its message commits under the send's stable id", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -6131,6 +6134,9 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(draft).toMatchObject({ text: "summarize the deploy status", serverRefused: false });
     const stableId = draft?.stableId;
     expect(stableId).toBeTruthy();
+    expect(errorCards()).toEqual([
+      expect.objectContaining({ message: "Failed to fetch", unansweredSend: { stableId } }),
+    ]);
 
     handleSessionEvent({
       type: "session_input_consumed",
@@ -6143,9 +6149,45 @@ describe("chatStore — delivered-but-unacked send", () => {
     });
 
     expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(errorCards()).toEqual([]);
     const last = useChatStore.getState().blocks.at(-1) as UserMessageBlock;
     expect(last.type).toBe("user_message");
     expect(last.ctx.itemId).toBe(stableId);
+  });
+
+  it("retracts a native send's failure card once its transcript mirror commits", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+    });
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        return Promise.reject(new TypeError("Load failed"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+    await useChatStore.getState().send("file a single PR", "agent_xyz");
+    expect(errorCards()).toEqual([
+      expect.objectContaining({
+        message: "Load failed",
+        unansweredSend: { stableId: expect.any(String), text: "file a single PR" },
+      }),
+    ]);
+    const mirror = (itemId: string, text: string) =>
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId,
+        itemType: "message",
+        data: { role: "user", content: [{ type: "input_text", text }] },
+        createdBy: "user@example.com",
+      });
+
+    // The mirror commits under its own id, so only its text identifies the send.
+    mirror("1".repeat(32), "something else");
+    expect(errorCards()).toHaveLength(1);
+    mirror("2".repeat(32), "[Attached: /tmp/notes.md]\n\nfile a single PR");
+    expect(errorCards()).toEqual([]);
   });
 
   it("flips a restored draft to delivered and stops the stable-id reuse", () => {
@@ -6173,7 +6215,7 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(useChatStore.getState().pendingRetryStableId).toBeNull();
   });
 
-  it("hands back no draft when the message committed before the send failure settled", async () => {
+  it("hands back no draft or card when the message committed before the send failure settled", async () => {
     const stableId = "b".repeat(32);
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -6202,6 +6244,7 @@ describe("chatStore — delivered-but-unacked send", () => {
 
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(errorCards()).toEqual([]);
   });
 
   it("marks the draft server-refused when the POST is answered with an Omnigent error", async () => {
@@ -6226,6 +6269,9 @@ describe("chatStore — delivered-but-unacked send", () => {
       text: "summarize the deploy status",
       serverRefused: true,
     });
+    // An answered refusal is a real failure: its card names no send to retract it.
+    expect(errorCards()).toHaveLength(1);
+    expect(errorCards()[0]).not.toHaveProperty("unansweredSend");
   });
 
   it("still hands back a server-refused draft whose persisted item is in the transcript", async () => {
@@ -13839,9 +13885,21 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  /** The card a send leaves when its POST gets no answer. */
+  function unansweredSendCard(send: NonNullable<ErrorBlock["unansweredSend"]>): ErrorBlock {
+    return {
+      type: "error",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+      message: "Load failed",
+      source: "",
+      code: "",
+      unansweredSend: send,
+    };
+  }
+
   // A restored failed-send draft reconciles against the snapshot too: its
   // `session_input_consumed` proof is never replayed after a reconnect.
-  it("retracts an ack-lost restored draft when the reconnect snapshot holds its item", async () => {
+  it("retracts an ack-lost restored draft and its card when the reconnect snapshot holds its item", async () => {
     const stableId = "c".repeat(32);
     const before = userMessage("draft_pre", "before the gap");
     seedSession("conv_draft_acklost", [before]);
@@ -13850,7 +13908,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     useChatStore.setState({
       conversationId: "conv_draft_acklost",
       abortController: controller,
-      blocks: itemsToBlocks([before]),
+      blocks: [...itemsToBlocks([before]), unansweredSendCard({ stableId })],
       // The POST got no answer at all; the composer restored the text.
       restoredSendDraft: {
         conversationId: "conv_draft_acklost",
@@ -14064,6 +14122,39 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: true });
     expect(state.pendingRetryStableId).toBeNull();
+  });
+
+  it("keeps the failure card of a send the snapshot records the runner refusing", async () => {
+    const id = "conv_card_rejected";
+    const stableId = "e".repeat(32);
+    const before = userMessage(`${id}_pre`, "before the gap");
+    seedSession(id, [before]);
+    const sinks = routeStreamOpens();
+    serveRunnerRejectedSnapshot(id, stableId);
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      blocks: [...itemsToBlocks([before]), unansweredSendCard({ stableId })],
+    });
+
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // The server persisted the message before the runner refused it.
+    seedSessionItems(id, [before, { ...userMessage(`${id}_gap`, "resend me"), id: stableId }]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    expect(useChatStore.getState().blocks).toContainEqual(unansweredSendCard({ stableId }));
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
   });
 
   it("keeps an attributed rejection in force after the session has moved on", async () => {
@@ -14843,6 +14934,60 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each([
+    { path: "ordinary backfill", gapLength: 5 },
+    { path: "the fresh-window fallback", gapLength: 100 },
+  ])(
+    "retracts a native send's failure card when reconnect recovers its mirror through $path",
+    async ({ gapLength }) => {
+      const id = `conv_native_card_${gapLength}`;
+      const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+      const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+      seedSession(id, preGap);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        isNativeTerminalSession: true,
+        blocks: [
+          ...itemsToBlocks(windowItems),
+          unansweredSendCard({ stableId: "a".repeat(32), text: "ship it" }),
+          // Only a message from before the gap says the same thing.
+          unansweredSendCard({ stableId: "b".repeat(32), text: "pre 25" }),
+        ],
+        hasMoreHistory: true,
+        oldestItemId: windowItems[0]!.id,
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(sinks).toHaveLength(1);
+
+      // The first send's mirror commits during the gap, under its own id.
+      const gap = Array.from({ length: gapLength - 1 }, (_, i) => gapUser("gap", i));
+      const mirror = {
+        ...userMessage("mirror", "[Attached: /tmp/notes.md]\n\nship it"),
+        id: "f".repeat(32),
+      };
+      seedSessionItems(id, [...preGap, ...gap, mirror]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+
+      const cards = useChatStore
+        .getState()
+        .blocks.filter((block): block is ErrorBlock => block.type === "error");
+      expect(cards.map((card) => card.unansweredSend?.text)).toEqual(["pre 25"]);
+
+      const last = sinks[1]!;
+      last.push("data: [DONE]\n\n");
+      last.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
 
   it.each([
     { path: "ordinary backfill", gapLength: 5, refreshesWindow: false },
