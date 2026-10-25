@@ -7454,6 +7454,38 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
     });
 
+    it.each([
+      ["clears it when the launch moved on", "provisioning", null],
+      ["keeps it while the launch still asks", "action_required", "Sign in."],
+    ] as const)(
+      "a reloaded snapshot of a dismissed warning %s",
+      async (_label, stage, dismissed) => {
+        useChatStore.setState({
+          conversationId: "conv_abc",
+          sandboxStatus: { stage: "action_required", error: null, details: "Sign in." },
+          sandboxActionDismissed: "Sign in.",
+        });
+        fetchMock.mockImplementation(() =>
+          mockResponse({
+            id: "conv_abc",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: {},
+            sandbox_status: {
+              stage,
+              error: null,
+              details: stage === "action_required" ? "Sign in." : null,
+            },
+          }),
+        );
+        await useChatStore.getState().refreshSessionState("conv_abc");
+        expect(useChatStore.getState().sandboxStatus?.stage).toBe(stage);
+        expect(useChatStore.getState().sandboxActionDismissed).toBe(dismissed);
+      },
+    );
+
     it("advances the provisioning indicator through launch stages", () => {
       useChatStore.setState({
         sandboxStatus: { stage: "provisioning", error: null },
@@ -13404,6 +13436,66 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await loop;
     }
   });
+
+  it.each([
+    ["moved on", { stage: "provisioning", error: null }, null],
+    ["settled", null, null],
+    ["still asks", { stage: "action_required", error: null, details: "Sign in." }, "Sign in."],
+  ] as const)(
+    "a reconnect that finds the launch %s updates a dismissed warning",
+    async (_label, snapshotStatus, dismissed) => {
+      seedSession("conv_dismissed", []);
+      const sinks = routeStreamOpens(["server-a", "server-b"]);
+      const normalFetch = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0]!;
+        if (path === "/v1/sessions/conv_dismissed" && (init?.method ?? "GET") === "GET") {
+          return Promise.resolve(
+            mockResponse({
+              id: "conv_dismissed",
+              agent_id: "agent_xyz",
+              status: "idle",
+              created_at: 0,
+              items: [],
+              labels: {},
+              pending_elicitations: [],
+              pending_inputs: [],
+              mcp_startup: null,
+              terminal_pending: false,
+              sandbox_status: snapshotStatus,
+            }),
+          );
+        }
+        return normalFetch(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_dismissed",
+        abortController: controller,
+        sandboxStatus: { stage: "action_required", error: null, details: "Sign in." },
+        sandboxActionDismissed: "Sign in.",
+      });
+      const loop = startStreamPump("conv_dismissed", controller, setState, getState);
+      try {
+        await vi.advanceTimersByTimeAsync(1);
+        sinks[0]!.error();
+        // The reconnect reads the snapshot the missed stream events would have updated.
+        await vi.advanceTimersByTimeAsync(50);
+        await drainAsync(2);
+        expect(useChatStore.getState().sandboxActionDismissed).toBe(dismissed);
+      } finally {
+        controller.abort();
+        const last = sinks[sinks.length - 1];
+        if (last) {
+          last.push("data: [DONE]\n\n");
+          last.close();
+        }
+        await vi.advanceTimersByTimeAsync(20);
+        await loop;
+      }
+    },
+  );
 
   it("suppresses delayed previews after snapshot-only completion recovery", async () => {
     seedSession("conv_native_tombstone", []);

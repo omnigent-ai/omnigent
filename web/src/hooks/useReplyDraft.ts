@@ -1,6 +1,6 @@
 import { useCallback, useMemo, useState, type SetStateAction } from "react";
-import { nanoid } from "nanoid";
 import {
+  appendReplyQuote,
   restoreReplyDraft,
   removeReplyQuote,
   serializeReplyDraft,
@@ -36,11 +36,7 @@ export function useReplyDraft() {
     focusText(null);
   }, []);
   const appendQuote = useCallback((text: string) => {
-    const id = nanoid();
-    setDraft((current) => ({
-      quotes: [...current.quotes, { id, before: current.text, text: text.replace(/\r\n?/g, "\n") }],
-      text: "",
-    }));
+    setDraft((current) => appendReplyQuote(current, text));
     focusText(null);
   }, []);
   const removeQuote = useCallback((id: string) => {

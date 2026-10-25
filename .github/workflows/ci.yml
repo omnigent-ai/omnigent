@@ -102,11 +102,25 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Set up Node.js for local relay tests
-        if: matrix.group == 'misc'
+      - name: Set up Node.js for local relay and harness CLI tests
+        if: matrix.group == 'misc' || matrix.group == 'inner-rest'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+
+      # Tests that exercise a real harness CLI skip without it; install the
+      # pinned CLI only in the lanes that run them.
+      - name: Install Codex CLI
+        if: matrix.group == 'misc'
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+        with:
+          harness: codex
+
+      - name: Install Pi CLI
+        if: matrix.group == 'inner-rest'
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@72e41e11b0489294045d9164d5c26d6c9a239d56
+        with:
+          harness: pi
 
       - name: Install test system dependencies
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox

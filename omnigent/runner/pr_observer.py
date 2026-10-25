@@ -11,7 +11,8 @@ import logging
 import re
 import shlex
 import threading
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 from omnigent.git_providers import load_facet, providers
@@ -29,6 +30,9 @@ _logger = logging.getLogger(__name__)
 # Ids of the providers that already failed once in this process.
 _failed_providers: set[str] = set()
 _failed_providers_lock = threading.Lock()
+_lookup_pool = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-observer")
+_pending_lookups: set[tuple[str, str]] = set()
+_pending_lookups_lock = threading.Lock()
 
 
 def _failed(result: object) -> bool:
@@ -46,7 +50,13 @@ def _failed(result: object) -> bool:
             return True
         if obj.get("success") is False or obj.get("cancelled") is True:
             return True
-    return False
+    return bool(
+        re.search(
+            r"(?:^|\n)(?:\[exit code: -?[1-9][0-9]*\]"
+            r"|Process exited with code -?[1-9][0-9]*)\s*\Z",
+            output_text(result),
+        )
+    )
 
 
 def _prepare_shell_text(command: str) -> tuple[str, bool]:
@@ -225,6 +235,20 @@ def _object_pr(obj: dict[str, object], facets: list[_ProviderFacet]) -> PullRequ
     return None
 
 
+def _shell_operations(
+    tool_name: str, arguments: dict[str, object], facets: list[_ProviderFacet]
+) -> list[tuple[str, ShellPrOp]]:
+    if tool_name not in SHELL_TOOLS and tool_name not in {"exec_command", "run_command"}:
+        return []
+    command = arguments.get("command", arguments.get("cmd"))
+    if not isinstance(command, str) or len(command) > 100_000:
+        return []
+    segments = _shell_segments(command)
+    return [
+        (facet.provider_id, op) for facet in facets for op in facet.shell_pr_operations(segments)
+    ]
+
+
 def extract_prs(
     tool_name: str, arguments: dict[str, object], result: object
 ) -> tuple[list[PullRequestRef], bool]:
@@ -244,27 +268,17 @@ def extract_prs(
     references: list[PullRequestRef] = []
     created = False
     if tool_name in SHELL_TOOLS or tool_name in {"exec_command", "run_command"}:
-        command = arguments.get("command", arguments.get("cmd"))
-        if not isinstance(command, str) or len(command) > 100_000:
-            return [], False
-        segments = _shell_segments(command)
         # Every recognized PR command, reads included; ``commands`` are those that change a PR.
         provider_ops = [
-            (facet.provider_id, op)
-            for facet in facets
-            for op in facet.shell_pr_operations(segments)
+            (provider_id, op)
+            for provider_id, op in _shell_operations(tool_name, arguments, facets)
+            if op.resolve_result is None
         ]
         ops = [op for _, op in provider_ops]
         commands = [op for op in ops if op.tracks]
         if not commands:
             return [], False
         text = output_text(result)
-        if re.search(
-            r"(?:^|\n)(?:\[exit code: -?[1-9][0-9]*\]"
-            r"|Process exited with code -?[1-9][0-9]*)\s*\Z",
-            text,
-        ):
-            return [], False
         created = all(op.creates for op in commands)
         references = [target for op in commands if (target := op.target) is not None]
         if any(op.creates for op in commands) and (ref := _created_pr_metadata(result)):
@@ -312,6 +326,29 @@ def extract_prs(
     return list({ref.url: ref for ref in references}.values()), created
 
 
+def _record_resolved_prs(
+    session_id: str,
+    provider_id: str,
+    resolve: Callable[[object], Sequence[PullRequestRef]],
+    result: object,
+    source: str,
+    observation_id: str,
+) -> None:
+    try:
+        references = [ref for ref in resolve(result) if ref.provider == provider_id]
+        SessionPrRegistry(session_id).record(
+            references,
+            relationship="worked_on",
+            source=source,
+            observation_id=observation_id,
+        )
+    except Exception:  # noqa: BLE001 — optional lookups must never affect tool execution
+        _log_provider_failure(provider_id, "resolve_result")
+    finally:
+        with _pending_lookups_lock:
+            _pending_lookups.discard((session_id, observation_id))
+
+
 def observe_tool_completion(
     session_id: str,
     *,
@@ -333,7 +370,37 @@ def observe_tool_completion(
             source=source,
             observation_id=observation_key(source, call_id, [tool_name, arguments, result]),
         )
-    except Exception:  # noqa: BLE001 — the observer must never change a tool call's result
+        if not _failed(result):
+            for index, (provider_id, op) in enumerate(
+                _shell_operations(tool_name, arguments, _facets())
+            ):
+                if op.resolve_result is None:
+                    continue
+                observation_id = observation_key(
+                    f"{source}:{provider_id}:{index}:resolved",
+                    call_id,
+                    [tool_name, arguments, result],
+                )
+                key = (session_id, observation_id)
+                with _pending_lookups_lock:
+                    if key in _pending_lookups:
+                        continue
+                    _pending_lookups.add(key)
+                try:
+                    _lookup_pool.submit(
+                        _record_resolved_prs,
+                        session_id,
+                        provider_id,
+                        op.resolve_result,
+                        result,
+                        source,
+                        observation_id,
+                    )
+                except Exception:
+                    with _pending_lookups_lock:
+                        _pending_lookups.discard(key)
+                    raise
+    except Exception:
         _logger.warning(
             "Failed to record session PRs", extra={"session_id": session_id}, exc_info=True
         )

@@ -104,7 +104,8 @@ jobs:
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
-          if [ "$DEPENDENCY" = true ] && [ "$UI_SCOPE" != dependency ]; then
+          # Dependency-only PRs skip only when the scope rules out the web UI.
+          if [ "$DEPENDENCY" = true ] && { [ "$UI_SCOPE" = none ] || [ "$UI_SCOPE" = sidecar ]; }; then
             echo "ui=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

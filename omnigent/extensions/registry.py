@@ -443,7 +443,7 @@ def _load_community_manifests() -> tuple[
             candidates.append((key, manifest, _entry_point_asset_package(entry_point)))
         # Entry points are an external package boundary: one plugin may raise
         # any exception, and must not prevent healthy extensions from loading.
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             errors[key] = str(exc)
             _logger.warning(
                 "could not load extension entry point %s (%s)",

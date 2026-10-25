@@ -1,7 +1,8 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import { type ComponentProps, useContext, useState } from "react";
-import { cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
@@ -67,7 +68,10 @@ vi.mock("@/hooks/useTerminals", async (importOriginal) => ({
   useDeleteTerminal: () => ({}),
 }));
 vi.mock("./GridSessionsContext", () => ({
-  useGridSessions: () => ({ closePane: vi.fn() }),
+  useGridSessions: () => {
+    const [selectedSessionId, selectSession] = useState("first");
+    return { closePane: vi.fn(), selectedSessionId, selectSession };
+  },
   gridTitle: () => "Test grid",
 }));
 vi.mock("@/components/chat/SideChatPane", () => ({
@@ -80,7 +84,7 @@ vi.mock("@/components/chat/SideChatPane", () => ({
         <button type="button" onClick={() => terminal?.setView("terminal")}>
           Open terminal dialog
         </button>
-        <button type="button" onClick={() => context.openFile("notes.md", { line: 7 })}>
+        <button type="button" onClick={() => context.openFile("notes.md", { line: 7, endLine: 9 })}>
           Open citation
         </button>
         <button type="button" onClick={() => context.registerNavigationGuard?.(() => {})}>
@@ -101,6 +105,7 @@ vi.mock("@/shell/WorkspacePanel", () => ({
         data-maximized={String(props.maximized)}
         data-width={props.width}
         data-terminal={props.selectedTerminalKey ?? ""}
+        data-end-line={props.filePosition?.endLine}
       >
         <span>{props.selectedFilePath ?? "No file"}</span>
         <span>{props.filePosition?.line}</span>
@@ -134,6 +139,28 @@ afterEach(() => {
   fixture.terminals = [];
   fixture.terminalPending = false;
   vi.restoreAllMocks();
+});
+
+it("opens agent-requested files only in the active workspace and respects navigation guards", () => {
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "ui-files", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  act(() => emitUiOpenFile({ type: "ui_open_file", path: "background.md" }, "second"));
+  expect(screen.getByTestId("workspace-second")).not.toHaveTextContent("background.md");
+  act(() => emitUiOpenFile({ type: "ui_open_file", path: "guide.md" }, "first"));
+  expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
+  fireEvent.click(
+    within(screen.getByRole("region", { name: "first (active)" })).getByText("Block navigation"),
+  );
+  act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
+  expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
+  expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {
@@ -227,6 +254,7 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   let workspace = screen.getByRole("complementary", { name: "Workspace" });
   expect(workspace).toHaveAttribute("data-width", "480");
   expect(workspace).toHaveTextContent("notes.md7agent-first");
+  expect(workspace).toHaveAttribute("data-end-line", "9");
   fireEvent.change(within(workspace).getByRole("textbox", { name: "File draft" }), {
     target: { value: "Unsaved edit" },
   });
@@ -253,16 +281,19 @@ it("shares one workspace, preserves per-session files and drafts, and persists g
   fireEvent.click(within(workspace).getByText("Open other"));
   expect(workspace).toHaveTextContent("other.md");
   fireEvent.click(within(workspace).getByText("Maximize"));
-  expect(screen.getByTestId("session-grid")).toHaveAttribute("inert");
+  const gridContent = screen.getByTestId("session-grid").parentElement!;
+  expect(gridContent).toHaveAttribute("inert");
+  expect(gridContent).toContainElement(
+    screen.getByRole("button", { name: "Collapse grid workspace" }),
+  );
+  fireEvent.click(within(workspace).getByText("Maximize"));
+  expect(gridContent).not.toHaveAttribute("inert");
   fireEvent.click(screen.getByRole("button", { name: "Collapse grid workspace" }));
   expect(screen.queryByRole("complementary", { name: "Workspace" })).not.toBeInTheDocument();
-  expect(screen.getByTestId("session-grid")).not.toHaveAttribute("inert");
+  expect(gridContent).not.toHaveAttribute("inert");
   expect(readSessionWorkspaceState("first").widthPx).toBe(320);
   expect(readSessionWorkspaceState("second").widthPx).toBe(900);
   expect(readSessionWorkspaceState("grid:saved")).toEqual({ open: false, widthPx: 504 });
-  // Removing the active session chooses a remaining cell.
-  view.rerender(tree(splitGrid("first", "first", "third", "bottom")!));
-  expect(first).toHaveAttribute("data-active", "true");
   view.unmount();
   render(tree());
   fireEvent.click(screen.getByRole("button", { name: "Expand grid workspace" }));

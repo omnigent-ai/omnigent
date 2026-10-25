@@ -79,7 +79,7 @@ no harness-specific tests exist. No passing per-harness results are implied.
 
 | Checklist ID | Bench dimensions | Existing automation / remaining gap |
 | --- | --- | --- |
-| `launch-reply` | `basic_turn`, `streaming`, `cost_tracking` | Server/runner observations; browser launch/rendering and exact-once presentation need the owning UI tests. |
+| `launch-reply` | `basic_turn`, `streaming`, `cost_tracking` | Also check authored instructions for custom agents via the [native instruction recipe](./native-harnesses.md#driving-it-with-the-repro-environment); bench replies alone do not prove delivery. Server/runner observations; browser launch/rendering and exact-once presentation need the owning UI tests. |
 | `working-status` | — | No shared status-continuity probe. Use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment) for Claude OSC/file fallback and UI status routing; SDK lifecycle and other natives need their own evidence. A completed basic turn does not prove quiet-work or blocked-state accuracy. |
 | `tool-history` | `tool_calling` | Tool round trip only. Later-turn recall is not a shared probe; reuse the Pi scenarios below and identify other harness coverage explicitly. |
 | `model-effort` | `model_override`, `reasoning` | Native-TUI model override is currently skipped; SDK routing/reasoning observations are narrower than selection persistence. Reasoning output does not prove outgoing effort, tool continuity, High→Low or UI state. |
@@ -202,6 +202,10 @@ exists. Add an owner/next step for unresolved rows.
   bench observations; it does not validate this entire checklist or browser UI.
 - Tool, reasoning and interrupt probes are independent checks, not a substitute
   for a single session surviving tools, effort changes and follow-ups.
+- For Pi gateway reasoning, include a model whose metadata exists only in its
+  vendor catalog (for example GPT), alongside a Databricks-catalog model (Gemini).
+  Observe outgoing effort through a tool result and follow-up; a pre-enriched
+  model fixture or a visible High label alone misses catalog fallback failures.
 - Browser reload is not runner restart; neither is credential renewal. Test
   the boundary affected by the change and name unrun boundaries explicitly.
 - Use the same baseline for all affected harnesses. Until a gap is covered,

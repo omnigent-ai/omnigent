@@ -1,4 +1,4 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   CheckCircle2Icon,
@@ -9,7 +9,7 @@ import {
   SettingsIcon,
   TriangleAlertIcon,
 } from "lucide-react";
-import { Link, useNavigate } from "@/lib/routing";
+import { Link, useNavigate, useSearchParams } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import {
   DropdownMenu,
@@ -99,7 +99,13 @@ export const SettingsHarnessesSection = () => {
   const info = useServerInfo();
   const queryClient = useQueryClient();
   const { data: hosts } = useHosts({ refetchOnFocus: true });
-  const [selectedHostId, setSelectedHostId] = useState<string | null>(null);
+  const [searchParams] = useSearchParams();
+  const requestedHostId = searchParams.get("host");
+  const [selectedHostId, setSelectedHostId] = useState<string | null>(requestedHostId);
+  // In-section links drop `?host`, so only a new deep link replaces the pick.
+  useEffect(() => {
+    if (requestedHostId !== null) setSelectedHostId(requestedHostId);
+  }, [requestedHostId]);
   const [credentialKinds, setCredentialKinds] = useState<Record<string, HarnessCredentialKind>>({});
   const [readyNotice, setReadyNotice] = useState<{
     harness: string;

@@ -31,6 +31,7 @@ from omnigent.spec.types import (
     AgentSpec,
     ExecutorSpec,
     InteractionConfig,
+    ToolGroupsConfig,
     ToolsConfig,
 )
 from omnigent.tools.base import Tool
@@ -242,6 +243,15 @@ def build_researcher_spec(parent_spec: AgentSpec) -> AgentSpec:
         llm=parent_spec.llm,
         interaction=InteractionConfig(conversational=False),
         tools=ToolsConfig(),
+        # A headless one-shot fetcher: no browser pane, review comments,
+        # scheduling, policy editing or agent lookup to drive.
+        tool_groups=ToolGroupsConfig(
+            browser=False,
+            scheduled_tasks=False,
+            comments=False,
+            policies=False,
+            agent_discovery=False,
+        ),
         os_env=child_os_env,
         instructions=_RESEARCHER_INSTRUCTIONS,
         executor=child_executor,

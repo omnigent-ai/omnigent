@@ -12,6 +12,8 @@
 // pre-existing `name(argsSummary)` shape with no bolded verb so we
 // never lose information for tools we haven't taught this module about.
 
+import type { ShellOutputFormat } from "@/lib/shellToolOutput";
+
 /**
  * Structured title for a tool call.
  * - `verb`: the static action phrase (e.g. "Read", "Start child
@@ -22,11 +24,14 @@
  *   string when the title is verb-only (e.g. "Read inbox").
  * - `filePath`: set when the call targets exactly one file, as the agent
  *   passed it (relative or absolute); the trigger row links it.
+ * - `isShellCommand`: set when `body` is a shell command line; the
+ *   trigger row renders it terminal-style (`$ cmd`, monospace).
  */
 export interface ToolTitle {
   verb: string | null;
   body: string;
   filePath?: string;
+  isShellCommand?: boolean;
 }
 
 type ArgFormatter = (args: Record<string, unknown>) => ToolTitle | null;
@@ -34,10 +39,7 @@ type ArgFormatter = (args: Record<string, unknown>) => ToolTitle | null;
 const FORMATTERS: Record<string, ArgFormatter> = {
   // OS-environment tools — drop the noisy `sys_os_*` prefix; the verb
   // alone communicates the action.
-  sys_os_shell: (args) => {
-    const cmd = asString(args.command);
-    return cmd === null ? null : { verb: null, body: cmd };
-  },
+  sys_os_shell: (args) => shellTitle(asString(args.command)),
   sys_os_read: (args) => withPath("Read", args.path),
   sys_os_write: (args) => withPath("Write", args.path),
   sys_os_edit: (args) => withPath("Edit", args.path),
@@ -136,8 +138,7 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   Bash: (args) => {
     const desc = asString(args.description);
     if (desc !== null) return { verb: null, body: desc };
-    const cmd = asString(args.command);
-    return cmd === null ? null : { verb: null, body: cmd };
+    return shellTitle(asString(args.command));
   },
   Read: (args) => withPath("Read", args.file_path),
   Write: (args) => withPath("Write", args.file_path),
@@ -170,7 +171,7 @@ const FORMATTERS: Record<string, ArgFormatter> = {
   // shell (`/bin/bash -lc '...'`); show the inner command like its TUI.
   shell: (args) => {
     const cmd = asString(args.command);
-    return cmd === null ? null : { verb: null, body: unwrapShellCommand(cmd) };
+    return shellTitle(cmd === null ? null : unwrapShellCommand(cmd));
   },
   apply_patch: (args) => {
     const changes = Array.isArray(args.changes) ? args.changes : null;
@@ -186,10 +187,7 @@ const FORMATTERS: Record<string, ArgFormatter> = {
 
   // Pi / OpenCode native harness tools (lowercase names). OpenCode
   // passes `filePath`, Pi passes `path`.
-  bash: (args) => {
-    const cmd = asString(args.command);
-    return cmd === null ? null : { verb: null, body: cmd };
-  },
+  bash: (args) => shellTitle(asString(args.command)),
   read: (args) => withPath("Read", args.filePath ?? args.path),
   edit: (args) => withPath("Edit", args.filePath ?? args.path),
   write: (args) => withPath("Write", args.filePath ?? args.path),
@@ -218,7 +216,9 @@ export function formatToolTitle(
   args: Record<string, unknown>,
   argsSummary?: string,
 ): ToolTitle {
-  const formatter = FORMATTERS[name];
+  // Prefixed omnigent shell tools get the same `$ command` row as their panel.
+  const formatter =
+    FORMATTERS[name] ?? (isShellTool(name) ? FORMATTERS[stripOmnigentPrefix(name)] : undefined);
   if (formatter !== undefined) {
     const title = formatter(args);
     if (title !== null && (title.verb !== null || title.body.length > 0)) {
@@ -299,16 +299,88 @@ function stripOmnigentPrefix(name: string): string {
 // `/bin/bash -lc 'cat notes.txt'` or `/bin/zsh -lc ls`.
 const SHELL_WRAPPER_RE = /^(?:\S+\/)?(?:bash|zsh|sh|dash|fish)\s+-l?c\s+([\s\S]+)$/;
 
-/** Peel a login-shell wrapper (and its quotes) off a command string. */
+/**
+ * Peel a login-shell wrapper (and its quoting) off a command string. Anything
+ * after the wrapper that is not exactly one shell word, e.g.
+ * `sh -c 'a' && echo 'b'`, is returned unchanged.
+ */
 function unwrapShellCommand(command: string): string {
-  const match = SHELL_WRAPPER_RE.exec(command.trim());
-  if (match === null) return command.trim();
-  const inner = match[1]!.trim();
-  const quote = inner[0];
-  if ((quote === "'" || quote === '"') && inner.length >= 2 && inner.endsWith(quote)) {
-    return inner.slice(1, -1).trim();
+  const trimmed = command.trim();
+  const match = SHELL_WRAPPER_RE.exec(trimmed);
+  if (match === null) return trimmed;
+  const inner = decodeShellWord(match[1]!.trim())?.trim();
+  return inner ? inner : trimmed;
+}
+
+/** Decode one shell word (`'it'\''s'`, `"a \"b\""`, `ls`), or `null` if it is not exactly one. */
+function decodeShellWord(text: string): string | null {
+  const piece = /'([^']*)'|"((?:[^"\\]|\\[\s\S])*)"|\\([\s\S])|([^\s'"\\]+)/y;
+  let decoded = "";
+  while (piece.lastIndex < text.length) {
+    const match = piece.exec(text);
+    if (match === null) return null;
+    const [, singleQuoted, doubleQuoted, escaped, bare] = match;
+    if (doubleQuoted !== undefined) {
+      decoded += doubleQuoted.replace(/\\([\\"$`])/g, "$1");
+    } else {
+      decoded += singleQuoted ?? escaped ?? bare;
+    }
   }
-  return inner;
+  return decoded;
+}
+
+/** Whether `name` is a shell-command tool in any harness (Bash, shell, sys_os_shell...). */
+export function isShellTool(name: string): boolean {
+  return RUN_CATEGORIES[stripOmnigentPrefix(name)] === "shell";
+}
+
+/** A shell tool call: the command line it ran and how its output is shaped. */
+export interface ShellToolCall {
+  command: string;
+  outputFormat: ShellOutputFormat;
+}
+
+const SHELL_OUTPUT_FORMATS: Record<string, ShellOutputFormat> = {
+  sys_os_shell: "sys-os-json",
+  shell: "codex-suffix",
+};
+
+/**
+ * Describe a shell tool call, or return `null` when the call is not a shell
+ * tool or carries no string `command`. Only Codex's `shell` adds a
+ * login-shell wrapper, so other harnesses' commands are shown as run.
+ */
+export function shellToolCall(name: string, args: Record<string, unknown>): ShellToolCall | null {
+  if (!isShellTool(name)) return null;
+  const command = asString(args.command);
+  if (command === null) return null;
+  const bareName = stripOmnigentPrefix(name);
+  return {
+    command: bareName === "shell" ? unwrapShellCommand(command) : command,
+    outputFormat: SHELL_OUTPUT_FORMATS[bareName] ?? "plain",
+  };
+}
+
+// Leading `NAME=value` assignments, with quoted values, e.g.
+// `PATH="$HOME/bin:$PATH" FOO=1 make` -> `PATH="$HOME/bin:$PATH" FOO=1 `.
+// Unquoted values stop at quotes, parens and shell operators, so neither
+// `FOO="a b"c` nor `FOO=a;b` is split inside a value.
+const ENV_PREFIX_RE =
+  /^(?:[A-Za-z_][A-Za-z0-9_]*=(?:"(?:[^"\\]|\\.)*"|'[^']*'|[^\s"'()`;&|<>]*)\s+)+/;
+const ASSIGNMENT_RE = /^[A-Za-z_][A-Za-z0-9_]*=/;
+
+/**
+ * Split leading environment assignments off a command so the row can dim
+ * them and let the program name stand out. `env` keeps its trailing
+ * whitespace; `env + rest` always equals the input.
+ */
+export function splitEnvPrefix(command: string): { env: string; rest: string } {
+  const match = ENV_PREFIX_RE.exec(command);
+  if (match === null) return { env: "", rest: command };
+  const rest = command.slice(match[0].length);
+  // Assignments with no program after them (`FOO=1 BAR=2`) are not a prefix.
+  if (rest.length === 0 || ASSIGNMENT_RE.test(rest)) return { env: "", rest: command };
+  return { env: match[0], rest };
 }
 
 function categorizeCall(call: ToolRunCall): RunCategory | "other" {
@@ -357,6 +429,10 @@ function asString(v: unknown): string | null {
 
 function asNumber(v: unknown): number | null {
   return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+function shellTitle(command: string | null): ToolTitle | null {
+  return command === null ? null : { verb: null, body: command, isShellCommand: true };
 }
 
 function verbOnly(verb: string): ToolTitle {

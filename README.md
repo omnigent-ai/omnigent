@@ -402,6 +402,16 @@ Open the server URL it prints, hit **New Chat**, pick your machine, and go.
 Check status with `omnigent server status`; stop everything with
 `omnigent stop`.
 
+Integrations can open the new-chat composer with text already filled in using
+`/?prompt=Explain%20this%20code`. Build links with
+`URLSearchParams` to preserve newlines, Unicode, and characters such as `&` and
+`+`. For a deployment under `/tools/omnigent`, use
+`/tools/omnigent/?prompt=Explain%20this%20code`.
+
+The text is an editable draft: the user chooses a host and agent and presses
+Send to start the session. The prompt parameter is removed from the current URL
+after loading, while other query parameters and the fragment are retained.
+
 To suppress the automatic browser tab, use `omni host --no-open` or set
 `OMNIGENT_HOST_NO_OPEN=1` in your shell. Both also apply to `omni host
 --background` and `omni start`. Sign-in may still open a browser; use
@@ -445,6 +455,12 @@ session_title_instructions: |
 
 Server operators can set the same key in the YAML passed to
 `omnigent server --config`.
+
+Claude Code sessions generate titles with the `haiku` model alias. If that
+model answers the message instead of returning a title, set
+`OMNIGENT_BACKGROUND_TITLE_CLAUDE_MODEL` to another Claude model alias, such as
+`sonnet`, in the environment of the `omnigent` or `omnigent host` process that
+runs the session.
 
 </details>
 

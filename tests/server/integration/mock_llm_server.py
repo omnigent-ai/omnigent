@@ -34,7 +34,9 @@ Usage::
 
     python tests/server/integration/mock_llm_server.py 9999
 
-Configuration via ``POST /mock/configure``::
+Configuration via ``POST /mock/configure``:
+
+.. code-block:: json
 
     {
         "key": "mock-model",
