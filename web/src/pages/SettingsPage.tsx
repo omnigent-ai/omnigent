@@ -3325,10 +3325,9 @@ function ArchivedSection() {
                   </CommandList>
                   <p
                     role="status"
-                    aria-live="polite"
                     className={cn(
-                      "px-2 py-6 text-center text-ui",
-                      filteredProjectNames.length > 0 && "hidden",
+                      "text-center text-ui",
+                      filteredProjectNames.length === 0 && "px-2 py-6",
                     )}
                   >
                     {filteredProjectNames.length === 0 ? "No projects found" : ""}
