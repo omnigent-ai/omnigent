@@ -34,6 +34,9 @@ function agentNavigationEpoch(conversationId: string): number {
   return agentNavigationEpochs.get(conversationId) ?? 0;
 }
 
+// Mounted hooks re-read a session's tabs when an agent or another hook changes them.
+const tabListeners = new Set<(conversationId: string) => void>();
+
 function readBrowserTabsState(conversationId: string): BrowserTabsState {
   const saved = readSessionWorkspaceState(conversationId);
   const tabs = saved.openBrowsers ?? [];
@@ -43,60 +46,128 @@ function readBrowserTabsState(conversationId: string): BrowserTabsState {
   };
 }
 
-function withAgentBrowserSelected(current: BrowserTabsState): BrowserTabsState {
-  return {
-    tabs: current.tabs.includes(AGENT_BROWSER_TAB_ID)
-      ? current.tabs
-      : [...current.tabs, AGENT_BROWSER_TAB_ID],
-    selected: AGENT_BROWSER_TAB_ID,
-  };
-}
-
-/** Persist the agent/link browser as a selected soft tab for a session. */
-export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
-  agentNavigationEpochs.set(conversationId, agentNavigationEpoch(conversationId) + 1);
-  const next = withAgentBrowserSelected(readBrowserTabsState(conversationId));
+function writeBrowserTabsState(
+  conversationId: string,
+  next: BrowserTabsState,
+  agentBrowserId?: string | null,
+): BrowserTabsState {
   writeSessionWorkspaceState(conversationId, {
     openBrowsers: next.tabs,
     selectedBrowserId: next.selected,
+    ...(agentBrowserId === undefined ? {} : { agentBrowserId }),
   });
+  for (const listener of tabListeners) listener(conversationId);
   return next;
+}
+
+/** The tab agents act on: the one they last opened or selected, else the agent browser. */
+export function agentBrowserTabId(conversationId: string): string {
+  const saved = readSessionWorkspaceState(conversationId);
+  const chosen = saved.agentBrowserId;
+  return chosen && (saved.openBrowsers ?? []).includes(chosen) ? chosen : AGENT_BROWSER_TAB_ID;
+}
+
+/** The session's open browser tab ids, in rail order. */
+export function browserTabIds(conversationId: string): string[] {
+  return readBrowserTabsState(conversationId).tabs;
+}
+
+/** Persist an agent-driven browser tab (by default the agent's current one) as
+ *  a selected soft tab for a session. In-app links use the reserved tab. */
+export function openAgentBrowserTab(
+  conversationId: string,
+  tabId: string = agentBrowserTabId(conversationId),
+): BrowserTabsState {
+  agentNavigationEpochs.set(conversationId, agentNavigationEpoch(conversationId) + 1);
+  const current = readBrowserTabsState(conversationId);
+  return writeBrowserTabsState(conversationId, {
+    tabs: current.tabs.includes(tabId) ? current.tabs : [...current.tabs, tabId],
+    selected: tabId,
+  });
+}
+
+/** Open a new selected tab; `forAgent` also makes it the tab agents act on. */
+export function addBrowserTab(conversationId: string, { forAgent = false } = {}): string {
+  const tabId = crypto.randomUUID();
+  const current = readBrowserTabsState(conversationId);
+  writeBrowserTabsState(
+    conversationId,
+    { tabs: [...current.tabs, tabId], selected: tabId },
+    forAgent ? tabId : undefined,
+  );
+  return tabId;
+}
+
+/** Make an open tab the one agents act on, and show it. Returns false if it isn't open. */
+export function selectAgentBrowserTab(conversationId: string, tabId: string): boolean {
+  const current = readBrowserTabsState(conversationId);
+  if (!current.tabs.includes(tabId)) return false;
+  writeBrowserTabsState(conversationId, { ...current, selected: tabId }, tabId);
+  return true;
+}
+
+/** Close a tab's view and drop it from the rail; false when the view would not close. */
+export async function closeBrowserTab(conversationId: string, tabId: string): Promise<boolean> {
+  const navigationEpoch = agentNavigationEpoch(conversationId);
+  const desktop = (
+    window as unknown as {
+      omnigentDesktop?: {
+        browserClose?: (viewId: string) => Promise<{ ok: boolean }>;
+      };
+    }
+  ).omnigentDesktop;
+  const result = await desktop
+    ?.browserClose?.(browserViewId(conversationId, tabId))
+    .catch(() => ({ ok: false }));
+  if (result && !result.ok) return false;
+  // A fresh agent/link navigation supersedes an older close of the reserved
+  // agent view. Keep the recreated tab selected when the close resolves late.
+  if (tabId === AGENT_BROWSER_TAB_ID && agentNavigationEpoch(conversationId) !== navigationEpoch) {
+    return true;
+  }
+  const previous = readBrowserTabsState(conversationId);
+  const index = previous.tabs.indexOf(tabId);
+  if (index === -1) return true;
+  const tabs = previous.tabs.filter((id) => id !== tabId);
+  const selected =
+    previous.selected === tabId ? (tabs[Math.max(0, index - 1)] ?? null) : previous.selected;
+  // Agents move to the newly shown tab when theirs closes, like a browser does.
+  const agentClosed = agentBrowserTabId(conversationId) === tabId;
+  writeBrowserTabsState(conversationId, { tabs, selected }, agentClosed ? selected : undefined);
+  return true;
 }
 
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
   useEffect(() => {
     setState(readBrowserTabsState(conversationId));
+    const listener = (changed: string) => {
+      if (changed === conversationId) setState(readBrowserTabsState(conversationId));
+    };
+    tabListeners.add(listener);
+    return () => {
+      tabListeners.delete(listener);
+    };
   }, [conversationId]);
 
-  const update = useCallback(
-    (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
-      const next = mutate(readBrowserTabsState(conversationId));
-      writeSessionWorkspaceState(conversationId, {
-        openBrowsers: next.tabs,
-        selectedBrowserId: next.selected,
-      });
-      setState(next);
+  const select = useCallback(
+    (selected: string | null) => {
+      writeBrowserTabsState(conversationId, { ...readBrowserTabsState(conversationId), selected });
     },
     [conversationId],
   );
 
-  const select = (selected: string | null) => {
-    update((current) => ({ ...current, selected }));
-  };
-
   useEffect(() => {
-    const selectAgentBrowser = (sourceConversationId: string) => {
-      if (sourceConversationId === conversationId) {
-        setState(openAgentBrowserTab(conversationId));
-      }
-    };
     const unsubscribeAction = onBrowserActionRequest((event, sourceConversationId) => {
       if (sourceConversationId === conversationId && event.action === "navigate") {
-        selectAgentBrowser(sourceConversationId);
+        openAgentBrowserTab(conversationId);
       }
     });
-    const unsubscribeLink = onInAppLinkOpen(selectAgentBrowser);
+    const unsubscribeLink = onInAppLinkOpen((sourceConversationId) => {
+      if (sourceConversationId === conversationId) {
+        openAgentBrowserTab(conversationId, AGENT_BROWSER_TAB_ID);
+      }
+    });
     return () => {
       unsubscribeAction();
       unsubscribeLink();
@@ -104,41 +175,10 @@ export function useBrowserTabs(conversationId: string) {
   }, [conversationId]);
 
   const add = () => {
-    const selected = crypto.randomUUID();
-    update((current) => ({ tabs: [...current.tabs, selected], selected }));
+    addBrowserTab(conversationId);
   };
 
-  const close = async (tabId: string): Promise<boolean> => {
-    const navigationEpoch = agentNavigationEpoch(conversationId);
-    const desktop = (
-      window as unknown as {
-        omnigentDesktop?: {
-          browserClose?: (viewId: string) => Promise<{ ok: boolean }>;
-        };
-      }
-    ).omnigentDesktop;
-    const result = await desktop
-      ?.browserClose?.(browserViewId(conversationId, tabId))
-      .catch(() => ({ ok: false }));
-    if (result && !result.ok) return false;
-    // A fresh agent/link navigation supersedes an older close of the reserved
-    // agent view. Keep the recreated tab selected when the close resolves late.
-    if (
-      tabId === AGENT_BROWSER_TAB_ID &&
-      agentNavigationEpoch(conversationId) !== navigationEpoch
-    ) {
-      return true;
-    }
-    update((previous) => {
-      const index = previous.tabs.indexOf(tabId);
-      if (index === -1) return previous;
-      const tabs = previous.tabs.filter((id) => id !== tabId);
-      const selected =
-        previous.selected === tabId ? (tabs[Math.max(0, index - 1)] ?? null) : previous.selected;
-      return { tabs, selected };
-    });
-    return true;
-  };
+  const close = (tabId: string): Promise<boolean> => closeBrowserTab(conversationId, tabId);
 
   return {
     ...state,

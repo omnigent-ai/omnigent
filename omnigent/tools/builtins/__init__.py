@@ -290,9 +290,19 @@ _BUILTIN_REGISTRY: dict[str, _BuiltinFactory | None] = {
     # instantiated via this registry). Execution is runner-dispatched
     # (``_BROWSER_TOOLS`` in omnigent/runner/tool_dispatch.py).
     "browser_navigate": None,
+    "browser_go_back": None,
+    "browser_go_forward": None,
+    "browser_reload": None,
+    "browser_tabs": None,
     "browser_snapshot": None,
     "browser_click": None,
+    "browser_hover": None,
+    "browser_drag": None,
+    "browser_scroll": None,
     "browser_type": None,
+    "browser_press_key": None,
+    "browser_select_option": None,
+    "browser_check": None,
     "browser_screenshot": None,
     "ui_open_file": None,
 }

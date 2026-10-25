@@ -46,8 +46,11 @@ SUBAGENT_WAKE_NOTICE_INSTRUCTION = (
 # description alone loses to a model's native web tooling, so the composed
 # system prompt must carry the preference explicitly.
 EMBEDDED_BROWSER_PRIORITY_INSTRUCTION = (
-    "Embedded browser: the browser_navigate / browser_snapshot / "
-    "browser_click / browser_type / browser_screenshot tools drive the "
+    "Embedded browser: the browser_navigate / browser_go_back / "
+    "browser_go_forward / browser_reload / browser_tabs / browser_snapshot / "
+    "browser_click / browser_hover / browser_drag / browser_scroll / "
+    "browser_type / browser_press_key / browser_select_option / "
+    "browser_check / browser_screenshot tools drive the "
     "Omnigent app's embedded browser pane, which the user can watch "
     "alongside the chat. When asked to look at, open, or interact with a "
     "web page, prefer these embedded-browser tools over your own web "

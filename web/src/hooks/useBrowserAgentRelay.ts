@@ -20,6 +20,14 @@ import { getSessionSlim } from "@/lib/sessionsApi";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import type { Host } from "@/hooks/useHosts";
 import type { Session } from "@/lib/types";
+import {
+  addBrowserTab,
+  agentBrowserTabId,
+  browserTabIds,
+  browserViewId,
+  closeBrowserTab,
+  selectAgentBrowserTab,
+} from "@/hooks/useBrowserTabs";
 
 /** Subset of `window.omnigentDesktop` the relay calls (typed locally, not via
  *  nativeBridge). All optional — an older shell may predate the feature, so the
@@ -47,10 +55,37 @@ interface BrowserDesktopBridge {
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
   browserPerformAction?: (
     conversationId: string,
-    action: "snapshot" | "click" | "type",
+    action: string,
     args?: Record<string, unknown>,
   ) => Promise<{ ok: boolean; result?: string; error?: string }>;
+  browserHasView?: (
+    conversationId: string,
+  ) => Promise<{ exists: boolean; url?: string; title?: string }>;
 }
+
+/** Where a navigation comes from, for main's loopback-eligibility check. */
+interface NavigationSource {
+  sourceHostId: string | null;
+  rememberedArcaHostId: string | null;
+  sourceIsArcaHost: boolean;
+}
+
+// Pre-typed desktops can only run these through the v0.18 script executor.
+type LegacyAction = "snapshot" | "click" | "type";
+const LEGACY_ACTIONS = new Set<string>(["snapshot", "click", "type"]);
+const isLegacyAction = (action: string): action is LegacyAction => LEGACY_ACTIONS.has(action);
+// Actions main performs and answers with a JSON object.
+const DESKTOP_ACTIONS = new Set([
+  "go_back",
+  "go_forward",
+  "reload",
+  "hover",
+  "drag",
+  "scroll",
+  "press_key",
+  "select_option",
+  "check",
+]);
 
 function isLoopbackPreview(url: string): boolean {
   try {
@@ -81,64 +116,163 @@ interface ActionResult {
   data_url?: string;
 }
 
+function unsupportedActionError(action: string): string {
+  return `this Omnigent desktop app does not support browser_${action}; update the app to use it`;
+}
+
 async function performAction(
   desktop: BrowserDesktopBridge,
   conversationId: string,
-  action: "snapshot" | "click" | "type",
+  action: string,
   args?: Record<string, unknown>,
 ) {
   if (desktop.browserPerformAction) {
-    return desktop.browserPerformAction(conversationId, action, args);
+    const r = await desktop.browserPerformAction(conversationId, action, args);
+    // An older shell's main process rejects actions it predates with this message.
+    if (!r?.ok && r?.error === "Unsupported browser action" && !LEGACY_ACTIONS.has(action)) {
+      return { ok: false, error: unsupportedActionError(action) };
+    }
+    return r;
   }
   // Pre-typed desktops retain their existing executor until the v0.21 transition.
-  if (desktop.browserExecute) {
+  if (desktop.browserExecute && isLegacyAction(action)) {
     return desktop.browserExecute(conversationId, buildBrowserActionScript(action, args));
   }
+  if (desktop.browserExecute) return { ok: false, error: unsupportedActionError(action) };
   return { ok: false, error: "this desktop shell does not support the browser pane" };
 }
 
-/** Execute one claimed action against the conversation's WebContentsView.
- *  `conversationId` targets the right view; `desktop` is the (feature-detected)
- *  bridge. Returns a normalized `ActionResult` — never throws (the outer catch
- *  converts any in-page/IPC error to `{ok:false, error}`). */
+/** Parse main's JSON answer into the result's `data`, dropping its own `ok`. */
+function actionData(result: string | undefined): Record<string, unknown> | undefined {
+  try {
+    const parsed: unknown = JSON.parse(result ?? "");
+    if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+    const { ok: _ok, ...data } = parsed as Record<string, unknown>;
+    return Object.keys(data).length > 0 ? data : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+async function navigateView(
+  desktop: BrowserDesktopBridge,
+  viewId: string,
+  url: string,
+  source: NavigationSource,
+): Promise<ActionResult> {
+  if (!desktop.browserOpenOrNavigate) {
+    return { ok: false, error: "this desktop shell does not support the browser pane" };
+  }
+  const { sourceHostId, rememberedArcaHostId, sourceIsArcaHost } = source;
+  // force: honor the explicit agent nav even on same-URL. agent: mark it
+  // model-issued so the registry applies the scheme/host allowlist (Risk).
+  const r = await desktop.browserOpenOrNavigate(viewId, url, undefined, {
+    force: true,
+    agent: true,
+    ...(sourceHostId ? { sourceHostId } : {}),
+    ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
+    ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
+  });
+  if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
+  if (
+    isLoopbackPreview(url) &&
+    sourceHostId &&
+    rememberedArcaHostId &&
+    sourceHostId !== rememberedArcaHostId
+  ) {
+    // Main only approves this after consent captures the source host.
+    writeArcaHostId(sourceHostId);
+  }
+  return { ok: true, data: { final_url: url } };
+}
+
+/** `browser_tabs`: list, open, select or close the session's browser tabs. */
+async function manageTabs(
+  sessionId: string,
+  args: Record<string, unknown>,
+  desktop: BrowserDesktopBridge,
+  source: NavigationSource,
+): Promise<ActionResult> {
+  const tabId = typeof args.tab_id === "string" ? args.tab_id : undefined;
+  switch (args.action) {
+    case "list": {
+      const current = agentBrowserTabId(sessionId);
+      const tabs = await Promise.all(
+        browserTabIds(sessionId).map(async (id) => {
+          const view = await desktop
+            .browserHasView?.(browserViewId(sessionId, id))
+            .catch(() => undefined);
+          return {
+            tab_id: id,
+            url: view?.exists ? (view.url ?? "") : "",
+            title: view?.exists ? (view.title ?? "") : "",
+            current: id === current,
+          };
+        }),
+      );
+      return { ok: true, data: { tabs, current_tab_id: current } };
+    }
+    case "new": {
+      const url = typeof args.url === "string" ? args.url : "";
+      const created = addBrowserTab(sessionId, { forAgent: true });
+      if (url) {
+        const opened = await navigateView(desktop, browserViewId(sessionId, created), url, source);
+        if (!opened.ok) return { ...opened, data: { tab_id: created } };
+      }
+      return { ok: true, data: { tab_id: created, ...(url ? { url } : {}) } };
+    }
+    case "select": {
+      if (!tabId) return { ok: false, error: "tab_id is required to select a tab" };
+      if (!selectAgentBrowserTab(sessionId, tabId)) {
+        return { ok: false, error: `no open tab ${tabId}; call browser_tabs with action list` };
+      }
+      return { ok: true, data: { tab_id: tabId } };
+    }
+    case "close": {
+      const target = tabId ?? agentBrowserTabId(sessionId);
+      if (!browserTabIds(sessionId).includes(target)) {
+        return { ok: false, error: `no open tab ${target}; call browser_tabs with action list` };
+      }
+      if (!(await closeBrowserTab(sessionId, target))) {
+        return { ok: false, error: `tab ${target} did not close` };
+      }
+      return {
+        ok: true,
+        data: { closed_tab_id: target, current_tab_id: agentBrowserTabId(sessionId) },
+      };
+    }
+    default:
+      return { ok: false, error: "action must be one of list, new, select, close" };
+  }
+}
+
+/** Execute one claimed action against the session's current agent browser tab.
+ *  `desktop` is the (feature-detected) bridge. Returns a normalized
+ *  `ActionResult` — never throws (the outer catch converts any in-page/IPC
+ *  error to `{ok:false, error}`). */
 async function dispatch(
-  conversationId: string,
+  sessionId: string,
   action: string,
   args: Record<string, unknown>,
   desktop: BrowserDesktopBridge,
-  sourceHostId: string | null,
-  rememberedArcaHostId: string | null,
-  sourceIsArcaHost: boolean,
+  source: NavigationSource,
 ): Promise<ActionResult> {
+  const conversationId = browserViewId(sessionId, agentBrowserTabId(sessionId));
   try {
+    if (DESKTOP_ACTIONS.has(action)) {
+      const r = await performAction(desktop, conversationId, action, args);
+      if (!r?.ok) return { ok: false, error: r?.error ?? `${action} failed` };
+      const data = actionData(r.result);
+      return data ? { ok: true, data } : { ok: true };
+    }
     switch (action) {
       case "navigate": {
         const url = String(args.url ?? "");
         if (!url) return { ok: false, error: "url is required" };
-        if (!desktop.browserOpenOrNavigate) {
-          return { ok: false, error: "this desktop shell does not support the browser pane" };
-        }
-        // force: honor the explicit agent nav even on same-URL. agent: mark it
-        // model-issued so the registry applies the scheme/host allowlist (Risk).
-        const r = await desktop.browserOpenOrNavigate(conversationId, url, undefined, {
-          force: true,
-          agent: true,
-          ...(sourceHostId ? { sourceHostId } : {}),
-          ...(rememberedArcaHostId ? { rememberedArcaHostId } : {}),
-          ...(sourceIsArcaHost ? { sourceIsArcaHost: true } : {}),
-        });
-        if (!r?.ok) return { ok: false, error: r?.error ?? "navigate failed" };
-        if (
-          isLoopbackPreview(url) &&
-          sourceHostId &&
-          rememberedArcaHostId &&
-          sourceHostId !== rememberedArcaHostId
-        ) {
-          // Main only approves this after consent captures the source host.
-          writeArcaHostId(sourceHostId);
-        }
-        return { ok: true, data: { final_url: url } };
+        return await navigateView(desktop, conversationId, url, source);
       }
+      case "tabs":
+        return await manageTabs(sessionId, args, desktop, source);
       case "screenshot": {
         if (!desktop.browserScreenshot) {
           return { ok: false, error: "this desktop shell does not support the browser pane" };
@@ -158,7 +292,14 @@ async function dispatch(
         }
       }
       case "click": {
-        const r = await performAction(desktop, conversationId, "click", args);
+        // Defaults stay off the wire so older shells still take a plain click.
+        const { button, double_click: doubleClick, ...target } = args;
+        const mouseInput = (button !== undefined && button !== "left") || doubleClick === true;
+        const clickArgs = mouseInput ? args : target;
+        const r = await performAction(desktop, conversationId, "click", clickArgs);
+        if (!r?.ok && mouseInput && r?.error === "Unsupported browser action argument") {
+          return { ok: false, error: unsupportedActionError("click with button or double_click") };
+        }
         if (!r?.ok) return { ok: false, error: r?.error ?? "click failed" };
         return { ok: true };
       }
@@ -247,7 +388,9 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
       const claimToken = await claimAction(sourceConversationId, evt.actionId);
       if (!claimToken) return;
       let sourceHostId: string | null = null;
-      if (evt.action === "navigate") {
+      // Tabs can open a URL, so they establish provenance like a navigation.
+      const navigates = evt.action === "navigate" || evt.action === "tabs";
+      if (navigates) {
         try {
           // Parent hints cannot establish which ancestor has the nearest own host binding.
           const visited = new Set<string>();
@@ -274,9 +417,9 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
           // Unknown provenance stays denied for localhost; public browsing still works.
         }
       }
-      const rememberedArcaHostId = evt.action === "navigate" ? readArcaHostId() : null;
+      const rememberedArcaHostId = navigates ? readArcaHostId() : null;
       const sourceIsArcaHost =
-        evt.action === "navigate" && sourceHostId !== null
+        navigates && sourceHostId !== null
           ? queryClient
               .getQueriesData<Host[]>({ queryKey: ["hosts"] })
               .flatMap(([, rows]) => rows ?? [])
@@ -286,15 +429,11 @@ export function useBrowserAgentRelay(conversationId: string | null | undefined):
           : false;
       const result = cancelled
         ? { ok: false, error: "browser relay context changed" }
-        : await dispatch(
-            sourceConversationId,
-            evt.action,
-            evt.args,
-            desktop,
+        : await dispatch(sourceConversationId, evt.action, evt.args, desktop, {
             sourceHostId,
             rememberedArcaHostId,
             sourceIsArcaHost,
-          );
+          });
       await postResult(sourceConversationId, evt.actionId, claimToken, result);
     };
 

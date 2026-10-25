@@ -83,7 +83,11 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
-import { browserViewOwnerId, openAgentBrowserTab } from "@/hooks/useBrowserTabs";
+import {
+  AGENT_BROWSER_TAB_ID,
+  browserViewOwnerId,
+  openAgentBrowserTab,
+} from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   isAgentTerminalKey,
@@ -1863,23 +1867,37 @@ function AppShellImpl() {
 
   // Auto-open a Browser soft tab on a `navigate` action — agent-issued
   // (browser_navigate) or a chat link the user routed in-app — so the load
-  // never lands in a hidden pane, even behind an open file or shell tab.
+  // never lands in a hidden pane, even behind an open file or shell tab. An
+  // agent opening or selecting a tab (browser_tabs) surfaces the pane too.
   // Browser-capable shells only (neither source fires without the bridge).
   useEffect(() => {
     if (!supportsBrowser()) return;
-    const surfaceBrowserTab = (sourceConversationId: string) => {
+    const surfaceBrowserTab = (sourceConversationId: string, tabId?: string) => {
       // The mounted WorkspacePanel hook owns the active session's tab state.
       // Persist here only for background sessions that have no mounted hook.
-      if (sourceConversationId !== conversationId) openAgentBrowserTab(sourceConversationId);
+      if (sourceConversationId !== conversationId) {
+        openAgentBrowserTab(sourceConversationId, tabId);
+      }
       if (sourceConversationId === conversationId) {
         handleRightRailTabChange("browser");
         setRightPanelOpenAnimated(true);
       }
     };
-    const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
+    const unsubscribeLink = onInAppLinkOpen((sourceConversationId) =>
+      surfaceBrowserTab(sourceConversationId, AGENT_BROWSER_TAB_ID),
+    );
     const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
-      if (evt.action !== "navigate" || !sourceConversationId) return;
-      surfaceBrowserTab(sourceConversationId);
+      if (!sourceConversationId) return;
+      if (evt.action === "navigate") surfaceBrowserTab(sourceConversationId);
+      // The relay records the tab change itself; only reveal the pane here.
+      else if (
+        evt.action === "tabs" &&
+        (evt.args.action === "new" || evt.args.action === "select") &&
+        sourceConversationId === conversationId
+      ) {
+        handleRightRailTabChange("browser");
+        setRightPanelOpenAnimated(true);
+      }
     });
     return () => {
       unsubscribeLink();

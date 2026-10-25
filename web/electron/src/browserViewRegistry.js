@@ -65,6 +65,10 @@ function agentPartition(scope, viewId) {
 // default partition scope. In-memory partitions never outlive the process, so
 // no cross-run uniqueness is needed.
 let registrySeq = 0;
+// Layout size for an agent acting on a view the user has not shown yet.
+const DETACHED_AGENT_VIEWPORT = { width: 1280, height: 800 };
+// A history navigation that hasn't started loading by now finished from cache.
+const HISTORY_IDLE_MS = 300;
 
 function createBrowserViewRegistry({
   WebContentsViewCtor, // (opts) => new WebContentsView(opts) — injectable for tests
@@ -87,6 +91,7 @@ function createBrowserViewRegistry({
   resolveHost = lookupHostAddresses,
   resolveProxy = async () => "DIRECT",
   cap = DEFAULT_CAP,
+  historyLoadTimeoutMs = 10_000,
   // Partition namespace for this registry's views — see agentPartition.
   // Injectable so tests can pin it; defaults to a per-instance unique value.
   partitionScope = `w${++registrySeq}`,
@@ -247,6 +252,8 @@ function createBrowserViewRegistry({
     const wc = entry.view && entry.view.webContents;
     if (!wc || typeof wc.on !== "function") return;
     wc.on("context-menu", (_event, params) => {
+      // An agent's right-click opens the page's own menu, never the shell's.
+      if (entry.suppressContextMenuUntil > Date.now()) return;
       const items = [];
       if (params.linkURL) {
         if (/^https?:\/\//i.test(params.linkURL)) {
@@ -393,6 +400,96 @@ function createBrowserViewRegistry({
     return checkAgentNavigation(url, {
       allowLocalhost: isArcaAgentContext(agentContext),
       resolveHost: (hostname) => resolveHost(hostname, partition),
+    });
+  }
+
+  // An inactive view is never laid out (0x0), so agent input would find no
+  // viewport. Size it off-screen; setActive re-applies the pane's real bounds.
+  function ensureAgentViewport(conversationId) {
+    const entry = entries.get(conversationId);
+    if (!entry || activeConversationId === conversationId) return;
+    try {
+      const bounds = entry.view.getBounds?.();
+      if (bounds && bounds.width > 0 && bounds.height > 0) return;
+      entry.view.setBounds({ x: 0, y: 0, ...DETACHED_AGENT_VIEWPORT });
+    } catch {
+      /* destroyed */
+    }
+  }
+
+  // Agent back / forward / reload. History entries can be pages the user
+  // browsed to permissively, so the destination gets the same agent check as
+  // a fresh navigation, and the agent lock covers its redirects and requests.
+  async function agentNavigateHistory(conversationId, action) {
+    const entry = entries.get(conversationId);
+    if (!entry) return { ok: false, error: "No browser view" };
+    const wc = entry.view.webContents;
+    const nav = wc.navigationHistory;
+    let url;
+    if (action === "reload") {
+      url = wc.getURL();
+    } else if (action === "go_back" || action === "go_forward") {
+      if (!nav || typeof nav.getActiveIndex !== "function") {
+        return { ok: false, error: "this desktop shell does not support agent history navigation" };
+      }
+      const index = nav.getActiveIndex() + (action === "go_back" ? -1 : 1);
+      if (index < 0 || index >= nav.length()) {
+        return {
+          ok: false,
+          error: action === "go_back" ? "no previous page in this tab" : "no next page in this tab",
+        };
+      }
+      url = nav.getEntryAtIndex(index)?.url;
+    } else {
+      return { ok: false, error: "Unsupported browser action" };
+    }
+    if (!url) return { ok: false, error: "no page to load in this tab" };
+    const verdict = await checkAgentNavigationFor(conversationId, url, entry.agentContext);
+    if (!verdict.ok) return verdict;
+    entry.agentNavLocked = true;
+    const settled = waitForLoad(wc);
+    try {
+      if (action === "reload") wc.reload();
+      else if (action === "go_back") nav.goBack();
+      else nav.goForward();
+    } catch (e) {
+      return { ok: false, error: e && e.message ? e.message : String(e) };
+    }
+    await settled;
+    try {
+      return { ok: true, url: wc.getURL(), title: wc.getTitle() };
+    } catch {
+      return { ok: false, error: "browser view closed" };
+    }
+  }
+
+  // Resolve once the page stops loading, a same-document navigation lands, or
+  // the timeout passes; a cached page may never report a load at all.
+  function waitForLoad(wc) {
+    return new Promise((resolve) => {
+      const startedAt = Date.now();
+      const done = () => {
+        clearInterval(poll);
+        try {
+          wc.removeListener("did-stop-loading", done);
+          wc.removeListener("did-navigate-in-page", done);
+        } catch {
+          /* destroyed */
+        }
+        resolve();
+      };
+      const poll = setInterval(() => {
+        const elapsed = Date.now() - startedAt;
+        let loading = false;
+        try {
+          loading = wc.isLoading();
+        } catch {
+          /* destroyed */
+        }
+        if (elapsed >= historyLoadTimeoutMs || (elapsed >= HISTORY_IDLE_MS && !loading)) done();
+      }, 50);
+      wc.once("did-stop-loading", done);
+      wc.once("did-navigate-in-page", done);
     });
   }
 
@@ -662,6 +759,8 @@ function createBrowserViewRegistry({
     openOrNavigate,
     beginAgentNavigation,
     checkAgentNavigation: checkAgentNavigationFor,
+    agentNavigateHistory,
+    ensureAgentViewport,
     shouldCancelAgentRequest,
     agentRequestHeaders,
     shouldCancelAgentResponse,

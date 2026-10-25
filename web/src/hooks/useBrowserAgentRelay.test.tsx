@@ -1,4 +1,4 @@
-import { renderHook } from "@testing-library/react";
+import { cleanup, renderHook } from "@testing-library/react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import type { ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
@@ -25,6 +25,13 @@ import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import type { BrowserActionRequestEvent } from "@/lib/events";
 import { useBrowserAgentRelay } from "./useBrowserAgentRelay";
+import {
+  AGENT_BROWSER_TAB_ID,
+  agentBrowserTabId,
+  browserViewId,
+  openAgentBrowserTab,
+  selectAgentBrowserTab,
+} from "./useBrowserTabs";
 import legacyActions from "../../electron/test/fixtures/browserActions-v0.18.json";
 
 const CONV = "conv_relay";
@@ -773,5 +780,150 @@ describe("useBrowserAgentRelay — result POST resilience", () => {
     await Promise.resolve();
 
     expect(authenticatedFetch).not.toHaveBeenCalled();
+  });
+});
+
+describe("useBrowserAgentRelay — extended actions and tabs", () => {
+  beforeEach(() => {
+    authenticatedFetch.mockResolvedValue(WON);
+  });
+  afterEach(() => {
+    localStorage.clear();
+  });
+
+  /** Run one action through the relay and return the posted result. */
+  async function resultOf(action: string, args: Record<string, unknown> = {}) {
+    // One mounted relay per action, so each action is claimed and run once.
+    cleanup();
+    authenticatedFetch.mockReset().mockResolvedValue(WON);
+    await runAction(actionEvent(action, args));
+    return postedResult().result as Record<string, unknown>;
+  }
+
+  it("runs main-owned actions and returns their data without main's own ok flag", async () => {
+    const bridge = installBridge({
+      browserPerformAction: vi.fn(async (_id: string, action: string) => ({
+        ok: true,
+        result:
+          action === "scroll"
+            ? JSON.stringify({ scroll_x: 0, scroll_y: 640, at_end: false, container: "page" })
+            : action === "go_back"
+              ? JSON.stringify({ url: "https://example.com/a", title: "A" })
+              : JSON.stringify({ ok: true }),
+      })),
+    });
+    expect(await resultOf("hover", { ref: 3, snapshot_id: "s1" })).toEqual({ ok: true });
+    expect(bridge.browserPerformAction).toHaveBeenLastCalledWith(CONV, "hover", {
+      ref: 3,
+      snapshot_id: "s1",
+    });
+    expect(await resultOf("scroll", { direction: "down" })).toEqual({
+      ok: true,
+      data: { scroll_x: 0, scroll_y: 640, at_end: false, container: "page" },
+    });
+    expect(await resultOf("go_back")).toEqual({
+      ok: true,
+      data: { url: "https://example.com/a", title: "A" },
+    });
+  });
+
+  it("asks for a desktop update when the shell predates an action", async () => {
+    installBridge({
+      browserPerformAction: vi.fn().mockResolvedValue({
+        ok: false,
+        error: "Unsupported browser action",
+      }),
+    });
+    expect((await resultOf("press_key", { key: "Enter" })).error).toMatch(
+      /does not support browser_press_key; update the app/,
+    );
+    installBridge({ browserPerformAction: undefined, browserExecute: vi.fn() });
+    expect((await resultOf("select_option", { ref: 1, values: ["a"] })).error).toMatch(
+      /does not support browser_select_option/,
+    );
+  });
+
+  it("keeps default click options off the wire and reports old shells for mouse options", async () => {
+    const bridge = installBridge();
+    await resultOf("click", { ref: 2, button: "left", double_click: false });
+    expect(bridge.browserPerformAction).toHaveBeenLastCalledWith(CONV, "click", { ref: 2 });
+    await resultOf("click", { ref: 2, button: "right" });
+    expect(bridge.browserPerformAction).toHaveBeenLastCalledWith(CONV, "click", {
+      ref: 2,
+      button: "right",
+    });
+    bridge.browserPerformAction.mockResolvedValue({
+      ok: false,
+      error: "Unsupported browser action argument",
+    });
+    expect((await resultOf("click", { ref: 2, double_click: true })).error).toMatch(
+      /does not support browser_click with button or double_click/,
+    );
+  });
+
+  it("opens a tab, makes it current for later actions, and lists every tab", async () => {
+    const bridge = installBridge({
+      browserHasView: vi.fn(async (viewId: string) =>
+        viewId === CONV
+          ? { exists: true, url: "https://example.com/", title: "Example" }
+          : { exists: false },
+      ),
+    });
+    expect((await resultOf("navigate", { url: "https://example.com/" })).ok).toBe(true);
+    // The mounted tab hook records the agent browser; mimic it for this relay-only test.
+    expect(selectAgentBrowserTab(CONV, AGENT_BROWSER_TAB_ID)).toBe(false);
+    openAgentBrowserTab(CONV);
+
+    const opened = await resultOf("tabs", { action: "new", url: "https://example.org/" });
+    const tabId = (opened.data as { tab_id: string }).tab_id;
+    expect(bridge.browserOpenOrNavigate).toHaveBeenLastCalledWith(
+      browserViewId(CONV, tabId),
+      "https://example.org/",
+      undefined,
+      { force: true, agent: true },
+    );
+    await resultOf("hover", { ref: 1 });
+    expect(bridge.browserPerformAction).toHaveBeenLastCalledWith(
+      browserViewId(CONV, tabId),
+      "hover",
+      { ref: 1 },
+    );
+    expect((await resultOf("tabs", { action: "list" })).data).toEqual({
+      tabs: [
+        {
+          tab_id: AGENT_BROWSER_TAB_ID,
+          url: "https://example.com/",
+          title: "Example",
+          current: false,
+        },
+        { tab_id: tabId, url: "", title: "", current: true },
+      ],
+      current_tab_id: tabId,
+    });
+  });
+
+  it("selects and closes tabs, falling back to the shown tab when the current one closes", async () => {
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    installBridge({ browserClose });
+    openAgentBrowserTab(CONV);
+    const second = (await resultOf("tabs", { action: "new" })).data as { tab_id: string };
+    expect(await resultOf("tabs", { action: "select", tab_id: AGENT_BROWSER_TAB_ID })).toEqual({
+      ok: true,
+      data: { tab_id: AGENT_BROWSER_TAB_ID },
+    });
+    expect(agentBrowserTabId(CONV)).toBe(AGENT_BROWSER_TAB_ID);
+    await resultOf("tabs", { action: "select", tab_id: second.tab_id });
+    expect(await resultOf("tabs", { action: "close" })).toEqual({
+      ok: true,
+      data: { closed_tab_id: second.tab_id, current_tab_id: AGENT_BROWSER_TAB_ID },
+    });
+    expect(browserClose).toHaveBeenCalledWith(browserViewId(CONV, second.tab_id));
+    expect((await resultOf("tabs", { action: "select", tab_id: "gone" })).error).toMatch(
+      /no open tab gone/,
+    );
+    expect((await resultOf("tabs", { action: "close", tab_id: "gone" })).ok).toBe(false);
+    expect((await resultOf("tabs", { action: "rename" })).error).toMatch(
+      /list, new, select, close/,
+    );
   });
 });

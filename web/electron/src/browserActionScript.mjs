@@ -158,15 +158,167 @@ function findElJs(args) {
   );
 }
 
+const TARGET_ARGS = ["ref", "snapshot_id", "selector"];
+// Argument keys each action accepts. Target-less `scroll` scrolls the page.
+const ACTION_ARGS = {
+  snapshot: [],
+  click: TARGET_ARGS,
+  type: [...TARGET_ARGS, "text"],
+  locate: [...TARGET_ARGS, "scroll"],
+  focus: TARGET_ARGS,
+  scroll: [...TARGET_ARGS, "direction", "amount"],
+  select_option: [...TARGET_ARGS, "values"],
+  check: [...TARGET_ARGS, "checked"],
+};
+const OPTIONAL_TARGET_ACTIONS = new Set(["scroll"]);
+const SCROLL_DIRECTIONS = ["up", "down", "left", "right"];
+
+/** Validate the action-specific (non-target) arguments. */
+function validateActionArgs(action, args) {
+  if (action === "type" && (typeof args.text !== "string" || args.text.length > 100000)) {
+    throw new Error("text must be a string of at most 100000 characters");
+  }
+  if (action === "locate" && args.scroll !== undefined && !["center", "nearest"].includes(args.scroll)) {
+    throw new Error('scroll must be "center" or "nearest"');
+  }
+  if (action === "scroll") {
+    if (!SCROLL_DIRECTIONS.includes(args.direction)) {
+      throw new Error("direction must be one of up, down, left, right");
+    }
+    if (
+      args.amount !== undefined &&
+      (!Number.isSafeInteger(args.amount) || args.amount <= 0 || args.amount > 100000)
+    ) {
+      throw new Error("amount must be a positive integer of at most 100000");
+    }
+  }
+  if (
+    action === "select_option" &&
+    (!Array.isArray(args.values) ||
+      args.values.length === 0 ||
+      args.values.length > 100 ||
+      args.values.some((value) => typeof value !== "string" || value.length > 4096))
+  ) {
+    throw new Error("values must be 1 to 100 strings of at most 4096 characters");
+  }
+  if (action === "check" && args.checked !== undefined && typeof args.checked !== "boolean") {
+    throw new Error("checked must be a boolean");
+  }
+}
+
+/** In-page helper describing an element in one short line for error messages. */
+const DESCRIBE_JS =
+  `const describe = (node) => { if (!node || !node.tagName) return 'nothing'; ` +
+  `let d = '<' + node.tagName.toLowerCase() + (node.id ? '#' + node.id : '') + ` +
+  `[...node.classList].slice(0, 2).map((c) => '.' + c).join('') + '>'; ` +
+  `const t = (node.innerText || '').trim().replace(/\\s+/g, ' ').slice(0, 40); ` +
+  `return t ? d + ' "' + t + '"' : d; }; `;
+
+/** Scroll the target into view and return its center plus what covers it, if anything. */
+function locateJs(args) {
+  const block = args.scroll === "nearest" ? "nearest" : "center";
+  return (
+    `(() => { ${findElJs(args)}${DESCRIBE_JS}` +
+    `el.scrollIntoView({ block: ${jsString(block)}, inline: ${jsString(block)} }); ` +
+    `const r = el.getBoundingClientRect(); ` +
+    `if (!r.width || !r.height) throw new Error('element has no visible size — call browser_snapshot again'); ` +
+    `const x = r.left + r.width / 2, y = r.top + r.height / 2; ` +
+    `const inView = x >= 0 && y >= 0 && x < innerWidth && y < innerHeight; ` +
+    `const hit = inView ? document.elementFromPoint(x, y) : null; ` +
+    `const label = hit && hit.closest && hit.closest('label'); ` +
+    `const reachable = !!hit && (hit === el || el.contains(hit) || (label && label.control === el)); ` +
+    `return JSON.stringify({ x, y, inView, covered: inView && !reachable ? describe(hit) : null }); })()`
+  );
+}
+
+function focusJs(args) {
+  return (
+    `(() => { ${findElJs(args)}` +
+    `el.focus(); ` +
+    `if (document.activeElement !== el && !el.contains(document.activeElement)) ` +
+    `throw new Error('element is not focusable'); ` +
+    `return 'ok'; })()`
+  );
+}
+
+function scrollJs(args) {
+  const hasTarget = args.ref !== undefined || args.selector !== undefined;
+  const vertical = args.direction === "up" || args.direction === "down";
+  const sign = args.direction === "up" || args.direction === "left" ? -1 : 1;
+  return (
+    `(() => { ${DESCRIBE_JS}` +
+    `const target = ${hasTarget ? `(() => { ${findElJs(args)}return el; })()` : "null"}; ` +
+    `const vertical = ${jsString(vertical)}; ` +
+    `const canScroll = (n) => { const o = getComputedStyle(n)[vertical ? 'overflowY' : 'overflowX']; ` +
+    `return /(auto|scroll|overlay)/.test(o) && (vertical ? n.scrollHeight > n.clientHeight : n.scrollWidth > n.clientWidth); }; ` +
+    `let box = null; ` +
+    `for (let n = target; n && n !== document.body && n !== document.documentElement; n = n.parentElement) { ` +
+    `if (canScroll(n)) { box = n; break; } } ` +
+    `const scroller = box || document.scrollingElement || document.documentElement; ` +
+    `const size = box ? (vertical ? box.clientHeight : box.clientWidth) : (vertical ? innerHeight : innerWidth); ` +
+    `const amount = ${args.amount === undefined ? "Math.max(1, Math.round(size * 0.8))" : jsNumber(args.amount)}; ` +
+    `const delta = ${jsNumber(sign)} * amount; ` +
+    `scroller.scrollBy({ top: vertical ? delta : 0, left: vertical ? 0 : delta, behavior: 'instant' }); ` +
+    `const pos = vertical ? scroller.scrollTop : scroller.scrollLeft; ` +
+    `const max = vertical ? scroller.scrollHeight - scroller.clientHeight : scroller.scrollWidth - scroller.clientWidth; ` +
+    `return JSON.stringify({ scroll_x: Math.round(scroller.scrollLeft), scroll_y: Math.round(scroller.scrollTop), ` +
+    `at_end: delta > 0 ? pos >= max - 1 : pos <= 0, container: box ? describe(box) : 'page' }); })()`
+  );
+}
+
+function selectOptionJs(args) {
+  return (
+    `(() => { ${findElJs(args)}` +
+    `if (el.tagName !== 'SELECT') throw new Error('element is not a native <select> (it is <' + el.tagName.toLowerCase() + '>) — click it to open a custom dropdown instead'); ` +
+    `if (el.disabled) throw new Error('select is disabled'); ` +
+    `const wanted = ${JSON.stringify(args.values)}; ` +
+    `const options = [...el.options]; ` +
+    `const norm = (text) => text.trim().replace(/\\s+/g, ' '); ` +
+    `const picked = wanted.map((w) => options.find((o) => o.value === w) || options.find((o) => norm(o.label) === norm(w) || norm(o.text) === norm(w))); ` +
+    `const missing = wanted.find((w, i) => !picked[i]); ` +
+    `if (missing !== undefined) throw new Error('no option matches ' + JSON.stringify(missing) + '; options: ' + options.slice(0, 20).map((o) => JSON.stringify(o.label || o.value)).join(', ')); ` +
+    `if (!el.multiple && picked.length > 1) throw new Error('this select accepts only one value'); ` +
+    `const disabled = picked.find((o) => o.disabled); ` +
+    `if (disabled) throw new Error('option ' + JSON.stringify(disabled.label || disabled.value) + ' is disabled'); ` +
+    `for (const o of options) o.selected = picked.includes(o); ` +
+    `el.dispatchEvent(new Event('input', { bubbles: true })); ` +
+    `el.dispatchEvent(new Event('change', { bubbles: true })); ` +
+    `return JSON.stringify({ selected: [...el.selectedOptions].map((o) => o.value) }); })()`
+  );
+}
+
+function checkJs(args) {
+  const want = args.checked !== false;
+  return (
+    `(async () => { ${findElJs(args)}` +
+    `const box = el.tagName === 'LABEL' && el.control ? el.control : el; ` +
+    `const role = box.getAttribute('role'); ` +
+    `const native = box.tagName === 'INPUT' && (box.type === 'checkbox' || box.type === 'radio'); ` +
+    `if (!native && !['checkbox', 'radio', 'switch', 'menuitemcheckbox', 'menuitemradio'].includes(role)) ` +
+    `throw new Error('element is not a checkbox, radio button or switch'); ` +
+    `const radio = native ? box.type === 'radio' : role === 'radio' || role === 'menuitemradio'; ` +
+    `const read = () => (native ? box.checked : box.getAttribute('aria-checked') === 'true'); ` +
+    `const want = ${jsString(want)}; ` +
+    `if (read() === want) return JSON.stringify({ checked: want }); ` +
+    `if (radio && !want) throw new Error("a radio button can't be unchecked — check another option in its group"); ` +
+    `if (box.disabled || box.getAttribute('aria-disabled') === 'true') throw new Error('element is disabled'); ` +
+    `box.scrollIntoView({ block: 'center', inline: 'center' }); ` +
+    `box.click(); ` +
+    // Frameworks may re-render aria-checked asynchronously after the click.
+    `for (let i = 0; i < 10 && read() !== want; i++) await new Promise((r) => setTimeout(r, 20)); ` +
+    `if (read() !== want) throw new Error('clicking did not change its state; it is still ' + (read() ? 'checked' : 'unchecked')); ` +
+    `return JSON.stringify({ checked: want }); })()`
+  );
+}
+
 export function buildBrowserActionScript(action, args = {}) {
   if (!args || typeof args !== "object" || Array.isArray(args)) {
     throw new Error("Browser action arguments must be an object");
   }
-  if (!["snapshot", "click", "type"].includes(action)) {
+  if (!Object.hasOwn(ACTION_ARGS, action)) {
     throw new Error("Unsupported browser action");
   }
-  const allowed = action === "snapshot" ? [] : ["ref", "snapshot_id", "selector"];
-  if (action === "type") allowed.push("text");
+  const allowed = ACTION_ARGS[action];
   if (Object.keys(args).some((key) => !allowed.includes(key))) {
     throw new Error("Unsupported browser action argument");
   }
@@ -174,7 +326,8 @@ export function buildBrowserActionScript(action, args = {}) {
   if (args.ref !== undefined && (!Number.isSafeInteger(args.ref) || args.ref <= 0)) {
     throw new Error("ref must be a positive integer");
   }
-  if (args.ref === undefined && (typeof args.selector !== "string" || !args.selector)) {
+  const hasTarget = args.ref !== undefined || (typeof args.selector === "string" && args.selector);
+  if (!hasTarget && !(OPTIONAL_TARGET_ACTIONS.has(action) && args.selector === undefined)) {
     throw new Error("A ref or selector is required");
   }
   if (
@@ -189,9 +342,12 @@ export function buildBrowserActionScript(action, args = {}) {
   ) {
     throw new Error("snapshot_id must be a string of at most 128 characters");
   }
-  if (action === "type" && (typeof args.text !== "string" || args.text.length > 100000)) {
-    throw new Error("text must be a string of at most 100000 characters");
-  }
+  validateActionArgs(action, args);
+  if (action === "locate") return locateJs(args);
+  if (action === "focus") return focusJs(args);
+  if (action === "scroll") return scrollJs(args);
+  if (action === "select_option") return selectOptionJs(args);
+  if (action === "check") return checkJs(args);
   if (action === "click") {
     return (
       `(() => { ${findElJs(args)} ` +

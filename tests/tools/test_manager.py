@@ -92,9 +92,19 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # owned) so any agent can drive the desktop app's browser without
         # the spec opting in. Schema-only; runner-dispatched.
         "browser_navigate",
+        "browser_go_back",
+        "browser_go_forward",
+        "browser_reload",
+        "browser_tabs",
         "browser_snapshot",
         "browser_click",
+        "browser_hover",
+        "browser_drag",
+        "browser_scroll",
         "browser_type",
+        "browser_press_key",
+        "browser_select_option",
+        "browser_check",
         "browser_screenshot",
     }
 )
@@ -1694,9 +1704,19 @@ _TOOL_GROUP_MEMBERS: dict[str, frozenset[str]] = {
     "browser": frozenset(
         {
             "browser_navigate",
+            "browser_go_back",
+            "browser_go_forward",
+            "browser_reload",
+            "browser_tabs",
             "browser_snapshot",
             "browser_click",
+            "browser_hover",
+            "browser_drag",
+            "browser_scroll",
             "browser_type",
+            "browser_press_key",
+            "browser_select_option",
+            "browser_check",
             "browser_screenshot",
         }
     ),
@@ -1743,13 +1763,13 @@ def test_tool_groups_false_drops_only_that_group(group: str) -> None:
 
 def test_tool_groups_all_false_keeps_the_load_bearing_tools() -> None:
     """
-    With every group off, the 16 gated tools are gone but the session
+    With every group off, the 26 gated tools are gone but the session
     reads, ``sys_session_rename`` and ``sys_cancel_task`` stay: multi-agent
     participation and async handles depend on them, so they have no key.
     """
     names = _tool_names(_grouped_spec(**dict.fromkeys(_TOOL_GROUP_MEMBERS, False)))
     gated = frozenset().union(*_TOOL_GROUP_MEMBERS.values())
-    assert len(gated) == 16
+    assert len(gated) == 26
     assert not (gated & names)
     assert {
         "sys_session_list",

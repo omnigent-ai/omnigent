@@ -11,6 +11,19 @@ const crypto = require("node:crypto");
 const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
+const { needsTrustedInput, performBrowserInput } = require("./browserInput");
+
+const HISTORY_ACTIONS = new Set(["go_back", "go_forward", "reload"]);
+
+/** A plain left click runs `el.click()`, which takes no mouse options. */
+function withoutDefaultClickArgs(action, params) {
+  if (action !== "click" || !params || typeof params !== "object") return params;
+  const { button: _button, double_click: doubleClick, ...rest } = params;
+  if (doubleClick !== undefined && typeof doubleClick !== "boolean") {
+    throw new Error("double_click must be a boolean");
+  }
+  return rest;
+}
 const { buildDesignModeScript } = require("./designModeScript");
 
 // Max age of a real native input event for a design-mode submit marker to be
@@ -153,6 +166,14 @@ function readNavState(wc) {
 
 /** Navigate back through history, preferring the Electron 42 navigationHistory
  *  API. Returns true if a back navigation was issued. Never throws. */
+function readTitle(wc) {
+  try {
+    return wc.getTitle();
+  } catch {
+    return "";
+  }
+}
+
 function goBack(wc) {
   try {
     const nav = wc.navigationHistory;
@@ -536,7 +557,20 @@ function registerBrowserIpc({
     if (!entry) return { ok: false, error: "No browser view" };
     try {
       const { action, params } = legacy ? decodeLegacyBrowserAction(args?.js) : (args ?? {});
-      const js = buildBrowserActionScript(action, params);
+      g.registry.ensureAgentViewport?.(conversationId);
+      if (HISTORY_ACTIONS.has(action)) {
+        if (params && Object.keys(params).length > 0) {
+          throw new Error("Unsupported browser action argument");
+        }
+        const r = await g.registry.agentNavigateHistory(conversationId, action);
+        if (!r.ok) return { ok: false, error: r.error };
+        return { ok: true, result: JSON.stringify({ url: r.url, title: r.title }) };
+      }
+      if (needsTrustedInput(action, params)) {
+        const result = await performBrowserInput(entry, action, params);
+        return { ok: true, result: JSON.stringify(result) };
+      }
+      const js = buildBrowserActionScript(action, withoutDefaultClickArgs(action, params));
       const result = await entry.view.webContents.executeJavaScript(js, false);
       return { ok: true, result: typeof result === "string" ? result : JSON.stringify(result) };
     } catch (e) {
@@ -561,6 +595,7 @@ function registerBrowserIpc({
     return {
       exists: true,
       url: entry.view.webContents.getURL(),
+      title: readTitle(entry.view.webContents),
       ...readNavState(entry.view.webContents),
     };
   });

@@ -572,13 +572,13 @@ class ToolManager:
 
     def _register_browser_tools(self) -> None:
         """
-        Auto-register the embedded-browser tools (``browser_navigate`` /
-        ``browser_snapshot`` / ``browser_click`` / ``browser_type`` /
-        ``browser_screenshot``).
+        Auto-register the embedded-browser tools (``BROWSER_TOOL_CLASSES``:
+        ``browser_navigate``, ``browser_snapshot``, ``browser_click`` and
+        the rest).
 
         Framework-owned and registered without the spec opting in, so
         any agent can drive the desktop app's embedded browser;
-        ``tool_groups.browser: false`` drops all five. The classes here
+        ``tool_groups.browser: false`` drops all of them. The classes here
         are schema-only (``name`` / ``description`` / ``get_schema``);
         execution lives in the runner ``_BROWSER_TOOLS`` dispatch branch
         (``omnigent/runner/tool_dispatch.py``), which needs the runner's
@@ -586,21 +586,9 @@ class ToolManager:
         """
         if not self._spec.tool_groups.browser:
             return
-        from omnigent.tools.builtins.browser import (
-            BrowserClickTool,
-            BrowserNavigateTool,
-            BrowserScreenshotTool,
-            BrowserSnapshotTool,
-            BrowserTypeTool,
-        )
+        from omnigent.tools.builtins.browser import BROWSER_TOOL_CLASSES
 
-        for _cls in (
-            BrowserNavigateTool,
-            BrowserSnapshotTool,
-            BrowserClickTool,
-            BrowserTypeTool,
-            BrowserScreenshotTool,
-        ):
+        for _cls in BROWSER_TOOL_CLASSES:
             self._tools[_cls.name()] = _cls()
 
     def _register_os_env_tools(self, *, schema_only: bool = False) -> None:

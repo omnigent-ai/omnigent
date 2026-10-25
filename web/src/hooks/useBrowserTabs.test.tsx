@@ -2,11 +2,18 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
+import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import {
   AGENT_BROWSER_TAB_ID,
+  addBrowserTab,
+  agentBrowserTabId,
+  browserTabIds,
   browserViewId,
   browserViewOwnerId,
+  closeBrowserTab,
   openAgentBrowserTab,
+  selectAgentBrowserTab,
   useBrowserTabs,
 } from "./useBrowserTabs";
 
@@ -248,5 +255,83 @@ describe("browser soft tabs", () => {
       openBrowsers: [AGENT_BROWSER_TAB_ID],
       selectedBrowserId: AGENT_BROWSER_TAB_ID,
     });
+  });
+});
+
+describe("agent browser tabs", () => {
+  const navigate = (conversationId: string) =>
+    emitBrowserActionRequest(
+      { type: "browser_action_request", actionId: "nav", action: "navigate", args: {} },
+      conversationId,
+    );
+
+  it("tracks the agent's current tab and shows it in mounted hooks", () => {
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    expect(agentBrowserTabId("session-a")).toBe(AGENT_BROWSER_TAB_ID);
+    let agentTab = "";
+    act(() => {
+      agentTab = addBrowserTab("session-a", { forAgent: true });
+    });
+    expect(result.current.selected).toBe(agentTab);
+    expect(agentBrowserTabId("session-a")).toBe(agentTab);
+    // A user-added tab is shown but does not move the agent.
+    act(() => result.current.add());
+    expect(agentBrowserTabId("session-a")).toBe(agentTab);
+    // The agent's next navigation brings its own tab back to the front.
+    act(() => navigate("session-a"));
+    expect(result.current.selected).toBe(agentTab);
+    expect(browserTabIds("session-a")).toHaveLength(2);
+  });
+
+  it("selects only open tabs for the agent", () => {
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    act(() => result.current.add());
+    const userTab = result.current.selected!;
+    act(() => result.current.select(null));
+    expect(selectAgentBrowserTab("session-a", "missing")).toBe(false);
+    act(() => {
+      expect(selectAgentBrowserTab("session-a", userTab)).toBe(true);
+    });
+    expect(result.current.selected).toBe(userTab);
+    expect(agentBrowserTabId("session-a")).toBe(userTab);
+  });
+
+  it("opens in-app links in the reserved agent browser, not the agent's current tab", async () => {
+    const browserOpenOrNavigate = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, { omnigentDesktop: { kind: "electron", browserOpenOrNavigate } });
+    writeOpenLinksInApp(true);
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    act(() => {
+      addBrowserTab("session-a", { forAgent: true });
+    });
+    expect(maybeOpenLinkInApp("session-a", "https://example.com/")).toBe(true);
+    await vi.waitFor(() => expect(result.current.selected).toBe(AGENT_BROWSER_TAB_ID));
+    expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+      "session-a",
+      "https://example.com/",
+      undefined,
+      {
+        agent: true,
+      },
+    );
+  });
+
+  it("moves the agent to the shown tab when its current tab closes", async () => {
+    Object.assign(window, {
+      omnigentDesktop: { browserClose: vi.fn().mockResolvedValue({ ok: true }) },
+    });
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    act(() => result.current.add());
+    const first = result.current.selected!;
+    let agentTab = "";
+    act(() => {
+      agentTab = addBrowserTab("session-a", { forAgent: true });
+    });
+    await act(() => closeBrowserTab("session-a", agentTab));
+    expect(result.current.tabs).toEqual([first]);
+    expect(agentBrowserTabId("session-a")).toBe(first);
+    await act(() => closeBrowserTab("session-a", first));
+    expect(agentBrowserTabId("session-a")).toBe(AGENT_BROWSER_TAB_ID);
+    expect(readSessionWorkspaceState("session-a").agentBrowserId).toBeNull();
   });
 });

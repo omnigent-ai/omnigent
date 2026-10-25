@@ -42,6 +42,8 @@ export interface SessionWorkspaceState {
   selectedTerminalKey?: string | null;
   openBrowsers?: string[];
   selectedBrowserId?: string | null;
+  /** The browser tab agents act on (null = the reserved agent browser tab). */
+  agentBrowserId?: string | null;
   /** Ordered list of open side-chat tabs (child conversation ids). Browser-local
    *  by design: side chats are ephemeral and vanish when the app is closed. */
   openSideChats?: string[];
@@ -127,6 +129,9 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   }
   if (record.selectedBrowserId === null || typeof record.selectedBrowserId === "string") {
     state.selectedBrowserId = record.selectedBrowserId;
+  }
+  if (record.agentBrowserId === null || typeof record.agentBrowserId === "string") {
+    state.agentBrowserId = record.agentBrowserId;
   }
   if (Array.isArray(record.openSideChats)) {
     state.openSideChats = [

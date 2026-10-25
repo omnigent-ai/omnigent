@@ -386,6 +386,7 @@ function makeWebContents({
   canBack = false,
   canForward = false,
   url = "https://example.com/restored",
+  title = "Restored page",
 } = {}) {
   const calls = [];
   // Cookies pushed into the (fake) session by the Chrome import handlers.
@@ -421,6 +422,7 @@ function makeWebContents({
     isDevToolsOpened: () => devtoolsOpen,
     isDestroyed: () => false,
     getURL: () => url,
+    getTitle: () => title,
     getZoomFactor: () => 1,
     executeJavaScript: (js) => {
       calls.push(`executeJavaScript:${String(js).slice(0, 40)}`);
@@ -534,6 +536,7 @@ it("restores the URL and history state for the requested browser tab only", () =
   assert.deepEqual(ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: viewId }), {
     exists: true,
     url: "https://example.com/restored",
+    title: "Restored page",
     canGoBack: true,
     canGoForward: false,
   });
@@ -1367,6 +1370,76 @@ describe("browserIpc — typed actions", () => {
     assert.deepEqual(result, { ok: true, result: "ok" });
     assert.equal(calls.length, 1);
     assert.equal(calls[0][1], false);
+  });
+
+  it("keeps a plain left click on the script path and sends other clicks as mouse input", async () => {
+    const wc = makeWebContents();
+    const commands = [];
+    wc.debugger = {
+      isAttached: () => false,
+      attach() {},
+      detach() {},
+      on() {},
+      removeListener() {},
+      sendCommand: async (method, params) => commands.push([method, params.type, params.button]),
+    };
+    wc.executeJavaScript = async (js) => {
+      wc.scripts.push(js);
+      return js.includes("elementFromPoint")
+        ? JSON.stringify({ x: 4, y: 8, inView: true, covered: null })
+        : "ok";
+    };
+    const { ipcMain, event } = setup({ webContents: wc });
+    const perform = (params) =>
+      ipcMain.invoke("omnigent:browser-perform-action", event, {
+        conversationId: "conv_1",
+        action: "click",
+        params,
+      });
+    assert.deepEqual(await perform({ selector: "a", button: "left", double_click: false }), {
+      ok: true,
+      result: "ok",
+    });
+    assert.match(wc.scripts.at(-1), /el\.click\(\)/);
+    assert.equal(commands.length, 0);
+    assert.deepEqual(await perform({ selector: "a", button: "right" }), {
+      ok: true,
+      result: JSON.stringify({ ok: true }),
+    });
+    assert.deepEqual(commands.at(-1), ["Input.dispatchMouseEvent", "mouseReleased", "right"]);
+    assert.equal((await perform({ selector: "a", double_click: "yes" })).ok, false);
+  });
+
+  it("routes agent history actions through the registry's policy-checked navigation", async () => {
+    const wc = makeWebContents();
+    const { ipcMain, event, registry } = setup({ webContents: wc });
+    const history = [];
+    registry.agentNavigateHistory = async (id, action) => {
+      history.push([id, action]);
+      return action === "go_forward"
+        ? { ok: false, error: "no next page in this tab" }
+        : { ok: true, url: "https://example.com/a", title: "A" };
+    };
+    const perform = (action, params) =>
+      ipcMain.invoke("omnigent:browser-perform-action", event, {
+        conversationId: "conv_1",
+        action,
+        params,
+      });
+    assert.deepEqual(await perform("go_back"), {
+      ok: true,
+      result: JSON.stringify({ url: "https://example.com/a", title: "A" }),
+    });
+    assert.deepEqual(await perform("go_forward", {}), {
+      ok: false,
+      error: "no next page in this tab",
+    });
+    assert.equal((await perform("reload", { url: "http://10.0.0.5" })).ok, false);
+    assert.deepEqual(history, [
+      ["conv_1", "go_back"],
+      ["conv_1", "go_forward"],
+    ]);
+    assert.equal(wc.calls.filter((call) => /reload|goBack/.test(call)).length, 0);
   });
 });
 

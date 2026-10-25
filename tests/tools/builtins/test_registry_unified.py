@@ -155,9 +155,19 @@ def test_builtin_names_size_matches_registry() -> None:
                 # Tool classes; execution is runner-dispatched via the
                 # _BROWSER_TOOLS branch in runner/tool_dispatch.py).
                 "browser_navigate",
+                "browser_go_back",
+                "browser_go_forward",
+                "browser_reload",
+                "browser_tabs",
                 "browser_snapshot",
                 "browser_click",
+                "browser_hover",
+                "browser_drag",
+                "browser_scroll",
                 "browser_type",
+                "browser_press_key",
+                "browser_select_option",
+                "browser_check",
                 "browser_screenshot",
                 "ui_open_file",
             }

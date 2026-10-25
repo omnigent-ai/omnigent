@@ -982,7 +982,7 @@ export interface BrowserActionRequestEvent {
   type: "browser_action_request";
   /** Server-minted id; echoed on claim + result to resolve the parked Future. */
   actionId: string;
-  /** The bare verb: "navigate" | "snapshot" | "click" | "type" | "screenshot". */
+  /** The tool name without its `browser_` prefix, e.g. "navigate", "click" or "tabs". */
   action: string;
   /** Action-specific args (url, ref, selector, text, …); shape validated per-action. */
   args: Record<string, unknown>;

@@ -836,3 +836,187 @@ describe("browserViewRegistry — overlay suppression (#3980)", () => {
     assert.equal(ctx.visibility.length, 0, "nothing to toggle with no active view");
   });
 });
+
+describe("browserViewRegistry — agent history navigation", () => {
+  /** A registry whose one view has a scripted history and load events. */
+  function makeHistoryRegistry({ history, active, isArcaAgentContext } = {}) {
+    const listeners = new Map();
+    const calls = [];
+    let index = active;
+    let loading = false;
+    const webContents = {
+      loadURL() {},
+      close() {},
+      setWindowOpenHandler() {},
+      on() {},
+      once(event, fn) {
+        listeners.set(event, fn);
+      },
+      removeListener(event) {
+        listeners.delete(event);
+      },
+      getURL: () => history[index],
+      getTitle: () => `Page ${index}`,
+      isLoading: () => loading,
+      reload() {
+        calls.push("reload");
+      },
+      navigationHistory: {
+        length: () => history.length,
+        getActiveIndex: () => index,
+        getEntryAtIndex: (i) => ({ url: history[i] }),
+        goBack() {
+          calls.push("goBack");
+          index -= 1;
+          loading = true;
+          setTimeout(() => {
+            loading = false;
+            listeners.get("did-stop-loading")?.();
+          }, 5);
+        },
+        goForward() {
+          calls.push("goForward");
+          index += 1;
+        },
+      },
+    };
+    const registry = createBrowserViewRegistry({
+      WebContentsViewCtor: () => ({ setBounds() {}, webContents }),
+      createBoundsController: createBrowserViewBoundsController,
+      attachToHost() {},
+      detachFromHost() {},
+      sendToRenderer() {},
+      isArcaAgentContext,
+      resolveHost: async () => ["93.184.216.34"],
+      historyLoadTimeoutMs: 1000,
+    });
+    registry.getOrCreate("conv_1");
+    return { registry, calls, entry: registry.get("conv_1") };
+  }
+
+  it("goes back and forward, waiting for the load, and reports the page", async () => {
+    const { registry, calls, entry } = makeHistoryRegistry({
+      history: ["https://example.com/a", "https://example.com/b"],
+      active: 1,
+    });
+    assert.deepEqual(await registry.agentNavigateHistory("conv_1", "go_back"), {
+      ok: true,
+      url: "https://example.com/a",
+      title: "Page 0",
+    });
+    assert.equal(entry.agentNavLocked, true, "redirects of the history load stay guarded");
+    assert.deepEqual(await registry.agentNavigateHistory("conv_1", "go_forward"), {
+      ok: true,
+      url: "https://example.com/b",
+      title: "Page 1",
+    });
+    assert.equal((await registry.agentNavigateHistory("conv_1", "reload")).ok, true);
+    assert.deepEqual(calls, ["goBack", "goForward", "reload"]);
+  });
+
+  it("refuses at the ends of history and for unknown views or actions", async () => {
+    const { registry, calls } = makeHistoryRegistry({
+      history: ["https://example.com/"],
+      active: 0,
+    });
+    assert.deepEqual(await registry.agentNavigateHistory("conv_1", "go_back"), {
+      ok: false,
+      error: "no previous page in this tab",
+    });
+    assert.deepEqual(await registry.agentNavigateHistory("conv_1", "go_forward"), {
+      ok: false,
+      error: "no next page in this tab",
+    });
+    assert.equal((await registry.agentNavigateHistory("nope", "reload")).error, "No browser view");
+    assert.equal((await registry.agentNavigateHistory("conv_1", "stop")).ok, false);
+    assert.deepEqual(calls, []);
+  });
+
+  it("applies the agent URL policy to the destination a user browsed to", async () => {
+    const { registry, calls } = makeHistoryRegistry({
+      history: ["http://192.168.1.1/admin", "https://example.com/"],
+      active: 1,
+    });
+    const back = await registry.agentNavigateHistory("conv_1", "go_back");
+    assert.equal(back.ok, false);
+    assert.match(back.error, /internal host/);
+    const onInternalPage = makeHistoryRegistry({ history: ["http://10.0.0.5/"], active: 0 });
+    assert.equal(
+      (await onInternalPage.registry.agentNavigateHistory("conv_1", "reload")).ok,
+      false,
+    );
+    assert.deepEqual([...calls, ...onInternalPage.calls], []);
+  });
+
+  it("lets an eligible loopback context go back to its loopback page", async () => {
+    const context = { sourceHostId: "arca" };
+    const { registry, entry } = makeHistoryRegistry({
+      history: ["http://localhost:5173/", "https://example.com/"],
+      active: 1,
+      isArcaAgentContext: (ctx) => ctx === context,
+    });
+    entry.agentContext = context;
+    assert.equal((await registry.agentNavigateHistory("conv_1", "go_back")).ok, true);
+  });
+});
+
+describe("browserViewRegistry — agent right-click", () => {
+  it("does not open the shell's context menu while an agent right-click is in flight", () => {
+    const { registry, fireContextMenu, menus } = makeEventCapturingRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    const params = { linkURL: "https://example.com/next", selectionText: "" };
+    registry.get("conv_1").suppressContextMenuUntil = Date.now() + 1000;
+    fireContextMenu(params);
+    assert.equal(menus.length, 0);
+    registry.get("conv_1").suppressContextMenuUntil = Date.now() - 1;
+    fireContextMenu(params);
+    assert.equal(menus.length, 1);
+  });
+});
+
+describe("browserViewRegistry — agent viewport", () => {
+  function makeSizedRegistry() {
+    const sizes = [];
+    let bounds = { x: 0, y: 0, width: 0, height: 0 };
+    const registry = createBrowserViewRegistry({
+      WebContentsViewCtor: () => ({
+        getBounds: () => bounds,
+        setBounds(next) {
+          bounds = next;
+          sizes.push(next);
+        },
+        webContents: {
+          loadURL() {},
+          close() {},
+          on() {},
+          removeListener() {},
+          setWindowOpenHandler() {},
+        },
+      }),
+      createBoundsController: createBrowserViewBoundsController,
+      attachToHost() {},
+      detachFromHost() {},
+      sendToRenderer() {},
+    });
+    return { registry, sizes };
+  }
+
+  it("lays out a view the user has not shown so agent input has a viewport", () => {
+    const { registry, sizes } = makeSizedRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    registry.ensureAgentViewport("conv_1");
+    assert.deepEqual(sizes, [{ x: 0, y: 0, width: 1280, height: 800 }]);
+    registry.ensureAgentViewport("conv_1");
+    assert.equal(sizes.length, 1, "an already-sized view keeps its bounds");
+    registry.ensureAgentViewport("missing");
+  });
+
+  it("leaves the active view to the pane's own bounds", () => {
+    const { registry, sizes } = makeSizedRegistry();
+    registry.openOrNavigate("conv_1", "https://example.com");
+    registry.setActive("conv_1");
+    sizes.length = 0;
+    registry.ensureAgentViewport("conv_1");
+    assert.deepEqual(sizes, []);
+  });
+});
