@@ -603,6 +603,7 @@ def get_models(provider: str) -> list[ModelInfo]:
 _MODEL_PROVIDER_PATTERNS: tuple[tuple[re.Pattern[str], str], ...] = (
     (re.compile(r"^claude-", re.IGNORECASE), "anthropic"),
     (re.compile(r"^(?:gpt-|o\d(?:-|$))", re.IGNORECASE), "openai"),
+    (re.compile(r"^minimax-", re.IGNORECASE), "minimax"),
     (re.compile(r"^gemini-", re.IGNORECASE), "gemini"),
     (re.compile(r"^qwen(?:\d|-)", re.IGNORECASE), "dashscope"),
     (re.compile(r"^llama-", re.IGNORECASE), "meta_llama"),
@@ -763,6 +764,9 @@ _SPECIALTY_MODEL_TOKENS: tuple[str, ...] = (
 # flagship ``gpt-*`` is broadly accessible, so no steering is needed).
 _PREFERRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
     "anthropic": "sonnet",
+    # Keep ordinary MiniMax choices Flash-first while still allowing the
+    # catalog's newest compatible model when a future Flash release is absent.
+    "minimax": "m3.1-flash",
 }
 
 # Required provider → case-insensitive model-id substring. If no entry matches,
@@ -1062,6 +1066,7 @@ _PROVIDER_AUTH_MODES: dict[str, dict[str, dict[str, Any]]] = {
 _PROVIDER_DISPLAY_NAMES: dict[str, str] = {
     "openai": "OpenAI",
     "anthropic": "Anthropic",
+    "minimax": "MiniMax",
     "bedrock": "Amazon Bedrock",
     "gemini": "Google Gemini",
     "vertex_ai": "Google Vertex AI",
@@ -1105,6 +1110,7 @@ def format_provider_name(provider: str) -> str:
 PROVIDER_ENV_VARS: dict[str, str] = {
     "openai": "OPENAI_API_KEY",
     "anthropic": "ANTHROPIC_API_KEY",
+    "minimax": "MINIMAX_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "mistral": "MISTRAL_API_KEY",
     "groq": "GROQ_API_KEY",

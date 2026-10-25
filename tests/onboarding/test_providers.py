@@ -738,6 +738,20 @@ def test_default_chat_model_openrouter_requires_kimi_family() -> None:
     assert default_chat_model("openrouter", allowed_models={"openai/gpt-6"}) is None
 
 
+def test_default_chat_model_minimax_prefers_flash_then_m3(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """MiniMax ordinary defaults prefer the Flash rollout and retain M3 fallback."""
+    models = [
+        ModelInfo(name="MiniMax-M3", provider="minimax", mode="chat"),
+        ModelInfo(name="MiniMax-M3.1-Flash", provider="minimax", mode="chat"),
+    ]
+    monkeypatch.setattr(_providers_mod, "get_chat_models", lambda _provider: models)
+
+    assert default_chat_model("minimax") == "MiniMax-M3.1-Flash"
+    assert default_chat_model("minimax", allowed_models={"MiniMax-M3"}) == "MiniMax-M3"
+
+
 def test_default_chat_model_without_catalog_is_none() -> None:
     """Offline onboarding asks for a model instead of using a source pin."""
     assert default_chat_model("xai") is None
