@@ -2223,6 +2223,20 @@ async def test_launch_on_windows_passes_the_pane_program_as_argv(
     assert _new_session_command(cmd)[-len(args) - 2 :] == ["--", "bash", *args]
 
 
+async def test_launch_on_windows_gives_panes_a_term_windows_programs_know(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows programs such as Claude Code draw Unicode glyphs only for a TERM they know."""
+    cmd = await _capture_launch_argv(
+        tmp_path, monkeypatch, keep_alive_after_exit=False, windows=True
+    )
+
+    options = cmd[: cmd.index("new-session")]
+    assert contains_subsequence(
+        options, ["set-option", "-g", "default-terminal", "xterm-256color"]
+    )
+
+
 @pytest.mark.parametrize("launch_fails", [False, True])
 async def test_launch_discards_previous_exit_diagnostics_before_starting(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, launch_fails: bool

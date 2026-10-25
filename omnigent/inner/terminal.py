@@ -1694,6 +1694,10 @@ class TerminalInstance:
                 self.conversation_link or _TMUX_EMPTY_OPTION_VALUE,
             ],
         ]
+        if IS_WINDOWS:
+            # Windows has no terminfo; its programs draw Unicode only for a
+            # TERM they know, and Claude Code draws ">" under tmux-256color.
+            option_commands.append(["set-option", "-g", "default-terminal", "xterm-256color"])
         if self.tmux_start_on_attach:
             option_commands.append(
                 [
