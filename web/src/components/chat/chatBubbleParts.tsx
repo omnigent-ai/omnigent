@@ -1077,6 +1077,10 @@ function AssistantBubble({
   // A bubble carrying an error but no prose stands alone as a thread-level
   // element — the hover footer belongs to assistant text, not to the error.
   const errorOnly = hasError && !markdownText;
+  // A bubble whose items are all errors (e.g. an undelivered-message notice) is a
+  // thread-level card, not an assistant reply, so it takes the "error" role; a
+  // failed turn that still produced tool or reasoning output keeps the assistant role.
+  const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
   const spansFullColumn = isWide || hasError;
 
   return (
@@ -1084,7 +1088,7 @@ function AssistantBubble({
       <Message
         from="assistant"
         data-testid="message-bubble"
-        data-role="assistant"
+        data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
         className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
@@ -1680,7 +1684,7 @@ export function LatestTurnSpacer({
   // Bounded rAF retries for capturing the anchor when committed blocks exist but
   // their rows haven't mounted yet (windowed transcript, published a frame
   // before the virtualizer fills its window). A resize we could observe isn't
-  // guaranteed — the wrapper height is fixed to the estimate — so we drive the
+  // guaranteed — the wrapper's height tracks the estimate — so we drive the
   // retry ourselves rather than wait for one. When the budget runs out (e.g. a
   // tool-only trailing turn that never has an anchor) capture settles to `null`.
   const captureFrameRef = useRef(0);

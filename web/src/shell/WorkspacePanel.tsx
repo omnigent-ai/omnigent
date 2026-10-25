@@ -73,7 +73,12 @@ import { SIDE_CHAT_COMMAND_PREFIX, supportsSideChat, usesNativeSideChatFork } fr
 import { createSideChat, stopSession } from "@/lib/sessionsApi";
 import { useSessionAgent } from "@/hooks/useAgents";
 import type { SessionLiveness } from "@/hooks/useSessionLiveness";
-import { terminalTabKey, useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
+import {
+  terminalDisplayLabel,
+  terminalTabKey,
+  useCreateTerminal,
+  useTerminals,
+} from "@/hooks/useTerminals";
 import { SuppressBrowserView } from "@/hooks/useSuppressBrowserView";
 import { readPreferredShell, resolveDefaultShell, writePreferredShell } from "./preferredShell";
 import { WorkspaceTabsScroller } from "./WorkspaceTabsScroller";
@@ -1104,7 +1109,7 @@ function WorkspacePanelImpl({
     (key: string) => {
       const t = terminals.find((term) => terminalTabKey(term) === key);
       if (!t) return key.replace(/^terminal:/, "");
-      return t.session ? `${t.name} · ${t.session}` : t.name;
+      return terminalDisplayLabel(t);
     },
     [terminals],
   );

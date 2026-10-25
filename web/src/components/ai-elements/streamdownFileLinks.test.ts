@@ -8,6 +8,8 @@ import { describe, expect, it } from "vitest";
 import {
   markWorkspaceFileLinks,
   rewriteFileUriLinks,
+  shortFileCitationLabel,
+  splitWorkspaceFileCitation,
   WORKSPACE_FILE_LINK_ATTR,
 } from "./streamdown-security";
 
@@ -80,6 +82,8 @@ describe("markWorkspaceFileLinks", () => {
     // `notes.md:12` parses as scheme "notes.md:" if you only look for a colon.
     expectHandedOver(markHref("docs/notes.md:12"), "docs/notes.md:12");
     expectHandedOver(markHref("notes.md:12:7"), "notes.md:12:7");
+    expectHandedOver(markHref("notes.md:12-18"), "notes.md:12-18");
+    expectHandedOver(markHref("Makefile:12"), "Makefile:12");
   });
 
   it.each([
@@ -139,6 +143,10 @@ describe("markWorkspaceFileLinks", () => {
     it("decodes a basename citation once after its colon suffix is rewritten", () => {
       expectHandedOver(rewriteThenMarkHref("My%20Notes.md:12"), "My Notes.md#L12");
     });
+
+    it("keeps a basename citation's line range when its colon suffix is rewritten", () => {
+      expectHandedOver(rewriteThenMarkHref("Main.scala:68-72"), "Main.scala#L68-L72");
+    });
   });
 
   it.each([
@@ -146,6 +154,12 @@ describe("markWorkspaceFileLinks", () => {
     ["http://localhost:3000/x.md", "plain http URL"],
     ["//cdn.example.com/x.md", "protocol-relative URL"],
     ["mailto:someone@example.com", "mailto"],
+    ["tel:555-1234", "phone number shaped like a line range"],
+    ["SMS:555-0100", "uppercase phone scheme"],
+    ["skype:555-1234", "scheme without an extension before a range"],
+    ["geo:1-2", "short scheme shaped like a line range"],
+    ["mailto:555-1234", "mail scheme shaped like a line range"],
+    ["Makefile:12-18", "extensionless name before a range stays a link"],
     ["#section-two", "in-page anchor"],
     ["javascript:alert(1)", "script scheme"],
     ["docs/page.md?raw=1", "path carrying a query"],
@@ -180,5 +194,54 @@ describe("markWorkspaceFileLinks", () => {
     markWorkspaceFileLinks()({ type: "root", children: [img, bare] });
     expect(img.properties).toEqual({ src: "x.png" });
     expect(bare.properties).toEqual({});
+  });
+});
+
+describe("splitWorkspaceFileCitation", () => {
+  it.each([
+    ["src/Main.scala:68-72", "src/Main.scala", 68, 72],
+    ["src/Main.scala#L68-L72", "src/Main.scala", 68, 72],
+    ["src/Main.scala#L68-72", "src/Main.scala", 68, 72],
+    ["src/Main.scala#L68C3-L72C9", "src/Main.scala", 68, 72],
+  ])("reads the range in %s", (text, path, line, endLine) => {
+    expect(splitWorkspaceFileCitation(text)).toMatchObject({ path, line, endLine });
+  });
+
+  it.each([
+    "src/Main.scala:68",
+    "src/Main.scala:68:4",
+    "src/Main.scala:72-68",
+    "src/Main.scala#L5-L5",
+  ])("reports no range for %s", (text) => {
+    const citation = splitWorkspaceFileCitation(text);
+    expect(citation.path).toBe("src/Main.scala");
+    expect(citation).not.toHaveProperty("endLine");
+  });
+
+  it("does not read a colon range with columns, which only the hash form supports", () => {
+    expect(splitWorkspaceFileCitation("src/Main.scala:12:3-15:2")).not.toHaveProperty("endLine");
+  });
+
+  it("drops the range of an invalid zero start line", () => {
+    expect(splitWorkspaceFileCitation("src/Main.scala:0-5")).toEqual({
+      path: "src/Main.scala",
+      line: null,
+      hasPosition: true,
+    });
+  });
+});
+
+describe("shortFileCitationLabel", () => {
+  it.each([
+    ["/repo/sql/core/SQLFunctionExpression.scala:68-72", "SQLFunctionExpression.scala:68-72"],
+    ["src/Main.scala#L41", "Main.scala#L41"],
+    ["~/ws/docs/notes.md", "notes.md"],
+    ["docs/My Notes.md:3:1", "My Notes.md:3:1"],
+  ])("labels %s by its file name", (text, label) => {
+    expect(shortFileCitationLabel(text)).toBe(label);
+  });
+
+  it.each(["README.md", "README.md:12", "docs/"])("has no shorter label for %s", (text) => {
+    expect(shortFileCitationLabel(text)).toBeNull();
   });
 });

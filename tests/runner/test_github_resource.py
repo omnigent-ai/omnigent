@@ -942,18 +942,24 @@ def test_summarize_checks_mixed() -> None:
         {"context": "legacy-ok", "state": "SUCCESS", "targetUrl": "t"},
         {"context": "legacy-wait", "state": "PENDING"},
         {"context": "legacy-err", "state": "ERROR"},
+        {"name": "cancelled job", "status": "COMPLETED", "conclusion": "CANCELLED"},
+        {"name": "skipped job", "status": "COMPLETED", "conclusion": "SKIPPED"},
     ]
     result = _summarize_checks(rollup)
     assert result["passing"] == 2
     assert result["failing"] == 2
     assert result["pending"] == 2
-    assert result["total"] == 6
+    assert result["cancelled"] == 1
+    assert result["skipped"] == 1
+    assert result["total"] == 8
     # Per-check details carry the job name, bucket, and link (name falls back to
     # context / workflowName; url falls back to targetUrl).
     assert {"name": "unit", "bucket": "passing", "url": "u"} in result["runs"]
     assert {"name": "e2e", "bucket": "failing", "url": None} in result["runs"]
     assert {"name": "bench", "bucket": "pending", "url": None} in result["runs"]
     assert {"name": "legacy-ok", "bucket": "passing", "url": "t"} in result["runs"]
+    assert {"name": "cancelled job", "bucket": "cancelled", "url": None} in result["runs"]
+    assert {"name": "skipped job", "bucket": "skipped", "url": None} in result["runs"]
 
 
 def test_summarize_checks_empty() -> None:
@@ -962,6 +968,8 @@ def test_summarize_checks_empty() -> None:
         "passing": 0,
         "failing": 0,
         "pending": 0,
+        "cancelled": 0,
+        "skipped": 0,
         "total": 0,
         "runs": [],
     }
@@ -970,23 +978,28 @@ def test_summarize_checks_empty() -> None:
 def test_github_info_includes_body_and_comments(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """The PR carries its description and its shaped conversation comments.
-
-    ``body`` feeds the Summary tab's description; ``comments`` its list. A
-    minimized/collapsed comment is dropped (as GitHub hides it), and each entry
-    is flattened to ``{author, body, created_at, url}``.
-    """
+    """Issue comments and review bodies appear together, without minimized comments."""
     view = {
         "number": 8,
         "title": "t",
         "state": "OPEN",
-        "url": "u",
+        "url": "https://github.com/o/r/pull/8",
         "isDraft": False,
         "author": {"login": "a"},
         "baseRefName": "main",
         "headRefName": "feature",
         "statusCheckRollup": [],
         "body": "## Summary\nDoes things.",
+        "reviews": [
+            {
+                "author": {"login": "other-reviewer"},
+                "body": "Looks good overall",
+                "submittedAt": "2026-09-05T07:45:00Z",
+                "state": "COMMENTED",
+            },
+            {"author": {"login": "silent-reviewer"}, "body": ""},
+            {"author": {"login": "draft-reviewer"}, "body": "not submitted"},
+        ],
         "comments": [
             {
                 "author": {"login": "reviewer"},
@@ -1022,15 +1035,21 @@ def test_github_info_includes_body_and_comments(
 
     info = github_info(str(repo))
     assert info["pr"]["body"] == "## Summary\nDoes things."
-    # The minimized comment is dropped; the survivor is flattened to snake_case.
     assert info["pr"]["comments"] == [
         {
             "author": "reviewer",
             "body": "nice",
             "created_at": "2026-09-05T07:32:02Z",
             "url": "https://example.com/c/1",
-        }
+        },
+        {
+            "author": "other-reviewer",
+            "body": "Looks good overall",
+            "created_at": "2026-09-05T07:45:00Z",
+            "url": "https://github.com/o/r/pull/8",
+        },
     ]
+    assert not info["pr"].get("comments_partial")
 
 
 def test_github_info_empty_body_is_null(repo: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1070,7 +1089,7 @@ def test_github_info_empty_body_is_null(repo: Path, monkeypatch: pytest.MonkeyPa
 
 
 def test_shape_comments_filters_minimized_and_caps() -> None:
-    """Minimized comments drop out and the list caps at ``_MAX_COMMENTS``."""
+    """Minimized comments drop out and the merged list caps at ``_MAX_COMMENTS``."""
     raw: list[dict[str, object]] = [
         {"author": {"login": "min"}, "body": "x", "isMinimized": True},
     ]
@@ -1086,6 +1105,29 @@ def test_shape_comments_filters_minimized_and_caps() -> None:
         {"author": None, "body": "hi", "created_at": None, "url": None}
     ]
     assert github_resource._shape_comments(None) == []
+    assert github_resource._shape_comments(
+        raw[:1] + raw[1 : github_resource._MAX_COMMENTS],
+        [{"author": {"login": "early"}, "body": "review", "submittedAt": "a"}],
+        pr_url="https://github.com/o/r/pull/8",
+    )[0] == {
+        "author": "early",
+        "body": "review",
+        "created_at": "a",
+        "url": "https://github.com/o/r/pull/8",
+    }
+    assert github_resource._comments_payload({"comments": [], "url": "u"}) == {
+        "comments": [],
+        "comments_partial": True,
+    }
+    payload = github_resource._comments_payload({"comments": raw, "reviews": []})
+    assert len(payload["comments"]) == github_resource._MAX_COMMENTS
+    assert payload["comments_partial"] is True
+
+    visible = [{"body": f"comment {i}"} for i in range(60)]
+    empty_reviews = [{"body": "", "submittedAt": "2026-01-01"} for _ in range(41)]
+    payload = github_resource._comments_payload({"comments": visible, "reviews": empty_reviews})
+    assert len(payload["comments"]) == 60
+    assert "comments_partial" not in payload
 
 
 def test_gh_scrubs_env_tokens_in_sandbox(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1164,6 +1206,13 @@ _PR_WITHOUT_CHECKS = {
     "baseRefOid": "b" * 40,
     "body": "Description",
     "comments": [],
+    "reviews": [
+        {
+            "author": {"login": "second-reviewer"},
+            "body": "Please update the docs",
+            "submittedAt": "2026-10-16T17:30:38Z",
+        }
+    ],
 }
 
 
@@ -1244,6 +1293,40 @@ def test_reference_info_keeps_auth_when_checks_field_is_forbidden(
     assert not (info["pr"].get("checks") or {}).get("total")
     assert info["pr"]["checks_supported"] is False
     assert info["pr"]["body"] == "Description"
+    assert info["pr"]["comments"] == [
+        {
+            "author": "second-reviewer",
+            "body": "Please update the docs",
+            "created_at": "2026-10-16T17:30:38Z",
+            "url": "https://github.com/acme/repo/pull/42",
+        }
+    ]
+
+
+def test_review_field_unavailable_keeps_issue_comments(
+    repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An older gh still shows issue comments and marks the feed incomplete."""
+
+    def fake_gh(
+        argv: Sequence[str], *, cwd: str, token: str | None = None
+    ) -> tuple[int, str, str]:
+        if argv[:2] != ["pr", "view"]:
+            return (1, "", "no stub")
+        fields = argv[argv.index("--json") + 1].split(",")
+        if "reviews" in fields:
+            return (1, "", 'Unknown JSON field: "reviews"')
+        data = dict(_PR_WITHOUT_CHECKS)
+        data.pop("reviews")
+        data["comments"] = [{"author": {"login": "owner"}, "body": "hello"}]
+        return (0, json.dumps(data), "")
+
+    monkeypatch.setattr(github_resource, "_gh", fake_gh)
+    monkeypatch.setattr(github_resource.shutil, "which", lambda _name: "/usr/bin/gh")
+    reference = PullRequestRef.from_url("https://github.com/acme/repo/pull/42")
+    info = github_resource._reference_info(str(repo), reference)
+    assert info["pr"]["comments"][0]["body"] == "hello"
+    assert info["pr"]["comments_partial"] is True
 
 
 def test_commit_fallback_fetch_retries_without_forbidden_checks_field(

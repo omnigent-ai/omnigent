@@ -177,7 +177,7 @@ async def test_claude_program_status_real_launch_and_fallback(
                 while len(statuses) == before:
                     await asyncio.sleep(0.02)
             assert statuses[-1] == ("running", "permission prompt")
-        for key, state in (("d", "idle"), ("w", "running"), ("i", "idle"), ("e", "failed")):
+        for key, state in (("d", "idle"), ("w", "running"), ("i", "idle")):
             await instance.send(keys=key)
             await wait_status(state)
         for key in ("c", "u"):
@@ -185,6 +185,13 @@ async def test_claude_program_status_real_launch_and_fallback(
             await wait_status("idle")  # Falls back to the still-unchanged status file.
             await instance.send(keys="w")
             await wait_status("running")
+        # An error report publishes nothing; the StopFailure hook owns the failed edge.
+        await instance.send(keys="e")
+        async with asyncio.timeout(5):
+            while reader.status is None or reader.status.state != "error":
+                await asyncio.sleep(0.02)
+        await asyncio.sleep(0.3)  # Longer than a poll, so a published failure would show here.
+        assert statuses[-1] == ("running", None)
         reader.path.unlink()
         reader.path.mkdir()  # Make snapshot replacement fail while the command keeps running.
         await instance.send(keys="b")

@@ -38,6 +38,7 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
 )
+from omnigent.util.event_loop_watchdog import monitor_event_loop
 from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
@@ -684,6 +685,23 @@ def _make_auth_token_factory(
         RUNNER_TUNNEL_BINDING_TOKEN_ENV_VAR,
     )
 
+    # Behind the Databricks Apps proxy (header auth) the server cannot mint a
+    # runner token and the proxy admits only the owner's own Databricks token,
+    # so that launcher-refreshed bearer is the runner's credential, for its server only.
+    from omnigent.util.proxy_bearer import (
+        proxy_bearer_allowed_for,
+        proxy_bearer_configured,
+        read_proxy_bearer,
+    )
+
+    if (
+        proxy_bearer_configured()
+        and resolved_server_url
+        and proxy_bearer_allowed_for(resolved_server_url)
+    ):
+        os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, None)
+        return lambda: read_proxy_bearer(resolved_server_url)
+
     initial_token = (
         os.environ.pop(RUNNER_INITIAL_AUTH_TOKEN_ENV_VAR, "").strip()
         if _allow_initial_token
@@ -1299,9 +1317,86 @@ _SPEC_FETCH_429_RETRY_DELAYS_S = (0.5, 1.0, 2.0)
 _SPEC_FETCH_MAX_RETRY_AFTER_S = 2.0
 
 
+class _AgentSpecCache:
+    """Serialize worker-owned bundle loading and shutdown for one runner."""
+
+    def __init__(self, root: Path) -> None:
+        self.root = root
+        self._admission = asyncio.Lock()
+        self._lock = threading.Lock()
+        self._closed = False
+
+    async def resolve(
+        self, response: httpx.Response, agent_id: str, session_id: str
+    ) -> ResolvedSpec:
+        """Queue before occupying a worker, and retain admission through cancellation."""
+        await self._admission.acquire()
+        worker = asyncio.create_task(asyncio.to_thread(self._load, response, agent_id, session_id))
+        worker.add_done_callback(self._load_finished)
+        return await asyncio.shield(worker)
+
+    def _load_finished(self, worker: asyncio.Task[ResolvedSpec]) -> None:
+        self._admission.release()
+        if not worker.cancelled():
+            worker.exception()
+
+    def _load(self, response: httpx.Response, agent_id: str, session_id: str) -> ResolvedSpec:
+        """Keep cache mutation owned until the worker ends, even after cancellation."""
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("spec_resolver: agent bundle cache is closed")
+            return _load_agent_spec_bundle(self.root, response, agent_id, session_id)
+
+    def close(self) -> None:
+        """Retire the cache before deleting it so queued workers cannot recreate it."""
+        with self._lock:
+            self._closed = True
+            shutil.rmtree(self.root, ignore_errors=True)
+
+
+def _load_agent_spec_bundle(
+    spec_cache_root: Path, resp: httpx.Response, agent_id: str, session_id: str
+) -> ResolvedSpec:
+    """Hash, load and publish a validated bundle while its cache lock is held."""
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
+    from omnigent.runner.native import ResolvedSpec
+    from omnigent.spec import load
+
+    # Only operator-authored bundles may expand the runner's environment.
+    # Missing or unknown provenance stays tenant-scoped.
+    session_scoped_header = resp.headers.get("X-Agent-Session-Scoped", "true").strip().lower()
+    expand_env = session_scoped_header == "false"
+    # The digest keeps a reused agent/version id off a previous bundle's directory.
+    version = resp.headers.get("X-Agent-Version", "0")
+    digest = hashlib.sha256(resp.content).hexdigest()[:16]
+    dest = _agent_cache_dest(spec_cache_root, agent_id, f"{version}-{digest}")
+    # An older runner may not support sub-agents validated by a newer server.
+    try:
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    except Exception:  # noqa: BLE001 — the downloaded bundle must validate before replacement
+        # Cached files can be missing, truncated, or malformed. Validate the
+        # downloaded bundle privately before replacing any cached files.
+        spec_cache_root.mkdir(parents=True, exist_ok=True)
+        with TemporaryDirectory(prefix=".spec-", dir=spec_cache_root) as staging_dir:
+            staging = Path(staging_dir)
+            load(resp.content, dest=staging, expand_env=expand_env, prune_invalid_sub_agents=True)
+            if dest.exists():
+                shutil.rmtree(dest)
+                _logger.warning(
+                    "Rebuilding incomplete agent bundle cache for %s",
+                    agent_id,
+                    extra={"session_id": session_id},
+                )
+            staging.rename(dest)
+        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
+    spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
+    _apply_host_interactive_shells(spec)
+    return ResolvedSpec(spec=spec, workdir=dest)
+
+
 async def _resolve_agent_spec_from_server(
     server_client: httpx.AsyncClient,
-    spec_cache_root: Path,
+    spec_cache: _AgentSpecCache,
     agent_id: str,
     session_id: str | None = None,
 ) -> ResolvedSpec | None:
@@ -1310,8 +1405,7 @@ async def _resolve_agent_spec_from_server(
 
     :param server_client: HTTP client pointed at the Omnigent server,
         e.g. base URL ``"http://127.0.0.1:6767"``.
-    :param spec_cache_root: Stable runner-local cache root for
-        extracted agent bundles.
+    :param spec_cache: Runner-owned bundle cache with serialized worker access.
     :param agent_id: Opaque agent identifier to fetch, e.g.
         ``"ag_abc123"``.
     :param session_id: Session identifier used to fetch the bundle
@@ -1324,10 +1418,8 @@ async def _resolve_agent_spec_from_server(
     :raises RuntimeError: If the server returns a non-200 status
         other than 404, including a 429 that outlasts the retries.
     """
-    from omnigent.mcp_selection import MCP_SELECTION_HEADER, selected_mcp_spec
+    from omnigent.mcp_selection import MCP_SELECTION_HEADER
     from omnigent.native.native_terminal import request_with_429_retry
-    from omnigent.runner.native import ResolvedSpec
-    from omnigent.spec import load
 
     if session_id is None:
         _logger.warning(
@@ -1353,49 +1445,7 @@ async def _resolve_agent_spec_from_server(
         return None
     if resp.status_code != 200:
         raise RuntimeError(f"spec_resolver: GET {path} failed with HTTP {resp.status_code}")
-    # Env-expansion decision: the MCP/LLM
-    # connection actually opens here on the runner, so the runner —
-    # not just the server — must refuse to expand ${VAR} against its
-    # process env for tenant-supplied (session-scoped) bundles. The
-    # server reports provenance via X-Agent-Session-Scoped. Fail safe:
-    # a missing/unknown header is treated as session-scoped (no
-    # expansion). Only operator-authored template agents expand.
-    session_scoped_header = resp.headers.get("X-Agent-Session-Scoped", "true").strip().lower()
-    expand_env = session_scoped_header == "false"
-    # Cache key: agent id + version header + content digest. Re-extracting
-    # on every dispatch would be wasteful; the digest keeps an agent removed
-    # and added again (its version restarts at 1) off the old bundle's directory.
-    version = resp.headers.get("X-Agent-Version", "0")
-    digest = hashlib.sha256(resp.content).hexdigest()[:16]
-    dest = _agent_cache_dest(spec_cache_root, agent_id, f"{version}-{digest}")
-    # prune_invalid_sub_agents: the server already validated this bundle
-    # before serving it, so a sub-agent that fails validation *here* means
-    # this runner is older than that server and can't run that sub-agent
-    # (e.g. it names a harness this version doesn't know). Drop the
-    # unsupported sub-agent and launch the parent with what this runner
-    # *does* support, rather than failing every dispatch of the agent.
-    # See omnigent.spec.load.
-    try:
-        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    except FileNotFoundError:
-        # Temp cleanup can leave a version directory without its bundle.
-        # Validate privately before replacing an incomplete cache entry.
-        spec_cache_root.mkdir(parents=True, exist_ok=True)
-        with TemporaryDirectory(prefix=".spec-", dir=spec_cache_root) as staging_dir:
-            staging = Path(staging_dir)
-            load(resp.content, dest=staging, expand_env=expand_env, prune_invalid_sub_agents=True)
-            if dest.exists():
-                shutil.rmtree(dest)
-                _logger.warning(
-                    "Rebuilding incomplete agent bundle cache for %s",
-                    agent_id,
-                    extra={"session_id": session_id},
-                )
-            staging.rename(dest)
-        spec = load(dest, expand_env=expand_env, prune_invalid_sub_agents=True)
-    spec = selected_mcp_spec(spec, json.loads(resp.headers.get(MCP_SELECTION_HEADER, "{}")))
-    _apply_host_interactive_shells(spec)
-    return ResolvedSpec(spec=spec, workdir=dest)
+    return await spec_cache.resolve(resp, agent_id, session_id)
 
 
 def create_app(
@@ -1505,7 +1555,7 @@ def create_app(
     # references.
     import tempfile
 
-    _spec_cache_root = Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-"))
+    _spec_cache = _AgentSpecCache(Path(tempfile.mkdtemp(prefix=f"runner-specs-{_runner_id}-")))
 
     async def spec_resolver(agent_id: str, session_id: str | None = None) -> ResolvedSpec | None:
         """
@@ -1530,7 +1580,7 @@ def create_app(
         """
         return await _resolve_agent_spec_from_server(
             server_client,
-            _spec_cache_root,
+            _spec_cache,
             agent_id,
             session_id=session_id,
         )
@@ -1560,7 +1610,7 @@ def create_app(
                     "Reaped %d orphaned native bridge dir(s) from prior runs",
                     _reaped_bridge_dirs,
                 )
-        except Exception:  # noqa: BLE001 — housekeeping must never block startup
+        except Exception:  # housekeeping must never block startup
             _logger.debug("native bridge-dir orphan sweep failed", exc_info=True)
 
     # Reuse the tunnel binding token for runner-side request auth.
@@ -1660,19 +1710,16 @@ def create_app(
         if mcp_manager is not None:
             await mcp_manager.shutdown()
         await server_client.aclose()
-        # Best-effort cleanup of extracted spec bundles. Missing
-        # / already-gone is fine; ignore_errors handles a partial
-        # write that leaves a directory in an unreadable state.
-        import shutil
-
-        shutil.rmtree(_spec_cache_root, ignore_errors=True)
+        # A cancelled resolver can still own a worker; retire and clean under its lock.
+        await asyncio.to_thread(_spec_cache.close)
 
     # starlette 1.x removed add_event_handler; drive startup/shutdown via lifespan.
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         await _start_pm()
         try:
-            yield
+            with monitor_event_loop(process_role="runner"):
+                yield
         finally:
             await _stop_pm()
 
@@ -1759,7 +1806,7 @@ async def _run_tunnel_from_env() -> None:
         from omnigent.runtime import telemetry
 
         telemetry.init("omni-runner")
-    except Exception:  # noqa: BLE001 — best-effort; tracing failure must not crash the runner
+    except Exception:  # best-effort; tracing failure must not crash the runner
         _logger.debug(
             "telemetry init failed in runner",
             exc_info=True,
@@ -1880,7 +1927,7 @@ async def _run_tunnel_from_env() -> None:
                         allowed_origins=frozenset({allowed_origin}),
                     )
                 )
-        except Exception:  # noqa: BLE001 — optimization only; never block the tunnel
+        except Exception:  # optimization only; never block the tunnel
             _logger.warning(
                 "direct-attach listener setup failed",
                 exc_info=True,

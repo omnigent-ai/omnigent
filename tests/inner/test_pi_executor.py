@@ -10,8 +10,9 @@ import shutil
 import socket
 import tempfile
 import textwrap
+import threading
 import unittest
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -46,7 +47,8 @@ from omnigent.inner.pi_executor import (
     _ToolServer,
 )
 from omnigent.models.model_catalog import ModelEntry
-from omnigent.models.model_metadata import ModelMetadata, ModelWireAPI
+from omnigent.models.model_metadata import ModelCapability, ModelMetadata, ModelWireAPI
+from omnigent.onboarding.providers import ModelInfo
 from omnigent.runtime.harnesses._scaffold import PolicyVerdictPayload
 
 
@@ -1008,7 +1010,7 @@ class TestToolServer(unittest.TestCase):
             )
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 proc.kill()
                 stdout, stderr = await proc.communicate()
                 stderr_text = stderr.decode("utf-8", errors="replace")
@@ -1130,7 +1132,7 @@ class TestToolServer(unittest.TestCase):
             async def executor(name, args):
                 # A dict carrying values json.dumps rejects by default.
                 return {
-                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
                     "tags": {1, 2, 3},
                 }
 
@@ -1166,7 +1168,7 @@ class TestToolServer(unittest.TestCase):
         still yield a valid frame rather than re-raising the very crash the
         guard exists to prevent. The id is stringified in that envelope.
         """
-        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc)
+        bad_id = datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC)
         out = _safe_dumps({"id": bad_id, "result": {"k": "v"}}, bad_id)  # type: ignore[arg-type]
         payload = json.loads(out)
         self.assertEqual(payload["id"], str(bad_id))
@@ -1189,7 +1191,7 @@ class TestToolServer(unittest.TestCase):
             async def executor(name, args, *, call_id=None):
                 self.assertEqual(call_id, "call-1")
                 return {
-                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=timezone.utc),
+                    "when": datetime(2026, 6, 18, 12, 0, 0, tzinfo=UTC),
                     "tags": {1, 2, 3},
                 }
 
@@ -4129,6 +4131,19 @@ def test_profile_gateway_default_does_not_clobber_explicit_model() -> None:
 
 def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
     """Pi reuses UC availability and enriches aliases with MLflow limits."""
+    lookup_threads = []
+    vendor_model = ModelInfo(
+        name="gpt-next",
+        provider="openai",
+        supports_reasoning=True,
+        max_input_tokens=400_000,
+        max_output_tokens=128_000,
+    )
+
+    def vendor_models(provider):
+        lookup_threads.append(threading.get_ident())
+        return [vendor_model] if provider == "openai" else []
+
     responses = frozenset({ModelWireAPI.OPENAI_RESPONSES})
     entries = (
         ModelEntry(
@@ -4149,27 +4164,24 @@ def test_gateway_wire_catalog_fetches_once_and_indexes_aliases() -> None:
         ) as fetch,
         patch(
             "omnigent.models.model_catalog.catalog_model_entries",
-            return_value=(
-                ModelEntry(
-                    id="databricks-gpt-next",
-                    family="openai",
-                    metadata=ModelMetadata(
-                        context_window=400_000,
-                        max_output_tokens=128_000,
-                    ),
-                ),
-            ),
+            return_value=(),
         ) as enrich,
+        patch(
+            "omnigent.onboarding.providers.get_models",
+            side_effect=vendor_models,
+        ),
     ):
         executor = PiExecutor(gateway=True)
         first = _run(executor._load_gateway_model_wire_apis())
         second = _run(executor._load_gateway_model_wire_apis())
 
+    assert lookup_threads and threading.get_ident() not in lookup_threads
     assert first["databricks-gpt-next"] == responses
     assert second is first
     assert executor._gateway_model_entries is not None
     assert executor._gateway_model_entries[0].metadata.context_window == 400_000
     assert executor._gateway_model_entries[0].metadata.max_output_tokens == 128_000
+    assert executor._gateway_model_entries[0].metadata.supports(ModelCapability.REASONING) is True
     fetch.assert_called_once_with("https://h.example.com", "tok")
     enrich.assert_called_once_with("databricks")
 
@@ -4194,7 +4206,8 @@ def test_gateway_wire_catalog_failure_is_cached() -> None:
     fetch.assert_called_once_with("https://h.example.com", "tok")
 
 
-def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> None:
+@pytest.mark.parametrize("failure_stage", ["catalog", "vendor_fallback"])
+def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails(failure_stage) -> None:
     """MLflow downtime does not erase workspace-discovered picker models."""
     entries = (
         ModelEntry(
@@ -4215,14 +4228,23 @@ def test_gateway_catalog_keeps_live_models_when_mlflow_enrichment_fails() -> Non
         ),
         patch(
             "omnigent.models.model_catalog.catalog_model_entries",
-            side_effect=OSError("offline"),
+            return_value=(),
+            side_effect=OSError("offline") if failure_stage == "catalog" else None,
         ),
+        patch(
+            "omnigent.onboarding.providers.find_catalog_models",
+            side_effect=AttributeError("malformed catalog capabilities"),
+        ) as lookup,
     ):
         executor = PiExecutor(gateway=True)
         wire_catalog = _run(executor._load_gateway_model_wire_apis())
+        assert _run(executor._load_gateway_model_wire_apis()) is wire_catalog
 
     assert wire_catalog["system.ai.gpt-live"] == frozenset({ModelWireAPI.OPENAI_RESPONSES})
     assert executor._gateway_model_entries == entries
+
+    if failure_stage == "vendor_fallback":
+        lookup.assert_called_once_with("system.ai.gpt-live")
 
 
 def test_dedicated_gateway_fetches_wire_catalog_from_workspace_host() -> None:
@@ -5561,6 +5583,54 @@ def test_pi_turn_without_usage_leaves_usage_none() -> None:
     _run(_test())
 
 
+@pytest.mark.parametrize(
+    "method, handler_mode, expected",
+    [
+        ("confirm", "accept", {"confirmed": True}),
+        ("select", "accept", {"value": "Allow"}),
+        ("notify", "missing", None),
+        ("confirm", "missing", {"confirmed": False}),
+        ("confirm", "timeout", {"confirmed": False}),
+    ],
+)
+def test_pi_extension_ui_rpc_round_trip(method: str, handler_mode: str, expected: dict | None):
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
+
+    executor, rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(
+                type="extension_ui_request",
+                id="dialog",
+                method=method,
+                title="Continue?",
+                options=["Allow", "Block"],
+                timeout=20,
+            ),
+            _rpc_frame(type="agent_end", messages=[]),
+            _rpc_frame(type="agent_settled"),
+        ]
+    )
+
+    async def answer(elicitation_id: str, params: ElicitationRequestParams) -> ElicitationResult:
+        assert elicitation_id == "elicit_pi_dialog"
+        assert params.mode == "form" and params.message == "Continue?"
+        if handler_mode == "timeout":
+            await asyncio.sleep(1)
+        return ElicitationResult(action="accept", content={"0": "Allow"})
+
+    if handler_mode != "missing":
+        executor._form_elicitation_handler = answer
+    events = _run(_run_session_turn(executor, "hello"))
+    assert any(isinstance(event, TurnComplete) for event in events)
+    assert rpc.process is not None and isinstance(rpc.process.stdin, _FakeStreamWriter)
+    commands = [json.loads(line) for line in b"".join(rpc.process.stdin.data).splitlines()]
+    responses = [cmd for cmd in commands if cmd.get("type") == "extension_ui_response"]
+    assert responses == (
+        [] if expected is None else [{"type": "extension_ui_response", "id": "dialog", **expected}]
+    )
+
+
 # ---------------------------------------------------------------------------
 # Reasoning effort → pi thinking level
 # ---------------------------------------------------------------------------
@@ -5910,6 +5980,30 @@ def _assert_session_evicted(executor: PiExecutor, rpc: _PiRpcSession) -> None:
     assert _SESSION_KEY not in executor._session_states, "the RPC session was kept"
     # ``_PiRpcSession.close`` terminates the process and then clears it.
     assert rpc.process is None, "the pi process was not closed"
+
+
+def test_extension_answer_write_failure_evicts_waiting_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    executor, rpc = _session_executor(
+        [
+            _rpc_frame(type="response", success=True),
+            _rpc_frame(
+                type="extension_ui_request", id="dialog", method="confirm", title="Continue?"
+            ),
+        ]
+    )
+    send = rpc.send_command
+
+    async def fail_answer(command: dict) -> None:
+        if command.get("type") == "extension_ui_response":
+            raise BrokenPipeError("test dialog response write failed")
+        await send(command)
+
+    monkeypatch.setattr(rpc, "send_command", fail_answer)
+    events = _run(_run_session_turn(executor, "hello"))
+    assert any(isinstance(event, ExecutorError) for event in events)
+    _assert_session_evicted(executor, rpc)
 
 
 def _retry_recovery_frames(recovered: str) -> list[str]:

@@ -6,11 +6,11 @@ import copy
 import fnmatch
 import json
 import re
+import tomllib
 from datetime import UTC, datetime, timedelta
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-import tomllib
 import yaml
 from maintainer_approval import gh_json, paginated
 

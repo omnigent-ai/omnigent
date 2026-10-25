@@ -500,6 +500,44 @@ async def test_events_compact_on_native_session_types_slash_command(
 
 
 @pytest.mark.asyncio
+async def test_events_clear_on_claude_native_types_clear_into_the_tui(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"clear"}`` on a claude-native session types
+    Claude Code's own ``/clear`` into the pane and returns 200.
+
+    Claude Code's /clear hook rotates the terminal onto a fresh Omnigent
+    session, so the web /clear must run inside Claude Code.
+    """
+    captured: list[str] = []
+
+    def _fake_inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        """Record the typed command without touching tmux."""
+        captured.append(command)
+
+    monkeypatch.setattr(claude_native_bridge, "inject_slash_command", _fake_inject)
+    app, _ = await _build_app_for_spec(_harness_spec("claude-native"))
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={
+                "session_id": "0d1c2b3a4f5e6d7c8b9a0f1e2d3c4b5a",
+                "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb",
+            },
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(
+            "/v1/sessions/0d1c2b3a4f5e6d7c8b9a0f1e2d3c4b5a/events",
+            json={"type": "clear"},
+        )
+
+    assert resp.status_code == 200, resp.text
+    assert captured == ["/clear"]
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("error_type", [RuntimeError, OSError])
 async def test_events_compact_on_native_session_returns_503_when_bridge_not_ready(
     monkeypatch: pytest.MonkeyPatch,
@@ -668,6 +706,54 @@ async def test_events_compact_on_codex_native_types_settles_then_submits(
     )
     # /compact is a control signal, not a state change.
     assert queued_events == [], f"compact must not publish session events; got {queued_events!r}."
+
+
+@pytest.mark.asyncio
+async def test_events_clear_on_codex_native_types_clear_into_the_tui(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    POST ``/events`` with ``{"type":"clear"}`` on a codex-native session types
+    Codex's own ``/clear`` into its tmux pane and returns 200.
+
+    Codex's /clear starts a fresh thread in the same terminal; the forwarder
+    then rotates the Omnigent session, so the web /clear must run inside Codex.
+    """
+    from tests.runner.helpers import make_test_terminal_instance
+
+    tmux_calls: list[tuple[str, list[str]]] = []
+
+    def _fake_run_tmux(socket_path: str, *args: str) -> None:
+        """Record tmux send-keys calls without touching tmux."""
+        tmux_calls.append((socket_path, list(args)))
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", _fake_run_tmux)
+    monkeypatch.setattr(native_controls, "_CODEX_POPUP_RENDER_S", 0)
+
+    conv_id = "5b6a0c3d0f1e4a7b8c9d0e1f2a3b4c5d"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("codex", "main", tmp_path)
+    terminal_registry._by_conversation.setdefault(conv_id, {})[("codex", "main")] = instance
+    app, _ = await _build_app_for_spec(
+        _harness_spec("codex-native"), terminal_registry=terminal_registry
+    )
+
+    async with _runner_client(app) as client:
+        create_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        resp = await client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+
+    assert resp.status_code == 200, resp.text
+    socket = str(instance.socket_path)
+    assert tmux_calls == [
+        (socket, ["send-keys", "-t", "main", "C-u"]),
+        (socket, ["send-keys", "-l", "-t", "main", "/clear"]),
+        (socket, ["send-keys", "-t", "main", "Enter"]),
+    ]
 
 
 @pytest.mark.asyncio
@@ -1615,6 +1701,55 @@ async def test_events_compact_on_opencode_native_503_when_summarize_raises(
 
 
 @pytest.mark.asyncio
+async def test_events_clear_on_opencode_native_waits_for_an_idle_reap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``/clear`` relaunches OpenCode only after a reap holding the terminal lock finishes.
+
+    The relaunch reuses the session's tool relay before it registers the new pane;
+    interleaved with a reap, the reap would close the relay the new pane uses.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = f"conv_{uuid.uuid4().hex[:12]}"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    terminal_registry._by_conversation[conv_id] = {("opencode", "main"): instance}
+    relaunches: list[str] = []
+
+    async def _record_relaunch(session_id: str, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        relaunches.append(session_id)
+
+    monkeypatch.setattr(native_controls, "_auto_create_opencode_terminal", _record_relaunch)
+    app, _pm = await _build_app_for_spec(
+        _harness_spec("opencode-native"), terminal_registry=terminal_registry
+    )
+    async with _runner_client(app) as http_client:
+        create_resp = await http_client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        lock = app.state.native_terminal_ensure_locks["opencode"].setdefault(
+            conv_id, asyncio.Lock()
+        )
+        async with lock:
+            clear = asyncio.create_task(
+                http_client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+            )
+            await asyncio.sleep(0.2)
+            assert not relaunches, "/clear relaunched OpenCode while the lock was held"
+        resp = await clear
+        assert resp.status_code == 200, resp.text
+        assert relaunches == [conv_id]
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2451,7 +2586,102 @@ async def test_events_model_change_reports_a_tmux_failure_as_503(
 
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"] == "claude_native_model_failed"
+    # No person can act on this, so the reply names the log, not the raw text.
+    detail = resp.json()["detail"]
+    assert detail.startswith("Request failed on the runner; see the runner log for details:")
+    assert "command not found" not in detail
     assert typed == ([] if stage == "wait" else ["/model claude-opus-4-7"])
+
+
+_PASSWORD_PANE_TAIL = (
+    " Last terminal output:\n"
+    "✔ Unity Gateway connected\n"
+    "• Enter password to configure settings for Claude Code.\n"
+    "Password:"
+)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stage", "error", "expected_detail"),
+    [
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudePromptTimeout(
+                "Claude Code terminal did not become ready within 9.0s. "
+                "The message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's input box never appeared. It may still be starting, or waiting "
+            "on a prompt such as a password. Check the terminal, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            id="launcher-password-prompt",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeSignInPending(
+                "Claude Code is waiting for a sign-in in this session's terminal.",
+                title="Claude Code can't start until you sign in to Databricks",
+                remediation="Open the sign-in link and sign in.",
+            ),
+            "Claude Code can't start until you sign in to Databricks. "
+            "Finish the sign-in in the terminal, then switch models again.",
+            id="sign-in",
+        ),
+        pytest.param(
+            "inject",
+            claude_native_bridge.ClaudeUserPromptPending(
+                "Answer the pending Claude question or permission request before "
+                "changing settings."
+            ),
+            "Claude is waiting for an answer to a question or prompt. "
+            "Answer it, then switch models again.",
+            id="permission-prompt",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeTerminalDialog(
+                "Claude Code is waiting for an answer in its terminal (Trust this folder?), "
+                "so the message was not delivered." + _PASSWORD_PANE_TAIL
+            ),
+            "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+            "answer or dismiss it, then switch models again." + _PASSWORD_PANE_TAIL,
+            id="dialog",
+        ),
+        pytest.param(
+            "wait",
+            claude_native_bridge.ClaudeTerminalExited(
+                "The Claude Code terminal has exited (status 1)." + _PASSWORD_PANE_TAIL,
+                exit_status="1",
+            ),
+            "The Claude Code terminal has exited. Relaunch it, then switch models again."
+            + _PASSWORD_PANE_TAIL,
+            id="exited",
+        ),
+    ],
+)
+async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error: Exception,
+    expected_detail: str,
+) -> None:
+    """A switch refused by a terminal awaiting the person names what to do, not the log path."""
+
+    def _wait(bridge_dir: Any, *, ready_timeout_s: float, timeout_s: float = 1.0) -> None:
+        del bridge_dir, ready_timeout_s, timeout_s
+        if stage == "wait":
+            raise error
+
+    def _inject(bridge_dir: Any, *, command: str, **_kwargs: Any) -> None:
+        del bridge_dir, command
+        raise error
+
+    resp = await _post_model_change_through_a_boot(
+        monkeypatch, wait=_wait, inject=_inject, status=lambda _bridge_dir: None
+    )
+
+    assert resp.status_code == 503, resp.text
+    assert resp.json() == {"error": "claude_native_model_failed", "detail": expected_detail}
 
 
 @pytest.mark.asyncio

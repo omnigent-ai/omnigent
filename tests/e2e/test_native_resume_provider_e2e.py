@@ -32,10 +32,9 @@ from omnigent.harnesses.claude_native.main import _materialize_claude_agent_spec
 from omnigent.harnesses.pi_native.main import _materialize_pi_agent_spec
 from tests._helpers.live_server import terminate_process
 from tests._helpers.server_runner import server_runner
-from tests._helpers.session import bundle_files, post_session_bundle
+from tests._helpers.session import bundle_files, post_session_bundle, send_user_text
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests, set_fallback_mock_llm
-from tests.e2e.test_host_codex_native_e2e import _send_user_text
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
 _MODEL = "claude-sonnet-4-5"
@@ -241,7 +240,7 @@ def test_connected_native_resume_routes_to_configured_provider(
                 return captured if any(captured.values()) else None
 
             if terminal is None:
-                _send_user_text(client, session_id=session_id, text=prompt)
+                send_user_text(client, session_id=session_id, text=prompt)
             else:
                 tmux = [
                     "tmux",

@@ -11,6 +11,7 @@ Usage in a policy callable::
 
     from omnigent.policies.schema import PolicyEvent, PolicyResponse
 
+
     def my_policy(event: PolicyEvent) -> PolicyResponse | None:
         if event["type"] != "tool_call":
             return None  # abstain
@@ -28,8 +29,8 @@ Two-argument form (with config)::
 Factory form (with ``factory_params``)::
 
     def create_policy(limit: int = 10) -> PolicyCallable:
-        def evaluate(event: PolicyEvent) -> PolicyResponse | None:
-            ...
+        def evaluate(event: PolicyEvent) -> PolicyResponse | None: ...
+
         return evaluate
 """
 
