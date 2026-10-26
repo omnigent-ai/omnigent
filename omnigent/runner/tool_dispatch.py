@@ -3228,6 +3228,16 @@ async def _send_to_existing_session(
         or "agent"
     )
     instance_title = parsed.title if parsed.title is not None else (display_title or "")
+    if snap_data.get("host_id"):
+        return await _post_remote_child_dispatch(
+            target_session_id,
+            message,
+            server_client,
+            parent_id=conversation_id,
+            agent=agent_label,
+            title=instance_title,
+            wrapper_label=_session_wrapper_label(snap_data),
+        )
     existing_work = _subagent_work.get_subagent_work(target_session_id)
     if existing_work is not None and existing_work.status == "launching":
         # No active turn to inject into yet; a send now could race a parallel
@@ -3324,6 +3334,8 @@ def _build_session_create_body(
     message: object,
     model: object = None,
     reasoning_effort: object = None,
+    host_id: object = None,
+    workspace: object = None,
 ) -> _JsonObject:
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
@@ -3351,12 +3363,16 @@ def _build_session_create_body(
         written as ``model_override`` on the session.
     :param reasoning_effort: Optional reasoning level, e.g. ``"high"``;
         written as ``reasoning_effort`` on the session.
+    :param host_id: Optional registered execution host, validated by the server.
+    :param workspace: Absolute working directory on that host, not the caller's machine.
     :returns: The JSON request body.
     """
     body: _JsonObject = {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
     }
+    if isinstance(host_id, str) and isinstance(workspace, str):
+        body.update(host_id=host_id, workspace=workspace)
     if isinstance(title, str) and title:
         body["title"] = title
     if isinstance(model, str) and model:
@@ -3458,8 +3474,8 @@ async def _execute_session_create(
       ``POST /v1/sessions`` create.
 
     Both modes force ``parent_session_id`` to the caller (child-only).
-    The child inherits the caller's runner (server-side affinity), so a
-    queued initial message starts a turn immediately. Returns a handle
+    The child inherits the caller's runner unless an explicit registered
+    ``host_id`` and remote ``workspace`` select its own runner. Returns a handle
     the orchestrator can monitor (``sys_session_get_history`` /
     ``sys_session_get_info``) or drive (``sys_session_send`` by
     ``conversation_id``) — unlike named-mode send, it does NOT block on
@@ -3501,6 +3517,21 @@ async def _execute_session_create(
                 )
             }
         )
+    host_id, workspace = args.get("host_id"), args.get("workspace")
+    if host_id is not None or workspace is not None:
+        if not (
+            isinstance(host_id, str)
+            and host_id.strip()
+            and isinstance(workspace, str)
+            and workspace.strip()
+        ):
+            return json.dumps(
+                {
+                    "error": (
+                        "sys_session_create requires non-empty 'host_id' and 'workspace' together"
+                    )
+                }
+            )
     if has_config_path:
         # The multipart create carries only the config bundle, so an effort
         # passed here would never reach the child. Refuse instead of dropping it.
@@ -3514,6 +3545,21 @@ async def _execute_session_create(
                     )
                 }
             )
+    if host_id is not None:
+        try:
+            capability = await server_client.get("/v1/session-create-capabilities", timeout=10.0)
+            flags = capability.json() if capability.status_code == 200 else None
+            supported = (
+                isinstance(flags, dict)
+                and flags.get("registered_host_children") is True
+                and flags.get("caller_supplied_child_id") is True
+            )
+        except (httpx.HTTPError, ValueError):
+            supported = False
+        if not supported:
+            return json.dumps({"error": "remote_child_placement_unsupported"})
+        args = {**args, "_child_session_id": uuid.uuid4().hex}
+    if has_config_path:
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -3527,31 +3573,101 @@ async def _execute_session_create(
         str(agent_id),
         conversation_id,
         args.get("title"),
-        args.get("message"),
+        # A host launch binds its runner after creation. Seeded history alone
+        # does not execute a turn there; post the message after the launch.
+        args.get("message") if host_id is None else None,
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
+        host_id=host_id,
+        workspace=workspace,
     )
+    if host_id is not None:
+        body["child_session_id"] = args["_child_session_id"]
     try:
         resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
+        if host_id is not None:
+            return _unknown_remote_create(args["_child_session_id"], str(exc))
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
-    if resp.status_code == 404:
+    if resp.status_code == 404 and host_id is None:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "agent_id": agent_id})
     if resp.status_code >= 400:
+        if host_id is not None and resp.status_code >= 500:
+            return _unknown_remote_create(args["_child_session_id"], resp.text[:200])
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
         )
-    data = resp.json()
+    data = _read_session_create_response(
+        resp, reserved_child_id=args.get("_child_session_id") if host_id is not None else None
+    )
+    if isinstance(data, str):
+        return data
     if not isinstance(data.get("id"), str) or not data["id"]:
+        if host_id is not None:
+            return _unknown_remote_create(
+                args["_child_session_id"], "server did not return a child session id"
+            )
         return json.dumps({"error": "server did not return a child session id"})
+    if host_id is not None and data["id"] != args["_child_session_id"]:
+        return _unknown_remote_create(
+            args["_child_session_id"],
+            "server returned a different child ID",
+            actual_child_id=data["id"],
+        )
+    message = args.get("message")
+    if host_id is not None and isinstance(message, str) and message:
+        result = await _post_remote_child_dispatch(
+            data["id"],
+            message,
+            server_client,
+            parent_id=conversation_id,
+            agent=str(data.get("agent_name") or "agent"),
+            title=str(args.get("title") or ""),
+        )
+        if "error" in json.loads(result):
+            return result
     return _finalize_created_session(
         data,
         conversation_id=conversation_id,
         agent_id=str(agent_id),
         title=args.get("title"),
         publish_event=publish_event,
+    )
+
+
+def _read_session_create_response(
+    response: httpx.Response, *, reserved_child_id: object | None
+) -> _JsonObject | str:
+    """Preserve a reserved identity when a successful create reply is unreadable."""
+    try:
+        data = response.json()
+    except ValueError:
+        data = None
+    if isinstance(data, dict):
+        return data
+    detail = "server did not return a session response object"
+    if reserved_child_id is not None:
+        return _unknown_remote_create(reserved_child_id, detail)
+    return json.dumps({"error": detail})
+
+
+def _unknown_remote_create(
+    child_id: object, detail: str, *, actual_child_id: str | None = None
+) -> str:
+    """Keep an addressable identity when creation may already have committed."""
+    return json.dumps(
+        {
+            "error": "create_outcome_unknown",
+            "conversation_id": child_id,
+            **({"server_returned_child_id": actual_child_id} if actual_child_id else {}),
+            "detail": detail,
+            "message": (
+                "Inspect this child ID before continuing; do not create a replacement "
+                "or replay the first message blindly."
+            ),
+        }
     )
 
 
@@ -3602,7 +3718,7 @@ async def _post_child_first_message(
     server_client: httpx.AsyncClient,
 ) -> str | None:
     """
-    Queue a bundle-created child's first user message.
+    Queue a newly created child's first user message after its host launch.
 
     Posted as a separate event so the server's post_event forwards it
     to the runner and starts the child turn (same pattern as
@@ -3646,6 +3762,78 @@ async def _post_child_first_message(
             }
         )
     return None
+
+
+async def _post_remote_child_dispatch(
+    child_id: str,
+    message: str,
+    client: httpx.AsyncClient,
+    *,
+    parent_id: str,
+    agent: str,
+    title: str,
+    wrapper_label: str | None = None,
+) -> str:
+    """Track a remote turn through durable receipts instead of a local inbox edge."""
+    from omnigent.runner import subagent_work
+
+    dispatch_id = subagent_work.new_subagent_work_id()
+    error: str | None = None
+    try:
+        response = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={
+                "type": "message",
+                "data": {
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": message}],
+                    "remote_dispatch_id": dispatch_id,
+                },
+            },
+            timeout=_ASK_GATE_DELIVERY_TIMEOUT,
+        )
+        if response.status_code >= 500:
+            error = (
+                f"remote message outcome unknown: {response.status_code}; "
+                "inspect this child before retrying"
+            )
+        elif response.status_code >= 400:
+            return json.dumps(
+                {
+                    "error": f"remote message failed: {response.status_code}",
+                    "conversation_id": child_id,
+                }
+            )
+    except httpx.HTTPError as exc:
+        error = f"remote message outcome unknown: {exc}; inspect this child before retrying"
+    subagent_work.register_child_session(
+        child_id,
+        parent_session_id=parent_id,
+        title=title,
+        tool=agent,
+        session_name=title,
+    )
+    entry = subagent_work.register_subagent_work(
+        parent_session_id=parent_id,
+        child_session_id=child_id,
+        agent=agent,
+        title=title,
+        wrapper_label=wrapper_label,
+        work_id=dispatch_id,
+    )
+    entry.status = "waiting"
+    entry.remote = True
+    handle = {
+        "conversation_id": child_id,
+        "task_id": child_id,
+        "kind": "sub_agent",
+        "status": "waiting",
+        "agent": agent,
+        "title": title,
+    }
+    if error is not None:
+        handle["error"] = error
+    return json.dumps(handle)
 
 
 async def _upload_config_bundle(
@@ -3693,6 +3881,9 @@ async def _upload_config_bundle(
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
     metadata: _JsonObject = {"parent_session_id": conversation_id}
+    if args.get("host_id") is not None:
+        metadata.update(host_id=args["host_id"], workspace=args["workspace"])
+        metadata["child_session_id"] = args["_child_session_id"]
     title = args.get("title")
     if isinstance(title, str) and title:
         metadata["title"] = title
@@ -3704,15 +3895,23 @@ async def _upload_config_bundle(
             timeout=60.0,
         )
     except Exception as exc:  # noqa: BLE001
+        if args.get("host_id") is not None:
+            return _unknown_remote_create(args["_child_session_id"], str(exc))
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
     if resp.status_code in (401, 403):
         return json.dumps({"error": "access_denied", "config_path": config_path})
     if resp.status_code >= 400:
+        if args.get("host_id") is not None and resp.status_code >= 500:
+            return _unknown_remote_create(args["_child_session_id"], resp.text[:200])
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
         )
-    data: _JsonObject = resp.json()
-    return data
+    return _read_session_create_response(
+        resp,
+        reserved_child_id=args.get("_child_session_id")
+        if args.get("host_id") is not None
+        else None,
+    )
 
 
 async def _session_create_from_config_path(
@@ -3758,7 +3957,17 @@ async def _session_create_from_config_path(
         return data
     child_session_id = data.get("session_id")
     if not isinstance(child_session_id, str) or not child_session_id:
+        if args.get("host_id") is not None:
+            return _unknown_remote_create(
+                args["_child_session_id"], "server did not return a child session id"
+            )
         return json.dumps({"error": "server did not return a child session id"})
+    if args.get("host_id") is not None and child_session_id != args["_child_session_id"]:
+        return _unknown_remote_create(
+            args["_child_session_id"],
+            "server returned a different child ID",
+            actual_child_id=child_session_id,
+        )
     created_agent_id = data.get("agent_id")
     if not isinstance(created_agent_id, str) or not created_agent_id:
         # CreatedSessionResponse.agent_id is a required field — a
@@ -3773,9 +3982,23 @@ async def _session_create_from_config_path(
 
     message = args.get("message")
     if isinstance(message, str) and message:
-        message_error = await _post_child_first_message(child_session_id, message, server_client)
-        if message_error is not None:
-            return message_error
+        if args.get("host_id") is not None:
+            result = await _post_remote_child_dispatch(
+                child_session_id,
+                message,
+                server_client,
+                parent_id=conversation_id,
+                agent=str(data.get("agent_name") or "agent"),
+                title=str(args.get("title") or ""),
+            )
+            if "error" in json.loads(result):
+                return result
+        else:
+            message_error = await _post_child_first_message(
+                child_session_id, message, server_client
+            )
+            if message_error is not None:
+                return message_error
 
     return _finalize_created_session(
         # Adapt the multipart CreatedSessionResponse shape to the
@@ -6465,9 +6688,10 @@ async def _session_close_via_rest(
     if scope_error is not None:
         return scope_error
     parsed = _parse_session_title(_optional_string(target_snap.get("title")))
-    if parsed.agent is None or parsed.title is None:
-        return json.dumps({"error": "session_not_a_sub_agent", "conversation_id": target_id})
-    new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
+    # Parentage/tree membership, not display-title syntax, determines eligibility.
+    agent = parsed.agent or _optional_string(target_snap.get("agent_name")) or "agent"
+    title = parsed.title if parsed.title is not None else target_snap.get("title") or ""
+    new_title = f"{agent}:{title}{_CLOSED_TITLE_INFIX}{target_id}"
     try:
         patch = await server_client.patch(
             f"{_session_url(target_id)}",
@@ -6489,8 +6713,8 @@ async def _session_close_via_rest(
         {
             "closed": True,
             "conversation_id": target_id,
-            "agent": parsed.agent,
-            "title": parsed.title,
+            "agent": agent,
+            "title": title,
         }
     )
 
@@ -8821,10 +9045,23 @@ async def _cancel_evicted_native_subagent(
     if (
         not isinstance(snapshot, dict)
         or snapshot.get("parent_session_id") != conversation_id
-        or not isinstance(wrapper, str)
-        or native_cancel_capability(wrapper) != "stop"
+        or (
+            not snapshot.get("host_id")
+            and (not isinstance(wrapper, str) or native_cancel_capability(wrapper) != "stop")
+        )
     ):
         return f"Error: no in-flight task with task_id {task_id}"
+    if snapshot.get("host_id") and native_cancel_capability(wrapper) != "stop":
+        try:
+            response = await server_client.post(
+                f"/v1/sessions/{task_id}/events",
+                json={"type": "interrupt", "data": {}},
+                timeout=30.0,
+            )
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            return f"Error: remote interrupt was not confirmed: {exc}"
+        return _best_effort_cancel_result(task_id, "unknown")
     # A 503 is a failed kill, not proof the pane is gone. Report an explicit
     # unconfirmed result rather than ``absent`` / a cached terminal status.
     status_code, stop_error = await _post_session_stop(server_client, task_id)
@@ -8893,11 +9130,24 @@ async def _cancel_subagent_task(
     # route to the child during that window — otherwise cancelling a slow-to-
     # start sub-agent would silently no-op and leave it running. A failed
     # stop-capable native entry still falls through when its pane is alive.
-    capability = native_cancel_capability(entry.wrapper_label)
+    wrapper_label = entry.wrapper_label
+    if entry.remote:
+        if server_client is None:
+            return "Error: sys_cancel_task requires server access for sub-agent tasks"
+        try:
+            snapshot = await server_client.get(f"/v1/sessions/{task_id}", timeout=10.0)
+            snapshot.raise_for_status()
+        except httpx.HTTPError as exc:
+            return f"Error: remote cancel lookup failed: {exc}"
+        child = snapshot.json()
+        if child.get("parent_session_id") != conversation_id or not child.get("host_id"):
+            return f"Error: no in-flight task with task_id {task_id}"
+        wrapper_label = _session_wrapper_label(child)
+    capability = native_cancel_capability(wrapper_label)
     can_stop_failed = (
         capability == "stop"
         and entry.status == "failed"
-        and await _native_child_pane_alive(str(task_id), entry.wrapper_label)
+        and (entry.remote or await _native_child_pane_alive(str(task_id), entry.wrapper_label))
     )
     if entry.status not in ("launching", "running", "waiting") and not can_stop_failed:
         return _cached_subagent_cancel_result(str(task_id), entry.status)
@@ -8925,7 +9175,7 @@ async def _cancel_subagent_task(
     updated = _subagent_work.get_subagent_work(str(task_id)) or entry
     if updated.status == "cancelled":
         return json.dumps({"cancelled": True, "task_id": task_id, "status": "cancelled"})
-    if capability == "best_effort":
+    if capability == "best_effort" or (entry.remote and capability == "inprocess"):
         return _best_effort_cancel_result(str(task_id), updated.status)
     return json.dumps(
         {

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import asyncio
 import dataclasses
+import hashlib
 import logging
 import math
 import os
@@ -24,6 +25,7 @@ from fastapi.responses import JSONResponse
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY
 from omnigent.debug_logging import runner_primary_session_id
 from omnigent.native.native_coding_agents import native_coding_agent_for_harness
+from omnigent.remote_child_protocol import SUBAGENT_DELIVERED_ID_LABEL_KEY
 from omnigent.runner.policy_proxy import _ASK_GATE_DELIVERY_TIMEOUT
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -86,7 +88,6 @@ _SUBAGENT_DELIVERY_SUPERSEDED_DISPATCH = "superseded_dispatch"
 # sent to the child; the delivered id is the receipt the parent's
 # ``sys_read_inbox`` drain writes once it has consumed that turn's result.
 SUBAGENT_DISPATCH_ID_LABEL_KEY = "omnigent.subagent.dispatch_id"
-SUBAGENT_DELIVERED_ID_LABEL_KEY = "omnigent.subagent.delivered_id"
 
 
 # Bounded retry budget for the sub-agent wake POST. The wake is the sole
@@ -153,6 +154,7 @@ class _SubagentWorkEntry:
     delivered: bool = False
     cancellation_confirmed: bool = False
     launch_timed_out: bool = False
+    remote: bool = False
 
 
 @dataclasses.dataclass(frozen=True)
@@ -329,7 +331,7 @@ def mark_subagent_work_started(child_session_id: str) -> _SubagentWorkEntry | No
     entry = _subagent_work_by_child.get(child_session_id)
     if entry is None:
         return None
-    if entry.status in {"launching", "waiting"}:
+    if entry.status in {"launching", "waiting"} and not entry.remote:
         entry.status = "running"
     return entry
 
@@ -536,7 +538,11 @@ async def _list_child_sessions(
 
 
 async def _fetch_latest_assistant_text(
-    server_client: httpx.AsyncClient, session_id: str
+    server_client: httpx.AsyncClient,
+    session_id: str,
+    response_hash: str | None = None,
+    result_item_id: str | None = None,
+    allow_error: bool = False,
 ) -> str | None:
     """
     Return the newest assistant message text of a session, reading newest first.
@@ -552,7 +558,18 @@ async def _fetch_latest_assistant_text(
     while True:
         page = await _get_recovery_page(server_client, f"/v1/sessions/{session_id}/items", params)
         for item in page.get("data", []):
+            if result_item_id is not None and item.get("id") != result_item_id:
+                continue
+            if allow_error and item.get("type") == "error":
+                message = item.get("message")
+                return message if isinstance(message, str) else None
             if item.get("type") != "message" or item.get("role") != "assistant":
+                continue
+            if (
+                response_hash is not None
+                and hashlib.sha256(str(item.get("response_id", "")).encode()).hexdigest()
+                != response_hash
+            ):
                 continue
             return "\n".join(
                 block["text"]
@@ -606,16 +623,64 @@ async def _recover_subagent_results_from_server(
             continue
         raw_labels = child.get("labels")
         labels = raw_labels if isinstance(raw_labels, dict) else {}
-        dispatch_id = undelivered_subagent_dispatch_id(labels)
+        from omnigent.remote_child_protocol import remote_child_state
+
+        remote = remote_child_state(labels)
+        dispatch_id = (
+            remote["dispatch_id"]
+            if remote is not None
+            else undelivered_subagent_dispatch_id(labels)
+        )
+        if remote is not None:
+            if remote.get("status") not in _SUBAGENT_TERMINAL_STATUSES:
+                if existing is None:
+                    pending = register_subagent_work(
+                        parent_session_id=parent_id,
+                        child_session_id=child_id,
+                        agent=str(child.get("tool") or child.get("agent_name") or "sub-agent"),
+                        title=str(child.get("session_name") or ""),
+                        wrapper_label=wrapper_label_from_labels(labels),
+                        work_id=dispatch_id,
+                    )
+                    pending.status = "waiting"
+                    pending.remote = True
+                continue
+            if labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY) == dispatch_id:
+                continue
+            status = remote["status"]
+            interrupted = False
         if dispatch_id is None or (existing is not None and existing.work_id != dispatch_id):
             continue
         output: str | None = None
-        if status == "failed":
+        if remote is not None and status in {"failed", "cancelled"}:
+            if remote.get("result_item_id") is not None:
+                output = await _fetch_latest_assistant_text(
+                    server_client,
+                    child_id,
+                    response_hash=remote.get("response_id"),
+                    result_item_id=remote.get("result_item_id"),
+                    allow_error=True,
+                )
+                if output is None:
+                    continue
+            else:
+                output = f"Remote child execution {status}."
+        elif status == "failed":
             error = child.get("last_task_error")
             message = error.get("message") if isinstance(error, dict) else None
             output = message if isinstance(message, str) else None
         elif not interrupted:
-            output = await _fetch_latest_assistant_text(server_client, child_id)
+            if remote is not None and remote.get("result_item_id") is None:
+                output = ""
+            else:
+                output = await _fetch_latest_assistant_text(
+                    server_client,
+                    child_id,
+                    response_hash=remote.get("response_id") if remote is not None else None,
+                    result_item_id=remote.get("result_item_id") if remote is not None else None,
+                )
+                if remote is not None and output is None:
+                    continue
         # A forwarded completion or newer dispatch may arrive during the history read.
         if (
             get_subagent_work(child_id) is not existing
@@ -631,6 +696,7 @@ async def _recover_subagent_results_from_server(
             wrapper_label=wrapper_label_from_labels(labels),
             work_id=dispatch_id,
         )
+        entry.remote = remote is not None
         if interrupted:
             # This dispatch already existed; a local launch timeout cannot judge it.
             entry.status = "waiting"

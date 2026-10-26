@@ -4137,6 +4137,10 @@ def create_app(
         """Attach bound streams, then recover independent session trees concurrently."""
         from omnigent.entities import Conversation
         from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+        from omnigent.remote_child_protocol import (
+            SUBAGENT_DELIVERED_ID_LABEL_KEY,
+            remote_child_state,
+        )
         from omnigent.server.child_session_recovery import (
             RECOVERY_STORE_CONCURRENCY,
             _interrupted,
@@ -4327,11 +4331,21 @@ def create_app(
                             row = rows.get(child_id)
                             if (
                                 row is None
-                                or row.host_id is not None
-                                or row.runner_id is None
                                 or not _restorable(row)
                                 or is_side_chat_child(row.labels)
                             ):
+                                continue
+                            remote = (
+                                remote_child_state(row.labels) if row.host_id is not None else None
+                            )
+                            if (
+                                remote is not None
+                                and row.labels.get(SUBAGENT_DELIVERED_ID_LABEL_KEY)
+                                != remote["dispatch_id"]
+                            ):
+                                eager_root_ids.add(root_id)
+                                break
+                            if row.host_id is not None or row.runner_id is None:
                                 continue
                             if row.runner_id != runner_id and runner_router.runner_is_online(
                                 row.runner_id

@@ -1179,6 +1179,23 @@ def test_close_marks_closed_and_tombstones_internal_title(session_fixture: _Fixt
     assert refreshed.labels[CLOSED_LABEL_KEY] == CLOSED_LABEL_VALUE
 
 
+@pytest.mark.parametrize("title", ["independent build", None])
+def test_close_accepts_structural_children_without_named_titles(session_fixture, title) -> None:
+    child = session_fixture.conv_store.create_conversation(
+        kind="sub_agent", title=title, parent_conversation_id=session_fixture.parent_conv_id
+    )
+    result = json.loads(
+        SysSessionCloseTool().invoke(
+            json.dumps({"conversation_id": child.id}), session_fixture.ctx
+        )
+    )
+    assert result["closed"] is True
+    assert (
+        session_fixture.conv_store.get_conversation(child.id).labels[CLOSED_LABEL_KEY]
+        == CLOSED_LABEL_VALUE
+    )
+
+
 def test_close_then_peek_by_id_still_resolves_tombstoned_row(
     session_fixture: _Fixture,
 ) -> None:

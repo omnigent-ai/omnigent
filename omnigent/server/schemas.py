@@ -1667,6 +1667,7 @@ class _SessionCreateRequestBase(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     parent_session_id: str | None = None
     sub_agent_name: str | None = None
+    child_session_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
     # A managed create's ``host_id``, moved here at validation so ``host_id``
@@ -1755,6 +1756,8 @@ class _SessionCreateRequestBase(BaseModel):
         # at module scope would risk import cycles.
         from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 
+        if self.child_session_id is not None and not (self.parent_session_id and self.host_id):
+            raise ValueError("child_session_id requires parent_session_id and host_id")
         if self.host_type == "managed":
             if self.requested_host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(
                 self.requested_host_id
@@ -1913,6 +1916,7 @@ class SessionCreateMetadata(BaseModel):
     terminal_launch_args: list[str] | None = None
     parent_session_id: str | None = None
     host_type: Literal["external", "managed"] = "external"
+    child_session_id: str | None = Field(default=None, pattern=r"^[0-9a-f]{32}$")
     sandbox_provider: str | None = None
 
     model_config = ConfigDict(extra="forbid")
@@ -1950,6 +1954,8 @@ class SessionCreateMetadata(BaseModel):
         # scope would risk import cycles.
         from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 
+        if self.child_session_id is not None and not (self.parent_session_id and self.host_id):
+            raise ValueError("child_session_id requires parent_session_id and host_id")
         if self.host_type == "managed":
             if self.host_id is not None:
                 raise ValueError(

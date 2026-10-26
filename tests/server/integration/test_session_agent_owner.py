@@ -388,8 +388,13 @@ async def test_policy_evaluation_uses_inherited_edit_authority(
         await asyncio.gather(drain, evaluation, return_exceptions=True)
 
 
+@pytest.mark.parametrize("remote_child", [False, True])
 async def test_reuse_then_patch_never_reaches_the_owners_agent(
     auth_client: httpx.AsyncClient,
+    auth_app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+    remote_child: bool,
+    db_uri: str,
 ) -> None:
     """Binding the owner's agent into your own session does not let you patch it.
 
@@ -402,15 +407,36 @@ async def test_reuse_then_patch_never_reaches_the_owners_agent(
     alice_session = agent["_session_id"]
     await _share_editor(auth_client, alice_session, ALICE, BOB)
 
+    payload = {"agent_id": agent["id"]}
+    if remote_child:
+        from omnigent.server.routes._sessions import orchestration
+        from omnigent.stores.host_store import HostStore
+
+        host_id = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        hosts = HostStore(db_uri)
+        hosts.upsert_on_connect(host_id, "bob-build-host", BOB)
+        auth_app.state.host_store = hosts
+        auth_app.state.host_registry = None
+
+        async def validated_workspace(**_kwargs: object) -> str:
+            return "/work/repo"
+
+        # Host transport is covered by the launch suite; this test isolates
+        # agent ownership after parent authorization on an independent host.
+        monkeypatch.setattr(orchestration, "_validate_session_workspace", validated_workspace)
+        payload.update(parent_session_id=alice_session, host_id=host_id, workspace="/work/repo")
+
     # BOB reuses ALICE's agent in his own new session.
     reuse = await auth_client.post(
         "/v1/sessions",
-        json={"agent_id": agent["id"]},
+        json=payload,
         headers={"X-Forwarded-Email": BOB},
     )
     assert reuse.status_code == 201, reuse.text
     bob_session = reuse.json()["id"]
     assert reuse.json()["agent_id"] != agent["id"], "BOB runs on his own copy"
+    copied_agent = SqlAlchemyAgentStore(db_uri).get(reuse.json()["agent_id"])
+    assert copied_agent is not None and copied_agent.created_by == BOB
 
     put = await auth_client.put(
         f"/v1/sessions/{bob_session}/agent",
@@ -423,7 +449,9 @@ async def test_reuse_then_patch_never_reaches_the_owners_agent(
         },
         headers={"X-Forwarded-Email": BOB},
     )
-    assert put.status_code == 200, put.text
+    # A child still inherits the shared parent's session permissions. Placement
+    # does not promote the collaborator to session owner.
+    assert put.status_code == (403 if remote_child else 200), put.text
     alices_agent = await auth_client.get(
         f"/v1/sessions/{alice_session}/agent", headers={"X-Forwarded-Email": ALICE}
     )

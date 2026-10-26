@@ -868,8 +868,9 @@ class SysSessionCreateTool(Tool):
     A **child-only write**: the new session's ``parent_session_id`` is
     forced to the caller's own session, so an orchestrator can only spawn
     sessions inside its own subtree — never a top-level or sibling
-    session. The child inherits the caller's runner (co-location), so it
-    starts executing as soon as a message is queued.
+    session. The child inherits the caller's runner by default. An explicit
+    ``host_id`` plus ``workspace`` launches it on that registered host instead;
+    there is no fallback to the parent's machine and no workspace-file transfer.
 
     Two addressing modes — exactly one of ``agent_id`` or
     ``config_path`` must be given:
@@ -927,6 +928,11 @@ class SysSessionCreateTool(Tool):
             "re-upload its bundle. Optionally queue an initial user "
             "message. The new session is always a child of the calling "
             "session (you cannot create top-level or sibling sessions). "
+            "By default it runs on your runner. To use an existing registered "
+            "execution host, provide host_id and an absolute workspace on that "
+            "host together. The server checks host access and workspace; it "
+            "never falls back to your machine. Repository files, uncommitted "
+            "changes and local credentials are not copied. "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
@@ -980,6 +986,21 @@ class SysSessionCreateTool(Tool):
                             "description": (
                                 "Optional human-readable label for the "
                                 "new session, e.g. 'auth refactor'."
+                            ),
+                        },
+                        "host_id": {
+                            "type": "string",
+                            "description": (
+                                "Optional existing registered execution host id. "
+                                "Requires workspace. Omit both to inherit your runner."
+                            ),
+                        },
+                        "workspace": {
+                            "type": "string",
+                            "description": (
+                                "Absolute working directory on host_id, not on the "
+                                "caller. Must already exist and be accessible there. "
+                                "Requires host_id; repository files are not synchronized."
                             ),
                         },
                         "message": {
@@ -1784,7 +1805,12 @@ class SysSessionCloseTool(Tool):
         busy_error = _busy_check_or_none(child_conv_id=resolution.child.id)
         if busy_error is not None:
             return busy_error
-        labelled = _agent_title_from_conversation(resolution.child)
+        child = resolution.child
+        labelled = (
+            _agent_title_from_conversation(child)
+            if child.title and ":" in child.title
+            else _AgentTitle(agent="agent", title=child.title or "")
+        )
         # Re-build the tombstoned title from the parsed components so
         # the marker lands in the canonical position even if the
         # original title used uncommon characters around the colon.

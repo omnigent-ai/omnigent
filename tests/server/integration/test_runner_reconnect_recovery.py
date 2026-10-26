@@ -537,3 +537,59 @@ async def test_root_recovery_failure_is_quiet_only_after_tunnel_replacement(
             assert transport_warnings
         else:
             assert errors
+
+
+@pytest.mark.parametrize("status", ["pending", "running", "completed", "failed", "cancelled"])
+@pytest.mark.parametrize("delivered", [False, True])
+async def test_idle_parent_recovers_undrained_registered_host_child(
+    app: FastAPI,
+    agent: Agent,
+    monkeypatch: pytest.MonkeyPatch,
+    status: str,
+    delivered: bool,
+) -> None:
+    from omnigent.remote_child_protocol import REMOTE_CHILD_STATE, SUBAGENT_DELIVERED_ID_LABEL_KEY
+
+    parent = _create_session(app, agent.id)
+    store = app.state.runner_router._conversation_store
+    store.set_session_live_status(parent.id, "idle")
+    store.set_labels(
+        parent.id,
+        {"omnigent.last_task_error_code": "", "omnigent.last_task_error_message": ""},
+    )
+    sessions._session_status_cache[parent.id] = "idle"
+    child = store.create_conversation(
+        agent_id=agent.id, kind="sub_agent", parent_conversation_id=parent.id, runner_id="remote"
+    )
+    store.set_host_id(child.id, "a" * 32, workspace="/tmp/remote-workspace")
+    dispatch_id = "remote-dispatch"
+    store.set_labels(
+        child.id,
+        {
+            REMOTE_CHILD_STATE: json.dumps(
+                {
+                    "dispatch_id": dispatch_id,
+                    "status": status,
+                    "response_id": "b" * 64
+                    if status in {"running", "completed", "failed"}
+                    else None,
+                    "result_item_id": None,
+                }
+            ),
+            SUBAGENT_DELIVERED_ID_LABEL_KEY: dispatch_id if delivered else "earlier-dispatch",
+        },
+    )
+    requested: list[str] = []
+
+    async def respond(request: httpx.Request) -> httpx.Response:
+        requested.append(json.loads(request.content)["session_id"])
+        return httpx.Response(201, json={})
+
+    async with _recover(app, monkeypatch, respond) as (relays, finished):
+        await asyncio.wait_for(finished.wait(), budget(5))
+        assert requested == ([] if delivered else [parent.id])
+        assert child.id not in relays
+        restored_child = store.get_conversation(child.id)
+        assert restored_child is not None
+        assert restored_child.runner_id == "remote"
+        assert restored_child.host_id == "a" * 32

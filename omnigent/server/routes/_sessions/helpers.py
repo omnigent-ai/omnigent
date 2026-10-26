@@ -10510,6 +10510,12 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
     """
     if not labels:
         return
+    from omnigent.remote_child_protocol import REMOTE_CHILD_NAMESPACE
+
+    if any(key.startswith(REMOTE_CHILD_NAMESPACE) for key in labels):
+        raise OmnigentError(
+            "remote child receipts are server-internal", code=ErrorCode.INVALID_INPUT
+        )
     from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
     if any(key.startswith(MCP_SELECTION_PREFIX) for key in labels):
@@ -10678,6 +10684,8 @@ def _persist_stored_session_bundle(
         any non-integrity reason.
     """
     inference_kwargs: dict[str, Any] = {}
+    if metadata.child_session_id is not None:
+        inference_kwargs["conversation_id"] = metadata.child_session_id
     if inference_snapshot is not None:
         inference_kwargs["inference_snapshot"] = inference_snapshot
     if inference_model is not None:
@@ -11128,6 +11136,13 @@ def _child_session_summary_from_conversation(
     current_task_status = _child_session_current_task_status_from_cached_status(cached_status)
     if last_task_error is not None:
         current_task_status = "failed"
+
+    from omnigent.remote_child_protocol import TERMINAL, remote_child_state
+
+    remote = remote_child_state(labels) if conv.host_id else None
+    if remote is not None:
+        current_task_status = remote["status"] if remote["status"] in TERMINAL else "in_progress"
+        busy = remote["status"] not in TERMINAL
 
     # For Codex children, fall back to the prompt label as preview when the
     # real transcript has not arrived yet — avoids synthesizing a user message
