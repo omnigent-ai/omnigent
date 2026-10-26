@@ -388,6 +388,54 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
         assert "did not confirm" in session.errors[0]["message"]
 
 
+@pytest.mark.parametrize("same_model", [False, True], ids=["different-model", "same-model"])
+async def test_refused_model_change_preserves_newer_silent_selection(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    same_model: bool,
+) -> None:
+    """A late refusal cannot overwrite model metadata saved by a newer launch."""
+    session = native_session
+    assert session.claude is not None
+    session.claude.confirm = False
+    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    refusal_ready = asyncio.Event()
+    release_refusal = asyncio.Event()
+
+    async def hold_refusal(response: httpx.Response) -> None:
+        if response.request.url.path.endswith("/events"):
+            refusal_ready.set()
+            await release_refusal.wait()
+
+    session.runner.event_hooks["response"].append(hold_refusal)
+    first = asyncio.create_task(_pick_model(client, session))
+    newer_model = session.requested_model if same_model else "claude-sonnet-4-6"
+    try:
+        await asyncio.wait_for(refusal_ready.wait(), timeout=5)
+        newer = await client.patch(
+            f"/v1/sessions/{session.session_id}",
+            json={"model_override": newer_model, "silent": True},
+        )
+        assert newer.status_code == 200, newer.text
+        session.claude.report_model(newer_model)
+        session.assert_model(newer_model)
+        release_refusal.set()
+        refused = await asyncio.wait_for(first, timeout=5)
+    finally:
+        release_refusal.set()
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+        session.runner.event_hooks["response"].remove(hold_refusal)
+
+    assert refused.status_code == 503, refused.text
+    assert "Please check the current selection and try again" in refused.text
+    assert session.runner_replies[0].json()["error"] == "claude_native_model_unconfirmed"
+    assert session.errors[0]["code"] == "model_change_not_applied"
+    session.assert_model(newer_model)
+    assert session.tunnel.dispatch_errors == []
+
+
 @pytest.mark.parametrize("screen", [_QUESTION, _PERMISSION], ids=["question", "permission"])
 async def test_claude_pending_prompt_blocks_model_pick_without_answering_it(
     client: httpx.AsyncClient,

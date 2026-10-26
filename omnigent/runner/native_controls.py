@@ -1360,6 +1360,8 @@ def build_native_controls(
             resolve_bound_model,
         )
         from omnigent.models.claude_model_vocabulary import (
+            alias_pins,
+            canonical_claude_id,
             claude_model_command_arg,
             picker_command_values,
         )
@@ -1399,7 +1401,8 @@ def build_native_controls(
                     picker_values = stored_claude_picker_values(claude_config, stored_rows)
         model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
         inference_config = load_runtime_inference_config()
-        if binding_for_harness(inference_config, "claude-native") is not None:
+        bound_model = binding_for_harness(inference_config, "claude-native") is not None
+        if bound_model:
             resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
             model_arg = resolved_model
         if model_arg is None:
@@ -1487,9 +1490,28 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
+        if not bound_model:
+            # A repeated alias pick keeps the same model; its launch pin proves
+            # the exact generation even when the options cache is cold.
+            pinned = alias_pins(env or {}).get(model_arg.lower().removesuffix("[1m]"))
+            if pinned:
+                if model_arg.endswith("[1m]") or (resolved_model or "").endswith("[1m]"):
+                    pinned = pinned.removesuffix("[1m]") + "[1m]"
+                expected.add(pinned)
+            expected.update(
+                canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
+            )
 
         def _switched(current: str | None) -> bool:
-            return bool(current and (current in expected or (baseline and current != baseline)))
+            comparable = current if bound_model or not current else canonical_claude_id(current)
+            return bool(
+                current
+                and (
+                    current in expected
+                    or comparable in expected
+                    or (baseline and current != baseline)
+                )
+            )
 
         try:
             # Accepted trade-off: ``/model <id>`` also saves the pick as the
