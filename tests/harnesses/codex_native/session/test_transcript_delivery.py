@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -404,7 +405,10 @@ def test_forwarder_posts_codex_user_and_agent_messages(tmp_path: Path) -> None:
     ]
 
 
-def test_forwarder_recovers_missed_user_message_before_assistant(tmp_path: Path) -> None:
+@pytest.mark.parametrize("has_user_record", [False, True])
+def test_forwarder_recovers_missed_user_message_before_assistant(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, has_user_record: bool
+) -> None:
     """
     A missed live ``userMessage`` is recovered before the assistant reply.
 
@@ -416,6 +420,7 @@ def test_forwarder_recovers_missed_user_message_before_assistant(tmp_path: Path)
     forwarder must resume to recover the turn's user message and post it
     BEFORE the reply so Omnigent assigns it the earlier position.
     """
+    caplog.set_level(logging.INFO, logger=codex_native_forwarder.__name__)
     posted: list[dict[str, Any]] = []
 
     # Resume returns the full turn (user then assistant) with Codex's
@@ -440,6 +445,8 @@ def test_forwarder_recovers_missed_user_message_before_assistant(tmp_path: Path)
             }
         }
     }
+    if not has_user_record:
+        resume_response["result"]["thread"]["turns"][0]["items"].pop(0)
     fake_client = _FakeCodexAppServerClient(response=resume_response)
     forwarder_state = codex_native_forwarder._CodexForwarderState(
         parent_session_id="conv_123",
@@ -466,11 +473,29 @@ def test_forwarder_recovers_missed_user_message_before_assistant(tmp_path: Path)
     items = [p for p in posted if p["type"] == "external_conversation_item"]
     roles = [p["data"]["item_data"]["role"] for p in items]
     # User recovered and posted first, then the assistant reply.
-    assert roles == ["user", "assistant"]
-    assert items[0]["data"]["item_data"]["content"][0]["text"] == "hello codex"
-    assert items[1]["data"]["item_data"]["content"][0]["text"] == "hello from codex"
+    assert roles == (["user", "assistant"] if has_user_record else ["assistant"])
+    if has_user_record:
+        assert items[0]["data"]["item_data"]["content"][0]["text"] == "hello codex"
+    assert items[-1]["data"]["item_data"]["content"][0]["text"] == "hello from codex"
     # The recovery issued exactly one resume to fetch the user message.
     assert [method for method, _ in fake_client.requests] == ["thread/resume"]
+    missing = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_user_record_recovery"
+    ]
+    assert missing == (
+        []
+        if has_user_record
+        else [
+            {
+                "native_turn_id": "turn_123",
+                "thread_id": "thread_123",
+                "harness": "codex-native",
+                "outcome": "resume_returned_no_user_record",
+            }
+        ]
+    )
 
 
 def test_forwarder_skips_user_recovery_when_user_seen_live(tmp_path: Path) -> None:

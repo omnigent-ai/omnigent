@@ -86,6 +86,18 @@ def test_diagnostic_emit_filters_extra_content_and_malformed_fields(
         exception_type="x" * 65,
         pending_age_ms=True,
         rpc_error_code=-32600,
+        native_source_id="thread:turn:item",
+        transcript_cursor_bytes=0,
+        transcript_read_end_bytes=512,
+        transcript_cursor_lines=2,
+        skipped_input_count=1,
+        is_meta=False,
+        is_compact_summary=True,
+        skip_user_messages=False,
+        deduplicated=True,
+        has_text=True,
+        has_file=False,
+        transcript_path="/private/transcript.jsonl",
     )
     [record] = caplog.records
     assert record.attributes == {
@@ -96,4 +108,36 @@ def test_diagnostic_emit_filters_extra_content_and_malformed_fields(
         "cause_class": "accepted_missing_native_record",
         "reason_code": "completed_without_native_record",
         "rpc_error_code": -32600,
+        "native_source_id": "thread:turn:item",
+        "transcript_cursor_bytes": 0,
+        "transcript_read_end_bytes": 512,
+        "transcript_cursor_lines": 2,
+        "skipped_input_count": 1,
+        "is_meta": False,
+        "is_compact_summary": True,
+        "skip_user_messages": False,
+        "deduplicated": True,
+        "has_text": True,
+        "has_file": False,
     }
+
+
+@pytest.mark.parametrize("invalid_counter", [-1, 10**15, True, "42"])
+def test_record_observation_filters_invalid_fields(
+    caplog: pytest.LogCaptureFixture, invalid_counter: object
+) -> None:
+    caplog.set_level(logging.INFO, logger=__name__)
+    log_input_event(
+        logging.getLogger(__name__),
+        "native_user_record_observed",
+        attributes={"native_source_id": "/private/transcript.jsonl"},
+        transcript_cursor_bytes=invalid_counter,
+        transcript_read_end_bytes=invalid_counter,
+        transcript_cursor_lines=invalid_counter,
+        skipped_input_count=invalid_counter,
+        is_meta="false",
+        deduplicated=1,
+        has_file="private content",
+    )
+    [record] = caplog.records
+    assert record.attributes == {}

@@ -70,6 +70,7 @@ from omnigent.native.failure_telemetry import (
     native_failure_id,
     normalize_failure_context,
 )
+from omnigent.native.input_diagnostics import log_input_event
 from omnigent.process_logging import harness_stderr_capture_enabled
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.session_event_batch import (
@@ -5122,6 +5123,25 @@ async def _forward_available_items(
     for item in items:
         if item.source_id in seen:
             continue
+        if (
+            item.item_type == "message"
+            and item.data.get("role") == "user"
+            and retry_tracker.retry_delay_s(f"item:{item.source_id}") is None
+        ):
+            log_input_event(
+                _logger,
+                "native_user_record_observed",
+                session_id=session_id,
+                attributes={"native_source_id": item.source_id},
+                harness="claude-native",
+                response_id=item.response_id,
+                transcript_cursor_bytes=state.byte_offset,
+                transcript_read_end_bytes=result.byte_offset,
+                transcript_cursor_lines=state.line_cursor,
+                is_meta=item.data.get("is_meta") is True,
+                is_compact_summary=item.is_compact_summary,
+                skip_user_messages=skip_user_messages,
+            )
         if item.response_id == current_response_id or (
             # Between turns, the ended turn's own output still sets or clears its error.
             current_response_id is None
@@ -5722,6 +5742,18 @@ async def _post_external_conversation_item(
             },
         )
         resp.raise_for_status()
+
+    if item.item_type == "message" and item.data.get("role") == "user":
+        log_input_event(
+            _logger,
+            "native_user_record_forward_finished",
+            session_id=session_id,
+            attributes={"native_source_id": item.source_id},
+            harness="claude-native",
+            response_id=item.response_id,
+            outcome="forward_accepted",
+            is_meta=item.data.get("is_meta") is True,
+        )
 
 
 async def _post_external_output_text_delta(

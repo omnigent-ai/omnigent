@@ -17,6 +17,7 @@ from pathlib import Path
 
 import httpx
 
+import omnigent.native.input_diagnostics as input_diagnostics
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
 from omnigent.entities.session_resources import terminal_resource_id
@@ -6307,6 +6308,14 @@ async def _ensure_user_message_posted(
         return
     user_item = _find_turn_user_message(response, turn_id)
     if user_item is None:
+        input_diagnostics.log_input_event(
+            _logger,
+            "native_user_record_recovery",
+            session_id=session_id,
+            attributes={"native_turn_id": turn_id, "thread_id": thread_id},
+            harness="codex-native",
+            outcome="resume_returned_no_user_record",
+        )
         return
     recovered_params: _JsonObject = {
         "threadId": thread_id,
@@ -6384,6 +6393,23 @@ async def _post_user_message(
     # this stale entry, folding the prior image into it. Only a truly empty
     # message (no text, no file block) is skipped.
     has_file_block = _user_message_has_file_content(item)
+    source_id = source_id or _source_id(params, item)
+    observation = {
+        "native_source_id": _bounded_source_id(source_id),
+        "native_turn_id": _turn_id_from_payload(params),
+        "response_id": _response_id(params),
+    }
+    input_diagnostics.log_input_event(
+        _logger,
+        "native_user_record_observed",
+        session_id=session_id,
+        attributes=observation,
+        harness="codex-native",
+        has_text=bool(text),
+        has_file=has_file_block,
+        is_meta=_is_codex_skill_wrapper(text),
+        outcome="forwarding" if text or has_file_block else "empty_record_skipped",
+    )
     if not text and not has_file_block:
         return False
     # Text-only / text+image post the text; image-only posts empty content and
@@ -6400,14 +6426,24 @@ async def _post_user_message(
             session_id,
             _source_id(params, item),
         )
-    return await _post_external_item(
+    posted = await _post_external_item(
         client,
         session_id,
         item_type="message",
         item_data=item_data,
         response_id=_response_id(params),
-        source_id=source_id or _source_id(params, item),
+        source_id=source_id,
     )
+    input_diagnostics.log_input_event(
+        _logger,
+        "native_user_record_forward_finished",
+        session_id=session_id,
+        attributes=observation,
+        harness="codex-native",
+        outcome="forward_accepted" if posted else "forward_not_accepted",
+        is_meta=item_data.get("is_meta") is True,
+    )
+    return posted
 
 
 async def _post_agent_message(

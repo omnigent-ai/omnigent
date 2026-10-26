@@ -3036,6 +3036,19 @@ async def _persist_external_conversation_item_unlocked(
     :returns: Store-assigned conversation item id.
     """
     item = _new_external_conversation_item(session_id, body)
+    user_record = (
+        item.type == "message" and isinstance(item.data, MessageData) and item.data.role == "user"
+    )
+    record_identity = {"native_source_id": body.data.get("source_id"), "item_id": item.stable_id}
+    if user_record:
+        log_input_event(
+            _logger,
+            "native_user_record_received",
+            session_id=session_id,
+            attributes=record_identity,
+            response_id=item.response_id,
+            is_meta=isinstance(item.data, MessageData) and item.data.is_meta is True,
+        )
     if item.stable_id is not None and _drains_pending_inputs(item):
         # A forwarder retry of a mirror already persisted under its source-derived
         # id: nothing to drain, persist or publish. Draining again could match a
@@ -3044,6 +3057,15 @@ async def _persist_external_conversation_item_unlocked(
         # retries are absorbed by the idempotent append below.
         existing = await asyncio.to_thread(conversation_store.get_item, session_id, item.stable_id)
         if existing is not None:
+            if user_record:
+                log_input_event(
+                    _logger,
+                    "native_user_record_persisted",
+                    session_id=session_id,
+                    attributes=record_identity,
+                    response_id=existing.response_id,
+                    deduplicated=True,
+                )
             return existing.id
     if _drains_pending_inputs(item) and STARTUP_LABEL in conv.labels:
         await restore_pending_inputs(conversation_store, session_id)
@@ -3181,6 +3203,18 @@ async def _persist_external_conversation_item_unlocked(
         )
         raise
     persisted = persisted_items[len(skipped_new_items)]
+    if user_record:
+        log_input_event(
+            _logger,
+            "native_user_record_persisted",
+            session_id=session_id,
+            attributes={**record_identity, "item_id": persisted.id},
+            response_id=persisted.response_id,
+            deduplicated=persisted.deduplicated,
+            match_method=match_method,
+            skipped_input_count=len(skipped_pending),
+            matched_pending_id=cleared_pending_id,
+        )
     if persisted.deduplicated:
         # A re-post of an already-committed item: nothing new to render or
         # title. Every pending entry consumed above belongs to a LATER user

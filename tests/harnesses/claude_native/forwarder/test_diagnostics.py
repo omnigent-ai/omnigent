@@ -15,6 +15,63 @@ from omnigent.harnesses.claude_native.bridge import (
 )
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("delivery", ["accepted", "skipped", "backoff"])
+async def test_user_record_observation_is_bounded_and_distinguishes_forwarding(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture, delivery: str
+) -> None:
+    transcript = tmp_path / "private-transcript.jsonl"
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-record",
+                "message": {"role": "user", "content": "private prompt"},
+            }
+        )
+        + "\n"
+    )
+    state = forwarder.TranscriptForwardState(
+        transcript_path=transcript, line_cursor=0, byte_offset=0
+    )
+    tracker = forwarder._PostRetryTracker(base_delay_s=3600, max_delay_s=3600)
+    caplog.set_level(logging.INFO, logger=forwarder.__name__)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda request: httpx.Response(503 if delivery == "backoff" else 202)
+        ),
+        base_url="http://test",
+    ) as client:
+        for _ in range(3):
+            state = await forwarder._forward_available_items(
+                client=client,
+                session_id="conv_record",
+                bridge_dir=tmp_path / "bridge",
+                agent_name="claude-native-ui",
+                state=state,
+                retry_tracker=tracker,
+                dedupe=forwarder._ForwardDedupeState(),
+                skip_user_messages=delivery == "skipped",
+            )
+    [observed] = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_user_record_observed"
+    ]
+    assert observed["native_source_id"] == "user-record:0:message"
+    assert observed["transcript_cursor_bytes"] == 0
+    assert observed["transcript_read_end_bytes"] == transcript.stat().st_size
+    assert observed["skip_user_messages"] is (delivery == "skipped")
+    finished = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_user_record_forward_finished"
+    ]
+    assert len(finished) == int(delivery == "accepted")
+    assert "private prompt" not in json.dumps([observed, finished])
+    assert str(transcript) not in json.dumps([observed, finished])
+
+
 def test_observer_hook_stderr_is_logged_incrementally(
     tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
