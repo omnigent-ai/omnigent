@@ -252,19 +252,30 @@ def test_build_claude_native_base_args_resume_prefix(
 
 
 @pytest.mark.parametrize(
-    ("terminal_launch_args", "items_status", "user_texts", "has_prior_history", "expected"),
+    ("terminal_launch_args", "items_status", "pages", "has_prior_history", "expected", "requests"),
     [
-        (["--verbose"], 200, ["--verbose"], True, False),
-        (["old prompt\nsecond line", "--verbose"], 200, ["old prompt\nsecond line"], False, True),
-        (["new prompt", "--verbose"], 200, ["old prompt"], True, False),
-        (["old prompt"], 500, [], True, True),
-        (["old prompt"], 500, [], False, False),
-        (["old prompt"], None, [], True, True),
+        (["--verbose"], 200, [["--verbose"]], True, False, 0),
+        (
+            ["old prompt\nsecond line", "--verbose"],
+            200,
+            [["old prompt\nsecond line"]],
+            False,
+            True,
+            1,
+        ),
+        (["new prompt", "--verbose"], 200, [["old prompt"]], True, False, 1),
+        (["resume prompt"], 200, [["old prompt"], ["resume prompt"], ["later"]], True, True, 2),
+        (["resume prompt"], 200, [["old prompt"], ["later"]], True, False, 2),
+        (["old prompt"], 500, [[]], True, True, 1),
+        (["old prompt"], 500, [[]], False, False, 1),
+        (["old prompt"], None, [[]], True, True, 0),
     ],
     ids=[
         "no-legacy-prompt",
         "recorded-prompt-consumed",
         "explicit-resume-prompt-kept",
+        "prompt-recorded-past-first-page",
+        "prompt-on-no-page-kept",
         "unreadable-history-with-prior-session",
         "unreadable-history-fresh-session",
         "offline-with-prior-session",
@@ -273,20 +284,24 @@ def test_build_claude_native_base_args_resume_prefix(
 async def test_claude_legacy_prompt_consumed(
     terminal_launch_args: list[str],
     items_status: int | None,
-    user_texts: list[str],
+    pages: list[list[str]],
     has_prior_history: bool,
     expected: bool,
+    requests: int,
 ) -> None:
     """Only a stored prompt already recorded as a user turn is omitted."""
     import httpx
 
     from omnigent.runner.native.orchestration import _claude_legacy_prompt_consumed
 
-    requested_paths: list[str] = []
+    requested_cursors: list[str | None] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
-        requested_paths.append(request.url.path)
+        assert request.url.path == "/v1/sessions/conv_legacy/items"
         assert items_status is not None
+        cursor = request.url.params.get("after")
+        requested_cursors.append(cursor)
+        index = 0 if cursor is None else int(cursor.removeprefix("item_")) + 1
         return httpx.Response(
             items_status,
             json={
@@ -296,8 +311,10 @@ async def test_claude_legacy_prompt_consumed(
                         "role": "user",
                         "content": [{"type": "input_text", "text": text}],
                     }
-                    for text in user_texts
-                ]
+                    for text in pages[index]
+                ],
+                "has_more": index < len(pages) - 1,
+                "last_id": f"item_{index}",
             },
         )
 
@@ -312,12 +329,30 @@ async def test_claude_legacy_prompt_consumed(
         )
 
     assert consumed is expected
-    expected_paths = (
-        ["/v1/sessions/conv_legacy/items"]
-        if items_status is not None and not terminal_launch_args[0].startswith("-")
-        else []
-    )
-    assert requested_paths == expected_paths
+    assert requested_cursors == [None, "item_0"][:requests]
+
+
+@pytest.mark.parametrize(("last_id", "requests"), [(None, 1), ("item_0", 2)])
+async def test_claude_prompt_in_history_stops_on_a_stalled_cursor(
+    last_id: str | None, requests: int
+) -> None:
+    """A page that claims more items without a new cursor makes history unknown."""
+    import httpx
+
+    from omnigent.runner.native.orchestration import _claude_prompt_in_history
+
+    requested_cursors: list[str | None] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_cursors.append(request.url.params.get("after"))
+        return httpx.Response(200, json={"data": [], "has_more": True, "last_id": last_id})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        assert await _claude_prompt_in_history(client, "conv_legacy", "old prompt") is None
+
+    assert requested_cursors == [None, "item_0"][:requests]
 
 
 def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resume() -> None:

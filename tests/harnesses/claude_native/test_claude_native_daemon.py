@@ -443,7 +443,7 @@ def test_run_with_remote_server_unsent_prompt_stops_before_attach(
 
     monkeypatch.setattr(claude_native, "_attach_with_transcript_forwarder", record_attach)
 
-    with pytest.raises(click.ClickException, match="Session conv_new was created without it"):
+    with pytest.raises(click.ClickException, match="Session conv_new did not receive it"):
         claude_native._run_with_remote_server(
             "https://example.com",
             spec_path,

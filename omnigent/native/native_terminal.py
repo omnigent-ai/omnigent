@@ -121,7 +121,7 @@ async def post_initial_prompt(
     """
     from omnigent.cli_auth import open_server_client
 
-    unsent = f"Session {session_id} was created without it."
+    unsent = f"Session {session_id} did not receive it."
     try:
         async with open_server_client(
             base_url,
@@ -139,9 +139,15 @@ async def post_initial_prompt(
                     },
                 },
             )
-    except httpx.HTTPError as exc:
+    except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
         raise click.ClickException(
             f"{harness_name} initial prompt could not be sent ({type(exc).__name__}). {unsent}"
+        ) from exc
+    except httpx.HTTPError as exc:
+        # The request may have reached the server, which can still queue it.
+        raise click.ClickException(
+            f"{harness_name} initial prompt was not confirmed ({type(exc).__name__}). "
+            f"Session {session_id} may not have received it."
         ) from exc
     if response.status_code >= 400:
         raise click.ClickException(

@@ -7725,8 +7725,8 @@ def _is_runner_owned_antigravity_terminal(
     )
 
 
-# @deprecated, remove in 0.22.0 with _claude_legacy_prompt_consumed: clients
-# before 0.20.0 stored ``-p`` in the persisted launch args.
+# @deprecated, remove in 0.22.0 with the two legacy-prompt helpers below:
+# clients before 0.20.0 stored ``-p`` in the persisted launch args.
 def _claude_legacy_launch_prompt(terminal_launch_args: list[str] | None) -> str | None:
     """
     Return the ``-p`` prompt older clients stored ahead of the launch flags.
@@ -7740,6 +7740,40 @@ def _claude_legacy_launch_prompt(terminal_launch_args: list[str] | None) -> str 
     return terminal_launch_args[0]
 
 
+async def _claude_prompt_in_history(
+    server_client: httpx.AsyncClient, session_id: str, prompt: str
+) -> bool | None:
+    """
+    Report whether *prompt* is a user turn anywhere in the session's history.
+
+    :param server_client: Runner→server client.
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :param prompt: Exact user-turn text to find, e.g. ``"hello"``.
+    :returns: ``True`` / ``False``, or ``None`` when history is unreadable.
+    """
+    from omnigent.runner.turn_routing import _user_message_texts
+
+    path = f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}/items"
+    params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
+    while True:
+        try:
+            response = await server_client.get(path, params=params, timeout=30.0)
+            response.raise_for_status()
+            page = response.json()
+        except (httpx.HTTPError, ValueError):
+            return None
+        if not isinstance(page, dict):
+            return None
+        if prompt in _user_message_texts(page.get("data")):
+            return True
+        if not page.get("has_more"):
+            return False
+        last_id = page.get("last_id")
+        if not isinstance(last_id, str) or last_id == params.get("after"):
+            return None
+        params["after"] = last_id
+
+
 async def _claude_legacy_prompt_consumed(
     *,
     server_client: httpx.AsyncClient | None,
@@ -7751,9 +7785,10 @@ async def _claude_legacy_prompt_consumed(
     Report whether a stored legacy launch prompt already ran on the session.
 
     Older clients stored ``-p`` in the launch args both on create and on an
-    explicit resume, so only a prompt already recorded as a user turn is a
-    replay. When history is unreadable, a session with prior history is
-    treated as having consumed it.
+    explicit resume, so a prompt recorded as a user turn anywhere in history
+    is a replay. When history is unreadable, a session with prior history is
+    treated as having consumed it: an unrun resume prompt is dropped rather
+    than risk replaying an old one.
 
     :param server_client: Runner→server client, or ``None`` when offline.
     :param session_id: Session id, e.g. ``"conv_abc123"``.
@@ -7765,9 +7800,7 @@ async def _claude_legacy_prompt_consumed(
     if prompt is None:
         return False
     if server_client is not None:
-        from omnigent.runner.turn_routing import _prompt_already_ran
-
-        already_ran = await _prompt_already_ran(session_id, prompt, server_client)
+        already_ran = await _claude_prompt_in_history(server_client, session_id, prompt)
         if already_ran is not None:
             return already_ran
     return has_prior_history
