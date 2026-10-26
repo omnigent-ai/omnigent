@@ -5170,59 +5170,90 @@ class TestToolCallPolicyGate(unittest.TestCase):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("trigger", ["manual", "auto", "hook", "incomplete"])
-@pytest.mark.parametrize("stream_failure", [False, True])
-def test_compaction_stream_exports_checkpoint_without_disk(
-    trigger: str, stream_failure: bool, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    """A completed compaction survives a client rebuild and subsequent stream errors."""
+@pytest.fixture
+def compaction_stream(monkeypatch: pytest.MonkeyPatch):
+    """Script raw CLI responses while retaining the real transport tap and SDK parser."""
     import claude_agent_sdk as real_sdk
     from claude_agent_sdk._internal.message_parser import parse_message
     from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+
+    def configure(turns):
+        responses = iter(turns)
+        prompts = []
+
+        async def raw_messages(self):
+            for frame in next(responses):
+                if isinstance(frame, Exception):
+                    raise frame
+                yield {"parent_tool_use_id": None, **frame}
+            yield {
+                "type": "result",
+                "subtype": "success",
+                "session_id": "c9a2d66b-163e-488d-b311-14f29fb157eb",
+                "duration_ms": 1,
+                "duration_api_ms": 1,
+                "is_error": False,
+                "num_turns": 0,
+                "total_cost_usd": 0.0,
+                "usage": {},
+            }
+
+        class _FakeSDK(_sdk_types()):
+            AssistantMessage = real_sdk.AssistantMessage
+            UserMessage = real_sdk.UserMessage
+            SystemMessage = real_sdk.SystemMessage
+            ResultMessage = real_sdk.ResultMessage
+            TextBlock = real_sdk.TextBlock
+            ThinkingBlock = real_sdk.ThinkingBlock
+            ToolUseBlock = real_sdk.ToolUseBlock
+            ToolResultBlock = real_sdk.ToolResultBlock
+
+            class ClaudeSDKClient(_SDKClient):
+                async def query(self, prompt, session_id="default"):
+                    prompts.append(
+                        prompt if isinstance(prompt, str) else [item async for item in prompt]
+                    )
+
+                async def receive_response(self):
+                    async for frame in self.transport.read_messages():
+                        yield parse_message(frame)
+
+        monkeypatch.setattr(SubprocessCLITransport, "read_messages", raw_messages)
+        monkeypatch.setattr("omnigent.inner.claude_sdk_executor._ensure_sdk", lambda: _FakeSDK)
+        return ClaudeSDKExecutor(), prompts
+
+    return configure
+
+
+@pytest.mark.parametrize("trigger", ["manual", "auto", "hook"])
+@pytest.mark.parametrize("stream_failure", [False, True])
+def test_compaction_stream_exports_checkpoint_without_disk(
+    trigger: str, stream_failure: bool, compaction_stream
+) -> None:
+    """A completed compaction survives a client rebuild and subsequent stream errors."""
     from omnigent.inner.executor import CompactionComplete, CompactionStarted
 
-    session_id = "c9a2d66b-163e-488d-b311-14f29fb157eb"
     tool_use = {"type": "tool_use", "id": "call-1", "name": "Read", "input": {"path": "x"}}
     tool_result = {"type": "tool_result", "tool_use_id": "call-1", "content": "file content"}
     summary = "The user is investigating a file."
-    turns = [
-        [
-            {"type": "user", "uuid": "old", "message": {"content": "old verbose history"}},
-            {
-                "type": "assistant",
-                "uuid": "call",
-                "message": {"content": [tool_use], "model": "test"},
+    compacted_turn = [
+        {"type": "system", "subtype": "status", "status": "compacting"},
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "boundary",
+            "compact_metadata": {
+                "trigger": trigger,
+                "post_tokens": 123,
+                "preserved_messages": {"anchor_uuid": "summary", "uuids": ["call", "result"]},
             },
-            {"type": "user", "uuid": "result", "message": {"content": [tool_result]}},
-        ],
-        [
-            {"type": "system", "subtype": "status", "status": "compacting"},
-            {
-                "type": "system",
-                "subtype": "compact_boundary",
-                "uuid": "boundary",
-                "compact_metadata": {
-                    "trigger": trigger,
-                    "post_tokens": 123,
-                    "preserved_messages": {"anchor_uuid": "summary", "uuids": ["call", "result"]},
-                },
-            },
-            {
-                "type": "user",
-                "uuid": "summary",
-                "isSynthetic": True,
-                "message": {"content": summary},
-            },
-        ],
-        [],
-        [],
+        },
+        {"type": "user", "uuid": "summary", "isSynthetic": True, "message": {"content": summary}},
     ]
-    if trigger == "incomplete":
-        turns[1].pop()
     if trigger == "hook":
-        turns[1].insert(
+        compacted_turn.insert(
             0,
             {
                 "type": "system",
@@ -5233,70 +5264,37 @@ def test_compaction_stream_exports_checkpoint_without_disk(
             },
         )
     elif trigger == "auto":
-        turns[1] = turns[1][1:]
-    responses = iter(turns)
-    prompts = []
-
-    async def raw_messages(self):
-        for frame in next(responses):
-            yield {"session_id": session_id, "parent_tool_use_id": None, **frame}
-        if stream_failure and executor._clients["s1"].transcript.generation:
-            raise RuntimeError("context refilled after compaction")
-        yield {
-            "type": "result",
-            "subtype": "success",
-            "session_id": session_id,
-            "duration_ms": 1,
-            "duration_api_ms": 1,
-            "is_error": False,
-            "num_turns": 0,
-            "total_cost_usd": 0.0,
-            "usage": {},
-        }
-
-    monkeypatch.setattr(SubprocessCLITransport, "read_messages", raw_messages)
-
-    class _FakeSDK(_sdk_types()):
-        AssistantMessage = real_sdk.AssistantMessage
-        UserMessage = real_sdk.UserMessage
-        SystemMessage = real_sdk.SystemMessage
-        ResultMessage = real_sdk.ResultMessage
-        TextBlock = real_sdk.TextBlock
-        ThinkingBlock = real_sdk.ThinkingBlock
-        ToolUseBlock = real_sdk.ToolUseBlock
-        ToolResultBlock = real_sdk.ToolResultBlock
-
-        class ClaudeSDKClient(_SDKClient):
-            async def query(self, prompt, session_id="default"):
-                prompts.append(
-                    prompt if isinstance(prompt, str) else [item async for item in prompt]
-                )
-
-            async def receive_response(self):
-                async for frame in self.transport.read_messages():
-                    yield parse_message(frame)
-
-    executor = ClaudeSDKExecutor()
+        compacted_turn = compacted_turn[1:]
+    if stream_failure:
+        compacted_turn.append(RuntimeError("context refilled after compaction"))
+    executor, prompts = compaction_stream(
+        [
+            [
+                {"type": "user", "uuid": "old", "message": {"content": "old verbose history"}},
+                {
+                    "type": "assistant",
+                    "uuid": "call",
+                    "message": {"content": [tool_use], "model": "test"},
+                },
+                {"type": "user", "uuid": "result", "message": {"content": [tool_result]}},
+            ],
+            compacted_turn,
+            [],
+            [],
+        ]
+    )
 
     async def _t():
-        with (
-            patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
-            patch(
-                "claude_agent_sdk.get_session_messages", side_effect=AssertionError("disk read")
-            ),
+        with patch(
+            "claude_agent_sdk.get_session_messages", side_effect=AssertionError("disk read")
         ):
             inputs = [{"role": "user", "content": "continue", "session_id": "s1"}]
             first = [event async for event in executor.run_turn(inputs, [], "")]
             assert not any(isinstance(event, CompactionComplete) for event in first)
+            original_client = executor._clients["s1"]
             events = [event async for event in executor.run_turn(inputs, [], "")]
             started = [event for event in events if isinstance(event, CompactionStarted)]
             completed = [event for event in events if isinstance(event, CompactionComplete)]
-            if trigger == "incomplete":
-                assert len(started) == 1
-                assert not completed
-                assert isinstance(events[-1], ExecutorError if stream_failure else TurnComplete)
-                await executor.close()
-                return
             assert len(started) == len(completed) == 1
             assert events.index(started[0]) < events.index(completed[0]) < len(events) - 1
             assert isinstance(events[-1], ExecutorError if stream_failure else TurnComplete)
@@ -5309,7 +5307,6 @@ def test_compaction_stream_exports_checkpoint_without_disk(
             if not stream_failure:
                 subsequent = [event async for event in executor.run_turn(inputs, [], "")]
                 assert not any(isinstance(event, CompactionComplete) for event in subsequent)
-            original_client = executor._clients.get("s1")
             await executor.close_session("s1")
             rebuilt = [
                 event
@@ -5325,6 +5322,35 @@ def test_compaction_stream_exports_checkpoint_without_disk(
             assert "file content" in replay
             assert "old verbose history" not in replay
             await executor.close()
+
+    _run(_t())
+
+
+@pytest.mark.parametrize("stream_failure", [False, True])
+def test_incomplete_compaction_stream_preserves_server_history(
+    stream_failure: bool, compaction_stream
+) -> None:
+    from omnigent.inner.executor import CompactionComplete, CompactionStarted
+
+    frames = [
+        {"type": "system", "subtype": "status", "status": "compacting"},
+        {"type": "system", "subtype": "compact_boundary", "uuid": "incomplete"},
+    ]
+    if stream_failure:
+        frames.append(RuntimeError("stream ended before summary"))
+    executor, _ = compaction_stream([frames])
+
+    async def _t():
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "continue", "session_id": "s1"}], [], ""
+            )
+        ]
+        assert sum(isinstance(event, CompactionStarted) for event in events) == 1
+        assert not any(isinstance(event, CompactionComplete) for event in events)
+        assert isinstance(events[-1], ExecutorError if stream_failure else TurnComplete)
+        await executor.close()
 
     _run(_t())
 

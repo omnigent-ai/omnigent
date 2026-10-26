@@ -82,6 +82,60 @@ def test_incomplete_compaction_never_exports_old_or_empty_context(incomplete: st
     assert transcript.checkpoint_since(0) is None
 
 
+@pytest.mark.parametrize("resumption", ["result", "user", "assistant"])
+def test_abandoned_boundary_does_not_drop_later_retained_messages(resumption: str) -> None:
+    transcript = ClaudeCompactionTranscript()
+    transcript.observe({"type": "system", "subtype": "compact_boundary", "uuid": "abandoned"})
+    if resumption == "result":
+        transcript.observe({"type": "result"})
+    message_type = "assistant" if resumption == "assistant" else "user"
+    transcript.observe(
+        {"type": message_type, "uuid": "continued", "message": {"content": "still needed"}}
+    )
+    assert transcript.checkpoint_since(0) is None
+    transcript.observe(
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "next-boundary",
+            "compact_metadata": {
+                "preserved_messages": {"anchor_uuid": "summary", "uuids": ["continued"]}
+            },
+        }
+    )
+    transcript.observe(
+        {"type": "user", "uuid": "summary", "isSynthetic": True, "message": {"content": "summary"}}
+    )
+    assert transcript.checkpoint_since(1) == [
+        {"type": "message", "role": "user", "content": "summary"},
+        {"type": "message", "role": message_type, "content": "still needed"},
+    ]
+
+
+@pytest.mark.parametrize("id_field", ["uuids", "all_uuids"])
+def test_unstreamed_retained_attachment_logs_its_id_and_rejects_checkpoint(
+    id_field: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    transcript = ClaudeCompactionTranscript()
+    transcript.observe({"type": "user", "uuid": "seen", "message": {"content": "Read @file.txt"}})
+    preserved = {"anchor_uuid": "summary", "uuids": ["seen"]}
+    preserved[id_field] = ["seen", "unstreamed-attachment"]
+    transcript.observe(
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "file-boundary",
+            "compact_metadata": {"preserved_messages": preserved},
+        }
+    )
+    transcript.observe(
+        {"type": "user", "uuid": "summary", "isSynthetic": True, "message": {"content": "summary"}}
+    )
+    assert transcript.checkpoint_since(0) is None
+    assert "file-boundary" in caplog.text
+    assert "unstreamed-attachment" in caplog.text
+
+
 def test_multiple_compactions_only_export_the_latest_complete_boundary() -> None:
     transcript = ClaudeCompactionTranscript()
     for number in range(2):

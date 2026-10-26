@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator
 from copy import copy
 from typing import TYPE_CHECKING
@@ -10,6 +11,8 @@ from omnigent.inner.executor import Message
 
 if TYPE_CHECKING:
     from claude_agent_sdk import ClaudeAgentOptions, Transport
+
+logger = logging.getLogger(__name__)
 
 
 class ClaudeCompactionTranscript:
@@ -28,8 +31,14 @@ class ClaudeCompactionTranscript:
         self._valid_checkpoint = False
 
     def observe(self, frame: Message) -> None:
-        """Observe a root-session frame before the SDK parses it."""
+        """Observe a root-session frame before the SDK parses it.
+
+        :param frame: Raw CLI output, including replayed user messages.
+        """
         if frame.get("parent_tool_use_id") or frame.get("isSidechain"):
+            return
+        if frame.get("type") == "result":
+            self._boundary = None
             return
         if frame.get("type") == "system" and frame.get("subtype") == "compact_boundary":
             self.generation += 1
@@ -50,33 +59,32 @@ class ClaudeCompactionTranscript:
             return
         entry: Message = {"type": "message", "role": frame["type"], "content": content}
         if self._boundary is not None:
-            if frame["type"] != "user" or not (
+            is_summary = frame["type"] == "user" and (
                 frame.get("isSynthetic") or frame.get("isCompactSummary")
-            ):
-                return
-            retained = self._retained_messages(uuid)
+            )
+            retained = self._retained_messages(uuid, self._boundary) if is_summary else None
             self._boundary = None
-            if retained is None:
+            if is_summary and retained is None:
                 self._messages = {uuid: entry}
                 return
-            before, after = retained
-            self._messages = {**before, uuid: entry, **after}
-            self._valid_checkpoint = bool(content)
-            return
+            if retained is not None:
+                before, after = retained
+                self._messages = {**before, uuid: entry, **after}
+                self._valid_checkpoint = bool(content)
+                return
         self._messages[uuid] = entry
 
     def _retained_messages(
-        self, summary_uuid: str
+        self, summary_uuid: str, boundary: Message
     ) -> tuple[dict[str, Message], dict[str, Message]] | None:
-        assert self._boundary is not None
-        metadata = self._boundary.get("compact_metadata", {})
+        metadata = boundary.get("compact_metadata", {})
         if not isinstance(metadata, dict):
             return None
         preserved = metadata.get("preserved_messages")
         if preserved is not None:
             if not isinstance(preserved, dict):
                 return None
-            uuids = preserved.get("uuids")
+            uuids = preserved.get("all_uuids", preserved.get("uuids"))
             if not isinstance(uuids, list) or not all(isinstance(uuid, str) for uuid in uuids):
                 return None
         else:
@@ -90,22 +98,40 @@ class ClaudeCompactionTranscript:
                 head = ordered.index(preserved["head_uuid"])
                 tail = ordered.index(preserved["tail_uuid"])
             except (KeyError, ValueError):
+                logger.warning(
+                    "Skipping Claude compaction checkpoint: retained segment endpoints "
+                    "were not observed (boundary=%s, head=%s, tail=%s).",
+                    boundary.get("uuid"),
+                    preserved.get("head_uuid"),
+                    preserved.get("tail_uuid"),
+                )
                 return None
             if head > tail:
                 return None
             uuids = ordered[head : tail + 1]
-        if any(uuid not in self._messages for uuid in uuids):
+        missing = [uuid for uuid in uuids if uuid not in self._messages]
+        if missing:
+            logger.warning(
+                "Skipping Claude compaction checkpoint: retained message IDs "
+                "were not observed in the CLI stream (boundary=%s, missing=%s).",
+                boundary.get("uuid"),
+                missing,
+            )
             return None
         retained = {uuid: self._messages[uuid] for uuid in uuids}
         anchor = preserved.get("anchor_uuid")
         if anchor == summary_uuid:
             return {}, retained
-        if anchor == self._boundary.get("uuid"):
+        if anchor == boundary.get("uuid"):
             return retained, {}
         return None
 
     def checkpoint_since(self, generation: int) -> list[Message] | None:
-        """Return current context only after a new, complete summary arrives."""
+        """Return current context only after a new, complete summary arrives.
+
+        :param generation: Compaction generation observed before starting the turn.
+        :returns: Replayable context, or ``None`` if no new complete checkpoint exists.
+        """
         if self.generation == generation or not self._valid_checkpoint:
             return None
         return list(self._messages.values())
@@ -114,7 +140,12 @@ class ClaudeCompactionTranscript:
 def compaction_transport(
     options: ClaudeAgentOptions, transcript: ClaudeCompactionTranscript
 ) -> Transport:
-    """Tap the CLI transport before SDK parsing loses checkpoint fields."""
+    """Tap the CLI transport before SDK parsing loses checkpoint fields.
+
+    :param options: Client launch options; caller-owned permission settings are preserved.
+    :param transcript: Recorder scoped to this client's lifetime.
+    :returns: SDK subprocess transport that records raw frames before forwarding them.
+    """
     from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
     class CapturingTransport(SubprocessCLITransport):
