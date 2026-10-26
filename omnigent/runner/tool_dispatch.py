@@ -3558,12 +3558,14 @@ async def _execute_session_create(
                 body["initial_input"] = initial_items[0]
         else:
             body.pop("initial_items", None)
-    unconfirmed_creation = json.dumps(
-        {
-            "error": "Session creation could not be confirmed; "
-            "inspect your sessions before creating another; do not automatically retry",
-        }
-    )
+    unconfirmed_creation = {
+        "error": "Session creation could not be confirmed; "
+        "inspect your sessions before creating another. Use sys_session_list's sessions "
+        "results, then sys_session_get_info with a discovered session_id; "
+        "do not automatically retry",
+        "agent_id": agent_id,
+        "title": args.get("title"),
+    }
     create_requested = False
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
@@ -3577,6 +3579,7 @@ async def _execute_session_create(
             )
             if host_id is not None:
                 body["host_id"] = host_id
+                unconfirmed_creation["host_id"] = host_id
             create_requested = True
             resp = await post_on_host(
                 server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
@@ -3586,10 +3589,16 @@ async def _execute_session_create(
             resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         if placement != "child" and create_requested:
-            return unconfirmed_creation
+            return json.dumps(unconfirmed_creation)
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
     if placement != "child" and (resp.status_code >= 500 or resp.status_code in (408, 429)):
-        return unconfirmed_creation
+        return json.dumps(unconfirmed_creation)
+    if placement == "same_host":
+        from omnigent.runner.session_requests import is_wrong_replica
+
+        # Host loss can be reported before persistence or during the later launch.
+        if is_wrong_replica(resp) or resp.status_code == 409:
+            return json.dumps(unconfirmed_creation)
     if placement != "child" and resp.status_code in (404, 405):
         return json.dumps(
             {
@@ -3614,11 +3623,11 @@ async def _execute_session_create(
             raise ValueError("Expected a session object")
     except ValueError:
         if placement != "child":
-            return unconfirmed_creation
+            return json.dumps(unconfirmed_creation)
         return json.dumps({"error": "server did not return a child session id"})
     if not isinstance(data.get("id"), str) or not data["id"]:
         if placement != "child":
-            return unconfirmed_creation
+            return json.dumps(unconfirmed_creation)
         return json.dumps({"error": "server did not return a child session id"})
     if placement != "child":
         handle: dict[str, object] = {

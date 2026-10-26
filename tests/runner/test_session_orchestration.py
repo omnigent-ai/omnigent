@@ -187,16 +187,21 @@ async def test_same_host_first_task_failure_returns_created_session(status):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("placement", ["same_host", "managed"])
 @pytest.mark.parametrize(
-    "failure", ["timeout", "non_json", "null", "list", "missing_id", "invalid_id", 408, 429, 503]
+    "placement,reserves_host", [("same_host", False), ("managed", False), ("managed", True)]
 )
-async def test_independent_creation_uncertain_result_is_not_retried(placement, failure):
+@pytest.mark.parametrize(
+    "failure",
+    ["timeout", "non_json", "null", "list", "missing_id", "invalid_id", 408, 429, 503],
+)
+async def test_independent_creation_uncertain_result_is_not_retried(
+    placement, reserves_host, failure
+):
     requests = []
 
     def respond(request):
         if request.url.path == "/v1/info":
-            return httpx.Response(200, json={"request_managed_sandbox_host_id": True})
+            return httpx.Response(200, json={"request_managed_sandbox_host_id": reserves_host})
         requests.append(request)
         assert request.url.path == "/v1/sessions/orchestrated"
         if isinstance(failure, int):
@@ -219,7 +224,12 @@ async def test_independent_creation_uncertain_result_is_not_retried(placement, f
             await execute_tool(
                 tool_name="sys_session_create",
                 arguments=json.dumps(
-                    {"agent_id": "worker", "placement": placement, "message": "Start"}
+                    {
+                        "agent_id": "worker",
+                        "placement": placement,
+                        "message": "Start",
+                        "title": "Review worker",
+                    }
                 ),
                 server_client=client,
                 conversation_id=uuid4().hex,
@@ -228,6 +238,14 @@ async def test_independent_creation_uncertain_result_is_not_retried(placement, f
     assert "creation could not be confirmed" in result["error"]
     assert "inspect your sessions before creating another" in result["error"]
     assert "do not automatically retry" in result["error"]
+    assert "sys_session_list" in result["error"]
+    assert "sys_session_get_info" in result["error"]
+    assert result["agent_id"] == "worker"
+    assert result["title"] == "Review worker"
+    if reserves_host:
+        assert result["host_id"] == json.loads(requests[0].content)["host_id"]
+    else:
+        assert "host_id" not in result
     assert "conversation_id" not in result
     assert len(requests) == 1
 
@@ -257,15 +275,41 @@ async def test_managed_create_info_failure_does_not_attempt_creation():
 
 
 @pytest.mark.asyncio
-async def test_message_routing_accepts_null_snapshot_labels():
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "success",
+        "lookup_http_error",
+        "lookup_timeout",
+        "lookup_invalid_json",
+        "send_timeout",
+        "hop_limit",
+    ],
+)
+async def test_message_routing_lookup_and_keyless_delivery(outcome):
     requests = []
+    lookups = []
 
     def respond(request):
         if request.method == "GET":
-            return httpx.Response(200, json={"labels": None})
+            lookups.append(request)
+            if outcome == "lookup_http_error":
+                return httpx.Response(503)
+            if outcome == "lookup_timeout":
+                raise httpx.ReadTimeout("Lookup failed")
+            if outcome == "lookup_invalid_json":
+                return httpx.Response(200, text="Not a snapshot")
+            return httpx.Response(
+                200,
+                json={"labels": None, "parent_session_id": uuid4().hex}
+                if outcome == "hop_limit"
+                else {"labels": None},
+            )
         requests.append(request)
         if len(requests) == 1:
             return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        if outcome in {"send_timeout", "hop_limit"}:
+            raise httpx.ReadTimeout("Keyless delivery is uncertain")
         return httpx.Response(202, json={"queued": True})
 
     async with httpx.AsyncClient(
@@ -279,8 +323,16 @@ async def test_message_routing_accepts_null_snapshot_labels():
                 conversation_id=uuid4().hex,
             )
         )
-    assert result == {"queued": True}
-    assert len(requests) == 2
+    assert len(lookups) == (16 if outcome == "hop_limit" else 1)
+    if outcome.startswith("lookup_"):
+        assert result["error"] == "Message not delivered: target host could not be resolved"
+        assert len(requests) == 1
+    else:
+        assert len(requests) == 2
+        if outcome == "success":
+            assert result == {"queued": True}
+        else:
+            assert "do not automatically resend" in result["error"]
 
 
 @pytest.mark.asyncio

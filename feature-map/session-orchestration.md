@@ -18,7 +18,7 @@ workers on its host or a new managed sandbox. This is behind the disabled-by-def
   Side chats and their children also inherit restrictions from the source chain.
   Accepted work, including tasks saved while a worker starts, continues. Making
   the sender private restores eligibility.
-- `scheduled`: newly scheduled runs and their children cannot use the new sends
+- `scheduled`: newly scheduled runs, their forks and children cannot use the new sends
   or independent creates. Ordinary scheduling, child work and reads stay available.
   An owner can still message a long-lived private manager directly.
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
@@ -61,7 +61,12 @@ can supply their own provider through the existing launcher interface.
   orchestration route without falling back to ordinary creation.
   Two ASGI replicas sharing a database verify host routing for root, child and
   side-chat destinations with the production runner client/auth and a simulated
-  ingress. Queue tests check refusal before saving and replay after sharing.
+  ingress. Same-host creation covers root/child managers, inherited host routing,
+  legacy keyless routing and refusal before writes on the wrong replica. A tunnel
+  loss after workspace validation leaves one discoverable worker and reports
+  uncertainty without retrying creation. Queue tests check refusal before saving
+  and replay after sharing. Scheduled-origin tests include full forks after
+  schedule-history deletion.
 - Browser/terminal manual check: send a distinctive task to a second session;
   open its Chat and confirm the source label and result. Ask the manager to
   read it. Share the manager and repeat: the tool must report refusal and the
@@ -80,6 +85,15 @@ can supply their own provider through the existing launcher interface.
   A policy-denied first task also returns an error with the policy reason, while
   retaining the worker ID. Message acknowledgements require a boolean `queued`;
   `queued: false` alone means synchronous handling, not denial.
+- Unconfirmed creation includes the requested agent ID/title and any reserved
+  managed host ID. Use `sys_session_list`'s `sessions` results to discover candidate
+  session IDs, then `sys_session_get_info` to inspect their metadata. A host ID is
+  not a session ID; these hints do not prove creation or uniquely identify a worker.
+  Same-host `wrong_replica`/409 responses can occur before persistence or during
+  launch afterward, so the runner treats them as uncertain and never auto-retries.
+  An early wrong-replica refusal creates no row; a late launch failure may leave
+  one that the owner can inspect. Keyless legacy routing must be configured on
+  the runner; independent creation has no automatic routing fallback.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
 - A shared receiver can continue working but cannot message back while shared.
@@ -101,13 +115,20 @@ can supply their own provider through the existing launcher interface.
   or authenticated provenance. Other users can copy it into ordinary messages.
   V1 deliberately keeps this advisory text instead of adding structured provenance.
 - Admission is the final source check before delivery or saving a startup task.
-  Successfully queued tasks can finish after the sender is shared; replay retains
+  A queued result means acceptance, not execution; destination policy may still
+  deny the task during startup replay. Successfully queued tasks can finish after
+  the sender is shared; replay retains
   normal destination permissions and policy checks. The check and subsequent
   dispatch/save are not one atomic transaction. Unsharing does not erase history.
-- Only an explicit wrong-replica refusal permits a bounded re-address. Timeouts,
+- For peer messages, an explicit wrong-replica refusal permits a bounded re-address.
+  If the subsequent host lookup fails, the task was not delivered. A successful
+  lookup with no host may still attempt legacy keyless delivery; uncertainty on
+  that POST remains uncertain. Timeouts,
   other refusals and unparseable delivery acknowledgements are never retried.
 - Scheduled origin is recorded before launch, cannot be edited by clients, and
-  survives deletion of the schedule. Sessions predating this marker may have no
+  survives deletion of the schedule and full forks. Forking a scheduled run to
+  continue interactively intentionally keeps the orchestration restriction in v1.
+  Sessions predating this marker may have no
   recoverable scheduling origin; their upgrade policy still needs a decision.
 - Existing child creation and `sys_session_send` keep their parent/completion
   semantics. Independent workers use `sys_session_message` for later work.
@@ -115,3 +136,7 @@ can supply their own provider through the existing launcher interface.
   it is disabled. Peer messaging has no additional per-agent opt-in; creation
   retains its existing `spawn` advertisement gate. No schema migration or
   per-owner settings page is needed.
+  V1 treats eligible private agents as delegates across the owner's sessions.
+  Unlike sharing, messaging does not grant another user access, but untrusted
+  content can still influence an agent to steer other owned sessions. Enabling
+  the flag accepts that broader trust; hiding a tool is not authorization.

@@ -17,7 +17,9 @@ class SysSessionMessageTool(Tool):
             "orchestration enabled and a private, non-scheduled sending session, including "
             "its side-chat source chain. The receiver "
             "may be shared: its readers will see your message. It uses normal queue/steering "
-            "behavior without changing parentage or forwarding replies. Check results with "
+            "behavior without changing parentage or forwarding replies. A queued result "
+            "means accepted, not executed; destination policy may still deny it during "
+            "startup replay. Check results with "
             "sys_session_get_info/sys_session_get_history. Do not automatically retry an "
             "uncertain delivery."
         )

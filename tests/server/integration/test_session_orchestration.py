@@ -298,8 +298,9 @@ async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, 
 
 
 @pytest.mark.parametrize("execution_target", ["connected_host", "managed_sandbox"])
+@pytest.mark.parametrize("full_fork", [False, True])
 async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_reads(
-    auth_client, auth_app, peers, db_uri, execution_target
+    auth_client, auth_app, peers, db_uri, execution_target, full_fork
 ):
     from omnigent.server.scheduled.fire import FireDeps, build_on_fire
     from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
@@ -343,6 +344,15 @@ async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_r
     assert labels_at_launch[0][SCHEDULED_TASK_ORIGIN_LABEL_KEY] == task.id
     schedules.delete(task.id)
     assert schedules.list_runs(task.id)[0] == []
+
+    if full_fork:
+        response = await auth_client.post(f"/v1/sessions/{scheduled_id}/fork", json={})
+        assert response.status_code == 201, response.text
+        scheduled_id = response.json()["id"]
+        assert (
+            conversations.get_conversation(scheduled_id).labels[SCHEDULED_TASK_ORIGIN_LABEL_KEY]
+            == task.id
+        )
 
     scheduled = {"id": scheduled_id}
     auth_client.headers.update(_bind_runner(db_uri, scheduled_id))
@@ -946,3 +956,131 @@ async def test_managed_create_is_addressed_before_provisioning(
         pending[0].data.content[0]["text"] == f"[Message from session {source['id']}]\nFirst task"
     )
     await stack.tunnel_replica.state.startup_inputs.shutdown()
+
+
+@pytest.mark.parametrize("two_replica_stack", ["authenticated"], indirect=True)
+@pytest.mark.parametrize("child_manager", [False, True])
+@pytest.mark.parametrize("routing", ["host", "keyless", "wrong_replica", "disconnect", "offline"])
+async def test_same_host_creation_across_replicas(
+    two_replica_stack, db_uri, monkeypatch, child_manager, routing
+):
+    import httpx
+
+    from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, open_server_client
+    from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
+    from omnigent.runner._entry import _RunnerDatabricksAuth
+    from omnigent.server.routes import _host_launch
+    from tests.server.integration.test_sessions_permissions import _register_online_host
+
+    stack = two_replica_stack
+    for app in (stack.keyless_replica, stack.tunnel_replica):
+        app.state.feature_flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
+    source = await _create_session_as(stack.tunnel_client, "", "alice")
+    headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, source["id"])}
+    host_id = uuid4().hex
+    _register_online_host(stack.tunnel_replica, host_id, "alice")
+    stack.conv_store.set_host_id(source["id"], host_id, workspace="/worker")
+    manager = source
+    if child_manager:
+        response = await stack.tunnel_client.post(
+            "/v1/sessions",
+            headers=headers,
+            json={"agent_id": source["agent_id"], "parent_session_id": source["id"]},
+        )
+        assert response.status_code == 201, response.text
+        manager = response.json()
+        assert stack.conv_store.get_conversation(manager["id"]).host_id is None
+    before = {s.id for s in stack.conv_store.list_conversations().data}
+    launches = []
+
+    def answer_host(connection, payload):
+        frame = decode_host_frame(payload)
+        if isinstance(frame, HostStatFrame):
+            connection.pending_stats[frame.request_id].set_result(
+                {"status": "ok", "exists": True, "type": "directory", "canonical_path": frame.path}
+            )
+            if routing in {"disconnect", "offline"}:
+                # Workspace validation succeeded; the tunnel vanishes before launch.
+                monkeypatch.setattr(
+                    stack.tunnel_replica.state.host_registry, "get", lambda _: None
+                )
+        elif isinstance(frame, HostLaunchRunnerFrame):
+            launches.append(frame)
+            connection.pending_launches[frame.request_id].set_result({"status": "launched"})
+        else:
+            pytest.fail(f"Unexpected host frame: {frame}")
+
+    monkeypatch.setattr(stack.tunnel_replica.state.host_registry, "send_text", answer_host)
+    monkeypatch.setattr(_host_launch, "_host_sharded", routing != "offline")
+    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "0" if routing == "keyless" else "1")
+    monkeypatch.setenv("OMNIGENT_RUNNER_SLICE_KEY", host_id)
+    transports = [
+        httpx.ASGITransport(app=app) for app in (stack.keyless_replica, stack.tunnel_replica)
+    ]
+    posts = []
+
+    async def ingress(request):
+        key = request.headers.get(OMNIGENT_SLICE_KEY_HEADER)
+        on_target = key is None if routing in {"keyless", "wrong_replica"} else key == host_id
+        response = await transports[int(on_target)].handle_async_request(request)
+        await response.aread()
+        if request.method == "POST":
+            posts.append((key, response.status_code))
+        return response
+
+    async with open_server_client(
+        "http://sharded",
+        headers=headers,
+        auth=_RunnerDatabricksAuth(lambda: "test-bearer", "http://sharded"),
+        transport=httpx.MockTransport(ingress),
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": source["agent_id"],
+                        "placement": "same_host",
+                        "title": "Review worker",
+                    }
+                ),
+                server_client=client,
+                conversation_id=manager["id"],
+            )
+        )
+        if routing in {"disconnect", "offline"}:
+            listing = json.loads(
+                await execute_tool(
+                    tool_name="sys_session_list",
+                    arguments="{}",
+                    server_client=client,
+                    conversation_id=manager["id"],
+                )
+            )
+            workers = [s for s in listing["sessions"] if s["title"] == result["title"]]
+            assert len(workers) == 1
+            recovered = json.loads(
+                await execute_tool(
+                    tool_name="sys_session_get_info",
+                    arguments=json.dumps({"session_id": workers[0]["session_id"]}),
+                    server_client=client,
+                    conversation_id=manager["id"],
+                )
+            )
+            assert recovered["agent_id"] == result["agent_id"]
+            assert recovered["host_id"] == host_id
+    created = {s.id for s in stack.conv_store.list_conversations().data} - before
+    assert len(posts) == 1
+    if routing in {"wrong_replica", "disconnect", "offline"}:
+        assert "do not automatically retry" in result["error"], result
+        assert posts == [(host_id, 409 if routing == "offline" else 400)]
+        assert len(created) == (0 if routing == "wrong_replica" else 1)
+        assert launches == []
+    else:
+        assert "error" not in result, result
+        assert posts == [(None if routing == "keyless" else host_id, 201)]
+        assert created == {result["conversation_id"]}
+        worker = stack.conv_store.get_conversation(result["conversation_id"])
+        assert worker.parent_conversation_id is None
+        assert worker.host_id == host_id and worker.workspace == "/worker"
+        assert len(launches) == 1 and launches[0].session_id == worker.id

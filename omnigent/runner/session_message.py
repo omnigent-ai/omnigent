@@ -35,7 +35,12 @@ async def execute_message_tool(
         headers = {ORCHESTRATION_SOURCE_HEADER: source_id}
         response = await client.post(path, headers=headers, json=payload, timeout=60)
         if is_wrong_replica(response):
-            host_id = await session_host_id(client, target)
+            try:
+                host_id = await session_host_id(client, target)
+            except (httpx.HTTPError, ValueError):
+                return json.dumps(
+                    {"error": "Message not delivered: target host could not be resolved"}
+                )
             response = await post_on_host(
                 client, path, host_id=host_id, headers=headers, json=payload, timeout=60
             )

@@ -992,6 +992,7 @@ def register_core_routes(
         if body.requested_host_id is not None:
             await _check_requested_host_id(request, body.requested_host_id, user_id)
         if orchestration_source is not None:
+            # Recheck source permissions and placement after asynchronous validation.
             source = await asyncio.to_thread(
                 require_orchestration_source,
                 request,
