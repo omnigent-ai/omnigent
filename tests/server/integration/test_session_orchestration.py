@@ -9,7 +9,10 @@ from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.feature_flags import Feature, FeatureFlags
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+)
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.integration.test_managed_startup_inputs import auth_app as auth_app
@@ -196,6 +199,85 @@ async def test_child_inherits_source_sharing(auth_client, peers, db_uri):
     permissions.grant("bob", source["id"], LEVEL_READ)
     captured.clear()
     assert "Shared sessions cannot" in (await _send(auth_client, child, target))["detail"]
+    assert not captured.get("posts")
+
+
+@pytest.mark.parametrize("descendant", ["side_chat", "nested_side_chat", "child"])
+@pytest.mark.parametrize("share", ["source", "side_chat"])
+async def test_side_chat_inherits_sharing_for_new_controls(
+    auth_client, peers, db_uri, descendant, share
+):
+    source, target, captured = peers
+    response = await auth_client.post(
+        f"/v1/sessions/{source['id']}/fork", json={"side_chat": True}
+    )
+    assert response.status_code == 201, response.text
+    side = response.json()
+    _bind_runner(db_uri, side["id"])
+    manager = side
+    if descendant != "side_chat":
+        response = await auth_client.post(
+            f"/v1/sessions/{side['id']}/fork"
+            if descendant == "nested_side_chat"
+            else "/v1/sessions",
+            json={"side_chat": True}
+            if descendant == "nested_side_chat"
+            else {"agent_id": side["agent_id"], "parent_session_id": side["id"]},
+        )
+        assert response.status_code == 201, response.text
+        manager = response.json()
+        if descendant == "nested_side_chat":
+            _bind_runner(db_uri, manager["id"])
+    assert (await _send(auth_client, manager, target)).get("queued") is True
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    shared_id = source["id"] if share == "source" else side["id"]
+    permissions.grant("bob", shared_id, LEVEL_READ)
+    store = SqlAlchemyConversationStore(db_uri)
+    before_sessions = {s.id for s in store.list_conversations().data}
+    before_grants = permissions.list_for_user("alice")
+    captured.clear()
+    assert "Shared sessions cannot" in (await _send(auth_client, manager, target))["detail"]
+    for placement in ("same_host", "managed"):
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": side["agent_id"], "placement": placement}),
+                server_client=auth_client,
+                conversation_id=manager["id"],
+            )
+        )
+        assert "Shared sessions cannot" in result["detail"], result
+    assert not captured.get("posts")
+    assert {s.id for s in store.list_conversations().data} == before_sessions
+    assert permissions.list_for_user("alice") == before_grants
+    # Sharing restricts new controls, not existing owner reads or incoming work.
+    history = await auth_client.get(f"/v1/sessions/{manager['id']}/items")
+    assert history.status_code == 200, history.text
+    _bind_runner(db_uri, target["id"])
+    assert (await _send(auth_client, target, manager)).get("queued") is True
+    permissions.revoke("bob", shared_id)
+    assert (await _send(auth_client, manager, target)).get("queued") is True
+
+
+@pytest.mark.parametrize("source_link", ["missing", "cycle"])
+async def test_side_chat_requires_resolvable_source(auth_client, peers, db_uri, source_link):
+    source, target, captured = peers
+    response = await auth_client.post(
+        f"/v1/sessions/{source['id']}/fork", json={"side_chat": True}
+    )
+    assert response.status_code == 201, response.text
+    side = response.json()
+    _bind_runner(db_uri, side["id"])
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_labels(
+        side["id"],
+        {SIDE_CHAT_SOURCE_LABEL_KEY: side["id"] if source_link == "cycle" else uuid4().hex},
+    )
+    captured.clear()
+    assert (
+        "Session is not owned or available" in (await _send(auth_client, side, target))["detail"]
+    )
     assert not captured.get("posts")
 
 

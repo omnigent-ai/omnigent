@@ -13,7 +13,12 @@ from omnigent.runner.identity import (
 from omnigent.server.auth import LEVEL_OWNER
 from omnigent.server.feature_flags import Feature
 from omnigent.server.schemas import SessionStartupInput
-from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY, ConversationStore
+from omnigent.stores.conversation_store import (
+    SCHEDULED_TASK_ORIGIN_LABEL_KEY,
+    SIDE_CHAT_LABEL_KEY,
+    SIDE_CHAT_SOURCE_LABEL_KEY,
+    ConversationStore,
+)
 from omnigent.stores.permission_store import PermissionStore
 from omnigent.util.session_lifecycle import is_session_closed
 
@@ -55,6 +60,11 @@ def require_owned_session(
                     "Shared sessions cannot send messages or launch independent sessions",
                     code=ErrorCode.FORBIDDEN,
                 )
+            if current.labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+                # Side chats keep their own grants but inherit source restrictions.
+                source_id = current.labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
+                current = conversations.get_conversation(source_id) if source_id else None
+                continue
         assert session is not None
         return session
     raise OmnigentError("Session is not owned or available", code=ErrorCode.FORBIDDEN)

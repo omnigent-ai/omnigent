@@ -346,3 +346,56 @@ def test_private_manager_launch_send_read_and_sharing(
                     ]
                 }
                 assert after_scheduled == before_managed | {scheduled}
+
+                fork = client.post(
+                    f"/v1/sessions/{manager}/fork",
+                    json={"side_chat": True, "title": "Private side chat"},
+                )
+                assert fork.status_code == 201, fork.text
+                side_chat = fork.json()["id"]
+                grants = client.get(f"/v1/sessions/{side_chat}/permissions").json()["permissions"]
+                assert [g["user_id"] for g in grants] == ["local"]
+                bound = client.patch(
+                    f"/v1/sessions/{side_chat}",
+                    json={"runner_id": client.get(f"/v1/sessions/{manager}").json()["runner_id"]},
+                )
+                assert bound.status_code == 200, bound.text
+                configure(
+                    "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK_SIDE_CHAT",
+                    [
+                        {
+                            "tool_calls": [
+                                tool(
+                                    "sys_session_message",
+                                    {
+                                        "session_id": worker,
+                                        "message": "SIDE_CHAT_MUST_NOT_DELIVER",
+                                    },
+                                    "side-chat-message",
+                                )
+                            ]
+                        },
+                        {"text": "SIDE_CHAT_BLOCKED"},
+                    ],
+                )
+                send(side_chat, "MANAGER_SEND_READ_CREATE_MANAGED_BLOCK_SIDE_CHAT")
+                wait_text(side_chat, "SIDE_CHAT_BLOCKED")
+                assert "SIDE_CHAT_MUST_NOT_DELIVER" not in json.dumps(items(worker))
+                # Native tool results reach the model without entering the UI transcript.
+                side_chat_results = [
+                    entry
+                    for request in get_mock_requests(mock)
+                    for entry in request.get("input", request.get("messages", []))
+                    if isinstance(entry, dict)
+                    and (
+                        (
+                            entry.get("type") == "function_call_output"
+                            and entry.get("call_id") == "side-chat-message"
+                        )
+                        or (
+                            entry.get("role") == "tool"
+                            and entry.get("tool_call_id") == "side-chat-message"
+                        )
+                    )
+                ]
+                assert "Shared sessions cannot" in json.dumps(side_chat_results)

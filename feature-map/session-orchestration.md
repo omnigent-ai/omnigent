@@ -15,6 +15,7 @@ workers on its host or a new managed sandbox. This is behind the disabled-by-def
   and `managed` placements create independent, initially private sessions.
   Managed creation uses the server's configured default sandbox provider.
 - `sharing`: sharing the sender blocks subsequent sends and independent creates.
+  Side chats and their children also inherit restrictions from the source chain.
   Accepted work, including tasks saved while a worker starts, continues. Making
   the sender private restores eligibility.
 - `scheduled`: newly scheduled runs and their children cannot use the new sends
@@ -85,13 +86,16 @@ can supply their own provider through the existing launcher interface.
   session on the same runner can be named as the source. Stable-ID runner pools
   using allow-listed tunnel tokens are unsupported;
   this gate requires token-derived runner IDs and refuses other bindings.
-- Side chats currently use their own sharing permissions; copied history from
-  a shared source is not a privacy restriction. Whether to inherit source-sharing
-  restrictions is an open product decision before activation.
+- Side chats must be private and have a private, owned, available source chain
+  to send work or create independent workers. Nested side chats and their children
+  inherit this restriction. Missing or cyclic source chains are refused. Ordinary
+  reads and incoming work remain available; making the source private restores
+  eligibility without erasing copied history.
 - Peer messages carry only task text and owner attribution. They do not forward
   per-event model/tool overrides or a caller-supplied delivery ID.
   The textual source prefix is a display hint, not an authorization credential
   or authenticated provenance. Other users can copy it into ordinary messages.
+  V1 deliberately keeps this advisory text instead of adding structured provenance.
 - Admission is the final source check before delivery or saving a startup task.
   Successfully queued tasks can finish after the sender is shared; replay retains
   normal destination permissions and policy checks. The check and subsequent
