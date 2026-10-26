@@ -54,6 +54,7 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         owner="server",
         review_by_release="0.22.0",
         frontend_visible=False,
+        default_enabled=True,
     ),
     FeatureDefinition(
         feature=Feature.AUTOMATIONS_V2,
