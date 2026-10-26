@@ -81,7 +81,13 @@ import { skillInvocationPrefix } from "@/lib/harnessSetup";
 import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
 import { parentIdFromLabels } from "@/lib/sessionHost";
-import { appendReplyQuote, removeReplyQuote, serializeReplyDraft } from "@/lib/replyDraft";
+import {
+  appendReplyQuote,
+  removeReplyQuote,
+  restoreReplyDraft,
+  serializeReplyDraft,
+  snapshotReplyDraft,
+} from "@/lib/replyDraft";
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
@@ -835,7 +841,7 @@ function SideChatComposer({
       )
     ) {
       clearComposer(childId);
-      enqueueMessage(message, outgoing, undefined, childId);
+      enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
       return;
     }
     // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
@@ -900,7 +906,8 @@ function SideChatComposer({
             onEdit={(queueId) => {
               const target = queuedMessages.find((message) => message.queueId === queueId);
               if (!target) return;
-              updateComposer(childId, () => ({ text: target.text, files: target.files ?? [] }));
+              const restored = restoreReplyDraft(target.text, target.replyDraft);
+              updateComposer(childId, () => ({ ...restored, files: target.files ?? [] }));
               dequeueMessage(queueId);
               tailTextareaRef.current?.focus();
             }}

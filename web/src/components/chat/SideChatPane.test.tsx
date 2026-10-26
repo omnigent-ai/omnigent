@@ -931,6 +931,34 @@ describe("side-chat interrupt", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
+  it("restores a queued follow-up's quote when it is edited", () => {
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: {
+          text: "Follow up",
+          files: [],
+          quotes: [{ id: "quote", before: "Earlier answer", text: "Quoted passage" }],
+        },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.queryByRole("textbox", { name: "Reply text before quote 1" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue(
+      "Earlier answer",
+    );
+    expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
+      text: "Follow up",
+      files: [],
+      quotes: [expect.objectContaining({ before: "Earlier answer", text: "Quoted passage" })],
+    });
+    expect(input).toHaveValue("Follow up");
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
   it("queues /compact for a running Codex side chat with Always steer off", () => {
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");

@@ -17661,6 +17661,30 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
   });
 
+  it("drains an idle side chat's queue when a held head is released", async () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+    useChatStore.getState().enqueueMessage("held follow-up", undefined, undefined, "conv_side");
+    useChatStore.setState((s) => ({
+      queuedMessages: s.queuedMessages.map((m) => ({ ...m, waitingForHost: true })),
+    }));
+    side.setState({ sessionStatus: "idle" });
+    await tick();
+    const sidePosts = () =>
+      fetchMock.mock.calls.filter(
+        ([u, init]) =>
+          u === "/v1/sessions/conv_side/events" && (init as RequestInit)?.method === "POST",
+      );
+    expect(sidePosts()).toEqual([]);
+
+    // The release only edits the app-global queue, never the side chat's entry.
+    useChatStore.getState().releaseHostHeldMessages("conv_side");
+    await tick();
+    expect(sidePosts()).toHaveLength(1);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
   it.each(
     ["compaction_completed", "compaction_failed", "pi_compact_unavailable"].flatMap((terminal) =>
       [false, true].map((background) => [terminal, background] as const),

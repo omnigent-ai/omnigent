@@ -2277,9 +2277,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // A send owns the latch, so the queue waits for it — that is the
       // one-message-per-turn contract. Unless the latch is stranded, in which
       // case waiting is forever: clear it so the composer also stops queueing
-      // (`shouldQueueSend` reads the same flag) and drain below. Only the
-      // ACTIVE conversation can wedge like this; `flushBackgroundQueues`
-      // already drives every other queue off the server's own status.
+      // (`shouldQueueSend` reads the same flag) and drain below. Only queues
+      // drained here can wedge like this; `flushBackgroundQueues` drives the
+      // rest off the server's own status.
       if (!sendLatchIsStranded(s)) return;
       // The stranded send still holds this conversation's chain link, so the
       // drain below would park on it for another SEND_CHAIN_MAX_WAIT_MS. Same
@@ -4241,7 +4241,7 @@ function watchEntryQueue(conversationId: string): void {
     entryDrainedQueues.add(conversationId);
   }
 }
-conversationRegistry.subscribe((id) => {
+function scheduleEntryFlush(id: string): void {
   if (!entryDrainedQueues.has(id) || scheduledEntryFlushes.has(id)) return;
   scheduledEntryFlushes.add(id);
   // Defer past the current write so a send's own state changes can't flush twice.
@@ -4251,6 +4251,12 @@ conversationRegistry.subscribe((id) => {
     if (queuedMessages.some((m) => m.conversationId === id)) maybeFlushQueuedHead(id);
     else entryDrainedQueues.delete(id);
   });
+}
+conversationRegistry.subscribe(scheduleEntryFlush);
+// Queue edits (release, delete, reorder, a failed send's return) land on the root, not the entry.
+useChatStore.subscribe((state, previous) => {
+  if (state.queuedMessages === previous.queuedMessages) return;
+  for (const id of entryDrainedQueues) scheduleEntryFlush(id);
 });
 // Without a live entry there's no status to watch; the background flush takes over.
 conversationRegistry.subscribeDisposed((id) => entryDrainedQueues.delete(id));
