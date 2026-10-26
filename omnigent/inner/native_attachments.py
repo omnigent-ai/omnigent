@@ -661,7 +661,7 @@ def _attachment_response_evidence(response: httpx.Response) -> dict[str, object]
         return evidence
     try:
         payload = response.json()
-    except ValueError:
+    except (ValueError, RecursionError):
         evidence["response_kind"] = "non_json" if response.content else "empty"
         return evidence
     error = payload.get("error") if isinstance(payload, dict) else None
