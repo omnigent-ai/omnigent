@@ -8542,22 +8542,25 @@ def resolve_launch_effort_level(claude_args: tuple[str, ...]) -> str | None:
     Return the effort the wrapped ``claude`` will run at for ``claude_args``.
 
     The last pass-through ``--effort`` wins, as for Claude itself, when it
-    names a valid effort; otherwise fall back to :func:`read_user_effort_level`.
+    names a valid effort in any case; otherwise fall back to
+    :func:`read_user_effort_level`.
 
     :param claude_args: Pass-through Claude CLI args, e.g.
         ``("--effort", "xhigh")``.
     :returns: A recognized effort, e.g. ``"xhigh"``; ``None`` when neither
         the args nor ``~/.claude/settings.json`` carry a valid one.
     """
-    effort: str | None = None
+    effort = ""
     # Unlike _arg_value, keep an empty or flag-like last value: Claude takes
     # the token after --effort as its value and ignores earlier occurrences.
     tokens = iter(claude_args)
     for arg in tokens:
         if arg == "--effort":
-            effort = next(tokens, None)
+            effort = next(tokens, "")
         elif arg.startswith("--effort="):
             effort = arg.removeprefix("--effort=")
+    # Claude trims and lowercases the value before validating it.
+    effort = effort.strip().lower()
     if effort in CLAUDE_EFFORTS:
         return effort
     return read_user_effort_level()
