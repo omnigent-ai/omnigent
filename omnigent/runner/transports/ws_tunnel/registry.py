@@ -107,6 +107,8 @@ class RunnerSession:
     :param close_reason: Reason accompanying ``close_code``.
     :param peer_close_reason: Reason in the runner's own close frame, e.g.
         ``RUNNER_IDLE_SHUTDOWN_CLOSE_REASON``; ``None`` until the runner closes.
+    :param peer_close_code: Close code the socket reported when the runner's side
+        ended, e.g. ``1006`` for an abnormal drop; ``None`` until it ends.
     :param diagnostics: Timing observations owned by this connection's socket loop.
     """
 
@@ -128,6 +130,7 @@ class RunnerSession:
     close_code: int | None = None
     close_reason: str | None = None
     peer_close_reason: str | None = None
+    peer_close_code: int | None = None
     diagnostics: TunnelDiagnostics = field(default_factory=TunnelDiagnostics)
 
 

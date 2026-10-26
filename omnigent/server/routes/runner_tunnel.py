@@ -670,6 +670,7 @@ def create_runner_tunnel_router(
             shutdown_state.note_tunnel_close_code(getattr(exc, "code", None))
             if session is not None:
                 session.peer_close_reason = getattr(exc, "reason", None) or None
+                session.peer_close_code = getattr(exc, "code", None)
             close_code = getattr(exc, "code", None)
             # A normal or going-away close (idle shutdown, host restart) is expected.
             _logger.log(

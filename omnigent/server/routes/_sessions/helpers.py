@@ -4937,6 +4937,7 @@ def _publish_status(
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
     failure_context: object = None,
+    disconnect_evidence: Mapping[str, str] | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4971,6 +4972,8 @@ def _publish_status(
         undifferentiated signature. Ignored for non-failed edges.
     :param failure_context: Untrusted optional native evidence, normalized at
         the failure-log boundary. Malformed values cannot reject the status edge.
+    :param disconnect_evidence: Flat string attributes describing the runner
+        drop that caused a ``"failed"`` edge, logged on the failure row only.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -5047,6 +5050,7 @@ def _publish_status(
                 response_id=response_id,
                 cached_background_task_count=_session_background_task_count_cache.get(session_id),
                 **failure_log_attributes(failure_context),
+                **(disconnect_evidence or {}),
             ),
         )
         session_live_state.persist_scheduled_run_completion(
