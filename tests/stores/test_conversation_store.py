@@ -2133,6 +2133,91 @@ def test_list_conversations_search_snippet_uses_earliest_match(
     assert "second mention" not in snippet
 
 
+def _append_user_text(
+    store: SqlAlchemyConversationStore, conversation_id: str, text: str, response_id: str
+) -> None:
+    store.append(
+        conversation_id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id=response_id,
+                data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+            )
+        ],
+    )
+
+
+@pytest.mark.parametrize("where", ["title", "content"])
+@pytest.mark.parametrize(
+    ("query", "matching_text", "decoy_text"),
+    [
+        ("%", "literal 50% later", "innocent prose"),
+        ("50%", "literal 50% later", "innocent 50 later"),
+        ("_", "open file_name", "innocent prose"),
+        ("file_name", "open file_name", "open fileXname"),
+        ("!", "deploy it now!", "deploy it now"),
+        ("\\", "path C:\\temp done", "path C:temp done"),
+        ("C:\\temp", "path C:\\temp done", "path C:temp done"),
+    ],
+    ids=[
+        "percent",
+        "percent-in-word",
+        "underscore",
+        "underscore-in-word",
+        "escape-char",
+        "backslash",
+        "backslash-in-path",
+    ],
+)
+def test_list_conversations_search_treats_like_metacharacters_literally(
+    conversation_store: SqlAlchemyConversationStore,
+    where: str,
+    query: str,
+    matching_text: str,
+    decoy_text: str,
+) -> None:
+    """
+    ``%``, ``_`` and ``\\`` in ``search_query`` match themselves in titles and chat
+    content, never as LIKE wildcards or escapes; a content hit's snippet contains the query.
+    """
+    matching = conversation_store.create_conversation()
+    decoy = conversation_store.create_conversation()
+    if where == "title":
+        conversation_store.update_conversation(matching.id, title=matching_text)
+        conversation_store.update_conversation(decoy.id, title=decoy_text)
+    else:
+        conversation_store.update_conversation(matching.id, title="Matching session")
+        conversation_store.update_conversation(decoy.id, title="Decoy session")
+        _append_user_text(conversation_store, matching.id, matching_text, "resp_match")
+        _append_user_text(conversation_store, decoy.id, decoy_text, "resp_decoy")
+
+    by_id = {c.id: c for c in conversation_store.list_conversations(search_query=query).data}
+    assert matching.id in by_id, "literal match should be included"
+    assert decoy.id not in by_id, "wildcard-only look-alike must be excluded"
+    snippet = by_id[matching.id].search_snippet
+    if where == "content":
+        assert snippet is not None
+        assert query.lower() in snippet.lower()
+    else:
+        assert snippet is None
+
+
+def test_list_conversations_search_snippet_comes_from_the_literal_match(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """The snippet comes from the literal match, not from an earlier wildcard-only turn."""
+    conv = conversation_store.create_conversation()
+    _append_user_text(conversation_store, conv.id, "innocent first", "resp_first")
+    _append_user_text(conversation_store, conv.id, "literal 50% later", "resp_later")
+
+    by_id = {c.id: c for c in conversation_store.list_conversations(search_query="%").data}
+    assert conv.id in by_id
+    snippet = by_id[conv.id].search_snippet
+    assert snippet is not None
+    assert "50%" in snippet
+
+
 def test_list_conversations_excludes_archived_by_default(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
