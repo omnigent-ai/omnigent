@@ -1248,11 +1248,13 @@ export interface ChatActions {
    */
   steerAllQueuedMessages: (conversationId: string) => void;
   /**
-   * Drop all queued messages for a conversation. Called when a conversation is
-   * deleted so its queue can't linger in memory (it would never flush — you
-   * can't be bound to a deleted session).
+   * Drop and return all queued messages for a conversation. Called when a
+   * conversation is deleted so its queue can't linger in memory (it would never
+   * flush — you can't be bound to a deleted session), or a side chat closes.
    */
-  clearQueuedMessages: (conversationId: string) => void;
+  clearQueuedMessages: (conversationId: string) => QueuedMessage[];
+  /** Put back messages taken by `clearQueuedMessages`, ahead of any queued since. */
+  restoreQueuedMessages: (messages: QueuedMessage[]) => void;
   /**
    * Flush the queue head if the session is idle and ready. Level-triggered:
    * safe to call on any state change (idempotent — no-ops when busy, when the
@@ -2245,12 +2247,30 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   clearQueuedMessages: (conversationId) => {
+    const removed = get().queuedMessages.filter((m) => m.conversationId === conversationId);
+    if (removed.length === 0) return removed;
+    setActive((s) => ({
+      queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
+    }));
+    return removed;
+  },
+
+  restoreQueuedMessages: (messages) => {
+    const conversationId = messages[0]?.conversationId;
+    if (conversationId === undefined) return;
     setActive((s) => {
-      if (!s.queuedMessages.some((m) => m.conversationId === conversationId)) return {};
+      const at = s.queuedMessages.findIndex((m) => m.conversationId === conversationId);
+      const index = at === -1 ? s.queuedMessages.length : at;
       return {
-        queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
+        queuedMessages: [
+          ...s.queuedMessages.slice(0, index),
+          ...messages,
+          ...s.queuedMessages.slice(index),
+        ],
       };
     });
+    // Re-arm the side-chat watcher that dropped this queue when it emptied.
+    get().maybeFlushQueuedHead(conversationId);
   },
 
   maybeFlushQueuedHead: (targetId) => {
@@ -4255,7 +4275,7 @@ useChatStore.subscribe((state, previous) => {
   if (state.queuedMessages === previous.queuedMessages) return;
   for (const id of entryDrainedQueues) scheduleEntryFlush(id);
 });
-// Without a live entry there's no status to watch; the background flush takes over.
+// Without a live entry there's no status to watch; the queue waits until the side chat reopens.
 conversationRegistry.subscribeDisposed((id) => entryDrainedQueues.delete(id));
 
 type NativeModelFamily = "claude" | "codex";

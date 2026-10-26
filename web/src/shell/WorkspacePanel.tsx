@@ -1081,10 +1081,13 @@ function WorkspacePanelImpl({
       />
     );
   const closeSideChat = async (childId: string) => {
+    // Take the queue first so the stop's idle status can't send it to the closing chat.
+    const queued = useChatStore.getState().clearQueuedMessages(childId);
     if (!childId.startsWith("pending:")) {
       try {
         await stopSession(childId);
       } catch {
+        useChatStore.getState().restoreQueuedMessages(queued);
         toast.error("Couldn't close side chat. Try again.");
         return;
       }

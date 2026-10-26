@@ -17685,6 +17685,35 @@ describe("chatStore — client-side message queue", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
+  it("restores a taken side-chat queue ahead of newer follow-ups and drains it", async () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+    useChatStore.getState().enqueueMessage("first follow-up", undefined, undefined, "conv_side");
+    const taken = useChatStore.getState().clearQueuedMessages("conv_side");
+    await tick();
+    useChatStore.setState((s) => ({
+      queuedMessages: [
+        ...s.queuedMessages,
+        { queueId: "q_newer", text: "newer follow-up", conversationId: "conv_side" },
+      ],
+    }));
+
+    useChatStore.getState().restoreQueuedMessages(taken);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "first follow-up",
+      "newer follow-up",
+    ]);
+    side.setState({ sessionStatus: "idle" });
+    await tick();
+    const sidePosts = fetchMock.mock.calls.filter(
+      ([u, init]) =>
+        u === "/v1/sessions/conv_side/events" && (init as RequestInit)?.method === "POST",
+    );
+    expect(sidePosts).toHaveLength(1);
+    expect(String((sidePosts[0][1] as RequestInit).body)).toContain("first follow-up");
+  });
+
   it.each(
     ["compaction_completed", "compaction_failed", "pi_compact_unavailable"].flatMap((terminal) =>
       [false, true].map((background) => [terminal, background] as const),

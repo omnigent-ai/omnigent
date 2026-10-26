@@ -334,7 +334,9 @@ example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
 chat with its tab's close button; the parent and sibling chats keep running.
 While a side chat works, typing a follow-up turns Interrupt into Send, which
-queues or steers it as the main composer does; Escape still interrupts. A
+queues or steers it as the main composer does; Escape still interrupts. Its queue
+strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
+Closing the side chat discards its queued follow-ups. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
 without choosing a workspace. The side-chat composer opens the same `/` menu
 affordance as the main composer but with a narrower set — `/help` and the
