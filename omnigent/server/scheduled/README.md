@@ -222,7 +222,7 @@ session exists, the row's `session_id` links the run to its session events.
 | Event | Logged when | Extra attributes |
 | --- | --- | --- |
 | `scheduled_run_claimed` | This server claimed a due occurrence. | `target`, `host_id`, `claim_delay_seconds` |
-| `scheduled_run_claim_skipped` | The occurrence was already claimed or the task changed. | `target` (no run) |
+| `scheduled_run_claim_skipped` | The claim did not apply: the occurrence was already claimed, or the task was edited, paused, or deleted after it was listed. | `target` (no run) |
 | `scheduled_run_session_attached` | The executor recorded the fired session. | `target`, `session_delay_seconds` |
 | `scheduled_run_startup_ended` | Startup ended on the executing server. | `target`, `outcome`, `error_code`, `prompt_delay_seconds` |
 | `scheduled_run_recovered` | Recovery inspected an expired startup. | `outcome` |
@@ -231,16 +231,25 @@ session exists, the row's `session_id` links the run to its session events.
 `startup_ended` outcomes are `running`, `failed`, or `skipped` from the executor, or
 `lease_lost`, `interrupted`, `unfinished`, or `cancelled` when startup ended
 without a result. Recovery outcomes are `running`, `failed`, `uncertain`,
-`superseded` (another server recorded a result first), `timeout`, or `error`.
-Operations are `poll`, `initialize`, `claim`, `recovery`, `cleanup`, and
-`lease_renewal`. Delays are seconds from the scheduled time.
+`superseded` (the run was no longer the expired startup recovery inspected),
+`timeout`, or `error`. Operations are `poll`, `initialize`, `claim`, `recovery`,
+`cleanup`, and `lease_renewal`. Delays are seconds from the scheduled time.
+
+Outcomes are logged when the database write commits, so a write that finishes
+after its caller was cancelled or timed out still logs its real result. A run can
+therefore log `timeout` and later `running`. Recovery logs `uncertain` on every
+sweep that cannot decide, so expect several per run.
+
+The sink stores attribute values as strings; cast delays before computing
+percentiles. Attributes whose value is `None`, such as `error_code` or
+`prompt_delay_seconds` on a non-`running` outcome, are omitted rather than stored.
 
 The design's success metrics come from these events:
 
 | Success metric | Calculation |
 | --- | --- |
-| Fire success rate | Distinct `run_id`s whose `startup_ended` or `recovered` outcome is `running` ÷ distinct claimed `run_id`s. Occurrences missed during downtime are never claimed. |
-| Duplicate fires | Claimed `run_id`s per `(task_workspace_id, task_id, scheduled_at)`. The database's unique key keeps this at one; `claim_skipped` shows how often it applies. |
+| Fire success rate | Distinct `run_id`s whose `startup_ended` or `recovered` outcome is `running` ÷ distinct claimed `run_id`s, excluding runs the executor ended as `skipped`. Occurrences missed during downtime are never claimed. |
+| Duplicate fires | Claimed `run_id`s per `(task_workspace_id, task_id, scheduled_at)`. The database's unique key keeps this at one. `claim_skipped` also counts edited, paused, and deleted tasks, so it is not a duplicate count. |
 | Fire delay | p90 of `session_delay_seconds`. To exclude sandbox boot time, the executor must record the session before waiting for the sandbox. |
 | Time to prompt | `prompt_delay_seconds` on `running` outcomes, by `target`. |
 | Fires per day, Arclet vs. pinned host | Claimed runs by `target`. Active tasks and owners come from `scheduled_tasks`. |

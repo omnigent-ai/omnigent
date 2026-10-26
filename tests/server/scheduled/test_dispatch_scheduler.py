@@ -18,7 +18,10 @@ from omnigent.server.scheduled.dispatch_scheduler import (
 )
 from omnigent.server.scheduled.schedule import occurrence_host_id
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
+from tests._helpers.polling import poll_until_async
 from tests.server.scheduled.test_scheduler import FakeClock
+
+_SCHEDULER_LOGGER = "omnigent.server.scheduled.dispatch_scheduler"
 
 
 @pytest.fixture
@@ -40,6 +43,14 @@ def _task(store: SqlAlchemyScheduledTaskStore, seed: str = "task", **kwargs):
         **kwargs,
     )
     return store.get(task.id)
+
+
+def _events(caplog, event_name: str) -> list[dict]:
+    return [
+        {**record.attributes, "session_id": getattr(record, "session_id", None)}
+        for record in caplog.records
+        if getattr(record, "event_name", None) == event_name
+    ]
 
 
 async def _drain(scheduler: PersistentTaskScheduler) -> None:
@@ -418,31 +429,49 @@ async def test_cancelled_lease_write_waiting_for_lock_never_reaches_store(
 
 @pytest.mark.parametrize(
     "interruption",
-    ["lease_loss", "renewal_timeout", "stop", "executor_error", "running_executor_error"],
+    [
+        "lease_loss",
+        "renewal_timeout",
+        "stop",
+        "stop_during_finish",
+        "executor_error",
+        "running_executor_error",
+    ],
 )
 async def test_interrupted_executor_stops_and_preserves_run_state(
     store, monkeypatch, caplog, interruption
 ):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     task = _task(store)
     clock = FakeClock(task.next_run_at)
     entered = asyncio.Event()
     exited = asyncio.Event()
     renewal_blocked = asyncio.Event()
+    finish_blocked = asyncio.Event()
     release = threading.Event()
     leases = []
     loop = asyncio.get_running_loop()
     original_renew = store.renew_starting_run
+    original_transition = store.transition_starting_run
 
     def hanging_renewal(*args, **kwargs):
         loop.call_soon_threadsafe(renewal_blocked.set)
         assert release.wait(10)
         return original_renew(*args, **kwargs)
 
+    def blocked_transition(*args, **kwargs):
+        loop.call_soon_threadsafe(finish_blocked.set)
+        assert release.wait(10)
+        return original_transition(*args, **kwargs)
+
+    if interruption == "stop_during_finish":
+        monkeypatch.setattr(store, "transition_starting_run", blocked_transition)
+
     async def fire(task, lease):
         leases.append(lease)
         entered.set()
         try:
-            if interruption == "running_executor_error":
+            if interruption in {"running_executor_error", "stop_during_finish"}:
                 await lease.finish("running")
             if interruption in {"executor_error", "running_executor_error"}:
                 raise RuntimeError("executor could not complete startup")
@@ -477,16 +506,30 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
             clock.advance(1)
         elif interruption == "stop":
             await asyncio.wait_for(scheduler.stop(), 10)
+        elif interruption == "stop_during_finish":
+            await asyncio.wait_for(finish_blocked.wait(), 10)
+            await asyncio.wait_for(scheduler.stop(), 10)
+            # The shielded write commits after its caller was cancelled.
+            release.set()
+            await asyncio.wait_for(
+                asyncio.gather(*list(leases[0]._writes), return_exceptions=True), 10
+            )
         await asyncio.wait_for(asyncio.gather(*startups, return_exceptions=True), 10)
         assert exited.is_set()
         assert all(startup.cancelled() or startup.exception() is None for startup in startups)
         assert scheduler._startups == {}
         run = store.list_runs(task.id)[0][0]
-        expected_status = "running" if interruption == "running_executor_error" else "starting"
+        expected_status = (
+            "running"
+            if interruption in {"running_executor_error", "stop_during_finish"}
+            else "starting"
+        )
         assert run.status == expected_status
         assert (run.lease_expires_at is None) == (expected_status == "running")
         records = [
-            record for record in caplog.records if record.name.endswith("dispatch_scheduler")
+            record
+            for record in caplog.records
+            if record.name.endswith("dispatch_scheduler") and record.levelno >= logging.WARNING
         ]
         if interruption in {"lease_loss", "renewal_timeout"}:
             assert len(records) == 1
@@ -508,6 +551,19 @@ async def test_interrupted_executor_stops_and_preserves_run_state(
             assert "executor could not complete startup" in caplog.text
             assert records[0].levelno == logging.ERROR
             assert records[0].exc_info is not None
+        expected_outcome = {
+            "lease_loss": "lease_lost",
+            "renewal_timeout": "lease_lost",
+            "stop": "cancelled",
+            "stop_during_finish": "running",
+            "executor_error": "interrupted",
+            "running_executor_error": "running",
+        }[interruption]
+        # A startup that ends with a write in flight is logged once that write settles.
+        await poll_until_async(lambda: _events(caplog, "scheduled_run_startup_ended"))
+        assert [event["outcome"] for event in _events(caplog, "scheduled_run_startup_ended")] == [
+            expected_outcome
+        ]
     finally:
         release.set()
         await scheduler.stop()
@@ -566,7 +622,8 @@ async def test_stop_prevents_a_poll_from_starting_more_work(store, monkeypatch, 
         await scheduler.stop()
 
 
-async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store) -> None:
+async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store, caplog) -> None:
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     task = _task(store)
     clock = FakeClock(task.next_run_at)
     started = asyncio.Event()
@@ -601,6 +658,10 @@ async def test_expiry_cancels_old_executor_and_reconciles_without_refiring(store
         assert reconciled[0].status == "starting"
         assert store.list_runs(task.id)[0][0].status == "failed"
         assert fire_calls == 1
+        assert [e["outcome"] for e in _events(caplog, "scheduled_run_startup_ended")] == [
+            "cancelled"
+        ]
+        assert [e["outcome"] for e in _events(caplog, "scheduled_run_recovered")] == ["failed"]
     finally:
         await scheduler.stop()
 
@@ -688,7 +749,8 @@ async def test_recovery_skips_unowned_hosts_and_ownership_errors(store) -> None:
         await scheduler.stop()
 
 
-async def test_late_recovery_result_cannot_overwrite_another_replica(store, monkeypatch):
+async def test_late_recovery_result_cannot_overwrite_another_replica(store, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     task = _task(store)
     clock = FakeClock(task.next_run_at)
     run = store.claim_scheduled_run(
@@ -742,6 +804,8 @@ async def test_late_recovery_result_cannot_overwrite_another_replica(store, monk
         assert recorded == results[0]
         assert recorded.error is None
         fire.assert_not_awaited()
+        outcomes = [event["outcome"] for event in _events(caplog, "scheduled_run_recovered")]
+        assert outcomes == ["running", "superseded"]
     finally:
         await asyncio.gather(*(scheduler.stop() for scheduler in schedulers))
 
@@ -873,7 +937,9 @@ async def test_expired_cleanup_failure_is_retried_without_another_fire(
     fire.assert_not_awaited()
 
 
-async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, monkeypatch):
+async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(
+    store, monkeypatch, caplog
+):
     monkeypatch.setattr(store, "_cleanup_batch_size", 1)
     deleted = [_task(store, f"deleted-{index}") for index in range(2)]
     for task in deleted:
@@ -959,11 +1025,14 @@ async def test_recovery_retries_discovery_and_resumes_deleted_task_purge(store, 
         assert all(store.get(item.id) is None for item in deleted)
         assert store.list_runs(task.id)[0][0].status == "failed"
         fire.assert_not_awaited()
+        failed = _events(caplog, "scheduled_task_operation_failed")
+        assert [event["operation"] for event in failed] == ["recovery", "cleanup"]
     finally:
         await scheduler.stop()
 
 
 async def test_recovery_timeout_allows_inflight_transition_to_finish(store, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     task = _task(store)
     clock = FakeClock(task.next_run_at)
     store.claim_scheduled_run(
@@ -1007,6 +1076,12 @@ async def test_recovery_timeout_allows_inflight_transition_to_finish(store, monk
         release.set()
         await asyncio.wait_for(committed.wait(), 10)
         assert store.list_runs(task.id)[0][0].status == "running"
+        # The late commit is still logged, after the timeout.
+        await poll_until_async(lambda: len(_events(caplog, "scheduled_run_recovered")) == 2)
+        assert [event["outcome"] for event in _events(caplog, "scheduled_run_recovered")] == [
+            "timeout",
+            "running",
+        ]
         await scheduler.poll_once()
         await _drain(scheduler)
         recover.assert_awaited_once()
@@ -1291,7 +1366,8 @@ async def test_heartbeat_stops_retrying_at_last_confirmed_expiry(store, monkeypa
     assert store.list_runs(task.id)[0] == [run]
 
 
-async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(store):
+async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     tasks = [_task(store, f"expired-{index}") for index in range(3)]
     clock = FakeClock(max(task.next_run_at for task in tasks))
     for task in tasks:
@@ -1338,6 +1414,10 @@ async def test_recovery_pages_leave_time_for_cleanup_and_revisit_uncertain_runs(
             await _drain(scheduler)
             assert recover.await_args.args == (run,)
         assert recover.await_count == 2 * len(runs) + 1
+        # Each inspection that cannot decide logs another uncertain event.
+        uncertain = _events(caplog, "scheduled_run_recovered")
+        assert len(uncertain) == recover.await_count
+        assert {event["outcome"] for event in uncertain} == {"uncertain"}
     finally:
         await scheduler.stop()
 
@@ -1392,20 +1472,12 @@ async def test_restart_after_stop_starts_recovery_scan_from_the_beginning(store)
         await scheduler.stop()
 
 
-def _events(caplog, event_name: str) -> list[dict]:
-    return [
-        {**record.attributes, "session_id": getattr(record, "session_id", None)}
-        for record in caplog.records
-        if getattr(record, "event_name", None) == event_name
-    ]
-
-
 async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog):
     from sqlalchemy import update
 
     from omnigent.db.db_models import SqlScheduledTask
 
-    caplog.set_level(logging.INFO, logger="omnigent.server.scheduled.dispatch_scheduler")
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
     pinned = {"execution_target": "connected_host", "host_id": uuid.uuid4().hex}
     tasks = {
         seed: _task(store, seed, **pinned)
@@ -1429,10 +1501,13 @@ async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog
             .values(next_run_at=duplicate.next_run_at)
         )
     session_id = uuid.uuid4().hex
+    claims_done = asyncio.Event()
 
     async def fire(task, lease):
         if task.name == "delivered":
             await lease.attach_session(session_id)
+            # Advance only after every claim has read the clock.
+            await claims_done.wait()
             clock.advance(3)
             await lease.finish("running")
         elif task.name == "failed":
@@ -1444,6 +1519,7 @@ async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog
     scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now)
     try:
         await scheduler.poll_once()
+        claims_done.set()
         await _drain(scheduler)
         clock.advance(120)
         await scheduler.poll_once()

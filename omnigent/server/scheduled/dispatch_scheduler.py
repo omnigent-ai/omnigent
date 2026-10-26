@@ -34,7 +34,7 @@ def _run_event(event_name: str, run: ScheduledTaskRun, **attributes: object) -> 
     return debug_event(
         event_name,
         session_id=run.conversation_id,
-        # Explicit, so run attributes can never bind to these parameters.
+        # Fails loudly if a run attribute reuses a debug_event parameter name.
         turn_id=None,
         user_id=None,
         task_id=run.scheduled_task_id,
@@ -42,6 +42,21 @@ def _run_event(event_name: str, run: ScheduledTaskRun, **attributes: object) -> 
         task_workspace_id=run.workspace_id,
         scheduled_at=run.scheduled_at,
         **attributes,
+    )
+
+
+def _log_recovery_result(
+    run: ScheduledTaskRun, status: str, transition: asyncio.Future[ScheduledTaskRun | None]
+) -> None:
+    if transition.cancelled() or transition.exception() is not None:
+        return  # The awaiting sweep logs errors; a later sweep retries the run.
+    # None means the run was no longer the expired startup recovery inspected.
+    outcome = status if transition.result() is not None else "superseded"
+    _logger.info(
+        "Recovery recorded outcome %s for run %s",
+        outcome,
+        run.id,
+        extra=_run_event("scheduled_run_recovered", run, outcome=outcome),
     )
 
 
@@ -86,19 +101,22 @@ class StartupLease:
     async def attach_session(self, conversation_id: str) -> None:
         """Persist the session before dispatch so crash recovery can inspect it."""
         first_session = self.run.conversation_id is None
-        await self._transition("starting", conversation_id=conversation_id)
-        if first_session:
-            _logger.info(
-                "Recorded session %s for scheduled run %s",
-                conversation_id,
-                self.run.id,
-                extra=_run_event(
-                    "scheduled_run_session_attached",
-                    self.run,
-                    target=self._target,
-                    session_delay_seconds=_seconds(self._now() - self.run.scheduled_at),
-                ),
-            )
+
+        def log_session() -> None:
+            if first_session:
+                _logger.info(
+                    "Recorded session %s for scheduled run %s",
+                    conversation_id,
+                    self.run.id,
+                    extra=_run_event(
+                        "scheduled_run_session_attached",
+                        self.run,
+                        target=self._target,
+                        session_delay_seconds=_seconds(self._now() - self.run.scheduled_at),
+                    ),
+                )
+
+        await self._transition("starting", conversation_id=conversation_id, committed=log_session)
 
     async def finish(
         self,
@@ -115,24 +133,40 @@ class StartupLease:
                 "Use 'running' after sending the prompt, 'failed' for a known failure, "
                 "or 'skipped' when execution is intentionally skipped."
             )
+
+        def log_outcome() -> None:
+            _logger.info(
+                "Scheduled run %s startup ended with status %s",
+                self.run.id,
+                status,
+                extra=_run_event(
+                    "scheduled_run_startup_ended",
+                    self.run,
+                    target=self._target,
+                    outcome=status,
+                    error_code=error_code,
+                    prompt_delay_seconds=_seconds(self._now() - self.run.scheduled_at)
+                    if status == "running"
+                    else None,
+                ),
+            )
+
         await self._transition(
-            status, conversation_id=conversation_id, error=error, error_code=error_code
-        )
-        _logger.info(
-            "Scheduled run %s startup ended with status %s",
-            self.run.id,
             status,
-            extra=_run_event(
-                "scheduled_run_startup_ended",
-                self.run,
-                target=self._target,
-                outcome=status,
-                error_code=error_code,
-                prompt_delay_seconds=_seconds(self._now() - self.run.scheduled_at)
-                if status == "running"
-                else None,
-            ),
+            conversation_id=conversation_id,
+            error=error,
+            error_code=error_code,
+            committed=log_outcome,
         )
+
+    def when_writes_settle(self, callback: Callable[[], None]) -> None:
+        """Run *callback* once in-flight lease writes finish, or now if there are none."""
+        pending = list(self._writes)
+        if not pending:
+            callback()
+            return
+        settled = asyncio.gather(*pending, return_exceptions=True)
+        settled.add_done_callback(lambda _: callback())
 
     async def _transition(
         self,
@@ -141,6 +175,7 @@ class StartupLease:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
+        committed: Callable[[], None] | None = None,
     ) -> None:
         await self._write(
             lambda: self._store.transition_starting_run(
@@ -150,11 +185,16 @@ class StartupLease:
                 conversation_id=conversation_id,
                 error=error,
                 error_code=error_code,
-            )
+            ),
+            committed=committed,
         )
 
     async def _write(
-        self, operation: Callable[[], ScheduledTaskRun | None], *, renewing: bool = False
+        self,
+        operation: Callable[[], ScheduledTaskRun | None],
+        *,
+        renewing: bool = False,
+        committed: Callable[[], None] | None = None,
     ) -> None:
         async def apply() -> None:
             try:
@@ -174,6 +214,9 @@ class StartupLease:
                         "check the run."
                     )
                 self.run = run
+                # Runs even if the caller was cancelled, so committed outcomes are logged.
+                if committed is not None:
+                    committed()
             finally:
                 self._lock.release()
 
@@ -432,28 +475,29 @@ class PersistentTaskScheduler:
                                         "Expected 'running', 'failed', or None "
                                         "to check again later."
                                     )
-                                recorded = await asyncio.to_thread(
-                                    self._store.transition_starting_run,
-                                    run,
-                                    now=self._now,
-                                    status=status,
-                                    expired=True,
-                                    error="Run startup did not complete before its lease "
-                                    "expired; recovery marked the run as failed."
-                                    if status == "failed"
-                                    else None,
-                                    error_code="startup_expired" if status == "failed" else None,
+                                transition = asyncio.ensure_future(
+                                    asyncio.to_thread(
+                                        self._store.transition_starting_run,
+                                        run,
+                                        now=self._now,
+                                        status=status,
+                                        expired=True,
+                                        error="Run startup did not complete before its lease "
+                                        "expired; recovery marked the run as failed."
+                                        if status == "failed"
+                                        else None,
+                                        error_code="startup_expired"
+                                        if status == "failed"
+                                        else None,
+                                    )
                                 )
-                                # Another server may have recorded a result first.
-                                outcome = status if recorded is not None else "superseded"
-                                _logger.info(
-                                    "Recovery recorded outcome %s for run %s",
-                                    outcome,
-                                    run.id,
-                                    extra=_run_event(
-                                        "scheduled_run_recovered", run, outcome=outcome
-                                    ),
+                                # Logged on completion, even if this sweep times out first.
+                                transition.add_done_callback(
+                                    lambda done, run=run, status=status: _log_recovery_result(
+                                        run, status, done
+                                    )
                                 )
+                                await asyncio.shield(transition)
             except TimeoutError:
                 _logger.warning(
                     "Recovery timed out for run %s; an in-flight database update may "
@@ -508,8 +552,8 @@ class PersistentTaskScheduler:
                         )
                     if run is None:
                         _logger.info(
-                            "Skipped occurrence %s of task %s: it was already claimed "
-                            "or the task changed",
+                            "Skipped occurrence %s of task %s: it was already claimed, "
+                            "or the task changed after it was listed",
                             task.next_run_at,
                             task.id,
                             extra=debug_event(
@@ -595,19 +639,24 @@ class PersistentTaskScheduler:
                 fire.cancel()
                 heartbeat.cancel()
                 await asyncio.gather(fire, heartbeat, return_exceptions=True)
-                if lease.run.status == "starting":
-                    _logger.info(
-                        "Scheduled run %s startup ended without a result (%s); "
-                        "recovery will check it after its lease expires",
-                        lease.run.id,
-                        outcome,
-                        extra=_run_event(
-                            "scheduled_run_startup_ended",
-                            lease.run,
-                            target=task.execution_target,
-                            outcome=outcome,
-                        ),
-                    )
+
+                def log_unfinished() -> None:
+                    if lease.run.status == "starting":
+                        _logger.info(
+                            "Scheduled run %s startup ended without a result (%s); "
+                            "recovery will check it after its lease expires",
+                            lease.run.id,
+                            outcome,
+                            extra=_run_event(
+                                "scheduled_run_startup_ended",
+                                lease.run,
+                                target=task.execution_target,
+                                outcome=outcome,
+                            ),
+                        )
+
+                # A cancelled finish can still commit; log only if it did not.
+                lease.when_writes_settle(log_unfinished)
 
     async def _fire(self, task: ScheduledTask, lease: StartupLease) -> None:
         await lease.check()
