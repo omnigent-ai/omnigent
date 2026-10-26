@@ -1428,8 +1428,10 @@ async def test_external_session_superseded_leaves_interrupted_entries_hidden(
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
+@pytest.mark.parametrize("tool_use_id", ["toolu_016PwCnwmHv8h7kVpWLVd9YX", None])
 async def test_external_subagent_start_mints_child_session(
     client: httpx.AsyncClient,
+    tool_use_id: str | None,
 ) -> None:
     """
     Posting ``external_subagent_start`` to a claude-native parent
@@ -1456,7 +1458,7 @@ async def test_external_subagent_start_mints_child_session(
                 "subagent_id": "a5c7effac5a9a35ab",
                 "agent_type": "Explore",
                 "description": "Trace the auth flow",
-                "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
+                **({"tool_use_id": tool_use_id} if tool_use_id is not None else {}),
             },
         },
     )
@@ -1486,6 +1488,7 @@ async def test_external_subagent_start_mints_child_session(
     # Description is preserved on the row's labels for surfaces that
     # want it; the rail's row UI ignores ``session_name``.
     assert child["labels"]["omnigent.claude_native.description"] == "Trace the auth flow"
+    assert child["labels"].get("omnigent.claude_native.tool_use_id") == tool_use_id
 
 
 async def test_session_event_batch_is_ordered_and_idempotent(
@@ -2199,8 +2202,10 @@ async def test_external_subagent_start_falls_back_to_the_bare_agent_type(
     assert child["session_name"] == "a361e6a6aa05689cb"
 
 
+@pytest.mark.parametrize("tool_use_id", ["toolu_016PwCnwmHv8h7kVpWLVd9YX", None])
 async def test_external_subagent_start_is_idempotent_on_subagent_id(
     client: httpx.AsyncClient,
+    tool_use_id: str | None,
 ) -> None:
     """
     Two POSTs carrying the same ``subagent_id`` resolve to the same
@@ -2220,7 +2225,7 @@ async def test_external_subagent_start_is_idempotent_on_subagent_id(
             "subagent_id": "a5c7effac5a9a35ab",
             "agent_type": "Explore",
             "description": "Trace the auth flow",
-            "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
+            **({"tool_use_id": tool_use_id} if tool_use_id is not None else {}),
         },
     }
 
@@ -2373,31 +2378,38 @@ async def test_external_subagent_start_idempotency_pages_beyond_first_100(
 
 
 @pytest.mark.parametrize(
-    "missing_key",
-    ["subagent_id", "agent_type", "description", "tool_use_id"],
+    ("invalid_key", "invalid_value"),
+    [
+        ("subagent_id", None),
+        ("agent_type", None),
+        ("description", None),
+        ("tool_use_id", None),
+        ("tool_use_id", ""),
+        ("tool_use_id", 123),
+    ],
 )
-async def test_external_subagent_start_rejects_missing_required_keys(
+async def test_external_subagent_start_rejects_invalid_fields(
     client: httpx.AsyncClient,
-    missing_key: str,
+    invalid_key: str,
+    invalid_value: object,
 ) -> None:
-    """
-    A POST missing any of the four required ``data`` keys returns
-    400 — payload validation is at the route boundary so the handler
-    body always sees a complete record.
-    """
+    """Missing required fields and malformed optional tool IDs return 400."""
     agent = await create_test_agent(client)
     parent = await _create_session(
         client,
         agent["id"],
         labels={"omnigent.wrapper": "claude-code-native-ui"},
     )
-    data = {
+    data: dict[str, object] = {
         "subagent_id": "a5c7effac5a9a35ab",
         "agent_type": "Explore",
         "description": "Trace the auth flow",
         "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
     }
-    data.pop(missing_key)
+    if invalid_key == "tool_use_id":
+        data[invalid_key] = invalid_value
+    else:
+        data.pop(invalid_key)
     resp = await client.post(
         f"/v1/sessions/{parent['id']}/events",
         json={"type": "external_subagent_start", "data": data},
@@ -2405,7 +2417,7 @@ async def test_external_subagent_start_rejects_missing_required_keys(
     assert resp.status_code == 400
     # Error message must name the missing field so the forwarder's
     # logs point at the bug rather than reading "Invalid payload".
-    assert missing_key in resp.text
+    assert invalid_key in resp.text
 
 
 # ── POST /v1/sessions/{id}/events skill slash_command ─────

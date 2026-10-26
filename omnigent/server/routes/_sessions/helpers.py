@@ -3798,7 +3798,7 @@ async def _persist_external_subagent_start(
     Mint a child :class:`Conversation` row for a claude-native
     sub-agent and emit the parent's ``session.created`` SSE event.
 
-    Claude Code spawns sub-agents internally via its Task tool and
+    Claude Code spawns sub-agents internally via tools or forked skills and
     never POSTs to Omnigent to register them. The forwarder watches the
     parent's on-disk ``subagents/`` directory and calls this handler
     when a new ``.meta.json`` appears. We reuse the parent's
@@ -3822,8 +3822,8 @@ async def _persist_external_subagent_start(
     :param body: The POST event body. Required ``data`` keys:
         ``subagent_id`` (Claude-side id, e.g. ``"a5c7eff..."``),
         ``agent_type`` (e.g. ``"Explore"``), ``description``
-        (free-form, used in the title), ``tool_use_id``
-        (e.g. ``"toolu_..."``).
+        (free-form display label). Optional ``tool_use_id`` links a
+        tool-spawned child to its call; forked skills have no tool call.
     :param conversation_store: Store used to read existing children
         (for idempotency) and create the new row.
     :returns: The child conversation id, e.g. ``"conv_child456"``.
@@ -3851,9 +3851,9 @@ async def _persist_external_subagent_start(
             "external_subagent_start requires data.description (string)",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not isinstance(tool_use_id, str) or not tool_use_id:
+    if "tool_use_id" in body.data and (not isinstance(tool_use_id, str) or not tool_use_id):
         raise OmnigentError(
-            "external_subagent_start requires non-empty data.tool_use_id",
+            "external_subagent_start requires non-empty data.tool_use_id when provided",
             code=ErrorCode.INVALID_INPUT,
         )
     if parent_conv.agent_id is None:
@@ -3905,9 +3905,10 @@ async def _persist_external_subagent_start(
     labels = {
         _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
         _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY: subagent_id,
-        _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY: tool_use_id,
         _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY: description,
     }
+    if tool_use_id is not None:
+        labels[_CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY] = tool_use_id
 
     try:
         child = await asyncio.to_thread(

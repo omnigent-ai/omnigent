@@ -54,8 +54,8 @@ implements them separately, so a fix for one harness does not reach the others.
   with its forwarder, helper server and tool relay; the next message brings it
   back with the conversation. Kimi is exempt; live work and open prompts stay.
 - `subagent-discovery`: Claude children appear under the agent that spawned
-  them, including delayed spawns; an unresolved spawn does not keep an idle
-  runner re-reading unchanged conversations.
+  them, including forked slash commands and delayed spawns; an unresolved
+  spawn does not keep an idle runner re-reading unchanged conversations.
 - `disconnect`: startup waits and active operations settle when their native
   connection ends; reconnect can receive fresh events. Distinguish a native
   CLI disconnect, a runner going offline, and a browser stream reconnect.
@@ -113,7 +113,9 @@ without a session ID to resume.
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
 the linked session's Agents panel and check the child under its parent. Ask a
 child to delegate again to check nested ownership; completed children remain
-visible while the runner idles.
+visible while the runner idles. Also invoke an installed skill configured with
+`context: fork`, such as `/code-review`, from Chat or the native terminal.
+The skill's agent and any helpers it delegates should appear in the same tree.
 
 **Native Gemini setup:** run `omni setup` → Antigravity → Configure native agy
 API key / gateway. If existing providers conflict, choose the Gemini default
@@ -798,8 +800,11 @@ Cross-harness journeys:
   transcripts, then registration under the right parent when the spawn arrives.
   The same module covers cache invalidation on append and same-size rewrites,
   eviction, deleted files, transient read failures, and existing Task/fork and
-  restart behavior. These use real transcript files and forwarder code with a
-  mocked HTTP peer; they do not measure runner CPU or prove browser rendering.
+  restart behavior. The `slash_command` variant of
+  `test_subagent_watcher_preserves_nested_parent_graph_across_restart`
+  checks a forked skill without a tool-call ID and its nested helpers.
+  These use real transcript files and forwarder code with a mocked HTTP peer;
+  they do not measure runner CPU or prove browser rendering.
 - **`subagent-discovery`, Claude (manual runner performance):** use an isolated
   server/runner from this checkout, with real Claude Code and tmux and a scripted
   model endpoint. Follow the native prerequisites above; do not use a developer
