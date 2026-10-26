@@ -2157,8 +2157,12 @@ describe("session PR selection", () => {
     ["ready", {}, true],
     ["draft", { is_draft: true }, false],
     ["blocked", { merge_state_status: "BLOCKED" }, false],
+    ["conflicts", { merge_state_status: "DIRTY" }, false],
+    ["behind", { merge_state_status: "BEHIND" }, false],
+    ["hooks", { merge_state_status: "HAS_HOOKS" }, true],
+    ["missing head", { head_sha: undefined }, false],
     ["unknown", { merge_state_status: "UNKNOWN" }, false],
-    ["unsupported checks", { checks_supported: false }, false],
+    ["unsupported checks", { checks_supported: false }, true],
     ["merged", { state: "MERGED" }, false],
     [
       "auto merge",
@@ -2196,11 +2200,11 @@ describe("session PR selection", () => {
   );
 
   it.each(["failing", "pending", "cancelled", "partial", "read-only"])(
-    "keeps check counts instead of merge for %s",
+    "keeps check details and uses mergeability for %s",
     async (reason) => {
       const pr = {
         ...state.info!.data!.pr!,
-        merge_state_status: "CLEAN",
+        merge_state_status: "UNSTABLE",
         head_sha: "head",
         checks: {
           total: 1,
@@ -2231,7 +2235,7 @@ describe("session PR selection", () => {
         ],
       });
       renderPanel();
-      expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+      expect(!!screen.queryByRole("button", { name: "Merge" })).toBe(reason !== "read-only");
       const passed = screen.getByRole("button", { name: "1 passed" });
       expect(passed).toHaveTextContent(/^1$/);
       fireEvent.pointerEnter(passed);

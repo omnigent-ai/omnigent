@@ -1080,13 +1080,14 @@ function PullRequestListRow({
     data?.capabilities.merging &&
     pr?.state === "OPEN" &&
     !pr.is_draft &&
-    pr.checks_supported !== false &&
-    checks &&
-    !checks.partial &&
-    checks.failing === 0 &&
-    checks.pending === 0 &&
-    !checks.cancelled &&
     mergeState?.kind === "ready";
+  const checksUnavailable = checks?.partial || pr?.checks_supported === false;
+  const checkStatus = (
+    <>
+      {checks && <PullRequestCheckCounts checks={checks} compact />}
+      {checksUnavailable && <span title="Some checks could not be loaded">Incomplete checks</span>}
+    </>
+  );
   const title = (pr?.title ?? association.title)?.trim();
   const identity = pullRequestLabel({ ...association, title: null });
   const label = title ? `${identity} — ${title}` : identity;
@@ -1124,12 +1125,16 @@ function PullRequestListRow({
       </button>
       <div className="flex max-w-[45%] shrink-0 flex-wrap items-center justify-end gap-1 text-xs text-muted-foreground">
         {ready && pr ? (
-          <PullRequestMerge
-            compact
-            conversationId={conversationId}
-            prUrl={association.url}
-            pr={pr}
-          />
+          <>
+            {(checksUnavailable || !!checks?.failing || !!checks?.pending || !!checks?.cancelled) &&
+              checkStatus}
+            <PullRequestMerge
+              compact
+              conversationId={conversationId}
+              prUrl={association.url}
+              pr={pr}
+            />
+          </>
         ) : info.error ? (
           <span title={String(info.error)}>Status unavailable</span>
         ) : !pr ? (
@@ -1139,16 +1144,11 @@ function PullRequestListRow({
         ) : (
           <>
             {pr.is_draft && <span>Draft</span>}
-            {checks && <PullRequestCheckCounts checks={checks} compact />}
-            {checks?.partial || pr.checks_supported === false ? (
-              <span title="Some checks could not be loaded">Incomplete checks</span>
-            ) : (
-              checks?.total === 0 &&
-              !pr.is_draft && (
-                <span title={mergeState && "hint" in mergeState ? mergeState.hint : undefined}>
-                  No checks
-                </span>
-              )
+            {checkStatus}
+            {!checksUnavailable && checks?.total === 0 && !pr.is_draft && (
+              <span title={mergeState && "hint" in mergeState ? mergeState.hint : undefined}>
+                No checks
+              </span>
             )}
           </>
         )}
