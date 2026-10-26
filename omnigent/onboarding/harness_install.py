@@ -154,6 +154,14 @@ HERMES_KEY = "hermes"
 
 _HERMES_INSTALL_HINT = "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash"
 
+# prime-agent ships a self-updating binary (``prime-agent update``) and
+# accepts per-spawn ``--provider`` / ``--model`` / ``--thinking`` flags, so
+# Omnigent can thread a generic provider through like the other
+# OpenAI-compatible CLIs. Auth lives in its own settings
+# (``~/.prime/agent/settings.json``); the ``prime-agent`` binary must be
+# on PATH.
+PRIME_AGENT_KEY = "prime-agent"
+
 # Devin (Cognition) ships via a curl installer rather than npm and authenticates
 # through its own ``devin auth login``, which writes a credential file it reads
 # back at spawn — Omnigent stores no Devin credential. ``devin auth status``
@@ -321,6 +329,12 @@ _HARNESS_INSTALL: dict[str, HarnessInstallSpec] = {
         install_command=("bash", "-c", _HERMES_INSTALL_HINT),
         min_version=_HERMES_MIN_VERSION,
     ),
+    PRIME_AGENT_KEY: HarnessInstallSpec(
+        "prime-agent",
+        "prime-agent",
+        package=None,
+        install_hint="prime-agent update",
+    ),
     DEVIN_KEY: HarnessInstallSpec(
         "Devin",
         "devin",
@@ -396,6 +410,12 @@ _HARNESS_NAME_TO_KEY: dict[str, str] = {
     # gates on the same binary.
     "hermes-native": HERMES_KEY,
     "native-hermes": HERMES_KEY,
+    # prime-agent (``harness: prime-agent``) wraps the ``prime-agent`` CLI,
+    # which takes per-spawn provider/model flags like the other
+    # OpenAI-compatible CLIs.
+    PRIME_AGENT_KEY: PRIME_AGENT_KEY,
+    "prime-agent-native": PRIME_AGENT_KEY,
+    "native-prime-agent": PRIME_AGENT_KEY,
     # Native Devin TUI (``devin-native``, via ``omni devin``) wraps the ``devin``
     # CLI; ``native-devin`` gates on the same binary. The bare ``devin`` spelling
     # canonicalizes to ``devin-native``, so it lands here too, and the ACP row
