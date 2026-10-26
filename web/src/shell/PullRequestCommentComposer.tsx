@@ -30,9 +30,6 @@ export function PullRequestCommentComposer({
         post();
       }}
     >
-      <p className="shrink-0 text-ui text-muted-foreground">
-        {account ? `Comment as ${account}` : "Comment using the host’s GitHub account"}
-      </p>
       <Tabs value={tab} onValueChange={setTab} className="min-h-0">
         <TabsList className="shrink-0">
           <TabsTrigger value="write">Write</TabsTrigger>
@@ -41,8 +38,8 @@ export function PullRequestCommentComposer({
         <TabsContent value="write" className="min-h-0 overflow-y-auto">
           <Textarea
             aria-label="New PR comment"
-            className="max-h-40"
-            placeholder="Leave a comment… Markdown is supported."
+            className="max-h-40 bg-transparent dark:bg-transparent"
+            placeholder="Leave a comment..."
             value={draft.body}
             disabled={draft.pending}
             onChange={(event) => setBody(event.target.value)}
@@ -69,14 +66,19 @@ export function PullRequestCommentComposer({
           {draft.error}
         </p>
       )}
-      <Button
-        type="submit"
-        size="sm"
-        className="shrink-0 self-start"
-        disabled={draft.pending || !draft.body.trim() || tooLong}
-      >
-        {draft.pending ? "Posting…" : "Post comment"}
-      </Button>
+      <div className="flex shrink-0 items-center gap-2">
+        <Button
+          type="submit"
+          size="sm"
+          className="shrink-0"
+          disabled={draft.pending || !draft.body.trim() || tooLong}
+        >
+          {draft.pending ? "Posting…" : "Post comment"}
+        </Button>
+        <p className="min-w-0 truncate text-ui text-muted-foreground" title={account ?? undefined}>
+          {account ? `Comment as ${account}` : "Comment using the host’s GitHub account"}
+        </p>
+      </div>
     </form>
   );
 }
