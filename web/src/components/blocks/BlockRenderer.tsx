@@ -15,6 +15,7 @@
 // 2. Turn folding: once settled, each work run collapses behind a
 //    "Worked" row. Assistant messages remain visible in order;
 //    pending elicitations and routing cards stay visible too.
+//    A copy of output that a message points back to stays open beside it.
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -22,6 +23,7 @@ import { ChevronRightIcon } from "lucide-react";
 import { LIVE_ITEM_PREFIX } from "@/lib/blocks";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import type { RenderItem } from "@/lib/renderItems";
 import type { SessionStatus } from "@/lib/types";
 import type { ActiveResponse } from "@/store/types";
@@ -284,8 +286,17 @@ export function BlockRenderer({
 
   if (showFold) {
     const rendered: ReactNode[] = [];
-    for (const segment of partition.segments) {
+    for (const [segmentIndex, segment] of partition.segments.entries()) {
       if (segment.kind === "text") {
+        const referenced = referencedOutputTool(partition.segments[segmentIndex - 1], segment);
+        if (referenced) {
+          // Default-open card mounts tooltips at once; keep it safe outside an app-root provider.
+          rendered.push(
+            <TooltipProvider key={`referenced-output:${keyFor(referenced, 0)}`}>
+              {renderToolCard(referenced, "card", true)}
+            </TooltipProvider>,
+          );
+        }
         rendered.push(
           ...renderSequence(segment.items, {
             liveEdge: false,
@@ -467,6 +478,36 @@ function partitionTurn(items: RenderItem[]): TurnPartition {
     else segments.push({ kind: "work", items: wrapup, startIndex: end });
   }
   return { segments };
+}
+
+type ToolItem = Extract<RenderItem, { kind: "tool" }>;
+
+// Explicit pointers back to earlier output; "above 90%" or "the table above" do not count.
+const BACKWARD_REFERENCE = new RegExp(
+  [
+    String.raw`\b(?:output|report|results?|logs?)\s+(?:is|are)\s+above(?=\s*(?:[.,;:!?)]|$))`,
+    String.raw`\b(?:output|report|results?|logs?)\s+above\b(?!\s*(?:[\d$%]|(?:a|an|the|average|baseline|threshold|normal|expectations?)\b))`,
+    String.raw`\b(?:shown|printed|displayed|listed|see)\s+above\b`,
+    String.raw`(?:^|[.!?]\s+|\n\s*)above(?:\s+(?:is|are)\b|\s*:)`,
+    String.raw`\bscroll(?:ing)?\s+up\b`,
+  ].join("|"),
+  "i",
+);
+
+/** The latest output of the work run that the following message points back to. */
+function referencedOutputTool(
+  previous: TurnSegment | undefined,
+  segment: TurnSegment,
+): ToolItem | undefined {
+  if (previous?.kind !== "work" || segment.kind !== "text") return undefined;
+  const pointsBack = segment.items.some(
+    (item) => item.kind === "text" && BACKWARD_REFERENCE.test(item.text),
+  );
+  if (!pointsBack) return undefined;
+  return previous.items.findLast(
+    (item): item is ToolItem =>
+      item.kind === "tool" && !isTrailingWrapup(item) && !!item.output?.trim(),
+  );
 }
 
 function isPendingElicitation(item: RenderItem): boolean {
@@ -787,18 +828,7 @@ function renderItem(
           />
         );
       }
-      return (
-        <ToolCard
-          key={key}
-          name={item.execution.name}
-          argsSummary={item.execution.argsSummary}
-          arguments={item.execution.arguments}
-          output={item.output}
-          state={item.state}
-          startedAt={item.startedAt}
-          duration={item.duration}
-        />
-      );
+      return renderToolCard(item, key);
     case "native_tool":
       // Reuse the same tool card. Native tools are server-side
       // (provider-managed) so they're always "completed" by the
@@ -873,6 +903,22 @@ function renderItem(
     case "elicitation":
       return <ElicitationCard key={key} item={item} />;
   }
+}
+
+function renderToolCard(item: ToolItem, key: string, defaultOpen = false): ReactNode {
+  return (
+    <ToolCard
+      key={key}
+      name={item.execution.name}
+      argsSummary={item.execution.argsSummary}
+      arguments={item.execution.arguments}
+      output={item.output}
+      state={item.state}
+      startedAt={item.startedAt}
+      duration={item.duration}
+      defaultOpen={defaultOpen}
+    />
+  );
 }
 
 /**

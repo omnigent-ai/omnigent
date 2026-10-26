@@ -543,7 +543,7 @@ describe("BlockRenderer dispatch", () => {
   });
 
   describe("settled-turn process fold (Worked row)", () => {
-    const tool = (n: number, name = `tool_${n}`): RenderItem => ({
+    const tool = (n: number, name = `tool_${n}`, output = "ok"): RenderItem => ({
       kind: "tool",
       itemId: `fc_${n}`,
       execution: {
@@ -553,9 +553,9 @@ describe("BlockRenderer dispatch", () => {
         callId: `c_${n}`,
         agentName: "nessie",
         executedBy: "server",
-        output: "ok",
+        output,
       },
-      output: "ok",
+      output,
       state: "output-available",
       startedAt: null,
       duration: undefined,
@@ -596,6 +596,116 @@ describe("BlockRenderer dispatch", () => {
       expect(individualToolTrigger).not.toHaveClass("text-sm");
       // The answer remains visible after expansion too.
       expect(screen.getByText("All done here.")).toBeDefined();
+    });
+
+    it("shows command output that the final answer points to as above", () => {
+      const reportLine = "REPORT line 2: tests-42-passed";
+      const report = `REPORT line 1: build-ok\n${reportLine}\nREPORT line 3: failures-0\n`;
+      const items: RenderItem[] = [
+        {
+          kind: "tool",
+          itemId: "fc_report",
+          execution: {
+            name: "shell",
+            arguments: { command: "/bin/bash -lc \"printf 'REPORT line %d: %s\\n' 1 build-ok\"" },
+            argsSummary: "",
+            callId: "call_report",
+            agentName: "codex",
+            executedBy: "server",
+            output: report,
+          },
+          output: report,
+          state: "output-available",
+          startedAt: null,
+          duration: undefined,
+        },
+        {
+          kind: "text",
+          itemId: "m_final",
+          text: "Done. The full report is printed above; scroll up to read it.",
+          final: true,
+        },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" workedForS={2} />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(
+        screen.getByText("Done. The full report is printed above; scroll up to read it."),
+      ).toBeDefined();
+      expect(screen.getByText(new RegExp(reportLine))).toBeVisible();
+      expect(screen.getByRole("button", { name: "Worked for 2s" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+    });
+
+    it("opens only the latest tool output that has text, between the fold and the answer", () => {
+      const items: RenderItem[] = [
+        tool(1, "shell", "earlier step output"),
+        tool(2, "shell", "REPORT: tests-42-passed"),
+        tool(3, "shell", ""),
+        tool(4, "shell", "\n  \n"),
+        { kind: "text", itemId: "m1", text: "Done. See the report above.", final: true },
+        tool(5, "turn_diff", "diff --git a/x b/x"),
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      const fold = screen.getByRole("button", { name: "Worked" });
+      const report = screen.getByText(/REPORT: tests-42-passed/);
+      const answer = screen.getByText("Done. See the report above.");
+      expect(fold).toHaveAttribute("aria-expanded", "false");
+      expect(report).toBeVisible();
+      expect(fold.compareDocumentPosition(report) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(
+        report.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(screen.queryByText(/earlier step output/)).toBeNull();
+      expect(screen.queryByText(/diff --git/)).toBeNull();
+
+      fireEvent.click(fold);
+      expect(screen.getByText("Ran 4 shell commands, called 1 other tool")).toBeVisible();
+      expect(screen.getByText(/REPORT: tests-42-passed/)).toBeVisible();
+    });
+
+    it.each([
+      ["Scroll up for the full report.", true],
+      ["See above.", true],
+      ["The full report is shown above.", true],
+      ["Above is the full report.", true],
+      ["The output is above.", true],
+      ["The log shown above the summary has the details.", true],
+      ["The test output above shows the failure.", true],
+      ["All checks passed.", false],
+      ["CPU usage stayed above 90% during the run.", false],
+      ["Latency is above the threshold.", false],
+      ["Latency was above-average today.", false],
+      ["Above all, the build is green.", false],
+      ["The table above lists each step.", false],
+      ["The table above is a summary of the steps.", false],
+      ["All set. The summary is above.", false],
+      ["Error logs above 1GB were rotated.", false],
+      ["Results above the baseline were flagged.", false],
+      ["The results are above expectations.", false],
+      ["Results above average were flagged.", false],
+      ["Logs above threshold were rotated.", false],
+    ])("pins the work output for %j only when it points back: %s", (text, pinned) => {
+      const items: RenderItem[] = [
+        tool(1, "shell", "REPORT: tests-42-passed"),
+        { kind: "text", itemId: "m1", text, final: true },
+      ];
+      render(
+        <FileViewerContext.Provider value={FILE_VIEWER_NOOP}>
+          <BlockRenderer items={items} sessionStatus="idle" />
+        </FileViewerContext.Provider>,
+      );
+      expect(screen.getByTestId("turn-worked-fold")).toBeDefined();
+      expect(screen.queryByText(/REPORT: tests-42-passed/) !== null).toBe(pinned);
     });
 
     it("keeps the answer and follow-up in order around separate work runs", () => {
