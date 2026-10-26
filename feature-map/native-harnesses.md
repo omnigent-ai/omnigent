@@ -827,7 +827,7 @@ persistence deduplication. These checks do not establish desktop rendering parit
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered
 and duplicate results, plus missing calls and outputs arriving across user turns.
-Unmatched outputs retain their content as labeled text without inventing a call;
+Unmatched outputs retain their content as labeled, untrusted tool data without inventing a call;
 same-turn results retain their names and pairing. The existing
 `tests/e2e/test_pi_native_resume_duplicate_tool_result_e2e.py::test_cold_resume_does_not_replay_duplicate_tool_result`
 checks real server/runner serialization with a stub Pi process.
@@ -838,7 +838,9 @@ stops Pi, removes its isolated local history file and cold-resumes. Both retain
 parallel results and recovery text, and the follow-up succeeds.
 
 For a manual check, fork an affected session onto a Responses model and send a
-follow-up; expect retained output without an orphan-call HTTP 400. Repeat after
+follow-up; expect retained output without an orphan-call HTTP 400. Reload Chat
+and confirm the reply appears once; ask another question and confirm the copied
+tool values reach the model without executing the tools again. Repeat after
 stopping the isolated test terminal and removing its local session file. Existing
 local files are reused unchanged. For Gemini, fork tool-containing history and
 send a follow-up; expect no empty `function_response.name` error. These automated
