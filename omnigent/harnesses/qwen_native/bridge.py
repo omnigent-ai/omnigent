@@ -38,7 +38,7 @@ import sys
 import tempfile
 import time
 import uuid
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -172,7 +172,7 @@ def qwen_session_recording_exists(session_id: str, workspace: Path | str) -> boo
 
 def _qwen_iso_now() -> str:
     """Return the current UTC time as a qwen-style ISO-8601 millisecond stamp."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%S.%f")[:-3] + "Z"
 
 
 def _qwen_synth_uuid(qwen_session_id: str, index: int) -> str:

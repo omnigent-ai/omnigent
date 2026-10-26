@@ -375,11 +375,9 @@ def configure_mock_llm(
     Use different keys to give each agent its own response stream::
 
         # Parent agent uses "mock-parent" model
-        configure_mock_llm(url, [{"text": "spawning reviewer..."}],
-                           key="mock-parent")
+        configure_mock_llm(url, [{"text": "spawning reviewer..."}], key="mock-parent")
         # Sub-agent uses "mock-reviewer" model
-        configure_mock_llm(url, [{"text": "LGTM"}],
-                           key="mock-reviewer")
+        configure_mock_llm(url, [{"text": "LGTM"}], key="mock-reviewer")
 
     Pass *match* to route by request CONTENT instead of model: the queue
     serves any request whose ``role="user"`` input contains the token.

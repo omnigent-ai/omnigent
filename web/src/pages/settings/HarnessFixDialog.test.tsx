@@ -11,8 +11,10 @@ import { HarnessFixDialog, type HarnessFixDialogProps } from "./HarnessFixDialog
 vi.mock("@/lib/identity", () => ({ authenticatedFetch: vi.fn() }));
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 vi.mock("@/lib/clipboard", () => ({ copyText: vi.fn().mockResolvedValue(undefined) }));
+let databricksFeatures = true;
 vi.mock("@/lib/CapabilitiesContext", () => ({
   useServerInfo: () => ({
+    databricks_features: databricksFeatures,
     features: { harness_install: true },
     installable_harnesses: [
       "claude-native",
@@ -92,6 +94,7 @@ function renderDialog(overrides: Partial<HarnessFixDialogProps> = {}) {
 }
 
 beforeEach(() => {
+  databricksFeatures = true;
   vi.clearAllMocks();
   vi.mocked(authenticatedFetch).mockImplementation(async (input) => {
     if (String(input) === "/v1/harnesses") return json(catalog);
@@ -483,12 +486,22 @@ describe("HarnessFixDialog", () => {
     });
   });
 
-  it("offers Isaac but not Personal for Pi", async () => {
-    renderDialog({ harness: "pi-native", harnessLabel: "Pi" });
+  it.each([
+    ["claude-native", "Claude Code"],
+    ["codex-native", "Codex"],
+    ["pi-native", "Pi"],
+  ])(
+    "offers and preselects Isaac for %s when databricks_features is false",
+    (harness, harnessLabel) => {
+      databricksFeatures = false;
+      renderDialog({ harness, harnessLabel });
 
-    expect(screen.getByRole("radio", { name: /Isaac/ })).toBeVisible();
-    expect(screen.queryByRole("radio", { name: /Personal subscription/ })).not.toBeInTheDocument();
-  });
+      expect(screen.getByRole("radio", { name: /Isaac/ })).toHaveAttribute("aria-checked", "true");
+      if (harness === "pi-native") {
+        expect(screen.queryByRole("radio", { name: /Personal subscription/ })).toBeNull();
+      }
+    },
+  );
 
   it("does not offer credential forms before installing a harness", () => {
     renderDialog({ mode: "install", harness: "pi-native", harnessLabel: "Pi" });

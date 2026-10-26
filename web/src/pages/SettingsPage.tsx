@@ -194,6 +194,12 @@ import {
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
 import {
+  DEFAULT_FOLD_ASSISTANT_NARRATION,
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  useFoldAssistantNarration,
+  writeFoldAssistantNarration,
+} from "@/lib/foldNarrationPreferences";
+import {
   DEFAULT_WORKSPACE_TAB,
   defaultWorkspaceTabs,
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
@@ -917,6 +923,29 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+/** Opt-in: fold a finished turn's earlier messages so only the last shows. */
+function FoldAssistantNarrationControl() {
+  const enabled = useFoldAssistantNarration();
+  const labelId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Show only the final answer"
+        labelId={labelId}
+        description="Once a turn finishes, fold its progress messages into the Worked row. The last message stays visible as the answer."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={enabled}
+        onCheckedChange={writeFoldAssistantNarration}
+        data-testid="fold-assistant-narration-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.fold_assistant_narration"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
   // replace it with a note (plus a link to the host's own theme settings when
@@ -952,6 +981,7 @@ function AppearanceSection() {
     writePinnedWorkspaceTabs(defaultWorkspaceTabs);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
+    writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -979,6 +1009,7 @@ function AppearanceSection() {
           "omnigent:default-workspace-tab",
           PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
+          FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -1085,6 +1116,9 @@ function AppearanceSection() {
             <TranscriptViewDefaultControl />
             <div className="mt-4 border-t border-border pt-4">
               <HideUnconfiguredHarnessesControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <FoldAssistantNarrationControl />
             </div>
           </SettingsGroup>
 

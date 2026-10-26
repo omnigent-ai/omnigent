@@ -113,6 +113,8 @@ function isAbortTimeout(error: unknown): boolean {
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
 export type SessionSortBy = "updated_at" | "created_at";
+/** `?search_scope=`: `title` and `content` are disjoint groups of one search. */
+export type SessionSearchScope = "all" | "title" | "content";
 
 export interface UseConversationsOptions {
   sortBy?: SessionSortBy;
@@ -516,9 +518,11 @@ export async function fetchConversationsPage({
   signal: requestSignal,
   limit = sidebarConfig.sessionPageSize,
   sortBy = "updated_at",
+  searchScope = "all",
 }: {
   after?: string;
   searchQuery: string;
+  searchScope?: SessionSearchScope;
   includeArchived: boolean;
   project?: string;
   visibility?: "mine" | "shared" | "archived";
@@ -536,6 +540,7 @@ export async function fetchConversationsPage({
   });
   if (after) params.set("after", after);
   if (searchQuery) params.set("search_query", searchQuery);
+  if (searchQuery && searchScope !== "all") params.set("search_scope", searchScope);
   // Only request archived rows when the toggle is on, so the default
   // sidebar never pays to fetch them. The server excludes archived
   // sessions unless include_archived=true.
@@ -723,6 +728,41 @@ export function useConversations(
   });
   // A session deleted between two scroll pages kills the cursor; reload the
   // list from page 1 rather than replacing the sidebar with the raw 400.
+  useRestartOnStaleCursor(queryKey);
+  return query;
+}
+
+/**
+ * One palette search group; keyed outside `["conversations"]`, which patches rows
+ * live. Dropped once unobserved, so a later search never shows a stale row.
+ */
+export function useSessionSearch(
+  searchQuery: string,
+  searchScope: SessionSearchScope,
+  { enabled = true, limit = 10 }: { enabled?: boolean; limit?: number } = {},
+) {
+  const queryClient = useQueryClient();
+  const queryKey = ["session-search", searchQuery, searchScope, limit];
+  const query = useInfiniteQuery({
+    queryKey,
+    queryFn: ({ pageParam }) =>
+      fetchConversationsPage({
+        after: pageParam,
+        searchQuery,
+        searchScope,
+        includeArchived: false,
+        queryClient,
+        limit,
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
+    staleTime: 0,
+    gcTime: 0,
+    retry: (failureCount, error) =>
+      !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
+    enabled: enabled && searchQuery !== "",
+  });
   useRestartOnStaleCursor(queryKey);
   return query;
 }

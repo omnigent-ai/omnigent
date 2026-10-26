@@ -882,6 +882,9 @@ def test_native_claude_lost_message_does_not_duplicate_the_next_one(
     expect(
         page.get_by_test_id("error-headline").filter(has_text=_UNDELIVERED_HEADLINE)
     ).to_have_count(1)
+    # At settlement, the undelivered notice must not count as an assistant reply.
+    expect(page.locator(_ASSISTANT).filter(has_text=_UNDELIVERED_HEADLINE)).to_have_count(0)
+    expect(page.locator(_ASSISTANT)).to_have_count(2)
 
     # The canonical transcript agrees: each message once, in send order.
     user_texts = [

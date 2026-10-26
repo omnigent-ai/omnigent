@@ -74,8 +74,19 @@ function mintEvaluateElicitationId() {
   return `elicit_evaluate_${crypto.randomBytes(16).toString("hex")}`;
 }
 
-function sleep(ms) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
+function sleep(ms, signal) {
+  return new Promise((resolve) => {
+    function finish() {
+      clearTimeout(timer);
+      if (signal) signal.removeEventListener("abort", finish);
+      resolve();
+    }
+    const timer = setTimeout(finish, ms);
+    if (signal) {
+      signal.addEventListener("abort", finish, { once: true });
+      if (signal.aborted) finish();
+    }
+  });
 }
 
 function readConfig() {
@@ -170,156 +181,74 @@ function relayCredentials() {
   return null;
 }
 
-/**
- * Evaluate a TOOL_CALL policy for a native Pi tool via the Omnigent server's
- * session-level HTTP endpoint (POST /v1/sessions/{sessionId}/policies/evaluate).
- *
- * This is the same endpoint used by the Claude Code, Codex, and Cursor native
- * hooks. It does NOT require an active Omnigent turn context on the harness
- * side — the endpoint evaluates against the session's full policy set directly.
- *
- * Verdict handling (parity with the native hooks):
- *   - POLICY_ACTION_DENY  → block the Pi tool call with the policy reason.
- *   - POLICY_ACTION_ALLOW / UNSPECIFIED (the engine default when no policy
- *       matches) → proceed.
- *   - POLICY_ACTION_ASK   → the server resolves ASK by PARKING this request
- *       (URL-based elicitation: it publishes an approval card to the web UI
- *       and holds the connection until a human resolves it), then returns a
- *       hard ALLOW/DENY — so a writable session never observes a raw ASK here.
- *       The park is realized by a generous client read budget plus re-attach
- *       retries (see the _PARK_* tuning above): if undici severs a long park
- *       (headersTimeout) we re-POST the SAME _omnigent_elicitation_id so the
- *       server re-attaches to the existing elicitation instead of opening a
- *       second approval card. A LEGITIMATE long-poll re-attach (the server is
- *       reachable and still holding the connection) is the only case that may
- *       loop toward the long park ceiling. If a raw ASK ever does come back
- *       (e.g. a read-only caller that cannot park), we re-evaluate up to
- *       _MAX_RAW_ASK_ROUNDS and then fail CLOSED.
- *
- * Fail CLOSED (a block verdict) whenever a usable verdict cannot be obtained:
- * the transient-retry budget for a genuine transport/5xx error is exhausted,
- * a raw ASK never collapses within _MAX_RAW_ASK_ROUNDS, or the long park
- * ceiling is reached. PHASE_TOOL_CALL is the SOLE enforcement point for a
- * native connector tool — the call is never re-checked server-side — so an
- * unevaluable policy MUST block, not proceed. This matches
- * omnigent.policies.types.FAIL_CLOSED_PHASES and the Python native hook's
- * fail_closed_hook_output(PreToolUse) → deny. (pi-native is itself a sole
- * gate, exactly like the Claude / Codex native hooks; an eventually-allowing
- * human-approval gate would defeat its own purpose, so the earlier fail-open
- * posture was wrong here.) A reachable server long-polling a parked ASK is
- * the deliberate exception: that is the human approval window, not an outage,
- * and we keep waiting (re-attaching) rather than blocking.
- *
- * @returns {Promise<{block: boolean, reason: string} | null>} A verdict.
- *   ``{block: true}`` either from a DENY or from failing closed; ``{block:
- *   false}`` on ALLOW; ``null`` only when the gate is structurally disabled
- *   (no server/session configured or no global fetch) so there is nothing to
- *   enforce against.
- */
-async function evalNativePolicyHttp(config, toolName, args) {
-  if (
-    !config ||
-    !config.serverUrl ||
-    !config.sessionId ||
-    typeof fetch !== "function"
-  )
-    return null;
-  // Prefer relay (non-expiring local token); fall back to direct server call.
+function mintPiUiElicitationId() {
+  return `elicit_pi_${crypto.randomBytes(16).toString("hex")}`;
+}
+
+const _UNSUPPORTED_ENDPOINT = Symbol("unsupported endpoint");
+
+// Shared long-poll transport for policy verdicts and extension dialogs.
+async function postParkedJson(config, relayPath, serverPath, payload, {
+  parkDeadline, signal, retryEmpty = false,
+}) {
   const relay = relayCredentials();
   const url = relay
-    ? `${relay.url}/policies/evaluate`
-    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}/policies/evaluate`;
-  // Mint one stable re-attach id for this tool call. Every (re)POST carries
-  // it so a re-park lands on the SAME elicitation — no duplicate approval
-  // card. Kept for the whole call, across both the park loop and any
-  // transient-error retries.
-  const elicitationId = mintEvaluateElicitationId();
-  const body = JSON.stringify({
-    event: {
-      type: "PHASE_TOOL_CALL",
-      target: "",
-      data: { name: toolName, arguments: args },
-      context: {},
-    },
-    _omnigent_elicitation_id: elicitationId,
-  });
-  const reqHeaders = relay
-    ? {
-        "content-type": "application/json",
-        authorization: `Bearer ${relay.token}`,
-      }
-    : {
-        "content-type": "application/json",
-        ...freshAuthHeaders(config.authHeaders),
-      };
+    ? `${relay.url}${relayPath}`
+    : `${config.serverUrl}/v1/sessions/${encodeURIComponent(config.sessionId)}${serverPath}`;
+  const body = JSON.stringify(payload);
+  const requestHeaders = () => relay
+    ? { "content-type": "application/json", authorization: `Bearer ${relay.token}` }
+    : { "content-type": "application/json", ...freshAuthHeaders(config.authHeaders) };
 
-  const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
-  // Independent transient-error budget so a server that is actually down
-  // resolves quickly (fail CLOSED) instead of riding the long park ceiling.
   let transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
   let transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
-  // Bound on consecutive raw ASK rounds (see _MAX_RAW_ASK_ROUNDS).
-  let rawAskRounds = 0;
+  let emptyResponses = 0;
 
   while (true) {
-    if (Date.now() >= parkDeadline) {
-      // Park ceiling reached (well past any sane ask_timeout): the gate is
-      // wedged, not resolving. Fail CLOSED — PHASE_TOOL_CALL is the sole
-      // enforcement point, so a never-resolving gate must block, not proceed.
-      return failClosedVerdict();
-    }
-    // AbortController bounds each attempt under undici's headersTimeout so a
-    // long park is retried (re-attach) rather than thrown as a header
-    // timeout. AbortSignal.timeout would be terser but is newer; this form
-    // works on every Node that ships global fetch.
+    if (signal && signal.aborted) return null;
+    if (Date.now() >= parkDeadline) return null;
     const controller =
       typeof AbortController === "function" ? new AbortController() : null;
+    const remaining = parkDeadline - Date.now();
+    const attemptMs = Math.min(_PARK_ATTEMPT_TIMEOUT_MS, Math.max(remaining, 1));
     const timer = controller
-      ? setTimeout(() => controller.abort(), _PARK_ATTEMPT_TIMEOUT_MS)
+      ? setTimeout(() => controller.abort(), attemptMs)
       : null;
+    const callerSignal = signal;
+    const cancelAttempt = () => controller && controller.abort();
+    if (callerSignal) {
+      callerSignal.addEventListener("abort", cancelAttempt, { once: true });
+      if (callerSignal.aborted) cancelAttempt();
+    }
     const attemptStart = Date.now();
     let resp;
+    let text;
     try {
       resp = await fetch(url, {
         method: "POST",
-        headers: reqHeaders,
+        headers: requestHeaders(),
         body,
         ...(controller ? { signal: controller.signal } : {}),
       });
+      text = resp.ok ? await resp.text() : "";
     } catch (_err) {
+      if ((callerSignal && callerSignal.aborted) || Date.now() >= parkDeadline) return null;
       if (timer) clearTimeout(timer);
-      // Distinguish a LEGITIMATE long-poll re-attach from a GENUINE transport
-      // error. controller.signal.aborted alone is unreliable: once our
-      // per-attempt timer has fired it reads true even if a real connect
-      // reset raced the timer. A genuine connect error throws
-      // fast — well under _PARK_ATTEMPT_TIMEOUT_MS — whereas a real long-poll
-      // only aborts once the timer fires after holding the connection open
-      // the whole attempt. So require BOTH aborted AND that the attempt
-      // survived ~to the per-attempt timeout before treating it as a re-park.
       const aborted = !!(controller && controller.signal.aborted);
       const elapsed = Date.now() - attemptStart;
-      const isLongPollReattach =
-        aborted && elapsed >= _PARK_REATTACH_MIN_ELAPSED_MS;
+      const reattachFloor = Math.min(
+        _PARK_REATTACH_MIN_ELAPSED_MS,
+        Math.max(attemptMs - 5_000, attemptMs * 0.8),
+      );
+      const isLongPollReattach = aborted && elapsed >= reattachFloor;
       if (isLongPollReattach) {
-        // Re-park: the server held the connection the whole time, so re-POST
-        // the SAME elicitation id immediately (no backoff). This is the human
-        // approval window — keep waiting (bounded only by parkDeadline).
-        // A completed long-poll is a healthy round-trip, so refresh the
-        // transient budget the same way the ASK branch does. Without this the
-        // entry budget expires during the first park, and a genuine transport
-        // blip while the human is still deciding would fail closed with zero
-        // retries instead of getting its full transient window.
+        if (Date.now() >= parkDeadline) return null;
         transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
         transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
         continue;
       }
-      // Genuine transport error (connect refused / reset, or an abort that
-      // fired too early to be a real park) → charge it against the short
-      // transient budget. When that budget is exhausted, fail CLOSED.
-      if (Date.now() + transientBackoff >= transientDeadline) {
-        return failClosedVerdict();
-      }
-      await sleep(transientBackoff);
+      if (Date.now() + transientBackoff >= transientDeadline) return null;
+      await sleep(transientBackoff, signal);
       transientBackoff = Math.min(
         transientBackoff * 2,
         _TRANSIENT_RETRY_MAX_BACKOFF_MS,
@@ -327,65 +256,134 @@ async function evalNativePolicyHttp(config, toolName, args) {
       continue;
     } finally {
       if (timer) clearTimeout(timer);
+      if (callerSignal) callerSignal.removeEventListener("abort", cancelAttempt);
     }
+    if (callerSignal && callerSignal.aborted) return null;
 
     if (!resp.ok) {
-      // 5xx is transient (retry within budget, re-attaching); 4xx is final
-      // (a bad request won't succeed on retry). Either way, an unevaluable
-      // PHASE_TOOL_CALL fails CLOSED.
+      if (resp.status === 404 || resp.status === 405) return _UNSUPPORTED_ENDPOINT;
       if (resp.status >= 500) {
-        if (Date.now() + transientBackoff >= transientDeadline) {
-          return failClosedVerdict();
-        }
-        await sleep(transientBackoff);
+        if (Date.now() + transientBackoff >= transientDeadline) return null;
+        await sleep(transientBackoff, signal);
         transientBackoff = Math.min(
           transientBackoff * 2,
           _TRANSIENT_RETRY_MAX_BACKOFF_MS,
         );
         continue;
       }
-      return failClosedVerdict();
+      return null;
     }
 
-    let json;
-    try {
-      json = await resp.json();
-    } catch (_err) {
-      // Malformed body — not retryable, and we have no verdict. Fail CLOSED.
-      return failClosedVerdict();
-    }
-
-    const result = json && json.result;
-    if (result === "POLICY_ACTION_DENY") {
-      return {
-        block: true,
-        reason: json.reason || "blocked by Omnigent policy",
-      };
-    }
-    if (result === "POLICY_ACTION_ASK") {
-      // The gate did not park server-side (e.g. a read-only caller that cannot
-      // open an elicitation) yet still wants approval. Re-evaluate
-      // (re-attaching) so a gate that is about to collapse to a hard verdict
-      // gets the chance — but bound it: a raw ASK that NEVER collapses must
-      // not ride the 24h park ceiling and then proceed. After
-      // _MAX_RAW_ASK_ROUNDS we fail CLOSED, mirroring the Python native hook
-      // which denies a stray ASK rather than deferring (an unresolvable
-      // approval gate that eventually allows would defeat its purpose).
-      rawAskRounds += 1;
-      if (rawAskRounds >= _MAX_RAW_ASK_ROUNDS) {
-        return failClosedVerdict();
-      }
-      // Reset the transient budget since this is a healthy round-trip, not a
-      // failure, and give it a brief beat so we do not hot-loop a server that
-      // keeps returning ASK.
+    if (!text && retryEmpty) {
+      // Bound empty proxy responses; explicit server cancellation never re-parks.
+      if (++emptyResponses >= 3 || Date.now() >= parkDeadline) return null;
       transientDeadline = Date.now() + _TRANSIENT_RETRY_BUDGET_MS;
       transientBackoff = _TRANSIENT_RETRY_INITIAL_BACKOFF_MS;
-      await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
+      // A server that answers immediately (consumed tombstone, a proxy that
+      // ends the long poll) would otherwise spin here with no delay.
+      await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS, signal);
       continue;
     }
-    // ALLOW / UNSPECIFIED / anything else → proceed.
-    return { block: false, reason: "" };
+    let json;
+    try {
+      json = JSON.parse(text);
+    } catch (_err) {
+      return null;
+    }
+    return json && typeof json === "object" ? json : null;
   }
+}
+
+async function parkPiExtensionUiHttp(config, request, opts = {}) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function") {
+    return null;
+  }
+  const timeoutMs = opts && typeof opts.timeout === "number" && opts.timeout > 0
+    ? opts.timeout : _PARK_TOTAL_BUDGET_MS;
+  return postParkedJson(config, "/hook/pi/extension-ui", "/hooks/pi-extension-ui", {
+    elicitation_id: mintPiUiElicitationId(),
+    request: { ...request, timeout: timeoutMs },
+  }, {
+    parkDeadline: Date.now() + timeoutMs,
+    signal: opts && opts.signal,
+    retryEmpty: true,
+  });
+}
+
+function extensionUiValue(response) {
+  return response && !response.cancelled && typeof response.value === "string"
+    ? response.value : undefined;
+}
+
+function wrapExtensionUi(ctx, config) {
+  if (!ctx || ctx.mode !== "tui" || !ctx.ui || ctx.ui.__omnigentUiWrapped) {
+    return;
+  }
+  const ui = ctx.ui;
+  ui.__omnigentUiWrapped = true;
+  const original = Object.fromEntries(
+    ["confirm", "select", "input", "editor"]
+      .filter((method) => typeof ui[method] === "function")
+      .map((method) => [method, ui[method].bind(ui)]),
+  );
+
+  if (original.confirm) ui.confirm = async (title, message, opts) => {
+    const request = { method: "confirm", title, message };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.confirm(title, message, opts);
+    return !!(verdict && verdict.confirmed === true);
+  };
+  if (original.select) ui.select = async (title, options, opts) => {
+    const request = {
+      method: "select",
+      title,
+      options: Array.isArray(options) ? options : [],
+    };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.select(title, options, opts);
+    return extensionUiValue(verdict);
+  };
+  if (original.input) ui.input = async (title, placeholder, opts) => {
+    const request = { method: "input", title, placeholder };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.input(title, placeholder, opts);
+    return extensionUiValue(verdict);
+  };
+  if (original.editor) ui.editor = async (title, prefill, opts) => {
+    const request = { method: "editor", title, prefill };
+    const verdict = await parkPiExtensionUiHttp(config, request, opts);
+    if (verdict === _UNSUPPORTED_ENDPOINT) return original.editor(title, prefill, opts);
+    return extensionUiValue(verdict);
+  };
+}
+
+// A missing verdict blocks native tools; declining an ordinary dialog does not.
+async function evalNativePolicyHttp(config, toolName, args) {
+  if (!config || !config.serverUrl || !config.sessionId || typeof fetch !== "function") {
+    return null;
+  }
+  const payload = {
+    event: {
+      type: "PHASE_TOOL_CALL",
+      target: "",
+      data: { name: toolName, arguments: args },
+      context: {},
+    },
+    _omnigent_elicitation_id: mintEvaluateElicitationId(),
+  };
+  const parkDeadline = Date.now() + _PARK_TOTAL_BUDGET_MS;
+  for (let round = 0; round < _MAX_RAW_ASK_ROUNDS; round += 1) {
+    const json = await postParkedJson(config, "/policies/evaluate", "/policies/evaluate", payload, {
+      parkDeadline,
+    });
+    if (!json || json === _UNSUPPORTED_ENDPOINT) return failClosedVerdict();
+    if (json.result === "POLICY_ACTION_DENY") {
+      return { block: true, reason: json.reason || "blocked by Omnigent policy" };
+    }
+    if (json.result !== "POLICY_ACTION_ASK") return { block: false, reason: "" };
+    if (round + 1 < _MAX_RAW_ASK_ROUNDS) await sleep(_TRANSIENT_RETRY_INITIAL_BACKOFF_MS);
+  }
+  return failClosedVerdict();
 }
 
 /**
@@ -834,9 +832,10 @@ function headers(config) {
   };
 }
 
-const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
-const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
-const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
+const _ASSISTANT_ITEM_MAX_ATTEMPTS = 5;
+const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 1_000;
+const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 8_000;
+const _ASSISTANT_ITEM_RETRY_BUDGET_MS = 30_000;
 const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
 
 function boundedSourceId(sourceId) {
@@ -884,9 +883,9 @@ async function postEventChecked(config, body, signal) {
   return response;
 }
 
-async function postEvent(config, body) {
+async function postEvent(config, body, signal) {
   try {
-    await postEventChecked(config, body);
+    await postEventChecked(config, body, signal);
   } catch (_err) {
     // Keep Pi responsive even if Omnigent is temporarily unavailable.
   }
@@ -907,22 +906,26 @@ function assistantItemPostTimeoutMs(config) {
     : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
 }
 
-// Final assistant messages and errors survive transient transport failures.
-async function postConversationItem(config, data, sourceId) {
-  const body = {
-    type: "external_conversation_item",
-    data: { ...data, source_id: boundedSourceId(sourceId) },
-  };
+// History and completion delivery share bounded retries.
+async function postEventWithRetry(config, body, signal) {
   let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
   let lastError;
+  const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
   for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    signal?.throwIfAborted();
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(),
-      assistantItemPostTimeoutMs(config),
+      Math.min(assistantItemPostTimeoutMs(config), remaining),
     );
     try {
-      return await postEventChecked(config, body, controller.signal);
+      return await postEventChecked(
+        config,
+        body,
+        signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+      );
     } catch (err) {
       lastError = err;
     } finally {
@@ -930,13 +933,126 @@ async function postConversationItem(config, data, sourceId) {
     }
     if (
       attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
-      !isRetryableAssistantError(lastError)
+      !isRetryableAssistantError(lastError) ||
+      Date.now() + backoff >= deadline
     )
       break;
-    await sleep(backoff);
+    signal?.throwIfAborted();
+    await sleep(backoff, signal);
     backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
   }
-  throw lastError || new Error("assistant conversation item POST failed");
+  throw lastError || new Error(`${body.type} POST failed`);
+}
+
+// Bound retained payloads as well as item count while the server is unavailable.
+const _HISTORY_QUEUE_MAX_ITEMS = 256;
+const _HISTORY_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
+const _HISTORY_SHUTDOWN_TIMEOUT_MS = 5_000;
+
+function createHistoryQueue(config) {
+  const pending = new Map();
+  const controller = new AbortController();
+  let queuedBytes = 0;
+  let worker = null;
+  let closed = false;
+
+  async function deliver(item) {
+    if (item.accepted) return;
+    await postEventWithRetry(config, {
+      type: "external_conversation_item",
+      data: { ...item.data, source_id: boundedSourceId(item.sourceId) },
+    }, controller.signal);
+    item.accepted = true;
+    item.onAccepted?.();
+  }
+
+  async function drain() {
+    for (const [sourceId, item] of pending) {
+      if (controller.signal.aborted) break;
+      try {
+        // A result cannot overtake a call whose earlier delivery exhausted retries.
+        if (item.dependency) await deliver(item.dependency);
+        await deliver(item);
+      } catch (error) {
+        console.error(`[pi-native] Failed to persist ${item.data.item_type} (${sourceId}):`, error);
+        try {
+          item.onFailure?.(error);
+        } catch (notificationError) {
+          console.error("[pi-native] History failure notification failed:", notificationError);
+        }
+      } finally {
+        pending.delete(sourceId);
+        queuedBytes -= item.bytes;
+        item.settle();
+      }
+    }
+    if (pending.size) {
+      console.error(`[pi-native] Discarding ${pending.size} history items at shutdown`);
+      pending.clear();
+      queuedBytes = 0;
+    }
+  }
+
+  function start() {
+    worker = drain().finally(() => {
+      worker = null;
+      if (pending.size) start();
+    });
+  }
+
+  return {
+    enqueue(data, sourceId, { onAccepted, dependency, onFailure, previous } = {}) {
+      const existing = pending.get(sourceId);
+      if (existing) return existing;
+      const bytes = previous?.bytes ??
+        (Buffer.byteLength(JSON.stringify(data)) + (dependency?.bytes || 0));
+      if (
+        closed || pending.size >= _HISTORY_QUEUE_MAX_ITEMS ||
+        queuedBytes + bytes > _HISTORY_QUEUE_MAX_BYTES
+      ) {
+        const error = new Error(`History queue ${closed ? "closed" : "full"}: ${data.item_type}`);
+        console.error("[pi-native]", error);
+        try {
+          onFailure?.(error);
+        } catch (notificationError) {
+          console.error("[pi-native] History failure notification failed:", notificationError);
+        }
+        return null;
+      }
+      const item = previous || {
+        data, sourceId, onAccepted, dependency, onFailure, bytes, accepted: false,
+      };
+      item.settled = new Promise(resolve => { item.settle = resolve; });
+      pending.set(sourceId, item);
+      queuedBytes += bytes;
+      if (!worker) start();
+      return item;
+    },
+    async flush() {
+      // Later prompts must not extend the ending turn's delivery barrier.
+      const settled = Promise.all([...pending.values()].map(item => item.settled));
+      let timeout;
+      try {
+        return await Promise.race([
+          settled.then(() => true),
+          new Promise(resolve => {
+            timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+    async close() {
+      closed = true;
+      const timeout = setTimeout(() => controller.abort(), _HISTORY_SHUTDOWN_TIMEOUT_MS);
+      try {
+        while (worker) await worker;
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+  };
 }
 
 function assistantMessageSourceId(message, responseId, text) {
@@ -1454,12 +1570,16 @@ function startInboxPoller(
 module.exports = function (pi) {
   process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
   const config = readConfig();
+  const history = createHistoryQueue(config);
+  pi.on("session_shutdown", () => history.close());
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;
   // Response id shared across a turn's ``running`` → ``idle`` status pair.
   // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
+  let turnResult = null;
+  let turnOutcomeController = new AbortController();
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
   // !activeResponseId: agent_start resets activeResponseId to null and only
@@ -1480,6 +1600,7 @@ module.exports = function (pi) {
   const postedAssistantMessages = new Set();
   const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
+  let toolCallBytes = 0;
   const pendingInterruptMs = 30_000;
   // Live streaming state for assistant text deltas. Pi emits
   // message_update events carrying an assistantMessageEvent of type
@@ -1702,18 +1823,8 @@ module.exports = function (pi) {
     if (changed) await publishTaskList();
   }
 
-  // Cumulative session token usage. Pi reports PER-MESSAGE counts (one
-  // assistant message per LLM call); session billing is their SUM — each call
-  // is billed for the full context it re-sent, so summing per-message inputs is
-  // the correct cumulative input. The server applies vendor pricing to these
-  // cumulative totals and republishes a ``session.usage`` event (the SAME
-  // contract claude-native / codex-native / cursor-native use), so the web
-  // Session-cost badge + per-model token breakdown light up with no
-  // server/frontend changes. Dedup by message fingerprint so a re-emitted
-  // ``message_end`` / ``turn_end`` / ``agent_end`` carrying the same assistant
-  // message never double-counts. ``usageModel`` tracks the latest message's
-  // model (mirrors a mid-session model switch). ``lastPostedUsageKey`` dedups
-  // the POST itself so a flush with no new tokens is skipped.
+  // Sum each assistant message once; restored totals cover pre-relaunch messages.
+  // The POST key skips unchanged totals.
   const countedUsageMessages = new Set();
   let cumulativeInputTokens = 0;
   let cumulativeOutputTokens = 0;
@@ -1776,6 +1887,9 @@ module.exports = function (pi) {
     const postKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
     if (postKey === lastPostedUsageKey) return;
     lastPostedUsageKey = postKey;
+    // Persist the running total before the POST so a relaunch restores it even
+    // when the flush fails and the server never records this report.
+    persistCumulativeUsage();
     const data = {
       cumulative_input_tokens: cumulativeInputTokens,
       cumulative_output_tokens: cumulativeOutputTokens,
@@ -1783,6 +1897,70 @@ module.exports = function (pi) {
     };
     if (usageModel) data.model = usageModel;
     await postEvent(config, { type: "external_session_usage", data });
+  }
+
+  // Restore cumulative totals before recording new usage after a relaunch.
+  function usageStatePath() {
+    if (!config || !config.bridgeDir) return null;
+    return path.join(config.bridgeDir, "cumulative_usage.json");
+  }
+
+  function persistCumulativeUsage() {
+    const statePath = usageStatePath();
+    if (!statePath) return;
+    // Per-pid temp name: an exiting Pi process and its relaunched successor
+    // can flush concurrently, and a shared temp path could persist a torn file.
+    const tmp = `${statePath}.${process.pid}.tmp`;
+    try {
+      fs.writeFileSync(
+        tmp,
+        JSON.stringify({
+          cumulative_input_tokens: cumulativeInputTokens,
+          cumulative_output_tokens: cumulativeOutputTokens,
+          cumulative_cache_read_input_tokens: cumulativeCacheReadTokens,
+          model: usageModel,
+        }),
+      );
+      fs.renameSync(tmp, statePath);
+    } catch (_err) {
+      // Remove temporary state after a failed best-effort checkpoint.
+      try {
+        fs.unlinkSync(tmp);
+      } catch (_cleanupErr) {}
+    }
+  }
+
+  function raiseUsageTotals(saved) {
+    if (!saved || typeof saved !== "object") return;
+    const input = toInt(saved.cumulative_input_tokens);
+    const output = toInt(saved.cumulative_output_tokens);
+    const cacheRead = toInt(saved.cumulative_cache_read_input_tokens);
+    // Only raise the counters; a stale file must never pull a live total down.
+    if (input > cumulativeInputTokens) cumulativeInputTokens = input;
+    if (output > cumulativeOutputTokens) cumulativeOutputTokens = output;
+    if (cacheRead > cumulativeCacheReadTokens) cumulativeCacheReadTokens = cacheRead;
+    if (!usageModel && typeof saved.model === "string" && saved.model)
+      usageModel = saved.model;
+  }
+
+  function restoreCumulativeUsage() {
+    const baseline = config && config.usageBaseline;
+    raiseUsageTotals(baseline);
+    const statePath = usageStatePath();
+    if (statePath) {
+      try {
+        raiseUsageTotals(JSON.parse(fs.readFileSync(statePath, "utf8")));
+      } catch (_err) {}
+    }
+    // The server already holds this baseline. Only reassert a newer local total.
+    if (
+      baseline &&
+      cumulativeInputTokens === toInt(baseline.cumulative_input_tokens) &&
+      cumulativeOutputTokens === toInt(baseline.cumulative_output_tokens) &&
+      cumulativeCacheReadTokens === toInt(baseline.cumulative_cache_read_input_tokens)
+    ) {
+      lastPostedUsageKey = `${cumulativeInputTokens}-${cumulativeOutputTokens}-${cumulativeCacheReadTokens}-${usageModel || ""}`;
+    }
   }
 
   function rememberContext(ctx) {
@@ -1852,12 +2030,10 @@ module.exports = function (pi) {
     const name = String(toolCall.name || toolCall.toolName || "");
     if (!callId || !name) return;
     const key = `${responseId}:${callId}`;
-    toolCallsById.set(callId, { key, responseId, name });
     if (postedToolCalls.has(key)) return;
-    postedToolCalls.add(key);
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    const known = toolCallsById.get(callId);
+    const item = history.enqueue(
+      {
         response_id: responseId,
         item_type: "function_call",
         item_data: {
@@ -1869,7 +2045,23 @@ module.exports = function (pi) {
           call_id: callId,
         },
       },
-    });
+      `pi:tool-call:${key}`,
+      {
+        onAccepted: () => postedToolCalls.add(key),
+        previous: known?.key === key ? known.item : undefined,
+      },
+    );
+    toolCallBytes -= toolCallsById.get(callId)?.item?.bytes || 0;
+    toolCallsById.delete(callId);
+    toolCallsById.set(callId, { key, responseId, name, item });
+    toolCallBytes += item?.bytes || 0;
+    while (
+      toolCallsById.size > _HISTORY_QUEUE_MAX_ITEMS || toolCallBytes > _HISTORY_QUEUE_MAX_BYTES
+    ) {
+      const oldest = toolCallsById.keys().next().value;
+      toolCallBytes -= toolCallsById.get(oldest)?.item?.bytes || 0;
+      toolCallsById.delete(oldest);
+    }
   }
 
   async function postToolResult(event, responseId) {
@@ -1879,10 +2071,14 @@ module.exports = function (pi) {
     const known = toolCallsById.get(callId);
     const key = known && known.key ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
-    postedToolResults.add(key);
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    const dependency = known?.item ||
+      (postedToolCalls.has(key) ? { accepted: true, bytes: 0 } : null);
+    if (!dependency) {
+      console.error(`[pi-native] Withholding result without a queued call: ${callId}`);
+      return;
+    }
+    history.enqueue(
+      {
         response_id: known && known.responseId ? known.responseId : responseId,
         item_type: "function_call_output",
         item_data: {
@@ -1890,7 +2086,9 @@ module.exports = function (pi) {
           output: textFromToolResult(event),
         },
       },
-    });
+      `pi:tool-result:${key}`,
+      { onAccepted: () => postedToolResults.add(key), dependency },
+    );
   }
 
   async function postCompletedReasoning(text, responseId, keyHint, streamed) {
@@ -1898,17 +2096,15 @@ module.exports = function (pi) {
     const textKey = `${responseId}:text:${fingerprint(text)}`;
     const key = `${responseId}:${keyHint || fingerprint(text)}`;
     if (postedReasoning.has(key) || postedReasoning.has(textKey)) return;
-    postedReasoning.add(key);
-    postedReasoning.add(textKey);
-    if (!streamed) {
+    if (!streamed && !postedReasoning.has(`delta:${textKey}`)) {
+      postedReasoning.add(`delta:${textKey}`);
       await postEvent(config, {
         type: "external_output_reasoning_delta",
         data: { delta: text, started: true },
       });
     }
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
+    history.enqueue(
+      {
         response_id: responseId,
         item_type: "reasoning",
         item_data: {
@@ -1917,7 +2113,12 @@ module.exports = function (pi) {
           content: [{ type: "reasoning_text", text }],
         },
       },
-    });
+      `pi:reasoning:${textKey}`,
+      { onAccepted: () => {
+        postedReasoning.add(key);
+        postedReasoning.add(textKey);
+      } },
+    );
   }
 
   function reasoningBlockKey(responseId, contentIndex) {
@@ -2024,6 +2225,8 @@ module.exports = function (pi) {
 
   pi.on("session_start", async (_event, ctx) => {
     rememberContext(ctx);
+    restoreCumulativeUsage();
+    wrapExtensionUi(ctx, config);
     registerTaskToolIfMissing();
     restoreTaskList(ctx);
     if (taskList.length) await publishTaskList();
@@ -2045,7 +2248,7 @@ module.exports = function (pi) {
           if (!agentRunning) {
             await postEvent(config, {
               type: "external_session_status",
-              data: { status: "idle", response_id: responseId },
+              data: { status: "idle", turn_completed: false, response_id: responseId },
             });
           }
           compacting = false;
@@ -2087,6 +2290,8 @@ module.exports = function (pi) {
         data: { model: startupModel },
       });
     }
+    // Publish readiness before usage so a hung POST cannot delay input handling.
+    await postSessionUsage();
     // Readiness is not turn completion: a queued prompt may already be running.
     // Only agent_end publishes idle so startup cannot complete a child task.
   });
@@ -2125,7 +2330,10 @@ module.exports = function (pi) {
     // this loop and can still arm/replay; agent_end clears once the loop
     // completes. See F18.
     clearPendingInterrupt();
+    turnOutcomeController.abort();
+    turnOutcomeController = new AbortController();
     agentRunning = true;
+    turnResult = null;
     setOmnigentStatus(config, ctx, "running");
     activeResponseId = null;
     turnOrdinal = 0;
@@ -2135,6 +2343,7 @@ module.exports = function (pi) {
     postedAssistantMessages.clear();
     streamedReasoningBlocks.clear();
     toolCallsById.clear();
+    toolCallBytes = 0;
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
@@ -2151,6 +2360,12 @@ module.exports = function (pi) {
 
   pi.on("agent_end", async (event, ctx) => {
     rememberContext(ctx);
+    const cancelled = ctx?.signal?.aborted || hasPendingInterrupt();
+    const outcomeSignal = turnOutcomeController.signal;
+    const endResponseId =
+      turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
+    const result = turnResult;
+    const drainedHistory = compacting ? Promise.resolve(true) : history.flush();
     clearPendingInterrupt();
     agentRunning = false;
     setOmnigentStatus(config, ctx, "idle");
@@ -2167,17 +2382,43 @@ module.exports = function (pi) {
       if (accumulateUsage(message)) changed = true;
     }
     if (changed) await postSessionUsage();
+    if (outcomeSignal.aborted) return;
     // Reuse the agent_start response_id so the web client matches the idle
     // edge and clears the "streaming" status, unblocking queued follow-ups.
-    const endResponseId =
-      turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
-    // Manual compact aborts the turn first; its own completion publishes idle.
+    // Compaction interrupts a loop without completing its delegated task.
     if (compacting) return;
+    const outcome = cancelled ? "cancelled" : result?.outcome ?? "failed";
+    // Readiness is not a completed result. Older servers may ignore this observation.
     await postEvent(config, {
-      type: "external_session_status",
-      data: { status: "idle", response_id: endResponseId },
-    });
+      type: "subagent.status",
+      data: { idle: true, response_id: endResponseId },
+    }, AbortSignal.timeout(assistantItemPostTimeoutMs(config)));
+    const drained = await drainedHistory;
+    if (outcomeSignal.aborted) return;
+    // Pi continues queued steering after agent_end; the parent's dispatch is still active.
+    if (outcome === "completed" && ctx?.hasPendingMessages?.()) return;
+    const deliveryFailed = !drained || (Boolean(result?.output) && !result.item?.accepted);
+    const status = deliveryFailed || outcome === "failed" ? "failed" : "idle";
+    const output = deliveryFailed
+      ? "Omnigent could not save the Pi turn output; see host logs."
+      : (result?.output ?? (cancelled ? "" : "Pi turn ended without a final response."));
+    try {
+      await postEventWithRetry(config, {
+        type: "external_session_status",
+        data: {
+          status, response_id: endResponseId,
+          turn_completed: !deliveryFailed && outcome === "completed",
+          turn_outcome: deliveryFailed ? "failed" : outcome,
+          output,
+          ...(status === "failed" ? { failure_detail: output } : {}),
+        },
+      }, outcomeSignal);
+    } catch (error) {
+      if (outcomeSignal.aborted) return;
+      console.error("[pi-native] Failed to deliver turn outcome:", error);
+      ctx?.ui?.notify?.("Omnigent could not deliver the Pi turn outcome; see host logs.", "error");
+    }
   });
 
   pi.on("turn_start", async (event, ctx) => {
@@ -2301,17 +2542,18 @@ module.exports = function (pi) {
         await applyModelChange(pi, config, ctx, decision.model);
       }
     }
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
-        response_id: `pi-user-${Date.now()}-${++sequence}`,
+    const responseId = newResponseId("user");
+    history.enqueue(
+      {
+        response_id: responseId,
         item_type: "message",
         item_data: {
           role: "user",
           content: [{ type: "input_text", text }],
         },
       },
-    });
+      `pi:user:${responseId}`,
+    );
   });
 
   pi.on("message_end", async (event, ctx) => {
@@ -2353,8 +2595,7 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      await postConversationItem(
-        config,
+      const item = history.enqueue(
         {
           response_id: responseId,
           item_type: "error",
@@ -2366,17 +2607,22 @@ module.exports = function (pi) {
         },
         assistantMessageSourceId(message, responseId, errorMessage),
       );
+      turnResult = { item, outcome: "failed", output: `Pi model error: ${errorMessage}` };
       return;
     }
     const text = textFromMessage(message);
-    if (!text) return;
+    const outcome = stopReason === "aborted" ? "cancelled"
+      : stopReason === "toolUse" || stopReason === "error" ? "failed" : "completed";
+    if (!text) {
+      turnResult = { outcome, output: "", item: null };
+      return;
+    }
     const sourceId = assistantMessageSourceId(message, responseId, text);
     if (postedAssistantMessages.has(sourceId)) return;
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
-    await postConversationItem(
-      config,
+    const item = history.enqueue(
       {
         response_id: responseId,
         item_type: "message",
@@ -2387,10 +2633,14 @@ module.exports = function (pi) {
         },
       },
       sourceId,
+      {
+        onAccepted: () => postedAssistantMessages.add(sourceId),
+        onFailure: () => ctx?.ui?.notify?.(
+          "Omnigent could not save the assistant response; see host logs.", "error",
+        ),
+      },
     );
-    // Retry a failed callback on its next delivery; only suppress duplicates
-    // after the authoritative POST has been accepted.
-    postedAssistantMessages.add(sourceId);
+    turnResult = { item, outcome, output: item ? text : "History delivery rejected" };
   });
 
   pi.on("turn_end", async (event, ctx) => {

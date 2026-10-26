@@ -72,6 +72,14 @@ Issues with no activity for 30 days are marked `stale` and close after another
 14 days without activity. New activity restarts that inactivity window. Issues
 labeled `pinned`, `security`, or `bug` are exempt.
 
+Pull requests with no activity for 60 days are marked `stale` and close after
+another 14 days without activity. New activity clears the label and restarts
+the inactivity window. This applies to both contributor and maintainer PRs,
+including drafts. PRs labeled `pinned` or `security` are exempt. Source branches
+are kept, and authors can comment `/reopen` to resume work after an automated
+closure. This policy also applies to older PRs that predate the review-state
+labels below.
+
 If a bug is labeled `needs-info`, the automation asks its author for the
 specific missing information and gives them 7 days to respond. An author reply
 triggers another triage pass; the label clears only when the new information is
@@ -126,6 +134,20 @@ source .venv/bin/activate    # or prefix commands with `uv run`
 Repository-only dependencies use PEP 735 groups: `lint` for static checks and
 code generation, `test` for pytest, and `dev` for both. Product capabilities
 remain installable extras. Plain `uv sync` installs neither group by default.
+
+Package mirrors that embargo new releases, such as the Databricks PyPI proxy
+used for internal builds, install omnigent from the requirements declared in
+`pyproject.toml`, not from `uv.lock`. When you raise a dependency floor or add a
+dependency, keep the floor at a release those mirrors already serve and let
+`uv.lock` pin anything newer. With Databricks network access, run
+`just check-internal-mirror` before merging; it resolves through the proxy
+without writing `uv.lock`. The `young-dependency-floor` custom lint fails when a
+floor needs a release inside the uv cooldown. An urgent bump, such as a security
+fix, may keep that floor once the mirror serves the release: suppress the lint
+on the requirement with a `custom-lint: disable-next` comment that says why.
+Adding or changing that waiver keeps the required Maintainer Approval check red
+until a maintainer, the author included, runs `just check-internal-mirror` and
+adds the `dependency-floor-approved` label.
 
 Common checks:
 

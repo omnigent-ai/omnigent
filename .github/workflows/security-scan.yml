@@ -3,7 +3,8 @@ name: Security Scan
 # The single deterministic security scan for a PR. Runs ONCE per PR and produces
 # the `Security Scan` check; the per-workflow gate jobs (security-gate.yml) don't
 # re-scan, they poll THIS check and mirror its result, so the work happens once
-# while still gating every CI workflow.
+# while gating contributor CI. Verified Dependabot CI proceeds independently;
+# its merge still requires a successful Security Scan and advisory policy.
 #
 # It only STATICALLY analyses the diff/head (semgrep, grep, diff-read) with NO
 # secrets on fork PRs, so it never executes untrusted code. The scanner is always
@@ -11,7 +12,7 @@ name: Security Scan
 # PR can't edit its own scan.
 #
 # Blocking: any detector that finds something fails this check; the per-workflow
-# pollers mirror the failure and skip the dependent CI jobs (no PR-code checkout
+# contributor pollers mirror the failure and skip dependent CI jobs (no PR-code checkout
 # / uv sync / test). Detectors run fail-fast -- the first finding fails the job,
 # so a clean PR must pass every one.
 #
@@ -47,19 +48,18 @@ jobs:
       UV_INDEX_URL: https://pypi.org/simple
     steps:
       - name: Check out scanner from main
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          ref: main             # trusted; never the PR head
-          sparse-checkout: |
-            .github/scripts/security-scan
-            .github/scripts/merge-ready
-            .github/security
-            .github/scripts/maintainer_approval.py
-            .github/scripts/dependabot_automerge.py
-            .github/scripts/dependabot_policy.py
-            .github/dependabot-automerge.json
-          sparse-checkout-cone-mode: false
-          persist-credentials: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Bootstrap without executing an Action pin supplied by the PR.
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$REPO.git"
+          git sparse-checkout set --no-cone .github/scripts .github/security .github/dependabot-automerge.json
+          authorization=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$authorization"
+          git -c "http.extraHeader=AUTHORIZATION: basic $authorization" fetch --depth=1 origin main
+          git checkout --detach FETCH_HEAD
 
       - name: Load maintainers
         id: maintainers
@@ -75,6 +75,8 @@ jobs:
           AUTHOR_ASSOCIATION: ${{ github.event.pull_request.author_association }}
           # Trusted-CI-bot allowlist in should-scan.sh (GitHub-set, not PR-controlled).
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
           # For the skip-security-scan label waiver + author check (read-only).
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
@@ -104,7 +106,7 @@ jobs:
 
       - name: Install trusted policy parser
         if: >-
-          github.event.pull_request.user.login == 'dependabot[bot]'
+          steps.gate.outputs.dependabot == 'true'
         run: |
           python3 -m venv "$RUNNER_TEMP/dependabot-policy-env"
           "$RUNNER_TEMP/dependabot-policy-env/bin/pip" install --disable-pip-version-check --only-binary=:all: PyYAML==6.0.3
@@ -114,7 +116,7 @@ jobs:
         id: dependabot
         if: >-
           steps.gate.outputs.scan == 'true' &&
-          github.event.pull_request.user.login == 'dependabot[bot]'
+          steps.gate.outputs.dependabot == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}

@@ -123,7 +123,7 @@ def _to_agent_object(agent: Agent, agent_cache: AgentCache) -> AgentObject:
         # Kind for the Add Agent picker (Codex vs Claude). Stays None
         # when the bundle can't be loaded (the except below).
         harness = loaded.spec.executor.harness_kind
-    except Exception:  # noqa: BLE001 — spec load failure must not break the list
+    except Exception:  # spec load failure must not break the list
         _logger.debug(
             "Failed to load spec for agent %s; mcp_servers/skills will be empty",
             agent.id,
@@ -394,7 +394,6 @@ def create_builtin_agents_router(
             },
             415: {"model": ErrorResponse, "description": "A JSON request body is required"},
             422: {"model": ErrorResponse, "description": "Invalid partial configuration"},
-            428: {"model": ErrorResponse, "description": "If-Match is required"},
         },
     )
     async def patch_agent_config(
@@ -404,16 +403,17 @@ def create_builtin_agents_router(
         response: Response,
         if_match: str | None = Header(default=None),
     ) -> AgentConfigObject | JSONResponse:
-        """Patch only supplied fields; require the ETag from GET /agents/{id}/config."""
+        """Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config."""
         agent = await editable_agent(request, agent_id)
-        if if_match is None:
-            return _config_error(428, "precondition_required", "If-Match is required")
-        if len(request.headers.getlist("if-match")) != 1 or not (
-            len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
-        ):
-            return _config_error(400, "invalid_input", "Supply one strong configuration ETag")
-        if if_match != _config_etag(agent):
-            return _config_error(412, "precondition_failed", "Agent changed; reload before saving")
+        if if_match is not None:
+            if len(request.headers.getlist("if-match")) != 1 or not (
+                len(if_match) == 66 and if_match.startswith('"') and if_match.endswith('"')
+            ):
+                return _config_error(400, "invalid_input", "Supply one strong configuration ETag")
+            if if_match != _config_etag(agent):
+                return _config_error(
+                    412, "precondition_failed", "Agent changed; reload before saving"
+                )
         bundle, spec, location = await asyncio.to_thread(configuration, agent, body)
         if len(bundle) > MAX_INSTALL_BUNDLE_BYTES:
             raise _too_large()

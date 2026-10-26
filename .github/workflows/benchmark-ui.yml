@@ -29,6 +29,9 @@ env:
 jobs:
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   # Job-level filtering keeps this usable as a required check for all PRs.
   detect:

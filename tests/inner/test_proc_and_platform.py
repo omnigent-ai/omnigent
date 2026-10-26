@@ -371,7 +371,10 @@ def test_kill_tree_reaps_descendant_that_left_process_group(tmp_path: Path) -> N
         "path = pathlib.Path(os.environ['CHILD_PID_PATH'])\n"
         "if os.fork() == 0:\n"
         "    os.setsid()\n"
-        "    path.write_text(str(os.getpid()))\n"
+        # Publish atomically: the poll below must never read a created-but-empty file.
+        "    pending = path.with_suffix('.pending')\n"
+        "    pending.write_text(str(os.getpid()))\n"
+        "    pending.replace(path)\n"
         "    while True: time.sleep(1)\n"
         "while True: time.sleep(1)\n"
     )

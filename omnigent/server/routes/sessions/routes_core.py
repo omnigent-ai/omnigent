@@ -112,10 +112,7 @@ from omnigent.server.routes._sessions.common import (
     _CODEX_NATIVE_COLLABORATION_MODES,
     _CODEX_NATIVE_WRAPPER_LABEL_VALUE,
     _DEVIN_NATIVE_WRAPPER_LABEL_VALUE,
-    _MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
     _logger,
-    _managed_launch_tasks,
-    _unbound_managed_launch_tasks,
     get_server_runner_router,
     set_server_runner_router,
 )
@@ -161,6 +158,7 @@ from omnigent.server.routes._sessions.helpers import (
     _same_provider_family,
     _session_status_cache,
     _set_read_state,
+    _start_managed_launch_task,
     _surface_model_change_forward_failure,
     _title_content_from_item,
     _validate_terminal_launch_args,
@@ -636,45 +634,13 @@ def register_core_routes(
             agent_id=agent_id,
             host_id=requested_host_id,
         )
-        startup = getattr(request.app.state, "startup_inputs", None)
-
-        async def record_unbound_launch_failure() -> None:
-            # Shutdown gave up on the launch. Bound, the host's replica finishes
-            # it; unbound, no replica can, so fail the saved inputs rather than
-            # leave them pending with nothing to deliver them.
-            assert startup is not None
-            conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if conv is not None and conv.host_id is None:
-                await startup.record_launch_failure(
-                    session_id, "the server shut down before the sandbox finished launching"
-                )
-
-        async def launch_and_record_failure() -> None:
-            try:
-                await launch
-            except asyncio.CancelledError:
-                if startup is not None:
-                    with contextlib.suppress(Exception):
-                        await asyncio.wait_for(
-                            record_unbound_launch_failure(),
-                            timeout=_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S,
-                        )
-                raise
-            except Exception as exc:
-                if startup is not None:
-                    await startup.record_launch_failure(
-                        session_id, f"managed sandbox failed to launch: {exc}"
-                    )
-                raise
-            failed = managed_launches.get(session_id)
-            if startup is not None and failed is not None and failed.error is not None:
-                await startup.record_launch_failure(session_id, failed.error)
-
-        launch_task = asyncio.create_task(launch_and_record_failure())
-        _managed_launch_tasks.add(launch_task)
-        _unbound_managed_launch_tasks.add(launch_task)
-        launch_task.add_done_callback(_managed_launch_tasks.discard)
-        launch_task.add_done_callback(_unbound_managed_launch_tasks.discard)
+        _start_managed_launch_task(
+            session_id,
+            launch,
+            conversation_store=conversation_store,
+            tracker=managed_launches,
+            startup=getattr(request.app.state, "startup_inputs", None),
+        )
 
     async def _check_requested_host_id(
         request: Request, requested_host_id: str, user_id: str | None
@@ -849,7 +815,7 @@ def register_core_routes(
             launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
         except ConnectionError as exc:
             launch_result = {"status": "failed", "error": str(exc)}
-        except asyncio.TimeoutError:
+        except TimeoutError:
             launch_result = {
                 "status": "failed",
                 "error": (
@@ -1643,6 +1609,7 @@ def register_core_routes(
         order: str = Query(default="desc", pattern="^(asc|desc)$"),
         sort_by: str = Query(default="created_at", pattern="^(created_at|updated_at)$"),
         search_query: str | None = Query(default=None),
+        search_scope: str = Query(default="all", pattern="^(all|title|content)$"),
         include_archived: bool = Query(default=False),
         kind: str = Query(default="default", pattern="^(default|sub_agent|any)$"),
         project: str | None = Query(default=None),
@@ -1679,6 +1646,12 @@ def register_core_routes(
             matches if its title contains the query or any of
             its conversation items' text does. Powers the
             sidebar's session search.
+        :param search_scope: Which ``search_query`` matches to return.
+            ``"all"`` (default) returns title or content matches.
+            ``"title"`` returns only title matches. ``"content"``
+            returns content matches whose title does not match;
+            ``title`` and ``content`` never overlap. Ignored without
+            a ``search_query``.
         :param include_archived: When ``False`` (default), archived
             sessions are omitted. When ``True``, archived sessions
             are returned alongside active ones (the sidebar groups
@@ -1782,6 +1755,7 @@ def register_core_routes(
             order=order,
             sort_by=sort_by,
             search_query=normalized_query,
+            search_scope=search_scope,
             include_archived=include_archived_param,
             archived_only=archived_only_param,
             project=project,
@@ -2923,18 +2897,15 @@ def register_core_routes(
                 )
                 parent_initialized = False
                 if _runner_client is not None and conv is not None and conv.agent_id is not None:
-                    # The versioned payload's snapshot carries harness_override,
-                    # so a rebind after a cross-harness create initializes the
-                    # override harness — a bare body left the runner resolving
-                    # from the spec, and the recovery turn that executes seeded
-                    # initial_items ran on the spec's harness. Recovery stays
-                    # enabled: on rebind it is what runs the pending kickoff.
+                    # The versioned snapshot keeps harness_override on rebind.
+                    # Recovery runs the pending kickoff, except a side chat's copied turn.
                     try:
                         runner_init_resp = await _runner_client.post(
                             "/v1/sessions",
                             json=build_runner_session_init_payload(
                                 conv,
                                 server_version=VERSION,
+                                suppress_recovery_turn=conv.labels.get(SIDE_CHAT_LABEL_KEY) == "1",
                             ),
                             timeout=10.0,
                         )
@@ -3912,10 +3883,12 @@ def register_core_routes(
                     break
                 files_after = files_page.last_id
 
-            from omnigent.inner.native_attachments import requires_filesystem
+            from omnigent.inner.native_attachments import uses_filesystem_delivery
 
             filesystem_sources = [
-                stored for stored in fork_source_files if requires_filesystem(stored.filename)
+                stored
+                for stored in fork_source_files
+                if uses_filesystem_delivery(stored.filename, stored.source_metadata)
             ]
             if filesystem_sources:
                 await asyncio.to_thread(

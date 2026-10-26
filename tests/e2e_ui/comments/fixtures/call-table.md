@@ -1,0 +1,5 @@
+| Client \ View | Format A (older examples, help pages) | Format B | Format C |
+| --- | --- | --- | --- |
+| **Desktop** | Show a short introduction and a numbered list of examples. No call. | Show the welcome message and a list of available help topics. No call. | Same as the previous example. |
+| **Tablet** | Show a longer introduction with helpful examples for new users. Continue with a short explanation (preview: hidden / not displayed). Call. | Show the welcome message with a detailed description of the example, followed by a short status message (preview: as before). No call (preview: call). | Show the welcome message and some additional notes about the example. Keep the original descriptions in the help panel (preview: as before). No call (preview: call). |
+| **Phone** | Show a short introduction and examples in a compact layout. Include another explanation (preview: hidden / not displayed). Call. | Show the welcome message with extra information about the compact layout (preview: as before). Call. | Show a final example with a short status message (preview: as before). No call (preview: call). |

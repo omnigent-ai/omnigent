@@ -1,11 +1,31 @@
 import { describe, expect, it } from "vitest";
-import { formatToolRunLabel, formatToolTitle } from "./toolTitle";
+import {
+  formatToolRunLabel,
+  formatToolTitle,
+  shellCommandPreview,
+  shellToolCall,
+  splitEnvPrefix,
+} from "./toolTitle";
 
 describe("formatToolTitle", () => {
   it("strips sys_os_shell down to the command string with no bold verb", () => {
     expect(formatToolTitle("sys_os_shell", { command: "ls -la" })).toEqual({
       verb: null,
       body: "ls -la",
+      isShellCommand: true,
+    });
+  });
+
+  it("gives a prefixed omnigent shell tool the same row as its terminal panel", () => {
+    expect(formatToolTitle("mcp__omnigent__sys_os_shell", { command: "ls -la" })).toEqual({
+      verb: null,
+      body: "ls -la",
+      isShellCommand: true,
+    });
+    // Other prefixed tools keep their existing fallback title.
+    expect(formatToolTitle("mcp__omnigent__sys_os_read", { path: "a.py" }, "path=a.py")).toEqual({
+      verb: null,
+      body: "mcp__omnigent__sys_os_read(path=a.py)",
     });
   });
 
@@ -146,6 +166,7 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("Bash", { command: "ls docs" })).toEqual({
       verb: null,
       body: "ls docs",
+      isShellCommand: true,
     });
     expect(formatToolTitle("Read", { file_path: "/repo/README.md" })).toEqual({
       verb: "Read",
@@ -175,6 +196,7 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("shell", { command: "/bin/bash -lc 'cat notes.txt'" })).toEqual({
       verb: null,
       body: "cat notes.txt",
+      isShellCommand: true,
     });
     expect(
       formatToolTitle("apply_patch", {
@@ -201,6 +223,7 @@ describe("formatToolTitle", () => {
     expect(formatToolTitle("bash", { command: "cat notes.txt" })).toEqual({
       verb: null,
       body: "cat notes.txt",
+      isShellCommand: true,
     });
     expect(formatToolTitle("read", { filePath: "/repo/notes.txt" })).toEqual({
       verb: "Read",
@@ -309,5 +332,101 @@ describe("formatToolRunLabel", () => {
     expect(formatToolRunLabel([call("turn_diff")])).toBe("Called 1 tool");
     expect(formatToolRunLabel([call("TodoWrite")])).toBe("Called 1 tool");
     expect(formatToolRunLabel([call("alpha_tool"), call("beta_tool")])).toBe("Called 2 tools");
+  });
+});
+
+describe("shellToolCall", () => {
+  const commandOf = (name: string, args: Record<string, unknown>) =>
+    shellToolCall(name, args)?.command ?? null;
+
+  it("returns the command for shell tools only", () => {
+    expect(commandOf("shell", { command: "/bin/zsh -lc 'pnpm install'" })).toBe("pnpm install");
+    expect(commandOf("mcp__omnigent__sys_os_shell", { command: "ls -la" })).toBe("ls -la");
+    expect(commandOf("Bash", { command: "git status", description: "Check" })).toBe("git status");
+    expect(commandOf("Read", { command: "ls" })).toBeNull();
+    expect(commandOf("Bash", { command: 42 })).toBeNull();
+    // OpenAI's local_shell passes an argv array, which has no single command line.
+    expect(commandOf("local_shell", { command: ["ls", "-la"] })).toBeNull();
+  });
+
+  it("only unwraps Codex's shell, and keeps commands that are not one quoted word", () => {
+    // Claude ran this wrapper itself, so it is shown and copied as run.
+    expect(commandOf("Bash", { command: "bash -c 'make test'" })).toBe("bash -c 'make test'");
+    // Only `a` runs inside sh; stripping the outer quotes would mangle the rest.
+    expect(commandOf("shell", { command: "sh -c 'a' && echo 'b'" })).toBe("sh -c 'a' && echo 'b'");
+    expect(commandOf("shell", { command: String.raw`/bin/bash -lc 'echo '\''hi'\'''` })).toBe(
+      "echo 'hi'",
+    );
+    expect(commandOf("shell", { command: String.raw`/bin/zsh -lc "echo \"a b\""` })).toBe(
+      'echo "a b"',
+    );
+    // An empty wrapped command shows the wrapper rather than nothing.
+    expect(commandOf("shell", { command: "/bin/bash -lc ''" })).toBe("/bin/bash -lc ''");
+  });
+
+  it.each([
+    ["sys_os_shell", "sys-os-json"],
+    ["mcp__omnigent__sys_os_shell", "sys-os-json"],
+    ["shell", "codex-suffix"],
+    ["Bash", "plain"],
+    ["bash", "plain"],
+  ])("reads %s output as %s", (name, format) => {
+    expect(shellToolCall(name, { command: "ls" })?.outputFormat).toBe(format);
+  });
+});
+
+describe("splitEnvPrefix", () => {
+  it.each([
+    [
+      'PATH="$HOME/bin:$PATH" pnpm install',
+      { env: 'PATH="$HOME/bin:$PATH" ', rest: "pnpm install" },
+    ],
+    ["FOO=1 BAR='a b' make test", { env: "FOO=1 BAR='a b' ", rest: "make test" }],
+    ["git status", { env: "", rest: "git status" }],
+    // Assignments with no program after them are not a prefix.
+    ["FOO=1", { env: "", rest: "FOO=1" }],
+    ["FOO=1 BAR=2", { env: "", rest: "FOO=1 BAR=2" }],
+    // Never split inside a value.
+    ['FOO="a b"c make', { env: "", rest: 'FOO="a b"c make' }],
+    ["FOO=$(a b) cmd", { env: "", rest: "FOO=$(a b) cmd" }],
+    ["FOO=a;b cmd", { env: "", rest: "FOO=a;b cmd" }],
+    ["FOO=a&&b cmd", { env: "", rest: "FOO=a&&b cmd" }],
+    ["FOO=a|b cmd", { env: "", rest: "FOO=a|b cmd" }],
+  ])("splits %s", (command, expected) => {
+    expect(splitEnvPrefix(command)).toEqual(expected);
+  });
+});
+
+describe("shellCommandPreview", () => {
+  it("shows a one-line command as it is", () => {
+    expect(shellCommandPreview("ls -la")).toEqual({ firstLine: "ls -la", moreLines: 0 });
+  });
+
+  it("counts the non-blank lines after the first", () => {
+    expect(shellCommandPreview("git diff --check\n\ngit status --short\nls\n")).toEqual({
+      firstLine: "git diff --check",
+      moreLines: 2,
+    });
+  });
+
+  it("drops a trailing backslash from the first line", () => {
+    expect(shellCommandPreview("pnpm test \\\n  --filter web")).toEqual({
+      firstLine: "pnpm test",
+      moreLines: 1,
+    });
+  });
+
+  it("skips leading comment lines", () => {
+    expect(shellCommandPreview("# Inspect the tree\ngit status")).toEqual({
+      firstLine: "git status",
+      moreLines: 1,
+    });
+  });
+
+  it("keeps a comment-only script", () => {
+    expect(shellCommandPreview("# nothing to run\n")).toEqual({
+      firstLine: "# nothing to run",
+      moreLines: 0,
+    });
   });
 });

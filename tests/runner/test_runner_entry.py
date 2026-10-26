@@ -3,26 +3,33 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import importlib
 import io
 import logging
 import os
+import queue
 import signal
 import sys
 import tarfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 import httpx
 import pytest
 
+from omnigent.errors import OmnigentError
 from omnigent.native import _native_forwarder_health as native_forwarder_health
 from omnigent.native import native_terminal
 from omnigent.runner._entry import (
     _DEFAULT_RUNNER_IDLE_TIMEOUT_S,
     _DEFAULT_RUNNER_THREADPOOL_MAX_WORKERS,
     _agent_cache_dest,
+    _AgentSpecCache,
     _apply_host_interactive_shells,
     _host_interactive_shells_from_env,
     _InitialAuthTokenFactory,
@@ -64,7 +71,9 @@ from omnigent.runner.transports.ws_tunnel.serve import (
     RUNNER_TUNNEL_REJECTION_PREFIX,
     RunnerTunnelAuthRejectedError,
 )
+from omnigent.util import event_loop_watchdog as watchdog
 from tests._helpers.session import bundle_files
+from tests.budgets import budget
 
 # Force-load the MCP streamable-http client before any test monkeypatches
 # httpx.AsyncClient: the MCP SDK evaluates `httpx.AsyncClient | None` eagerly at
@@ -2554,6 +2563,28 @@ async def test_runner_shutdown_closes_terminal_registry(
     sync_clients: list[_TrackingSyncClient] = []
     terminal_sweeps: list[int] = []
     bridge_sweeps: list[int] = []
+    watching = False
+    watchdog_roles: list[str] = []
+    stall_records: queue.Queue[logging.LogRecord] = queue.Queue()
+
+    class Capture(logging.Handler):
+        def emit(self, record: logging.LogRecord) -> None:
+            stall_records.put(record)
+
+    @contextmanager
+    def monitor(**kwargs: Any):
+        nonlocal watching
+        watchdog_roles.append(kwargs["process_role"])
+        watching = True
+        try:
+            with watchdog.monitor_event_loop(
+                **kwargs,
+                stall_threshold_s=budget(0.2),
+                sample_interval_s=budget(0.02),
+            ):
+                yield
+        finally:
+            watching = False
 
     class _FakeProcessManager:
         def __init__(self) -> None:
@@ -2563,10 +2594,12 @@ async def test_runner_shutdown_closes_terminal_registry(
             process_managers.append(self)
 
         async def start(self, *, sweep_orphans: bool = True) -> None:
+            assert not watching
             assert sweep_orphans is expected_sweep_orphans
             self.started = True
 
         async def shutdown(self) -> None:
+            assert not watching
             self.shutdown_called = True
 
     def _terminal_registry_factory(
@@ -2624,12 +2657,25 @@ async def test_runner_shutdown_closes_terminal_registry(
         "omnigent.runner.identity.get_stable_runner_id",
         lambda: "runner-test-id",
     )
+    monkeypatch.setattr(entry_mod, "monitor_event_loop", monitor, raising=False)
 
     app = entry_mod.create_app()
     # starlette 1.x removed Router.startup/shutdown; drive the lifespan instead.
-    async with app.router.lifespan_context(app):
-        pass
+    handler = Capture()
+    watchdog._logger.addHandler(handler)
+    try:
+        async with app.router.lifespan_context(app):
+            # Block only this test loop until the independent watchdog captures it.
+            record = stall_records.get(timeout=budget(2))
+            assert watching
+            assert record.event_name == "runner_event_loop_stalled"
+            assert "test_runner_shutdown_closes_terminal_registry" in record.captured_stack_trace
+    finally:
+        watchdog._logger.removeHandler(handler)
+        handler.close()
 
+    assert watchdog_roles == ["runner"]
+    assert not watching
     assert process_managers and process_managers[0].started
     assert process_managers[0].shutdown_called
     assert terminal_sweeps == ([] if host_owns_global_cleanup else [1])
@@ -2721,7 +2767,7 @@ async def test_resolve_agent_spec_from_server_returns_none_for_404(
         base_url="http://server.test",
     ) as client:
         spec = await _resolve_agent_spec_from_server(
-            client, tmp_path, "ag_missing", session_id="conv_test"
+            client, _AgentSpecCache(tmp_path), "ag_missing", session_id="conv_test"
         )
 
     assert spec is None
@@ -2742,6 +2788,46 @@ def _spec_bundle(name: str) -> bytes:
     return buf.getvalue()
 
 
+@pytest.mark.parametrize("cached", [False, True])
+async def test_resolve_agent_spec_keeps_loop_responsive_during_bundle_load(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cached: bool
+) -> None:
+    from omnigent import spec as spec_module
+
+    cache = _AgentSpecCache(tmp_path)
+    bundle = _spec_bundle("cached-agent")
+    load_entered = threading.Event()
+    heartbeat_served = threading.Event()
+    original_load = spec_module.load
+
+    def blocked_load(*args: Any, **kwargs: Any) -> Any:
+        load_entered.set()
+        assert heartbeat_served.wait(5), "bundle loading blocked the runner event loop"
+        return original_load(*args, **kwargs)
+
+    async def heartbeat() -> None:
+        assert await asyncio.to_thread(load_entered.wait, 5)
+        heartbeat_served.set()
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        if cached:
+            await _resolve_agent_spec_from_server(client, cache, "ag_cached", "conv_test")
+        monkeypatch.setattr(spec_module, "load", blocked_load)
+        pulse = asyncio.create_task(heartbeat())
+        try:
+            resolved = await _resolve_agent_spec_from_server(
+                client, cache, "ag_cached", "conv_test"
+            )
+        finally:
+            heartbeat_served.set()
+            await pulse
+
+    assert resolved is not None and resolved.spec.name == "cached-agent"
+
+
 @pytest.mark.asyncio
 async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     tmp_path: Path,
@@ -2753,6 +2839,7 @@ async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     :returns: None.
     """
 
+    cache = _AgentSpecCache(tmp_path)
     original = _spec_bundle("cached-agent")
     served = [original, original, _spec_bundle("re-added")]
     requested_paths: list[str] = []
@@ -2767,7 +2854,7 @@ async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     ) as client:
         resolved = [
             await _resolve_agent_spec_from_server(
-                client, tmp_path, "ag_cached", session_id="conv_test"
+                client, cache, "ag_cached", session_id="conv_test"
             )
             for _ in range(3)
         ]
@@ -2786,7 +2873,15 @@ async def test_resolve_agent_spec_from_server_caches_by_version_and_content(
     ]
 
 
-async def test_resolve_agent_spec_rebuilds_cache_after_config_is_removed(tmp_path: Path) -> None:
+@pytest.mark.parametrize(
+    "cached_config",
+    [None, b"name: truncated-agent\n", b"spec_version: [\n", b"\xff"],
+    ids=["missing", "missing-version", "invalid-yaml", "invalid-encoding"],
+)
+async def test_resolve_agent_spec_rebuilds_damaged_cache(
+    tmp_path: Path, cached_config: bytes | None
+) -> None:
+    cache = _AgentSpecCache(tmp_path)
     bundle = bundle_files(
         {
             "config.yaml": (
@@ -2800,14 +2895,18 @@ async def test_resolve_agent_spec_rebuilds_cache_after_config_is_removed(tmp_pat
         base_url="http://server.test",
     ) as client:
         original = await _resolve_agent_spec_from_server(
-            client, tmp_path, "ag_cached", session_id="conv_test"
+            client, cache, "ag_cached", session_id="conv_test"
         )
         assert original is not None
-        (original.workdir / "config.yaml").unlink()
+        config_path = original.workdir / "config.yaml"
+        if cached_config is None:
+            config_path.unlink()
+        else:
+            config_path.write_bytes(cached_config)
         (original.workdir / "partial.txt").write_text("left behind by an interrupted extraction")
 
         repaired = await _resolve_agent_spec_from_server(
-            client, tmp_path, "ag_cached", session_id="conv_test"
+            client, cache, "ag_cached", session_id="conv_test"
         )
 
     assert repaired is not None
@@ -2818,9 +2917,35 @@ async def test_resolve_agent_spec_rebuilds_cache_after_config_is_removed(tmp_pat
     assert list(tmp_path.iterdir()) == [repaired.workdir]
 
 
+async def test_resolve_agent_spec_keeps_cache_when_downloaded_bundle_is_invalid(
+    tmp_path: Path,
+) -> None:
+    config = b"name: truncated-agent\n"
+    bundle = bundle_files({"config.yaml": config})
+    digest = hashlib.sha256(bundle).hexdigest()[:16]
+    cached = _agent_cache_dest(tmp_path, "ag_cached", f"0-{digest}")
+    cached.mkdir()
+    (cached / "config.yaml").write_bytes(config)
+    (cached / "in-use.txt").write_text("retain until a replacement validates")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        with pytest.raises(OmnigentError, match="missing required field: spec_version"):
+            await _resolve_agent_spec_from_server(
+                client, _AgentSpecCache(tmp_path), "ag_cached", session_id="conv_test"
+            )
+
+    assert (cached / "config.yaml").read_bytes() == config
+    assert (cached / "in-use.txt").read_text() == "retain until a replacement validates"
+    assert list(tmp_path.iterdir()) == [cached]
+
+
 async def test_resolve_agent_spec_does_not_publish_interrupted_extraction(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    cache = _AgentSpecCache(tmp_path)
     bundle = bundle_files(
         {
             "config.yaml": (
@@ -2842,18 +2967,193 @@ async def test_resolve_agent_spec_does_not_publish_interrupted_extraction(
             patch.setattr("omnigent.spec.extract_safe", interrupted_extract)
             with pytest.raises(OSError, match="interrupted extraction"):
                 await _resolve_agent_spec_from_server(
-                    client, tmp_path, "ag_cached", session_id="conv_test"
+                    client, cache, "ag_cached", session_id="conv_test"
                 )
         assert list(tmp_path.iterdir()) == []
 
         repaired = await _resolve_agent_spec_from_server(
-            client, tmp_path, "ag_cached", session_id="conv_test"
+            client, cache, "ag_cached", session_id="conv_test"
         )
 
     assert repaired is not None
     assert repaired.spec.name == "cached-agent"
     assert list(tmp_path.iterdir()) == [repaired.workdir]
     assert not (repaired.workdir / "partial.txt").exists()
+
+
+@pytest.mark.parametrize("repair", [False, True])
+@pytest.mark.parametrize("first_outcome", ["completed", "cancelled", "cancelled_error"])
+async def test_resolve_agent_spec_serializes_concurrent_cache_publication(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, repair: bool, first_outcome: str
+) -> None:
+    from omnigent import spec as spec_module
+
+    cache = _AgentSpecCache(tmp_path)
+    bundle = _spec_bundle("cached-agent")
+    extracting = threading.Event()
+    release_extraction = threading.Event()
+    contending = threading.Event()
+    original_extract = spec_module.extract_safe
+    original_admission = cache._admission
+    extractions = 0
+
+    class ObservedAdmission:
+        async def acquire(self) -> None:
+            if original_admission.locked():
+                contending.set()
+            await original_admission.acquire()
+
+        def release(self) -> None:
+            original_admission.release()
+
+    def blocked_extract(source: Any, dest: Path) -> None:
+        nonlocal extractions
+        extractions += 1
+        extracting.set()
+        assert release_extraction.wait(5), "test did not release bundle extraction"
+        if extractions == 1 and first_outcome == "cancelled_error":
+            raise OSError("interrupted extraction")
+        original_extract(source, dest)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        if repair:
+            original = await _resolve_agent_spec_from_server(client, cache, "ag_cached", "conv")
+            assert original is not None
+            (original.workdir / "config.yaml").unlink()
+        monkeypatch.setattr(spec_module, "extract_safe", blocked_extract)
+        monkeypatch.setattr(cache, "_admission", ObservedAdmission())
+        first = asyncio.create_task(
+            _resolve_agent_spec_from_server(client, cache, "ag_cached", "conv_first")
+        )
+        second = None
+        try:
+            assert await asyncio.to_thread(extracting.wait, 5)
+            if first_outcome != "completed":
+                first.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await first
+            second = asyncio.create_task(
+                _resolve_agent_spec_from_server(client, cache, "ag_cached", "conv_second")
+            )
+            assert await asyncio.to_thread(contending.wait, 5)
+            assert extractions == 1
+        finally:
+            release_extraction.set()
+            resolved = await asyncio.gather(
+                first, *([second] if second is not None else []), return_exceptions=True
+            )
+
+    assert len(resolved) == 2
+    first_spec, second_spec = resolved
+    assert second_spec is not None and not isinstance(second_spec, BaseException)
+    assert (second_spec.workdir / "config.yaml").is_file()
+    assert second_spec.spec.name == "cached-agent"
+    if first_outcome == "completed":
+        assert first_spec is not None and not isinstance(first_spec, BaseException)
+        assert first_spec.workdir == second_spec.workdir
+    else:
+        assert isinstance(first_spec, asyncio.CancelledError)
+    assert list(tmp_path.iterdir()) == [second_spec.workdir]
+    assert extractions == (2 if first_outcome == "cancelled_error" else 1)
+
+
+async def test_pending_spec_loads_leave_executor_capacity_for_runner_controls(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent import spec as spec_module
+
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(ThreadPoolExecutor(max_workers=2))
+    cache = _AgentSpecCache(tmp_path)
+    bundle = _spec_bundle("cached-agent")
+    extracting = asyncio.Event()
+    release_extraction = threading.Event()
+    all_requested = asyncio.Event()
+    original_extract = spec_module.extract_safe
+    requests = 0
+
+    def blocked_extract(source: Any, dest: Path) -> None:
+        loop.call_soon_threadsafe(extracting.set)
+        assert release_extraction.wait(5), "test did not release bundle extraction"
+        original_extract(source, dest)
+
+    def serve_bundle(_: httpx.Request) -> httpx.Response:
+        nonlocal requests
+        requests += 1
+        if requests == 4:
+            all_requested.set()
+        return httpx.Response(200, content=bundle)
+
+    monkeypatch.setattr(spec_module, "extract_safe", blocked_extract)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(serve_bundle), base_url="http://server.test"
+    ) as client:
+        pending = [
+            asyncio.create_task(
+                _resolve_agent_spec_from_server(client, cache, "ag_cached", "conv")
+            )
+            for _ in range(4)
+        ]
+        try:
+            await asyncio.wait_for(all_requested.wait(), 5)
+            await asyncio.wait_for(extracting.wait(), 5)
+            assert await asyncio.wait_for(asyncio.to_thread(lambda: True), 2)
+            assert not release_extraction.is_set()
+        finally:
+            release_extraction.set()
+            resolved = await asyncio.gather(*pending)
+
+    assert all(spec is not None and spec.spec.name == "cached-agent" for spec in resolved)
+
+
+@pytest.mark.parametrize("extraction_fails", [False, True])
+async def test_cancelled_spec_worker_cannot_recreate_closed_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extraction_fails: bool
+) -> None:
+    from omnigent import spec as spec_module
+
+    root = tmp_path / "cache"
+    cache = _AgentSpecCache(root)
+    bundle = _spec_bundle("cached-agent")
+    extracting = threading.Event()
+    release_extraction = threading.Event()
+    original_extract = spec_module.extract_safe
+
+    def blocked_extract(source: Any, dest: Path) -> None:
+        extracting.set()
+        assert release_extraction.wait(5), "test did not release bundle extraction"
+        if extraction_fails:
+            raise OSError("interrupted extraction")
+        original_extract(source, dest)
+
+    monkeypatch.setattr(spec_module, "extract_safe", blocked_extract)
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, content=bundle)),
+        base_url="http://server.test",
+    ) as client:
+        resolving = asyncio.create_task(
+            _resolve_agent_spec_from_server(client, cache, "ag_cached", "conv")
+        )
+        try:
+            assert await asyncio.to_thread(extracting.wait, 5)
+            resolving.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await resolving
+            closing = asyncio.create_task(asyncio.to_thread(cache.close))
+        finally:
+            release_extraction.set()
+            await asyncio.gather(resolving, return_exceptions=True)
+        await closing
+        assert not root.exists()
+        with pytest.raises(RuntimeError, match="cache is closed"):
+            await _resolve_agent_spec_from_server(client, cache, "ag_cached", "conv")
+        assert not root.exists()
+
+    # Closing is idempotent even if extraction failed after its awaiter was cancelled.
+    await asyncio.to_thread(cache.close)
 
 
 @pytest.mark.asyncio
@@ -2883,7 +3183,7 @@ async def test_resolve_agent_spec_from_server_retries_a_throttled_fetch(
         base_url="http://server.test",
     ) as client:
         spec = await _resolve_agent_spec_from_server(
-            client, tmp_path, "ag_throttled", session_id="conv_test"
+            client, _AgentSpecCache(tmp_path), "ag_throttled", session_id="conv_test"
         )
 
     assert spec is not None and spec.name == "throttled-agent"
@@ -2920,7 +3220,7 @@ async def test_resolve_agent_spec_from_server_raises_when_throttling_persists(
     ) as client:
         with pytest.raises(RuntimeError, match="HTTP 429"):
             await _resolve_agent_spec_from_server(
-                client, tmp_path, "ag_throttled", session_id="conv_test"
+                client, _AgentSpecCache(tmp_path), "ag_throttled", session_id="conv_test"
             )
 
     assert attempts == 4
@@ -2957,7 +3257,7 @@ async def test_resolve_agent_spec_from_server_raises_for_non_404_errors(
     ) as client:
         with pytest.raises(RuntimeError) as exc_info:
             await _resolve_agent_spec_from_server(
-                client, tmp_path, "ag_test", session_id="conv_test"
+                client, _AgentSpecCache(tmp_path), "ag_test", session_id="conv_test"
             )
 
     message = str(exc_info.value)
@@ -3377,7 +3677,7 @@ async def test_runner_selection_changes_without_rewriting_cached_bundle(tmp_path
     ) as client:
         results = [
             await _resolve_agent_spec_from_server(
-                client, tmp_path, "ag_selected", session_id="session"
+                client, _AgentSpecCache(tmp_path), "ag_selected", session_id="session"
             )
             for _ in range(3)
         ]

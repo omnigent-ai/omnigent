@@ -1312,7 +1312,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                     ) -> None:
                         try:
                             await super().run_compaction(args)
-                        except Exception:  # noqa: BLE001
+                        except Exception:
                             logger.debug(
                                 "Compaction call failed (endpoint may not support "
                                 "responses.compact), continuing without compaction",
@@ -2046,7 +2046,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                     _compacted: list[ReplayItem] | None = None
                     try:
                         _compacted = await state.sdk_session.get_items()
-                    except Exception:  # noqa: BLE001
+                    except Exception:
                         logger.warning(
                             "Failed to read compacted session items",
                             exc_info=True,
