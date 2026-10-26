@@ -1438,6 +1438,17 @@ describe("BlockRenderer dispatch", () => {
           ],
           labels: ["Started Peirce", "Completed Peirce"],
         },
+        {
+          shape: "opening a woken response",
+          continued: false,
+          items: [
+            notice("n1", "returned"),
+            text("m1", "Peirce reported back."),
+            tool(1, "Bash"),
+            text("m2", "The clip checks out."),
+          ],
+          labels: ["Completed Peirce"],
+        },
       ])("folds a notice run into the nearest work, $shape", ({ continued, items, labels }) => {
         render(
           <MemoryRouter>
