@@ -995,7 +995,8 @@ class HostFsWriteFrame:
     preference (``op="github_set_preference"``), PR attach/remove
     (``op="github_prs_update"``), label edits (``op="github_labels_update"``),
     reviewer edits (``op="github_reviewers_update"``), title and description edits
-    (``op="github_details_update"``), description attachment uploads
+    (``op="github_details_update"``), comments (``op="github_comment_create"``),
+    description attachment uploads
     (``op="github_attachment_upload"``, the file base64-encoded in
     ``content_base64``), merges (``op="github_merge"``),
     and disabling auto-merge (``op="github_disable_auto_merge"``), for every git
@@ -1007,7 +1008,7 @@ class HostFsWriteFrame:
     :param request_id: Correlates the result, e.g. ``"req_fsw_1"``.
     :param op: Write op name — ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
-        ``"github_reviewers_update"``, ``"github_details_update"``,
+        ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
         ``"github_attachment_upload"``, ``"github_merge"``, or
         ``"github_disable_auto_merge"``.
     :param workspace: Absolute path to the session's workspace on the host.

@@ -9929,6 +9929,7 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
 @pytest.mark.parametrize(
     "resource,body,op,params",
     [
+        ("/comments", {"body": "Hello"}, "github_comment_create", {"body": "Hello"}),
         ("/labels", {"remove": ["bug"]}, "github_labels_update", {"add": [], "remove": ["bug"]}),
         (
             "/reviewers",
@@ -10526,3 +10527,74 @@ async def test_environment_id_is_one_runner_url_segment(
             == (base + quote(environment_id, safe="") + suffix).encode()
         )
         assert forwarded.fragment == ""
+
+
+@pytest.mark.asyncio
+async def test_comment_transport_timeout_does_not_retry_on_host(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    runner = _FakeRunnerClient()
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    posts = []
+
+    async def timeout(path: str, **kwargs: Any) -> httpx.Response:
+        posts.append(path)
+        raise httpx.ReadTimeout("Response lost after dispatch")
+
+    async def unexpected_fallback(**kwargs: Any) -> None:
+        pytest.fail("An uncertain POST must not be repeated on the host")
+
+    monkeypatch.setattr(runner, "post", timeout)
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", unexpected_fallback)
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/comments"
+    response = await client.post(
+        path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "body": "Hello"}
+    )
+    assert response.status_code == 502
+    assert posts == [path]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource,expected", [("comments", 502), ("details", 503)])
+async def test_host_write_timeout_preserves_comment_uncertainty(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    expected: int,
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.server.routes import _host_filesystem
+
+    sent: list[str] = []
+    connection = SimpleNamespace(host_id="test-host", pending_fs_requests={})
+    registry = SimpleNamespace(send_text=lambda _connection, frame: sent.append(frame))
+    real_write = _host_filesystem.write_workspace_from_host
+
+    async def write_without_reply(**kwargs: Any) -> dict[str, Any]:
+        return await real_write(
+            **{
+                **kwargs,
+                "host_registry": registry,
+                "host_conn": connection,
+                "timeout": 0.001,
+            }
+        )
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write_without_reply)
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/{resource}",
+        json={"pr_url": "https://github.com/acme/widgets/pull/17", "body": "Hello"},
+    )
+    assert response.status_code == expected, response.text
+    assert len(sent) == 1
+    assert connection.pending_fs_requests == {}
+    if resource == "comments":
+        assert (
+            response.json()["detail"]
+            == "Could not confirm comment posting. Check GitHub before retrying."
+        )
+    else:
+        assert response.json()["error"]["code"] == "runner_unavailable"

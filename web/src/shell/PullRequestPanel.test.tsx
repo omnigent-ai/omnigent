@@ -72,6 +72,9 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
   return {
     // The panel reads every info payload through the real normalizer.
     normalizePullRequestInfo: original.normalizePullRequestInfo,
+    usePullRequestCommentComposer: original.usePullRequestCommentComposer,
+    pullRequestCommentTooLong: original.pullRequestCommentTooLong,
+    MAX_PULL_REQUEST_COMMENT_CHARACTERS: original.MAX_PULL_REQUEST_COMMENT_CHARACTERS,
     applyPullRequestLabelChange: original.applyPullRequestLabelChange,
     pullRequestLabelsMutationKey: original.pullRequestLabelsMutationKey,
     usePullRequestRepoLabels: vi.fn(() => state.repoLabels),
@@ -2266,3 +2269,44 @@ describe("session PR selection", () => {
     expect(usePullRequestChangedFiles).toHaveBeenLastCalledWith("conv_1", true, url, "base:head");
   });
 });
+
+it.each([
+  [true, true, true],
+  [false, true, false],
+  [true, false, false],
+  [true, undefined, false],
+])(
+  "gates comment posting on edit access %s and host capability %s",
+  (canEdit, capability, visible) => {
+    state.canEdit = canEdit;
+    state.info!.data!.selected_pr_url = state.info!.data!.pr!.url;
+    state.info!.data!.capabilities = {
+      account_switching: false,
+      base_remote_selection: false,
+      line_counts: false,
+      linked_pr_diff: false,
+      comment_posting: capability,
+    };
+    renderComments();
+    expect(screen.queryByRole("textbox", { name: "New PR comment" }) !== null).toBe(visible);
+  },
+);
+
+it.each(["capabilities", "selected_pr_url"] as const)(
+  "hides comment posting without %s",
+  (missing) => {
+    state.info!.data!.selected_pr_url = state.info!.data!.pr!.url;
+    state.info!.data!.capabilities = {
+      account_switching: false,
+      base_remote_selection: false,
+      line_counts: false,
+      linked_pr_diff: false,
+      comment_posting: true,
+    };
+    if (missing === "capabilities") delete state.info!.data!.capabilities;
+    else delete state.info!.data!.selected_pr_url;
+    renderComments();
+    expect(screen.queryByRole("textbox", { name: "New PR comment" })).toBeNull();
+    expect(screen.getByText("No comments yet.").parentElement).toHaveClass("pb-16");
+  },
+);
