@@ -323,6 +323,33 @@ describe("BlockStream — text", () => {
     expect(textDone.fullText).toBe("Hello from transcript");
   });
 
+  it("message_done phase lands on the text_done it closes or emits", () => {
+    const streamed = reduce([
+      { type: "response_created", response: makeResponse({ responseId: "resp_1" }) },
+      { type: "text_delta", delta: "Checking." },
+      {
+        type: "message_done",
+        content: [],
+        itemId: "msg_1",
+        responseId: "resp_1",
+        phase: "commentary",
+      },
+    ]);
+    const closed = streamed.find((b): b is TextDone => b.type === "text_done");
+    expect(closed?.phase).toBe("commentary");
+
+    const [emitted] = reduce([
+      {
+        type: "message_done",
+        content: [{ type: "output_text", text: "Done." }],
+        itemId: "msg_2",
+        responseId: "resp_2",
+        phase: "final_answer",
+      },
+    ]);
+    expect((emitted as TextDone).phase).toBe("final_answer");
+  });
+
   it("simple text response → start, text, done, end", () => {
     const blocks = reduce([
       { type: "response_created", response: makeResponse() },

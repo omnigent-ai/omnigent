@@ -360,6 +360,7 @@ function assistantMessageToBlock(item: MessageItem): TextDone {
     fullText: text,
     hasCodeBlocks: text.includes("```"),
     ...(item.interrupted === true ? { interrupted: true } : {}),
+    ...(item.phase !== undefined ? { phase: item.phase } : {}),
   };
 }
 

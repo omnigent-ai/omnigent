@@ -14,11 +14,13 @@ from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
+from typing import get_args
 
 import httpx
 
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
+from omnigent.entities.conversation import AssistantMessagePhase
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_egress import (
@@ -6431,15 +6433,20 @@ async def _post_agent_message(
     text = item.get("text")
     if not isinstance(text, str) or not text:
         return False
+    item_data: _JsonObject = {
+        "role": "assistant",
+        "agent": _AGENT_NAME,
+        "content": [{"type": "output_text", "text": text}],
+    }
+    # Codex labels progress vs. answer text; the web UI folds commentary.
+    phase = item.get("phase")
+    if phase in _AGENT_MESSAGE_PHASES:
+        item_data["phase"] = phase
     return await _post_external_item(
         client,
         session_id,
         item_type="message",
-        item_data={
-            "role": "assistant",
-            "agent": _AGENT_NAME,
-            "content": [{"type": "output_text", "text": text}],
-        },
+        item_data=item_data,
         response_id=_response_id(params),
         message_id=_completed_streaming_message_id(params, item, "agentMessage"),
         source_id=source_id or _source_id(params, item),
@@ -6908,6 +6915,8 @@ _TOOL_ITEM_TYPES = frozenset(_TOOL_ITEM_BUILDERS)
 # review-mode affordance, so these are mirrored as a visible assistant-message
 # marker (see :func:`_post_review_mode_marker`).
 _REVIEW_MODE_ITEM_TYPES = frozenset({"enteredReviewMode", "exitedReviewMode"})
+# Codex ``MessagePhase`` values the server accepts; newer ones are dropped.
+_AGENT_MESSAGE_PHASES = frozenset(get_args(AssistantMessagePhase))
 
 
 async def _post_external_item(

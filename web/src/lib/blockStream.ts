@@ -39,6 +39,7 @@ import {
   slashCommandEchoText,
   structuredErrorFields,
 } from "./blocks";
+import type { AssistantMessagePhase } from "./conversationItems";
 import type { StreamEvent } from "./events";
 import { routingExtras } from "./routingDecision";
 import type { Response } from "./types";
@@ -259,9 +260,13 @@ function* closeReasoning(state: ReducerState): Generator<AnyBlock> {
  * `TextDone.ctx.itemId` so renderers can correlate the streamed text
  * back to its persisted item. `null` when the closure is fired by a
  * non-message boundary (tool call, terminal event without a preceding
- * message_done).
+ * message_done). `phase` is that message's harness label, when present.
  */
-function* closeText(state: ReducerState, itemId: string | null = null): Generator<AnyBlock> {
+function* closeText(
+  state: ReducerState,
+  itemId: string | null = null,
+  phase?: AssistantMessagePhase,
+): Generator<AnyBlock> {
   if (!state.inText) return;
   if (state.accumulated) {
     yield {
@@ -276,6 +281,7 @@ function* closeText(state: ReducerState, itemId: string | null = null): Generato
     ctx: ctx(state, itemId),
     fullText: state.fullText,
     hasCodeBlocks: state.fullText.includes("```"),
+    ...(phase !== undefined ? { phase } : {}),
   } satisfies TextDone;
   state.inText = false;
   state.fullText = "";
@@ -712,7 +718,11 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
       if (hadOpenText) {
         // On a response switch, event.itemId belongs to the new message — don't
         // attach it to the old text block being closed.
-        yield* closeText(state, isResponseSwitch ? null : event.itemId || null);
+        yield* closeText(
+          state,
+          isResponseSwitch ? null : event.itemId || null,
+          isResponseSwitch ? undefined : event.phase,
+        );
       }
 
       // A message_done with a new id is a genuine turn transition (the
@@ -748,6 +758,7 @@ function* processEvent(state: ReducerState, event: StreamEvent): Generator<AnyBl
           ctx: ctx(state, event.itemId || null),
           fullText: text,
           hasCodeBlocks: text.includes("```"),
+          ...(event.phase !== undefined ? { phase: event.phase } : {}),
         } satisfies TextDone;
       }
       return;

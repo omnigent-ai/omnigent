@@ -833,6 +833,51 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.queryByText("Gathering context.")).toBeNull();
       });
 
+      it("folds only Codex commentary when the turn reports answer phases", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Plan: multiply, then save.", final: true },
+          {
+            kind: "text",
+            itemId: "m1",
+            text: "Multiplying first.",
+            final: true,
+            phase: "commentary",
+          },
+          tool(1, "Bash"),
+          {
+            kind: "text",
+            itemId: "m2",
+            text: "17 × 23 = 391.",
+            final: true,
+            phase: "partial_answer",
+          },
+          tool(2, "Bash"),
+          { kind: "text", itemId: "m3", text: "Done.", final: true, phase: "final_answer" },
+        ];
+        const view = render(<BlockRenderer items={items} sessionStatus="idle" />);
+        expect(screen.getByText("Multiplying first.")).toBeDefined();
+
+        view.rerender(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.queryByText("Multiplying first.")).toBeNull();
+        // Answer text and an unlabelled message stay visible beside the folds.
+        expect(screen.getByText("17 × 23 = 391.")).toBeDefined();
+        expect(screen.getByText("Done.")).toBeDefined();
+        expect(screen.getByText("Plan: multiply, then save.")).toBeDefined();
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
+      });
+
+      it("falls back to the last message when no answer phase is reported", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Checking.", final: true, phase: "commentary" },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Still checking.", final: true, phase: "commentary" },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.queryByText("Checking.")).toBeNull();
+        expect(screen.getByText("Still checking.")).toBeDefined();
+      });
+
       it("leaves a single-message turn and a live turn unfolded until it settles", () => {
         const answerOnly: RenderItem[] = [
           { kind: "text", itemId: "m0", text: "Just the answer.", final: true },

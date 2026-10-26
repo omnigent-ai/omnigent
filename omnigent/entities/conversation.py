@@ -289,6 +289,10 @@ class StartupInputOptions(BaseModel):
     background_titles_enabled: bool = False
 
 
+# Codex ``MessagePhase`` values: progress narration vs. answer text.
+AssistantMessagePhase = Literal["commentary", "partial_answer", "final_answer"]
+
+
 class MessageData(BaseModel):
     """
     Data for a message item (user or assistant).
@@ -313,6 +317,9 @@ class MessageData(BaseModel):
     :param user_authored: Confirmed or conservatively preserved user input;
         prevents legacy content cleanup from hiding literal agent markup.
     :param subagent_return_id: Native task id of an explicitly completed child.
+    :param phase: Assistant-only harness label for the message, e.g. Codex
+        ``"commentary"`` (progress) or ``"final_answer"``. ``None`` when the
+        harness doesn't report one.
     """
 
     role: Literal["user", "assistant"]
@@ -324,6 +331,9 @@ class MessageData(BaseModel):
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
+    phase: AssistantMessagePhase | None = Field(
+        default=None, exclude_if=lambda value: value is None
+    )
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -342,10 +352,12 @@ class MessageData(BaseModel):
 
         :returns: The validated instance.
         :raises ValueError: If an assistant message is missing
-            ``agent``.
+            ``agent`` or a user message carries ``phase``.
         """
         if self.role == "assistant" and self.agent is None:
             raise ValueError("assistant messages require 'agent'")
+        if self.role == "user" and self.phase is not None:
+            raise ValueError("user messages cannot carry 'phase'")
         return self
 
 

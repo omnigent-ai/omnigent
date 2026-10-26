@@ -300,6 +300,23 @@ describe("itemsToBlocks — flat shape", () => {
     expect(td?.interrupted).toBe(true);
   });
 
+  it("assistant phase is preserved on TextDone", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg_commentary",
+        response_id: "codex_turn_123",
+        type: "message",
+        role: "assistant",
+        status: "completed",
+        model: "codex-native-ui",
+        phase: "commentary",
+        content: [{ type: "output_text", text: "Checking the tests." }],
+      },
+    ];
+    const td = itemsToBlocks(items).find((b): b is TextDone => b.type === "text_done");
+    expect(td?.phase).toBe("commentary");
+  });
+
   it("error items carry an info level through to the block only when set", () => {
     const base = {
       response_id: "resp_notice",

@@ -540,3 +540,34 @@ async def test_transient_delta_post_uses_one_short_attempt() -> None:
         assert client.timeouts == [fwd._DELTA_POST_TIMEOUT_SECONDS]
     finally:
         fwd._reset_forward_health()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("codex_phase", "expected_phase"),
+    [
+        ("commentary", "commentary"),
+        ("final_answer", "final_answer"),
+        ("summary", None),
+        (None, None),
+    ],
+)
+async def test_agent_message_forwards_known_codex_phase(
+    codex_phase: str | None, expected_phase: str | None
+) -> None:
+    """Codex's commentary/answer label persists so the web UI can fold narration."""
+    client = _RecordingClient()
+    item = {"id": "item_1", "type": "agentMessage", "text": "Checking the tests."}
+    if codex_phase is not None:
+        item["phase"] = codex_phase
+
+    posted = await fwd._post_agent_message(
+        client,  # type: ignore[arg-type]
+        "conv_x",
+        {"threadId": "thread_1", "turnId": "turn_1"},
+        item,
+    )
+
+    assert posted is True
+    [(_url, body)] = client.posts
+    assert body["data"]["item_data"].get("phase") == expected_phase

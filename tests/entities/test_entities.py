@@ -84,6 +84,16 @@ def test_assistant_message_includes_true_interrupted() -> None:
     }
 
 
+def test_message_phase_is_assistant_only_and_omitted_when_unset() -> None:
+    """Codex's commentary/answer label persists on assistant text only."""
+    msg = MessageData(role="assistant", agent="codex-native-ui", content=[], phase="commentary")
+    assert msg.model_dump(exclude_none=True)["phase"] == "commentary"
+    unlabelled = MessageData(role="assistant", agent="codex-native-ui", content=[])
+    assert "phase" not in unlabelled.model_dump()
+    with pytest.raises(ValidationError, match="phase"):
+        MessageData(role="user", content=[], phase="final_answer")
+
+
 def test_assistant_message_includes_agent() -> None:
     msg = MessageData(role="assistant", agent="my-agent", content=[])
     dumped = msg.model_dump(exclude_none=True)
