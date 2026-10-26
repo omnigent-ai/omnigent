@@ -221,6 +221,7 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
 starts the real CLI/server/runner/Pi with scripted routing and model replies.
 It covers composer API and session-owned TUI input, verifies the actual served
 model, then checks the follow-up request retains the tool result and first answer.
+Each composer/TUI prompt must appear exactly once in persisted user history.
 Run with a real Pi CLI on PATH and retries disabled. Composer API evidence
 does not cover browser clicks; scripted routing does not establish live judge
 quality. Broader Smart Routing journeys remain outside this Pi-specific recipe.
@@ -562,16 +563,23 @@ Cross-harness journeys:
 - **`approvals`, Pi extension dialogs:**
   `tests/e2e/test_pi_extension_ui_round_trip.py::test_real_pi_dialog_answers_and_continues`
   runs real SDK and native Pi through an isolated server/runner with a scripted
-  provider, sandbox disabled: four dialog answers, decline, later-turn history
-  and native cancellation/card cleanup after the reconnect grace period.
+  provider, sandbox disabled: all four dialog types, confirmation decline,
+  literal editor text, editor rejection and later-turn history. Pending cards
+  and the API sidebar count must clear after answers and native cancellation
+  (after the reconnect grace period).
   `tests/e2e_ui/approvals/test_pi_extension_ui.py` checks confirmation layout
-  and multiline editor submission through Chat using injected hooks; select
-  and input matrices stay in component tests. Older servers use native TUI
+  and editable prefill, exact multiline submission and sidebar badge cleanup
+  through Chat using injected hooks. Empty/whitespace editor answers and
+  select/input matrices stay in component tests. Older servers use native TUI
   dialogs on 404/405; supported servers deliver dialogs through the web only.
   Read-only callers cannot publish cards. Native timeouts are capped at the
   server limit, and cancelled waits stop re-parking (server/JS regressions).
-  Known gaps: stale sidebar “Needs response” after native cancellation,
-  Inbox/mobile, active SDK interruption, sandbox and Managed acceptance.
+  For a manual check, edit the prefill, cancel a subsequent editor, and send a
+  follow-up. Keep the service running while checking that the card and sidebar
+  “Needs response” badge settle.
+  Known gaps: native cancellation → browser sidebar settlement, select/input
+  cancellation through real Pi, active SDK interruption, Inbox/standalone
+  approvals, mobile, sandbox and Managed acceptance.
   These scenarios own their isolated environments:
 
   ```sh
