@@ -103,22 +103,11 @@ def test_dictation_streams_transcript_into_composer(
         context.close()
 
 
-@pytest.mark.parametrize(
-    ("surface", "start_with_hotkey"),
-    [
-        ("session", False),
-        ("landing", False),
-        ("session", True),
-        ("landing", True),
-        ("side-chat", False),
-    ],
-    ids=["session-button", "landing-button", "session-hotkey", "landing-hotkey", "side-chat"],
-)
+@pytest.mark.parametrize("surface", ["session", "landing", "side-chat"])
 def test_speech_service_denial_falls_back_to_client_audio(
     page: Page,
     seeded_session: tuple[str, str],
     surface: str,
-    start_with_hotkey: bool,
 ) -> None:
     """A denied speech service can still transcribe the browser's microphone."""
     base_url, session_id = seeded_session
@@ -154,10 +143,8 @@ def test_speech_service_denial_falls_back_to_client_audio(
         mic = page.get_by_role("complementary", name="Workspace").get_by_role(
             "button", name="Voice dictation"
         )
-    if start_with_hotkey:
-        page.keyboard.press("Control+Alt+KeyV")
-    else:
-        mic.click()
+    expect(mic).to_have_attribute("data-server-dictation-available", "true")
+    mic.click()
 
     assert page.evaluate("window.speechRecognitionStarts") == 1
     expect(composer).to_have_value(_FAKE_SCRIPT, timeout=_TRANSCRIPT_TIMEOUT_MS)

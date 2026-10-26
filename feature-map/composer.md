@@ -305,7 +305,7 @@ pickers, seeded from the source session when its harness family is kept.
 collapsed labels.
 
 **Side chat** (from an existing session): choose **+ → Start a new side chat**
-in the composer, then click the microphone beside **Ask a side question…**.
+in the composer, then click the microphone beside **Ask a side question...**.
 
 ## Driving it with the repro environment
 
@@ -524,10 +524,11 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`dictation`, both composers and side chat (own environment):**
   `tests/e2e_ui/chat/test_dictation.py::test_speech_service_denial_falls_back_to_client_audio`
   covers a browser speech service refusing access while the client microphone
-  remains available, through the button and hotkey on both composers and the
-  side-chat microphone button. It streams client audio through the fake server
+  remains available, through the buttons on both composers and in side chat.
+  It streams client audio through the fake server
   engine and keeps the transcript on Enter.
-  Manually on the landing page: dictate, then press Escape to restore the previous draft.
+  Manually on the landing page: dictate with ⌘/Ctrl+Alt+V, then press Escape
+  to restore the previous draft.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
