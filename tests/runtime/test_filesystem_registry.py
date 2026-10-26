@@ -147,18 +147,22 @@ def test_ephemeral_files_are_suppressed(registry: AgentEditFilesystemRegistry) -
         ".main.py.swo",  # vim secondary swap
         "#README.md#",  # Emacs auto-save
     ]
-    for f in ephemeral_files:
+    hidden = [*ephemeral_files, *sorted(_CURSOR_PLUMBING_PATHS)]
+    for f in hidden:
         _inject(registry, f, "created", conv_id)
+    # The user's own .cursor content is not plumbing.
+    _inject(registry, ".cursor/rules/style.md", "created", conv_id)
     _inject(registry, "real_file.md", "created", conv_id)
 
     results = registry.list_changed_files(conv_id, limit=50)
     paths = [r["path"] for r in results]
 
-    # Only the real file should appear.
-    assert paths == ["real_file.md"], (
-        f"Expected only 'real_file.md', got {paths}. "
-        "Ephemeral process-artifact files must be suppressed by record_change."
+    assert sorted(paths) == [".cursor/rules/style.md", "real_file.md"], (
+        f"Expected only the real files, got {paths}. "
+        "Ephemeral artifacts and Omnigent's .cursor plumbing must be suppressed."
     )
+    for f in hidden:
+        assert registry.get_changed_file(conv_id, f) is None, f
 
 
 def test_created_modified_multiple_times_stays_added(
@@ -503,19 +507,22 @@ def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
         ".main.py.swo",
         "#README.md#",
     ]
-    for file_path in ephemeral_files:
+    hidden = [*ephemeral_files, *sorted(_CURSOR_PLUMBING_PATHS)]
+    (tmp_path / ".cursor" / "rules").mkdir(parents=True)
+    for file_path in hidden:
         (tmp_path / file_path).write_text("temporary artifact")
+    (tmp_path / ".cursor" / "rules" / "style.md").write_text("user rule")
     (tmp_path / "real_change.py").write_text("agent wrote this")
 
     reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
     results = reg.list_changed_files("any-conv", limit=100)
 
     paths = [r["path"] for r in results]
-    assert paths == ["real_change.py"], (
-        f"Expected only 'real_change.py', got {paths}. "
-        "Git-backed changed files should suppress temp/editor artifacts."
+    assert sorted(paths) == [".cursor/rules/style.md", "real_change.py"], (
+        f"Expected only the real files, got {paths}. "
+        "Git-backed changed files should suppress temp/editor artifacts and .cursor plumbing."
     )
-    for file_path in ephemeral_files:
+    for file_path in hidden:
         result = reg.get_changed_file("any-conv", file_path)
         assert result is None, (
             f"Expected get_changed_file to hide {file_path!r}, got {result!r}. "
@@ -525,83 +532,6 @@ def test_git_changed_files_suppress_ephemeral_files(tmp_path: Path) -> None:
     real_result = reg.get_changed_file("any-conv", "real_change.py")
     assert real_result is not None
     assert real_result["status"] == "created"
-
-
-def test_git_changed_files_hide_omnigent_cursor_plumbing(tmp_path: Path) -> None:
-    """Omnigent-written ``.cursor`` session plumbing must not appear as changes.
-
-    A Cursor session writes ``.cursor/mcp.json``, ``.cursor/hooks.json`` and
-    ``.cursor/omnigent-hook.sh`` into the workspace because cursor-agent only
-    reads project config there. Only those exact paths are hidden; the user's
-    own ``.cursor`` content (e.g. rules) must keep showing.
-    """
-    env = _git_env()
-    subprocess.run(["git", "init"], cwd=tmp_path, check=True, capture_output=True, env=env)
-    subprocess.run(
-        ["git", "commit", "--allow-empty", "-m", "init"],
-        cwd=tmp_path,
-        check=True,
-        capture_output=True,
-        env=env,
-    )
-
-    cursor_dir = tmp_path / ".cursor"
-    (cursor_dir / "rules").mkdir(parents=True)
-    plumbing = ["mcp.json", "hooks.json", "omnigent-hook.sh"]
-    for name in plumbing:
-        (cursor_dir / name).write_text("omnigent session plumbing")
-    # A user's own cursor config is real workspace content, not plumbing.
-    (cursor_dir / "rules" / "style.md").write_text("user rule")
-    (tmp_path / "real_change.py").write_text("agent wrote this")
-
-    reg = GitFilesystemRegistry(watch_path=tmp_path, git_root=tmp_path)
-    results = reg.list_changed_files("any-conv", limit=100)
-
-    paths = [r["path"] for r in results]
-    assert "real_change.py" in paths
-    assert ".cursor/rules/style.md" in paths, (
-        f"Expected the user's own .cursor content in results but got {paths}. "
-        "Only Omnigent-written plumbing should be hidden, not the whole directory."
-    )
-    leaked = [p for p in paths if p in {f".cursor/{name}" for name in plumbing}]
-    assert leaked == [], (
-        f"Expected no Omnigent cursor plumbing in results but got {leaked}. "
-        "Session infrastructure is leaking into the Files panel."
-    )
-    for name in plumbing:
-        record = reg.get_changed_file("any-conv", f".cursor/{name}")
-        assert record is None, (
-            f"Expected get_changed_file to hide .cursor/{name}, got {record!r}. "
-            "Direct file lookup should match the changed-files list."
-        )
-
-
-def test_agent_edit_registry_hides_omnigent_cursor_plumbing(
-    registry: AgentEditFilesystemRegistry,
-) -> None:
-    """The non-git registry suppresses cursor plumbing the same way git does."""
-    conv_id = "conv_cursor_plumbing"
-    for name in ("mcp.json", "hooks.json", "omnigent-hook.sh"):
-        _inject(registry, f".cursor/{name}", "created", conv_id)
-    _inject(registry, ".cursor/rules/style.md", "created", conv_id)
-    _inject(registry, "real_change.py", "created", conv_id)
-    # An agent edit to a plumbing path is recorded but hidden at read time.
-    registry.record_change(".cursor/mcp.json", "modified", conv_id)
-    assert any(
-        e.path == ".cursor/mcp.json" and e.operation == "modified"
-        for e in registry._session_events[conv_id]
-    )
-
-    paths = [r["path"] for r in registry.list_changed_files(conv_id, limit=100)]
-    assert sorted(paths) == [".cursor/rules/style.md", "real_change.py"], (
-        f"Expected only user content and real changes, got {paths}. "
-        "Both registries should agree on hiding Omnigent cursor plumbing."
-    )
-    for name in ("mcp.json", "hooks.json", "omnigent-hook.sh"):
-        assert registry.get_changed_file(conv_id, f".cursor/{name}") is None, (
-            f"Expected get_changed_file to hide .cursor/{name}, matching the git registry."
-        )
-    assert registry.get_changed_file(conv_id, ".cursor/rules/style.md") is not None
 
 
 def test_cursor_plumbing_allowlist_matches_the_launchers(tmp_path: Path, monkeypatch) -> None:
