@@ -804,8 +804,9 @@ async def test_late_recovery_result_cannot_overwrite_another_replica(store, monk
         assert recorded == results[0]
         assert recorded.error is None
         fire.assert_not_awaited()
+        # Each replica logs when its own write finishes, in either order.
         outcomes = [event["outcome"] for event in _events(caplog, "scheduled_run_recovered")]
-        assert outcomes == ["running", "superseded"]
+        assert sorted(outcomes) == ["running", "superseded"]
     finally:
         await asyncio.gather(*(scheduler.stop() for scheduler in schedulers))
 
