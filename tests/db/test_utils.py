@@ -126,6 +126,39 @@ def test_cockroachdb_engine_settings(monkeypatch: pytest.MonkeyPatch) -> None:
     assert captured["pool_timeout"] == 10.0
 
 
+@pytest.mark.parametrize(
+    ("db_uri", "expect_reset_disabled"),
+    [
+        ("mysql+pymysql://user:pass@host/db", True),
+        ("postgresql+psycopg://user:pass@host/db", False),
+        ("cockroachdb://root@host/db", False),
+    ],
+)
+def test_pool_return_rollback_disabled_only_for_mysql(
+    monkeypatch: pytest.MonkeyPatch,
+    db_uri: str,
+    expect_reset_disabled: bool,
+) -> None:
+    """MySQL skips the redundant pool-return ROLLBACK; Postgres-family keeps
+    it because its pre-ping SELECT opens a transaction the reset must end."""
+    from omnigent.db import utils
+
+    captured: dict[str, Any] = {}
+
+    def capture(uri: str, **kwargs: Any) -> MagicMock:
+        captured.update(kwargs)
+        return MagicMock()
+
+    monkeypatch.setattr(utils, "create_engine", capture)
+    utils._create_engine(db_uri)
+
+    if expect_reset_disabled:
+        assert "pool_reset_on_return" in captured
+        assert captured["pool_reset_on_return"] is None
+    else:
+        assert "pool_reset_on_return" not in captured
+
+
 @pytest.mark.parametrize("dialect", ["cockroachdb", "mysql"])
 def test_run_write_transaction_retries_rolled_back_concurrency_failures(
     monkeypatch: pytest.MonkeyPatch,

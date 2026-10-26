@@ -33,6 +33,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent._platform import resolve_repo_symlink
 from omnigent.db.db_models import InvalidUuidError
+from omnigent.db.utils import shared_read_scope
 from omnigent.debug_logging import (
     add_audit_attrs,
     audit_event_logger,
@@ -2940,7 +2941,13 @@ def create_app(
             (mirrors the legacy single-session path, which treated a
             missing row as reachable).
         """
-        connectivity = conversation_store.get_session_connectivity(ids)
+        # One pool checkout per engine for the connectivity + hosts reads.
+        with shared_read_scope():
+            connectivity = conversation_store.get_session_connectivity(ids)
+            host_ids_to_check = {
+                conn.host_id for conn in connectivity.values() if conn.host_id is not None
+            }
+            online_hosts = _bulk_hosts_online(list(host_ids_to_check))
         # One consistent clock for the whole batch's freshness checks.
         liveness_now = int(time.time())
 
@@ -2956,13 +2963,9 @@ def create_app(
             # stale and self-corrects after the TTL.
             return runner_seen_is_fresh(conn.runner_last_seen, now=liveness_now)
 
-        # Resolve host liveness for every bound host in one query, so
+        # Host liveness is resolved for every bound host above, so
         # ``host_online`` can be reported even when the runner tunnel is
         # up (the open-session view shows host state regardless).
-        host_ids_to_check = {
-            conn.host_id for conn in connectivity.values() if conn.host_id is not None
-        }
-        online_hosts = _bulk_hosts_online(list(host_ids_to_check))
         host_versions = _bulk_host_versions(list(host_ids_to_check))
         result: dict[str, SessionLiveness] = {}
         for sid in ids:

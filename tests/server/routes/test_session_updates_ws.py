@@ -21,9 +21,11 @@ from datetime import UTC, datetime
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
+from sqlalchemy import event
 from starlette.websockets import WebSocketDisconnect
 
 import omnigent.server.routes.sessions as sessions_routes
+from omnigent.db.utils import get_or_create_engine
 from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.routes.sessions import SessionLiveness, create_sessions_router
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
@@ -198,6 +200,31 @@ def test_watch_returns_snapshot_of_accessible_sessions(app: FastAPI, stores) -> 
         # would drop the key (stream dumps full rows, so it must be present).
         assert items[s1]["runner_online"] is True
         assert items[s1]["host_online"] is None
+
+
+def test_snapshot_reads_share_one_pool_checkout(app: FastAPI, stores, db_uri: str) -> None:
+    """One rescan's permission, conversation, agent, child, and comment
+    reads share a single pool checkout instead of one per store call."""
+    s1 = _seed_session(stores, owner=ALICE, title="first")
+    checkouts: list[int] = []
+
+    def _on_checkout(_dbapi: object, _record: object, _proxy: object) -> None:
+        checkouts.append(1)
+
+    engine = get_or_create_engine(db_uri)
+    event.listen(engine, "checkout", _on_checkout)
+    try:
+        with TestClient(app).websocket_connect(
+            "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+        ) as ws:
+            ws.send_text(json.dumps({"type": "watch", "session_ids": [s1]}))
+            snapshot = _recv_until(ws, {"snapshot"})
+            reads_for_snapshot = len(checkouts)
+    finally:
+        event.remove(engine, "checkout", _on_checkout)
+
+    assert [item["id"] for item in snapshot["items"]] == [s1]  # type: ignore[index]
+    assert reads_for_snapshot == 1
 
 
 def test_child_busy_rollup_flows_through_updates_stream(
