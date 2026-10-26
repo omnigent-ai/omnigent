@@ -1,3 +1,19 @@
+import {
+  SandboxRepositoryPicker,
+  MAX_SANDBOX_REPOS,
+  composeSandboxWorkspaces,
+  deriveRepoName,
+  isValidSandboxRepoUrl,
+} from "./SandboxRepositoryPicker";
+
+export {
+  SANDBOX_REPO_LABEL_KEY,
+  composeSandboxWorkspace,
+  composeSandboxWorkspaces,
+  deriveRepoName,
+  isValidSandboxRepoUrl,
+  splitSandboxWorkspace,
+} from "./SandboxRepositoryPicker";
 import { useLoadedConversations } from "@/hooks/useSidebarData";
 import { useComposerContext } from "@/hooks/useComposerContext";
 import { useSlashCompletion } from "@/hooks/useSlashCompletion";
@@ -58,16 +74,14 @@ import {
   ComposerSendButton,
 } from "@/components/composer/ChatComposer";
 import { ComposerMentionChips } from "@/components/composer/ComposerMentionChips";
-import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useQueryClient } from "@tanstack/react-query";
 import {
   MonitorCloudIcon,
   CircleHelpIcon,
   ChevronDownIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
-  ChevronsUpDownIcon,
   GitBranchIcon,
-  LockIcon,
   FolderGit2Icon,
   FolderIcon,
   FolderOpenIcon,
@@ -75,7 +89,6 @@ import {
   ShuffleIcon,
   WandSparklesIcon,
   TriangleAlertIcon,
-  XIcon,
 } from "lucide-react";
 import { Dialog, DialogContent, DialogHeader, DialogTitle } from "@/components/ui/dialog";
 import { Badge } from "@/components/ui/badge";
@@ -112,7 +125,6 @@ import { MenuItem } from "@/components/ui/menu-item";
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "@/components/ui/tabs";
 import { authenticatedFetch, getCurrentUserId, resolveIdentity } from "@/lib/identity";
 import { backgroundSessionTitlesRequestHeaders } from "@/lib/backgroundSessionTitlesPreferences";
-import { fetchGithubBranches, fetchGithubRepos, type GithubRepo } from "@/lib/githubIntegration";
 import { composerContextToLabels } from "@/lib/composerContextAdapters";
 import { randomUUID } from "@/lib/randomUUID";
 import { sessionRoutingHostId, setSessionHost } from "@/lib/sessionHost";
@@ -120,14 +132,6 @@ import { readSubmitWithModEnter } from "@/lib/composerSendShortcutPreferences";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { Popover, PopoverContent, PopoverTrigger } from "@/components/ui/popover";
-import {
-  Command,
-  CommandEmpty,
-  CommandGroup,
-  CommandInput,
-  CommandItem,
-  CommandList,
-} from "@/components/ui/command";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
 import {
@@ -362,7 +366,7 @@ import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/comp
 import { CreateAgentDialog } from "./CreateAgentDialog";
 import { buildAgentBundle, type AgentBundleInput } from "@/lib/agentBundle";
 import { installAgentBundle } from "@/lib/agentsApi";
-import { createBundledSession, launchRunner } from "@/lib/sessionsApi";
+import { createBundledSession, launchRunner, wakeSandboxHost } from "@/lib/sessionsApi";
 import { promoteSessionDraft, recoverFailedSessionDraft } from "@/lib/sessionDrafts";
 
 // Short picker-row blurbs — the spec descriptions are long paragraphs that
@@ -954,292 +958,6 @@ export function sanitizeInitialPrompt(prompt: string): string {
   // eslint-disable-next-line no-control-regex
   const sanitized = prompt.replace(/[\x00-\x08\x0b-\x1f\x7f-\x9f]/g, "");
   return isSlashCommandText(sanitized) ? sanitized.trim() : sanitized.trimEnd();
-}
-
-/**
- * Session label recording the repository a managed session was created
- * with, as the raw ``<url>[#<branch>]`` request value (the server's
- * ``MANAGED_REPO_LABEL_KEY``). A sandbox relaunch re-clones from it, and
- * the fork dialog seeds its repository field from it so cloning a sandbox
- * session lands in the same checkout — which is why it lives beside the
- * workspace grammar below rather than with the server-capability probe.
- */
-export const SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo";
-
-/**
- * Return true when ``url`` is acceptable as a sandbox repository URL.
- *
- * Mirrors the server's accepted forms (``parse_repo_workspace``):
- * ``https://<host>/<path>`` or scp-style ``git@<host>:<path>``. The
- * server is the authority — this only gates the submit button so an
- * obviously unusable value gets inline feedback instead of a 422.
- *
- * The host may not carry an ``@``: that is embedded ``user:token@host``
- * userinfo, which the server refuses so a token never reaches a session
- * label or a sandbox Pod spec. Refusing it here keeps it out of the
- * request as well.
- *
- * @param url Value the user typed in the repository input.
- * @returns true when ``url.trim()`` matches one of the two forms.
- */
-export function isValidSandboxRepoUrl(url: string): boolean {
-  const t = url.trim();
-  return /^https:\/\/[^\s#/@]+\/+[^\s#@/][^\s#@]*$/.test(t) || /^git@[^\s#:@]+:[^\s#@]+$/.test(t);
-}
-
-/**
- * Compose the managed session's ``workspace`` string from the split
- * repository inputs.
- *
- * The API takes one Docker-build-context-style string —
- * ``<url>[#<branch>]`` — and the UI presents split fields, so this is
- * the reassembly step.
- *
- * @param url Repository URL input, e.g. ``"https://github.com/org/repo"``.
- * @param branch Branch input, e.g. ``"main"``; blank means the repo's
- *   default branch.
- * @returns The composed workspace string, or ``undefined`` when no
- *   repository was given (empty sandbox workspace).
- */
-export function composeSandboxWorkspace(url: string, branch: string): string | undefined {
-  const u = url.trim();
-  if (u === "") return undefined;
-  const b = branch.trim();
-  return b === "" ? u : `${u}#${b}`;
-}
-
-/**
- * Split a composed sandbox workspace back into its two inputs.
- *
- * The inverse of {@link composeSandboxWorkspace}: the API carries one
- * ``<url>[#<branch>]`` string, the UI presents a URL field and a branch
- * field. Splits on the FIRST ``#``, matching the server's own parse.
- *
- * @param workspace Composed workspace, e.g.
- *   ``"https://github.com/org/repo#main"``, or ``null`` when unset.
- * @returns The url and branch, each ``""`` when absent.
- */
-export function splitSandboxWorkspace(workspace: string | null): {
-  url: string;
-  branch: string;
-} {
-  if (workspace === null) return { url: "", branch: "" };
-  const hash = workspace.indexOf("#");
-  if (hash === -1) return { url: workspace, branch: "" };
-  return { url: workspace.slice(0, hash), branch: workspace.slice(hash + 1) };
-}
-
-/**
- * Compose the managed session's ``workspaces`` list from the selected repos.
- *
- * Each ``{url, branch}`` becomes a ``<url>[#<branch>]`` string; blank-URL
- * entries are dropped. The API clones them in parallel and starts the agent in
- * the single repo (one entry) or the parent that holds them all (several).
- *
- * @param repos The selected repos, in the order the user added them.
- * @returns The composed workspace strings (may be empty for no repo).
- */
-export function composeSandboxWorkspaces(repos: LastSandboxRepo[]): string[] {
-  return repos
-    .map((r) => composeSandboxWorkspace(r.url, r.branch))
-    .filter((w): w is string => w !== undefined);
-}
-
-// Max repos a managed sandbox may clone — mirrors the server's
-// `_MAX_MANAGED_WORKSPACES` so the picker stops adding before a create 422s.
-const MAX_SANDBOX_REPOS = 10;
-
-/**
- * Derive a repository's display name from its URL.
- *
- * Last path segment with a trailing ``.git`` stripped — the same rule
- * the server uses for the clone directory, so the chip label matches
- * the workspace directory the session will get.
- *
- * @param url Repository URL, e.g. ``"https://github.com/org/repo.git"``.
- * @returns The name, e.g. ``"repo"``; ``null`` when underivable.
- */
-export function deriveRepoName(url: string): string | null {
-  const t = url.trim().replace(/\/+$/, "");
-  if (t === "") return null;
-  const last = t.split(/[/:]/).pop() ?? "";
-  const name = last.endsWith(".git") ? last.slice(0, -4) : last;
-  return name === "" ? null : name;
-}
-
-/** Shared trigger styling for the repo/branch comboboxes. */
-const COMBOBOX_TRIGGER_CLASS =
-  "flex w-full items-center gap-2 rounded-md border border-input bg-background px-3 py-2 text-xs outline-none transition-colors hover:border-ring/60 focus-visible:border-ring";
-
-/**
- * Searchable combobox for picking one of the caller's GitHub repos.
- *
- * A trigger button opens a `cmdk` search list (repos are filtered as you
- * type on ``owner/name``), which scales to accounts with many repos far
- * better than a native ``<select>``. Selecting a repo fills the same
- * URL/branch state the free-text inputs drive; the empty value shows the
- * "Choose a repository…" placeholder.
- *
- * @param repos The caller's accessible repos (newest-first from the API).
- * @param value The selected repo's ``owner/name`` ("" = none).
- * @param onSelect Called with the chosen repo (or ``null`` to clear).
- */
-function SandboxRepoCombobox({
-  repos,
-  value,
-  onSelect,
-}: {
-  repos: GithubRepo[];
-  value: string;
-  onSelect: (repo: GithubRepo | null) => void;
-}): ReactNode {
-  const [open, setOpen] = useState(false);
-  const selected = repos.find((r) => r.full_name === value) ?? null;
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          role="combobox"
-          aria-expanded={open}
-          aria-label="GitHub repository"
-          className={COMBOBOX_TRIGGER_CLASS}
-          data-testid="new-chat-landing-repo-select"
-        >
-          <span className="truncate">{selected ? selected.full_name : "Choose a repository…"}</span>
-          <ChevronsUpDownIcon className="ml-auto size-3.5 shrink-0 opacity-50" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-(--radix-popover-trigger-width) min-w-72 p-0">
-        <Command>
-          <CommandInput
-            placeholder="Search repositories…"
-            data-testid="new-chat-landing-repo-search"
-          />
-          <CommandList>
-            <CommandEmpty>No repositories found.</CommandEmpty>
-            <CommandGroup>
-              {repos.map((r) => (
-                <CommandItem
-                  key={r.full_name}
-                  value={r.full_name}
-                  data-checked={r.full_name === value}
-                  onSelect={() => {
-                    onSelect(r);
-                    setOpen(false);
-                  }}
-                >
-                  <span className="truncate">{r.full_name}</span>
-                  {r.private && (
-                    <LockIcon
-                      className="size-3 shrink-0 opacity-60"
-                      aria-label="Private repository"
-                    />
-                  )}
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
-}
-
-/**
- * Searchable branch combobox for the connected-GitHub repo picker.
- *
- * Lazily fetches the chosen repo's branches and filters them as you type.
- * The empty value is the "default branch" sentinel: leaving it selected
- * appends no ``#branch`` fragment, so the server clones the repo's default
- * branch.
- *
- * @param fullName The chosen repo's ``owner/name``.
- * @param value The currently selected branch ("" = default).
- * @param defaultBranch The repo's default branch, for the sentinel label.
- * @param onChange Called with the newly selected branch.
- */
-function SandboxRepoBranchSelect({
-  fullName,
-  value,
-  defaultBranch,
-  onChange,
-}: {
-  fullName: string;
-  value: string;
-  defaultBranch: string | null;
-  onChange: (branch: string) => void;
-}): ReactNode {
-  const [open, setOpen] = useState(false);
-  const { data, isPending } = useQuery({
-    queryKey: ["github-branches", fullName],
-    queryFn: () => fetchGithubBranches(fullName),
-    staleTime: 5 * 60_000,
-  });
-  const branches = data?.connected ? data.branches : [];
-  const defaultLabel = defaultBranch ? `Default (${defaultBranch})` : "Default branch";
-  // Options: the fetched branches minus the default (represented by the
-  // empty-value sentinel). Include the current value even before the list
-  // loads (e.g. a draft-restored branch) so the trigger label always
-  // resolves to a real option.
-  const options = branches.filter((b) => b !== defaultBranch);
-  if (value !== "" && !options.includes(value)) {
-    options.unshift(value);
-  }
-  return (
-    <Popover open={open} onOpenChange={setOpen}>
-      <PopoverTrigger asChild>
-        <button
-          type="button"
-          role="combobox"
-          aria-expanded={open}
-          aria-label={`Branch for ${fullName}`}
-          className={COMBOBOX_TRIGGER_CLASS}
-          data-testid="new-chat-landing-repo-branch-select"
-        >
-          <GitBranchIcon className="size-3.5 shrink-0 opacity-60" />
-          <span className="truncate">{value === "" ? defaultLabel : value}</span>
-          <ChevronsUpDownIcon className="ml-auto size-3.5 shrink-0 opacity-50" />
-        </button>
-      </PopoverTrigger>
-      <PopoverContent align="start" className="w-(--radix-popover-trigger-width) min-w-72 p-0">
-        <Command>
-          <CommandInput
-            placeholder="Search branches…"
-            data-testid="new-chat-landing-repo-branch-search"
-          />
-          <CommandList>
-            <CommandEmpty>{isPending ? "Loading branches…" : "No branches found."}</CommandEmpty>
-            <CommandGroup>
-              <CommandItem
-                value={defaultLabel}
-                data-checked={value === ""}
-                onSelect={() => {
-                  onChange("");
-                  setOpen(false);
-                }}
-              >
-                {defaultLabel}
-              </CommandItem>
-              {options.map((b) => (
-                <CommandItem
-                  key={b}
-                  value={b}
-                  data-checked={b === value}
-                  onSelect={() => {
-                    onChange(b);
-                    setOpen(false);
-                  }}
-                >
-                  {b}
-                </CommandItem>
-              ))}
-            </CommandGroup>
-          </CommandList>
-        </Command>
-      </PopoverContent>
-    </Popover>
-  );
 }
 
 /**
@@ -2160,6 +1878,7 @@ interface LandingDraft {
   sandboxSelected: boolean;
   sandboxProvider: string | null;
   sandboxRepoSelections: LastSandboxRepo[];
+  sandboxCreateWorktrees: boolean;
   workspace: string;
   branchName: string;
   autoSeededBranch: string;
@@ -2578,59 +2297,31 @@ export function NewChatLandingScreen() {
   const [sandboxRepoSelections, setSandboxRepoSelections] = useState<LastSandboxRepo[]>(
     () => restoredDraft?.sandboxRepoSelections ?? readLastSandboxRepos(),
   );
+  const [sandboxCreateWorktrees, setSandboxCreateWorktrees] = useState(
+    () => restoredDraft?.sandboxCreateWorktrees ?? false,
+  );
+  const workspaceHost = !sandboxSelected
+    ? hosts?.find((host) => host.host_id === selectedHostId)
+    : undefined;
   // Whether the launch provider clones several repos (server-declared per
   // provider via /v1/info). A single-repo provider caps the picker at one, so
   // it reads as a plain single-repo picker and never offers a multi-repo menu.
   // Falls back to the server's default provider when none is picked yet, which
   // is what the launch will use.
-  const effectiveSandboxProvider =
-    sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null);
+  const effectiveSandboxProvider = workspaceHost?.sandbox_attached
+    ? workspaceHost.sandbox_provider
+    : (sandboxProvider ?? (info !== "loading" ? info.sandbox_provider : null));
+  const sandboxSessionWorkspaces =
+    (sandboxSelected || workspaceHost?.sandbox_attached === true) &&
+    info !== "loading" &&
+    effectiveSandboxProvider != null &&
+    info.sandbox_provider_capabilities?.[effectiveSandboxProvider]?.session_workspaces === true;
+  const repositoryWorkspaceSelected = sandboxSelected || sandboxSessionWorkspaces;
   const sandboxMultiRepo =
     info !== "loading" &&
-    effectiveSandboxProvider !== null &&
+    effectiveSandboxProvider != null &&
     info.sandbox_provider_capabilities?.[effectiveSandboxProvider]?.multi_repo === true;
   const maxSandboxRepos = sandboxMultiRepo ? MAX_SANDBOX_REPOS : 1;
-  // Append a repo (deduped by URL — adding one already picked is a no-op),
-  // remove one, or repoint its branch. Order is preserved so the list reads
-  // the way the user built it.
-  const addSandboxRepo = useCallback(
-    (url: string, branch = ""): void => {
-      const u = url.trim();
-      if (u === "") return;
-      setSandboxRepoSelections((prev) =>
-        // Cap at the provider's limit so a selection can't only fail with a 422
-        // at create; a duplicate URL is a no-op.
-        prev.some((r) => r.url === u) || prev.length >= maxSandboxRepos
-          ? prev
-          : [...prev, { url: u, branch: branch.trim() }],
-      );
-    },
-    [maxSandboxRepos],
-  );
-  const removeSandboxRepo = useCallback((url: string): void => {
-    setSandboxRepoSelections((prev) => prev.filter((r) => r.url !== url));
-  }, []);
-  const setSandboxRepoBranch = useCallback((url: string, branch: string): void => {
-    setSandboxRepoSelections((prev) => prev.map((r) => (r.url === url ? { ...r, branch } : r)));
-  }, []);
-  // Free-text URL being typed into the "paste a URL" adder (not yet added).
-  const [pendingRepoUrl, setPendingRepoUrl] = useState<string>("");
-  // When the server advertises the GitHub App and the caller has connected
-  // their account, offer a picker over their repos instead of only the
-  // free-text URL. The /repos endpoint returns `connected: false` when the
-  // account isn't linked, so gating the query on `enabled_connections` and
-  // reading `connected` off the payload doubles as the connection check.
-  const githubReposEnabled =
-    info !== "loading" && (info.enabled_connections ?? []).includes("github");
-  const { data: sandboxRepoData, isError: sandboxReposErrored } = useQuery({
-    queryKey: ["github-repos"],
-    queryFn: fetchGithubRepos,
-    enabled: githubReposEnabled,
-    staleTime: 5 * 60_000,
-  });
-  const sandboxRepoPickerConnected = sandboxRepoData?.connected ?? false;
-  const sandboxRepos = sandboxRepoPickerConnected ? (sandboxRepoData?.repos ?? []) : [];
-  const sandboxReposTruncated = sandboxRepoData?.truncated ?? false;
   const [workspace, setWorkspace] = useState<string>(() => restoredDraft?.workspace ?? "");
   // Source tracking for the create's field-omission contract: true while the
   // slot's value is the untouched seed the project-prefill effect wrote from
@@ -2749,6 +2440,7 @@ export function NewChatLandingScreen() {
   const skipDbcertCheckRef = useRef<(() => void) | null>(null);
   const [createError, setCreateError] = useState<string | null>(null);
   const [wakingHostId, setWakingHostId] = useState<string | null>(null);
+  const attemptedWake = useRef<string | null>(null);
   const [discoveryProvider, setDiscoveryProvider] = useState<string | null>(null);
   // "Connect a host" instructions modal, opened from the host dropdown.
   const [connectOpen, setConnectOpen] = useState(false);
@@ -2788,6 +2480,7 @@ export function NewChatLandingScreen() {
     sandboxSelected,
     sandboxProvider,
     sandboxRepoSelections,
+    sandboxCreateWorktrees,
     workspace,
     branchName,
     autoSeededBranch,
@@ -2928,7 +2621,6 @@ export function NewChatLandingScreen() {
     // Drafted sandbox repo fields are location state too — left in place they
     // would clone the previous project's repo into this project's sandbox.
     setSandboxRepoSelections([]);
-    setPendingRepoUrl("");
     agentFromConfigRef.current = false;
     workspaceFromConfigRef.current = false;
     seededHostRef.current = null;
@@ -3161,7 +2853,7 @@ export function NewChatLandingScreen() {
   // managed sandbox — the sandbox create path doesn't provision a runner for a
   // bundled agent. So a pending pick made before switching to a sandbox is
   // dropped there, falling back to a real agent; off the sandbox it's kept.
-  const pendingAgentAllowedOnTarget = !sandboxSelected;
+  const pendingAgentAllowedOnTarget = !repositoryWorkspaceSelected;
   // A configured agent absent from templates and the first 30 Mine sessions
   // stays unavailable until the user explicitly chooses another agent.
   const configuredAgentUnavailable =
@@ -4703,7 +4395,8 @@ export function NewChatLandingScreen() {
   // Existing git worktrees of the picked directory's repo, for the
   // worktree picker. Skipped for sandbox sessions (server-managed) and
   // when no directory is picked. A non-git path resolves to [].
-  const worktreesEnabled = !sandboxSelected && selectedHostId !== null && workspaceTrimmed !== "";
+  const worktreesEnabled =
+    !repositoryWorkspaceSelected && selectedHostId !== null && workspaceTrimmed !== "";
   const {
     data: hostWorktrees,
     isLoading: hostWorktreesLoading,
@@ -5115,7 +4808,7 @@ export function NewChatLandingScreen() {
   // whose `git worktree list` is slow must not hold the start, so it only
   // drives the chip's loading state and the worktree control.
   const workspaceStartLoading =
-    !sandboxSelected &&
+    !repositoryWorkspaceSelected &&
     (hostsLoading ||
       info === "loading" ||
       (projectParam !== "" &&
@@ -5221,7 +4914,10 @@ export function NewChatLandingScreen() {
     pickerSelectionError === null &&
     sandboxCatalogError === null &&
     selectedAgent != null &&
-    (sandboxSelected ? sandboxRepoValid : selectedHost?.status === "online" && workspaceValid) &&
+    (sandboxSelected
+      ? sandboxRepoValid
+      : selectedHost?.status === "online" &&
+        (sandboxSessionWorkspaces ? sandboxRepoValid : workspaceValid)) &&
     !creating;
 
   // Name the next missing input in the submit tooltip.
@@ -5235,15 +4931,15 @@ export function NewChatLandingScreen() {
           ? "Loading session configuration…"
           : pickerSelectionError || sandboxCatalogError
             ? (pickerSelectionError ?? sandboxCatalogError)
-            : sandboxSelected && sandboxRepoOverCap
+            : repositoryWorkspaceSelected && sandboxRepoOverCap
               ? `This sandbox provider clones at most ${maxSandboxRepos} ${
                   maxSandboxRepos === 1 ? "repository" : "repositories"
                 } — remove the extras`
-              : sandboxSelected && !sandboxRepoValid
+              : repositoryWorkspaceSelected && !sandboxRepoValid
                 ? "Please enter a valid repository URL"
                 : !sandboxSelected && selectedHostId && selectedHost?.status !== "online"
                   ? "Selected host is unavailable. Reconnect it or choose another host."
-                  : !sandboxSelected && (!selectedHostId || !workspaceValid)
+                  : !repositoryWorkspaceSelected && (!selectedHostId || !workspaceValid)
                     ? "Please choose a host and working directory"
                     : configuredAgentUnavailable && selectedAgent == null
                       ? "This project's configured agent is unavailable — pick an agent to continue"
@@ -5298,7 +4994,12 @@ export function NewChatLandingScreen() {
               { label: "Host", value: selectedHostDisplayName },
               {
                 label: "Status",
-                value: selectedHost?.status === "online" ? "Connected" : "Disconnected",
+                value:
+                  wakingHostId === selectedHostId
+                    ? "Waking…"
+                    : selectedHost?.status === "online"
+                      ? "Connected"
+                      : "Disconnected",
               },
             ]
           : [{ label: "Host", value: "None" }];
@@ -5307,22 +5008,6 @@ export function NewChatLandingScreen() {
     workspaceIsGit &&
     (branchName.trim() !== "" ||
       (worktreesEnabled && (hostWorktrees === undefined || hostWorktrees.length > 0)));
-  const showGithubRepoPicker = githubReposEnabled && sandboxRepoPickerConnected;
-  // The connected-GitHub repo (if any) a selection URL names, so its row can
-  // offer that repo's branch list. Repos not in the picker (pasted URLs, or a
-  // repo the account lost access to) resolve to undefined and fall back to a
-  // free-text branch input.
-  const repoForUrl = (url: string): GithubRepo | undefined =>
-    sandboxRepos.find(
-      (r) => (r.clone_url ?? `https://github.com/${r.full_name}.git`) === url.trim(),
-    );
-  // The clone URL of a connected repo, matching the server's derivation.
-  const repoCloneUrl = (r: GithubRepo): string =>
-    r.clone_url ?? `https://github.com/${r.full_name}.git`;
-  // Repos not yet selected — the "Add repository" combobox offers only these.
-  const unselectedRepos = sandboxRepos.filter(
-    (r) => !sandboxRepoSelections.some((s) => s.url === repoCloneUrl(r)),
-  );
   // Sandbox repository chip label: the single repo's name[#branch] (server's
   // clone-dir rule), a count when several, or a placeholder when none.
   const sandboxRepoLabel =
@@ -5423,26 +5108,35 @@ export function NewChatLandingScreen() {
     setPickedHarness(null);
   };
 
-  async function wakeAttachedHost(hostId: string) {
-    setWakingHostId(hostId);
-    setCreateError(null);
-    try {
-      const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/wake`, {
-        method: "POST",
-      });
-      if (!response.ok) {
-        const body = await response.json();
-        throw new Error(body.detail || "Could not wake sandbox");
+  const wakeAttachedHost = useCallback(
+    async (hostId: string) => {
+      attemptedWake.current = hostId;
+      setWakingHostId(hostId);
+      setCreateError(null);
+      try {
+        await wakeSandboxHost(hostId);
+        await queryClient.invalidateQueries({ queryKey: ["hosts"] });
+        void queryClient.invalidateQueries({ queryKey: ["host-filesystem", hostId] });
+        void queryClient.invalidateQueries({ queryKey: ["host-worktrees", hostId] });
+        void queryClient.invalidateQueries({ queryKey: ["sandbox-discovery"] });
+      } catch (error) {
+        if (attemptedWake.current === hostId)
+          setCreateError(error instanceof Error ? error.message : "Could not wake sandbox");
+      } finally {
+        if (attemptedWake.current === hostId) setWakingHostId(null);
       }
-      await queryClient.invalidateQueries({ queryKey: ["hosts"] });
-      selectHost(hostId);
-      void queryClient.invalidateQueries({ queryKey: ["sandbox-discovery"] });
-    } catch (error) {
-      setCreateError(error instanceof Error ? error.message : "Could not wake sandbox");
-    } finally {
-      setWakingHostId(null);
-    }
-  }
+    },
+    [queryClient],
+  );
+  useEffect(() => {
+    if (
+      !sandboxSelected &&
+      selectedHost?.sandbox_attached &&
+      selectedHost.status === "offline" &&
+      attemptedWake.current !== selectedHost.host_id
+    )
+      void wakeAttachedHost(selectedHost.host_id);
+  }, [sandboxSelected, selectedHost, wakeAttachedHost]);
 
   function selectHost(hostId: string) {
     // Persist the explicit pick even when it matches the current selection, so
@@ -5954,7 +5648,9 @@ export function NewChatLandingScreen() {
                 // The repos to clone in parallel; the agent starts in the one
                 // repo, or the parent that holds them all. Empty = empty
                 // sandbox workspace.
-                workspaces: composeSandboxWorkspaces(sandboxRepoSelections),
+                ...(!sandboxSessionWorkspaces
+                  ? { workspaces: composeSandboxWorkspaces(sandboxRepoSelections) }
+                  : {}),
                 // On a `project_id` create an ABSENT (path) workspace would be
                 // default-filled with the config's path workspace, which a
                 // managed create rejects — pin an explicit null (explicit
@@ -5993,6 +5689,16 @@ export function NewChatLandingScreen() {
                       ? null
                       : undefined,
               }),
+          ...(sandboxSessionWorkspaces
+            ? {
+                workspace: null,
+                git: null,
+                sandbox_workspace: {
+                  repositories: composeSandboxWorkspaces(sandboxRepoSelections),
+                  create_worktrees: sandboxCreateWorktrees,
+                },
+              }
+            : {}),
           // Native-wrapper labels + codex bypass + the born-filed project
           // label (see `createLabels` above).
           // Smart Routing sends none of these: the bound agent is only a
@@ -6177,7 +5883,7 @@ export function NewChatLandingScreen() {
         }
       }
       // Sandbox creates have no user-picked workspace to remember.
-      if (!sandboxSelected) addRecent(workspaceTrimmed);
+      if (!repositoryWorkspaceSelected) addRecent(workspaceTrimmed);
       // Remember the launched harness so the picker promotes it out of "More"
       // next time. Recorded only on a successful create, so a harness the user
       // merely browsed past never earns a primary slot.
@@ -6279,8 +5985,10 @@ export function NewChatLandingScreen() {
       <DropdownMenuItem
         key={host.host_id}
         onSelect={() => {
-          if (wakeable) void wakeAttachedHost(host.host_id);
-          else if (reconnect) pendingConnectRef.current = true;
+          if (wakeable) {
+            selectHost(host.host_id);
+            void wakeAttachedHost(host.host_id);
+          } else if (reconnect) pendingConnectRef.current = true;
           else selectHost(host.host_id);
         }}
         disabled={
@@ -6446,7 +6154,7 @@ export function NewChatLandingScreen() {
           data-testid="new-chat-landing-composer-surface"
         >
           {/* Keep the tray mounted while the execution target changes. */}
-          {sandboxSelected && (
+          {repositoryWorkspaceSelected && (
             <ComposerWorkspaceBar
               key="workspace-controls"
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"
@@ -6481,7 +6189,11 @@ export function NewChatLandingScreen() {
                     <ChevronDownIcon className="size-3.5 shrink-0 opacity-60" />
                   </button>
                 </PopoverTrigger>
-                <PopoverContent align="start" className="w-96 p-3">
+                <PopoverContent
+                  align="start"
+                  collisionPadding={16}
+                  className="w-96 max-w-[calc(100vw-2rem)] p-3"
+                >
                   <div className="flex flex-col gap-2">
                     <div className="flex items-center gap-1.5">
                       <span className="text-sm font-medium text-foreground">
@@ -6504,162 +6216,24 @@ export function NewChatLandingScreen() {
                         </Tooltip>
                       )}
                     </div>
-                    {/* Stale over-cap selection (repos remembered/added under
-                  a multi-repo provider, then switched to a single-repo one):
-                  warn and block submit rather than 422 after the session row
-                  is created. */}
-                    {sandboxRepoOverCap && (
-                      <p
-                        className="text-sm text-warning"
-                        data-testid="new-chat-landing-repo-overcap"
-                      >
-                        This sandbox provider clones at most {maxSandboxRepos}{" "}
-                        {maxSandboxRepos === 1 ? "repository" : "repositories"}. Remove the extra{" "}
-                        {maxSandboxRepos === 1 ? "repositories" : "ones"} to continue.
-                      </p>
-                    )}
-                    {/* Selected repos: each clones into its own sibling dir.
-                  A connected repo gets its branch combobox; a pasted URL a
-                  free-text branch. The remove button drops it. */}
-                    {sandboxRepoSelections.map((sel) => {
-                      const repo = repoForUrl(sel.url);
-                      const name = repo?.full_name ?? deriveRepoName(sel.url) ?? sel.url;
-                      return (
-                        <div
-                          key={sel.url}
-                          className="flex items-center gap-2"
-                          data-testid="new-chat-landing-repo-row"
-                        >
-                          <span className="min-w-0 flex-1 truncate text-sm" title={sel.url}>
-                            {name}
-                          </span>
-                          {repo ? (
-                            <div className="w-36 shrink-0">
-                              <SandboxRepoBranchSelect
-                                fullName={repo.full_name}
-                                value={sel.branch}
-                                defaultBranch={repo.default_branch}
-                                onChange={(b) => setSandboxRepoBranch(sel.url, b)}
-                              />
-                            </div>
-                          ) : (
-                            <input
-                              type="text"
-                              value={sel.branch}
-                              onChange={(e) => setSandboxRepoBranch(sel.url, e.target.value)}
-                              placeholder="branch"
-                              aria-label={`Branch for ${name}`}
-                              className="w-28 shrink-0 rounded-md border border-input bg-background px-2 py-1 text-xs outline-none transition-colors focus-visible:border-ring"
-                            />
-                          )}
-                          <button
-                            type="button"
-                            onClick={() => removeSandboxRepo(sel.url)}
-                            aria-label={`Remove ${name}`}
-                            className="shrink-0 rounded-sm p-1 text-muted-foreground transition-colors hover:text-foreground"
-                            data-testid="new-chat-landing-repo-remove"
-                          >
-                            <XIcon className="size-3.5" />
-                          </button>
-                        </div>
-                      );
-                    })}
-                    {sandboxRepoSelections.length > 0 && (
-                      <div className="my-0.5 border-t border-border" />
-                    )}
-                    {/* Add-repository controls, hidden once the provider's
-                  repo cap is reached — so a single-repo provider shows one
-                  slot and no multi-repo affordance. */}
-                    {sandboxRepoSelections.length < maxSandboxRepos && (
-                      <>
-                        {/* Add from the connected account's repos (only those
-                      not already picked); the free-text URL below is the
-                      fallback for a repo not in the list or no GitHub link. */}
-                        {showGithubRepoPicker && (
-                          <>
-                            <SandboxRepoCombobox
-                              repos={unselectedRepos}
-                              value=""
-                              onSelect={(repo) => {
-                                if (repo) {
-                                  addSandboxRepo(
-                                    repo.clone_url ?? `https://github.com/${repo.full_name}.git`,
-                                  );
-                                }
-                              }}
-                            />
-                            {sandboxReposTruncated && (
-                              <p
-                                className="text-sm text-muted-foreground"
-                                data-testid="new-chat-landing-repo-truncated"
-                              >
-                                Showing your most recently pushed repositories. Don't see one? Paste
-                                its URL below.
-                              </p>
-                            )}
-                            <p className="text-sm text-muted-foreground">
-                              or paste a repository URL:
-                            </p>
-                          </>
-                        )}
-                        {/* Connected but the repo list failed to load: say so
-                      explicitly, so a transient error isn't mistaken for
-                      "GitHub not connected" (the picker just wouldn't render). */}
-                        {githubReposEnabled && sandboxReposErrored && !showGithubRepoPicker && (
-                          <p
-                            className="text-sm text-destructive"
-                            data-testid="new-chat-landing-repo-error"
-                          >
-                            Couldn't load your GitHub repositories. Paste a repository URL below.
-                          </p>
-                        )}
-                        <div className="flex items-center gap-2">
-                          <input
-                            id="landing-repo-url"
-                            type="text"
-                            value={pendingRepoUrl}
-                            onChange={(e) => setPendingRepoUrl(e.target.value)}
-                            onKeyDown={(e) => {
-                              // Enter adds the repo (same as the Add button), so a
-                              // paste-then-Enter flow never needs the mouse.
-                              if (e.key === "Enter" && isValidSandboxRepoUrl(pendingRepoUrl)) {
-                                e.preventDefault();
-                                addSandboxRepo(pendingRepoUrl);
-                                setPendingRepoUrl("");
-                              }
-                            }}
-                            placeholder="https://github.com/org/repo"
-                            aria-label="Repository URL"
-                            className="min-w-0 flex-1 rounded-md border border-input bg-background px-3 py-2 text-sm outline-none transition-colors focus-visible:border-ring"
-                            data-testid="new-chat-landing-repo-input"
-                          />
-                          <button
-                            type="button"
-                            disabled={!isValidSandboxRepoUrl(pendingRepoUrl)}
-                            onClick={() => {
-                              addSandboxRepo(pendingRepoUrl);
-                              setPendingRepoUrl("");
-                            }}
-                            className="flex shrink-0 items-center gap-1 rounded-md border border-input px-2.5 py-2 text-sm text-muted-foreground transition-colors hover:text-foreground disabled:opacity-40"
-                            data-testid="new-chat-landing-repo-add"
-                          >
-                            <PlusIcon className="size-3.5" />
-                            Add
-                          </button>
-                        </div>
-                      </>
-                    )}
-                    <p className="text-sm text-muted-foreground">
-                      {maxSandboxRepos > 1
-                        ? "Cloned into the sandbox at startup. Several repos are cloned side by side and the agent starts in the parent that holds them; pick one and it starts directly inside it. Leave empty for a blank workspace."
-                        : "Cloned into the sandbox at startup as the working directory. Leave empty for a blank workspace."}
-                    </p>
+                    <SandboxRepositoryPicker
+                      key={selectedProject}
+                      sandboxRepoSelections={sandboxRepoSelections}
+                      setSandboxRepoSelections={setSandboxRepoSelections}
+                      sandboxCreateWorktrees={sandboxCreateWorktrees}
+                      setSandboxCreateWorktrees={setSandboxCreateWorktrees}
+                      sandboxSessionWorkspaces={sandboxSessionWorkspaces}
+                      maxSandboxRepos={maxSandboxRepos}
+                      githubReposEnabled={
+                        info !== "loading" && (info.enabled_connections ?? []).includes("github")
+                      }
+                    />
                   </div>
                 </PopoverContent>
               </Popover>
             </ComposerWorkspaceBar>
           )}
-          {!sandboxSelected && (
+          {!repositoryWorkspaceSelected && (
             <ComposerWorkspaceBar
               key="workspace-controls"
               className="h-7 px-2 py-0.5 md:h-[37px] md:px-3 md:py-1.5"

@@ -51,6 +51,9 @@ the header menu), and each place is a separate entry point.
   unread dot offers Mark as read instead. Bulk selection also offers these actions.
 - `project`: Add to project (Move session once filed) puts a session in a
   project folder from the row menu, the header menu, or the header's folder tag.
+- `project-static-default`: save a named static sandbox as a project default,
+  including offline boxes; wake on opening the project's new-session composer,
+  reuse for later sessions, and retain the selection after wake failure.
 - `project-rename`: the project menu opens a dialog with the name selected;
   typing replaces it without losing characters as the menu closes.
 - `bulk-actions`: select several rows, then mark as read or unread, archive,
@@ -204,6 +207,10 @@ session), archive or unarchive, and delete.
 
 **Project folder:** right-click its header or open its three-dot menu, then
 choose Rename project. Start typing as soon as the dialog opens.
+Choose **Project settings → Host** to save an attached static sandbox as the
+new-session default. Offline static boxes remain selectable; saving leaves them
+asleep. Use the project's **New session** button to wake and reuse the saved box.
+If wake fails, the box and draft remain selected; retry through its host-picker row.
 
 **Pinned section drag:** drag a pinned row onto another pinned row to reorder
 the Pinned section, or drop an unpinned row onto a pinned row to pin it into
@@ -232,6 +239,13 @@ mode pickers. Your custom
 agents (installed with `omnigent agent add`, imported in the Create custom agent
 dialog, or uploaded by running a session with their spec) stay available until
 you remove them.
+
+For a static sandbox whose controller supports session workspaces, Clone keeps
+the source working folder by default. Uncheck that option or choose another
+sandbox to select repositories, existing or typed branches, and worktree mode.
+Paused saved sandboxes wake when selected. If preparing a saved box fails,
+Retry start uses the same cloned conversation. Repo choices prefill from stored
+session metadata; selecting a different workspace does not copy uncommitted files.
 
 **Archive worktree prompt:** archive a worktree session from the row menu,
 bulk selection, or header menu; the "Also delete the worktree?" dialog offers
@@ -391,6 +405,15 @@ Tests that stop a runner, restart the server, or read the database cannot run
 through `verify-env run`. They are marked "own environment" below; run them with
 plain `uv run pytest`, which starts a private server for the test.
 
+**`project-static-default`:**
+`tests/e2e_ui/sessions/test_project_settings_dialog.py::test_project_static_sandbox_default_wakes_and_reuses`
+opens Project settings, saves an offline box without waking it, reopens settings,
+then starts two sessions on the same target. Project persistence uses the real
+server; host inventory, wake, filesystem and session launch are mocked.
+`web/src/shell/NewChatDialog.projectPrefill.test.tsx` covers wake failure/retry
+without losing the selected box or draft. Existing tests retain ordinary-host
+fallback and project override coverage.
+
 - **`session-grid` (browser contract):**
   `tests/browser_ui/chat/test_session_grid.py` drives sidebar drops, previews,
   the four-pane limit, independent sends, rejected-send recovery and live updates, reloads, pane closure,
@@ -512,6 +535,13 @@ plain `uv run pytest`, which starts a private server for the test.
   component coverage in `web/src/components/blocks/StatusBlocks.test.tsx`.
   No browser test drives the card into the fork dialog.
 - **`fork`, whole session and resources:**
+  `tests/e2e_ui/start_session/test_start_session.py::test_static_sandbox_repository_and_worktree_choices`
+  (own environment, `clone` and `fork` variants) drives the header Clone dialog
+  and the per-response Fork action through
+  source-folder reuse, waking another static sandbox, per-repo branch choices,
+  and a new static sandbox on mobile. The SPA and conversation-copy API are real;
+  controller, GitHub and runner-launch transport are mocked. Seeded history is
+  copied in full for Clone and truncated at the selected response for Fork.
   `tests/e2e_ui/fork_session/test_fork_preserves_image_attachment.py::test_fork_carries_image_reference_and_its_resource`.
   This uses the header menu and checks that the fork's image URL loads.
   The dialog's permission-mode picker for native targets has component

@@ -198,6 +198,7 @@ from omnigent.server.schemas import (
     ReadStatePutRequest,
     ResetSessionModelOverrideRequest,
     ResetSessionModelOverrideResponse,
+    SandboxWorkspaceRequest,
     SessionCreateRequest,
     SessionEventInput,
     SessionForkRequest,
@@ -509,6 +510,7 @@ def register_core_routes(
         sandbox_provider: str | None,
         workspaces: list[str],
         requested_host_id: str | None = None,
+        sandbox_workspace: SandboxWorkspaceRequest | None = None,
     ) -> None:
         """
         Provision a managed sandbox host for a just-created session.
@@ -605,6 +607,10 @@ def register_core_routes(
             # a single joined value) so the 256-char label-value cap can't
             # silently truncate the list and drop repos on relaunch.
             managed_labels.update(managed_repo_labels(workspaces))
+        if sandbox_workspace is not None:
+            from omnigent.server.sandbox_workspaces import sandbox_workspace_labels
+
+            managed_labels.update(sandbox_workspace_labels(sandbox_workspace))
         if managed_labels:
             await asyncio.to_thread(
                 conversation_store.set_labels,
@@ -643,6 +649,7 @@ def register_core_routes(
             agent_store=agent_store,
             agent_id=agent_id,
             host_id=requested_host_id,
+            sandbox_workspace=sandbox_workspace,
         )
         _start_managed_launch_task(
             session_id,
@@ -1173,6 +1180,7 @@ def register_core_routes(
                     sandbox_provider=body.sandbox_provider,
                     workspaces=body.managed_repo_workspaces(),
                     requested_host_id=body.requested_host_id,
+                    sandbox_workspace=body.sandbox_workspace,
                 )
         finally:
             # Push the new session to this user's other open tabs (see the
@@ -3705,6 +3713,17 @@ def register_core_routes(
             )
         assert base_agent is not None
 
+        if body.sandbox_workspace is not None:
+            from omnigent.server.auth import RESERVED_USER_LOCAL
+            from omnigent.server.sandbox_workspaces import session_workspace_launcher
+
+            session_workspace_launcher(
+                getattr(request.app.state, "sandbox_config", None),
+                body.sandbox_provider,
+                user_id or RESERVED_USER_LOCAL,
+                body.sandbox_workspace,
+            )
+
         if source.inference_snapshot is not None and switching_agent:
             from omnigent.harness_aliases import canonicalize_harness
             from omnigent.inference_config import resolve_bound_provider
@@ -4183,8 +4202,9 @@ def register_core_routes(
                     agent_id=new_conv.agent_id,
                     user_id=user_id,
                     sandbox_provider=body.sandbox_provider,
-                    workspaces=fork_workspaces,
+                    workspaces=[] if body.sandbox_workspace is not None else fork_workspaces,
                     requested_host_id=body.host_id,
+                    sandbox_workspace=body.sandbox_workspace,
                 )
         finally:
             # Push the forked session to this user's other open tabs — but NOT a

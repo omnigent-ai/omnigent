@@ -155,17 +155,18 @@ function locationStep(
     return settled(state);
   }
 
-  // The online check needs the host list — wait for it.
+  // Wait for the host list before resolving the saved default.
   if (hosts === undefined) return null;
 
-  // Seed the configured host only when it's online (silently dropped
-  // otherwise, so an offline default can't set up a create that only fails),
-  // and only when the user hasn't already picked a different host / the sandbox.
-  const configHostOnline =
+  // Saved static sandboxes can wake in place. Ordinary offline hosts keep
+  // the existing fallback, and an explicit user selection always wins.
+  const configHostAvailable =
     config?.hostId != null &&
-    hosts.some((h) => h.host_id === config.hostId && h.status === "online");
+    hosts.some(
+      (h) => h.host_id === config.hostId && (h.status === "online" || h.sandbox_attached === true),
+    );
   const configHostUsable =
-    configHostOnline &&
+    configHostAvailable &&
     !inputs.sandboxSelected &&
     (selectedHostId === null || selectedHostId === config!.hostId);
   if (configHostUsable) writes.hostId = config!.hostId;

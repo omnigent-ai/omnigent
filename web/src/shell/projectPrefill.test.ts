@@ -90,6 +90,20 @@ describe("projectPrefill config seeding", () => {
     expect(writes.workspace).toBe("/x");
   });
 
+  it.each(["online", "offline"] as const)("preserves a %s static sandbox default", (status) => {
+    const { writes } = runToDone(
+      inputs({
+        hosts: [
+          ...hosts,
+          { host_id: "static", name: "Sandbox", owner: "corey", status, sandbox_attached: true },
+        ],
+        config: { hostId: "static", workspace: "/existing-checkout" },
+      }),
+    );
+    expect(writes.hostId).toBe("static");
+    expect(writes.workspace).toBe("/existing-checkout");
+  });
+
   it("seeds a configured workspace even when the config names no host", () => {
     const { writes } = runToDone(inputs({ config: { workspace: "/x" } }));
     expect(writes.hostId).toBeUndefined();

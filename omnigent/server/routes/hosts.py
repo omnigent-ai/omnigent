@@ -21,11 +21,11 @@ import contextlib
 import logging
 import secrets
 import weakref
-from typing import Any
+from typing import Any, Self
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
@@ -74,7 +74,7 @@ from omnigent.server.routes._workspace_validation import (
     _is_windows_absolute_path,
     restore_host_filesystem_url_path,
 )
-from omnigent.server.schemas import SessionGitOptions
+from omnigent.server.schemas import SandboxWorkspaceRequest, SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
@@ -633,11 +633,24 @@ class LaunchRunnerRequest(BaseModel):
         as the session's ``git_branch`` for display and opt-in cleanup.
         ``None`` binds ``workspace`` directly. ``host_id`` is always
         present (it is in the path), so no host check is needed here.
+    :param sandbox_workspace: Optional repository and worktree choices prepared
+        by a saved sandbox's controller. Replaces ``workspace`` and ``git``;
+        requires the provider's ``session_workspaces`` capability.
     """
 
     session_id: str
-    workspace: str
+    workspace: str | None = None
     git: SessionGitOptions | None = None
+    sandbox_workspace: SandboxWorkspaceRequest | None = None
+
+    @model_validator(mode="after")
+    def check_workspace(self) -> Self:
+        if self.sandbox_workspace is not None:
+            if self.workspace is not None or self.git is not None:
+                raise ValueError("sandbox_workspace cannot be combined with workspace or git")
+        elif self.workspace is None:
+            raise ValueError("workspace is required")
+        return self
 
 
 async def _resolve_agent_spec_cwd(
@@ -1031,6 +1044,16 @@ def create_hosts_router(
         # when the router was wired without an agent cache (non-prod
         # test wiring); create_app always supplies one.
         workspace = body.workspace
+        if body.sandbox_workspace is not None:
+            from omnigent.server.sandbox_workspaces import prepare_sandbox_session_workspace
+
+            workspace = await prepare_sandbox_session_workspace(
+                host=target.host,
+                config=getattr(request.app.state, "sandbox_config", None),
+                session_id=body.session_id,
+                selection=body.sandbox_workspace,
+            )
+        assert workspace is not None
         if agent_store is not None and agent_cache is not None:
             from omnigent.server.routes._workspace_validation import (
                 WorkspaceValidationError,
@@ -1042,7 +1065,7 @@ def create_hosts_router(
                 workspace = await validate_workspace(
                     host_registry=host_registry,
                     host_id=host_id,
-                    workspace=body.workspace,
+                    workspace=workspace,
                     spec_cwd=spec_cwd,
                     host_name_for_errors=target.host.name,
                 )
@@ -1198,6 +1221,76 @@ def create_hosts_router(
 
             async def persist_binding() -> None:
                 """Record cleanup identity before making the new binding visible."""
+                if target.host.sandbox_attached:
+                    from omnigent.server.auth import LEVEL_READ
+                    from omnigent.server.managed_hosts import (
+                        MANAGED_REPO_LABEL_KEY,
+                        managed_repo_labels,
+                        read_managed_repo_workspaces,
+                    )
+                    from omnigent.server.permissions import check_session_access
+                    from omnigent.stores.conversation_store import (
+                        FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+                        FORK_SOURCE_LABEL_KEY,
+                    )
+
+                    source_id = target.conv.labels.get(FORK_SOURCE_LABEL_KEY)
+                    if source_id is not None and permission_store is not None:
+                        if not await asyncio.to_thread(
+                            check_session_access,
+                            user_id,
+                            source_id,
+                            LEVEL_READ,
+                            permission_store,
+                            conversation_store,
+                        ):
+                            source_id = None
+                    source = (
+                        await asyncio.to_thread(conversation_store.get_conversation, source_id)
+                        if source_id is not None
+                        else None
+                    )
+                    if source is None or source.host_id != host_id:
+                        # Another machine cannot resume the source's local native transcript.
+                        await asyncio.to_thread(
+                            conversation_store.delete_label,
+                            body.session_id,
+                            FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
+                        )
+                    if (
+                        source is not None
+                        and source.host_id == host_id
+                        and source.workspace == workspace
+                        and body.sandbox_workspace is None
+                    ):
+                        await asyncio.to_thread(
+                            conversation_store.set_labels,
+                            body.session_id,
+                            {
+                                **managed_repo_labels(read_managed_repo_workspaces(source.labels)),
+                                "omnigent.sandbox.create_worktrees": source.labels.get(
+                                    "omnigent.sandbox.create_worktrees", "false"
+                                ),
+                            },
+                        )
+                if body.sandbox_workspace is not None:
+                    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+                    from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
+                    from omnigent.server.sandbox_workspaces import sandbox_workspace_labels
+
+                    for key in target.conv.labels:
+                        if key in (
+                            MANAGED_REPO_LABEL_KEY,
+                            WORKTREE_ROOT_LABEL_KEY,
+                        ) or key.startswith(f"{MANAGED_REPO_LABEL_KEY}."):
+                            await asyncio.to_thread(
+                                conversation_store.delete_label, body.session_id, key
+                            )
+                    await asyncio.to_thread(
+                        conversation_store.set_labels,
+                        body.session_id,
+                        sandbox_workspace_labels(body.sandbox_workspace),
+                    )
                 if worktree is not None:
                     from omnigent.server.routes._host_worktree import (
                         WORKTREE_ROOT_LABEL_KEY,

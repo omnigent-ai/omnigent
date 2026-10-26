@@ -14,9 +14,12 @@ vi.mock("@/lib/projectsApi", () => ({
 // Hoisted so the vi.mock factory can reference it; per-test overrides let
 // cases control the host-resolved model catalog (default: empty, so the
 // Claude static-alias fallback is what populates the picker).
-const { hostModelOptionsMock } = vi.hoisted(() => ({ hostModelOptionsMock: vi.fn() }));
+const { hostModelOptionsMock, hostsMock } = vi.hoisted(() => ({
+  hostModelOptionsMock: vi.fn(),
+  hostsMock: vi.fn(),
+}));
 vi.mock("@/hooks/useHosts", () => ({
-  useHosts: () => ({ data: [{ host_id: "h1", name: "Laptop", owner: "me", status: "online" }] }),
+  useHosts: hostsMock,
   useHostModelOptions: hostModelOptionsMock,
 }));
 // Hoisted so the vi.mock factory below can reference it; per-test overrides
@@ -81,6 +84,9 @@ beforeEach(() => {
   createMock.mockReset();
   availableAgentsMock.mockReset();
   availableAgentsMock.mockReturnValue({ data: [pickerAgent()] });
+  hostsMock.mockReturnValue({
+    data: [{ host_id: "h1", name: "Laptop", owner: "me", status: "online" }],
+  });
   hostModelOptionsMock.mockReset();
   hostModelOptionsMock.mockReturnValue({ data: [] });
   updateMock.mockResolvedValue({ id: "p_1", name: "Work", config: {} });
@@ -219,6 +225,46 @@ describe("ProjectSettingsDialog", () => {
     expect(screen.getAllByText("Laptop").length).toBeGreaterThan(0);
     expect(screen.queryByText(/Sandbox/)).not.toBeInTheDocument();
   });
+
+  it.each(["online", "offline"])(
+    "saves a named %s static sandbox without requiring creation",
+    async (status) => {
+      hostsMock.mockReturnValue({
+        data: [
+          {
+            host_id: "static",
+            name: "machine-id",
+            display_name: "My sandbox",
+            owner: "me",
+            status,
+            sandbox_attached: true,
+          },
+          { host_id: "off", name: "Offline laptop", owner: "me", status: "offline" },
+        ],
+      });
+      getProjectMock.mockResolvedValue({
+        id: "p_1",
+        name: "Work",
+        config: { host_id: "static", workspace: "/existing" },
+      });
+      renderDialog();
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-host")).toHaveTextContent("My sandbox"),
+      );
+      expect(screen.queryByText("Offline laptop")).not.toBeInTheDocument();
+      if (status === "offline") {
+        expect(screen.getByTestId("project-settings-host")).toHaveTextContent("offline");
+        expect(screen.queryByText("Browse…")).not.toBeInTheDocument();
+      }
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          host_id: "static",
+          workspace: "/existing",
+        }),
+      );
+    },
+  );
 
   it("promotes a label-only folder (id=null) on save via createProject", async () => {
     createMock.mockResolvedValue({ id: "p_new", name: "Work" });

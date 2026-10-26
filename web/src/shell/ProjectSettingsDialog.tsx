@@ -237,20 +237,16 @@ export function ProjectSettingsDialog({
     );
   };
 
-  // Offer only online hosts (an offline host can only fail on create), plus the
-  // sandbox when the server supports it. If the project's stored host is no
-  // longer online, keep it as a labeled fallback item so opening + saving the
-  // dialog doesn't silently drop the saved default.
   const onlineHosts = (hosts.data ?? []).filter((h) => h.status === "online");
+  const selectableHosts = (hosts.data ?? []).filter(
+    (h) => h.status === "online" || h.sandbox_attached === true,
+  );
   const storedHostMissing =
     hostId !== NONE &&
     hostId !== SANDBOX_HOST_CHOICE &&
-    !onlineHosts.some((h) => h.host_id === hostId);
-  // The filesystem browser needs a concrete, online host to list against — so
-  // it's only offered when a real host is the default (not sandbox / no-default
-  // / an offline stored host). Otherwise the field is a plain path input.
-  const browsableHostId =
-    hostId !== NONE && hostId !== SANDBOX_HOST_CHOICE && !storedHostMissing ? hostId : null;
+    !selectableHosts.some((h) => h.host_id === hostId);
+  // Saving a sleeping sandbox as a default must not wake it to browse files.
+  const browsableHostId = onlineHosts.some((h) => h.host_id === hostId) ? hostId : null;
 
   // Agent picker groups, mirroring the composer's split (native harness CLIs vs
   // SDK / bundle agents). The picker takes both lists and a selection.
@@ -376,9 +372,10 @@ export function ProjectSettingsDialog({
                     {sandboxOptionLabel(sandboxProvider)}
                   </SelectItem>
                 )}
-                {onlineHosts.map((h) => (
+                {selectableHosts.map((h) => (
                   <SelectItem key={h.host_id} value={h.host_id}>
-                    {h.name}
+                    {h.display_name ?? h.name}
+                    {h.status === "offline" ? " (offline)" : ""}
                   </SelectItem>
                 ))}
                 {storedHostMissing && (

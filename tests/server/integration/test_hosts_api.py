@@ -1000,7 +1000,9 @@ async def test_host_skills_requires_owner(
     assert conn.pending_skills == {}
 
 
+@pytest.mark.parametrize("workspace_fields", [{"workspace": "/tmp"}, {"sandbox_workspace": {}}])
 async def test_launch_runner_403_wrong_owner(
+    workspace_fields,
     multi_user_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
 ) -> None:
     """
@@ -1034,7 +1036,7 @@ async def test_launch_runner_403_wrong_owner(
     async with AsyncClient(transport=ASGITransport(app=_app), base_url="http://test") as client:
         resp = await client.post(
             "/v1/hosts/a20f57f124c33161e2e17a8998af5b1f/runners",
-            json={"session_id": conv.id, "workspace": "/tmp"},
+            json={"session_id": conv.id, **workspace_fields},
             headers={"x-test-user": "bob@test.com"},
         )
     assert resp.status_code == 403, (
@@ -1043,7 +1045,9 @@ async def test_launch_runner_403_wrong_owner(
     )
 
 
+@pytest.mark.parametrize("controller_workspace", [False, True])
 async def test_launch_runner_validates_workspace_boundary(
+    controller_workspace,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1117,10 +1121,23 @@ async def test_launch_runner_validates_workspace_boundary(
 
     monkeypatch.setattr(_workspace_validation, "validate_workspace", _fake_validate_workspace)
 
+    if controller_workspace:
+        from omnigent.server import sandbox_workspaces
+
+        async def prepare_workspace(**kwargs):
+            return "/etc"
+
+        monkeypatch.setattr(
+            sandbox_workspaces, "prepare_sandbox_session_workspace", prepare_workspace
+        )
+
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
         resp = await client.post(
             f"/v1/hosts/{_HOST_ID}/runners",
-            json={"session_id": conv.id, "workspace": "/etc"},
+            json={
+                "session_id": conv.id,
+                **({"sandbox_workspace": {}} if controller_workspace else {"workspace": "/etc"}),
+            },
         )
 
     assert resp.status_code == 400, (

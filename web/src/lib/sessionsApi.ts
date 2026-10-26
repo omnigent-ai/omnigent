@@ -771,6 +771,18 @@ export async function createBundledSession(
   return { id: body.session_id };
 }
 
+export async function wakeSandboxHost(hostId: string): Promise<void> {
+  const response = await authenticatedFetch(`/v1/hosts/${encodeURIComponent(hostId)}/wake`, {
+    method: "POST",
+  });
+  await readJsonOrThrow(response);
+}
+
+export interface SandboxWorkspaceSelection {
+  repositories: string[];
+  create_worktrees: boolean;
+}
+
 /**
  * Fork (clone) a session into a new one via
  * POST /v1/sessions/{source_id}/fork.
@@ -824,7 +836,12 @@ export async function forkSession(
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
-    sandbox?: { provider?: string | null; workspace?: string | null; hostId?: string };
+    sandbox?: {
+      provider?: string | null;
+      workspace?: string | null;
+      hostId?: string;
+      sandboxWorkspace?: SandboxWorkspaceSelection;
+    };
     /** Mark the fork as a side chat (hidden from the left sidebar). */
     sideChat?: boolean;
   } = {},
@@ -842,6 +859,7 @@ export async function forkSession(
     sandbox_provider?: string;
     host_id?: string;
     workspace?: string | null;
+    sandbox_workspace?: SandboxWorkspaceSelection;
     side_chat?: boolean;
   } = {};
   if (sideChat) {
@@ -880,6 +898,9 @@ export async function forkSession(
     // sandbox", while omitting it inherits the source's repository.
     if (sandbox.workspace !== undefined) {
       body.workspace = sandbox.workspace;
+    }
+    if (sandbox.sandboxWorkspace !== undefined) {
+      body.sandbox_workspace = sandbox.sandboxWorkspace;
     }
     if (sandbox.hostId !== undefined) {
       body.host_id = sandbox.hostId;
@@ -951,24 +972,30 @@ export async function createSideChat(sourceId: string): Promise<{ childSessionId
 export async function launchRunner(
   hostId: string,
   sessionId: string,
-  workspace: string,
+  workspace: string | null,
   git?: {
     branchName: string;
     baseBranch?: string;
     existingWorktree?: boolean;
     existingBranch?: boolean;
   },
+  sandboxWorkspace?: SandboxWorkspaceSelection,
 ): Promise<{ runnerId: string }> {
   const body: {
     session_id: string;
-    workspace: string;
+    workspace?: string;
+    sandbox_workspace?: SandboxWorkspaceSelection;
     git?: {
       branch_name: string;
       base_branch?: string;
       existing_worktree?: boolean;
       existing_branch?: boolean;
     };
-  } = { session_id: sessionId, workspace };
+  } = {
+    session_id: sessionId,
+    ...(workspace !== null ? { workspace } : {}),
+    ...(sandboxWorkspace ? { sandbox_workspace: sandboxWorkspace } : {}),
+  };
   if (git !== undefined) {
     // `existing_worktree` binds a pre-existing worktree (no worktree is
     // created; the branch is recorded for the sidebar + delete flow) and

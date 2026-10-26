@@ -94,6 +94,8 @@ class SandboxCapabilities:
         handed a multi-repo request; providers opt in explicitly.
     :param git_clone_options: Provider honors ``RepoWorkspace.git_clone``
         when creating checkouts. Custom materializers must opt in.
+    :param session_workspaces: Reusable provider prepares per-session repository
+        selections through ``prepare_session_workspace``; disabled by default.
     """
 
     cli_bootstrap: bool = False
@@ -112,6 +114,8 @@ class SandboxCapabilities:
     git_clone_options: bool = False
     # Provisioned hosts are reusable; the provider retains lifecycle ownership.
     reusable_hosts: bool = False
+    # The controller prepares a directory for each new session on a reusable host.
+    session_workspaces: bool = False
 
 
 @dataclass(frozen=True)
@@ -193,7 +197,8 @@ class RepoWorkspace:
         e.g. ``"https://github.com/org/repo.git"`` or
         ``"git@github.com:org/repo.git"``.
     :param branch: Branch to clone (``--branch … --single-branch``), or
-        ``None`` for the default branch.
+        ``None`` for the default branch. The optional session-workspace hook
+        can instead create an absent branch in a controller-owned worktree.
     :param repo_name: Directory the clone lands in under the sandbox
         workspace, derived from the URL's last path segment, e.g.
         ``"repo"``.

@@ -13,7 +13,7 @@ import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
 import { SANDBOX_REPO_LABEL_KEY } from "./NewChatDialog";
 import { ForkSessionDialog } from "./ForkSessionDialog";
-import { forkSession, launchRunner } from "@/lib/sessionsApi";
+import { forkSession, launchRunner, wakeSandboxHost } from "@/lib/sessionsApi";
 import {
   useAvailableAgents,
   prefetchAvailableAgentDetails,
@@ -36,7 +36,11 @@ vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<typeof ReactRouterDomModule>();
   return { ...actual, useNavigate: () => navigateMock };
 });
-vi.mock("@/lib/sessionsApi", () => ({ forkSession: vi.fn(), launchRunner: vi.fn() }));
+vi.mock("@/lib/sessionsApi", () => ({
+  forkSession: vi.fn(),
+  launchRunner: vi.fn(),
+  wakeSandboxHost: vi.fn(),
+}));
 vi.mock("@/hooks/useAvailableAgents", () => ({
   useAvailableAgents: vi.fn(),
   prefetchAvailableAgentDetails: vi.fn(),
@@ -192,6 +196,8 @@ function openAdvanced(): void {
 }
 
 beforeEach(() => {
+  vi.mocked(wakeSandboxHost).mockReset();
+  vi.mocked(wakeSandboxHost).mockResolvedValue();
   forkSessionMock.mockReset();
   launchRunnerMock.mockReset();
   navigateMock.mockReset();
@@ -1422,6 +1428,148 @@ describe("ForkSessionDialog", () => {
     });
   });
 
+  describe("controller workspace targets", () => {
+    const staticHost = host({ sandbox_attached: true, sandbox_provider: "static" });
+    const props = {
+      sourceTitle: "API work",
+      sourceHostId: "host_1",
+      sourceWorkspace: "/work/api",
+      info: {
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "static",
+        sandbox_providers: ["static"],
+        sandbox_provider_capabilities: {
+          static: { reusable_hosts: true, session_workspaces: true, multi_repo: true },
+        },
+      },
+    };
+    beforeEach(() => {
+      setHosts([staticHost, host({ ...staticHost, host_id: "host_2", name: "Second sandbox" })]);
+      useSessionMock.mockReturnValue({
+        session: {
+          labels: {
+            [`${SANDBOX_REPO_LABEL_KEY}.1`]: "https://github.com/org/web",
+            [`${SANDBOX_REPO_LABEL_KEY}.0`]: "https://github.com/org/api#release",
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/org/stale",
+            "omnigent.sandbox.create_worktrees": "true",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      forkSessionMock.mockResolvedValue({ id: "conv_fork" } as Awaited<
+        ReturnType<typeof forkSession>
+      >);
+      launchRunnerMock.mockResolvedValue({ runnerId: "runner" } as Awaited<
+        ReturnType<typeof launchRunner>
+      >);
+    });
+
+    it("defaults to the same working folder and preserves the direct-launch path", async () => {
+      renderDialog(props);
+      expect(screen.getByRole("checkbox", { name: "Use source working folder" })).toBeChecked();
+      expect(screen.queryByRole("checkbox", { name: "Create worktrees" })).not.toBeInTheDocument();
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+      expect(checkHostDirectoryMock).toHaveBeenCalledWith("host_1", "/work/api");
+      expect(launchRunnerMock).toHaveBeenCalledWith(
+        "host_1",
+        "conv_fork",
+        "/work/api",
+        undefined,
+        undefined,
+      );
+    });
+
+    it.each(["same", "other", "new"])(
+      "prepares selected repos for a %s sandbox target",
+      async (target) => {
+        renderDialog(props);
+        if (target === "same") {
+          fireEvent.click(screen.getByRole("checkbox", { name: "Use source working folder" }));
+        } else {
+          openHostSelect();
+          fireEvent.click(
+            screen.getByTestId(
+              target === "new" ? "fork-session-sandbox-option" : "fork-session-host-option-host_2",
+            ),
+          );
+        }
+        expect(screen.getByRole("checkbox", { name: "Create worktrees" })).toBeChecked();
+        expect(screen.getByRole("textbox", { name: "Branch for api" })).toHaveValue("release");
+        expect(screen.getByRole("textbox", { name: "Branch for web" })).toHaveAttribute(
+          "placeholder",
+          "New worktree",
+        );
+        fireEvent.change(screen.getByRole("textbox", { name: "Branch for web" }), {
+          target: { value: "feature/clone" },
+        });
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+        await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+        const selection = {
+          repositories: [
+            "https://github.com/org/api#release",
+            "https://github.com/org/web#feature/clone",
+          ],
+          create_worktrees: true,
+        };
+        if (target === "new") {
+          expect(forkSessionMock.mock.calls[0][1]?.sandbox).toEqual({
+            provider: "static",
+            sandboxWorkspace: selection,
+          });
+          expect(launchRunnerMock).not.toHaveBeenCalled();
+        } else {
+          expect(launchRunnerMock).toHaveBeenCalledWith(
+            target === "same" ? "host_1" : "host_2",
+            "conv_fork",
+            null,
+            undefined,
+            selection,
+          );
+        }
+        expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+      },
+    );
+
+    it("retries preparation on the same clone after a controller error", async () => {
+      launchRunnerMock.mockRejectedValueOnce(new Error("Workspace preparation failed"));
+      renderDialog(props);
+      fireEvent.click(screen.getByRole("checkbox", { name: "Use source working folder" }));
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+      await screen.findByText("Workspace preparation failed");
+      expect(navigateMock).not.toHaveBeenCalled();
+      expect(screen.getByRole("checkbox", { name: "Create worktrees" })).toBeDisabled();
+      fireEvent.click(screen.getByRole("button", { name: "Retry start" }));
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+      expect(forkSessionMock).toHaveBeenCalledTimes(1);
+      expect(launchRunnerMock).toHaveBeenCalledTimes(2);
+      expect(launchRunnerMock.mock.calls[1]).toEqual(launchRunnerMock.mock.calls[0]);
+    });
+
+    it("selects and wakes a paused saved sandbox, with retry on failure", async () => {
+      setHosts([
+        staticHost,
+        host({ ...staticHost, host_id: "host_2", status: "offline", name: "Paused box" }),
+      ]);
+      vi.mocked(wakeSandboxHost).mockRejectedValueOnce(new Error("Wake failed"));
+      const view = renderDialog(props);
+      openHostSelect();
+      fireEvent.click(screen.getByTestId("fork-session-host-option-host_2"));
+      await screen.findByText("Wake failed");
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Paused box");
+      expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-disabled", "true");
+      fireEvent.click(screen.getByRole("button", { name: "Retry wake" }));
+      await waitFor(() => expect(wakeSandboxHost).toHaveBeenCalledTimes(2));
+      setHosts([staticHost, host({ ...staticHost, host_id: "host_2", name: "Paused box" })]);
+      view.refresh();
+      await waitFor(() =>
+        expect(screen.getByTestId("fork-session-submit")).not.toHaveAttribute("aria-disabled"),
+      );
+      expect(forkSessionMock).not.toHaveBeenCalled();
+    });
+  });
+
   describe("managed sandbox target", () => {
     const CODING = {
       sourceTitle: "My session",
@@ -1502,8 +1650,6 @@ describe("ForkSessionDialog", () => {
             within(screen.getByTestId("fork-session-host-option-host_1")).queryByText("Edit"),
           ).not.toBeInTheDocument();
           const offline = screen.getByTestId("fork-session-host-option-host_other");
-          fireEvent.keyDown(offline, { key: "Enter" });
-          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Existing box");
           fireEvent.keyDown(offline, { key: "ArrowRight" });
           expect(screen.getByRole("textbox", { name: "Sandbox name" })).toHaveAttribute(
             "placeholder",

@@ -23,6 +23,7 @@ import {
   importLocalSessions,
   interrupt,
   listRunners,
+  launchRunner,
   openSessionStream,
   postEvent,
   continueFailedTurn,
@@ -518,6 +519,32 @@ describe("forkSession", () => {
       host_type: "managed",
       sandbox_provider: "modal",
       workspace: "https://github.com/org/repo#main",
+    });
+  });
+
+  it("serializes controller choices on managed forks and saved-host launches", async () => {
+    const selection = {
+      repositories: ["https://github.com/org/repo#feature/new"],
+      create_worktrees: true,
+    };
+    fetchMock.mockResolvedValue(
+      mockJsonResponse({
+        id: "conv_fork",
+        agent_id: "agent_clone",
+        status: "idle",
+        created_at: 1704067200,
+      }),
+    );
+    await forkSession("conv_src", { sandbox: { provider: "static", sandboxWorkspace: selection } });
+    await launchRunner("host_static", "conv_fork", null, undefined, selection);
+    expect(JSON.parse(fetchMock.mock.calls[0][1].body)).toEqual({
+      host_type: "managed",
+      sandbox_provider: "static",
+      sandbox_workspace: selection,
+    });
+    expect(JSON.parse(fetchMock.mock.calls[1][1].body)).toEqual({
+      session_id: "conv_fork",
+      sandbox_workspace: selection,
     });
   });
 

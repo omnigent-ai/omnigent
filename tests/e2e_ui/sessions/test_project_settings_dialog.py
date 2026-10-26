@@ -20,10 +20,13 @@ host-free path (the worktree toggle is a plain Switch, no host needed).
 
 from __future__ import annotations
 
+import re
 import uuid
 
 import httpx
-from playwright.sync_api import Page, expect
+from playwright.sync_api import Page, Route, expect
+
+from tests._helpers.picker_routes import OWN_AGENTS
 
 
 def _create_project(base_url: str, name: str) -> str:
@@ -57,6 +60,127 @@ def _open_project_settings(page: Page, project: str) -> None:
     # The dialog's Save button confirms the editor mounted + the config fetch
     # settled (Save is disabled while loading).
     expect(page.get_by_test_id("project-settings-save")).to_be_enabled()
+
+
+def test_project_static_sandbox_default_wakes_and_reuses(
+    page: Page, seeded_session: tuple[str, str]
+) -> None:
+    """Real project persistence; controller wake and session launch are mocked."""
+    base_url, session_id = seeded_session
+    project = f"Static sandbox project {uuid.uuid4().hex[:6]}"
+    project_id = _create_project(base_url, project)
+    saved = {
+        "host_id": "saved-static",
+        "name": "controller-machine-id",
+        "display_name": "Project sandbox",
+        "owner": "e2e",
+        "status": "offline",
+        "sandbox_attached": True,
+        "sandbox_provider": "static",
+    }
+    wake_calls = []
+    creates = []
+    page.route(
+        "**/v1/hosts",
+        lambda route: route.fulfill(
+            json={
+                "hosts": [
+                    {"host_id": "laptop", "name": "Laptop", "owner": "e2e", "status": "online"},
+                    {
+                        "host_id": "adhoc",
+                        "name": "Ad hoc sandbox",
+                        "owner": "e2e",
+                        "status": "online",
+                        "sandbox_provider": "static",
+                    },
+                    saved,
+                ]
+            }
+        ),
+    )
+
+    def wake(route: Route) -> None:
+        wake_calls.append(route.request.url)
+        saved["status"] = "online"
+        route.fulfill(json={"host_id": saved["host_id"]})
+
+    def create(route: Route) -> None:
+        if route.request.method != "POST":
+            route.continue_()
+            return
+        creates.append(route.request.post_data_json)
+        route.fulfill(json={"id": session_id})
+
+    page.route("**/v1/hosts/saved-static/wake", wake)
+    page.route(
+        "**/v1/hosts/*/harnesses/*/model-options", lambda route: route.fulfill(json={"models": []})
+    )
+    page.route("**/v1/hosts/*/worktrees?*", lambda route: route.fulfill(json={"data": []}))
+    page.route(
+        re.compile(r"/v1/hosts/[^/]+/filesystem"),
+        lambda route: route.fulfill(json={"path": "/work/project", "entries": []}),
+    )
+    page.route(
+        "**/v1/agents",
+        lambda route: route.fulfill(
+            json={
+                "data": [
+                    {
+                        "id": "ag_demo",
+                        "name": "polly",
+                        "display_name": "Polly",
+                        "harness": "claude-sdk",
+                        "skills": [],
+                    }
+                ]
+            }
+        ),
+    )
+    page.route(OWN_AGENTS, lambda route: route.fulfill(json={"data": []}))
+    page.route(re.compile(r"/v1/sessions(\?.*)?$"), create)
+    page.route(
+        "**/v1/sessions/*/events",
+        lambda route: route.fulfill(json={"queued": True, "item_id": "demo"}),
+    )
+    page.goto(f"{base_url}/c/{session_id}")
+    _open_project_settings(page, project)
+    page.get_by_test_id("project-settings-host").click()
+    expect(page.get_by_role("option", name="Ad hoc sandbox", exact=True)).to_have_count(0)
+    page.get_by_role("option", name="Project sandbox (offline)", exact=True).click()
+    page.get_by_test_id("project-settings-workspace").fill("/work/project")
+    page.get_by_test_id("project-settings-save").click()
+    expect(page.get_by_test_id("project-settings-save")).to_have_count(0)
+    config = _get_project_config(base_url, project_id)
+    assert config["host_id"] == "saved-static"
+    assert config["workspace"] == "/work/project"
+    assert wake_calls == []
+
+    _open_project_settings(page, project)
+    expect(page.get_by_test_id("project-settings-host")).to_contain_text(
+        "Project sandbox (offline)"
+    )
+    page.get_by_role("button", name="Cancel", exact=True).click()
+    for prompt in ("Investigate using my existing checkout", "Continue on the same sandbox"):
+        page.get_by_role("link", name=f"New session in {project}", exact=True).click()
+        expect(page.get_by_test_id("new-chat-landing-host-chip")).to_have_attribute(
+            "aria-label", re.compile("Project sandbox")
+        )
+        page.get_by_test_id("new-chat-landing-host-chip").click()
+        expect(page.get_by_test_id("new-chat-landing-host-saved-static")).to_have_attribute(
+            "data-active", "true"
+        )
+        expect(page.get_by_test_id("new-chat-landing-host-adhoc")).to_have_count(0)
+        page.keyboard.press("Escape")
+        page.get_by_test_id("new-chat-landing-input").fill(prompt)
+        expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
+        page.get_by_test_id("new-chat-landing-submit").click()
+        expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    assert len(wake_calls) == 1
+    assert len(creates) == 2
+    assert all(
+        body["host_id"] == "saved-static" and body["project_id"] == project_id for body in creates
+    )
+    assert all("host_type" not in body for body in creates)
 
 
 def test_project_settings_worktree_toggle_persists(

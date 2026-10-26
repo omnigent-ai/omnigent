@@ -74,6 +74,7 @@ vi.mock("@/store/chatStore", () => ({
 vi.mock("@/lib/identity", () => ({
   authenticatedFetch: vi.fn(),
   getCurrentUserId: vi.fn(() => null),
+  subscribeIdentity: vi.fn(() => () => {}),
   resolveIdentity: vi.fn(async () => null),
 }));
 vi.mock("@/hooks/useHosts", () => ({
@@ -349,6 +350,66 @@ afterEach(() => {
 });
 
 describe("NewChatLandingScreen project prefill", () => {
+  it.each([false, true])(
+    "wakes the project sandbox without falling back (initial failure: %s)",
+    async (failFirst) => {
+      const savedHost = host({
+        host_id: "saved",
+        name: "Static sandbox",
+        status: "offline",
+        sandbox_attached: true,
+      });
+      vi.mocked(useHosts).mockReturnValue({ data: [host(), savedHost] } as ReturnType<
+        typeof useHosts
+      >);
+      setProjectConfig({ host_id: "saved", workspace: REPO, agent_id: "ag_hello" });
+      vi.mocked(authenticatedFetch).mockResolvedValue({
+        ok: !failFirst,
+        status: failFirst ? 502 : 200,
+        json: async () => (failFirst ? { detail: "Controller unavailable" } : {}),
+      } as Response);
+      const { rerender } = renderLanding();
+      await waitFor(() =>
+        expect(authenticatedFetch).toHaveBeenCalledWith("/v1/hosts/saved/wake", { method: "POST" }),
+      );
+      expect(screen.getByTestId("new-chat-landing-host-chip")).toHaveAttribute(
+        "aria-label",
+        expect.stringContaining("Static sandbox"),
+      );
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "Keep my work" },
+      });
+      expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+      if (failFirst) {
+        await waitFor(() =>
+          expect(screen.getByTestId("new-chat-landing-error")).toHaveTextContent(
+            "Controller unavailable",
+          ),
+        );
+        rerender(<NewChatLandingScreen />);
+        expect(authenticatedFetch).toHaveBeenCalledTimes(1);
+        vi.mocked(authenticatedFetch).mockResolvedValue({
+          ok: true,
+          json: async () => ({}),
+        } as Response);
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-host-chip"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-host-saved"));
+        await waitFor(() => expect(authenticatedFetch).toHaveBeenCalledTimes(2));
+      }
+      savedHost.status = "online";
+      rerender(<NewChatLandingScreen />);
+      await waitFor(() => expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled());
+      expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep my work");
+      expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveTextContent("alpha");
+      vi.mocked(authenticatedFetch).mockClear();
+      const body = await submitAndReadBody();
+      expect(body.host_id).toBe("saved");
+      expect(body.project_id).toBe("proj_alpha");
+      expect(body.workspace).toBeUndefined();
+      expect(body.host_type).toBeUndefined();
+    },
+  );
+
   it("discards project A's parked draft slots so project B's remount seeds B's defaults", async () => {
     const BETA_REPO = "/Users/corey/projects/beta";
     // Distinct stored defaults per project: Alpha pins ag_other + its repo,
