@@ -2162,6 +2162,7 @@ async def _capture_launch_argv(
     *,
     keep_alive_after_exit: bool,
     windows: bool = False,
+    command: str = "bash",
     args: list[str] | None = None,
 ) -> list[str]:
     """
@@ -2171,6 +2172,7 @@ async def _capture_launch_argv(
     :param monkeypatch: Pytest monkeypatch fixture.
     :param keep_alive_after_exit: Value for the instance's opt-in flag.
     :param windows: Whether the launch takes the Windows path.
+    :param command: The pane program, e.g. ``"bash"``.
     :param args: Arguments of the pane program, e.g. ``["-c", "echo $HOME"]``.
     :returns: The flattened tmux launch argv.
     """
@@ -2202,6 +2204,7 @@ async def _capture_launch_argv(
         session_key="s1",
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
+        command=command,
         args=args or [],
         keep_alive_after_exit=keep_alive_after_exit,
     )
@@ -2232,6 +2235,30 @@ async def test_launch_on_windows_passes_the_pane_program_as_argv(
     )
 
     assert _new_session_command(cmd)[-len(args) - 2 :] == ["--", "bash", *args]
+
+
+@pytest.mark.parametrize("shim_argv", [["C:/pnpm/node.exe", "C:/pkg/cli.js"], None])
+async def test_launch_on_windows_runs_a_node_cmd_shim_as_its_node_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shim_argv: list[str] | None
+) -> None:
+    """A Windows tmux refuses a .cmd pane program, which needs cmd.exe to parse its arguments."""
+    monkeypatch.setattr(
+        terminal_mod,
+        "node_cmd_shim_argv",
+        lambda path: shim_argv if path == "C:/pnpm/pi.CMD" else None,
+    )
+
+    cmd = await _capture_launch_argv(
+        tmp_path,
+        monkeypatch,
+        keep_alive_after_exit=False,
+        windows=True,
+        command="C:/pnpm/pi.CMD",
+        args=["--mode", "rpc"],
+    )
+
+    program = shim_argv or ["C:/pnpm/pi.CMD"]
+    assert _new_session_command(cmd)[-len(program) - 3 :] == ["--", *program, "--mode", "rpc"]
 
 
 async def test_launch_on_windows_gives_panes_a_term_windows_programs_know(

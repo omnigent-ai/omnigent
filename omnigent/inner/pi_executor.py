@@ -61,6 +61,7 @@ from omnigent.harnesses.pi_native.credentials import (
 )
 from omnigent.inner.agent_env import clean_agent_env
 from omnigent.inner.native_attachments import parse_data_uri
+from omnigent.inner.node_cmd_shim import node_cmd_shim_argv
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.models import model_catalog
 from omnigent.models.model_metadata import ModelWireAPI
@@ -1190,7 +1191,9 @@ class _PiRpcSession:
         :param extra_args: Extra CLI tokens (``--extension``,
             ``--tools``, ...). ``None`` appends nothing.
         """
-        args = [pi_path, "--mode", "rpc", "--no-session"]
+        # A .cmd shim would run through cmd.exe, which ends the command line at a newline.
+        launcher = node_cmd_shim_argv(pi_path) or [pi_path]
+        args = [*launcher, "--mode", "rpc", "--no-session"]
         if model:
             pi_coding_agent_dir = env.get("PI_CODING_AGENT_DIR")
             args.extend(

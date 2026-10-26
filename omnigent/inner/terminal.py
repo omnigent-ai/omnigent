@@ -45,6 +45,7 @@ from .agent_env import strip_desktop_session_env
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
+from .node_cmd_shim import node_cmd_shim_argv
 from .os_env import (
     OSEnvironment,
     _copy_tree,
@@ -1657,7 +1658,8 @@ class TerminalInstance:
                 raise
             inner_cmd = [launcher_path, *self.args]
         else:
-            inner_cmd = [self.command, *self.args]
+            # A Windows tmux refuses a .cmd shim, which needs cmd.exe to parse its arguments.
+            inner_cmd = [*(node_cmd_shim_argv(self.command) or [self.command]), *self.args]
         if self.program_status_app is not None:
             status_path = self.private_dir / "program-status.json"
             status_path.unlink(missing_ok=True)
