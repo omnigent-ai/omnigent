@@ -211,11 +211,23 @@ def _normalize_message_content(
     return str(content)
 
 
+def _recorded_call_id(message: Message) -> str | None:
+    """Return the ``call_id`` a tool history message recorded, if any."""
+    metadata = message.get("metadata")
+    call_id = metadata.get("call_id") if isinstance(metadata, dict) else None
+    return call_id if isinstance(call_id, str) and call_id else None
+
+
 def _convert_messages_to_responses(
     messages: list[Message],
 ) -> list[ResponsesItem]:
     """Convert internal history to Responses API input items for replay/reset."""
     result: list[ResponsesItem] = []
+    # The API rejects a call without its output, so a recorded id pairs only
+    # when both halves are present; anything else falls back to adjacency.
+    call_ids = {_recorded_call_id(m) for m in messages if m.get("role") == "tool_call"}
+    result_ids = {_recorded_call_id(m) for m in messages if m.get("role") == "tool_result"}
+    paired_ids = (call_ids & result_ids) - {None}
 
     i = 0
     while i < len(messages):
@@ -260,7 +272,11 @@ def _convert_messages_to_responses(
                 i += 1
                 continue
             tool_args = parsed.get("args", {})
-            call_id = f"call_{i}"
+            recorded_id = _recorded_call_id(msg)
+            if recorded_id is not None and recorded_id not in paired_ids:
+                i += 1
+                continue
+            call_id = recorded_id or f"call_{i}"
             result.append(
                 {
                     "type": "function_call",
@@ -272,7 +288,12 @@ def _convert_messages_to_responses(
                 }
             )
 
-            if i + 1 < len(messages) and messages[i + 1].get("role") == "tool_result":
+            if (
+                recorded_id is None
+                and i + 1 < len(messages)
+                and messages[i + 1].get("role") == "tool_result"
+                and _recorded_call_id(messages[i + 1]) not in paired_ids
+            ):
                 i += 1
                 raw_tool_output = messages[i].get("content")
                 if raw_tool_output is None:
@@ -296,13 +317,19 @@ def _convert_messages_to_responses(
                 if isinstance(redacted_content, str)
                 else json.dumps(redacted_content)
             )
-            result.append(
-                {
-                    "type": "message",
-                    "role": "user",
-                    "content": f"[tool result] {tool_output}",
-                }
-            )
+            recorded_id = _recorded_call_id(msg)
+            if recorded_id in paired_ids:
+                result.append(
+                    {"type": "function_call_output", "call_id": recorded_id, "output": tool_output}
+                )
+            else:
+                result.append(
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": f"[tool result] {tool_output}",
+                    }
+                )
 
         else:
             result.append(

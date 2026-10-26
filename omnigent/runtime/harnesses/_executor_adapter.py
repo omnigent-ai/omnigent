@@ -1508,14 +1508,11 @@ def _translate_input_to_messages(
 def _extract_role_keyed_messages(
     input_value: list[dict[str, Any]],
 ) -> list[Message]:
-    """Extract role-keyed message and tool-history items from an Omnigent input list.
+    """Extract role-keyed messages and tool history from an Omnigent input list.
 
-    function_call / function_call_output items are translated to ``tool_call`` /
-    ``tool_result`` messages (the inner history vocabulary) so executors that replay
-    full history into a fresh inner SDK session — a forked session, or a restart with
-    no Layer-1 state to reconstruct from — retain the recorded tool context. On a
-    continued turn the inner SDK's own session state already holds the tool items and
-    executors send only the new-message delta, so nothing is duplicated. Returns empty
+    ``function_call`` / ``function_call_output`` items become ``tool_call`` /
+    ``tool_result`` messages, so an executor replaying full history into a fresh
+    inner session (a fork or restart) keeps the tool context. Returns an empty
     list for non-history inputs.
     """
     messages: list[Message] = []

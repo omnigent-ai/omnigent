@@ -755,14 +755,8 @@ class _AgentsSessionState:
 
 
 def _without_tool_history(messages: list[Message]) -> list[Message]:
-    """Return *messages* minus ``tool_call`` / ``tool_result`` history items.
-
-    The history cursor counts only conversational messages: a live SDK session
-    already holds its own tool items (Layer-1 state), so replaying them on a
-    delta turn would duplicate context and misalign the cursor. Tool history is
-    consumed only by the full-replay path for a fresh SDK session, which has no
-    Layer-1 state to reconstruct it from.
-    """
+    """Drop ``tool_call`` / ``tool_result`` items: a live SDK session holds its own,
+    and the history cursor counts only conversational messages."""
     return [msg for msg in messages if msg.get("role") not in ("tool_call", "tool_result")]
 
 
@@ -1453,9 +1447,7 @@ class OpenAIAgentsSDKExecutor(Executor):
             state.resume_state = None
 
         if not state.started:
-            # Full replay into a fresh SDK session (fork, restart): include the
-            # tool_call / tool_result history — there is no Layer-1 state to
-            # reconstruct the recorded tool context from.
+            # A fresh SDK session (fork, restart) has no tool state, so replay the tool history.
             return _normalize_responses_items_for_chat(_convert_messages_to_responses(messages))
 
         split = split_transient_tail(_without_tool_history(messages))
