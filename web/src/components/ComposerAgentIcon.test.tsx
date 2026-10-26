@@ -35,11 +35,11 @@ it("keeps the CLI banner gradient on the Genie composer mark", () => {
       stop.getAttribute("stop-color"),
     ]),
   ).toEqual([
-    ["0%", "#6188E5"],
-    ["25%", "#9C45E7"],
+    ["25%", "#6188E5"],
+    ["37.5%", "#9C45E7"],
     ["50%", "#CC00E8"],
-    ["75%", "#E74B96"],
-    ["100%", "#FC6A48"],
+    ["62.5%", "#E74B96"],
+    ["75%", "#FC6A48"],
   ]);
   expect(asset.querySelector("path")?.getAttribute("fill")).toBe(`url(#${gradient?.id})`);
   expect(genieCodeLogoSource).not.toContain("currentColor");
