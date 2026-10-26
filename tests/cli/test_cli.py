@@ -2412,6 +2412,64 @@ def test_server_command_reads_tunnel_token_and_does_not_spawn_runner(
     }
 
 
+def test_server_preserves_explicit_builtin_agent_through_startup(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Built-in refresh must not replace a bundle supplied with ``--agent``."""
+    import uvicorn.server
+    from fastapi.testclient import TestClient
+
+    from omnigent.runtime import get_agent_cache
+
+    agent_dir = tmp_path / "polly"
+    agent_dir.mkdir()
+    _write_config(
+        agent_dir,
+        {
+            "spec_version": 1,
+            "name": "polly",
+            "description": "Explicitly registered bundle.",
+            "executor": {
+                "type": "omnigent",
+                "model": "test-codex-model",
+                "config": {"harness": "codex"},
+            },
+        },
+    )
+    observed: dict[str, Any] = {}
+
+    def run_app_lifespan(self: Any, **kwargs: Any) -> None:
+        with TestClient(self.config.app):
+            agent_store = self.config.app.state.agent_store
+            agent = agent_store.get_by_name("polly")
+            assert agent is not None
+            observed["spec"] = get_agent_cache().load(agent.id, agent.bundle_location).spec
+            assert agent_store.get_by_name("debby") is not None
+
+    monkeypatch.setattr(uvicorn.server.Server, "run", run_app_lifespan)
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path / "config"))
+    result = CliRunner().invoke(
+        cli,
+        [
+            "server",
+            "--port",
+            "0",
+            "--database-uri",
+            f"sqlite:///{tmp_path / 'chat.db'}",
+            "--artifact-location",
+            str(tmp_path / "artifacts"),
+            "--agent",
+            str(agent_dir),
+        ],
+    )
+
+    assert result.exit_code == 0, result.exception or result.output
+    assert observed["spec"].executor.config["harness"] == "codex"
+    assert observed["spec"].executor.model == "test-codex-model"
+    assert observed["spec"].description == "Explicitly registered bundle."
+
+
 def test_server_explicit_config_overrides_omnigent_config_env(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

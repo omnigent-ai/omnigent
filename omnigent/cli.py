@@ -4721,7 +4721,7 @@ def server(
     import uvicorn
     import uvicorn.server
 
-    from omnigent.server.app import create_app
+    from omnigent.server.app import _ensure_default_agents, create_app
     from omnigent.server.auth import create_auth_provider
     from omnigent.server.server_config import (
         SESSION_TITLE_INSTRUCTIONS_KEY,
@@ -4861,7 +4861,9 @@ def server(
         frozenset({_tunnel_token}) if _tunnel_token else None
     )
 
-    # Pre-register agents from --agent directories.
+    # Refresh built-ins first so explicit --agent bundles take precedence.
+    if agent_dirs:
+        _ensure_default_agents(agent_store, artifact_store, agent_cache)
     for agent_dir in agent_dirs:
         _preregister_agent(
             Path(agent_dir),
@@ -4995,6 +4997,7 @@ def server(
         policy_store=policy_store,
         artifact_store=artifact_store,
         agent_cache=agent_cache,
+        default_agents_seeded=bool(agent_dirs),
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,
