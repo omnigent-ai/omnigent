@@ -2013,7 +2013,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         :param client: HTTP client created by the prepare helper.
         :param bundle: Bundled agent bytes.
         :param bridge_id: Bridge label requested by the caller.
-        :param claude_args: Pass-through Claude args for the effort stamp.
+        :param claude_args: Launch args the effort stamp reads.
         :param terminal_launch_args: Claude launch args persisted on
             the session for the runner to apply.
         :returns: Fixed conversation id.
@@ -2139,7 +2139,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         headers={},
         session_id=None,
         session_bundle=b"bundle",
-        claude_args=("--print", "hi"),
+        claude_args=("--resume", "abc", "--print", "hi"),
         host_id="host_progress",
         workspace="/workspace",
         startup_progress=progress,

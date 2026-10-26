@@ -8549,7 +8549,15 @@ def resolve_launch_effort_level(claude_args: tuple[str, ...]) -> str | None:
     :returns: A recognized effort, e.g. ``"xhigh"``; ``None`` when neither
         the args nor ``~/.claude/settings.json`` carry a valid one.
     """
-    effort = _arg_value(claude_args, "--effort")
+    effort: str | None = None
+    # Unlike _arg_value, keep an empty or flag-like last value: Claude takes
+    # the token after --effort as its value and ignores earlier occurrences.
+    tokens = iter(claude_args)
+    for arg in tokens:
+        if arg == "--effort":
+            effort = next(tokens, None)
+        elif arg.startswith("--effort="):
+            effort = arg.removeprefix("--effort=")
     if effort in CLAUDE_EFFORTS:
         return effort
     return read_user_effort_level()

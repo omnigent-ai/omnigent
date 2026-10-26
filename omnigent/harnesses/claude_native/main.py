@@ -4667,7 +4667,7 @@ async def _prepare_claude_terminal_via_daemon(
                     client,
                     session_bundle,
                     bridge_id=None,
-                    claude_args=claude_args,
+                    claude_args=tuple(persist_args),
                     terminal_launch_args=persist_args or None,
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
