@@ -4454,9 +4454,9 @@ async def _close_claude_terminal(
 # (``omnigent host``) rather than this CLI: ensure the daemon, ask
 # the server to launch a runner on this host, wait for it to come
 # online, then wait for the runner to auto-create the Claude terminal
-# (``_auto_create_claude_terminal`` in ``runner/app.py``, which also
-# applies the ucode gateway auth from the runner's profile) before
-# attaching. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+# (``_auto_create_claude_terminal`` in ``runner/native/orchestration.py``,
+# which also applies the ucode gateway auth from the runner's profile)
+# before attaching. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 
 
 async def _newest_session_error_item(
