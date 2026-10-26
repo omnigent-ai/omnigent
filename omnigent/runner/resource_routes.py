@@ -1479,6 +1479,15 @@ def register_resource_routes(
             remove=body.get("remove", []),
         )
 
+    @app.post("/v1/sessions/{session_id}/resources/github/comments")
+    async def create_github_comment_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id, "create_pr_comment", pr_url=body["pr_url"], body=body.get("body")
+        )
+
     @app.post("/v1/sessions/{session_id}/resources/github/details")
     async def update_github_details_route(session_id: str, request: Request) -> JSONResponse:
         body = await request.json()

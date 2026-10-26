@@ -17007,6 +17007,47 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/comments": {
+      "post": {
+        "description": "Post a top-level comment using the host's selected GitHub account.",
+        "operationId": "create_session_github_comment_v1_sessions__session_id__resources_github_comments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Session Github Comment",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/details": {
       "post": {
         "description": "Replace the selected PR's title and/or description.\n\nUses the host's provider account; served by the runner when it's online,\nelse by the host over its tunnel.\n\n**Returns:** A `session.github.pr_details` with the PR's resulting title and body.",

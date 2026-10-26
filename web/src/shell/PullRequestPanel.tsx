@@ -21,6 +21,7 @@
 // PR each render their own empty state, and an associated PR falls through to
 // the header + stacked diff.
 
+import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
@@ -816,17 +817,17 @@ function PullRequestCommentsTab({
   comments,
   commentsPartial,
   providerLabel,
+  hasComposer,
 }: {
   comments: PullRequestComment[];
+  hasComposer: boolean;
   commentsPartial?: boolean;
   providerLabel: string;
 }) {
   const commentKeys = listKeys(comments, (c) => [c.url, c.created_at, c.author_id ?? c.author]);
   const authorHues = useMemo(() => pullRequestAuthorHues(comments), [comments]);
   return (
-    // Extra bottom padding so the last comment can scroll clear of the very
-    // bottom edge, where it's awkward to read.
-    <div className="space-y-2 p-3 pb-16">
+    <div className={cn("space-y-2 p-3", !hasComposer && "pb-16")}>
       {commentsPartial && (
         <p role="status" className="text-ui text-muted-foreground">
           Some comments are unavailable.
@@ -1650,6 +1651,7 @@ function PullRequestPanelDetails({
   const pr = data.pr!;
   const checks = pr.checks;
   const comments = pr.comments ?? [];
+  const canPostComment = !!(canEdit && data.capabilities.comment_posting && data.selected_pr_url);
 
   return (
     <TooltipProvider delayDuration={0}>
@@ -1774,12 +1776,28 @@ function PullRequestPanelDetails({
           />
         </TabsContent>
 
-        <TabsContent value="comments" className="min-h-0 flex-1 overflow-y-auto">
-          <PullRequestCommentsTab
-            comments={comments}
-            commentsPartial={pr.comments_partial}
-            providerLabel={copy.label}
-          />
+        <TabsContent value="comments" className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div
+            role="region"
+            aria-label="PR comments"
+            tabIndex={0}
+            className="min-h-0 flex-1 overflow-y-auto"
+          >
+            <PullRequestCommentsTab
+              comments={comments}
+              hasComposer={canPostComment}
+              commentsPartial={pr.comments_partial}
+              providerLabel={copy.label}
+            />
+          </div>
+          {canPostComment && data.selected_pr_url && (
+            <PullRequestCommentComposer
+              key={`${conversationId}:${data.selected_pr_url}`}
+              conversationId={conversationId}
+              prUrl={data.selected_pr_url}
+              account={data.auth.selected_account}
+            />
+          )}
         </TabsContent>
 
         {/* Changes: a controls row, then the sidebar (jump-to-file) + one scroll

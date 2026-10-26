@@ -126,6 +126,8 @@ class ProviderCapabilities:
     :ivar reviewer_editing: The user can request and withdraw reviews through
         :meth:`PullRequestFacet.review_candidates` and
         :meth:`PullRequestFacet.edit_reviewers`.
+    :ivar comment_posting: The user can post top-level comments through
+        :meth:`PullRequestFacet.create_comment`.
     :ivar details_editing: The user can edit the PR's title and description
         through :meth:`PullRequestFacet.edit_details`.
     :ivar attachment_uploads: The user can upload images and videos to embed in
@@ -139,6 +141,7 @@ class ProviderCapabilities:
     label_editing: bool = False
     merging: bool = False
     reviewer_editing: bool = False
+    comment_posting: bool = False
     details_editing: bool = False
     attachment_uploads: bool = False
 
@@ -443,6 +446,10 @@ class PullRequestFacet(Protocol):
         :returns: A ``session.github.pr_reviewers`` with the PR's resulting ``reviewers``.
         :raises ValueError: With a user-facing message when the provider refuses.
         """
+        ...
+
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Post a top-level conversation comment when ``comment_posting`` is supported."""
         ...
 
     def edit_details(

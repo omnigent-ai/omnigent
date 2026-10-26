@@ -9538,10 +9538,11 @@ def test_github_reviewer_ops_are_served_on_host(
     ]
 
 
-def test_github_details_update_is_served_on_host(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("comment", [False, True], ids=["details", "comment"])
+async def test_github_details_update_is_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, comment: bool
 ) -> None:
-    """The host renames the PR when the runner is offline, as the session's tracked PR."""
+    """The host writes PR text when the runner is offline, as the session's tracked PR."""
     from omnigent.host.frames import HostFsWriteFrame
     from omnigent.runner import github_resource
     from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
@@ -9549,10 +9550,19 @@ def test_github_details_update_is_served_on_host(
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
     monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
     sent: list[dict[str, str]] = []
+    answer = (
+        {
+            "id": 99,
+            "body": "Body",
+            "html_url": "https://github.com/example/one/pull/42#issuecomment-99",
+        }
+        if comment
+        else {"title": "Renamed", "body": "Body"}
+    )
 
     def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
         sent.append(json.loads(Path(argv[argv.index("--input") + 1]).read_text()))
-        return 0, json.dumps({"title": "Renamed", "body": "Body"}), ""
+        return 0, json.dumps(answer), ""
 
     monkeypatch.setattr(github_resource, "_gh", gh)
     url = "https://github.com/example/one/pull/42"
@@ -9564,22 +9574,37 @@ def test_github_details_update_is_served_on_host(
         edited = host._handle_fs_write(
             HostFsWriteFrame(
                 request_id="details-update",
-                op="github_details_update",
+                op="github_comment_create" if comment else "github_details_update",
                 workspace=str(tmp_path),
                 session_id="session",
-                params={"pr_url": url, "title": " Renamed ", "body": None},
+                params={
+                    "pr_url": url,
+                    **({"body": "Body"} if comment else {"title": " Renamed ", "body": None}),
+                },
             )
         )
     finally:
         _cleanup_host(host)
 
     assert edited.status == "ok", edited
-    assert edited.payload == {
-        "object": "session.github.pr_details",
-        "title": "Renamed",
-        "body": "Body",
-    }
-    assert sent == [{"title": "Renamed"}]
+    assert edited.payload == (
+        {
+            "object": "session.github.pr_comment",
+            "comment": {
+                "author": None,
+                "body": "Body",
+                "created_at": None,
+                "url": url + "#issuecomment-99",
+            },
+        }
+        if comment
+        else {
+            "object": "session.github.pr_details",
+            "title": "Renamed",
+            "body": "Body",
+        }
+    )
+    assert sent == ([{"body": "Body"}] if comment else [{"title": "Renamed"}])
 
 
 def test_github_attachment_upload_is_served_on_host(

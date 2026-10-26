@@ -32,6 +32,7 @@ _CAPABILITIES = ProviderCapabilities(
     label_editing=True,
     merging=True,
     reviewer_editing=True,
+    comment_posting=True,
     details_editing=True,
     attachment_uploads=True,
 )
@@ -212,6 +213,12 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._edit_reviewers(root, reference, add=add, remove=remove)
+
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Post through GitHub's issue comments API as the selected account."""
+        from omnigent.runner import github_resource
+
+        return github_resource._create_comment(root, reference, body=body)
 
     def edit_details(
         self,
