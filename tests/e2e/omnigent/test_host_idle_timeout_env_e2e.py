@@ -15,7 +15,6 @@ from pathlib import Path
 
 import httpx
 import pytest
-import yaml
 
 from tests._helpers.host import Host, isolated_host
 from tests._helpers.live_server import isolated_local_server
@@ -36,26 +35,6 @@ _RUNNER_STARTED = re.compile(r"Runner started: (\S+) \(pid=(\d+)\)")
 _REAPER_STARTED = re.compile(r"native pane reaper started \(idle_timeout=[^)]*\)")
 _HOST_ONLINE_TIMEOUT_S = 90.0
 _RUNNER_TIMEOUT_S = 60.0
-
-
-def _write_mock_claude_provider(mock_url: str):
-    def ready(host: Host) -> None:
-        config_path = host.home / ".omnigent" / "config.yaml"
-        config = yaml.safe_load(config_path.read_text()) or {}
-        config["providers"] = {
-            "mock-claude": {
-                "kind": "key",
-                "default": ["anthropic"],
-                "anthropic": {
-                    "base_url": mock_url,
-                    "api_key": "mock-key",
-                    "models": {"default": "claude-sonnet-4-20250514"},
-                },
-            }
-        }
-        config_path.write_text(yaml.safe_dump(config, sort_keys=False))
-
-    return ready
 
 
 def _wait_for(predicate, *, timeout: float, what: str, diagnostics):
@@ -82,8 +61,8 @@ def _runner_log(host: Host) -> Path | None:
     return logs[-1] if logs else None
 
 
-# Hosts < 0.19.0 do not forward the idle-timeout env knobs to spawned runners.
-@pytest.mark.min_runner_version("0.19.0")
+# Hosts < 0.20.0 do not forward the idle-timeout env knobs to spawned runners.
+@pytest.mark.min_runner_version("0.20.0")
 @pytest.mark.parametrize("spawn", ["zygote", "direct"])
 def test_host_env_idle_timeout_knobs_reach_spawned_runner(
     tmp_path: Path, mock_llm_server_url: str, spawn: str
@@ -103,7 +82,19 @@ def test_host_env_idle_timeout_knobs_reach_spawned_runner(
             tmp_path / "host",
             base_url,
             env=host_env,
-            ready=_write_mock_claude_provider(mock_llm_server_url),
+            config={
+                "providers": {
+                    "mock-claude": {
+                        "kind": "key",
+                        "default": ["anthropic"],
+                        "anthropic": {
+                            "base_url": mock_llm_server_url,
+                            "api_key": "mock-key",
+                            "models": {"default": "claude-sonnet-4-20250514"},
+                        },
+                    }
+                }
+            },
         ) as host,
         httpx.Client(base_url=base_url, timeout=30.0) as client,
     ):
@@ -149,8 +140,13 @@ def test_host_env_idle_timeout_knobs_reach_spawned_runner(
                 ),
             ).group(0)
 
+            runner_pid = int(started.group(2))
+            if spawn == "zygote":
+                assert re.search(
+                    rf"Forked runner via zygote \(zygote pid=\d+, runner pid={runner_pid}\)",
+                    host.log_path.read_text(errors="replace"),
+                ), "runner fell back to direct spawning instead of exercising the zygote"
             if spawn == "direct":
-                runner_pid = int(started.group(2))
                 runner_environ = _proc_environ(runner_pid)
                 assert runner_environ.get("OMNIGENT_LOG_LEVEL") == "INFO", (
                     "control variable missing: the host→runner env chain is broken"
