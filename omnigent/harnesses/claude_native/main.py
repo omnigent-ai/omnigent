@@ -250,6 +250,10 @@ _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV = "CLAUDE_CODE_DISABLE_AGENT_VIEW"
 # only in the pane, so a web-driven session shows an unanswerable prompt —
 # often with nobody attached to the terminal at all.
 _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV = "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY"
+# In auto / bypass-permissions mode Claude Code's dangerous-rm safety prompt
+# denies itself after 120s unanswered. Omnigent routes that prompt to the web
+# approval card and waits up to a day, so the vendor's timer must stay off.
+_CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT_ENV = "CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT"
 # Claude Code env vars that pin each model-tier alias to a provider-specific
 # model ID.  When set, the /model picker shows these IDs as options rather
 # than normalising to canonical Anthropic names (which the Databricks gateway
@@ -1526,10 +1530,13 @@ def build_native_claude_terminal_env(
 
     Forces MCP Tool Search on so Claude defers MCP tool schemas and
     loads them on demand, disables Claude Code's agent view so the
-    terminal stays pinned to the session the Omnigent UI is showing, and
+    terminal stays pinned to the session the Omnigent UI is showing,
     disables the in-TUI feedback surveys, which a web-driven session
     cannot see or answer (see
-    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`).
+    :data:`_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV`), and turns off the
+    dangerous-rm prompt's self-deny timer so an approval routed to the
+    web card stays answerable (see
+    :data:`_CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT_ENV`).
 
     :param claude_config: Optional provider/ucode launch config, e.g.
         one carrying ``{"ANTHROPIC_BASE_URL": "https://example.com"}``.
@@ -1537,16 +1544,15 @@ def build_native_claude_terminal_env(
     :returns: Environment overrides for the terminal process, e.g.
         ``{"ENABLE_TOOL_SEARCH": "true"}``.
     """
-    terminal_env = {
+    pinned_env = {
         _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV: "true",
         _CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV: "1",
         _CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV: "1",
+        _CLAUDE_CODE_DISABLE_DANGEROUS_RM_TIMEOUT_ENV: "1",
     }
-    if claude_config is not None:
-        terminal_env.update(claude_config.env)
-        terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
-        terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
-        terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
+    terminal_env = dict(claude_config.env) if claude_config is not None else {}
+    # Omnigent's pins win over a provider env that would re-enable them.
+    terminal_env.update(pinned_env)
     # On the apiKeyHelper path the credential reaches Claude Code via the
     # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
     # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
