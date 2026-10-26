@@ -6993,10 +6993,11 @@ def _publish_error_event(session_id: str, error: ErrorData) -> None:
 _MODEL_CHANGE_NOT_APPLIED_CODE = "model_change_not_applied"
 
 
-def _surface_model_change_forward_failure(
+async def _surface_model_change_forward_failure(
     session_id: str,
     model: str | None,
     runner_result: _RunnerForwardResult | None,
+    conversation_store: ConversationStore,
 ) -> bool:
     """
     Publish a visible notice when a native pane never took a model change.
@@ -7016,10 +7017,15 @@ def _surface_model_change_forward_failure(
     diverged — the notice is for a session whose runner IS reachable and still
     did not switch the pane.
 
+    A refusal the runner marks ``waiting_on_person`` (an open dialog, question
+    or sign-in in the pane) is a persisted ``info`` notice rather than an
+    error: the session keeps running and only needs the person's answer.
+
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param model: The model that was persisted, or ``None`` when cleared.
     :param runner_result: HTTP result from the forward, or ``None`` when no
         runner was reachable.
+    :param conversation_store: Store that persists a waiting-on-person notice.
     :returns: ``True`` when the runner rejected the change; ``False`` when it
         accepted the change or no runner answered.
     """
@@ -7035,6 +7041,7 @@ def _surface_model_change_forward_failure(
     if 200 <= runner_result.status_code < 300:
         return False
     reason = f"the runner returned status {runner_result.status_code}"
+    waiting_on_person = False
     # The runner's own detail names the concrete cause (e.g. "a dialog may
     # be open in the pane"); carry it into the visible notice when present.
     with contextlib.suppress(ValueError, TypeError):
@@ -7042,6 +7049,9 @@ def _surface_model_change_forward_failure(
         detail = parsed_body.get("detail") if isinstance(parsed_body, dict) else None
         if isinstance(detail, str) and detail.strip():
             reason = f"{reason} ({detail.strip()})"
+        waiting_on_person = (
+            isinstance(parsed_body, dict) and parsed_body.get("waiting_on_person") is True
+        )
     _logger.warning(
         "Model change not applied to the terminal for session=%s model=%r: %s (body=%s)",
         session_id,
@@ -7051,17 +7061,34 @@ def _surface_model_change_forward_failure(
         extra={"session_id": session_id},
     )
     target = model or "its default model"
-    _publish_error_event(
-        session_id,
-        ErrorData(
-            source="execution",
-            code=_MODEL_CHANGE_NOT_APPLIED_CODE,
-            message=(
-                f"The terminal was not switched to {target}: {reason}. "
-                "It is still running on its previous model."
-            ),
+    error = ErrorData(
+        source="execution",
+        code=_MODEL_CHANGE_NOT_APPLIED_CODE,
+        message=(
+            f"The terminal was not switched to {target}: {reason}. "
+            "It is still running on its previous model."
         ),
     )
+    if waiting_on_person:
+        notice = NewConversationItem(
+            type="error",
+            response_id=generate_task_id(),
+            data=error.model_copy(update={"level": "info"}),
+        )
+        try:
+            persisted = await asyncio.to_thread(conversation_store.append, session_id, [notice])
+        except Exception:  # noqa: BLE001 - fall back to the live error so the picker settles.
+            _logger.warning(
+                "Failed to persist model-change notice for session %s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        else:
+            if persisted:
+                _publish_external_conversation_item(session_id, persisted[0])
+                return True
+    _publish_error_event(session_id, error)
     return True
 
 

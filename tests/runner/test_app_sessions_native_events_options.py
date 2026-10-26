@@ -2681,7 +2681,16 @@ async def test_events_model_change_names_the_step_a_blocked_terminal_needs(
     )
 
     assert resp.status_code == 503, resp.text
-    assert resp.json() == {"error": "claude_native_model_failed", "detail": expected_detail}
+    expected = {"error": "claude_native_model_failed", "detail": expected_detail}
+    if isinstance(
+        error,
+        claude_native_bridge.ClaudeSignInPending
+        | claude_native_bridge.ClaudeTerminalDialog
+        | claude_native_bridge.ClaudeUserPromptPending,
+    ):
+        # Only a pane awaiting the person's answer is flagged; an exit or timeout is a failure.
+        expected["waiting_on_person"] = True
+    assert resp.json() == expected
 
 
 @pytest.mark.asyncio
