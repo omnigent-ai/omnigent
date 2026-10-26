@@ -1098,7 +1098,7 @@ function PullRequestListRow({
         onClick={onSelect}
         title={label}
         aria-label={label}
-        className="flex min-w-0 flex-1 items-center gap-2 py-2 text-left text-ui focus-visible:outline-ring"
+        className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-2 text-left text-ui focus-visible:outline-ring"
       >
         <GitPullRequestIcon
           aria-hidden
