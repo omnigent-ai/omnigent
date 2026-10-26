@@ -1,9 +1,7 @@
 """Coverage for failure attribution on the server's ``failed`` status edge.
 
-Every server-originated failed turn logs exactly one ERROR from
-``_publish_status``, so that single line is the whole population a
-reliability dashboard sees. These tests hold it to naming which publish
-path produced the edge, and hold the publish sites to passing one.
+Server-originated failed turns retain their cause and publish path.
+Recognized budget refusals remain observable at INFO without reporting a fault.
 """
 
 from __future__ import annotations
@@ -15,7 +13,7 @@ from pathlib import Path
 import pytest
 
 import omnigent.server.routes._sessions.helpers as helpers
-from omnigent.debug_logging import _attributes
+from omnigent.debug_logging import _attributes, record_to_row
 from omnigent.server.schemas import ErrorDetail
 
 # Statuses that are not failures. Anything else a publish site can pass —
@@ -87,6 +85,62 @@ def test_failed_edge_names_its_origin_code_and_previous_status(
     assert attributes["response_id"] == "resp_abc123"
     assert record.event_name == "session_turn_failed"
     assert record.session_id == "conv_attr1"
+
+
+@pytest.mark.parametrize(
+    ("code", "message", "budget_exhausted"),
+    [
+        ("budget_exhausted", "Budget limit reached.", True),
+        ("native_turn_error", 'API Error: 403 Budget "example" has reached its limit.', True),
+        ("codex_compaction_model_failed", 'Budget "example" has reached its limit.', True),
+        ("native_turn_error", "API Error: 401 Invalid token", False),
+        ("native_turn_error", "API Error: 403 Permission denied", False),
+    ],
+)
+def test_budget_refusal_logs_informational_outcome_and_keeps_failed_status(
+    caplog: pytest.LogCaptureFixture,
+    monkeypatch: pytest.MonkeyPatch,
+    code: str,
+    message: str,
+    budget_exhausted: bool,
+) -> None:
+    published = []
+    monkeypatch.setattr(
+        helpers.session_stream, "publish", lambda _sid, event: published.append(event)
+    )
+    with caplog.at_level(logging.INFO, logger="omnigent.server.routes.sessions"):
+        helpers._publish_status(
+            "conv_budget",
+            "failed",
+            failure_origin="native_terminal_status",
+        )
+        helpers._publish_status(
+            "conv_budget",
+            "failed",
+            ErrorDetail(code=code, message=message),
+            failure_origin="external_session_status",
+        )
+
+    observation, record = [
+        r for r in caplog.records if getattr(r, "session_id", None) == "conv_budget"
+    ]
+    assert observation.levelno == logging.INFO
+    assert observation.event_name == "native_terminal_status_observed"
+    row = record_to_row(record, source="server")
+    assert row["event_name"] == (
+        "session_turn_budget_exhausted" if budget_exhausted else "session_turn_failed"
+    )
+    assert row["level"] == ("INFO" if budget_exhausted else "ERROR")
+    assert row["attributes"]["code"] == ("budget_exhausted" if budget_exhausted else code)
+    if budget_exhausted:
+        assert row["attributes"]["error_category"] == "user"
+        assert row["attributes"]["error_impact"] == "blocking"
+        assert row["attributes"]["error_phase"] == "turn"
+    assert published[0]["status"] == "failed"
+    assert published[0].get("error") is None
+    assert published[1]["error"]["code"] == code
+    assert published[1]["error"]["message"] == message
+    assert helpers._session_status_cache["conv_budget"] == "failed"
 
 
 def test_detail_less_failure_still_reports_origin(

@@ -12,7 +12,7 @@ from omnigent.native.failure_telemetry import (
     provider_error_fields,
 )
 
-_API_ERROR = re.compile(r"^\s*API Error:\s*([1-5][0-9]{2})\b")
+_API_ERROR = re.compile(r"^\s*(?:Please run /login\s*·\s*)?API Error:\s*([1-5][0-9]{2})\b")
 _API_ERROR_BODY_MAX_CHARS = 16384
 
 

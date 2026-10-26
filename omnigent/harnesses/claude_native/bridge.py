@@ -88,6 +88,7 @@ from omnigent.harnesses.kiro_native import bridge as kiro_bridge
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
+from omnigent.runner.launch_failure import classify_native_turn_error
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 if TYPE_CHECKING:
@@ -9924,6 +9925,12 @@ def _display_text(text: str, *, is_api_error: bool) -> str:
     stripped = text.strip()
     if _CONTEXT_OVERFLOW_RE.match(stripped):
         return _CONTEXT_OVERFLOW_REPLACEMENT
+    if (
+        is_api_error
+        and classify_native_turn_error("native_turn_error", stripped) == "budget_exhausted"
+    ):
+        # Claude prefixes gateway budget refusals with a sign-in remedy that cannot help.
+        return re.sub(r"^Please run /login\s*·\s*", "", stripped)
     if is_api_error and _LOGIN_COMMAND_RE.search(stripped):
         return f"{text.rstrip()}\n\n{_LOGIN_GUIDANCE}"
     return text

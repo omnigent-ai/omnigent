@@ -1187,7 +1187,16 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         },
     }
     gate = asyncio.Event()
-    runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(event)}\n\n"], gate)
+    observation = {
+        "type": "session.status",
+        "status": "failed",
+        "status_source": "terminal_observation",
+    }
+    # Even a labeled observation carrying a real error remains a failure.
+    event["status_source"] = "terminal_observation"
+    runner = _ScriptedThenDropRunnerClient(
+        [f"data: {json.dumps(item)}\n\n" for item in [observation, event]], gate
+    )
     store = _RecordingLabelStore(live_status="running")
     sessions_module._session_status_cache[session_id] = "running"
     collector = None
@@ -1207,6 +1216,11 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
             await asyncio.wait_for(handle.task, timeout=_TASK_TIMEOUT_S)
 
         [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
+        [state_observation] = [
+            r for r in rows if r["event_name"] == "native_terminal_status_observed"
+        ]
+        assert state_observation["level"] == "INFO"
+        assert failure["level"] == "ERROR"
         attrs = failure["attributes"]
         assert isinstance(attrs, dict)
         assert attrs["failure_id"] == "err_synthetic_relay"
@@ -1216,6 +1230,8 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         status = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert status["type"] == "session.status"
         assert status["status"] == "failed"
+        assert status.get("error") is None
+        status = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert status["error"]["code"] == error["code"]
         assert sessions_module._session_status_cache.get(session_id) == "failed"
         persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])

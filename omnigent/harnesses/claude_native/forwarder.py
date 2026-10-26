@@ -71,6 +71,7 @@ from omnigent.native.failure_telemetry import (
     normalize_failure_context,
 )
 from omnigent.process_logging import harness_stderr_capture_enabled
+from omnigent.runner.launch_failure import budget_exhaustion_log_attributes
 from omnigent.runner.transports.ws_tunnel.event_delivery import RunnerEventDispatcher
 from omnigent.session_event_batch import (
     MAX_SESSION_EVENT_BATCH_EVENTS,
@@ -3904,14 +3905,19 @@ def _log_transcript_failure(session_id: str, item: ClaudeTranscriptItem) -> None
             "failure_decision": "observed",
             "runner_version": VERSION,
         }
+        budget_attributes = budget_exhaustion_log_attributes(
+            None, item.failure_context.get("native_error_message")
+        )
         _logger.info(
-            "Claude native API-error evidence observed; session=%s",
+            "Claude native %s evidence observed; session=%s",
+            "budget exhaustion" if budget_attributes else "API-error",
             session_id,
             extra=debug_event(
-                "native_failure_observed",
+                "native_budget_exhausted" if budget_attributes else "native_failure_observed",
                 session_id=session_id,
                 response_id=item.response_id,
                 **failure_log_attributes(context),
+                **budget_attributes,
             ),
         )
     except Exception as exc:  # noqa: BLE001 - telemetry cannot interrupt forwarding
