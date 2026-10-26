@@ -540,8 +540,7 @@ def find_oauth_error(exc: BaseException) -> McpOAuthError | None:
     """
     if isinstance(exc, McpOAuthError):
         return exc
-    # A 3.11+ builtin (we require 3.12); ruff's py310 target misflags it.
-    if isinstance(exc, BaseExceptionGroup):  # noqa: F821
+    if isinstance(exc, BaseExceptionGroup):
         for inner in exc.exceptions:
             found = find_oauth_error(inner)
             if found is not None:

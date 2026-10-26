@@ -293,9 +293,8 @@ class TestBrowserHandling:
 
     def test_find_oauth_error_unwraps_exception_groups(self) -> None:
         inner = McpOAuthError("sign in first")
-        # ExceptionGroup is a 3.11+ builtin; ruff's py310 target misflags it.
-        nested = ExceptionGroup("n", [inner])  # noqa: F821
-        group = ExceptionGroup("task group", [ValueError("other"), nested])  # noqa: F821
+        nested = ExceptionGroup("n", [inner])
+        group = ExceptionGroup("task group", [ValueError("other"), nested])
         assert find_oauth_error(group) is inner
         assert find_oauth_error(ValueError("x")) is None
 
