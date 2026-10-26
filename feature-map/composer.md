@@ -104,9 +104,8 @@ and steers messages while the agent is busy.
   opens and focuses the new-session composer in browsers. Native shells retain
   ⌘/Ctrl+Alt+N. Embedded apps require focus inside the app.
 - `queue-and-steer`: messages sent while the agent is busy wait in a queue and
-  can be steered into the running turn. Side chats have no client-side queue:
-  while one works, Send stays beside Interrupt and accepts follow-ups whatever
-  Always steer is set to.
+  can be steered into the running turn. Side-chat composers queue and steer the
+  same way, with their own queue strip.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
   and always-steer preference, keeping their element screenshots.
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.

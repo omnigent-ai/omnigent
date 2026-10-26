@@ -1212,8 +1212,14 @@ export interface ChatActions {
    * Queue a message client-side instead of POSTing it now, for a send made
    * while the agent is busy. The head is flushed automatically (FIFO, one per
    * turn) when the session next goes idle — see the `session_status` handler.
+   * `conversationId` targets a live conversation beside the visible one (a side chat).
    */
-  enqueueMessage: (text: string, files?: File[], replyDraft?: StoredReplyDraft) => void;
+  enqueueMessage: (
+    text: string,
+    files?: File[],
+    replyDraft?: StoredReplyDraft,
+    conversationId?: string,
+  ) => void;
   /** Let a conversation's messages held for an offline host flush again. */
   releaseHostHeldMessages: (conversationId: string) => void;
   /** Remove a queued message by id (the strip's per-row delete). */
@@ -1252,9 +1258,9 @@ export interface ChatActions {
    * safe to call on any state change (idempotent — no-ops when busy, when the
    * queue is empty, or when the head isn't for the bound conversation). POSTing
    * the head starts a turn → the session goes busy → this no-ops until the next
-   * idle, so the queue drains FIFO one per turn.
+   * idle, so the queue drains FIFO one per turn. Defaults to the visible conversation.
    */
-  maybeFlushQueuedHead: () => void;
+  maybeFlushQueuedHead: (conversationId?: string) => void;
   /**
    * Flush queued messages for conversations OTHER than the active one, whose
    * status in the `["conversations"]` cache is idle. The active conversation is
@@ -2097,8 +2103,10 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   abortController: null,
   historyGeneration: 0,
 
-  enqueueMessage: (text, files, replyDraft) => {
-    const { conversationId, boundAgentId, sessionHarness, startupPending } = get();
+  enqueueMessage: (text, files, replyDraft, targetId) => {
+    const target = queueTarget(get, targetId);
+    if (target === null) return;
+    const { conversationId, boundAgentId, sessionHarness, startupPending } = target.state;
     if (conversationId === null) return;
     if (startupPending && boundAgentId && !isCompactControl(sessionHarness, text, files)) {
       void get().send(text, boundAgentId, files, {
@@ -2110,7 +2118,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     queueSeq += 1;
     const queueId = `q_${queueSeq}`;
     const stableId = randomUUID().replace(/-/g, "");
-    setActive((s) => ({
+    target.write((s) => ({
       // Queueing consumes the composer like a send does: a restored failed
       // send is no longer what the composer holds, and the queued message
       // carries its own id, so neither the tracker nor the retry id may
@@ -2134,7 +2142,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // A message queued while the agent is idle (a race where the send routed
     // to the queue but the turn had already ended) would otherwise wait for an
     // idle edge that never comes — flush now.
-    get().maybeFlushQueuedHead();
+    get().maybeFlushQueuedHead(targetId);
   },
 
   dequeueMessage: (queueId) => {
@@ -2245,8 +2253,13 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     });
   },
 
-  maybeFlushQueuedHead: () => {
-    const s = get();
+  maybeFlushQueuedHead: (targetId) => {
+    const target = queueTarget(get, targetId);
+    if (target === null) return;
+    const s = target.state;
+    if (targetId !== undefined && targetId !== get().conversationId) {
+      watchEntryQueue(targetId);
+    }
     // Flush once the agent loop is free to take a turn. `waiting` is NOT busy:
     // the turn already ended and only background work (background shells /
     // sub-agents) outlives it, so the server accepts a new turn immediately —
@@ -2275,7 +2288,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // chain started here is safe.
       sendChains.delete(s.conversationId);
       // Clear the latch on THIS conversation's entry only, alongside its status.
-      setActive({ status: "idle", sendLatchedAt: null });
+      target.write({ status: "idle", sendLatchedAt: null });
     }
     // Flush the FIRST message OF THE BOUND CONVERSATION (FIFO within it), not
     // the global array head. The queue is one flat array across conversations,
@@ -2284,7 +2297,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const head = s.queuedMessages.find((m) => m.conversationId === s.conversationId);
     if (head === undefined || head.requiresRetry || head.waitingForHost) return;
     // Remove it BEFORE the POST so a re-entrant flush can't double-send.
-    setActive({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
+    target.write({ queuedMessages: s.queuedMessages.filter((m) => m.queueId !== head.queueId) });
     void s.send(head.text, head.agentId ?? s.boundAgentId, head.files, queuedSendOptions(head));
   },
 
@@ -2293,9 +2306,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     if (queryClient === null || s.queuedMessages.length === 0) return;
 
     // Conversations (other than the active one) that have a queued message.
-    // The active conversation is owned by maybeFlushQueuedHead.
+    // The active conversation and watched side chats are owned by maybeFlushQueuedHead.
     const candidateIds = new Set(
-      s.queuedMessages.map((m) => m.conversationId).filter((id) => id !== s.conversationId),
+      s.queuedMessages
+        .map((m) => m.conversationId)
+        .filter((id) => id !== s.conversationId && !entryDrainedQueues.has(id)),
     );
     if (candidateIds.size === 0) return;
 
@@ -3962,6 +3977,18 @@ function setterForState(conversationId: string): ChatState | null {
   return entry === undefined ? null : entryGetter(entry)();
 }
 
+/** State and writer for a queue's conversation; omitted means the visible one. */
+function queueTarget(
+  get: Getter,
+  conversationId: string | undefined,
+): { state: ChatState; write: Setter } | null {
+  if (conversationId === undefined || conversationId === get().conversationId) {
+    return { state: get(), write: setActive };
+  }
+  const state = setterForState(conversationId);
+  return state === null ? null : { state, write: setterFor(conversationId) };
+}
+
 type LiveSettingField = "reasoningEffort" | "modelOverride";
 
 /** One live pick of a session setting, sharing the confirmed value with overlapping picks. */
@@ -4205,6 +4232,28 @@ conversationRegistry.subscribe((id) => {
   const state = conversationRegistry.peek(id)?.getState();
   if (state !== undefined) rootSetState(state as Parameters<typeof rootSetState>[0]);
 });
+
+// A side chat's queue drains off its own entry, since no page effect watches it.
+const entryDrainedQueues = new Set<string>();
+const scheduledEntryFlushes = new Set<string>();
+function watchEntryQueue(conversationId: string): void {
+  if (useChatStore.getState().queuedMessages.some((m) => m.conversationId === conversationId)) {
+    entryDrainedQueues.add(conversationId);
+  }
+}
+conversationRegistry.subscribe((id) => {
+  if (!entryDrainedQueues.has(id) || scheduledEntryFlushes.has(id)) return;
+  scheduledEntryFlushes.add(id);
+  // Defer past the current write so a send's own state changes can't flush twice.
+  queueMicrotask(() => {
+    scheduledEntryFlushes.delete(id);
+    const { queuedMessages, maybeFlushQueuedHead } = useChatStore.getState();
+    if (queuedMessages.some((m) => m.conversationId === id)) maybeFlushQueuedHead(id);
+    else entryDrainedQueues.delete(id);
+  });
+});
+// Without a live entry there's no status to watch; the background flush takes over.
+conversationRegistry.subscribeDisposed((id) => entryDrainedQueues.delete(id));
 
 type NativeModelFamily = "claude" | "codex";
 

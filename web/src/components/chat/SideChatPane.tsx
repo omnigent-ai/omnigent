@@ -51,9 +51,11 @@ import {
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
+  holdsInitialDraft,
   isCompactControl,
   rejectBusyCompact,
   restoredSendDraftUnchanged,
@@ -62,6 +64,9 @@ import {
   useChatStore,
 } from "@/store/chatStore";
 import { conversationRegistry } from "@/store/conversationRegistry";
+import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { shouldQueueSend } from "@/lib/messageQueue";
 import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -461,6 +466,22 @@ function SideChatComposer({
   const { text, files } = composer ?? EMPTY_SIDE_CHAT_COMPOSER;
   const updateComposer = useChatStore((s) => s.updateSideChatComposer);
   const clearComposer = useChatStore((s) => s.clearSideChatComposer);
+  const enqueueMessage = useChatStore((s) => s.enqueueMessage);
+  const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
+  const dequeueMessage = useChatStore((s) => s.dequeueMessage);
+  const steerMessage = useChatStore((s) => s.steerMessage);
+  const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
+  const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
+  const allQueuedMessages = useChatStore((s) => s.queuedMessages);
+  const queuedMessages = useMemo(
+    () => allQueuedMessages.filter((message) => message.conversationId === childId),
+    [allQueuedMessages, childId],
+  );
+  // Grid sessions keep waiting for the turn to end; side chats queue like the main composer.
+  const queues = !pending && !fullSession;
+  useEffect(() => {
+    if (queues && queuedMessages.length > 0) maybeFlushQueuedHead(childId);
+  }, [queues, queuedMessages, busy, agentId, childId, maybeFlushQueuedHead]);
   const info = useServerInfo();
   const attachmentPolicy = info === "loading" ? null : (info.filesystem_attachments ?? null);
   useEffect(() => {
@@ -742,9 +763,8 @@ function SideChatComposer({
     onTabComplete: completeMenuSelection,
     clearText: () => setText(""),
   });
-  const showInterrupt = !pending && busy;
-  // Side chats accept follow-ups while busy; a grid session waits for its turn to end.
-  const sendBlocked = busy && fullSession;
+  // Like the main composer, a draft turns Interrupt into Send.
+  const showInterrupt = !pending && busy && (fullSession || !canSend);
 
   const interruptSideChat = () => {
     if (interrupting || !interruptReady) return;
@@ -762,7 +782,7 @@ function SideChatComposer({
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
-    if (sendBlocked || !canSend || agentId === null) return;
+    if ((busy && fullSession) || !canSend || agentId === null) return;
     // On in-process harnesses /help and skills resolve locally; native TUIs
     // (claude-native, codex-native) read the text themselves, and a quote or
     // attachment is always an ordinary message.
@@ -798,18 +818,47 @@ function SideChatComposer({
       runSkill(skill);
       return;
     }
-    const outgoing = files;
+    const outgoing = files.length > 0 ? files : undefined;
     const message = serializeReplyDraft({ quotes, text: trimmed });
-    // A running Codex chat refuses /compact; keep the draft as the main composer does.
+    const child = conversationRegistry.peek(childId)?.getState();
+    if (
+      queues &&
+      child !== undefined &&
+      shouldQueueSend(
+        childId,
+        child.status,
+        child.sessionStatus,
+        useChatStore.getState().queuedMessages,
+        readAlwaysSteer(),
+        false,
+        holdsInitialDraft(child),
+      )
+    ) {
+      clearComposer(childId);
+      enqueueMessage(message, outgoing, undefined, childId);
+      return;
+    }
+    // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
     if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
     clearComposer(childId);
-    void send(message, agentId, outgoing.length > 0 ? outgoing : undefined, {
-      pinnedConversationId: childId,
-    }).finally(refreshLabels);
+    void send(message, agentId, outgoing, { pinnedConversationId: childId }).finally(refreshLabels);
   };
 
   const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => {
+    // Mod+Enter submits any draft, then steers the whole queue into the running turn.
+    if (queues && intent.shouldSteerAllFromKeyboard) {
+      event.preventDefault();
+      submit();
+      steerAllQueuedMessages(childId);
+      return;
+    }
     if (slashCompletion.handleKey(event, intent)) return;
+    // Escape interrupts the running turn and keeps the draft, as in the main composer.
+    if (event.key === "Escape" && !pending && busy) {
+      event.preventDefault();
+      interruptSideChat();
+      return;
+    }
     if (intent.shouldSubmitFromKeyboard) {
       event.preventDefault();
       submit();
@@ -842,6 +891,24 @@ function SideChatComposer({
         <ComposerFeedbackRow data-testid="side-chat-command-notice">
           {commandNotice}
         </ComposerFeedbackRow>
+      )}
+      {queues && (
+        <TooltipProvider>
+          <QueuedMessagesStrip
+            messages={queuedMessages}
+            onDelete={dequeueMessage}
+            onEdit={(queueId) => {
+              const target = queuedMessages.find((message) => message.queueId === queueId);
+              if (!target) return;
+              updateComposer(childId, () => ({ text: target.text, files: target.files ?? [] }));
+              dequeueMessage(queueId);
+              tailTextareaRef.current?.focus();
+            }}
+            onSteer={steerMessage}
+            onReorder={reorderQueuedMessage}
+            widthClassName="mx-3 w-auto"
+          />
+        </TooltipProvider>
       )}
       <ChatComposer
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
@@ -939,26 +1006,23 @@ function SideChatComposer({
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
               />
-              {showInterrupt && (
-                <ComposerSendButton
-                  type="button"
-                  label={fullSession ? "Interrupt session" : "Interrupt side chat"}
-                  interrupt
-                  busy={interrupting}
-                  disabled={interrupting || !interruptReady}
-                  onClick={interruptSideChat}
-                  data-testid="side-chat-interrupt"
-                />
-              )}
-              {!sendBlocked && (
-                <ComposerSendButton
-                  type="button"
-                  label={fullSession ? "Send message" : "Send side question"}
-                  disabled={!canSend || !ready}
-                  onClick={submit}
-                  data-testid="side-chat-send"
-                />
-              )}
+              <ComposerSendButton
+                type="button"
+                label={
+                  fullSession
+                    ? showInterrupt
+                      ? "Interrupt session"
+                      : "Send message"
+                    : showInterrupt
+                      ? "Interrupt side chat"
+                      : "Send side question"
+                }
+                interrupt={showInterrupt}
+                busy={showInterrupt && interrupting}
+                disabled={showInterrupt ? interrupting || !interruptReady : !canSend || !ready}
+                onClick={showInterrupt ? interruptSideChat : submit}
+                data-testid={showInterrupt ? "side-chat-interrupt" : "side-chat-send"}
+              />
             </>
           ),
         }}

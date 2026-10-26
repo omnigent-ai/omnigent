@@ -17620,6 +17620,47 @@ describe("chatStore — client-side message queue", () => {
     },
   );
 
+  it("queues a side chat's follow-up on its own entry and drains it when that turn ends", async () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main", sessionStatus: "running" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+    seedConversationsCache([conv("conv_main", "running"), conv("conv_side", "idle")]);
+    const posts = (id: string) =>
+      fetchMock.mock.calls
+        .filter(
+          ([u, init]) =>
+            u === `/v1/sessions/${id}/events` && (init as RequestInit)?.method === "POST",
+        )
+        .map(([, init]) => JSON.parse((init as RequestInit).body as string));
+
+    useChatStore.getState().enqueueMessage("side follow-up", undefined, undefined, "conv_side");
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({
+        text: "side follow-up",
+        conversationId: "conv_side",
+        agentId: "agent_side",
+      }),
+    ]);
+    // The side chat's entry owns this queue, not the sidebar-driven background flush.
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    expect(posts("conv_side")).toEqual([]);
+
+    side.setState({ sessionStatus: "idle" });
+    await tick();
+    expect(posts("conv_side")).toEqual([
+      expect.objectContaining({
+        type: "message",
+        data: expect.objectContaining({
+          content: [{ type: "input_text", text: "side follow-up" }],
+        }),
+      }),
+    ]);
+    expect(posts("conv_main")).toEqual([]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
   it.each(
     ["compaction_completed", "compaction_failed", "pi_compact_unavailable"].flatMap((terminal) =>
       [false, true].map((background) => [terminal, background] as const),
