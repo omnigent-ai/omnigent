@@ -111,7 +111,7 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    "failure", ["timeout", "non_json", "null", "list", 408, 429, 500, 502, 503, 504]
+    "failure", ["timeout", "non_json", "null", "list", "empty", "non_bool", 408, 429, 503]
 )
 @pytest.mark.parametrize("after_routing", [False, True])
 async def test_message_timeout_is_not_retried(failure, after_routing):
@@ -127,6 +127,8 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
             return httpx.Response(202, text="Accepted")
         if failure in ("null", "list"):
             return httpx.Response(202, text="null" if failure == "null" else "[]")
+        if failure in ("empty", "non_bool"):
+            return httpx.Response(202, json={} if failure == "empty" else {"queued": 1})
         if isinstance(failure, int):
             return httpx.Response(failure)
         raise httpx.ReadTimeout("uncertain")
@@ -145,7 +147,7 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("status", [403, 502])
+@pytest.mark.parametrize("status", [403, 502, "policy_denied"])
 async def test_same_host_first_task_failure_returns_created_session(status):
     session_id = uuid4().hex
     requests = []
@@ -153,6 +155,10 @@ async def test_same_host_first_task_failure_returns_created_session(status):
     def respond(request):
         requests.append(request)
         if request.url.path.endswith("/events"):
+            if status == "policy_denied":
+                return httpx.Response(
+                    202, json={"queued": False, "denied": True, "reason": "Task needs approval"}
+                )
             return httpx.Response(status, text="First task unavailable")
         return httpx.Response(201, json={"id": session_id})
 
@@ -174,7 +180,80 @@ async def test_same_host_first_task_failure_returns_created_session(status):
     assert "Session created" in result["error"]
     assert "do not automatically resend" in result["error"]
     assert result["initial_message"]["error"]
+    if status == "policy_denied":
+        assert "Task needs approval" in result["error"]
+        assert result["initial_message"]["denied"] is True
     assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("placement", ["same_host", "managed"])
+@pytest.mark.parametrize(
+    "failure", ["timeout", "non_json", "null", "list", "missing_id", "invalid_id", 408, 429, 503]
+)
+async def test_independent_creation_uncertain_result_is_not_retried(placement, failure):
+    requests = []
+
+    def respond(request):
+        if request.url.path == "/v1/info":
+            return httpx.Response(200, json={"request_managed_sandbox_host_id": True})
+        requests.append(request)
+        assert request.url.path == "/v1/sessions/orchestrated"
+        if isinstance(failure, int):
+            return httpx.Response(failure)
+        if failure == "timeout":
+            raise httpx.ReadTimeout("Response lost after creation")
+        bodies = {
+            "non_json": "Created",
+            "null": "null",
+            "list": "[]",
+            "missing_id": "{}",
+            "invalid_id": '{"id": 123}',
+        }
+        return httpx.Response(201, text=bodies[failure])
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": placement, "message": "Start"}
+                ),
+                server_client=client,
+                conversation_id=uuid4().hex,
+            )
+        )
+    assert "creation could not be confirmed" in result["error"]
+    assert "inspect your sessions before creating another" in result["error"]
+    assert "do not automatically retry" in result["error"]
+    assert "conversation_id" not in result
+    assert len(requests) == 1
+
+
+@pytest.mark.asyncio
+async def test_managed_create_info_failure_does_not_attempt_creation():
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        return httpx.Response(503)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps({"agent_id": "worker", "placement": "managed"}),
+                server_client=client,
+                conversation_id=uuid4().hex,
+            )
+        )
+    assert "sys_session_create failed" in result["error"]
+    assert "could not be confirmed" not in result["error"]
+    assert [r.url.path for r in requests] == ["/v1/info"]
 
 
 @pytest.mark.asyncio

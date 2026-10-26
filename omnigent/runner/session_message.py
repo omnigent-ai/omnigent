@@ -54,8 +54,14 @@ async def execute_message_tool(
         return json.dumps({"error": "Session message refused", "detail": response.text[:1000]})
     try:
         acknowledgement = response.json()
-        if not isinstance(acknowledgement, dict):
-            raise ValueError("Expected a delivery acknowledgement object")
+        if not isinstance(acknowledgement, dict) or not isinstance(
+            acknowledgement.get("queued"), bool
+        ):
+            raise ValueError("Expected a delivery acknowledgement with boolean queued")
+        if acknowledgement.get("denied") is True:
+            acknowledgement["error"] = (
+                f"Session message denied by policy: {acknowledgement.get('reason', 'Denied')}"
+            )
         return json.dumps(acknowledgement)
     except ValueError:
         return json.dumps(

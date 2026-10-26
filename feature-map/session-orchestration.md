@@ -24,7 +24,8 @@ workers on its host or a new managed sandbox. This is behind the disabled-by-def
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
-  acknowledgements are uncertain and must not auto-retry.
+  acknowledgements are uncertain and must not auto-retry. After uncertain
+  creation, inspect existing sessions before creating another worker.
 
 ## How to get to it (user POV)
 
@@ -76,6 +77,9 @@ can supply their own provider through the existing launcher interface.
   If the same-host worker is created but its first task is not confirmed, the
   result includes a top-level error and the created session ID. Inspect that
   session before continuing; do not automatically create a replacement or resend.
+  A policy-denied first task also returns an error with the policy reason, while
+  retaining the worker ID. Message acknowledgements require a boolean `queued`;
+  `queued: false` alone means synchronous handling, not denial.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
 - A shared receiver can continue working but cannot message back while shared.

@@ -3558,6 +3558,13 @@ async def _execute_session_create(
                 body["initial_input"] = initial_items[0]
         else:
             body.pop("initial_items", None)
+    unconfirmed_creation = json.dumps(
+        {
+            "error": "Session creation could not be confirmed; "
+            "inspect your sessions before creating another; do not automatically retry",
+        }
+    )
+    create_requested = False
     try:
         endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
         if placement == "managed":
@@ -3570,13 +3577,19 @@ async def _execute_session_create(
             )
             if host_id is not None:
                 body["host_id"] = host_id
+            create_requested = True
             resp = await post_on_host(
                 server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
             )
         else:
+            create_requested = True
             resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
+        if placement != "child" and create_requested:
+            return unconfirmed_creation
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
+    if placement != "child" and (resp.status_code >= 500 or resp.status_code in (408, 429)):
+        return unconfirmed_creation
     if placement != "child" and resp.status_code in (404, 405):
         return json.dumps(
             {
@@ -3595,8 +3608,17 @@ async def _execute_session_create(
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
         )
-    data = resp.json()
+    try:
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError("Expected a session object")
+    except ValueError:
+        if placement != "child":
+            return unconfirmed_creation
+        return json.dumps({"error": "server did not return a child session id"})
     if not isinstance(data.get("id"), str) or not data["id"]:
+        if placement != "child":
+            return unconfirmed_creation
         return json.dumps({"error": "server did not return a child session id"})
     if placement != "child":
         handle: dict[str, object] = {
@@ -3620,7 +3642,8 @@ async def _execute_session_create(
             if initial_message.get("error"):
                 handle["status"] = "created_initial_message_failed"
                 handle["error"] = (
-                    "Session created, but its first task was not confirmed; "
+                    f"Session created, but its first task was refused or not confirmed "
+                    f"({initial_message['error']}); "
                     "inspect this session before continuing. Do not create a replacement; "
                     "do not automatically resend the task."
                 )

@@ -51,12 +51,28 @@ async def _send(client, source, target, message="Please inspect the PR"):
     )
 
 
-async def test_private_sender_can_message_shared_receiver(auth_client, peers, db_uri):
+@pytest.mark.parametrize("policy_denied", [False, True])
+async def test_private_sender_can_message_shared_receiver(
+    auth_client, peers, db_uri, monkeypatch, policy_denied
+):
+    from omnigent.server.routes.sessions import routes_events
+
     source, target, captured = peers
     permissions = SqlAlchemyPermissionStore(db_uri)
     permissions.ensure_user("bob")
     permissions.grant("bob", target["id"], LEVEL_READ)
+    if policy_denied:
+
+        async def deny_task(*args, **kwargs):
+            return {"verdict": "deny", "reason": "Task needs approval"}
+
+        monkeypatch.setattr(routes_events, "_evaluate_input_policy", deny_task)
     result = await _send(auth_client, source, target)
+    if policy_denied:
+        assert "Task needs approval" in result["error"]
+        assert result["denied"] is True and result["queued"] is False
+        assert not captured.get("posts")
+        return
     assert result.get("queued") is True, result
     assert "Please inspect the PR" in json.dumps(captured)
     items = await auth_client.get(f"/v1/sessions/{target['id']}/items")
@@ -451,17 +467,32 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
     assert permissions.list_for_user("alice") == before_grants
 
 
-@pytest.mark.parametrize("child_manager", [False, True])
-@pytest.mark.parametrize("move_before_recheck", [False, True])
+@pytest.mark.parametrize(
+    "child_manager,move_before_recheck,policy_denied",
+    [
+        (False, False, False),
+        (True, False, False),
+        (False, True, False),
+        (True, True, False),
+        (False, False, True),
+    ],
+)
 async def test_same_host_creation_uses_current_source_and_stays_private(
-    auth_client, auth_app, peers, db_uri, monkeypatch, move_before_recheck, child_manager
+    auth_client,
+    auth_app,
+    peers,
+    db_uri,
+    monkeypatch,
+    move_before_recheck,
+    child_manager,
+    policy_denied,
 ):
     from omnigent.host.frames import HostLaunchRunnerFrame, HostStatFrame, decode_host_frame
-    from omnigent.server.routes.sessions import routes_core
+    from omnigent.server.routes.sessions import routes_core, routes_events
     from omnigent.server.sharing_settings import DefaultPublicSessions
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
-    source, _, _ = peers
+    source, _, captured = peers
     hosts = [uuid4().hex for _ in range(3)]
     for host_id, owner in zip(hosts, ("alice", "alice", "bob"), strict=True):
         _register_online_host(auth_app, host_id, owner)
@@ -504,13 +535,42 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
             pytest.fail(f"Unexpected host frame: {frame}")
 
     monkeypatch.setattr(auth_app.state.host_registry, "send_text", answer_host)
-    response = await auth_client.post(
-        "/v1/sessions/orchestrated",
-        headers={ORCHESTRATION_SOURCE_HEADER: manager["id"]},
-        json={"agent_id": source["agent_id"], "host_id": hosts[2], "workspace": "/requested"},
-    )
-    assert response.status_code == 201, response.text
-    created = store.get_conversation(response.json()["id"])
+    if policy_denied:
+
+        async def deny_task(*args, **kwargs):
+            return {"verdict": "deny", "reason": "Task needs approval"}
+
+        monkeypatch.setattr(routes_events, "_evaluate_input_policy", deny_task)
+        before = {s.id for s in store.list_conversations().data}
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {
+                        "agent_id": source["agent_id"],
+                        "placement": "same_host",
+                        "message": "Start",
+                    }
+                ),
+                server_client=auth_client,
+                conversation_id=manager["id"],
+            )
+        )
+        assert result["status"] == "created_initial_message_failed", result
+        assert "Task needs approval" in result["error"]
+        assert result["initial_message"]["denied"] is True
+        assert all(path == "/v1/sessions" for path, _ in captured.get("posts", []))
+        created_id = result["conversation_id"]
+        assert {s.id for s in store.list_conversations().data} - before == {created_id}
+    else:
+        response = await auth_client.post(
+            "/v1/sessions/orchestrated",
+            headers={ORCHESTRATION_SOURCE_HEADER: manager["id"]},
+            json={"agent_id": source["agent_id"], "host_id": hosts[2], "workspace": "/requested"},
+        )
+        assert response.status_code == 201, response.text
+        created_id = response.json()["id"]
+    created = store.get_conversation(created_id)
     expected_host = hosts[1] if move_before_recheck else hosts[0]
     expected_workspace = "/moved" if move_before_recheck else "/original"
     assert checks == 2
