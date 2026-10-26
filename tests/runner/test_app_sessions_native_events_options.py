@@ -2175,18 +2175,24 @@ async def test_events_model_change_confirms_against_the_status_file(
             204,
         ),
         ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7[1m]", 204),
+        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7[1m]", 204),
+        ("opus[1m]", "system.ai.claude-opus-4-7[1M]", "claude-opus-4-7[1m]", 204),
         ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-6[1m]", 503),
         ("opus", "system.ai.claude-opus-4-7[1m]", "system.ai.claude-opus-4-7", 503),
         ("opus[1m]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
+        ("OPUS[1M]", "system.ai.claude-opus-4-7", "claude-opus-4-7", 503),
         ("opus", None, "claude-opus-4-7", 503),
     ],
     ids=[
         "gateway-pin",
         "canonical-spelling",
         "bracket-alias",
+        "uppercase-bracket-alias",
+        "uppercase-pin-marker",
         "different-generation",
         "different-context",
         "bracket-alias-different-context",
+        "uppercase-bracket-alias-different-context",
         "unpinned-alias",
     ],
 )
@@ -2216,16 +2222,27 @@ async def test_events_model_change_confirms_unchanged_model_against_launch_pin(
     assert resp.status_code == status_code, resp.text
 
 
+@pytest.mark.parametrize("translation", ["alias", "custom-slot", "picker"])
+@pytest.mark.parametrize("marker", ["[1m]", "[1M]"])
 async def test_events_model_change_does_not_confirm_plain_pin_for_marked_selection(
     monkeypatch: pytest.MonkeyPatch,
+    translation: str,
+    marker: str,
 ) -> None:
-    """An alias translation must not confirm the plain sibling of a 1M pick."""
+    """A translation must not confirm the plain sibling of a 1M pick."""
+    plain = "system.ai.claude-opus-4-7"
+    model_env = {
+        "alias": {"ANTHROPIC_DEFAULT_OPUS_MODEL": plain},
+        "custom-slot": {"ANTHROPIC_CUSTOM_MODEL_OPTION": plain},
+        "picker": {},
+    }[translation]
     resp = await _post_model_change_with_status_sequence(
         monkeypatch,
         ["claude-opus-4-7"],
-        model="system.ai.claude-opus-4-7[1m]",
-        model_env={"ANTHROPIC_DEFAULT_OPUS_MODEL": "system.ai.claude-opus-4-7"},
-        expected_command="/model opus",
+        model=plain + marker,
+        model_env=model_env,
+        picker_values=(plain,) if translation == "picker" else (),
+        expected_command="/model opus" if translation == "alias" else f"/model {plain}",
     )
     assert resp.status_code == 503, resp.text
     assert resp.json()["error"] == "claude_native_model_unconfirmed"

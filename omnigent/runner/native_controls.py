@@ -1493,11 +1493,17 @@ def build_native_controls(
         if not bound_model:
             # A repeated alias pick keeps the same model; its launch pin proves
             # the exact generation even when the options cache is cold.
+            long_context_requested = any(
+                value.lower().endswith("[1m]")
+                for value in (selected_model, resolved_model or "", model_arg)
+            )
             pinned = alias_pins(env or {}).get(model_arg.lower().removesuffix("[1m]"))
             if pinned:
-                if model_arg.endswith("[1m]") or (resolved_model or "").endswith("[1m]"):
-                    pinned = pinned.removesuffix("[1m]") + "[1m]"
+                if long_context_requested and not pinned.lower().endswith("[1m]"):
+                    pinned += "[1m]"
                 expected.add(pinned)
+            if long_context_requested:
+                expected = {value for value in expected if value.lower().endswith("[1m]")}
             expected.update(
                 canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
             )
