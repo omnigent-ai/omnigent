@@ -1614,7 +1614,8 @@ def _publish_elicitation_request_to_ancestors(
     :param conv_store: Store used to discover ancestor sessions.
     :param session_id: Child session that owns the elicitation,
         e.g. ``"conv_child123"``.
-    :param event: Original ``response.elicitation_request`` event.
+    :param event: Event whose ``elicitation_id`` selects the child's current
+        entry; mirrored as-is only when it has no id.
     """
     ancestor_ids = _ancestor_session_ids(conv_store, session_id)
     if not ancestor_ids:
@@ -1655,6 +1656,8 @@ def _publish_elicitation_resolved_to_ancestors(
     """
     ancestor_ids = _ancestor_session_ids(conv_store, session_id)
     with _ancestor_elicitation_mirror_lock:
+        if pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None:
+            return  # The child re-asked under this id; its request mirror owns the card.
         for ancestor_id in ancestor_ids:
             _publish_elicitation_resolved(
                 ancestor_id, elicitation_id, action=action, reason=reason
