@@ -6097,7 +6097,11 @@ async def test_terminated_cli_client_is_evicted_and_turn_recovers(
     ):
         events = [e async for e in executor.run_turn(messages, [], "")]
 
-    lifecycle = [r.attributes for r in caplog.records if getattr(r, "event_name", None)]
+    lifecycle = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_sdk_client_lifecycle"
+    ]
     assert [r["sdk_action"] for r in lifecycle] == [
         "exit_observed",
         "close_requested",
