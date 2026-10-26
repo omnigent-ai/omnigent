@@ -157,7 +157,7 @@ def test_build_claude_native_base_args(
                 "b.json",
             ],
             "sid-123",
-            False,
+            True,
             (
                 "--resume",
                 "sid-123",
@@ -168,7 +168,16 @@ def test_build_claude_native_base_args(
                 "b.json",
             ),
         ),
-        (None, None, ["old prompt"], "sid-123", False, ("--resume", "sid-123")),
+        (None, None, ["old prompt"], "sid-123", True, ("--resume", "sid-123")),
+        # An older client's explicit ``--resume -p`` prompt has not run yet.
+        (
+            None,
+            None,
+            ["new prompt", "--verbose"],
+            "sid-123",
+            False,
+            ("--resume", "sid-123", "new prompt", "--verbose"),
+        ),
         (
             None,
             None,
@@ -200,6 +209,7 @@ def test_build_claude_native_base_args(
         "no-resume",
         "legacy-prompt-omitted",
         "legacy-prompt-only",
+        "unconsumed-legacy-prompt-kept-on-resume",
         "legacy-prompt-omitted-without-transcript",
         "flag-values-preserved",
     ],
@@ -233,6 +243,75 @@ def test_build_claude_native_base_args_resume_prefix(
         )
         == expected
     )
+
+
+@pytest.mark.parametrize(
+    ("terminal_launch_args", "items_status", "user_texts", "has_prior_history", "expected"),
+    [
+        (["--verbose"], 200, ["--verbose"], True, False),
+        (["old prompt\nsecond line", "--verbose"], 200, ["old prompt\nsecond line"], False, True),
+        (["new prompt", "--verbose"], 200, ["old prompt"], True, False),
+        (["old prompt"], 500, [], True, True),
+        (["old prompt"], 500, [], False, False),
+        (["old prompt"], None, [], True, True),
+    ],
+    ids=[
+        "no-legacy-prompt",
+        "recorded-prompt-consumed",
+        "explicit-resume-prompt-kept",
+        "unreadable-history-with-prior-session",
+        "unreadable-history-fresh-session",
+        "offline-with-prior-session",
+    ],
+)
+async def test_claude_legacy_prompt_consumed(
+    terminal_launch_args: list[str],
+    items_status: int | None,
+    user_texts: list[str],
+    has_prior_history: bool,
+    expected: bool,
+) -> None:
+    """Only a stored prompt already recorded as a user turn is omitted."""
+    import httpx
+
+    from omnigent.runner.native.orchestration import _claude_legacy_prompt_consumed
+
+    requested_paths: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requested_paths.append(request.url.path)
+        assert items_status is not None
+        return httpx.Response(
+            items_status,
+            json={
+                "data": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": text}],
+                    }
+                    for text in user_texts
+                ]
+            },
+        )
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as client:
+        consumed = await _claude_legacy_prompt_consumed(
+            server_client=client if items_status is not None else None,
+            session_id="conv_legacy",
+            terminal_launch_args=terminal_launch_args,
+            has_prior_history=has_prior_history,
+        )
+
+    assert consumed is expected
+    expected_paths = (
+        ["/v1/sessions/conv_legacy/items"]
+        if items_status is not None and not terminal_launch_args[0].startswith("-")
+        else []
+    )
+    assert requested_paths == expected_paths
 
 
 def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resume() -> None:

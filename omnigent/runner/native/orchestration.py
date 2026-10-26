@@ -7725,6 +7725,52 @@ def _is_runner_owned_antigravity_terminal(
     )
 
 
+def _claude_legacy_launch_prompt(terminal_launch_args: list[str] | None) -> str | None:
+    """
+    Return the ``-p`` prompt older clients stored ahead of the launch flags.
+
+    :param terminal_launch_args: Persisted pass-through args, e.g.
+        ``["hello", "--permission-mode", "auto"]``.
+    :returns: The leading positional, e.g. ``"hello"``, or ``None``.
+    """
+    if not terminal_launch_args or terminal_launch_args[0].startswith("-"):
+        return None
+    return terminal_launch_args[0]
+
+
+async def _claude_legacy_prompt_consumed(
+    *,
+    server_client: httpx.AsyncClient | None,
+    session_id: str,
+    terminal_launch_args: list[str] | None,
+    has_prior_history: bool,
+) -> bool:
+    """
+    Report whether a stored legacy launch prompt already ran on the session.
+
+    Older clients stored ``-p`` in the launch args both on create and on an
+    explicit resume, so only a prompt already recorded as a user turn is a
+    replay. When history is unreadable, a session with prior history is
+    treated as having consumed it.
+
+    :param server_client: Runner→server client, or ``None`` when offline.
+    :param session_id: Session id, e.g. ``"conv_abc123"``.
+    :param terminal_launch_args: Persisted pass-through args.
+    :param has_prior_history: Whether the session resumes or carries history.
+    :returns: ``True`` when the leading prompt must be omitted.
+    """
+    prompt = _claude_legacy_launch_prompt(terminal_launch_args)
+    if prompt is None:
+        return False
+    if server_client is not None:
+        from omnigent.runner.turn_routing import _prompt_already_ran
+
+        already_ran = await _prompt_already_ran(session_id, prompt, server_client)
+        if already_ran is not None:
+            return already_ran
+    return has_prior_history
+
+
 def _build_claude_native_base_args(
     *,
     reasoning_effort: str | None,
@@ -7760,7 +7806,7 @@ def _build_claude_native_base_args(
     :param terminal_launch_args: The user's pass-through CLI args,
         e.g. ``["--dangerously-skip-permissions"]``. ``None`` or an
         empty list contributes nothing. A legacy leading positional
-        prompt is omitted when resuming.
+        prompt is omitted when ``skip_initial_prompt`` is set.
     :param resume_external_session_id: Claude-native session id to
         resume, e.g. ``"02857840-6362-408f-b41f-309e396ed7c6"``.
         Prepended as ``--resume <value>`` so Claude reopens the prior
@@ -7770,8 +7816,8 @@ def _build_claude_native_base_args(
         the same plain ``--resume`` path serves both cold resume and
         fork resume. ``None`` (a fresh launch, or no local transcript
         could be synthesized) adds nothing.
-    :param skip_initial_prompt: Also omit a legacy prompt when resuming
-        history failed and the terminal must launch without ``--resume``.
+    :param skip_initial_prompt: Omit a legacy leading prompt that the
+        session already ran (see :func:`_claude_legacy_prompt_consumed`).
     :returns: The assembled base args, e.g.
         ``("--resume", "<sid>", "--effort", "high")``.
     """
@@ -7783,10 +7829,9 @@ def _build_claude_native_base_args(
     if reasoning_effort is not None and reasoning_effort in CLAUDE_EFFORTS:
         args.extend(("--effort", reasoning_effort))
     if terminal_launch_args:
-        # Older clients persisted the prompt first, before all flag values.
         skip_leading_prompt = (
-            resume_external_session_id is not None or skip_initial_prompt
-        ) and not terminal_launch_args[0].startswith("-")
+            skip_initial_prompt and _claude_legacy_launch_prompt(terminal_launch_args) is not None
+        )
         args.extend(terminal_launch_args[1:] if skip_leading_prompt else terminal_launch_args)
     # model_override is a default: it applies only when the user did
     # not pass their own ``--model`` (in either the long ``--model X``
@@ -9286,7 +9331,16 @@ async def _auto_create_claude_terminal(
         model_override=launch_model,
         terminal_launch_args=session_launch_args,
         resume_external_session_id=resume_external_session_id,
-        skip_initial_prompt=session_external_id is not None or fork_source_external_id is not None,
+        skip_initial_prompt=await _claude_legacy_prompt_consumed(
+            server_client=server_client,
+            session_id=session_id,
+            terminal_launch_args=session_launch_args,
+            has_prior_history=(
+                session_external_id is not None
+                or fork_source_external_id is not None
+                or fork_carry_history
+            ),
+        ),
     )
 
     # Pass ``ap_server_url`` so ``build_hook_settings`` registers the
