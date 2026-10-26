@@ -2817,7 +2817,7 @@ def augment_claude_args(
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
-        launch_effort=_arg_value(claude_args, "--effort"),
+        launch_effort=_launch_effort_arg(claude_args),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )
@@ -2877,6 +2877,12 @@ def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
             if candidate and not candidate.startswith("--"):
                 value = candidate
     return value
+
+
+def _launch_effort_arg(args: tuple[str, ...]) -> str | None:
+    """Return the valid ``--effort`` in ``args``, trimmed and lowercased as Claude does."""
+    effort = (_arg_value(args, "--effort") or "").strip().lower()
+    return effort if effort in CLAUDE_EFFORTS else None
 
 
 def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
@@ -8541,29 +8547,17 @@ def resolve_launch_effort_level(claude_args: tuple[str, ...]) -> str | None:
     """
     Return the effort the wrapped ``claude`` will run at for ``claude_args``.
 
-    The last pass-through ``--effort`` wins, as for Claude itself, when it
-    names a valid effort in any case; otherwise fall back to
-    :func:`read_user_effort_level`.
+    A valid pass-through ``--effort`` wins. When a later ``--effort`` is
+    malformed, Claude falls back to the same value through the invocation
+    ``effortLevel`` that :func:`augment_claude_args` writes from it.
+    Otherwise fall back to :func:`read_user_effort_level`.
 
     :param claude_args: Pass-through Claude CLI args, e.g.
         ``("--effort", "xhigh")``.
     :returns: A recognized effort, e.g. ``"xhigh"``; ``None`` when neither
         the args nor ``~/.claude/settings.json`` carry a valid one.
     """
-    effort = ""
-    # Unlike _arg_value, keep an empty or flag-like last value: Claude takes
-    # the token after --effort as its value and ignores earlier occurrences.
-    tokens = iter(claude_args)
-    for arg in tokens:
-        if arg == "--effort":
-            effort = next(tokens, "")
-        elif arg.startswith("--effort="):
-            effort = arg.removeprefix("--effort=")
-    # Claude trims and lowercases the value before validating it.
-    effort = effort.strip().lower()
-    if effort in CLAUDE_EFFORTS:
-        return effort
-    return read_user_effort_level()
+    return _launch_effort_arg(claude_args) or read_user_effort_level()
 
 
 def _usage_from_transcript_entry(entry: _JsonObject) -> dict[str, int] | None:

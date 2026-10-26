@@ -8123,10 +8123,10 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
         (("--model", "opus"), "high"),
         (("--effort", "ultra"), "high"),
         (("--effort", "xhigh", "--effort", "ultra"), "high"),
-        (("--effort", "low", "--effort="), "high"),
-        (("--effort", "low", "--effort", "--verbose"), "high"),
+        (("--effort", "low", "--effort="), "low"),
+        (("--effort", "low", "--effort", "--verbose"), "low"),
         (("--effort", "XHIGH"), "xhigh"),
-        (("--effort=Low",), "low"),
+        (("--effort", "LOW", "--effort="), "low"),
         (("--effort", " max\n"), "max"),
         (("--effort", "low", "--effort", " "), "high"),
     ],
@@ -8137,11 +8137,18 @@ def test_resolve_launch_effort_level_prefers_passed_effort(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A valid pass-through ``--effort`` wins over settings.json's ``effortLevel``."""
+    """
+    A valid pass-through ``--effort`` wins over settings.json's ``effortLevel``.
+
+    Claude falls back to the wrapper's invocation ``effortLevel`` when the last
+    ``--effort`` is malformed, so any value written there must match the stamp.
+    """
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
     assert claude_native_bridge.resolve_launch_effort_level(claude_args) == expected
+    invocation = _load_invocation_settings(augment_claude_args(claude_args, bridge_dir=tmp_path))
+    assert invocation.get("effortLevel") in (None, expected)
 
 
 # ---------------------------------------------------------------------------
