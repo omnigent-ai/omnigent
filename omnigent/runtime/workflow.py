@@ -1612,10 +1612,10 @@ def _build_genie_spawn_env(
     Same shape as :func:`_build_codex_spawn_env` (genie is Databricks' codex
     fork), keyed by the ``HARNESS_GENIE_*`` vars in
     ``omnigent/inner/genie_harness.py``. A Databricks provider is brokered
-    exactly as for codex. Genie has no login of its own, so a launch with no
-    usable provider fails here instead of letting the executor pick the
-    default ``~/.databrickscfg`` profile. Codex's dismissed-``config.toml``
-    provider handling has no genie equivalent.
+    exactly as for codex. An implicit Codex-owned provider leaves Genie on
+    its own CLI configuration; explicit selections must be Genie-compatible.
+    A launch with no provider fails instead of selecting an arbitrary
+    ``~/.databrickscfg`` profile.
 
     :param spec: The agent spec.
     :param cwd: Session workspace, threaded as ``HARNESS_GENIE_CWD``.
@@ -1626,17 +1626,34 @@ def _build_genie_spawn_env(
     :raises OmnigentError: If no provider genie can use resolves.
     """
     env: dict[str, str] = {}
-    model = _resolve_spec_model(spec)
+    model = _resolve_bound_launch_model(spec, "genie")
     if model is not None:
         env["HARNESS_GENIE_MODEL"] = model
     provider = _resolve_provider_for_build(spec, harness_type="genie", for_launch=True)
-    if provider is None or provider.kind == SUBSCRIPTION_KIND:
+    if (
+        provider is not None
+        and provider.cli == "codex"
+        and provider.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND)
+    ):
+        from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+        binding = binding_for_harness(load_runtime_inference_config(load_config()), "genie")
+        if isinstance(spec.executor.auth, ProviderAuth) or binding is not None:
+            raise OmnigentError(
+                f"provider {provider.name!r} uses Codex-owned credentials, which Genie "
+                "cannot consume. Select a Databricks or OpenAI-compatible provider in "
+                "executor.auth / inference.harnesses.genie, or remove the explicit "
+                "selection to use Genie's own CLI configuration.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+        env["HARNESS_GENIE_GATEWAY"] = "0"
+    elif provider is None or provider.kind == SUBSCRIPTION_KIND:
         raise OmnigentError(
             "The 'genie' harness needs a Databricks workspace or an OpenAI-compatible "
             f"provider. Run `{cli_invocation()} setup` and add one for Genie.",
             code=ErrorCode.INVALID_INPUT,
         )
-    if provider.kind == DATABRICKS_KIND:
+    elif provider.kind == DATABRICKS_KIND:
         _configure_brokered_codex_with_ucode(env, spec, provider, harness_type="genie")
     else:
         configure_agent_harness_with_provider(env, provider, harness_type="genie")

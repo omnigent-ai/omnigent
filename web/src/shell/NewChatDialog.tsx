@@ -94,6 +94,7 @@ import { Spinner } from "@/components/ui/spinner";
 import { LaptopDbcertBanner } from "@/components/DbcertBanner";
 import { iconForAgent } from "@/components/AgentCard";
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
+import genieCodeLogo from "@/assets/genie-code-logo.svg";
 import { showToast } from "@/components/ui/toast";
 import {
   CLAUDE_NATIVE_EFFORTS,
@@ -1095,6 +1096,7 @@ const COMPOSER_HARNESS_ICONS: Record<
   string,
   { src: string; invertInDark: boolean; className?: string }
 > = {
+  genie: { src: genieCodeLogo, invertInDark: false },
   claude: {
     src: claudeCodeLogo,
     invertInDark: false,
@@ -1136,7 +1138,8 @@ export function ComposerAgentIcon({
     );
   }
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-  const product = nativeAgent ? COMPOSER_HARNESS_ICONS[nativeAgent.iconKind] : undefined;
+  const iconKind = agent.harness === "genie" ? "genie" : nativeAgent?.iconKind;
+  const product = iconKind ? COMPOSER_HARNESS_ICONS[iconKind] : undefined;
   const FallbackIcon = iconForAgent(agent);
   return product ? (
     <img

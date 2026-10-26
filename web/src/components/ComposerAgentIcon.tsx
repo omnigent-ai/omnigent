@@ -1,10 +1,12 @@
 import claudeCodeLogo from "@/assets/claude-code-logo.svg";
+import genieCodeLogo from "@/assets/genie-code-logo.svg";
 import { iconForAgent } from "@/components/AgentCard";
 import type { AvailableAgent } from "@/hooks/useAvailableAgents";
 import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { cn } from "@/lib/utils";
 
 const HARNESS_ICONS: Record<string, { src: string; invertInDark: boolean; className?: string }> = {
+  genie: { src: genieCodeLogo, invertInDark: false },
   claude: {
     src: claudeCodeLogo,
     invertInDark: false,
@@ -46,14 +48,15 @@ export function ComposerAgentIcon({
     );
   }
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
-  const product = nativeAgent ? HARNESS_ICONS[nativeAgent.iconKind] : undefined;
+  const iconKind = agent.harness === "genie" ? "genie" : nativeAgent?.iconKind;
+  const product = iconKind ? HARNESS_ICONS[iconKind] : undefined;
   const FallbackIcon = iconForAgent(agent);
   return product ? (
     <img
       src={product.src}
       alt=""
       aria-hidden="true"
-      data-harness-icon={nativeAgent?.iconKind}
+      data-harness-icon={iconKind}
       className={cn(
         "size-4 shrink-0 object-contain",
         product.className,
@@ -65,7 +68,7 @@ export function ComposerAgentIcon({
     <FallbackIcon
       className={cn("size-4 shrink-0", className)}
       aria-hidden="true"
-      data-harness-icon={nativeAgent?.iconKind}
+      data-harness-icon={iconKind}
     />
   );
 }
