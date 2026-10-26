@@ -184,6 +184,8 @@ class Session:
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
     :param host_id: Host owning this session's runner, or ``None`` when unbound.
+    :param pending_elicitations: Outstanding approval requests for reconciliation
+        after subscribing to the live stream.
     """
 
     id: str
@@ -206,6 +208,7 @@ class Session:
     external_session_id: str | None = None
     archived: bool = False
     host_id: str | None = None
+    pending_elicitations: list[dict[str, Any]] = field(default_factory=list)
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -222,6 +225,7 @@ class Session:
         raw_cw = raw.get("context_window")
         raw_ltt = raw.get("last_total_tokens")
         raw_updated_at = raw.get("updated_at")
+        pending = raw.get("pending_elicitations")
         return cls(
             id=str(raw["id"]),
             agent_id=str(raw["agent_id"]),
@@ -243,6 +247,9 @@ class Session:
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
             host_id=raw.get("host_id"),
+            pending_elicitations=[item for item in pending if isinstance(item, dict)]
+            if isinstance(pending, list)
+            else [],
         )
 
 

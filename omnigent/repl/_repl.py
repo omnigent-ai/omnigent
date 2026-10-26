@@ -1336,6 +1336,9 @@ def _server_event_to_sdk_event(event: object) -> object | None:
     return None
 
 
+_STREAM_SUBSCRIBE_TIMEOUT_S = 30.0
+
+
 class _SessionsChatReplAdapter:
     """
     Sessions-API adapter for the REPL.
@@ -1466,6 +1469,9 @@ class _SessionsChatReplAdapter:
         # Set by run_repl() to the rendering callback.
         self._on_event: Callable[[object], None] | None = None
         self._stream_task: asyncio.Task[None] | None = None
+        self._stream_subscription: asyncio.Future[Exception | None] | None = None
+        self._active_elicitation_ids: set[str] = set()
+        self._resolved_elicitation_ids: set[str] = set()
         self._recover_task: asyncio.Task[None] | None = None
         self._recover_lock = asyncio.Lock()
         self._bind_lock = asyncio.Lock()
@@ -1773,10 +1779,18 @@ class _SessionsChatReplAdapter:
         """
         _dbg = bool(os.environ.get("OMNIGENT_SESSIONS_ADAPTER_DEBUG"))
         await self._recover_runner_if_needed()
-        if self._session_id is not None and self._stream_task is not None:
+        if (
+            self._session_id is not None
+            and self._stream_task is not None
+            and not self._stream_task.done()
+        ):
             return self._session_id
         async with self._ensure_session_lock:
-            if self._session_id is not None and self._stream_task is not None:
+            if (
+                self._session_id is not None
+                and self._stream_task is not None
+                and not self._stream_task.done()
+            ):
                 return self._session_id
             if self._session_id is None:
                 if self._session_bundle is not None:
@@ -1793,11 +1807,8 @@ class _SessionsChatReplAdapter:
                 session = await self._client.sessions.get(self._session_id)
                 self._hydrate_from_session_snapshot(session)
             await self._bind_runner_if_needed()
-            if self._stream_task is None:
-                self._stream_task = asyncio.create_task(
-                    self._stream_pump(),
-                    name=f"sessions-adapter-stream-{self._session_id}",
-                )
+            if self._stream_task is None or self._stream_task.done():
+                self._start_stream_pump()
             if self._runner_recover is not None and self._recover_task is None:
                 self._recover_task = asyncio.create_task(
                     self._runner_recover_watch(),
@@ -1876,7 +1887,7 @@ class _SessionsChatReplAdapter:
         finally:
             if progress_host is not None:
                 progress_host.clear_streamed_text()
-        self._session_id = session.id
+        self._set_displayed_session(session.id)
         self._hydrate_from_session_snapshot(session)
         if launch_host_id is not None:
             set_session_host(session.id, launch_host_id)
@@ -1918,7 +1929,7 @@ class _SessionsChatReplAdapter:
             # constraint isn't active.
             workspace=os.getcwd(),
         )
-        self._session_id = session.id
+        self._set_displayed_session(session.id)
         self._hydrate_from_session_snapshot(session)
         await self._apply_pending_model_override(pending_model_override, session)
         if pending_debug:
@@ -2188,6 +2199,13 @@ class _SessionsChatReplAdapter:
             exc.status_code is not None and 400 <= exc.status_code < 500
         )
 
+    def _set_displayed_session(self, session_id: str | None) -> None:
+        """Elicitation IDs are scoped to the displayed session, across reconnects."""
+        if session_id != self._session_id:
+            self._active_elicitation_ids.clear()
+            self._resolved_elicitation_ids.clear()
+        self._session_id = session_id
+
     async def switch_to_session(self, new_session_id: str) -> str:
         """
         Re-point the adapter at a different existing session.
@@ -2222,13 +2240,13 @@ class _SessionsChatReplAdapter:
                 await self._stream_task
             self._stream_task = None
 
-        self._session_id = new_session_id
+        self._set_displayed_session(new_session_id)
 
         session = await self._client.sessions.get(new_session_id)
         self._hydrate_from_session_snapshot(session)
         await self._bind_runner_if_needed()
 
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        self._start_stream_pump()
         return new_session_id
 
     async def view_session(
@@ -2267,7 +2285,7 @@ class _SessionsChatReplAdapter:
         # versa) and mistakes the sub-agent for the tree root. ``_readonly_view``
         # stays the binding-suppression flag; ``_interactive_child`` separately
         # gates sends, so co-driving a child never re-roots the selector.
-        self._session_id = new_session_id
+        self._set_displayed_session(new_session_id)
         self._readonly_view = read_only
         self._interactive_child = interactive and read_only
         if self._stream_task is not None:
@@ -2277,7 +2295,7 @@ class _SessionsChatReplAdapter:
             self._stream_task = None
         session = await self._client.sessions.get(new_session_id)
         self._hydrate_from_session_snapshot(session)
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        self._start_stream_pump()
         return new_session_id
 
     async def aclose(self) -> None:
@@ -2305,6 +2323,73 @@ class _SessionsChatReplAdapter:
             )
             self._pending_local_tasks.clear()
 
+    def _start_stream_pump(self) -> None:
+        """Create a fresh subscription acknowledgment for this session."""
+        subscription: asyncio.Future[Exception | None] = asyncio.get_running_loop().create_future()
+        self._stream_subscription = subscription
+        self._stream_task = asyncio.create_task(
+            self._stream_pump(), name=f"sessions-adapter-stream-{self._session_id}"
+        )
+        # Also wake waiters when the task is cancelled before it starts.
+        self._stream_task.add_done_callback(lambda _: subscription.cancel())
+
+    def _renew_stream_subscription(self, failure: Exception) -> None:
+        """Fail startup waiters and invalidate readiness before reconnecting."""
+        if self._stream_subscription is not None and not self._stream_subscription.done():
+            self._stream_subscription.set_result(failure)
+        self._stream_subscription = asyncio.get_running_loop().create_future()
+
+    async def _wait_for_stream_subscription(self, session_id: str) -> None:
+        """Require a live subscriber; a failed or stalled stream never permits a POST."""
+        try:
+            async with asyncio.timeout(_STREAM_SUBSCRIBE_TIMEOUT_S):
+                while True:
+                    subscription = self._stream_subscription
+                    if subscription is None or self._session_id != session_id:
+                        raise RuntimeError("Session stream changed; input was not sent.")
+                    failure = await asyncio.shield(subscription)
+                    if failure is not None:
+                        raise failure
+                    if subscription is self._stream_subscription:
+                        if self._stream_task is None or self._stream_task.cancelling():
+                            raise asyncio.CancelledError
+                        return
+        except TimeoutError as exc:
+            raise TimeoutError("Session stream did not become ready; input was not sent.") from exc
+
+    def _dispatch_session_event(
+        self, event: object, *, session_id: str, from_snapshot: bool = False
+    ) -> None:
+        """Deduplicate active requests; only live requests can re-arm resolved IDs."""
+        from omnigent.server.schemas import ElicitationRequestEvent, ElicitationResolvedEvent
+
+        if session_id != self._session_id:
+            return
+        if isinstance(event, ElicitationRequestEvent):
+            if from_snapshot and event.elicitation_id in self._resolved_elicitation_ids:
+                return
+            self._resolved_elicitation_ids.discard(event.elicitation_id)
+            if self._on_event is None or event.elicitation_id in self._active_elicitation_ids:
+                return
+            self._active_elicitation_ids.add(event.elicitation_id)
+        elif isinstance(event, ElicitationResolvedEvent):
+            self._active_elicitation_ids.discard(event.elicitation_id)
+            self._resolved_elicitation_ids.add(event.elicitation_id)
+        if self._on_event is not None:
+            self._on_event(event)
+
+    async def _reconcile_pending_elicitations(self, session_id: str) -> None:
+        """Recover prompts missed while disconnected, including during a parked POST."""
+        from omnigent.server.schemas import ElicitationRequestEvent
+
+        snapshot = await self._client.sessions.get(session_id)
+        for payload in snapshot.pending_elicitations:
+            try:
+                event = ElicitationRequestEvent.model_validate(payload)
+            except ValueError:
+                continue
+            self._dispatch_session_event(event, session_id=session_id, from_snapshot=True)
+
     async def _stream_pump(self) -> None:
         """Subscribe to ``/v1/sessions/{id}/stream`` indefinitely.
 
@@ -2328,73 +2413,96 @@ class _SessionsChatReplAdapter:
         backoff = 0.5
         max_backoff = 5.0
         assert self._session_id is not None
-        while True:
-            try:
-                if _dbg:
-                    print(
-                        f"[sessions-adapter] subscribing /stream {self._session_id}",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                async for event in self._client.sessions.stream(self._session_id):
-                    if isinstance(event, _StatusEv) and event.status in (
-                        "idle",
-                        "waiting",
-                        "failed",
-                    ):
-                        turn_done = getattr(self, "_turn_done", None)
-                        if turn_done is not None:
-                            turn_done.set()
-                    if self._on_event is not None:
-                        self._on_event(event)
-                # Clean close (server sent [DONE]). Reopen.
-                await asyncio.sleep(backoff)
-                backoff = 0.5
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:  # noqa: BLE001 — reconnect on any error
-                # Recoverable transport errors (peer closed mid-chunk,
-                # read timeout, transient network error) are normal
-                # background noise — the session continues server-side
-                # and the next subscription picks up where we left off.
-                # Emit a one-line INFO so the TUI doesn't paint a fresh
-                # multi-line traceback every reconnect, and keep the
-                # full postmortem behind a DEBUG sibling for engineers
-                # who flip logging to DEBUG. Genuinely unexpected
-                # failures still get a WARNING with the traceback.
-                if _is_recoverable_sse_transport_error(exc):
-                    _log.info("SSE transport interrupted, reconnecting")
-                    _log.debug("recoverable SSE disconnect", exc_info=exc)
-                else:
-                    _log.warning("SSE stream error, reconnecting", exc_info=exc)
-                if self._runner_recover is not None:
-                    try:
-                        await self._recover_runner_if_needed()
-                        await self._bind_runner_if_needed()
-                        self._clear_runner_recovery_error()
-                    except Exception as recover_exc:  # noqa: BLE001
-                        _log.warning(
-                            "Runner recover after stream error failed",
-                            exc_info=recover_exc,
+        session_id = self._session_id
+        try:
+            while True:
+                try:
+                    if _dbg:
+                        print(
+                            f"[sessions-adapter] subscribing /stream {self._session_id}",
+                            file=sys.stderr,
+                            flush=True,
                         )
-                        with contextlib.suppress(Exception):
-                            self._emit_runner_recovery_error_once(recover_exc)
-                        if _dbg:
-                            print(
-                                "[sessions-adapter] runner recover after stream "
-                                f"error failed: {recover_exc!r}",
-                                file=sys.stderr,
-                                flush=True,
-                            )
-                if _dbg:
-                    print(
-                        f"[sessions-adapter] /stream error: {exc!r}; "
-                        f"reconnecting in {backoff:.1f}s",
-                        file=sys.stderr,
-                        flush=True,
+                    async for event in self._client.sessions.stream(session_id):
+                        if session_id != self._session_id:
+                            return
+                        subscription = self._stream_subscription
+                        assert subscription is not None
+                        if isinstance(event, _StatusEv) and event.status in (
+                            "idle",
+                            "waiting",
+                            "failed",
+                        ):
+                            turn_done = getattr(self, "_turn_done", None)
+                            if turn_done is not None:
+                                turn_done.set()
+                        # A buffered resolution must suppress its stale snapshot request.
+                        self._dispatch_session_event(event, session_id=session_id)
+                        if not subscription.done():
+                            # SSE data acknowledges registration; response headers do not.
+                            await self._reconcile_pending_elicitations(session_id)
+                            subscription.set_result(None)
+                    self._renew_stream_subscription(
+                        RuntimeError(
+                            "Session stream closed before subscribing; input was not sent."
+                        )
                     )
-                await asyncio.sleep(backoff)
-                backoff = min(backoff * 2, max_backoff)
+                    # Clean close (server sent [DONE]). Reopen.
+                    await asyncio.sleep(backoff)
+                    backoff = 0.5
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:  # noqa: BLE001 — reconnect on any error
+                    self._renew_stream_subscription(exc)
+                    # Recoverable transport errors (peer closed mid-chunk,
+                    # read timeout, transient network error) are normal
+                    # background noise — the session continues server-side
+                    # and the next subscription picks up where we left off.
+                    # Emit a one-line INFO so the TUI doesn't paint a fresh
+                    # multi-line traceback every reconnect, and keep the
+                    # full postmortem behind a DEBUG sibling for engineers
+                    # who flip logging to DEBUG. Genuinely unexpected
+                    # failures still get a WARNING with the traceback.
+                    if _is_recoverable_sse_transport_error(exc):
+                        _log.info("SSE transport interrupted, reconnecting")
+                        _log.debug("recoverable SSE disconnect", exc_info=exc)
+                    else:
+                        _log.warning("SSE stream error, reconnecting", exc_info=exc)
+                    if self._runner_recover is not None:
+                        try:
+                            await self._recover_runner_if_needed()
+                            await self._bind_runner_if_needed()
+                            self._clear_runner_recovery_error()
+                        except Exception as recover_exc:  # noqa: BLE001
+                            _log.warning(
+                                "Runner recover after stream error failed",
+                                exc_info=recover_exc,
+                            )
+                            with contextlib.suppress(Exception):
+                                self._emit_runner_recovery_error_once(recover_exc)
+                            if _dbg:
+                                print(
+                                    "[sessions-adapter] runner recover after stream "
+                                    f"error failed: {recover_exc!r}",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
+                    if _dbg:
+                        print(
+                            f"[sessions-adapter] /stream error: {exc!r}; "
+                            f"reconnecting in {backoff:.1f}s",
+                            file=sys.stderr,
+                            flush=True,
+                        )
+                    await asyncio.sleep(backoff)
+                    backoff = min(backoff * 2, max_backoff)
+        finally:
+            if (
+                self._stream_task is asyncio.current_task()
+                and self._stream_subscription is not None
+            ):
+                self._stream_subscription.cancel()
+                self._stream_subscription = None
 
     async def send(
         self,
@@ -2460,6 +2568,8 @@ class _SessionsChatReplAdapter:
         if self._model_override is not None:
             event_payload["model_override"] = self._model_override
 
+        await self._wait_for_stream_subscription(session_id)
+
         # Signal that a turn is active. The _on_event callback
         # uses this to know it should handle streaming text deltas
         # and tool rendering inline rather than as history items.
@@ -2485,11 +2595,8 @@ class _SessionsChatReplAdapter:
             # _turn_done when it sees session.status idle/failed;
             # the _on_event callback (when wired) also sets it.
             #
-            # Fallback polling: httpx's ASGI transport does not
-            # flush streaming body chunks eagerly, so the pump's
-            # SSE subscription may not be active when the workflow
-            # publishes its terminal event (no-replay pub-sub).
-            # We poll the snapshot every second as a backstop.
+            # A disconnect can lose a terminal event; poll the snapshot
+            # as a backstop after the POST has returned.
             while not self._turn_done.is_set():
                 try:
                     # Event.wait() is cancellation-safe (its finally block
@@ -2560,6 +2667,8 @@ class _SessionsChatReplAdapter:
         }
         if self._model_override is not None:
             event_payload["model_override"] = self._model_override
+
+        await self._wait_for_stream_subscription(session_id)
 
         self._is_streaming = True
         self._turn_done = asyncio.Event()
@@ -2993,7 +3102,7 @@ class _SessionsChatReplAdapter:
         for task in self._pending_local_tasks.values():
             task.cancel()
         self._pending_local_tasks = {}
-        self._session_id = None
+        self._set_displayed_session(None)
         self._current_response_id = None
         self._is_streaming = False
         self._pending_local_user_sends = 0
@@ -3029,7 +3138,7 @@ class _SessionsChatReplAdapter:
         if self._stream_task is not None:
             self._stream_task.cancel()
             self._stream_task = None
-        self._session_id = new_session_id
+        self._set_displayed_session(new_session_id)
         self._bound_runner_id = None  # Force re-bind on next send
 
 

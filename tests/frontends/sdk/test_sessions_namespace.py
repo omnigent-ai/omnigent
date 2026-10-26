@@ -120,6 +120,36 @@ def _session_response_body(
     }
 
 
+_PENDING_APPROVAL = {
+    "type": "response.elicitation_request",
+    "elicitation_id": "elicit_test",
+    "params": {"mode": "form", "message": "Approve synthetic input?"},
+}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("pending", "expected"),
+    [(None, []), ([], []), (["invalid"], []), ([_PENDING_APPROVAL], [_PENDING_APPROVAL])],
+)
+async def test_get_preserves_pending_approval_payloads(pending: Any, expected: Any) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200, json=_session_response_body() | {"pending_elicitations": pending}
+        )
+
+    ns, client = _make_namespace(handler)
+    try:
+        snapshot = await ns.get("conv_abc")
+    finally:
+        await client.aclose()
+    assert snapshot.pending_elicitations == expected
+
+
+def test_old_session_snapshot_has_no_pending_approvals() -> None:
+    assert Session.from_dict(_session_response_body()).pending_elicitations == []
+
+
 # ── create() ──────────────────────────────────────────────────────────
 
 

@@ -94,6 +94,66 @@ _TEST_HARNESS_NAME = "claude-sdk"
 _RUNNER_ID = "runner-tunnel-three-layer-test"
 
 
+class _LiveASGIStream(httpx.AsyncByteStream):
+    """Expose ASGI body chunks before the response completes."""
+
+    def __init__(self, communicator: ApplicationCommunicator) -> None:
+        self.communicator = communicator
+
+    async def __aiter__(self) -> AsyncIterator[bytes]:
+        while True:
+            message = await self.communicator.receive_output(timeout=10)
+            assert message["type"] == "http.response.body"
+            if message.get("body"):
+                yield message["body"]
+            if not message.get("more_body", False):
+                break
+
+    async def aclose(self) -> None:
+        await self.communicator.send_input({"type": "http.disconnect"})
+        await self.communicator.wait(timeout=1)
+
+
+class _StreamingASGITransport(httpx.ASGITransport):
+    """Keep the real session stream route live instead of buffering it forever."""
+
+    async def handle_async_request(self, request: httpx.Request) -> httpx.Response:
+        if not request.url.path.endswith("/stream"):
+            return await super().handle_async_request(request)
+        communicator = ApplicationCommunicator(
+            self.app,
+            {
+                "type": "http",
+                "asgi": {"version": "3.0", "spec_version": "2.0"},
+                "http_version": "1.1",
+                "method": request.method,
+                "scheme": request.url.scheme,
+                "path": request.url.path,
+                "raw_path": request.url.raw_path.split(b"?")[0],
+                "query_string": request.url.query,
+                "root_path": self.root_path,
+                "headers": request.headers.raw,
+                "client": self.client,
+                "server": (request.url.host, request.url.port or 80),
+            },
+        )
+        stream = _LiveASGIStream(communicator)
+        try:
+            await communicator.send_input(
+                {
+                    "type": "http.request",
+                    "body": await request.aread(),
+                    "more_body": False,
+                }
+            )
+            response = await communicator.receive_output(timeout=10)
+            assert response["type"] == "http.response.start"
+            return httpx.Response(response["status"], headers=response["headers"], stream=stream)
+        except BaseException:
+            await stream.aclose()
+            raise
+
+
 class FakeProcessManager:
     """In-process replacement for :class:`HarnessProcessManager`.
 
@@ -431,7 +491,7 @@ async def tunnel_three_layer_stack(tmp_path: Path) -> AsyncIterator[_TunnelStack
     )
 
     ap_client = httpx.AsyncClient(
-        transport=httpx.ASGITransport(app=ap_app),
+        transport=_StreamingASGITransport(app=ap_app),
         base_url="http://ap",
         timeout=httpx.Timeout(10.0, read=None),
     )

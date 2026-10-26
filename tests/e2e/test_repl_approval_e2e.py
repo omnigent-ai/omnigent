@@ -49,6 +49,7 @@ import pytest
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e._native_resume_helpers import poll_for_pending_elicitation
+from tests.e2e._repl_stream_gate import ReplStreamGate
 from tests.e2e.conftest import (
     configure_mock_llm,
     get_mock_requests,
@@ -698,9 +699,22 @@ def test_repl_two_turns_fires_one_approval_per_turn(
             child.terminate(force=True)
 
 
-def test_repl_approve_always_caches_for_later_turns(
+@pytest.fixture(params=[False, True], ids=["normal", "delayed-subscription"])
+def approval_cli(
     ap_cli: str,
     repl_env: dict[str, str],
+    tmp_path: Path,
+    request: pytest.FixtureRequest,
+) -> Iterator[ReplStreamGate]:
+    gate = ReplStreamGate(ap_cli, repl_env, tmp_path, enabled=request.param)
+    try:
+        yield gate
+    finally:
+        gate.close()
+
+
+def test_repl_approve_always_caches_for_later_turns(
+    approval_cli: ReplStreamGate,
     mock_llm_server_url: str,
 ) -> None:
     """
@@ -736,9 +750,9 @@ def test_repl_approve_always_caches_for_later_turns(
         match="approve-cache",
     )
     child = pexpect.spawn(
-        ap_cli,
+        approval_cli.executable,
         ["run", str(_ASK_DEMO_DIR), "--no-session"],
-        env=repl_env,
+        env=approval_cli.env,
         encoding="utf-8",
         codec_errors="replace",
         dimensions=(40, 120),
@@ -749,6 +763,7 @@ def test_repl_approve_always_caches_for_later_turns(
 
         # Turn 1: approve always.
         child.send("Hello approve-cache" + "\r")
+        approval_cli.release()
         child.expect("approval required", timeout=30)
         child.send("a" + "\r")
         # Echo line confirms the REPL parsed "a" as
@@ -783,6 +798,7 @@ def test_repl_approve_always_caches_for_later_turns(
             "said 'always' on turn 1 — cache lookup is broken.\n"
             f"Captured:\n{turn_two[:1500]}"
         )
+        approval_cli.verify()
     finally:
         try:
             child.send("/quit" + "\r")
