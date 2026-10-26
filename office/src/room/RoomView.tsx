@@ -5,14 +5,15 @@ import type { Priority, RoomSettingsPatch, RoomSummary } from "../../shared/type
 import type { BranchView } from "../../shared/workflowTypes.ts";
 import { type WorkerSession, officeApi } from "../api.ts";
 import { WORKER_STATE_LABELS, deriveWorkerState } from "../workers.ts";
-import { ApprovalDialog, type ApprovalRequest } from "./ApprovalDialog.tsx";
+import { ApprovalDialog, type ApprovalRequest, decideApproval } from "./ApprovalDialog.tsx";
+import { RequestAlert } from "./RequestAlert.tsx";
 import { RoomCanvas } from "./RoomCanvas.tsx";
 import { MAX_DESKS, buildRoomLayout } from "./roomLayout.ts";
 import { WorkerPanel } from "./WorkerPanel.tsx";
 import { openProblems, problemAnchor } from "./workflow/AgentProblems.tsx";
 import { ThemeSetup } from "./workflow/ThemeSetup.tsx";
 import { WorkflowPanel } from "./workflow/WorkflowPanel.tsx";
-import { type WorkflowRequest, WorkflowRequestDialog } from "./workflow/WorkflowRequestDialog.tsx";
+import { type WorkflowRequest, WorkflowRequestDialog, decideWorkflowRequest } from "./workflow/WorkflowRequestDialog.tsx";
 
 const POLL_MS = 3_000;
 
@@ -182,12 +183,24 @@ export function RoomView({ room, allRooms, serverNow, placementWaiting, onExit, 
             ))}
             {pendingWorkflow.map((request) => (
               <li key={request.kind === "gate" ? request.gate.id : request.proposal.id}>
-                <button type="button" className="request-button" onClick={() => setOpenWorkflowRequest(request)}>
-                  ⚑{" "}
-                  {request.kind === "gate"
-                    ? `${GATE_TITLES[request.gate.gate]} gate (${roleTitle(request.gate.requestedBy)}): ${request.gate.summary.slice(0, 80)}`
-                    : `Board proposal from the PM (${request.proposal.requirements.length} requirements)`}
-                </button>
+                <RequestAlert
+                  label={
+                    request.kind === "gate"
+                      ? `${GATE_TITLES[request.gate.gate]} gate (${roleTitle(request.gate.requestedBy)}): ${request.gate.summary.slice(0, 80)}`
+                      : `Board proposal from the PM (${request.proposal.requirements.length} requirements)`
+                  }
+                  detail={
+                    request.kind === "gate" && request.gate.operation ? (
+                      <>
+                        Allows <code>{request.gate.operation}</code>
+                      </>
+                    ) : undefined
+                  }
+                  approveLabel={request.kind === "gate" ? "Approve" : "Accept"}
+                  onApprove={() => decideWorkflowRequest(branchView?.branch.id ?? "", request, true)}
+                  onDetails={() => setOpenWorkflowRequest(request)}
+                  onChanged={() => void load()}
+                />
               </li>
             ))}
             {openQuestion ? (
@@ -208,9 +221,13 @@ export function RoomView({ room, allRooms, serverNow, placementWaiting, onExit, 
             ))}
             {requests.map((request) => (
               <li key={`${request.sessionId}:${request.elicitation.elicitation_id}`}>
-                <button type="button" className="request-button" onClick={() => setOpenRequest(request)}>
-                  ⚑ {request.workerName}: {(request.elicitation.params?.message ?? "Approval requested").slice(0, 90)}
-                </button>
+                <RequestAlert
+                  label={`${request.workerName}: ${(request.elicitation.params?.message ?? "Approval requested").slice(0, 90)}`}
+                  approveLabel="Approve"
+                  onApprove={() => decideApproval(request, "accept")}
+                  onDetails={() => setOpenRequest(request)}
+                  onChanged={() => void load()}
+                />
               </li>
             ))}
           </ul>

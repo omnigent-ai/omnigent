@@ -14,6 +14,15 @@ interface WorkflowRequestDialogProps {
   onDecided: () => void;
 }
 
+/** Approve or send back a gate or board proposal, bound to the version shown to the PO. */
+export async function decideWorkflowRequest(branchId: string, request: WorkflowRequest, approve: boolean, feedback = ""): Promise<void> {
+  if (request.kind === "gate") {
+    await officeApi.decideGate(branchId, request.gate.id, approve ? "approve" : "request_changes", request.gate.artifact.digest, feedback);
+  } else {
+    await officeApi.decideProposal(branchId, request.proposal.id, approve ? "accept" : "reject", feedback);
+  }
+}
+
 function RequirementsList({ requirements }: { requirements: BoardProposal["requirements"] }) {
   return (
     <ol className="requirements-preview">
@@ -49,11 +58,7 @@ export function WorkflowRequestDialog({ branchId, request, onClose, onDecided }:
     setBusy(true);
     setError(null);
     try {
-      if (request.kind === "gate") {
-        await officeApi.decideGate(branchId, request.gate.id, approve ? "approve" : "request_changes", request.gate.artifact.digest, feedback);
-      } else {
-        await officeApi.decideProposal(branchId, request.proposal.id, approve ? "accept" : "reject", feedback);
-      }
+      await decideWorkflowRequest(branchId, request, approve, feedback);
       onDecided();
     } catch (caught) {
       const message = (caught as Error).message;

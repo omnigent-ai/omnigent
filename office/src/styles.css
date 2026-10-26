@@ -453,3 +453,8 @@ select {
 .agent-problem-schedule { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin-top: 6px; }
 .request-problem { border-color: var(--danger); }
 .link-button { background: none; border: none; color: var(--warn); text-decoration: underline; cursor: pointer; padding: 0 4px; }
+
+.request-alert { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 12px; border: 2px solid var(--warn); padding: 6px 8px; margin-bottom: 6px; }
+.request-alert-text { display: flex; flex-direction: column; flex: 1 1 240px; min-width: 0; overflow-wrap: anywhere; }
+.request-alert-actions { display: flex; gap: 6px; }
+.request-alert .error-text { flex-basis: 100%; margin: 0; }

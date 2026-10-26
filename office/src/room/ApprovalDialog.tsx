@@ -19,6 +19,11 @@ function requestDetail(elicitation: PendingElicitation): string | null {
   return Object.keys(rest).length ? JSON.stringify(rest, null, 2) : null;
 }
 
+/** Answer an Omnigent approval request; feedback is only sent with a decline. */
+export async function decideApproval(request: ApprovalRequest, action: "accept" | "decline", feedback = ""): Promise<void> {
+  await officeApi.decide(request.sessionId, request.elicitation.elicitation_id, action, action === "decline" ? feedback : undefined);
+}
+
 export function ApprovalDialog({ request, onClose, onDecided }: ApprovalDialogProps) {
   const dialogRef = useRef<HTMLDialogElement>(null);
   const [feedback, setFeedback] = useState("");
@@ -34,7 +39,7 @@ export function ApprovalDialog({ request, onClose, onDecided }: ApprovalDialogPr
     setBusy(true);
     setError(null);
     try {
-      await officeApi.decide(request.sessionId, request.elicitation.elicitation_id, action, action === "decline" ? feedback : undefined);
+      await decideApproval(request, action, feedback);
       onDecided();
     } catch (caught) {
       const message = (caught as Error).message;
