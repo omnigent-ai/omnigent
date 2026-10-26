@@ -5774,9 +5774,15 @@ def _user_prompt_visible(pane: str) -> bool:
     lines = [line for line in pane.splitlines() if line.strip()]
     rules = [i for i, line in enumerate(lines) if _is_box_rule(line)]
     region = "\n".join(lines[rules[-2] + 1 :] if len(rules) >= 2 else lines)
+    return _auto_mode_billing_prompt_matches(
+        pane, _AUTO_MODE_BILLING_CONSENT
+    ) or _decision_prompt_text(region)
+
+
+def _decision_prompt_text(region: str) -> bool:
+    """Recognize decision text without depending on composer frame detection."""
     return (
-        _auto_mode_billing_prompt_matches(pane, _AUTO_MODE_BILLING_CONSENT)
-        or "Do you want to " in region
+        "Do you want to " in region
         or "Yes, and don't ask again" in region
         or (
             any(hint in region for hint in ("Enter to select", "Enter to submit"))
@@ -6187,13 +6193,32 @@ class _ComposerBox(NamedTuple):
 def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
     """Keep frame edges, excluding further-indented rule text in a draft.
 
-    The last two rules can be a frame edge and a draft line; the less-indented
-    rule identifies the frame in both a complete and a clipped input box.
+    A clipped draft can end in several indented rules. Its earlier glyph row
+    identifies the opening frame without mistaking a draft rule for an edge.
     """
     rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
     if len(rules) < 2:
         return rules
     frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
+    # Every later rule and continuation must be indented within the candidate draft.
+    following_indent = frame_indent
+    for idx in reversed(rules[:-2]):
+        indent = len(lines[idx]) - len(lines[idx].lstrip())
+        if (
+            indent < following_indent
+            and idx + 1 < len(lines)
+            and lines[idx + 1].strip()[:1] in _COMPOSER_MODE_GLYPHS
+            and all(
+                not line.strip() or len(line) - len(line.lstrip()) > indent
+                for line in lines[idx + 2 :]
+            )
+        ):
+            if _decision_prompt_text("\n".join(lines[rules[-2] + 1 :])):
+                # Ambiguous draft/dialog text cannot establish any writable frame.
+                return []
+            frame_indent = indent
+            break
+        following_indent = min(following_indent, indent)
     return [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
 
 

@@ -11262,7 +11262,7 @@ _STALE_DRAFT_CURSORS = pytest.mark.parametrize(
 # three-line draft is cut off without its closing rule, so a capture cannot
 # tell how much of it lies below the pane.
 _BOX_GEOMETRIES = pytest.mark.parametrize(
-    "visible_rows", [None, 2], ids=["whole-box-on-screen", "sliver-pane"]
+    "visible_rows", [None, 2, 4], ids=["whole-box-on-screen", "sliver-pane", "four-row-pane"]
 )
 
 
@@ -11270,8 +11270,12 @@ _BOX_GEOMETRIES = pytest.mark.parametrize(
 @_STALE_DRAFT_CURSORS
 @pytest.mark.parametrize(
     "draft",
-    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
-    ids=["plain-draft", "draft-with-rule"],
+    [
+        _STALE_MULTILINE_DRAFT,
+        _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────"),
+        "STALE ONE\n─────────\n─────────\nLAST LINE",
+    ],
+    ids=["plain-draft", "draft-with-rule", "draft-with-two-rules"],
 )
 def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
@@ -11302,8 +11306,12 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
 @_STALE_DRAFT_CURSORS
 @pytest.mark.parametrize(
     "draft",
-    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
-    ids=["plain-draft", "draft-with-rule"],
+    [
+        _STALE_MULTILINE_DRAFT,
+        _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────"),
+        "STALE ONE\n─────────\n─────────\nLAST LINE",
+    ],
+    ids=["plain-draft", "draft-with-rule", "draft-with-two-rules"],
 )
 def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
@@ -11435,7 +11443,34 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
             "──────\nold output\n  ──────\n  ❯ one\n    ──────\n    four\n  ──────\n",
             claude_native_bridge._ComposerBox(["  ❯ one", "    ──────", "    four"], framed=True),
         ),
+        (
+            "──────\n❯ one\n  ──────\n  ──────\n  four",
+            claude_native_bridge._ComposerBox(
+                ["❯ one", "  ──────", "  ──────", "  four"], framed=False
+            ),
+        ),
+        (
+            "──────\nold output\n  ──────\n  ❯ one\n    ──────\n    ──────\n    four",
+            claude_native_bridge._ComposerBox(
+                ["  ❯ one", "    ──────", "    ──────", "    four"], framed=False
+            ),
+        ),
+        (
+            "──────\n❯ one\n  ──────\n  ❯ quoted prompt\n  ──────\n  four",
+            claude_native_bridge._ComposerBox(
+                ["❯ one", "  ──────", "  ❯ quoted prompt", "  ──────", "  four"],
+                framed=False,
+            ),
+        ),
+        (
+            "──────\n❯ old\n──────\n  ──────\n  Change effort?\n  ❯ 1. Yes\n  ──────",
+            None,
+        ),
         ("──────\n  Change effort level?\n  ❯ 1. Yes, switch to low\n    2. No, go back\n", None),
+        (
+            "──────\n❯ old\nold output\n  ──────\n  ❯ current\n  ──────",
+            claude_native_bridge._ComposerBox(["  ❯ current"], framed=True),
+        ),
         ("plain output, no box\n", None),
     ],
     ids=[
@@ -11444,7 +11479,12 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         "rule-inside-draft",
         "rule-inside-clipped-draft",
         "indented-frame-with-earlier-rule",
+        "two-rules-inside-clipped-draft",
+        "two-rules-inside-indented-clipped-draft",
+        "quoted-prompt-inside-clipped-draft",
+        "old-composer-above-indented-dialog",
         "dialog-selector",
+        "old-clipped-composer-above-current-box",
         "no-box",
     ],
 )
@@ -11455,6 +11495,56 @@ def test_composer_box_reads_every_row_of_the_input_box(
     assert claude_native_bridge._composer_box(pane) == box
     if box is not None:
         assert claude_native_bridge._composer_row(pane) == box.rows[0]
+
+
+@pytest.mark.parametrize("glyph", ["❯", "!"])
+@pytest.mark.parametrize("separator", ["", "old output\n"])
+@pytest.mark.parametrize("slash_command", [False, True], ids=["message", "settings"])
+def test_old_clipped_composer_does_not_receive_keys_above_a_dialog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    glyph: str,
+    separator: str,
+    slash_command: bool,
+) -> None:
+    """An earlier prompt must not hide the decision currently holding the terminal."""
+    pane = (
+        f"──────\n{glyph} old prompt\n{separator}"
+        "  ──────\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n"
+        "  Enter to select · Esc to cancel\n  ──────"
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    sends = _fake_tmux(monkeypatch, [pane])
+
+    assert claude_native_bridge._composer_box(pane) is None
+    assert claude_native_bridge._user_prompt_visible(pane)
+    with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+        if slash_command:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+        else:
+            inject_user_message(bridge_dir, content="hello from the web")
+    assert sends == []
+
+
+@pytest.mark.parametrize("slash_command", [False, True], ids=["message", "settings"])
+def test_decision_text_in_a_clipped_draft_preserves_all_unsent_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash_command: bool,
+) -> None:
+    """A quoted dialog cannot turn draft rules into a proven single-row composer."""
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    draft = "STALE ONE\n─────────\n❯ quoted prompt\n─────────\nDo you want to proceed?\nSTALE LAST"
+    composer = _EditableComposer(draft, cursor=0, visible_rows=6)
+    composer.install(monkeypatch)
+
+    with pytest.raises(claude_native_bridge.ClaudeUserPromptPending):
+        if slash_command:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+        else:
+            inject_user_message(bridge_dir, content="hello from the web")
+    assert composer.submitted == []
+    assert composer.text == draft
 
 
 def test_a_model_switch_types_the_argument_form_and_confirms(
