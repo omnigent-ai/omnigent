@@ -659,14 +659,27 @@ class ClaudeSignInPending(RuntimeError):
     :param title: Card headline, e.g.
         ``"Claude Code can't start until you sign in to Databricks"``.
     :param remediation: The link (and code) to open, phrased as the next step.
+    :param launcher_auth_check: Bounded last-observed auth-check metadata, if available.
     """
 
     code = "databricks_sign_in_pending"
 
-    def __init__(self, message: str, *, title: str, remediation: str) -> None:
+    def __init__(
+        self,
+        message: str,
+        *,
+        title: str,
+        remediation: str,
+        launcher_auth_check: delivery_diagnostics.LauncherAuthCheckAttributes | None = None,
+    ) -> None:
         super().__init__(message)
         self.title = title
         self.remediation = remediation
+        self.launcher_auth_check = (
+            launcher_auth_check
+            if launcher_auth_check is not None
+            else delivery_diagnostics.launcher_auth_check_attributes()
+        )
 
 
 class ClaudeInjectionCancelled(RuntimeError):
@@ -6833,17 +6846,19 @@ def _wait_for_claude_prompt_ready(
         # on two consecutive polls. Fail now with the link rather than wait out
         # the budget and reap the pane the person needs to finish signing in.
         # The joined capture keeps an address wider than the pane in one piece.
-        sign_in = (
-            detect_sign_in_prompt(_capture_pane(socket_path, tmux_target, join_wrapped=True))
-            if "http" in pane
-            else None
+        sign_in_pane = (
+            _capture_pane(socket_path, tmux_target, join_wrapped=True) if "http" in pane else ""
         )
+        sign_in = detect_sign_in_prompt(sign_in_pane) if sign_in_pane else None
         if sign_in is not None and sign_in.url == sign_in_url:
             raise ClaudeSignInPending(
                 "Claude Code is waiting for a sign-in in this session's terminal, "
                 "so the message was not delivered.",
                 title="Claude Code can't start until you sign in to Databricks",
                 remediation=sign_in_next_step("Claude Code"),
+                launcher_auth_check=delivery_diagnostics.launcher_auth_check_attributes(
+                    sign_in_pane
+                ),
             )
         sign_in_url = sign_in.url if sign_in is not None else None
         # Another launch's sign-in holds the launcher's lock. Reaping the pane at

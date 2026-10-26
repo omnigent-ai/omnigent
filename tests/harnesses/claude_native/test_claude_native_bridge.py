@@ -10314,8 +10314,21 @@ _SIGN_IN_PANE = (
 )
 
 
+@pytest.mark.parametrize(
+    ("auth_marker", "expected_reason"),
+    [
+        ("", "unknown"),
+        (
+            "ug_auth_check_failed reason=timeout exception_type=TimeoutExpired exit_code=none\n",
+            "timeout",
+        ),
+        ("ug_auth_check_failed reason=secret-value\n", "unknown"),
+    ],
+)
 def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
     monkeypatch: pytest.MonkeyPatch,
+    auth_marker: str,
+    expected_reason: str,
 ) -> None:
     """
     A launcher sign-in prompt holding the pane fails delivery within a poll
@@ -10326,7 +10339,12 @@ def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
 
     def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
         captures.append(join_wrapped)
-        return _SIGN_IN_PANE
+        if captures == [False, True, False, True]:
+            return auth_marker + _SIGN_IN_PANE
+        return (
+            "ug_auth_check_failed reason=missing_token exception_type=none exit_code=none\n"
+            + _SIGN_IN_PANE
+        )
 
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
     monkeypatch.setattr(
@@ -10350,6 +10368,10 @@ def test_wait_for_claude_prompt_ready_fails_fast_with_the_sign_in_link(
     # Two plain polls saw the address; each looked again with wrapped rows joined.
     assert captures == [False, True, False, True]
     assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+    # Evidence comes from the joined capture that confirmed this sign-in, not an earlier poll.
+    assert raised.value.launcher_auth_check["launcher_auth_check_reason"] == expected_reason
+    assert "signin.example.com" not in str(raised.value.launcher_auth_check)
+    assert "secret-value" not in str(raised.value.launcher_auth_check)
 
 
 def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
@@ -10362,6 +10384,7 @@ def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target, *, join_wrapped=False: (
+            "ug_auth_check_failed reason=timeout exception_type=TimeoutExpired exit_code=none\n"
             "Waiting for another process to finish OAuth on port 8020...\n^[^[\n"
         ),
     )
@@ -10378,6 +10401,10 @@ def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
     assert raised.value.code == "databricks_sign_in_pending"
     assert raised.value.remediation.startswith("Finish the sign-in that another session opened")
     assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+    assert raised.value.launcher_auth_check == {
+        "launcher_auth_check_observation": "unknown",
+        "launcher_auth_check_reason": "unknown",
+    }
 
 
 def test_wait_for_claude_prompt_ready_reports_a_launcher_password_prompt(
@@ -10418,7 +10445,11 @@ def test_wait_for_claude_prompt_ready_prefers_a_rendered_prompt_over_a_link(
     """An address left in scrollback is not a sign-in gate once the input box is up."""
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
-        lambda socket_path, tmux_target, *, join_wrapped=False: _SIGN_IN_PANE + _READY_PANE,
+        lambda socket_path, tmux_target, *, join_wrapped=False: (
+            "ug_auth_check_failed reason=timeout exception_type=TimeoutExpired exit_code=none\n"
+            + _SIGN_IN_PANE
+            + _READY_PANE
+        ),
     )
     claude_native_bridge._wait_for_claude_prompt_ready(
         "/tmp/example/tmux.sock",

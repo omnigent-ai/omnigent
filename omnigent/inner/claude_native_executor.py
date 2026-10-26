@@ -11,6 +11,7 @@ from collections.abc import AsyncIterator, Callable
 from functools import partial
 from pathlib import Path
 
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_DIR_ENV_VAR,
     CLAUDE_FRAMEWORK_CONTEXT_FILE,
@@ -341,10 +342,15 @@ class ClaudeNativeExecutor(Executor):
         except ClaudeSignInPending as exc:
             # The pane is parked on a launcher sign-in the person finishes from
             # the card's link; reaping it would destroy that prompt.
-            _logger.warning(
-                "claude-native: launcher sign-in pending; message not delivered",
-                extra={"session_id": self._request_session_id},
-            )
+            with contextlib.suppress(Exception):
+                _logger.warning(
+                    "claude-native: launcher sign-in pending; message not delivered",
+                    extra=debug_event(
+                        "claude_launcher_sign_in_pending",
+                        session_id=self._request_session_id,
+                        **exc.launcher_auth_check,
+                    ),
+                )
             yield ExecutorError(
                 message=str(exc),
                 code=exc.code,
