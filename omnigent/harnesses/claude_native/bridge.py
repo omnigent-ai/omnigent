@@ -6257,9 +6257,16 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     # removes the space when the input box already held focus.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
-        box = _composer_box(_capture_pane(socket_path, tmux_target))
+        pane = _capture_pane(socket_path, tmux_target)
+        box = _composer_box(pane)
         settled = box is not None and box.framed and len(box.rows) <= 1
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            delivery_diagnostics.record_composer_not_cleared(
+                pane=pane,
+                rows=None if box is None else box.rows,
+                framed=box is not None and box.framed,
+                rule_count=sum(1 for line in pane.splitlines() if _is_box_rule(line)),
+            )
             raise ClaudeComposerNotCleared(
                 "A draft left in Claude Code's input box could not be cleared, so nothing "
                 "was sent. Open the terminal, clear the input box, then retry."
