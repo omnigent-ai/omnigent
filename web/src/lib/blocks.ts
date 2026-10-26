@@ -751,10 +751,7 @@ export type AnyBlock =
   | PolicyDeniedBlock
   | ResponseEndBlock;
 
-/**
- * Whether a pending elicitation card answers `sessionId`'s own prompt. Cards
- * mirrored from a sub-agent target the child session, so they don't count.
- */
+/** Whether a pending card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
 export function hasPendingOwnElicitation(
   blocks: readonly AnyBlock[],
   sessionId: string | null,
