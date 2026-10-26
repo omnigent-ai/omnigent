@@ -2924,6 +2924,7 @@ class SessionListItem(BaseModel):
     :param agent_name: Human-readable name of the bound agent,
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
+    :param harness: Canonical effective harness, including per-session overrides.
     :param status: Derived session lifecycle status.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
@@ -3017,6 +3018,7 @@ class SessionListItem(BaseModel):
     id: str
     agent_id: str
     agent_name: str | None = None
+    harness: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int

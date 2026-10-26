@@ -174,6 +174,8 @@ export interface Conversation {
   agent_id?: string;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
   agent_name?: string | null;
+  /** Effective harness, including any per-session override. */
+  harness?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
   status?: "idle" | "running" | "failed";
@@ -499,6 +501,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     workspace: wire.workspace ?? null,
     agent_id: wire.agent_id,
     agent_name: wire.agent_name ?? null,
+    harness: wire.harness ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
     status: wire.status ?? "idle",
     runner_online: wire.runner_online ?? undefined,
@@ -1826,6 +1829,7 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
     labels: session.labels ?? {},
     permission_level: session.permissionLevel,
     agent_id: session.agentId,
+    harness: session.harness,
     archived: session.archived,
   };
 }
