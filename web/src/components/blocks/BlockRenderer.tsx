@@ -13,8 +13,8 @@
 //    routing/fan-out cards never fold regardless of position.
 //
 // 2. Turn folding: once settled, each work run collapses behind a
-//    "Worked" row. Assistant messages (all but the last with the
-//    opt-in `foldNarration`), elicitations and routing cards stay visible.
+//    "Worked" row. Pending elicitations, routing cards and assistant
+//    messages stay visible (all but the last with opt-in `foldNarration`).
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -450,8 +450,7 @@ function partitionTurn(items: RenderItem[], foldNarration = false): TurnPartitio
     wrapup.unshift(items[end - 1]!);
     end -= 1;
   }
-  // The last non-blank message stays visible even in a continued bubble: a
-  // later bubble may answer a wake or a question card, not this turn.
+  // Keep the last non-blank message visible, even in a continued bubble.
   const answerIndex = foldNarration
     ? items.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
     : -1;

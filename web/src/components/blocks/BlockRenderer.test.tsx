@@ -821,7 +821,7 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.queryByText("Gathering context.")).toBeNull();
       });
 
-      it("leaves a single-message turn and a live turn unfolded", () => {
+      it("leaves a single-message turn and a live turn unfolded until it settles", () => {
         const answerOnly: RenderItem[] = [
           { kind: "text", itemId: "m0", text: "Just the answer.", final: true },
         ];
@@ -845,6 +845,20 @@ describe("BlockRenderer dispatch", () => {
         );
         expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
         expect(screen.getByText("Starting.")).toBeDefined();
+
+        view.rerender(
+          <BlockRenderer
+            items={live}
+            sessionStatus="idle"
+            turnLifecycle="completed"
+            foldNarration
+          />,
+        );
+        return waitFor(() => {
+          expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
+          expect(screen.queryByText("Starting.")).toBeNull();
+          expect(screen.getByText("Still going.")).toBeDefined();
+        });
       });
 
       it("keeps a terminal error turn and pending approvals visible", () => {
