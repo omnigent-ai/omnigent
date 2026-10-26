@@ -249,7 +249,8 @@ on every sweep that cannot decide, so expect several per run.
 
 During shutdown the scheduler does not wait for in-flight writes, so a run whose
 `running` write committed then may never log `running`, slightly understating fire
-success. A startup cancelled before its first step logs no `startup_ended`.
+success. A startup cancelled before its first step logs no `startup_ended`;
+recovery logs it later.
 
 The sink stores attribute values as strings; cast delays before computing
 percentiles. Attributes whose value is `None`, such as `error_code` or

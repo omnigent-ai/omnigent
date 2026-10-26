@@ -35,7 +35,7 @@ def _run_event(event_name: str, run: ScheduledTaskRun, **attributes: object) -> 
     return debug_event(
         event_name,
         session_id=run.conversation_id,
-        # Bound explicitly so type checking never matches **attributes against them.
+        # Explicit so a clashing attribute raises and type checks don't match **attributes.
         turn_id=None,
         user_id=None,
         task_id=run.scheduled_task_id,
@@ -96,7 +96,7 @@ def _log_late_recovery_failure(
 
 
 def _seconds(value: float) -> float:
-    # Never report a negative delay.
+    # Clock skew between replicas must not produce a negative delay.
     return round(max(0.0, float(value)), 3)
 
 
@@ -609,12 +609,6 @@ class PersistentTaskScheduler:
                             host_id=host_id,
                             lease_seconds=self._lease_seconds,
                         )
-                    # Start the claimed run before logging it.
-                    if run is not None and not self._stopped:
-                        key = (run.workspace_id, run.id)
-                        startup = asyncio.create_task(self._execute(task, run))
-                        self._startups[key] = startup
-                        startup.add_done_callback(lambda _, key=key: self._startups.pop(key, None))
                     if run is None:
                         _log_event(
                             _logger.info,
@@ -631,6 +625,14 @@ class PersistentTaskScheduler:
                             ),
                         )
                     else:
+                        # Start first so a failing claim log cannot keep the run from starting.
+                        if not self._stopped:
+                            key = (run.workspace_id, run.id)
+                            startup = asyncio.create_task(self._execute(task, run))
+                            self._startups[key] = startup
+                            startup.add_done_callback(
+                                lambda _, key=key: self._startups.pop(key, None)
+                            )
                         _log_event(
                             _logger.info,
                             "Claimed scheduled run %s for task %s",
