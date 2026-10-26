@@ -1333,6 +1333,71 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
     assert [m["role"] for m in messages] == ["user", "user"]
 
 
+def test_translate_input_to_messages_carries_tool_history() -> None:
+    """
+    Tool items are dropped unless the executor opts in. Opted in, each call appears
+    once (live history repeats it per status), a nameless call is dropped, bad
+    arguments become ``{}``, and outputs are image-stripped and capped for replay.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _REPLAYED_TOOL_OUTPUT_MAX_BYTES,
+        _translate_input_to_messages,
+    )
+
+    greet = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "greet",
+        "arguments": '{"name": "Ada"}',
+    }
+    image_output = json.dumps(
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "QUJD" * 64},
+            }
+        ]
+    )
+    input_value = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "greet the new hire"}],
+        },
+        {"type": "function_call", "call_id": "call_0", "arguments": "{}"},
+        greet,
+        {"type": "function_call", "call_id": "call_2", "name": "read", "arguments": "not json"},
+        {"type": "function_call", "call_id": "call_3", "name": "read", "arguments": "{}"},
+        greet,
+        {"type": "function_call_output", "call_id": "call_1", "output": "Hello, Ada!"},
+        {"type": "function_call_output", "call_id": "call_2", "output": "x" * 100_000},
+        {"type": "function_call_output", "call_id": "call_3", "output": image_output},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Done."}],
+        },
+    ]
+
+    assert [m["role"] for m in _translate_input_to_messages(input_value)] == ["user", "assistant"]
+    messages = _translate_input_to_messages(input_value, include_tool_history=True)
+
+    roles = [m["role"] for m in messages]
+    assert roles == ["user", *["tool_call"] * 3, *["tool_result"] * 3, "assistant"]
+    assert messages[1]["content"] == {"tool": "greet", "args": {"name": "Ada"}}
+    assert messages[1]["metadata"] == {"call_id": "call_1"}
+    assert messages[2]["content"] == {"tool": "read", "args": {}}
+    assert messages[4] == {
+        "role": "tool_result",
+        "content": "Hello, Ada!",
+        "metadata": {"call_id": "call_1"},
+    }
+    capped = messages[5]["content"]
+    assert len(capped.encode()) < _REPLAYED_TOOL_OUTPUT_MAX_BYTES + 200
+    assert "[output truncated by omnigent:" in capped
+    assert "QUJD" not in messages[6]["content"]
+
+
 # ── MCP tool-call observed/dispatch correlation ──────────
 #
 # These unit tests pin the queue mechanic that fixes the tool-call

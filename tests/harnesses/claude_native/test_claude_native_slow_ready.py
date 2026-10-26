@@ -33,7 +33,7 @@ sys.stdout.write("\x1b[?2004h")
 sys.stdout.flush()
 while not gate_started.exists():
     time.sleep(0.01)
-if sys.argv[3] == "dead":
+if sys.argv[3] in {"dead", "dead-no-status"}:
     print("Startup failed", flush=True)
     raise SystemExit(1)
 print("Starting Claude Code...", flush=True)
@@ -63,7 +63,9 @@ while True:
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux is required")
-@pytest.mark.parametrize("startup", ["slow", "dead", "base-budget-only", "exit-after-ready"])
+@pytest.mark.parametrize(
+    "startup", ["slow", "dead", "dead-no-status", "base-budget-only", "exit-after-ready"]
+)
 @pytest.mark.timeout(20)
 def test_first_message_survives_slow_terminal_startup(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, startup: str, caplog: pytest.LogCaptureFixture
@@ -80,6 +82,16 @@ def test_first_message_survives_slow_terminal_startup(
     terminal.write_text(_TERMINAL)
     original_wait = bridge._wait_for_claude_prompt_ready
     started_at: list[float] = []
+
+    if startup == "dead-no-status":
+        original_pane_state = bridge._claude_pane_state
+
+        def pane_state_without_exit_status(
+            socket_path: str, tmux_target: str
+        ) -> bridge._ClaudePaneState:
+            return original_pane_state(socket_path, tmux_target)._replace(exit_status=None)
+
+        monkeypatch.setattr(bridge, "_claude_pane_state", pane_state_without_exit_status)
 
     def observe_wait(
         socket_path: str,
@@ -158,16 +170,21 @@ def test_first_message_survives_slow_terminal_startup(
                 assert "MUST_NOT_DELIVER" not in json.dumps(row)
                 assert str(socket_path) not in json.dumps(row)
                 assert not delivered.exists()
-            elif startup == "dead":
-                with pytest.raises(
-                    bridge.ClaudeTerminalExited,
-                    match=r"has exited \(status (?:1|unknown)\)",
-                ) as excinfo:
+            elif startup in {"dead", "dead-no-status"}:
+                with pytest.raises(bridge.ClaudeTerminalExited) as excinfo:
                     bridge.inject_user_message(
                         bridge_dir, content="MUST_NOT_DELIVER", timeout_s=0.3
                     )
                 assert not delivered.exists()
                 assert excinfo.value.exit_status in {None, "1"}
+                if startup == "dead-no-status":
+                    assert excinfo.value.exit_status is None
+                expected_diagnostic = (
+                    "is no longer running (exit status unknown)"
+                    if excinfo.value.exit_status is None
+                    else "has exited (status 1)"
+                )
+                assert expected_diagnostic in str(excinfo.value)
                 pane_state = bridge._claude_pane_state(str(socket_path), "main")
                 assert pane_state.alive is False
                 assert pane_state.exited is True

@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -56,7 +57,7 @@ def api():
         "draft": False,
         "changed_files": 1,
         "user": {"login": "dependabot[bot]", "type": "Bot"},
-        "head": {"sha": HEAD, "repo": {"full_name": REPO}},
+        "head": {"sha": HEAD, "ref": "dependabot/uv/ruff", "repo": {"full_name": REPO}},
         "base": {"sha": BASE, "ref": "main"},
         "labels": [],
     }
@@ -230,6 +231,13 @@ elif args[:2] == ['workflow', 'run']:
 elif args[:2] == ['api', 'repos/example/project/statuses/' + 'a' * 40]:
     assert os.environ['GH_TOKEN'] == 'test-only'
     sys.exit(data.get('status_exit', 0))
+elif args[:3] == ['api', '--method', 'PUT']:
+    assert os.environ['GH_TOKEN'] == 'test-merge-token'
+    assert args == ['api', '--method', 'PUT', 'repos/example/project/pulls/123/update-branch',
+                    '-f', 'expected_head_sha=' + 'a' * 40]
+    if data.get('update_exit'):
+        print(data.get('update_error', 'gh: branch update rejected (HTTP 422)'), file=sys.stderr)
+        sys.exit(data['update_exit'])
 elif args[:3] == ['api', '--method', 'POST']:
     assert os.environ['GH_TOKEN'] == 'test-merge-token'
     assert args[3].endswith(('/rerun-failed-jobs', '/rerun'))
@@ -266,6 +274,11 @@ elif args[0] == 'api':
                         for line in (root / 'calls.jsonl').read_text().splitlines())
             if count > data.get('pull_after_reads', 1):
                 value = data['pull_after']
+        if endpoint.endswith('/pulls/123/reviews?per_page=100&page=1') and 'reviews_after' in data:
+            count = sum(json.loads(line) == args
+                        for line in (root / 'calls.jsonl').read_text().splitlines())
+            if count > 1:
+                value = data['reviews_after']
         if endpoint.endswith('/git/ref/heads/main') and 'main_after' in data:
             count = sum(json.loads(line) == args
                         for line in (root / 'calls.jsonl').read_text().splitlines())
@@ -792,32 +805,37 @@ def test_age_uses_registry_timestamp_and_accepts_exact_boundary(policy_module, a
     policy_module.validate_release(package, api["pypi"], 7, datetime(2020, 1, 8, tzinfo=UTC))
 
 
-def set_changed_files(api, files):
+def set_git_files(api, commit, files):
+    """Serve Git trees and blobs for one revision without changing the PR inventory."""
+    trees = {commit: {}}
+    for path, contents in files.items():
+        parts = path.split("/")
+        tree_id = commit
+        for part in parts[:-1]:
+            child = tree_id + "/" + part
+            trees[tree_id][part] = {"path": part, "mode": "040000", "sha": child}
+            trees.setdefault(child, {})
+            tree_id = child
+        blob_id = commit + "/" + path
+        trees[tree_id][parts[-1]] = {"path": parts[-1], "mode": "100644", "sha": blob_id}
+        api["routes"][f"{PREFIX}/git/blobs/{blob_id}"] = {
+            "encoding": "base64",
+            "content": base64.b64encode(contents.encode()).decode(),
+        }
+    for sha, tree in trees.items():
+        api["routes"][f"{PREFIX}/git/trees/{sha}"] = {"tree": list(tree.values())}
+
+
+def set_changed_files(api, files, *, number=123, head=HEAD):
     """Serve real Git tree/blob shapes for each base/head fixture file."""
     api["files"] = files
     changed = [path for path, (old, new) in files.items() if old != new]
-    api["routes"][f"{PREFIX}/pulls/123"]["changed_files"] = len(changed)
-    api["routes"][f"{PREFIX}/pulls/123/files?per_page=100&page=1"] = [
+    api["routes"][f"{PREFIX}/pulls/{number}"]["changed_files"] = len(changed)
+    api["routes"][f"{PREFIX}/pulls/{number}/files?per_page=100&page=1"] = [
         {"filename": path, "status": "modified"} for path in changed
     ]
-    for index, commit in enumerate((BASE, HEAD)):
-        trees = {commit: {}}
-        for path, contents in files.items():
-            parts = path.split("/")
-            tree_id = commit
-            for part in parts[:-1]:
-                child = tree_id + "/" + part
-                trees[tree_id][part] = {"path": part, "mode": "040000", "sha": child}
-                trees.setdefault(child, {})
-                tree_id = child
-            blob_id = commit + "/" + path
-            trees[tree_id][parts[-1]] = {"path": parts[-1], "mode": "100644", "sha": blob_id}
-            api["routes"][f"{PREFIX}/git/blobs/{blob_id}"] = {
-                "encoding": "base64",
-                "content": base64.b64encode(contents[index].encode()).decode(),
-            }
-        for sha, tree in trees.items():
-            api["routes"][f"{PREFIX}/git/trees/{sha}"] = {"tree": list(tree.values())}
+    for index, commit in enumerate((BASE, head)):
+        set_git_files(api, commit, {path: contents[index] for path, contents in files.items()})
 
 
 @pytest.fixture
@@ -1226,12 +1244,16 @@ def test_web_updates_preserve_security_and_compatibility(evaluate_fixture, polic
                 "integrity" if fault == "integrity" else "tarball"
             ] = "untrusted"
     elif fault == "override":
-        text = "packages: [web]\noverrides: {clsx: 2.1.1}\n"
+        text = "packages: [web]\noverrides: {clsx: '~2.0.0'}\n"
         files["pnpm-workspace.yaml"] = (text, text)
+        files["pnpm-lock.yaml"] = tuple(
+            yaml.safe_dump({**yaml.safe_load(lock), "overrides": {"clsx": "~2.0.0"}})
+            for lock in files["pnpm-lock.yaml"]
+        )
     elif fault == "shared":
         locks = [yaml.safe_load(text) for text in files["pnpm-lock.yaml"]]
         for lock in locks:
-            lock["importers"]["web/electron"] = copy.deepcopy(lock["importers"]["web"])
+            lock["importers"]["uncovered/workspace"] = copy.deepcopy(lock["importers"]["web"])
         files["pnpm-lock.yaml"] = tuple(yaml.safe_dump(lock) for lock in locks)
     elif fault == "graph":
         old, new = files["pnpm-lock.yaml"]
@@ -1241,7 +1263,8 @@ def test_web_updates_preserve_security_and_compatibility(evaluate_fixture, polic
     else:
         old, new = files["pnpm-lock.yaml"]
         files["pnpm-lock.yaml"] = (old, new + "\nimporters: {}\n")
-    with pytest.raises(policy_module.NeedsReview):
+    reason = "resolution violates compatibility override" if fault == "override" else None
+    with pytest.raises(policy_module.NeedsReview, match=reason):
         evaluate()
 
 
@@ -1372,15 +1395,62 @@ def test_required_workflow_must_test_current_head_and_base(tmp_path, api, entry,
 
 
 @pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
-def test_tested_action_pin_does_not_authorize_unmapped_workflow(tmp_path, expanded_update):
+@pytest.mark.parametrize(
+    "fault", [None, "different_pin", "unmapped_only", "commands", "credential"]
+)
+def test_tested_action_transition_covers_other_occurrences(tmp_path, expanded_update, fault):
     _, api = expanded_update
     pair = api["files"][".github/workflows/ci.yml"]
-    set_changed_files(
-        api, {".github/workflows/ci.yml": pair, ".github/workflows/release.yml": pair}
-    )
+    files = {".github/workflows/ci.yml": pair, ".github/workflows/release.yml": pair}
+    if fault == "different_pin":
+        files[".github/workflows/release.yml"] = (pair[0], pair[1].replace("2" * 40, "3" * 40))
+    elif fault == "unmapped_only":
+        del files[".github/workflows/ci.yml"]
+    elif fault == "commands":
+        files[".github/workflows/release.yml"] = (
+            pair[0],
+            pair[1] + "      - run: arbitrary-command\n",
+        )
+    if fault == "credential":
+        files = {
+            path: tuple(text.replace("actions/checkout", "docker/login-action") for text in pair)
+            for path, pair in files.items()
+        }
+    set_changed_files(api, files)
     process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
-    assert "release.yml: Action changes need mapped PR CI" in process.stdout
-    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (fault is None), process.stdout
+    if fault == "credential":
+        assert "docker/login-action requires human review" in process.stdout
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+@pytest.mark.parametrize("action", ["docker/build-push-action", "example/unlisted-action"])
+def test_action_evidence_does_not_extend_to_unmapped_publishers(
+    evaluate_fixture, policy_module, action
+):
+    api, evaluate = evaluate_fixture
+    files = {}
+    for name in ("docker-build.yml", "oss-publish-images.yml"):
+        path = f".github/workflows/{name}"
+        old = (ROOT / path).read_text()
+        pin = "c3c9e263c25d99ce0380d002d59b67737d91b0dc"
+        new = old.replace(f"docker/build-push-action@{pin}", f"{action}@{'2' * 40}")
+        old = old.replace("docker/build-push-action@", action + "@")
+        assert old != new
+        files[path] = old, new
+    api["files"] = files
+    # Avoid making release validation the reason an uncovered occurrence fails.
+    policy_module.github_release = lambda _repository, sha, _days: (
+        "7.4.1" if sha == "2" * 40 else "7.4.0",
+        "",
+    )
+    reason = (
+        "docker/build-push-action requires human review"
+        if action == "docker/build-push-action"
+        else "has an unmapped occurrence requiring human review"
+    )
+    with pytest.raises(policy_module.NeedsReview, match=reason):
+        evaluate()
 
 
 @pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
@@ -1529,7 +1599,7 @@ def test_worker_refreshes_stale_approval_without_merging(tmp_path, api, conditio
     posts = [call for call in calls if call[:3] == ["api", "--method", "POST"]]
     assert posts == (
         [["api", "--method", "POST", f"{PREFIX}/actions/runs/90/rerun-failed-jobs"]]
-        if condition in {"eligible", "reports_pending"}
+        if condition == "eligible"
         else []
     ), process.stdout
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
@@ -1860,3 +1930,403 @@ def test_worker_bounds_readiness_dispatch_for_each_head(tmp_path, api, condition
     assert mint_token["with"]["permission-actions"] == "write"
     readiness = yaml.safe_load((ROOT / ".github/workflows/merge-ready.yml").read_text())
     assert "format('Merge Ready #{0} ({1})', inputs.pr, inputs.sha)" in readiness["run-name"]
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "green",
+        "report",
+        "failed",
+        "pending",
+        "advisory",
+        "limit",
+        "incomplete",
+        "hold",
+        "head_moved",
+        "two_merges",
+        "two_pages",
+        "limit_two_pages",
+        "incomplete_two_pages",
+        "check_failed",
+        "check_pending",
+        "mixed_bases",
+        "wrong_tip",
+        "held_at_refresh",
+        "objection_at_refresh",
+        "update_rejected",
+        "update_rejected_without_http",
+        "approval_pending",
+        "approval_unrecoverable",
+        "approval_recoverable",
+        "optional_oidc",
+        "reusable_oidc",
+        "main_oidc",
+        "workflow_inventory",
+        "missing_branch",
+    ],
+)
+def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
+    tip = "c" * 40
+    workflow = {
+        "on": {"pull_request": None},
+        "permissions": {"contents": "read"},
+        "jobs": {"gate": {"uses": "./.github/workflows/security-gate.yml"}},
+    }
+    gate = (ROOT / ".github/workflows/security-gate.yml").read_text()
+    optional = yaml.safe_load((ROOT / ".github/workflows/release-omnigent.yml").read_text())
+    optional["on"] = optional.pop(True)
+    optional["on"]["pull_request"]["paths"] = (
+        ["uv.lock"] if condition == "optional_oidc" else ["release-only.txt"]
+    )
+    if condition == "reusable_oidc":
+        gate = gate.replace("  contents: read", "  contents: read\n  id-token: write", 1)
+    inventory = {
+        "uv.lock": (LOCK, LOCK.replace("0.15.1", "0.15.2")),
+        ".github/workflows/ci.yml": (yaml.safe_dump(workflow), yaml.safe_dump(workflow)),
+        ".github/workflows/security-gate.yml": (gate, gate),
+        ".github/workflows/release-omnigent.yml": (
+            yaml.safe_dump(optional),
+            yaml.safe_dump(optional),
+        ),
+    }
+    set_changed_files(api, inventory)
+    main_files = {path: pair[0] for path, pair in inventory.items()}
+    if condition == "main_oidc":
+        workflow["permissions"]["id-token"] = "write"
+        main_files[".github/workflows/ci.yml"] = yaml.safe_dump(workflow)
+    set_git_files(api, tip, main_files)
+    if condition == "workflow_inventory":
+        api["routes"][f"{PREFIX}/git/trees/{tip}/.github/workflows"]["truncated"] = True
+    api["routes"][f"{PREFIX}/git/ref/heads/main"]["object"]["sha"] = tip
+    api["routes"][f"{PREFIX}/compare/{tip}...{HEAD}"] = {"merge_base_commit": {"sha": BASE}}
+    pull = api["routes"][f"{PREFIX}/pulls/123"]
+    if condition == "missing_branch":
+        del pull["head"]["ref"]
+    pull["commits"] = 1
+    commits = [{"sha": HEAD, "parents": [{"sha": BASE}]}]
+    if condition in {"limit", "two_merges"}:
+        commits = [
+            {"sha": str(index) * 40, "parents": [{"sha": BASE}, {"sha": tip}]}
+            for index in range(3 if condition == "limit" else 2)
+        ] + commits
+        pull["commits"] = len(commits)
+    elif condition in {"two_pages", "limit_two_pages", "incomplete_two_pages"}:
+        commits = [
+            {"sha": f"{index:040x}", "parents": [{"sha": BASE}]} for index in range(100)
+        ] + commits
+        for index in (0, 100) if condition != "limit_two_pages" else (0, 99, 100):
+            commits[index]["parents"].append({"sha": tip})
+        pull["commits"] = len(commits)
+        api["routes"][f"{PREFIX}/pulls/123/commits?per_page=100&page=2"] = (
+            [] if condition == "incomplete_two_pages" else commits[100:]
+        )
+        commits = commits[:100]
+    elif condition == "incomplete":
+        pull["commits"] = 250
+    elif condition == "hold":
+        pull["labels"] = [{"name": "hold-automerge"}]
+    elif condition in {"head_moved", "held_at_refresh"}:
+        api["pull_after"] = copy.deepcopy(pull)
+        api["pull_after_reads"] = 2
+        if condition == "head_moved":
+            api["pull_after"]["head"]["sha"] = "d" * 40
+        else:
+            api["pull_after"]["labels"] = [{"name": "hold-automerge"}]
+    elif condition == "mixed_bases":
+        run = api["routes"][
+            f"{PREFIX}/actions/workflows/e2e.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+        ]["workflow_runs"][0]
+        run["pull_requests"][0]["base"]["sha"] = "d" * 40
+    elif condition == "wrong_tip":
+        commits[-1]["sha"] = "d" * 40
+    elif condition == "objection_at_refresh":
+        api["reviews_after"] = [{"user": {"login": "maintainer"}, "state": "CHANGES_REQUESTED"}]
+    elif condition in {"update_rejected", "update_rejected_without_http"}:
+        api["update_exit"] = 1
+        if condition == "update_rejected_without_http":
+            api["update_error"] = "opaque failure with private diagnostic text"
+    elif condition in {"check_failed", "check_pending"}:
+        api["routes"]["Pre-commit checks"]["check_runs"][0].update(
+            status="in_progress" if condition == "check_pending" else "completed",
+            conclusion="failure" if condition == "check_failed" else None,
+        )
+    elif condition.startswith("approval_"):
+        check = api["routes"]["Maintainer Approval"]["check_runs"][0]
+        if condition == "approval_pending":
+            check.update(status="in_progress", conclusion=None)
+        else:
+            check.update(
+                conclusion="failure",
+                details_url=f"https://github.com/{REPO}/actions/runs/90/job/1",
+            )
+            api["routes"][f"{PREFIX}/actions/runs/90"] = {
+                "path": ".github/workflows/maintainer-approval.yml",
+                "event": "pull_request_target",
+                "status": "completed",
+                "conclusion": "failure",
+                "run_attempt": 3 if condition == "approval_unrecoverable" else 1,
+            }
+    elif condition in {"failed", "pending"}:
+        run = api["routes"][
+            f"{PREFIX}/actions/workflows/e2e.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+        ]["workflow_runs"][0]
+        run.update(
+            status="in_progress" if condition == "pending" else "completed",
+            conclusion="failure" if condition == "failed" else None,
+        )
+    elif condition == "advisory":
+        api["report"]["Results"][0]["Vulnerabilities"].append(
+            {
+                "PkgName": "ruff",
+                "InstalledVersion": "0.15.2",
+                "Severity": "HIGH",
+                "VulnerabilityID": "CVE-update",
+            }
+        )
+    api["routes"][f"{PREFIX}/pulls/123/commits?per_page=100&page=1"] = commits
+    process, calls = run_cli(
+        tmp_path, api, mode="report" if condition == "report" else "merge", sweep=True
+    )
+    assert process.returncode == 0, process.stderr
+    updates = [call for call in calls if call[:3] == ["api", "--method", "PUT"]]
+    assert bool(updates) == (
+        condition
+        in {
+            "green",
+            "two_merges",
+            "two_pages",
+            "update_rejected",
+            "update_rejected_without_http",
+            "approval_recoverable",
+        }
+    ), process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+    assert not any(call[:3] == ["api", "--method", "POST"] for call in calls)
+    reason = {
+        "green": "waiting for fresh policy, scans and CI",
+        "two_merges": "waiting for fresh policy, scans and CI",
+        "two_pages": "waiting for fresh policy, scans and CI",
+        "approval_recoverable": "waiting for fresh policy, scans and CI",
+        "mixed_bases": "one identifiable base",
+        "wrong_tip": "Incomplete commit inventory",
+        "held_at_refresh": "PR was put on hold",
+        "objection_at_refresh": "A reviewer has requested changes",
+        "update_rejected": "GitHub rejected branch refresh (HTTP 422)",
+        "update_rejected_without_http": "GitHub rejected branch refresh; inspect",
+        "check_failed": "Waiting for successful Pre-commit checks",
+        "check_pending": "Waiting for successful Pre-commit checks",
+        "failed": "Latest e2e.yml run did not succeed",
+        "pending": "Latest e2e.yml run did not succeed",
+        "advisory": "CVE-update requires human review",
+        "limit": "Base refresh limit reached",
+        "limit_two_pages": "Base refresh limit reached",
+        "incomplete": "Incomplete commit inventory",
+        "incomplete_two_pages": "Incomplete commit inventory",
+        "hold": "A hold or scan-waiver label is present",
+        "head_moved": "PR or main changed during evaluation",
+        "report": "CI did not test the current PR head and base",
+        "approval_pending": "Waiting for Maintainer Approval",
+        "approval_unrecoverable": "Approval refresh retry limit reached",
+        "optional_oidc": "release-omnigent.yml: privileged or unknown permissions",
+        "reusable_oidc": "security-gate.yml: privileged or unknown permissions",
+        "main_oidc": "ci.yml: privileged or unknown permissions",
+        "workflow_inventory": "Workflow inventory is incomplete",
+        "missing_branch": "Missing PR branch",
+    }[condition]
+    assert reason in process.stdout
+    assert "private diagnostic text" not in process.stdout
+    if condition in {"two_pages", "limit_two_pages", "incomplete_two_pages"}:
+        assert ["api", f"{PREFIX}/pulls/123/commits?per_page=100&page=2"] in calls
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+def test_shared_checkout_refresh_cannot_enable_release_oidc(tmp_path, expanded_update):
+    _, api = expanded_update
+    files = {
+        path: tuple(
+            text.replace("jobs:\n", "permissions: {contents: read}\njobs:\n") for text in pair
+        )
+        for path, pair in api["files"].items()
+    }
+    release = (ROOT / ".github/workflows/release-omnigent.yml").read_text()
+    files[".github/workflows/release-omnigent.yml"] = tuple(
+        re.sub(r"actions/checkout@[a-f0-9]{40}", f"actions/checkout@{pin * 40}", release)
+        for pin in ("1", "2")
+    )
+    set_changed_files(api, files)
+    tip = "c" * 40
+    set_git_files(api, tip, {path: pair[0] for path, pair in files.items()})
+    api["routes"][f"{PREFIX}/git/ref/heads/main"]["object"]["sha"] = tip
+    api["routes"][f"{PREFIX}/compare/{tip}...{HEAD}"] = {"merge_base_commit": {"sha": BASE}}
+    api["routes"][f"{PREFIX}/pulls/123"]["commits"] = 1
+    api["routes"][f"{PREFIX}/pulls/123/commits?per_page=100&page=1"] = [
+        {"sha": HEAD, "parents": [{"sha": BASE}]}
+    ]
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert "eligible (actions/checkout==4.2.0)" in process.stdout
+    assert "release-omnigent.yml: privileged or unknown permissions" in process.stdout
+    assert not any(call[:3] == ["api", "--method", "PUT"] for call in calls)
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "read_all",
+        "job_write",
+        "sarif_oidc",
+        "write_all",
+        "missing_permissions",
+        "environment",
+        "secrets",
+        "secret_context",
+        "secret_case",
+        "secret_object",
+        "secret_format",
+        "secret_quoted_braces",
+        "secret_yaml_escape",
+        "remote_reusable",
+        "missing_reusable",
+        "nested_reusable",
+        "cycle",
+        "invalid_permissions",
+    ],
+)
+def test_refresh_permissions_follow_optional_and_reusable_jobs(policy_module, fault):
+    path = (
+        ".github/workflows/trivy.yml"
+        if fault == "sarif_oidc"
+        else ".github/workflows/optional.yml"
+    )
+    reusable = ".github/workflows/reusable.yml"
+    workflow = {
+        "on": "pull_request",
+        "permissions": {"contents": "read"},
+        "jobs": {"scan": {"runs-on": "ubuntu-latest", "steps": [{"run": "true"}]}},
+    }
+    job = workflow["jobs"]["scan"]
+    definitions = {path: workflow}
+    if fault == "read_all":
+        workflow["permissions"] = "read-all"
+    elif fault == "job_write":
+        job["permissions"] = {"id-token": "write"}
+    elif fault == "sarif_oidc":
+        job["permissions"] = {"security-events": "write", "id-token": "write"}
+    elif fault == "write_all":
+        workflow["permissions"] = "write-all"
+    elif fault == "missing_permissions":
+        del workflow["permissions"]
+    elif fault == "environment":
+        job["environment"] = "test-pypi"
+    elif fault == "secrets":
+        job["secrets"] = "inherit"
+    elif fault == "secret_context":
+        workflow["env"] = {"CREDENTIAL": "${{ secrets['CREDENTIAL'] }}"}
+    elif fault == "secret_case":
+        workflow["env"] = {"CREDENTIAL": "${{ SeCrEtS.CREDENTIAL }}"}
+    elif fault == "secret_object":
+        workflow["env"] = {"CREDENTIALS": "${{ toJSON(secrets) }}"}
+    elif fault == "secret_format":
+        workflow["env"] = {"CREDENTIAL": "${{ format('{0}', secrets.CREDENTIAL) }}"}
+    elif fault == "secret_quoted_braces":
+        workflow["env"] = {"CREDENTIAL": "${{ format('}} {0}', secrets.CREDENTIAL) }}"}
+    elif fault == "invalid_permissions":
+        job["permissions"] = {"contents": {"unknown": "read"}}
+    elif fault in {"remote_reusable", "missing_reusable", "nested_reusable", "cycle"}:
+        workflow["jobs"] = {"call": {"uses": "./" + reusable}}
+        if fault == "remote_reusable":
+            workflow["jobs"]["call"]["uses"] = "example/project/.github/workflows/build.yml@main"
+        elif fault != "missing_reusable":
+            definitions[reusable] = {
+                "on": "workflow_call",
+                "permissions": {"contents": "read"},
+                "jobs": {"nested": {"uses": "./" + path}}
+                if fault == "cycle"
+                else {
+                    "nested": {"runs-on": "ubuntu-latest", "permissions": {"id-token": "write"}}
+                },
+            }
+    texts = {name: yaml.safe_dump(value) for name, value in definitions.items()}
+    if fault == "secret_yaml_escape":
+        texts[path] += 'env: {CREDENTIAL: "${{ \\x73ecrets.CREDENTIAL }}"}\n'
+    if fault in {None, "read_all"}:
+        policy_module.require_refresh_permissions(texts, {"uv.lock"}, "dependabot/uv/ruff")
+    else:
+        reason = "secret access" if fault.startswith("secret_") else None
+        with pytest.raises(policy_module.NeedsReview, match=reason):
+            policy_module.require_refresh_permissions(texts, {"uv.lock"}, "dependabot/uv/ruff")
+
+
+@pytest.mark.parametrize(
+    "trigger,paths,expected",
+    [
+        ({"pull_request": None}, {"uv.lock"}, True),
+        ({"pull_request": {"types": ["labeled"]}}, {"uv.lock"}, False),
+        ({"pull_request": {"paths": ["release.yml"]}}, {"uv.lock"}, False),
+        ({"pull_request": {"paths": ["web/**"]}}, {"web/package.json"}, True),
+        ({"pull_request": {"paths": ["web/**"]}}, {"uv.lock"}, False),
+        ({"pull_request": {"paths": ["**/*.yml"]}}, {"uv.lock"}, True),
+        ({"pull_request": {"paths": ["!uv.lock"]}}, {"uv.lock"}, True),
+        ({"pull_request": {"paths-ignore": ["uv.lock"]}}, {"uv.lock"}, True),
+        ({"push": None}, {"uv.lock"}, True),
+        ({"push": {"branches": ["main"]}}, {"uv.lock"}, False),
+        ({"push": {"branches": ["dependabot/**"]}}, {"uv.lock"}, True),
+        ({"push": {"tags": ["v*"]}}, {"uv.lock"}, False),
+        ({"push": {"paths": ["release.yml"]}}, {"uv.lock"}, True),
+        ({"pull_request": {"types": ["labeled"]}, "push": None}, {"uv.lock"}, True),
+        ({"workflow_call": None}, {"uv.lock"}, False),
+    ],
+)
+def test_refresh_triggers_exclude_only_proven_inactive_workflows(
+    policy_module, trigger, paths, expected
+):
+    assert (
+        policy_module.refresh_workflow_may_run({"on": trigger}, paths, "dependabot/uv/ruff")
+        is expected
+    )
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+@pytest.mark.parametrize("conclusion", ["success", "skipped", "missing", "failure"])
+def test_android_action_update_requires_unsigned_build(tmp_path, expanded_update, conclusion):
+    _, api = expanded_update
+    pair = api["files"][".github/workflows/ci.yml"]
+    set_changed_files(api, {".github/workflows/android-bundle.yml": pair})
+    api["routes"][
+        f"{PREFIX}/actions/workflows/android-bundle.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+    ] = {
+        "workflow_runs": [
+            {
+                "id": 21,
+                "head_sha": HEAD,
+                "status": "completed",
+                "conclusion": "success",
+                "pull_requests": [{"number": 123, "head": {"sha": HEAD}, "base": {"sha": BASE}}],
+            }
+        ]
+    }
+    api["routes"][f"{PREFIX}/actions/runs/21/jobs?per_page=100&page=1"] = {
+        "jobs": []
+        if conclusion == "missing"
+        else [{"name": "Build unsigned AAB", "conclusion": conclusion}]
+    }
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (conclusion == "success"), (
+        process.stdout
+    )
+
+
+def test_consumer_coverage_outside_required_workflows_fails_closed(policy_module):
+    worker = importlib.import_module("dependabot_automerge")
+    candidate = {
+        "head": HEAD,
+        "ecosystem": "npm",
+        "workflows": ["web-tests.yml"],
+        "consumer_steps": [{"workflow": "unrequired.yml"}],
+    }
+    with pytest.raises(ValueError, match="Consumer coverage references a workflow outside"):
+        worker.require_reports(REPO, candidate)
