@@ -15,6 +15,9 @@
     <string name="connect_action">Connect</string>
     <string name="connect_recents">Recent servers</string>
     <string name="connect_invalid">Enter a valid http(s) server URL</string>
+    <string name="about_action">About</string>
+    <string name="about_title">About Omnigent</string>
+    <string name="about_version">Version %1$s\nBuild %2$d</string>
     <string name="oauth_completing">Completing Databricks sign-in…</string>
     <string name="oidc_completing">Completing sign-in…</string>
     <string name="oauth_invalid_callback">Databricks returned an invalid sign-in callback.</string>

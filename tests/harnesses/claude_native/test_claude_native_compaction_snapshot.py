@@ -3,7 +3,9 @@
 import asyncio
 import json
 import logging
+import time
 import uuid
+from datetime import UTC, datetime, timedelta
 from itertools import pairwise
 from pathlib import Path
 from typing import Any
@@ -14,6 +16,7 @@ import pytest
 from omnigent.entities.conversation import CompactionData
 from omnigent.harnesses.claude_native import forwarder
 from omnigent.harnesses.claude_native.bridge import (
+    _HOOKS_FILE,
     ClaudeTranscriptItem,
     read_transcript_items_since,
     record_hook_event,
@@ -151,6 +154,41 @@ def _transcript(*, segment_only: bool = False) -> list[dict[str, Any]]:
     ]
 
 
+def _second_compaction() -> list[dict[str, Any]]:
+    """A later turn and the compaction that retained it, appended after ``_transcript()``."""
+    return [
+        {
+            "type": "user",
+            "uuid": "recent",
+            "parentUuid": "summary",
+            "message": {"role": "user", "content": "new retained request"},
+        },
+        {
+            "type": "system",
+            "subtype": "compact_boundary",
+            "uuid": "boundary-2",
+            "parentUuid": None,
+            "compactMetadata": {
+                "preservedMessages": {
+                    "anchorUuid": "summary-2",
+                    "uuids": ["recent"],
+                }
+            },
+        },
+        {
+            "type": "user",
+            "uuid": "summary-2",
+            "parentUuid": "boundary-2",
+            "isCompactSummary": True,
+            "message": {"role": "user", "content": "second summary"},
+        },
+    ]
+
+
+def _claude_timestamp(moment: datetime) -> str:
+    return moment.astimezone(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+
+
 def _write_transcript(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, entries: list[dict[str, Any]]
 ) -> tuple[Path, Path]:
@@ -180,6 +218,7 @@ def _persist(
     *,
     summary_override: str | None = None,
     summary_source_id: str | None = None,
+    summary_not_before: float | None = None,
     allow_snapshot_fallback: bool = False,
 ) -> None:
     # Only the external HTTP service is replaced; the SDK and production
@@ -200,6 +239,7 @@ def _persist(
                 bridge_dir=bridge,
                 summary_override=summary_override,
                 summary_source_id=summary_source_id,
+                summary_not_before=summary_not_before,
                 allow_snapshot_fallback=allow_snapshot_fallback,
             )
 
@@ -252,6 +292,86 @@ def test_retained_turn_and_tool_pair_survive_save_and_resume(
     assert all(record["parentUuid"] == parent["uuid"] for parent, record in pairwise(records))
 
 
+@pytest.mark.parametrize(
+    "summary_source_id", [None, "summary:0:compact_summary"], ids=["hook", "transcript"]
+)
+def test_attachment_chain_preserves_compaction_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    summary_source_id: str | None,
+) -> None:
+    entries = _transcript()
+    summary = entries.pop()
+    parent_uuid = "boundary"
+    for attachment_type in ("instructions", "session_context", "date"):
+        attachment_uuid = f"attachment-{attachment_type}"
+        entries.append(
+            {
+                "type": "attachment",
+                "uuid": attachment_uuid,
+                "parentUuid": parent_uuid,
+                "attachment": {"type": attachment_type},
+            }
+        )
+        parent_uuid = attachment_uuid
+    summary["parentUuid"] = parent_uuid
+    entries.append(summary)
+    bridge, _ = _write_transcript(tmp_path, monkeypatch, entries)
+    posted: list[dict[str, Any]] = []
+
+    _persist(bridge, posted, summary_source_id=summary_source_id)
+
+    assert len(posted) == 1
+    assert posted[0]["type"] == "compaction"
+    messages = posted[0]["data"]["compacted_messages"]
+    assert [message["content"] for message in messages] == [
+        summary["message"]["content"],
+        entries[1]["message"]["content"],
+        entries[2]["message"]["content"],
+        entries[3]["message"]["content"],
+    ]
+    resumed = _records(messages)
+    assert [record["message"]["content"] for record in resumed[1:]] == [
+        message["content"] for message in messages
+    ]
+    assert all(record["parentUuid"] == parent["uuid"] for parent, record in pairwise(resumed))
+
+
+@pytest.mark.parametrize(
+    "invalid_ancestor",
+    [
+        None,
+        {"type": "attachment", "parentUuid": "attachment"},
+        {"type": "attachment", "parentUuid": 123},
+        {"type": "user", "parentUuid": "boundary"},
+        {"type": "system", "subtype": "other", "parentUuid": "boundary"},
+    ],
+    ids=["missing", "cycle", "invalid-parent", "message", "other-system"],
+)
+def test_summary_boundary_rejects_invalid_attachment_chain(
+    invalid_ancestor: dict[str, Any] | None,
+) -> None:
+    records = {entry["uuid"]: entry for entry in _transcript()}
+    records["summary"]["parentUuid"] = "attachment"
+    if invalid_ancestor is not None:
+        records["attachment"] = {"uuid": "attachment", **invalid_ancestor}
+
+    assert forwarder._compaction_summary_boundary(records, records["summary"]) is None
+
+
+def test_hook_snapshot_rejects_attachment_chain_to_an_older_boundary(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    entries = _transcript()
+    entries.insert(0, {"uuid": "older-boundary", "type": "system", "subtype": "compact_boundary"})
+    entries[-1]["parentUuid"] = "attachment"
+    entries.append({"uuid": "attachment", "type": "attachment", "parentUuid": "older-boundary"})
+    _, transcript = _write_transcript(tmp_path, monkeypatch, entries)
+
+    with pytest.raises(ValueError, match="Claude compaction summary is not available yet"):
+        forwarder._latest_compact_summary_uuid(transcript)
+
+
 @pytest.mark.parametrize("missing", ["request", "summary"])
 def test_incomplete_snapshot_is_not_persisted_and_can_retry(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, missing: str
@@ -269,6 +389,253 @@ def test_incomplete_snapshot_is_not_persisted_and_can_retry(
     transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
     _persist(bridge, posted)
     assert len(posted[0]["data"]["compacted_messages"]) == 4
+
+
+def test_hook_completion_before_summary_is_written_is_not_persisted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # SessionStart source=compact can be processed before Claude writes the
+    # compact_boundary/isCompactSummary records, so the transcript still holds
+    # only the pre-compaction turns.
+    entries = [
+        entry
+        for entry in _transcript()
+        if entry.get("subtype") != "compact_boundary" and not entry.get("isCompactSummary")
+    ]
+    bridge, _ = _write_transcript(tmp_path, monkeypatch, entries)
+    posted: list[dict[str, Any]] = []
+
+    with pytest.raises(_CompactionSnapshotError):
+        _persist(bridge, posted)
+
+    assert posted == []
+
+
+def test_hook_completion_waits_for_the_summary_of_a_boundary_without_retained_metadata(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # A boundary without preserved-message metadata keeps the SDK messages as
+    # the snapshot; until its summary record is on disk those are still the
+    # pre-compaction turns.
+    entries = _transcript()
+    next(entry for entry in entries if entry["uuid"] == "boundary")["compactMetadata"] = {
+        "trigger": "manual"
+    }
+    summary = entries.pop()
+    bridge, transcript = _write_transcript(tmp_path, monkeypatch, entries)
+    posted: list[dict[str, Any]] = []
+
+    with pytest.raises(_CompactionSnapshotError):
+        _persist(bridge, posted)
+    assert posted == []
+
+    entries.append(summary)
+    transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
+    _persist(bridge, posted)
+
+    assert [message["content"] for message in posted[0]["data"]["compacted_messages"]] == [
+        "summary of older context"
+    ]
+
+
+@pytest.mark.parametrize("stale_timestamp", ["2026-05-27T22:53:13.245Z", None])
+def test_hook_completion_ignores_a_boundary_written_before_its_precompact(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, stale_timestamp: str | None
+) -> None:
+    precompact_seen_at = datetime(2026, 5, 27, 22, 53, 20, tzinfo=UTC)
+    entries = _transcript()
+    if stale_timestamp is not None:
+        next(entry for entry in entries if entry["uuid"] == "boundary")["timestamp"] = (
+            stale_timestamp
+        )
+    entries.append(_second_compaction()[0])
+    bridge, transcript = _write_transcript(tmp_path, monkeypatch, entries)
+    posted: list[dict[str, Any]] = []
+
+    # The only boundary on disk belongs to an earlier compaction (or cannot be
+    # dated), so the hook path must wait rather than snapshot everything since it.
+    with pytest.raises(_CompactionSnapshotError):
+        _persist(bridge, posted, summary_not_before=precompact_seen_at.timestamp())
+    assert posted == []
+
+    recent, boundary, summary = _second_compaction()
+    boundary["timestamp"] = _claude_timestamp(precompact_seen_at + timedelta(seconds=2))
+    entries.extend([boundary, summary])
+    transcript.write_text("".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8")
+    _persist(bridge, posted, summary_not_before=precompact_seen_at.timestamp())
+
+    assert [message["content"] for message in posted[0]["data"]["compacted_messages"]] == [
+        "second summary",
+        recent["message"]["content"],
+    ]
+
+
+async def _poll_completion_hooks(
+    bridge: Path,
+    posted: list[dict[str, Any]],
+    hook_state: forwarder.HookForwardState,
+    tracker: _PostRetryTracker,
+) -> forwarder.HookForwardState:
+    """Run one hook-forwarder poll against a recording Omnigent stub."""
+
+    def handle(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return httpx.Response(200, json={"data": [{"id": "last-item"}]})
+        posted.append(json.loads(request.content))
+        return httpx.Response(202, json={})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handle), base_url="https://fixture.invalid"
+    ) as client:
+        return await _forward_available_status_events(
+            client=client,
+            session_id="conversation-test",
+            bridge_dir=bridge,
+            state=hook_state,
+            retry_tracker=tracker,
+            compaction_retry_tracker=tracker,
+            dedupe=forwarder._ForwardDedupeState(),
+            task_subjects={},
+            task_statuses={},
+            task_order=[],
+        )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "token", ["precompact", "undated_precompact", "none", "legacy_standalone"]
+)
+async def test_completion_hook_binds_to_the_boundary_of_its_own_compaction(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, token: str
+) -> None:
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+    entries = _transcript()
+    next(entry for entry in entries if entry["uuid"] == "boundary")["timestamp"] = (
+        "2026-05-27T22:53:13.245Z"
+    )
+    recent, boundary, summary = _second_compaction()
+    entries.append(recent)
+    bridge, transcript = _write_transcript(tmp_path, monkeypatch, entries)
+    if token in ("precompact", "undated_precompact"):
+        await forwarder._note_precompact(
+            bridge,
+            claude_session_id=_EXTERNAL_SESSION_ID,
+            transcript_path=str(transcript),
+            recorded_at=time.time() if token == "precompact" else None,
+        )
+    elif token == "legacy_standalone":
+        # Older forwarders stamped standalone tokens with the poll time, which
+        # postdates the boundary they complete.
+        forwarder._write_compaction_state(
+            bridge,
+            forwarder.CompactionForwardState(
+                pending=forwarder._PendingCompaction(seq=1, seen_at=time.time()),
+                last_seq=1,
+            ),
+        )
+    record_hook_event(
+        bridge,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+            "session_id": _EXTERNAL_SESSION_ID,
+            "transcript_path": str(transcript),
+        },
+    )
+    posted: list[dict[str, Any]] = []
+    tracker = _PostRetryTracker(base_delay_s=0, max_delay_s=0)
+
+    hook_state = await _poll_completion_hooks(
+        bridge, posted, forwarder.HookForwardState(event_cursor=0, byte_offset=0), tracker
+    )
+    boundaries = [event for event in posted if event["type"] == "compaction"]
+    if token == "precompact":
+        # The only boundary on disk predates the PreCompact: hold the hook
+        # until Claude writes this compaction's boundary and summary.
+        assert hook_state.event_cursor == 0
+        assert boundaries == []
+        boundary["timestamp"] = _claude_timestamp(datetime.now(UTC) + timedelta(seconds=5))
+        entries.extend([boundary, summary])
+        transcript.write_text(
+            "".join(json.dumps(entry) + "\n" for entry in entries), encoding="utf-8"
+        )
+        hook_state = await _poll_completion_hooks(bridge, posted, hook_state, tracker)
+        boundaries = [event for event in posted if event["type"] == "compaction"]
+        expected = ["second summary", recent["message"]["content"]]
+    else:
+        # Undated/standalone tokens (even legacy poll-time stamps) have no lower
+        # bound: bind to the latest boundary and keep its retained messages.
+        expected = [
+            "summary of older context",
+            "continue the retained request",
+            entries[2]["message"]["content"],
+            entries[3]["message"]["content"],
+            recent["message"]["content"],
+        ]
+
+    assert hook_state.event_cursor > 0
+    assert len(boundaries) == 1
+    assert [message["content"] for message in boundaries[0]["data"]["compacted_messages"]] == (
+        expected
+    )
+    state = forwarder._read_compaction_state(bridge)
+    assert state.persisted_seqs == (1,)
+    assert state.pending is None
+
+
+@pytest.mark.asyncio
+async def test_completion_hook_dates_the_boundary_from_when_precompact_fired(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
+    fired_at = datetime.now(UTC) - timedelta(minutes=5)
+    entries = _transcript()
+    next(entry for entry in entries if entry["uuid"] == "boundary")["timestamp"] = (
+        _claude_timestamp(fired_at + timedelta(seconds=30))
+    )
+    bridge, transcript = _write_transcript(tmp_path, monkeypatch, entries)
+    # The forwarder polls this PreCompact only now, in the same batch as the
+    # completion hook, after Claude already wrote the boundary.
+    with (bridge / _HOOKS_FILE).open("a", encoding="utf-8") as hooks:
+        hooks.write(
+            json.dumps(
+                {
+                    "recorded_at": fired_at.timestamp(),
+                    "payload": {
+                        "hook_event_name": "PreCompact",
+                        "session_id": _EXTERNAL_SESSION_ID,
+                        "transcript_path": str(transcript),
+                    },
+                }
+            )
+            + "\n"
+        )
+    record_hook_event(
+        bridge,
+        {
+            "hook_event_name": "SessionStart",
+            "source": "compact",
+            "session_id": _EXTERNAL_SESSION_ID,
+            "transcript_path": str(transcript),
+        },
+    )
+    posted: list[dict[str, Any]] = []
+
+    hook_state = await _poll_completion_hooks(
+        bridge,
+        posted,
+        forwarder.HookForwardState(event_cursor=0, byte_offset=0),
+        _PostRetryTracker(base_delay_s=0, max_delay_s=0),
+    )
+
+    assert hook_state.event_cursor > 0
+    boundaries = [event for event in posted if event["type"] == "compaction"]
+    assert [message["content"] for message in boundaries[0]["data"]["compacted_messages"]] == [
+        entries[i]["message"]["content"] for i in (5, 1, 2, 3)
+    ]
+    assert forwarder._read_compaction_state(bridge).persisted_seqs == (1,)
 
 
 @pytest.mark.parametrize("empty_content", [[], ""])
@@ -291,7 +658,10 @@ def test_valid_empty_retained_content_is_skipped(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("completion_path", ["transcript", "hook", "alternating"])
 async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, completion_path: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completion_path: str,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT", tmp_path)
@@ -385,7 +755,17 @@ async def test_permanently_missing_uuid_persists_sdk_fallback_and_unblocks_hooks
         "summary of older context"
     ]
     assert any(event["type"] == "external_session_todos" for event in posted)
+    assert [
+        event["data"]["status"]
+        for event in posted
+        if event["type"] == "external_compaction_status"
+    ] == ["completed"]
     assert not snapshot_tracker.has_retry_state("compaction-snapshot:1")
+    [fallback_log] = [
+        record for record in caplog.records if "snapshot retry budget exhausted" in record.message
+    ]
+    assert fallback_log.exc_info is not None
+    assert str(fallback_log.exc_info[1]) == "Claude retained message is not available yet"
 
 
 @pytest.mark.parametrize("failure", ["missing_file", "invalid_utf8", "sdk_error", "mismatch"])
@@ -595,36 +975,7 @@ def test_missing_sdk_snapshot_is_not_posted(
 def test_transcript_snapshot_is_bound_to_compact_summary_uuid(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    entries = _transcript()
-    entries.extend(
-        [
-            {
-                "type": "user",
-                "uuid": "recent",
-                "parentUuid": "summary",
-                "message": {"role": "user", "content": "new retained request"},
-            },
-            {
-                "type": "system",
-                "subtype": "compact_boundary",
-                "uuid": "boundary-2",
-                "parentUuid": None,
-                "compactMetadata": {
-                    "preservedMessages": {
-                        "anchorUuid": "summary-2",
-                        "uuids": ["recent"],
-                    }
-                },
-            },
-            {
-                "type": "user",
-                "uuid": "summary-2",
-                "parentUuid": "boundary-2",
-                "isCompactSummary": True,
-                "message": {"role": "user", "content": "second summary"},
-            },
-        ]
-    )
+    entries = _transcript() + _second_compaction()
     bridge, _ = _write_transcript(tmp_path, monkeypatch, entries)
     posted: list[dict[str, Any]] = []
 
@@ -642,36 +993,7 @@ def test_transcript_snapshot_is_bound_to_compact_summary_uuid(
 def test_latest_compaction_replaces_older_retained_context(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    entries = _transcript()
-    entries.extend(
-        [
-            {
-                "type": "user",
-                "uuid": "recent",
-                "parentUuid": "summary",
-                "message": {"role": "user", "content": "new retained request"},
-            },
-            {
-                "type": "system",
-                "subtype": "compact_boundary",
-                "uuid": "boundary-2",
-                "parentUuid": None,
-                "compactMetadata": {
-                    "preservedMessages": {
-                        "anchorUuid": "summary-2",
-                        "uuids": ["recent"],
-                    }
-                },
-            },
-            {
-                "type": "user",
-                "uuid": "summary-2",
-                "parentUuid": "boundary-2",
-                "isCompactSummary": True,
-                "message": {"role": "user", "content": "second summary"},
-            },
-        ]
-    )
+    entries = _transcript() + _second_compaction()
     bridge, _ = _write_transcript(tmp_path, monkeypatch, entries)
     posted: list[dict[str, Any]] = []
     _persist(bridge, posted)

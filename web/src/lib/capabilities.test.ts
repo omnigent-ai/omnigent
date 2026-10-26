@@ -148,9 +148,20 @@ describe("resolveServerInfo sandbox_providers", () => {
 describe("resolveServerInfo release features", () => {
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({
-      features: { usage_page: true, harness_install: false, malformed: "yes" },
+      features: {
+        usage_page: true,
+        harness_install: false,
+        automations_v2: true,
+        malformed: "yes",
+      },
     });
-    expect(parsed.features).toEqual({ usage_page: true, harness_install: false });
+    expect(parsed.features).toEqual({
+      usage_page: true,
+      harness_install: false,
+      automations_v2: true,
+    });
+    const { isFeatureEnabled } = await import("./capabilities");
+    expect(isFeatureEnabled(parsed, "automations_v2")).toBe(true);
   });
 
   it("defaults missing features off", async () => {
@@ -173,6 +184,16 @@ describe("resolveServerInfo release features", () => {
     const parsed = await resolveServerInfo();
     expect(isFeatureEnabled(parsed, "usage_page")).toBe(false);
     expect(isFeatureEnabled(parsed, "harness_install")).toBe(false);
+  });
+});
+
+describe("resolveServerInfo session_search_scope", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ session_search_scope: true })).session_search_scope).toBe(true);
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).session_search_scope).toBe(false);
   });
 });
 

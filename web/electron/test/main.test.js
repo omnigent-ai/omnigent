@@ -147,6 +147,8 @@ function loadNavigationHarness({
   arcaResult = { ok: true, alreadyRunning: false },
   arcaExtendResult = { ok: true, shutdownAt: null },
   dbcertRefreshResult = { ok: true },
+  dbcertSyncResult = { ok: true },
+  dbcertPreflightResult = { ok: true, valid: true },
   arcaLoginResult = { ok: true },
   arcaConsentResult,
   loadServer = async () => {},
@@ -183,6 +185,8 @@ function loadNavigationHarness({
     arcaConnects: [],
     arcaExtends: [],
     dbcertRefreshes: 0,
+    dbcertSyncs: 0,
+    dbcertPreflights: 0,
     arcaConsentRuns: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
@@ -190,6 +194,7 @@ function loadNavigationHarness({
     arcaLoginCancels: 0,
   };
   const pickers = [];
+  const findBars = [];
   const ipc = new Map();
   const webRequest = {};
   const jar = new Map();
@@ -354,6 +359,20 @@ function loadNavigationHarness({
           pickers.push(picker);
           return picker;
         }
+        if (options?.webPreferences?.preload?.endsWith("find_preload.js")) {
+          let destroyed = false;
+          const bar = Object.assign(new EventEmitter(), {
+            webContents: { send: () => {} },
+            isDestroyed: () => destroyed,
+            close() {
+              destroyed = true;
+              this.emit("closed");
+            },
+            loadFile: async () => {},
+          });
+          findBars.push(bar);
+          return bar;
+        }
         return win;
       },
       {
@@ -460,11 +479,21 @@ function loadNavigationHarness({
         calls.arcaExtends.push(mode);
         return typeof arcaExtendResult === "function" ? arcaExtendResult(mode) : arcaExtendResult;
       },
-      runDbcertRefresh: async () => {
+      runDbcertRefresh: async (options) => {
         calls.dbcertRefreshes += 1;
         return typeof dbcertRefreshResult === "function"
-          ? dbcertRefreshResult()
+          ? dbcertRefreshResult(options)
           : dbcertRefreshResult;
+      },
+      runDbcertArcaSync: async () => {
+        calls.dbcertSyncs += 1;
+        return typeof dbcertSyncResult === "function" ? dbcertSyncResult() : dbcertSyncResult;
+      },
+      checkDbcert: async () => {
+        calls.dbcertPreflights += 1;
+        return typeof dbcertPreflightResult === "function"
+          ? dbcertPreflightResult()
+          : dbcertPreflightResult;
       },
       isExecutableFile: (p) => p === arcaPath,
       startArcaConnect: (url) => {
@@ -628,7 +657,7 @@ function loadNavigationHarness({
   const mainRequire = createRequire(mainPath);
   const source =
     fs.readFileSync(mainPath, "utf8") +
-    "\nmodule.exports.testApi = { buildMenu, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
+    "\nmodule.exports.testApi = { buildMenu, openFindBar, signOutOfServer, createWindow, createBrowserRegistryForWindow, loadServerUrl, loadSetupPage, pinWindow, setWindowServerUrl, startArcaHostConnect, pickWorkspaceForBridge, registerIpc, registerPermissions, registerSessionExpiryAccess, registerNavigationFallbacks, windows, SETUP_PAGE, SERVER_SELECTOR_V2_PAGE, disposeAuth: () => { databricksAuth?.dispose(); oidcAuth?.dispose(); for (const watch of awayWatches.values()) watch.dispose(); }, setAwayBannerDelayMs: (ms) => { awayBannerDelayMs = ms; }, setReconnectDelaysMs: (delays) => { reconnectDelaysMs = delays; }, reconnectDelaysMs: () => reconnectDelaysMs, setReconnectSlowDelayMs: (ms) => { reconnectSlowDelayMs = ms; }, reconnectSlowDelayMs: () => reconnectSlowDelayMs, cancelReconnect };";
   const module = { exports: {} };
   const sandbox = {
     __dirname: path.dirname(mainPath),
@@ -685,6 +714,7 @@ function loadNavigationHarness({
     webContents,
     settingsPath: path.join(userData, "settings.json"),
     pickers,
+    findBars,
     emit: (eventName, ...args) => webContents.emit(eventName, ...args),
     emitWindow: (eventName) => {
       for (const listener of winListeners.get(eventName) ?? []) listener();
@@ -743,6 +773,8 @@ describe("Arca extend IPC", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
+        // Internal-feature fixtures simulate macOS on every test host.
+        chromeCookieImport: true,
       },
     );
     assert.deepEqual(await extend(event, "overnight"), { ok: true, shutdownAt: null });
@@ -788,26 +820,115 @@ describe("dbcert refresh IPC", () => {
 
   it("shares one sign-in between concurrent clicks", async (t) => {
     let finish;
+    const refreshOptions = [];
     const pending = new Promise((resolve) => {
       finish = resolve;
     });
     const h = loadNavigationHarness({
       serverUrl,
       internalFeatures: true,
-      dbcertRefreshResult: () => pending,
+      dbcertRefreshResult: (options) => {
+        refreshOptions.push({ ...options });
+        return pending;
+      },
     });
     t.after(h.cleanup);
     h.api.registerIpc();
     const refresh = h.ipc.get("omnigent:dbcert-refresh");
     const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
-    const first = refresh(event);
-    const second = refresh(event);
+    const first = refresh(event, { skipArcaSync: true });
+    const second = refresh(event, { skipArcaSync: true });
     finish({ ok: true });
     assert.deepEqual(await Promise.all([first, second]), [{ ok: true }, { ok: true }]);
     assert.equal(h.calls.dbcertRefreshes, 1);
     assert.deepEqual(await refresh(event), { ok: true });
     assert.equal(h.calls.dbcertRefreshes, 2);
+    assert.deepEqual(refreshOptions, [{ skipArcaSync: true }, { skipArcaSync: true }]);
+    assert.equal(h.calls.dbcertSyncs, 1);
   });
+
+  for (const localFirst of [false, true]) {
+    it(`shares renewal but preserves host sync (local-first=${localFirst})`, async (context) => {
+      let finishRenewal;
+      let finishSync;
+      const pendingRenewal = new Promise((resolve) => {
+        finishRenewal = resolve;
+      });
+      const pendingSync = new Promise((resolve) => {
+        finishSync = resolve;
+      });
+      const harness = loadNavigationHarness({
+        serverUrl,
+        internalFeatures: true,
+        dbcertRefreshResult: () => pendingRenewal,
+        dbcertSyncResult: () => pendingSync,
+      });
+      context.after(harness.cleanup);
+      harness.api.registerIpc();
+      const refresh = harness.ipc.get("omnigent:dbcert-refresh");
+      const event = { sender: harness.webContents, senderFrame: { url: serverUrl } };
+      const first = refresh(event, { skipArcaSync: localFirst });
+      const second = refresh(event, { skipArcaSync: !localFirst });
+      const anotherHost = refresh(event);
+      let hostDone = false;
+      anotherHost.then(() => {
+        hostDone = true;
+      });
+      assert.equal(harness.calls.dbcertRefreshes, 1);
+      assert.equal(harness.calls.dbcertSyncs, 0);
+      finishRenewal({ ok: true });
+      assert.deepEqual(await (localFirst ? first : second), { ok: true });
+      assert.equal(harness.calls.dbcertSyncs, 1);
+      assert.equal(hostDone, false);
+      let lateLocalResult;
+      const lateLocal = refresh(event, { skipArcaSync: true }).then((result) => {
+        lateLocalResult = result;
+        return result;
+      });
+      await new Promise((resolve) => {
+        setImmediate(resolve);
+      });
+      assert.deepEqual(lateLocalResult, { ok: true });
+      assert.equal(hostDone, false);
+      finishSync({ ok: true });
+      assert.deepEqual(await Promise.all([first, second, anotherHost, lateLocal]), [
+        { ok: true },
+        { ok: true },
+        { ok: true },
+        { ok: true },
+      ]);
+      assert.equal(harness.calls.dbcertRefreshes, 1);
+      assert.deepEqual(await refresh(event), { ok: true });
+      assert.equal(harness.calls.dbcertRefreshes, 2);
+    });
+  }
+
+  for (const renewalFails of [false, true]) {
+    it(`surfaces a joined refresh failure without another sign-in (renewal=${renewalFails})`, async (context) => {
+      let finish;
+      const failure = { ok: false, error: renewalFails ? "Sign-in canceled" : "Sync failed" };
+      const pending = new Promise((resolve) => {
+        finish = resolve;
+      });
+      const harness = loadNavigationHarness({
+        serverUrl,
+        internalFeatures: true,
+        dbcertRefreshResult: () => pending,
+        dbcertSyncResult: failure,
+      });
+      context.after(harness.cleanup);
+      harness.api.registerIpc();
+      const refresh = harness.ipc.get("omnigent:dbcert-refresh");
+      const event = { sender: harness.webContents, senderFrame: { url: serverUrl } };
+      const local = refresh(event, { skipArcaSync: true });
+      const host = refresh(event);
+      finish(renewalFails ? failure : { ok: true });
+      assert.deepEqual(await local, renewalFails ? failure : { ok: true });
+      assert.deepEqual(await host, failure);
+      assert.equal(harness.calls.dbcertRefreshes, 1);
+      assert.equal(harness.calls.dbcertSyncs, renewalFails ? 0 : 1);
+    });
+  }
 
   it("refuses pages other than the connected server's", async (t) => {
     const h = loadNavigationHarness({ serverUrl, internalFeatures: true });
@@ -821,6 +942,88 @@ describe("dbcert refresh IPC", () => {
       /connected server page/,
     );
     assert.equal(h.calls.dbcertRefreshes, 0);
+    await assert.rejects(
+      h.ipc.get("omnigent:dbcert-check")({
+        sender: h.webContents,
+        senderFrame: { url: "https://evil.example" },
+      }),
+      /connected server page/,
+    );
+    assert.equal(h.calls.dbcertPreflights, 0);
+  });
+
+  it("shares status checks without starting sign-in", async (t) => {
+    let finish;
+    const pending = new Promise((resolve) => {
+      finish = resolve;
+    });
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      dbcertPreflightResult: () => pending,
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+    const check = h.ipc.get("omnigent:dbcert-check");
+    const first = check(event);
+    const second = check(event);
+    assert.equal(h.calls.dbcertRefreshes, 0);
+    assert.equal(h.calls.dbcertPreflights, 1);
+    finish({ ok: true, valid: false });
+    assert.deepEqual(await Promise.all([first, second]), [
+      { ok: true, valid: false },
+      { ok: true, valid: false },
+    ]);
+    assert.deepEqual(await check(event), { ok: true, valid: false });
+    assert.equal(h.calls.dbcertPreflights, 2);
+    assert.equal(h.calls.dbcertRefreshes, 0);
+  });
+
+  it("rechecks pending status after renewal without clearing fresh verification", async (context) => {
+    let finishStaleCheck;
+    let finishFreshCheck;
+    const pendingChecks = [
+      new Promise((resolve) => {
+        finishStaleCheck = resolve;
+      }),
+      new Promise((resolve) => {
+        finishFreshCheck = resolve;
+      }),
+    ];
+    const harness = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      dbcertPreflightResult: () => pendingChecks.shift(),
+    });
+    context.after(harness.cleanup);
+    harness.api.registerIpc();
+    const event = { sender: harness.webContents, senderFrame: { url: serverUrl } };
+    const check = harness.ipc.get("omnigent:dbcert-check");
+    let staleResult;
+    const stale = check(event).then((result) => {
+      staleResult = result;
+      return result;
+    });
+    assert.deepEqual(
+      await harness.ipc.get("omnigent:dbcert-refresh")(event, { skipArcaSync: true }),
+      { ok: true },
+    );
+    const fresh = check(event);
+    assert.equal(harness.calls.dbcertPreflights, 2);
+    finishStaleCheck({ ok: true, valid: false });
+    await new Promise((resolve) => {
+      setImmediate(resolve);
+    });
+    assert.equal(staleResult, undefined);
+    const joined = check(event);
+    assert.equal(harness.calls.dbcertPreflights, 2);
+    finishFreshCheck({ ok: true, valid: true });
+    assert.deepEqual(await Promise.all([stale, fresh, joined]), [
+      { ok: true, valid: true },
+      { ok: true, valid: true },
+      { ok: true, valid: true },
+    ]);
   });
 
   for (const [what, options] of [
@@ -835,6 +1038,8 @@ describe("dbcert refresh IPC", () => {
       assert.equal(h.ipc.get("omnigent:get-desktop-features")(event).canRefreshDbcert, false);
       assert.equal((await h.ipc.get("omnigent:dbcert-refresh")(event)).ok, false);
       assert.equal(h.calls.dbcertRefreshes, 0);
+      assert.equal((await h.ipc.get("omnigent:dbcert-check")(event)).ok, false);
+      assert.equal(h.calls.dbcertPreflights, 0);
     });
   }
 });
@@ -3963,6 +4168,8 @@ describe("browser-view teardown on server change (src/main.js)", () => {
         canExtendArca: true,
         canRefreshDbcert: true,
         arcaPreviewRecovery: true,
+        // Internal-feature fixtures simulate macOS on every test host.
+        chromeCookieImport: true,
       },
     );
   });
@@ -4843,6 +5050,37 @@ describe("OIDC system-browser sign-in wiring", () => {
       assert.equal(h.api.windows.get(h.win).authKind, null, url);
     }
     /* oxlint-enable no-await-in-loop */
+  });
+});
+
+describe("find bar teardown (src/main.js)", () => {
+  function openBar() {
+    const h = loadNavigationHarness();
+    const stops = [];
+    h.webContents.isDestroyed = () => false;
+    h.webContents.stopFindInPage = (action) => stops.push(action);
+    h.win.removeListener = () => {};
+    h.api.openFindBar(h.win);
+    return { h, stops, bar: h.findBars[0] };
+  }
+
+  it("clears the search and refocuses the parent when the bar closes", (t) => {
+    const { h, stops, bar } = openBar();
+    t.after(h.cleanup);
+    bar.close();
+    assert.deepEqual(stops, ["clearSelection"]);
+    assert.equal(h.calls.focused, 1);
+  });
+
+  it("skips the parent's webContents once Cmd+W has destroyed them", (t) => {
+    const { h, bar } = openBar();
+    t.after(h.cleanup);
+    h.webContents.isDestroyed = () => true;
+    h.webContents.stopFindInPage = () => {
+      throw new TypeError("Object has been destroyed");
+    };
+    assert.doesNotThrow(() => bar.close());
+    assert.equal(h.calls.focused, undefined);
   });
 });
 

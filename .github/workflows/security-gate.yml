@@ -4,12 +4,13 @@ name: Security Gate
 # their real jobs declare `needs: gate`. Does NOT scan — the single scan runs in
 # security-scan.yml. This poller only decides whether to let its caller proceed:
 #   - non-PR event or trusted author -> proceed immediately
+#   - verified same-repository Dependabot -> validate changed action pins, proceed
 #   - untrusted PR -> wait for the `Security Scan` check on the head SHA and
 #     MIRROR its conclusion (success -> proceed; failure -> fail, skipping the
 #     dependent CI jobs).
 #
 # The scan (security-scan.yml) is blocking: a finding fails the `Security Scan`
-# check, which this poller mirrors to block dependent CI. Splitting scan from
+# check, which contributor pollers mirror to block dependent CI. Splitting scan from
 # gate runs the scan once, not once per workflow. The trust decision is read
 # from `main` (should-scan.sh).
 
@@ -27,6 +28,7 @@ on:
 
 permissions:
   contents: read
+  pull-requests: read
 
 jobs:
   gate:
@@ -35,11 +37,18 @@ jobs:
     timeout-minutes: 12
     steps:
       - name: Check out trust check from main
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
-        with:
-          ref: main             # trusted; never the PR head
-          sparse-checkout: .github/scripts/security-scan
-          persist-credentials: false
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: |
+          # Bootstrap without executing an Action pin supplied by the PR.
+          git init .
+          git remote add origin "$GITHUB_SERVER_URL/$REPO.git"
+          git sparse-checkout set --no-cone .github/scripts .github/security .github/dependabot-automerge.json
+          authorization=$(printf 'x-access-token:%s' "$GH_TOKEN" | base64 | tr -d '\n')
+          echo "::add-mask::$authorization"
+          git -c "http.extraHeader=AUTHORIZATION: basic $authorization" fetch --depth=1 origin main
+          git checkout --detach FETCH_HEAD
 
       - name: Trust gate
         id: gate
@@ -49,6 +58,10 @@ jobs:
           # Trusted-CI-bot allowlist in should-scan.sh; GitHub-set, not
           # PR-controlled. Lets the gate skip polling for bot PRs with no token.
           PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          PR_AUTHOR_TYPE: ${{ github.event.pull_request.user.type }}
+          PR_HEAD_REPO: ${{ github.event.pull_request.head.repo.full_name }}
+          REPO: ${{ github.repository }}
+          CI_ACCESS_ONLY: 'true'
         run: |
           # Before the scanner lands on main the scripts are absent there --
           # proceed (fail-open) so the introducing PR is not bricked.
@@ -58,6 +71,22 @@ jobs:
             exit 0
           fi
           bash .github/scripts/security-scan/should-scan.sh
+
+      - name: Install trusted policy parser
+        if: ${{ steps.gate.outputs.dependabot == 'true' }}
+        run: |
+          python3 -m venv "$RUNNER_TEMP/dependabot-policy-env"
+          "$RUNNER_TEMP/dependabot-policy-env/bin/pip" install --disable-pip-version-check --only-binary=:all: PyYAML==6.0.3
+          echo "$RUNNER_TEMP/dependabot-policy-env/bin" >> "$GITHUB_PATH"
+
+      - name: Validate Dependabot CI access
+        if: ${{ steps.gate.outputs.dependabot == 'true' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          PR: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: python3 .github/scripts/security-scan/dependabot-ci-access.py
 
       - name: Wait for Security Scan result
         # Only untrusted PRs wait; trusted authors / non-PR events proceeded above.

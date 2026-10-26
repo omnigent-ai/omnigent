@@ -13,6 +13,7 @@ from __future__ import annotations
 import argparse
 import asyncio
 import contextlib
+import dataclasses
 import os
 import shutil
 import signal
@@ -52,6 +53,7 @@ _SMOKE_JOURNEYS = [
     "list_project_sessions",
     "fork_session",
     "add_comment",
+    "policy_evaluate",
     "native_hook_spawn",
     *(name for name in ALL_JOURNEYS if name.startswith("project_order_")),
 ]
@@ -423,6 +425,29 @@ async def test_turn_session_rotates_every_n_samples() -> None:
     assert warmed == ["s1", "s2"]  # each fresh session gets its warm-up turn
     assert ctx.session_id == "s2"
     assert ctx.samples == 1
+
+
+@pytest.mark.asyncio
+async def test_cold_start_stops_each_runner_before_the_next_sample() -> None:
+    """Cold-start runners are stopped off the clock instead of piling up for the suite."""
+    events: list[str] = []
+
+    class _Env:
+        async def cold_start_first_delta(self, agent_id: str, _text: str) -> str:
+            events.append(f"start {agent_id}")
+            return f"s{sum(e.startswith('start') for e in events)}"
+
+        async def stop_session_runner(self, session_id: str) -> None:
+            events.append(f"stop {session_id}")
+
+    async def _setup(_env: BenchEnvironment) -> object:
+        return bench_journeys._ColdStartContext(agent_id="a")
+
+    journey = dataclasses.replace(ALL_JOURNEYS["session_cold_start"], setup=_setup)
+    result = await run_latency(journey, cast(BenchEnvironment, _Env()), iterations=2, warmup=1)
+
+    assert result.n_success == 2
+    assert events == ["start a", "stop s1", "start a", "stop s2", "start a", "stop s3"]
 
 
 @pytest.mark.asyncio
@@ -865,6 +890,25 @@ async def test_benchmark_smoke_runner_journeys() -> None:
         assert run_rows, f"{name} produced no runs"
         # Zero failures — a failure here means the full-turn path broke.
         assert run_rows[0]["n_failures"] == 0, f"{name}: {run_rows[0]['failures']}"
+
+
+@pytest.mark.parametrize("response_status", [500, 200])
+async def test_policy_evaluate_setup_rejects_failed_warmup(response_status: int) -> None:
+    """A failed warmup must not silently become a successful benchmark sample."""
+
+    def respond(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(200, json={"session_id": "policy-session"})
+        return httpx.Response(response_status, json={"result": "POLICY_ACTION_DENY"})
+
+    env = BenchEnvironment()
+    async with httpx.AsyncClient(
+        base_url="http://bench", transport=httpx.MockTransport(respond)
+    ) as client:
+        env.client = client
+        error = httpx.HTTPStatusError if response_status == 500 else RuntimeError
+        with pytest.raises(error):
+            await bench_journeys._setup_policy_evaluate_session(env)
 
 
 # ── seeder (direct store, no server) ─────────────────────────

@@ -24,6 +24,8 @@ import {
   useNavigate,
   useSearchParams,
 } from "react-router-dom";
+import { setEmbedRoot } from "@/lib/host";
+import { EmbeddedProvider } from "@/lib/embedded";
 import { RoutingProvider, reactRouterRouting, type RoutingApi } from "@/lib/routing";
 import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
@@ -192,7 +194,7 @@ vi.mock("./FileViewer", () => ({
   }: {
     open: boolean;
     path: string;
-    position?: { line: number; column?: number };
+    position?: { line: number; column?: number; endLine?: number };
     onClose: () => void;
     frameless?: boolean;
   }) => (
@@ -202,6 +204,7 @@ vi.mock("./FileViewer", () => ({
       data-path={path}
       data-line={position?.line}
       data-column={position?.column}
+      data-end-line={position?.endLine}
     >
       <button type="button" aria-label="file-viewer: close" onClick={onClose}>
         close
@@ -2712,6 +2715,75 @@ describe("Extension pages own the header", () => {
 });
 
 describe("Right workspace card visibility", () => {
+  it.each([true, false])(
+    "waits for capabilities before validating restored search (enabled=%s)",
+    async (enabled) => {
+      mockConversations([{ id: "conv_restore_search", permission_level: null }]);
+      writeSessionWorkspaceState("conv_restore_search", {
+        open: true,
+        rightRailTab: "content-search",
+      });
+      const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+      const tree = (info: ServerInfo | "loading") => (
+        <CapabilitiesProvider info={info}>
+          {sessionShellTree(client, "/c/conv_restore_search")}
+        </CapabilitiesProvider>
+      );
+      const { rerender } = render(tree("loading"));
+      expect(readSessionWorkspaceState("conv_restore_search").rightRailTab).toBe("content-search");
+      rerender(tree(serverInfo({ features: { workspace_content_search: enabled } })));
+      await waitFor(() =>
+        expect(
+          screen.getByRole("tab", { name: enabled ? "Content search" : "Files" }),
+        ).toHaveAttribute("aria-selected", "true"),
+      );
+      expect(readSessionWorkspaceState("conv_restore_search").rightRailTab).toBe(
+        enabled ? "content-search" : "files",
+      );
+    },
+  );
+
+  it.each(["MacIntel", "Win32"])(
+    "opens content search, focuses its input and preserves the query on %s",
+    async (platform) => {
+      vi.spyOn(navigator, "platform", "get").mockReturnValue(platform);
+      writeWorkspacePanelDefault("collapsed");
+      mockConversations([{ id: "conv_search_hotkey", permission_level: null }]);
+      renderShell(
+        "/c/conv_search_hotkey",
+        serverInfo({ features: { workspace_content_search: true } }),
+      );
+      expect(screen.queryByRole("complementary", { name: "Workspace" })).toBeNull();
+      const chord = {
+        code: "KeyF",
+        shiftKey: true,
+        metaKey: platform === "MacIntel",
+        ctrlKey: platform !== "MacIntel",
+      };
+      fireEvent.keyDown(document, chord);
+      const input = await screen.findByRole("searchbox", { name: "Search file contents" });
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(screen.getByRole("tab", { name: "Content search" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      fireEvent.change(input, { target: { value: "keep my query" } });
+      screen.getByRole("button", { name: "Search" }).focus();
+      fireEvent.keyDown(document.activeElement!, chord);
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(input).toHaveValue("keep my query");
+
+      fireEvent.mouseDown(screen.getByRole("tab", { name: "Files" }), { button: 0 });
+      fireEvent.click(screen.getByRole("button", { name: "files: select README.md" }));
+      expect(screen.getByTestId("file-viewer-inline")).toBeInTheDocument();
+      fireEvent.keyDown(document, chord);
+      await waitFor(() => expect(input).toHaveFocus());
+      expect(screen.queryByTestId("file-viewer-inline")).toBeNull();
+      expect(screen.getByTestId("url-params")).not.toHaveTextContent("file=");
+      expect(input).toHaveValue("keep my query");
+    },
+  );
+
   it("restores each Canvas card's saved Workspace choice", async () => {
     useEnvironmentMock.mockReturnValue({
       data: { available: true, root: null, home: null },
@@ -5218,6 +5290,15 @@ describe("file navigation request precedence", () => {
         <button type="button" onClick={() => openFile?.("AGENTS.md", { line: 200, column: 3 })}>
           Cite AGENTS
         </button>
+        <button
+          type="button"
+          onClick={() => openFile?.("AGENTS.md", { line: 10, column: 2, endLine: 14 })}
+        >
+          Cite AGENTS range
+        </button>
+        <button type="button" onClick={() => openFile?.("AGENTS.md", { line: 10, endLine: 10 })}>
+          Cite AGENTS empty range
+        </button>
       </>
     );
   }
@@ -5303,15 +5384,59 @@ describe("file navigation request precedence", () => {
     expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
   });
 
+  it("carries a cited line range through the URL and drops it for a single-line citation", () => {
+    renderNavigationShell();
+    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS range" }));
+    const viewer = screen.getByTestId("file-viewer-inline");
+    expect(viewer).toHaveAttribute("data-line", "10");
+    expect(viewer).toHaveAttribute("data-end-line", "14");
+    expect(screen.getByTestId("url-params")).toHaveTextContent("endLine=14");
+
+    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS" }));
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-end-line");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("endLine=");
+  });
+
+  it("drops an end line that does not follow the cited line", () => {
+    renderNavigationShell();
+    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS empty range" }));
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "10");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-end-line");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("endLine=");
+  });
+
+  it("opens an initial URL range citation and ignores an end before its start or without a start line", () => {
+    const { unmount } = renderNavigationShell(
+      reactRouterRouting,
+      "?file=README.md&line=100&endLine=104",
+    );
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-end-line", "104");
+    unmount();
+
+    const { unmount: unmountBackwards } = renderNavigationShell(
+      reactRouterRouting,
+      "?file=README.md&line=100&endLine=90",
+    );
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-line", "100");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-end-line");
+    unmountBackwards();
+
+    renderNavigationShell(reactRouterRouting, "?file=README.md&endLine=104");
+    expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
+    expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-end-line");
+  });
+
   it("closing the active file clears both coordinates before selecting its neighbor", () => {
     renderNavigationShell();
     fireEvent.click(screen.getByRole("button", { name: "Cite README" }));
-    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS" }));
+    fireEvent.click(screen.getByRole("button", { name: "Cite AGENTS range" }));
     fireEvent.click(screen.getByRole("button", { name: "Close AGENTS.md" }));
     expect(screen.getByTestId("file-viewer-inline")).toHaveAttribute("data-path", "README.md");
     expect(screen.getByTestId("file-viewer-inline")).not.toHaveAttribute("data-line");
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("line=");
     expect(screen.getByTestId("url-params")).not.toHaveTextContent("column=");
+    expect(screen.getByTestId("url-params")).not.toHaveTextContent("endLine=");
   });
 });
 
@@ -5542,5 +5667,38 @@ describe("AppShell design-mode submission", () => {
       expect.stringContaining("A later instruction without a new screenshot"),
       undefined,
     );
+  });
+});
+
+describe("new-session browser shortcut", () => {
+  it.each([false, true])("works from the composer with embedded=%s", (embedded) => {
+    mockConversations([{ id: "conv_abc", permission_level: null }]);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const app = embedded ? (
+      <EmbeddedProvider>
+        <AppShell />
+      </EmbeddedProvider>
+    ) : (
+      <AppShell />
+    );
+    const view = render(
+      shellTree(
+        client,
+        "/c/conv_abc",
+        <>
+          <Route index element={<p>New session route</p>} />
+          <Route path="c/:conversationId" element={<textarea aria-label="Message" />} />
+        </>,
+        app,
+      ),
+    );
+    if (embedded) setEmbedRoot(view.container);
+    const composer = screen.getByRole("textbox", { name: "Message" });
+    composer.focus();
+    fireEvent.keyDown(composer, { code: "KeyN", ctrlKey: true, altKey: true });
+    expect(screen.queryByText("New session route")).toBeNull();
+    fireEvent.keyDown(composer, { key: "O", code: "KeyO", ctrlKey: true, shiftKey: true });
+    expect(screen.getByText("New session route")).toBeInTheDocument();
+    setEmbedRoot(null);
   });
 });

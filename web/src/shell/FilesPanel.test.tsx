@@ -324,6 +324,8 @@ describe("FilesPanel header role", () => {
     // Content is always shown — the tree search box is part of it.
     const search = screen.getByRole("searchbox", { name: "Search all files" });
     expect(search).toBeInTheDocument();
+    expect(search).toHaveAttribute("placeholder", "Find files by name");
+    expect(screen.queryByRole("group", { name: "Search mode" })).not.toBeInTheDocument();
     expect(search.parentElement).toHaveClass("rounded-lg");
     expect(search.parentElement).not.toHaveClass("rounded-full");
   });

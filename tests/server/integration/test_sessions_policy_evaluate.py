@@ -1086,7 +1086,7 @@ async def test_concurrent_cost_asks_serialize_and_collapse_sibling(
     try:
         await asyncio.wait_for(second_in_gate.wait(), timeout=1.0)
         second_entered = True
-    except asyncio.TimeoutError:
+    except TimeoutError:
         second_entered = False
     assert not second_entered, (
         "A second concurrent cost ask entered the gate while the first was "
@@ -1511,7 +1511,7 @@ async def _seed_authenticated_session(auth_client: httpx.AsyncClient, db_uri: st
                             "allow_all": {
                                 "type": "function",
                                 "on": ["tool_call"],
-                                "function": "tests.runtime.policies.conftest._always_allow",
+                                "function": "omnigent.policies.builtins.safety.ask_on_os_tools",
                             }
                         }
                     },
@@ -1576,7 +1576,7 @@ async def test_authenticated_evaluate_route_sql_budget(
     payload = {
         "event": {
             "type": "PHASE_TOOL_CALL",
-            "data": {"name": "Bash", "arguments": {"command": "ls"}},
+            "data": {"name": "echo", "arguments": {}},
         }
     }
     # Warm the spec / policy / ACL caches so the count is the steady-state one.

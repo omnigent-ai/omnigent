@@ -1,6 +1,11 @@
 import { filterSessionScope } from "@/lib/sessionVisibility";
+import { useGridSessions } from "@/grid/GridSessionsContext";
+import { GridSidebar } from "@/grid/GridWorkspace";
+import { GridDropTargets, SPLIT_EDGES, type GridDropTarget } from "@/grid/GridDropTargets";
+import { gridSessionIds, splitGrid } from "@/grid/gridLayout";
 import { getCurrentUserId } from "@/lib/identity";
 import { PinCapacityContext, SidebarConfigContext } from "@/lib/sidebarConfig";
+import { useMenuGuardedTooltip } from "@/hooks/useMenuGuardedTooltip";
 import { useSidebarDisplayPagination } from "@/hooks/useSidebarDisplayPagination";
 import { useSidebarWorkingIds } from "@/hooks/useSidebarWorkingIds";
 import { useSidebarData, useSidebarView, type SidebarListQuery } from "@/hooks/useSidebarData";
@@ -30,7 +35,6 @@ import {
   ArchiveIcon,
   ArrowUpDownIcon,
   ArchiveRestoreIcon,
-  CheckIcon,
   CheckIcon as CheckMarkIcon,
   ChevronLeftIcon,
   ChevronRightIcon,
@@ -179,7 +183,6 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled, isSingleUserMode, sandboxOptionLabel } from "@/lib/capabilities";
 import { useBranding } from "@/lib/branding";
 import { relativeTime } from "@/lib/relativeTime";
-import { USER_SESSION_TITLE_MAX_CHARS } from "@/lib/sessionTitles";
 import { showToast } from "@/components/ui/toast";
 import { showArchiveUndoToast } from "./archiveUndoToast";
 import { unpinWithUndo } from "./unpinUndoToast";
@@ -192,7 +195,7 @@ import { SessionStateBadge } from "@/components/SessionStateBadge";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { useActiveRootSessionId } from "@/hooks/useSession";
 import { isSessionStoppable } from "@/lib/sessionStop";
-import { isImeCompositionKeyEvent } from "@/lib/ime";
+import { SidebarEditRow } from "./SidebarEditRow";
 import { hasSessionDraft, useHasSessionDraft, useSessionDraftIds } from "@/lib/sessionDrafts";
 import { useNow } from "@/hooks/useNow";
 import { useOptimisticTitle } from "@/lib/optimisticTitles";
@@ -287,12 +290,23 @@ import { useDesktopHostId } from "./RevealInFileManager";
 import { ForkSessionDialog } from "./ForkSessionDialog";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
-import { SIDEBAR_ROW } from "./sidebarStyles";
+import {
+  SIDEBAR_ROW,
+  SIDEBAR_HOVER_HIGHLIGHT,
+  SIDEBAR_ACTIVE_HIGHLIGHT,
+  SIDEBAR_GRID_MEMBER_HIGHLIGHT,
+  SIDEBAR_GRID_SELECTED_RING,
+  SIDEBAR_OPEN_MENU_HIGHLIGHT,
+} from "./sidebarStyles";
 import { MAIN_CANVAS_ID } from "@/canvas/canvasLayout";
 import { CANVAS_QUERY_PARAM, canvasLocation, isCanvasPathname } from "@/canvas/canvasNavigation";
 import { TooltipArrow } from "radix-ui/tooltip";
 import { getEmbedRoot } from "../lib/host";
-import { ALT_KEY, ARIA_MOD_KEY, CompactShortcutKeys, MOD_KEY } from "@/components/KeyboardShortcut";
+import {
+  CompactShortcutKeys,
+  newSessionAriaShortcut,
+  newSessionShortcutKeys,
+} from "@/components/KeyboardShortcut";
 
 // Positioning for a row's trailing session-state badge. Anchored at the row's
 // trailing icon edge in every viewport: on desktop it fades on hover so the pin
@@ -312,23 +326,17 @@ function isDotMarker(state: SessionState | null): boolean {
 }
 const SESSION_STATE_DOT_SLOT_CLASS = "w-6 justify-center";
 
-// Match the Settings sidebar's ghost-button hover treatment across every home
-// sidebar row.
-const SIDEBAR_HOVER_HIGHLIGHT = "hover:bg-muted hover:text-foreground dark:hover:bg-muted/50";
-// Keep a project-folder row highlighted while its actions menu is open (kebab
-// or header context menu, both flagged `data-state=open` inside `group/header`).
-// A right-click opens the context menu in a portal, dropping `:hover` from the
-// header, so the hover highlight alone would leave the row un-highlighted.
-const SIDEBAR_OPEN_MENU_HIGHLIGHT =
-  "group-has-[[data-state=open]]/header:bg-muted group-has-[[data-state=open]]/header:text-foreground dark:group-has-[[data-state=open]]/header:bg-muted/50";
-// Active highlight also wins on hover so active items don't lose their
-// background and flash when the mouse enters them.
-const SIDEBAR_ACTIVE_HIGHLIGHT =
-  "bg-[var(--sidebar-active)] text-[var(--sidebar-active-foreground)] hover:bg-[var(--sidebar-active)] hover:text-[var(--sidebar-active-foreground)] dark:hover:bg-[var(--sidebar-active)] dark:hover:text-[var(--sidebar-active-foreground)]";
 const DROP_TARGET_HIGHLIGHT = SIDEBAR_ACTIVE_HIGHLIGHT;
 
+// Stable sensor options keep dnd-kit from rerendering every row on list updates.
+const KEYBOARD_SENSOR_OPTIONS = {
+  coordinateGetter: sortableKeyboardCoordinates,
+  keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
+};
+const MOUSE_SENSOR_OPTIONS = { activationConstraint: { distance: 5 } };
+const TOUCH_SENSOR_OPTIONS = { activationConstraint: { delay: 250, tolerance: 8 } };
+
 const SCROLLBAR_HIDE_DELAY_MS = 700;
-const NEW_SESSION_KEYS = [MOD_KEY, ALT_KEY, "N"] as const;
 
 // Maps a first-class project id → its name, provided once at the list level so
 // each row resolves its ``project_id`` to a folder name without its own
@@ -495,8 +503,12 @@ function useActiveNavItem(): {
   activeExtensionPageId: string | null;
   newSessionProjectName: string | null;
 } {
-  const { conversationId: activeConversationId } = useParams<{ conversationId: string }>();
+  const { conversationId: activeConversationId, gridId } = useParams<{
+    conversationId: string;
+    gridId: string;
+  }>();
   const location = useLocation();
+  const serverInfo = useServerInfo();
   const rebasePath = useRebasePath();
   const extensions = useExtensions();
   const leaf = location.pathname.split("/").filter(Boolean).at(-1);
@@ -510,6 +522,7 @@ function useActiveNavItem(): {
     resolveExtensionPageFromPath(extensions, location.pathname)?.page.id ?? null;
   const isNewSessionRoute =
     activeConversationId == null &&
+    (gridId == null || !isFeatureEnabled(serverInfo, "grid_sessions_display_ui")) &&
     !isInboxPage &&
     !isCanvasPage &&
     !isTasksPage &&
@@ -1178,7 +1191,7 @@ function SidebarImpl({
                 <Link
                   to="/"
                   componentId="sidebar.new_chat"
-                  aria-keyshortcuts={`${ARIA_MOD_KEY}+Alt+N`}
+                  aria-keyshortcuts={newSessionAriaShortcut()}
                   onClick={(e) => {
                     switchTab("mine");
                     onNavClick(e);
@@ -1194,8 +1207,8 @@ function SidebarImpl({
                   />
                   New session
                   <CompactShortcutKeys
-                    keys={NEW_SESSION_KEYS}
-                    className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100"
+                    keys={newSessionShortcutKeys()}
+                    className="pointer-events-none absolute top-1/2 right-2 -translate-y-1/2 opacity-0 transition-opacity group-focus-visible/new-session:opacity-100 [&_kbd]:w-auto [&_kbd]:min-w-4 [&_kbd]:px-0.5 [&_kbd]:font-sans [&_kbd]:text-[10px] [@media((hover:hover)_and_(pointer:fine))]:group-hover/new-session:opacity-100"
                   />
                 </Link>
               </Button>
@@ -1340,6 +1353,7 @@ function SidebarImpl({
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
                 )}
               >
+                <GridSidebar onNavigate={onNavClick} />
                 {sidebarData.identityReady ? (
                   <ConversationList
                     conversationsQuery={displayQuery}
@@ -1728,6 +1742,7 @@ function ConversationList({
   onExitSelectionMode,
   getVisibleIdsRef,
 }: ConversationListProps) {
+  const grids = useGridSessions();
   // Row-invariant values resolved once here and shared with rows via context
   // (see IsMobileContext etc.), so each row doesn't run its own copy.
   const viewerId = useViewerId();
@@ -2177,12 +2192,9 @@ function ConversationList({
   // kebab. Touch: a press-and-hold delay so scrolling the list isn't hijacked
   // into a drag. Project headers also support keyboard sorting.
   const sensors = useSensors(
-    useSensor(KeyboardSensor, {
-      coordinateGetter: sortableKeyboardCoordinates,
-      keyboardCodes: { start: ["Space"], cancel: ["Escape"], end: ["Space"] },
-    }),
-    useSensor(MouseSensor, { activationConstraint: { distance: 5 } }),
-    useSensor(TouchSensor, { activationConstraint: { delay: 250, tolerance: 8 } }),
+    useSensor(KeyboardSensor, KEYBOARD_SENSOR_OPTIONS),
+    useSensor(MouseSensor, MOUSE_SENSOR_OPTIONS),
+    useSensor(TouchSensor, TOUCH_SENSOR_OPTIONS),
   );
   const handleDragStart = useCallback((event: DragStartEvent) => {
     const isProject = event.active.data.current?.type === "project-order";
@@ -2224,6 +2236,12 @@ function ConversationList({
       setActiveDrag(null);
       setOverPin(null);
       if (!dragged) return;
+      const gridTarget = event.over?.data.current as GridDropTarget | undefined;
+      if (gridTarget?.type === "session-grid") {
+        grids?.split(gridTarget.targetId, dragged.id, gridTarget.edge);
+        return;
+      }
+      if (event.active.data.current?.canManage === false) return;
       const target = (event.over?.data.current as SidebarDropTarget | undefined) ?? null;
       const action = resolveSidebarDrop(
         { id: dragged.id, project: dragged.project, isPinned: dragged.isPinned },
@@ -2278,6 +2296,7 @@ function ConversationList({
     },
     [
       activeDrag,
+      grids,
       moveToProject,
       expandProject,
       onTogglePinned,
@@ -2618,7 +2637,16 @@ function ConversationList({
           const droppableContainers = args.droppableContainers.filter(
             (container) => (container.data.current?.type === "project-order") === ordering,
           );
-          if (!ordering) return pointerWithin({ ...args, droppableContainers });
+          if (!ordering)
+            return pointerWithin({
+              ...args,
+              droppableContainers:
+                args.active.data.current?.canManage === false
+                  ? droppableContainers.filter(
+                      (container) => container.data.current?.type === "session-grid",
+                    )
+                  : droppableContainers,
+            });
           // Restrict project drops to the project list inside the sidebar.
           if (args.pointerCoordinates) {
             const rects = droppableContainers
@@ -2654,6 +2682,7 @@ function ConversationList({
           setOverProject(null);
         }}
       >
+        {activeDrag && <GridDropTargets sessionId={activeDrag.id} />}
         <RowEditHoldContext.Provider value={reportRowEditing}>
           <PinSavingContext.Provider value={pinWriting}>
             <div
@@ -3322,6 +3351,8 @@ function SessionFilterMenu({
   onViewChange: (patch: Partial<SidebarViewPreferences>) => void;
 }) {
   const triggerLabel = view === null ? "Filter sessions" : "Group, sort, and filter sessions";
+  const [menuOpen, setMenuOpen] = useState(false);
+  const tooltip = useMenuGuardedTooltip(menuOpen);
   const filters = multiUser
     ? SIDEBAR_FILTERS
     : SIDEBAR_FILTERS.filter((filter) => filter.value !== "shared");
@@ -3339,11 +3370,11 @@ function SessionFilterMenu({
     </DropdownMenuRadioGroup>
   );
   return (
-    <DropdownMenu>
-      <Tooltip disableHoverableContent>
+    <DropdownMenu onOpenChange={setMenuOpen}>
+      <Tooltip disableHoverableContent open={tooltip.open} onOpenChange={tooltip.onOpenChange}>
         <TooltipTrigger asChild>
           {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
-          <span className="inline-flex shrink-0">
+          <span className="inline-flex shrink-0" {...tooltip.triggerProps}>
             <DropdownMenuTrigger asChild>
               <Button
                 type="button"
@@ -3691,6 +3722,8 @@ function ConversationSection({
   onProjectAssigned?: (projectName: string) => void;
 }) {
   const groupingEmptyState = isFeatureEnabled(useContext(ServerInfoContext), "sidebar_grouping_ui");
+  const grids = useGridSessions();
+  const gridMembers = new Set(grids?.activeGrid ? gridSessionIds(grids.activeGrid.layout) : []);
   // An untitled section is always open — there's no header to collapse it.
   const isCollapsed = title != null && collapsed;
   const protectsCollapsedBadge = isCollapsed && marker != null;
@@ -3796,6 +3829,9 @@ function ConversationSection({
                   key={conv.id}
                   conversation={conv}
                   isActive={conv.id === activeConversationId}
+                  inActiveGrid={gridMembers.has(conv.id)}
+                  gridSelected={conv.id === grids?.selectedSessionId}
+                  gridsEnabled={grids?.enabled ?? false}
                   isPinned={pinnedConversationIds.includes(conv.id)}
                   onClick={onRowClick}
                   onTogglePinned={onTogglePinned}
@@ -3931,6 +3967,21 @@ function ConversationMenuItems({
 }) {
   const atPinCap = useContext(PinCapacityContext);
   const pinSaving = useContext(PinSavingContext);
+  const grids = useGridSessions();
+  const gridLayout = grids?.enabled
+    ? (grids.activeGrid?.layout ?? grids.conversationId)
+    : undefined;
+  const gridOptions = gridLayout
+    ? gridSessionIds(gridLayout).flatMap((targetId, index) =>
+        SPLIT_EDGES.filter(
+          (edge) => splitGrid(gridLayout, targetId, conversation.id, edge) !== null,
+        ).map((edge) => ({
+          targetId,
+          edge,
+          label: `${typeof gridLayout === "string" ? "Session" : `Pane ${index + 1}`} · split ${edge}`,
+        })),
+      )
+    : [];
   const { forkDisabledReason } = useSessionActionRestrictions(conversation.id, conversation);
   // Mobile lacks the horizontal room for a side-opening submenu, so the
   // project picker replaces the menu body in place instead of flying out
@@ -3993,6 +4044,21 @@ function ConversationMenuItems({
       {/* Pin/Unpin — mobile-only (md:hidden); desktop uses the
           hover-revealed quick-pin button. Archived rows omit it (archive
           outranks pin). */}
+      {!isArchived && gridOptions.length > 0 && (
+        <C.Sub>
+          <C.SubTrigger>Open in grid</C.SubTrigger>
+          <C.SubContent>
+            {gridOptions.map(({ targetId, edge, label }) => (
+              <C.Item
+                key={`${targetId}:${edge}`}
+                onSelect={() => grids?.split(targetId, conversation.id, edge)}
+              >
+                {label}
+              </C.Item>
+            ))}
+          </C.SubContent>
+        </C.Sub>
+      )}
       {!isArchived && (
         <C.Item
           data-testid="pin-conversation"
@@ -4536,6 +4602,9 @@ const DOUBLE_CLICK_PAIR_WINDOW_MS = 750;
 function ConversationRowImpl({
   conversation,
   isActive,
+  inActiveGrid,
+  gridSelected,
+  gridsEnabled,
   isPinned,
   onClick,
   onTogglePinned,
@@ -4549,6 +4618,9 @@ function ConversationRowImpl({
   // sub-agent view keeps its owning row highlighted). A prop, not a per-row
   // read, so only the two rows whose value flips re-render on a switch.
   isActive: boolean;
+  inActiveGrid: boolean;
+  gridSelected: boolean;
+  gridsEnabled: boolean;
   isPinned: boolean;
   onClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
@@ -4777,8 +4849,9 @@ function ConversationRowImpl({
     isDragging,
   } = useDraggable({
     id: conversation.id,
-    data: { type: "session", label, project: currentProject, isPinned },
-    disabled: !isOwner || selectionMode || isArchived || isEditing || isProvisionalRow,
+    data: { type: "session", label, project: currentProject, isPinned, canManage: isOwner },
+    disabled:
+      (!isOwner && !gridsEnabled) || selectionMode || isArchived || isEditing || isProvisionalRow,
   });
   // A drag ends with a synthetic click on the row's <Link> (mousedown + mouseup
   // on the same anchor still fires a click); swallow that one click so a drag
@@ -4827,7 +4900,7 @@ function ConversationRowImpl({
   if (isEditing) {
     return (
       <li>
-        <ConversationEditRow
+        <SidebarEditRow
           // Prefer the just-committed name so a rename reopened before the
           // prop catches up starts from what the row shows.
           initialTitle={pendingTitle ?? conversation.title ?? ""}
@@ -4961,6 +5034,8 @@ function ConversationRowImpl({
     <Link
       to={selectionMode ? "#" : `/c/${conversation.id}`}
       componentId="sidebar.conversation_switcher"
+      draggable={gridsEnabled ? false : undefined}
+      onDragStart={gridsEnabled ? (event) => event.preventDefault() : undefined}
       className={cn(
         SIDEBAR_ROW,
         "relative flex flex-col justify-center text-left text-foreground transition-colors",
@@ -4994,6 +5069,8 @@ function ConversationRowImpl({
         !selectionMode && menuOpen && "md:pr-20",
         selectionMode && "pr-2 pl-8",
         !selectionMode && isActive && SIDEBAR_ACTIVE_HIGHLIGHT,
+        !selectionMode && !isActive && inActiveGrid && SIDEBAR_GRID_MEMBER_HIGHLIGHT,
+        !selectionMode && gridSelected && SIDEBAR_GRID_SELECTED_RING,
         selectionMode && isSelected && SIDEBAR_ACTIVE_HIGHLIGHT,
       )}
       onClick={(e) => {
@@ -5615,6 +5692,9 @@ function conversationRenderEqual(a: Conversation, b: Conversation): boolean {
 const ConversationRow = memo(ConversationRowImpl, (prev, next) => {
   return (
     prev.isActive === next.isActive &&
+    prev.inActiveGrid === next.inActiveGrid &&
+    prev.gridSelected === next.gridSelected &&
+    prev.gridsEnabled === next.gridsEnabled &&
     prev.isPinned === next.isPinned &&
     prev.selectionMode === next.selectionMode &&
     prev.isSelected === next.isSelected &&
@@ -6280,110 +6360,6 @@ function ProjectPickerMenu({
   );
 }
 
-// ── ConversationEditRow ──────────────────────────────────────────────────────
-
-interface ConversationEditRowProps {
-  initialTitle: string;
-  onCommit: (title: string) => void;
-  onCancel: () => void;
-}
-
-/**
- * Inline-edit shell for a conversation row.
- *
- * Auto-focuses on mount and selects the whole title so the user can
- * start typing to replace. Enter commits, Escape cancels, blur
- * commits — matches the spec's "lose focus or press enter" wording.
- * The blur-commits-on-Escape case is avoided by clearing the value
- * with the dedicated cancel handler before blur fires.
- */
-function ConversationEditRow({ initialTitle, onCommit, onCancel }: ConversationEditRowProps) {
-  const [value, setValue] = useState(initialTitle);
-  const inputRef = useRef<HTMLInputElement>(null);
-  // Set when the user explicitly cancels (Escape or X click); blur
-  // checks this so we don't double-fire onCommit with the unedited
-  // value when the input loses focus as part of unmounting.
-  const cancelledRef = useRef(false);
-  // Tracks an active IME composition (e.g. Japanese conversion) so the Enter
-  // that confirms a candidate doesn't commit the rename. Mirrors the chat
-  // composer guard (#132/#243).
-  const isComposingRef = useRef(false);
-
-  useEffect(() => {
-    inputRef.current?.focus();
-    inputRef.current?.select();
-  }, []);
-
-  function handleKeyDown(e: KeyboardEvent<HTMLInputElement>) {
-    if (isImeCompositionKeyEvent(e, isComposingRef.current)) return;
-    if (e.key === "Enter") {
-      e.preventDefault();
-      onCommit(value);
-      return;
-    }
-    if (e.key === "Escape") {
-      e.preventDefault();
-      cancelledRef.current = true;
-      onCancel();
-    }
-  }
-
-  function handleBlur() {
-    if (cancelledRef.current) return;
-    onCommit(value);
-  }
-
-  return (
-    // Match the interactive row's responsive box metrics so entering edit mode
-    // doesn't shift the list. pl-1 + the input's px-1 align with row titles.
-    <div className="sidebar-compact-text flex h-8 items-center gap-1 rounded-[var(--radius-otto-sm)] bg-muted pr-1 pl-1 md:h-7">
-      <input
-        ref={inputRef}
-        type="text"
-        maxLength={USER_SESSION_TITLE_MAX_CHARS}
-        value={value}
-        onChange={(e) => setValue(e.target.value)}
-        onCompositionStart={() => {
-          isComposingRef.current = true;
-        }}
-        onCompositionEnd={() => {
-          isComposingRef.current = false;
-        }}
-        onKeyDown={handleKeyDown}
-        onBlur={handleBlur}
-        data-testid="rename-conversation-input"
-        className="min-w-0 flex-1 truncate rounded bg-transparent px-1 py-0.5 outline-none md:select-text"
-      />
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-xs"
-        aria-label="Save rename"
-        onMouseDown={(e) => {
-          // Prevent the input's blur from firing before the commit.
-          e.preventDefault();
-        }}
-        onClick={() => onCommit(value)}
-      >
-        <CheckIcon className="size-3.5" />
-      </Button>
-      <Button
-        type="button"
-        variant="ghost"
-        size="icon-xs"
-        aria-label="Cancel rename"
-        onMouseDown={(e) => e.preventDefault()}
-        onClick={() => {
-          cancelledRef.current = true;
-          onCancel();
-        }}
-      >
-        <XIcon className="size-3.5" />
-      </Button>
-    </div>
-  );
-}
-
 function BulkActionBar({
   selectedIds,
   allConversations,
@@ -6459,6 +6435,8 @@ function BulkActionBar({
 
   const [confirmDeleteOpen, setConfirmDeleteOpen] = useState(false);
   const [moveSearch, setMoveSearch] = useState("");
+  const [moveMenuOpen, setMoveMenuOpen] = useState(false);
+  const moveTooltip = useMenuGuardedTooltip(moveMenuOpen);
   // Worktree sessions among the selection each carry one local git branch
   // (git_branch); the delete modal lists them so each branch can be opted
   // into cleanup individually. `branchesToDelete` holds the session ids whose
@@ -6675,13 +6653,18 @@ function BulkActionBar({
             )}
             <DropdownMenu
               onOpenChange={(open) => {
+                setMoveMenuOpen(open);
                 if (!open) setMoveSearch("");
               }}
             >
-              <Tooltip disableHoverableContent>
+              <Tooltip
+                disableHoverableContent
+                open={moveTooltip.open}
+                onOpenChange={moveTooltip.onOpenChange}
+              >
                 <TooltipTrigger asChild>
                   {/* Separate nodes keep the Radix tooltip and menu trigger states independent. */}
-                  <span className="inline-flex shrink-0">
+                  <span className="inline-flex shrink-0" {...moveTooltip.triggerProps}>
                     <DropdownMenuTrigger asChild>
                       <Button
                         type="button"

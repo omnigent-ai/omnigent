@@ -17,9 +17,9 @@ Usage::
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
-import socket
 import threading
 import uuid
 from collections.abc import Iterator
@@ -34,23 +34,6 @@ from tests.e2e.conftest import (
     register_inline_agent,
     send_user_message_to_session,
 )
-
-
-def _reserve_port() -> int:
-    """Reserve a free localhost port for the Extract Templates stub.
-
-    There is a small close-to-rebind window; acceptable for a
-    single-process opt-in e2e run.
-    """
-    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-    sock.bind(("127.0.0.1", 0))
-    port = int(sock.getsockname()[1])
-    sock.close()
-    return port
-
-
-_STUB_PORT = _reserve_port()
-os.environ["OMNIGENT_NIMBLE_EXTRACT_BASE_URL"] = f"http://127.0.0.1:{_STUB_PORT}"
 
 _SENTINEL_URL = "https://e2e-extract.nimbleway.com/result-1"
 
@@ -96,18 +79,26 @@ class _ExtractStubHandler(BaseHTTPRequestHandler):
         del args
 
 
+# Keep the port bound from collection through fixture retries, as in the research stub.
+_EXTRACT_STUB_SERVER = HTTPServer(("127.0.0.1", 0), _ExtractStubHandler)
+atexit.register(_EXTRACT_STUB_SERVER.server_close)
+os.environ["OMNIGENT_NIMBLE_EXTRACT_BASE_URL"] = (
+    f"http://127.0.0.1:{_EXTRACT_STUB_SERVER.server_port}"
+)
+
+
 @pytest.fixture
 def extract_stub() -> Iterator[list[dict[str, object]]]:
     """Run the local Extract Templates stub for the duration of the test."""
     _received_requests.clear()
-    server = HTTPServer(("127.0.0.1", _STUB_PORT), _ExtractStubHandler)
+    server = _EXTRACT_STUB_SERVER
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
         yield _received_requests
     finally:
         server.shutdown()
-        server.server_close()
+        thread.join()
 
 
 def test_nimble_extract_happy_path(
