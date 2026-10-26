@@ -1124,6 +1124,21 @@ function makeAnchoredComment(
 }
 
 describe("classifyAndRemapComments", () => {
+  it("uses legacy search after the Markdown remapping module fails to load", () => {
+    const comment = makeAnchoredComment({
+      id: "failed-load",
+      path: "doc.md",
+      start_index: 0,
+      end_index: 16,
+      anchor_content: "say word now",
+    });
+    const addressed = { ...comment, id: "addressed", status: "addressed" as const };
+    expect(classifyAndRemapComments([comment], "prefix say word now").open).toEqual([comment]);
+    expect(classifyAndRemapComments([comment, addressed], "prefix say word now", null)).toEqual({
+      open: [{ ...comment, start_index: 7, end_index: 19 }],
+      addressed: [addressed],
+    });
+  });
   it("uses source-aware remapping only for open formatted Markdown anchors", () => {
     const formatted = makeAnchoredComment({
       id: "formatted",

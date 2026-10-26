@@ -8,7 +8,7 @@ import re
 from pathlib import Path
 
 import pytest
-from playwright.sync_api import Locator, Page, Request, expect
+from playwright.sync_api import Locator, Page, Request, Route, expect
 
 from tests.browser_ui.files.test_file_line_navigation import (
     BrowserSession,
@@ -181,14 +181,19 @@ def test_markdown_existing_comment_after_autosave(
 
 
 @pytest.mark.parametrize(
-    "updated",
-    ["prefix say **word** now", "prefix say word now"],
-    ids=["formatting-retained", "formatting-removed"],
+    "updated,chunk_failures",
+    [
+        ("prefix say **word** now", 0),
+        ("prefix say word now", 0),
+        ("prefix say word now", 1),
+    ],
+    ids=["formatting-retained", "formatting-removed", "chunk-load-fallback"],
 )
 def test_markdown_source_comment_after_external_edit(
     page: Page,
     seeded_session: BrowserSession,
     updated: str,
+    chunk_failures: int,
 ) -> None:
     original = "say **word** now"
     files = {_PATH: original}
@@ -201,6 +206,17 @@ def test_markdown_source_comment_after_external_edit(
     expect(editor).to_be_visible(timeout=30_000)
     expect(editor.locator('[data-comment-id="boundary-comment"]').first).to_be_visible()
     files[_PATH] = updated
+    attempts = []
+    if chunk_failures:
+
+        def load_chunk(route: Route) -> None:
+            attempts.append(route.request.url)
+            if len(attempts) <= chunk_failures:
+                route.abort()
+            else:
+                route.continue_()
+
+        page.route("**/markdownCommentRemap-*.js", load_chunk)
     page.reload()
     expect(editor).to_contain_text("prefix say word now", timeout=30_000)
     viewer.get_by_role("button", name=re.compile(r"^View mode")).click()
@@ -208,8 +224,10 @@ def test_markdown_source_comment_after_external_edit(
     line = viewer.locator("[data-line='1']")
     expect(line).to_contain_text(updated)
     overlay = line.locator("span[aria-hidden][style*='ch']").first
-    expect(overlay).to_have_attribute("style", re.compile(r"7ch"))
+    expect(overlay).to_have_attribute("style", re.compile(r"^left: calc\(7ch \+ 0\.75rem\);"))
     assert overlay.evaluate("element => element.style.width") == f"{len(updated) - 7}ch"
+    if chunk_failures:
+        assert len(attempts) == 1
 
 
 def test_markdown_editor_review_journey(page: Page, seeded_session: BrowserSession) -> None:

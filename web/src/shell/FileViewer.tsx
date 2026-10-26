@@ -150,7 +150,7 @@ function isFormattedMarkdownAnchor(comment: Comment): boolean {
 export function classifyAndRemapComments(
   comments: Comment[],
   fileContent: string,
-  remapFormatted?: (comment: Comment, content: string) => Comment,
+  remapFormatted?: ((comment: Comment, content: string) => Comment) | null,
 ): { open: Comment[]; addressed: Comment[] } {
   const open: Comment[] = [];
   const addressed: Comment[] = [];
@@ -176,7 +176,8 @@ export function classifyAndRemapComments(
       open.push(c);
       continue;
     }
-    if (isFormattedMarkdownAnchor(c)) {
+    // Keep raw spans while loading; a failed import (null) uses legacy search.
+    if (isFormattedMarkdownAnchor(c) && remapFormatted !== null) {
       open.push(remapFormatted?.(c, fileContent) ?? c);
       continue;
     }
@@ -621,19 +622,24 @@ function FileViewerBody({
 
   const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
-  const [remapFormatted, setRemapFormatted] =
-    useState<(comment: Comment, content: string) => Comment>();
+  const [remapFormatted, setRemapFormatted] = useState<
+    ((comment: Comment, content: string) => Comment) | null
+  >();
   const needsMarkdownRemap = allComments.some(
     (comment) => comment.status !== "addressed" && isFormattedMarkdownAnchor(comment),
   );
   useEffect(() => {
-    if (!needsMarkdownRemap || remapFormatted) return;
+    if (!needsMarkdownRemap || remapFormatted !== undefined) return;
     let cancelled = false;
     import("./markdownCommentRemap").then(
       ({ remapFormattedMarkdownComment }) => {
         if (!cancelled) setRemapFormatted(() => remapFormattedMarkdownComment);
       },
-      (error) => console.warn("Unable to load Markdown comment remapping", error),
+      (error) => {
+        if (cancelled) return;
+        console.warn("Unable to load Markdown comment remapping; using legacy search", error);
+        setRemapFormatted(null);
+      },
     );
     return () => {
       cancelled = true;

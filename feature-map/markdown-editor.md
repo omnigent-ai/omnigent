@@ -193,10 +193,14 @@ instead of treating one comparison clip as complete feature verification.
 
 - Comment offsets remain raw-source ranges; the quote is rendered text. A
   selection such as `wo**rd**` can span markup, and its minimal source range
-  ends at the last selected character, before the closing `**`. Formatted
-  comments are remapped through the same parser in Edit and Source views,
+  ends at the last selected character, before the closing `**`. Comments whose
+  raw ranges span markup are remapped through the same parser in Edit, Source,
+  and Diff views,
   preferring an exact stored range, then the closest verified source occurrence.
   Unsupported or oversized documents retain stored ranges in Source mode.
+  If the remapping module cannot load, Source and Diff use the legacy text search.
+  Equal-length source ranges still use legacy search after external edits,
+  including selections entirely inside bold or italic delimiters.
   This does not repair previously mis-saved offsets or guarantee tracking
   through arbitrary subsequent edits.
 - Older clients can display a formatted comment on a plain literal copy.

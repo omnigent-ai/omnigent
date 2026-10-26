@@ -525,7 +525,6 @@ def test_mixed_structures_accumulated_comments_after_autosave(
     selection_order = [index for index in range(len(raw_positions)) if index != target_index]
     selection_order.append(target_index)
     saved_comments = []
-    comment_blur_settle_ms = 200
 
     def check_highlight(comment_id: str, position: int) -> None:
         highlight = editor.locator(f'[data-comment-id="{comment_id}"]')
@@ -536,7 +535,8 @@ def test_mixed_structures_accumulated_comments_after_autosave(
         assert actual_position == position
 
     def select_word(position: int) -> None:
-        page.wait_for_timeout(comment_blur_settle_ms)
+        expect(viewer.locator("textarea[placeholder='Add a comment…']")).to_have_count(0)
+        expect(page.get_by_role("button", name="Add comment", exact=True)).to_be_hidden()
         editor.evaluate(
             """(element, position) => {
                 const view = element.editor.view;
