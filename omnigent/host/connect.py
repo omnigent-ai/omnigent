@@ -3456,6 +3456,7 @@ class HostProcess:
 
         path = quote(frame.session_id or "", safe="")
         headers = self._build_connect_headers()
+        auth_factory = self._auth_token_factory
         started = time.monotonic()
 
         def record_failure(
@@ -3498,6 +3499,15 @@ class HostProcess:
             raise
         if not response.is_success:
             record_failure(response=response)
+        if (
+            response.status_code == 401
+            and headers.get("Authorization")
+            and MANAGED_HOST_TOKEN_HEADER not in headers
+            and self._auth_token_factory is auth_factory
+        ):
+            # Let the next request rediscover repaired credentials without replaying this one.
+            self._auth_token_factory = None
+            self._auth_token_factory_resolved = False
         return response
 
     async def _prewarm_model_options(self) -> bool:
