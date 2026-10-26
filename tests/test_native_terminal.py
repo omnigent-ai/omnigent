@@ -36,7 +36,11 @@ async def test_post_initial_prompt_sends_one_message(
     )
     with (
         pytest.raises(
-            click.ClickException, match=f"{harness_name} initial prompt failed .*try later"
+            click.ClickException,
+            match=(
+                f"{harness_name} initial prompt failed .*try later\n"
+                "Session conv/a b was created without it"
+            ),
         )
         if status_code >= 400
         else nullcontext()
@@ -65,6 +69,48 @@ async def test_post_initial_prompt_sends_one_message(
             ],
         },
     }
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "error",
+    [httpx.ConnectError("connection refused"), httpx.ReadTimeout("")],
+    ids=["connect-error", "read-timeout"],
+)
+async def test_post_initial_prompt_reports_transport_failure_once(
+    monkeypatch: pytest.MonkeyPatch,
+    error: httpx.TransportError,
+) -> None:
+    """A transport failure names the prompt-less session instead of a traceback."""
+    attempts: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        attempts.append(request)
+        raise error
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda base_url, **kwargs: httpx.AsyncClient(
+            base_url=base_url, transport=httpx.MockTransport(handler), **kwargs
+        ),
+    )
+    with pytest.raises(
+        click.ClickException,
+        match=(
+            rf"Claude initial prompt could not be sent \({type(error).__name__}\)\. "
+            "Session conv_abc123 was created without it"
+        ),
+    ):
+        await native_terminal.post_initial_prompt(
+            base_url="https://example.test",
+            headers={},
+            session_id="conv_abc123",
+            prompt="hello",
+            auth=None,
+            harness_name="Claude",
+        )
+
+    assert len(attempts) == 1
 
 
 @pytest.mark.asyncio

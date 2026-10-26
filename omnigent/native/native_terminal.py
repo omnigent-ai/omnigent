@@ -117,30 +117,36 @@ async def post_initial_prompt(
     :param auth: Optional refresh-capable HTTP auth.
     :param harness_name: Display name for errors, e.g. ``"Claude"``.
     :returns: None.
-    :raises click.ClickException: If Omnigent rejects the prompt.
+    :raises click.ClickException: If the prompt is rejected or cannot be sent.
     """
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(
-        base_url,
-        headers=headers,
-        auth=auth,
-        timeout=httpx.Timeout(30.0),
-    ) as client:
-        response = await client.post(
-            f"/v1/sessions/{url_component(session_id)}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": prompt}],
+    unsent = f"Session {session_id} was created without it."
+    try:
+        async with open_server_client(
+            base_url,
+            headers=headers,
+            auth=auth,
+            timeout=httpx.Timeout(30.0),
+        ) as client:
+            response = await client.post(
+                f"/v1/sessions/{url_component(session_id)}/events",
+                json={
+                    "type": "message",
+                    "data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": prompt}],
+                    },
                 },
-            },
-        )
+            )
+    except httpx.HTTPError as exc:
+        raise click.ClickException(
+            f"{harness_name} initial prompt could not be sent ({type(exc).__name__}). {unsent}"
+        ) from exc
     if response.status_code >= 400:
         raise click.ClickException(
             f"{harness_name} initial prompt failed ({response.status_code}): "
-            f"{error_text(response)}"
+            f"{error_text(response)}\n{unsent}"
         )
 
 

@@ -7725,6 +7725,8 @@ def _is_runner_owned_antigravity_terminal(
     )
 
 
+# @deprecated, remove in 0.22.0 with _claude_legacy_prompt_consumed: clients
+# before 0.20.0 stored ``-p`` in the persisted launch args.
 def _claude_legacy_launch_prompt(terminal_launch_args: list[str] | None) -> str | None:
     """
     Return the ``-p`` prompt older clients stored ahead of the launch flags.

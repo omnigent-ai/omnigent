@@ -2923,7 +2923,7 @@ async def test_auto_create_cursor_terminal_wires_yolo_auto_accept(
         "resume",
         "resume-without-transcript",
         "fresh",
-        "truncated-fork-without-rebuilt-transcript",
+        "history-carrying-fork-without-transcript",
         "older-client-explicit-resume-prompt",
     ],
 )

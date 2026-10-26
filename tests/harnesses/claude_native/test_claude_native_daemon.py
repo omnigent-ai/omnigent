@@ -377,6 +377,57 @@ def test_run_with_remote_server_routes_through_daemon(
     )
 
 
+def test_run_with_remote_server_unsent_prompt_stops_before_attach(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """An unsent remote prompt fails with the session id and skips the attach."""
+    spec_path = tmp_path / "claude.yaml"
+    spec_path.write_text("name: claude-native-ui\nprompt: hi\n")
+    prepared = claude_native.PreparedClaudeTerminal(
+        session_id="conv_new",
+        terminal_id=claude_native.claude_terminal_resource_id(),
+        bridge_dir=tmp_path / "bridge",
+        reattached=False,
+    )
+    _install_daemon_seam_mocks(
+        monkeypatch,
+        prepared=prepared,
+        attach_outcome=claude_native._AttachOutcome.EXITED,
+        captured={},
+        ensured=[],
+    )
+
+    def refuse(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("connection refused", request=request)
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth.open_server_client",
+        lambda base_url, **kwargs: httpx.AsyncClient(
+            base_url=base_url, transport=httpx.MockTransport(refuse), **kwargs
+        ),
+    )
+    attached: list[dict[str, Any]] = []
+
+    async def record_attach(**kwargs: Any) -> claude_native._AttachOutcome:
+        attached.append(kwargs)
+        return claude_native._AttachOutcome.EXITED
+
+    monkeypatch.setattr(claude_native, "_attach_with_transcript_forwarder", record_attach)
+
+    with pytest.raises(click.ClickException, match="Session conv_new was created without it"):
+        claude_native._run_with_remote_server(
+            "https://example.com",
+            spec_path,
+            session_id=None,
+            resume_picker=False,
+            claude_args=(),
+            prompt="hello",
+        )
+
+    assert attached == []
+
+
 def test_run_with_remote_server_detach_prints_resume_hint(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
