@@ -1174,8 +1174,8 @@ def _resolve_provider_for_build(
        harness; elsewhere it returns ``None`` so the readout / native /
        openai-agents paths keep their own handling.
     3. An :class:`ApiKeyAuth` (spec or global) → a synthesized key provider
-       for a Codex launch; otherwise ``None`` (the claude-sdk / openai-agents
-       builders thread the key themselves).
+       for a Codex or Genie launch; otherwise ``None`` (the claude-sdk /
+       openai-agents builders thread the key themselves).
     4. The per-family global default (``providers: … default: true``), then an
        ambient-detected default.
     5. For claude-sdk, a configured Claude CLI subscription backed by managed
@@ -1236,7 +1236,7 @@ def _resolve_provider_for_build(
             auth.profile or None, harness_type=harness_type, for_launch=for_launch
         )
     if auth is not None:
-        if isinstance(auth, ApiKeyAuth) and for_launch and harness_type == "codex":
+        if isinstance(auth, ApiKeyAuth) and for_launch and harness_type in ("codex", "genie"):
             return _synthesize_codex_api_key_provider(auth)
         # ApiKeyAuth — threaded by the claude-sdk / openai-agents builders.
         return None
@@ -1260,7 +1260,11 @@ def _resolve_provider_for_build(
             global_auth.profile or None, harness_type=harness_type, for_launch=for_launch
         )
     if global_auth is not None:
-        if isinstance(global_auth, ApiKeyAuth) and for_launch and harness_type == "codex":
+        if (
+            isinstance(global_auth, ApiKeyAuth)
+            and for_launch
+            and harness_type in ("codex", "genie")
+        ):
             return _synthesize_codex_api_key_provider(global_auth)
         # Global ApiKeyAuth — threaded by the builder's global-auth branch.
         return None

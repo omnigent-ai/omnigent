@@ -851,6 +851,19 @@ def test_genie_quick_probe_agrees_with_picker_map(
     assert harness_readiness.harness_is_configured("genie") is expected
 
 
+def test_genie_readiness_honors_binary_override(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    binary = tmp_path / "custom-genie"
+    binary.write_text("#!/bin/sh\nexit 0\n")
+    binary.chmod(0o700)
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: None)
+    monkeypatch.setenv("OMNIGENT_GENIE_PATH", str(binary))
+
+    assert hi.harness_cli_binary(hi.GENIE_KEY) == str(binary)
+    assert configured_harness_map()["genie"] == "needs-auth"
+
+
 def test_configured_harness_map_runs_independent_probes_concurrently(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

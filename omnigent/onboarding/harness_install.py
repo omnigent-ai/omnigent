@@ -916,10 +916,14 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
 
 
 def harness_cli_binary(key: str) -> str | None:
-    """Resolve the CLI selected for an install key, including Pi's path override."""
+    """Resolve the CLI for an install key, including Pi and Genie overrides."""
     spec = harness_install_spec(key)
     if spec is None:
         return None
+    if key == GENIE_KEY:
+        from omnigent.inner.genie_executor import _find_genie_cli
+
+        return _find_genie_cli()
     command = spec.binary
     if key == PI_KEY:
         from omnigent.harness_startup_config import resolve_harness_path
