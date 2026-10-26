@@ -63,6 +63,10 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.harnesses.codex_native.failure_telemetry import (
+    codex_error_context,
+    codex_error_reason,
+)
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -76,6 +80,12 @@ from omnigent.native._native_post_delivery import (
     replay_dead_letters,
 )
 from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.native.failure_telemetry import (
+    FailureContext,
+    failure_log_attributes,
+    native_failure_id,
+    normalize_failure_context,
+)
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -1039,10 +1049,12 @@ class _CodexTerminalError:
     :param message: Human-readable error text, e.g.
         ``"401 Unauthorized: ChatGPT login expired"``.
     :param kind: Classification, either ``"auth"`` or ``"generic"``.
+    :param failure_context: Typed cause fields retained independently of display text.
     """
 
     message: str
     kind: str
+    failure_context: FailureContext = field(default_factory=dict)
 
     @property
     def is_auth(self) -> bool:
@@ -1190,7 +1202,11 @@ def _terminal_error_from_turn(params: _JsonObject) -> _CodexTerminalError | None
     if payload is None:
         return None
     message = _error_payload_message(payload)
-    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+    return _CodexTerminalError(
+        message=message,
+        kind=_classify_codex_error(payload, message),
+        failure_context=codex_error_context(payload, thread_id=_thread_id_from_params(params)),
+    )
 
 
 def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalError | None:
@@ -1199,7 +1215,11 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
     if not isinstance(payload, dict):
         return None
     message = _error_payload_message(payload)
-    return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+    return _CodexTerminalError(
+        message=message,
+        kind=_classify_codex_error(payload, message),
+        failure_context=codex_error_context(payload, thread_id=_thread_id_from_params(params)),
+    )
 
 
 @dataclass(frozen=True)
@@ -3000,7 +3020,7 @@ def _resume_terminal_status_edge_for_latest_turn(
         update_active_turn_id(bridge_dir, None)
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
-        error = _terminal_error_from_turn({"turn": turn})
+        error = _terminal_error_from_turn({"threadId": thread_id, "turn": turn})
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
@@ -3851,6 +3871,7 @@ async def _maybe_handle_turn_event(
                     compaction_model=compaction_model,
                     selected_model=selected_model if compaction_model else None,
                 ),
+                native_model=selected_model,
             )
             await usage_coalescer.flush()
         return True
@@ -4161,7 +4182,12 @@ async def _handle_terminal_turn_boundary_inner(
     )
     handled = terminal.handled
     if terminal.edge is not None:
-        await _post_turn_status_edge(client, session_id, terminal.edge)
+        await _post_turn_status_edge(
+            client,
+            session_id,
+            terminal.edge,
+            native_model=forwarder_state.model if forwarder_state is not None else None,
+        )
     if handled:
         await elicitation_tracker.resolve_by_terminal_turn_event(
             client,
@@ -6993,6 +7019,7 @@ async def _post_status(
     reauth_required: bool = False,
     compaction_model: str | None = None,
     selected_model: str | None = None,
+    failure_context: FailureContext | None = None,
 ) -> None:
     """
     Publish a native Codex status edge.
@@ -7011,6 +7038,7 @@ async def _post_status(
     :param compaction_model: Previous model a failed pre-turn compaction ran
         on, so the server can explain that switching models won't help.
     :param selected_model: The thread's selected model for that failure.
+    :param failure_context: Bounded native evidence attached only to failed edges.
     :returns: None.
     """
     data: _JsonObject = {"status": status}
@@ -7020,6 +7048,8 @@ async def _post_status(
         data["output"] = output
     if reauth_required:
         data["reauth_required"] = True
+    if status == "failed" and failure_context:
+        data["failure_context"] = dict(normalize_failure_context(failure_context))
     if compaction_model is not None and selected_model is not None:
         data["compaction_model"] = compaction_model
         data["selected_model"] = selected_model
@@ -7036,6 +7066,8 @@ async def _post_turn_status_edge(
     client: httpx.AsyncClient,
     session_id: str,
     edge: _CodexTurnStatusEdge | None,
+    *,
+    native_model: str | None = None,
 ) -> None:
     """
     Publish one Codex turn lifecycle edge if a valid edge was derived.
@@ -7049,10 +7081,29 @@ async def _post_turn_status_edge(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :param edge: Derived lifecycle edge, or ``None`` when no status should
         be published.
+    :param native_model: Known selected model; absent when the source lacks it.
     :returns: None.
     """
     if edge is None:
         return
+    context: FailureContext = {}
+    if edge.status == "failed":
+        context = normalize_failure_context(
+            {
+                **(edge.error.failure_context if edge.error is not None else {}),
+                "failure_source": "codex_app_server",
+                "detail_source": edge.source,
+                "failure_decision": "session_failed",
+                "native_harness": "codex-native",
+                "native_model": native_model or edge.selected_model,
+                "native_compaction_model": edge.compaction_model,
+                "native_error_reason": codex_error_reason(edge.error.message)
+                if edge.error is not None
+                else "missing_error_payload",
+            }
+        )
+        if edge.turn_id is not None:
+            context["failure_id"] = native_failure_id("codex_turn", session_id, edge.turn_id)
     _logger.info(
         "Codex forwarder publishing turn status: source=%s turn_id=%s status=%s",
         edge.source,
@@ -7067,14 +7118,7 @@ async def _post_turn_status_edge(
             has_turn_id=edge.turn_id is not None,
             has_error=edge.error is not None,
             native_error_kind=edge.error.kind if edge.error is not None else None,
-            native_error_reason=(
-                "thread_persistence_shutdown"
-                if edge.error is not None
-                and "failed to shutdown thread persistence" in edge.error.message[:4096].casefold()
-                else "unclassified"
-                if edge.error is not None
-                else None
-            ),
+            **failure_log_attributes(context),
         ),
     )
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
@@ -7094,6 +7138,7 @@ async def _post_turn_status_edge(
         reauth_required=reauth_required,
         compaction_model=edge.compaction_model,
         selected_model=edge.selected_model,
+        failure_context=context,
     )
 
 

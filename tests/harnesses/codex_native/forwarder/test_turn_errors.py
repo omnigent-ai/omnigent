@@ -272,6 +272,16 @@ async def test_handle_event_surfaces_non_retrying_error_notification(tmp_path: P
                     "status": "failed",
                     "response_id": "codex_turn_123",
                     "output": "You've hit your usage limit.",
+                    "failure_context": {
+                        "failure_id": fwd.native_failure_id("codex_turn", "conv_x", "turn_123"),
+                        "failure_source": "codex_app_server",
+                        "detail_source": "error",
+                        "failure_decision": "session_failed",
+                        "native_harness": "codex-native",
+                        "native_session_id": "thread_123",
+                        "native_error_reason": "unclassified",
+                        "native_error_category": "usageLimitExceeded",
+                    },
                 },
             },
         )
@@ -758,6 +768,15 @@ async def test_handle_event_deduplicates_error_then_terminal_boundary(tmp_path: 
                     "status": "failed",
                     "response_id": "codex_turn_123",
                     "output": "You've hit your usage limit.",
+                    "failure_context": {
+                        "failure_id": fwd.native_failure_id("codex_turn", "conv_x", "turn_123"),
+                        "failure_source": "codex_app_server",
+                        "detail_source": "error",
+                        "failure_decision": "session_failed",
+                        "native_harness": "codex-native",
+                        "native_session_id": "thread_123",
+                        "native_error_reason": "unclassified",
+                    },
                 },
             },
         )
@@ -1042,6 +1061,75 @@ async def test_post_turn_status_edge_clean_idle_has_no_output() -> None:
     assert data["status"] == "idle"
     assert "output" not in data
     assert "reauth_required" not in data
+    assert "failure_context" not in data
+
+
+@pytest.mark.parametrize("source", ["notification", "turn", "item", "resume"])
+async def test_failed_edges_preserve_structured_cause_across_protocol_paths(
+    source: str, tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO, logger=fwd._logger.name)
+    payload = {
+        "message": "Fatal error: application network policy is unavailable",
+        "codexErrorInfo": {"httpConnectionFailed": {"httpStatusCode": 503}},
+        "additionalDetails": "private command output",
+    }
+    turn = {"id": "turn_123", "status": "failed", "error": payload}
+    if source == "resume":
+        _seed_active_turn(tmp_path, "turn_123")
+        edge = fwd._resume_terminal_status_edge_for_latest_turn(tmp_path, "thread_123", [turn])
+    else:
+        if source == "notification":
+            error = fwd._terminal_error_from_notification(
+                {"threadId": "thread_123", "error": payload}
+            )
+        else:
+            if source == "item":
+                turn = {"id": "turn_123", "items": [{"type": "error", **payload}]}
+            error = fwd._terminal_error_from_turn({"threadId": "thread_123", "turn": turn})
+        edge = fwd._CodexTurnStatusEdge(
+            status="failed",
+            turn_id="turn_123",
+            source=source,
+            error=error,
+            compaction_model="previous-test-model",
+            selected_model="selected-test-model",
+        )
+    client = _RecordingClient()
+    await fwd._post_turn_status_edge(client, "conv_x", edge)
+
+    data = client.posts[0][1]["data"]
+    context = data["failure_context"]
+    assert data["status"] == "failed"
+    assert data["output"] == payload["message"]
+    assert context["native_session_id"] == "thread_123"
+    assert context["native_error_category"] == "httpConnectionFailed"
+    assert context["http_status"] == 503
+    assert context["native_error_reason"] == "network_policy_unavailable"
+    assert context["failure_source"] == "codex_app_server"
+    assert context["failure_id"] == fwd.native_failure_id("codex_turn", "conv_x", "turn_123")
+    if source != "resume":
+        assert context["native_model"] == "selected-test-model"
+        assert context["native_compaction_model"] == "previous-test-model"
+    [record] = [r for r in caplog.records if getattr(r, "event_name", None) == "codex_turn_status"]
+    assert record.attributes["native_error_category"] == "httpConnectionFailed"
+    assert record.attributes["http_status"] == "503"
+    assert "private command output" not in json.dumps(context)
+    assert "private command output" not in caplog.text
+    assert payload["message"] not in caplog.text
+
+
+async def test_failed_edge_without_error_records_missing_payload() -> None:
+    client = _RecordingClient()
+    await fwd._post_turn_status_edge(
+        client,
+        "conv_x",
+        fwd._CodexTurnStatusEdge(status="failed", turn_id=None, source="turn/failed"),
+    )
+    context = client.posts[0][1]["data"]["failure_context"]
+    assert context["native_error_reason"] == "missing_error_payload"
+    assert "failure_id" not in context
+    assert "native_error_category" not in context
 
 
 _CERTIFICATE_LINE = (
