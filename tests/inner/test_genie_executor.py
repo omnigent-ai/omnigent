@@ -14,7 +14,7 @@ from __future__ import annotations
 import tomllib
 from pathlib import Path
 from typing import Any
-from unittest.mock import AsyncMock, patch
+from unittest.mock import AsyncMock, Mock, patch
 
 import pytest
 from packaging.version import Version
@@ -138,6 +138,29 @@ class TestGenieExecutor:
             with pytest.raises(RuntimeError, match="Genie wire version"):
                 await check
         assert GenieExecutor._brokered_min_version == Version("0.2.0")
+
+    async def test_own_config_rejects_unsupported_version_before_session(
+        self, tmp_path: Path
+    ) -> None:
+        cli = tmp_path / "genie"
+        cli.write_text("#!/bin/sh\nprintf 'genie 0.1.0\\n'\n")
+        cli.chmod(0o755)
+        app_session_factory = Mock(side_effect=AssertionError("unsupported Genie reached session"))
+        executor = GenieExecutor(
+            codex_path=str(cli), gateway=False, app_session_factory=app_session_factory
+        )
+
+        with pytest.raises(
+            RuntimeError,
+            match=r"unsupported Genie wire version 0\.1\.0; .*Genie 0\.2\.0 or newer",
+        ):
+            await anext(
+                executor.run_turn(
+                    [{"role": "user", "content": "reply with the single word OK"}], [], ""
+                )
+            )
+
+        app_session_factory.assert_not_called()
 
     def test_writes_overrides_to_config_instead_of_argv(self) -> None:
         ex = _genie_executor()

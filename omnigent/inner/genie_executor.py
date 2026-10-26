@@ -101,6 +101,7 @@ class GenieExecutor(CodexExecutor):
     # The first release whose ``app-server`` is callable at all (genie #124).
     _brokered_min_version = Version("0.2.0")
     _brokered_catalog_probe = False
+    _check_own_config_version = True
 
     def __init__(self, **kwargs: Any) -> None:
         # Force the genie home spelling regardless of what a caller passed, so
