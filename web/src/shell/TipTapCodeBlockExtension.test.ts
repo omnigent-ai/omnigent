@@ -98,6 +98,32 @@ describe("CodeBlockWithLanguage", () => {
     expect(editor.getMarkdown()).toBe("```python\nprint(1)\n```");
   });
 
+  it.each([
+    ["a fence indented one space", " ```js\n x\n   y\n ```"],
+    ["a fence indented three spaces", "   ```js\n   x\n     y\n   ```"],
+    ["an indented tilde fence", "  ~~~js\n  x\n    y\n  ~~~"],
+    ["a fence indented past a bullet's content", "- item\n\n   ```js\n   x\n     y\n   ```"],
+    [
+      "a fence indented past an ordered item's content",
+      "1. item\n\n   para\n\n    ```js\n    x\n      y\n    ```",
+    ],
+  ])("keeps %s as a code block across saves", (_label, md) => {
+    const codeBlocks = (ed: Editor) => {
+      const blocks: { language: unknown; text: string }[] = [];
+      ed.state.doc.descendants((node) => {
+        if (node.type.name === "codeBlock") {
+          blocks.push({ language: node.attrs.language, text: node.textContent });
+        }
+      });
+      return blocks;
+    };
+    editor = makeEditor(md);
+    expect(codeBlocks(editor)).toEqual([{ language: "js", text: "x\n  y" }]);
+    const reopened = makeEditor(editor.getMarkdown());
+    expect(codeBlocks(reopened)).toEqual([{ language: "js", text: "x\n  y" }]);
+    reopened.destroy();
+  });
+
   it("round-trips a block whose body contains a fence line with a longer fence", () => {
     // A 4-backtick fence lets the body hold a ``` line; the serializer must emit
     // a fence longer than that run or the saved markdown corrupts on reload.

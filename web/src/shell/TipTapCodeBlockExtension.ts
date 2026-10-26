@@ -10,6 +10,17 @@ import { TipTapCodeBlockView } from "./TipTapCodeBlockView";
 import { softBreaksToNewlines } from "./TipTapSoftBreak";
 import { fenceForBody } from "./markdownFence";
 
+// CommonMark allows a fence to be indented up to three spaces; marked keeps
+// that indent in `raw`, which the base parser rejects, dropping the block.
+const INDENTED_FENCE = /^( {1,3})(`{3,}|~{3,})/;
+
+function removeFenceIndent(text: string, indent: string): string {
+  return text
+    .split("\n")
+    .map((line) => (line.startsWith(indent) ? line.slice(indent.length) : line))
+    .join("\n");
+}
+
 export const CodeBlockWithLanguage = CodeBlock.extend({
   addNodeView() {
     return ReactNodeViewRenderer(TipTapCodeBlockView);
@@ -51,6 +62,17 @@ export const CodeBlockWithLanguage = CodeBlock.extend({
           },
         }),
     );
+  },
+
+  parseMarkdown(token, helpers) {
+    const raw = token.raw ?? "";
+    const fence = INDENTED_FENCE.exec(raw);
+    if (!fence) return this.parent?.(token, helpers) ?? [];
+    const [, indent, marker] = fence;
+    // marked strips the fence indent from backtick-fenced content only.
+    const text =
+      marker.startsWith("~") && token.text ? removeFenceIndent(token.text, indent) : token.text;
+    return this.parent?.({ ...token, raw: raw.slice(indent.length), text }, helpers) ?? [];
   },
 
   // The base serializer emits a fixed ``` fence, which corrupts a code block
