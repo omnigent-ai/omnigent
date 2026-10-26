@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
@@ -1341,6 +1342,72 @@ describe("BlockRenderer dispatch", () => {
       fireEvent.click(screen.getByText("Worked for 42s"));
       expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
       expect(screen.getByText("Called 2 tools")).toBeDefined();
+    });
+
+    describe("sub-agent notices", () => {
+      const notice = (itemId: string, phase: "delegated" | "returned"): RenderItem => ({
+        kind: "subagent_activity",
+        itemId,
+        data: {
+          type: "resource_event",
+          event_type: `session.subagent.${phase}`,
+          resource_type: "session",
+          resource_id: "conv_child",
+          resource: { title: "Peirce" },
+        },
+      });
+      const text = (itemId: string, value: string): RenderItem => ({
+        kind: "text",
+        itemId,
+        text: value,
+        final: true,
+      });
+      const renderTurn = (items: RenderItem[], continued = false) =>
+        render(
+          <MemoryRouter>
+            <BlockRenderer items={items} sessionStatus="idle" continued={continued} />
+          </MemoryRouter>,
+        );
+      const noticeLabels = () =>
+        screen.queryAllByTestId("subagent-activity").map((node) => node.textContent);
+
+      it("folds mid-turn notices into the work around them", () => {
+        renderTurn([
+          tool(1, "spawn_agent"),
+          notice("n1", "delegated"),
+          tool(2, "wait"),
+          notice("n2", "returned"),
+          text("m1", "Peirce finished the recording."),
+        ]);
+        expect(screen.getByText("Peirce finished the recording.")).toBeDefined();
+        expect(noticeLabels()).toEqual([]);
+
+        fireEvent.click(screen.getByRole("button", { name: "Worked" }));
+        expect(noticeLabels()).toEqual(["Started Peirce", "Completed Peirce"]);
+      });
+
+      it.each([false, true])(
+        "keeps notices nothing has followed visible unless continued = %s",
+        (continued) => {
+          renderTurn(
+            [tool(1, "spawn_agent"), text("m1", "Waiting on Peirce."), notice("n1", "delegated")],
+            continued,
+          );
+          expect(screen.getAllByRole("button", { name: "Worked" })).toHaveLength(continued ? 2 : 1);
+          expect(noticeLabels()).toEqual(continued ? [] : ["Started Peirce"]);
+        },
+      );
+
+      it("keeps a terminal error unfolded when a notice lands after it", () => {
+        renderTurn([
+          text("m0", "Trying the build."),
+          tool(1, "Bash"),
+          { kind: "error", itemId: null, source: "", code: "server_error", message: "Failed." },
+          notice("n1", "returned"),
+        ]);
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
+      });
     });
 
     it("never folds the last assistant bubble while the session is running", async () => {

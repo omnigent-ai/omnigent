@@ -13,8 +13,9 @@
 //    routing/fan-out cards never fold regardless of position.
 //
 // 2. Turn folding: once settled, each work run collapses behind a
-//    "Worked" row. Pending elicitations, routing cards and assistant
-//    messages stay visible (all but the last with opt-in `foldNarration`).
+//    "Worked" row, sub-agent notices included. Pending elicitations,
+//    routing cards, the newest notices and assistant messages stay
+//    visible (all but the last message with opt-in `foldNarration`).
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -31,6 +32,7 @@ import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
+import { SubagentActivityMessage } from "./SubagentActivityMessage";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
@@ -175,7 +177,9 @@ function hasFoldableShape(
   { segments }: TurnPartition,
   continued = false,
 ): boolean {
-  const lastItem = items.findLast((item) => !isTrailingWrapup(item));
+  const lastItem = items.findLast(
+    (item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity",
+  );
   // A terminal failure or denial must stay visible beside the assistant text.
   if (isFailureItem(lastItem)) return false;
   return (
@@ -192,7 +196,7 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
-  const partition = partitionTurn(inputs.items, foldsNarration(inputs));
+  const partition = partitionTurn(inputs.items, foldsNarration(inputs), inputs.continued);
   return (
     hasFoldableShape(inputs.items, partition, inputs.continued) &&
     partition.segments.every((segment) => segment.kind === "work")
@@ -235,7 +239,11 @@ export function BlockRenderer({
   // A native assistant message has no reliable final-answer marker.
   // Keep each message visible even when a later tool call follows it,
   // unless the user opted into folding all but the last message.
-  const partition = partitionTurn(items, foldsNarration({ items, turnLifecycle, foldNarration }));
+  const partition = partitionTurn(
+    items,
+    foldsNarration({ items, turnLifecycle, foldNarration }),
+    continued,
+  );
   const workRunCount = partition.segments.filter((segment) => segment.kind === "work").length;
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
@@ -455,7 +463,11 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * reliable final-answer marker, so every completed message stays visible
  * unless `foldNarration` asks to keep only the last one.
  */
-function partitionTurn(items: RenderItem[], foldNarration = false): TurnPartition {
+function partitionTurn(
+  items: RenderItem[],
+  foldNarration = false,
+  continued = false,
+): TurnPartition {
   let end = items.length;
   const wrapup: RenderItem[] = [];
   while (end > 0 && isTrailingWrapup(items[end - 1]!)) {
@@ -466,6 +478,13 @@ function partitionTurn(items: RenderItem[], foldNarration = false): TurnPartitio
   const answerIndex = foldNarration
     ? items.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
     : -1;
+  // Sub-agent notices nothing has followed yet are the turn's latest news. They
+  // fold once committed work, here or in a later bubble, moves past them.
+  const latestNoticesStart = continued
+    ? end
+    : items.findLastIndex(
+        (item, i) => i < end && item.kind !== "subagent_activity" && !isProvisionalItem(item),
+      ) + 1;
   const segments: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
     const item = items[i]!;
@@ -473,7 +492,8 @@ function partitionTurn(items: RenderItem[], foldNarration = false): TurnPartitio
       isPendingElicitation(item) ||
       isPersistentToolCard(item) ||
       isInProgressTool(item) ||
-      isSlashCommandCard(item)
+      isSlashCommandCard(item) ||
+      (item.kind === "subagent_activity" && i >= latestNoticesStart)
     ) {
       segments.push({ kind: "exempt", item, index: i });
       continue;
@@ -512,10 +532,14 @@ function isSlashCommandCard(item: RenderItem): boolean {
  * That is what made the fold flicker on codex: a reasoning burst plus a
  * narration preview folded mid-turn, then the fold vanished when the
  * preview merged into the real bubble. A genuine turn always carries at
- * least one server-assigned item id.
+ * least one server-assigned item id; a sub-agent notice is not turn work.
  */
 function isProvisionalTrace(items: RenderItem[]): boolean {
-  return items.every((item) => item.itemId === null || item.itemId.startsWith(LIVE_ITEM_PREFIX));
+  return items.every((item) => item.kind === "subagent_activity" || isProvisionalItem(item));
+}
+
+function isProvisionalItem(item: RenderItem): boolean {
+  return item.itemId === null || item.itemId.startsWith(LIVE_ITEM_PREFIX);
 }
 
 /**
@@ -895,6 +919,8 @@ function renderItem(
       );
     case "elicitation":
       return <ElicitationCard key={key} item={item} />;
+    case "subagent_activity":
+      return <SubagentActivityMessage key={key} data={item.data} />;
   }
 }
 

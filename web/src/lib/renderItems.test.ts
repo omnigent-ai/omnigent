@@ -241,9 +241,9 @@ describe("shell command user turns", () => {
 });
 
 describe("sub-agent timeline events", () => {
-  const notice = (): AnyBlock => ({
+  const notice = (itemId = "notice_1"): AnyBlock => ({
     type: "native_tool",
-    ctx: ctx({ itemId: "notice_1", responseId: "subagent_returned" }),
+    ctx: ctx({ itemId, responseId: `subagent_${itemId}` }),
     toolType: "subagent_activity",
     label: "Sub-agent activity",
     data: {},
@@ -254,52 +254,137 @@ describe("sub-agent timeline events", () => {
     executions: [mkExec("Agent", "call_1")],
     iteration: 0,
   };
-  const answer: AnyBlock = {
+  const text = (itemId: string, responseId: string, fullText: string): AnyBlock => ({
     type: "text_done",
-    ctx: ctx({ itemId: "parent_answer", responseId: "parent_turn" }),
-    fullText: "The review is complete.",
+    ctx: ctx({ itemId, responseId }),
+    fullText,
     hasCodeBlocks: false,
-  };
+  });
+  const answer = text("parent_answer", "parent_turn", "The review is complete.");
+
+  // Streams `blocks` through one reuse cache, checking every prefix against a full rebuild.
+  function buildStreamed(blocks: AnyBlock[]): Bubble[] {
+    const cache = createBubbleCache();
+    for (let length = 1; length < blocks.length; length++) {
+      const prefix = blocks.slice(0, length);
+      expect(buildBubbles(prefix, null, cache)).toEqual(buildBubbles(prefix, null));
+    }
+    const bubbles = buildBubbles(blocks, null, cache);
+    expect(bubbles).toEqual(buildBubbles(blocks, null));
+    return bubbles;
+  }
 
   it.each([true, false])("preserves parent liveness with streaming response = %s", (streaming) => {
     const active: ActiveResponse | null = streaming
       ? { responseId: "parent_turn", state: "streaming", error: null }
       : null;
     const bubbles = buildBubbles([work, notice()], active, undefined, [], true);
-    expect(bubbles[0]).toMatchObject({
-      kind: "assistant",
-      responseId: "parent_turn",
-      lifecycle: streaming ? "streaming" : "completed",
-      items: [{ kind: "tool", state: "input-available" }],
-    });
+    expect(bubbles).toMatchObject([
+      {
+        kind: "assistant",
+        responseId: "parent_turn",
+        lifecycle: streaming ? "streaming" : "completed",
+        items: [
+          { kind: "tool", state: "input-available" },
+          { kind: "subagent_activity", itemId: "notice_1" },
+        ],
+      },
+    ]);
     expect(liveCandidateAssistantIndex(bubbles)).toBe(0);
   });
 
-  it.each([false, true])("preserves timeline and parent identity with steering = %s", (steered) => {
+  it.each([false, true])("keeps a mid-turn notice in its turn with steering = %s", (steered) => {
     const user: AnyBlock = {
       type: "user_message",
       ctx: ctx({ itemId: "steering", responseId: "parent_turn" }),
       content: [{ type: "input_text", text: "Include the API change too." }],
     };
-    const cache = createBubbleCache();
-    const blocks = [work, notice(), ...(steered ? [user] : [])];
-    buildBubbles(blocks, null, cache);
-    const bubbles = buildBubbles([...blocks, answer], null, cache);
-    expect(bubbles.map((bubble) => bubble.kind)).toEqual([
-      "assistant",
-      "subagent_activity",
-      ...(steered ? ["user"] : []),
-      "assistant",
+    const bubbles = buildStreamed([work, notice(), ...(steered ? [user] : []), answer]);
+    const answerItem = { kind: "text", text: "The review is complete." };
+    expect(bubbles).toMatchObject([
+      {
+        kind: "assistant",
+        responseId: "parent_turn",
+        stableId: "parent_tool",
+        items: [{ kind: "tool" }, { kind: "subagent_activity" }, ...(steered ? [] : [answerItem])],
+      },
+      ...(steered
+        ? [
+            { kind: "user" },
+            { responseId: "parent_turn", stableId: "parent_answer", defaultExpanded: true },
+          ]
+        : []),
     ]);
-    if (!steered) expect(bubbles[0]).toMatchObject({ continued: true });
-    expect(bubbles.at(-1)).toMatchObject({
-      responseId: "parent_turn",
-      stableId: "parent_answer",
-      ...(steered ? { defaultExpanded: true } : {}),
-      items: [{ kind: "text", text: "The review is complete." }],
-    });
     expect(lastRenderableAssistantIndex(bubbles)).toBe(bubbles.length - 1);
     expect(liveCandidateAssistantIndex(bubbles)).toBe(bubbles.length - 1);
+  });
+
+  it("opens a woken turn's bubble with the notice that woke it", () => {
+    const bubbles = buildStreamed([
+      work,
+      notice("started"),
+      text("parent_wait", "parent_turn", "Waiting on the reviewer."),
+      notice("returned"),
+      { ...work, ctx: ctx({ itemId: "wake_tool", responseId: "wake_turn" }) },
+      text("wake_answer", "wake_turn", "The reviewer approved it."),
+    ]);
+    expect(bubbles).toMatchObject([
+      {
+        responseId: "parent_turn",
+        continued: true,
+        items: [
+          { kind: "tool" },
+          { kind: "subagent_activity", itemId: "started" },
+          { kind: "text" },
+        ],
+      },
+      {
+        responseId: "wake_turn",
+        stableId: "returned",
+        items: [
+          { kind: "subagent_activity", itemId: "returned" },
+          { kind: "tool" },
+          { kind: "text" },
+        ],
+      },
+    ]);
+  });
+
+  it("never looks past an unconfirmed user message for the next turn", () => {
+    const sent: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "sent", responseId: "" }),
+      content: [{ type: "input_text", text: "Any update?" }],
+    };
+    expect(
+      buildStreamed([work, notice(), sent, text("wake_answer", "wake_turn", "Still running.")]),
+    ).toMatchObject([
+      { responseId: "parent_turn", items: [{ kind: "tool" }, { kind: "subagent_activity" }] },
+      { kind: "user", itemId: "sent" },
+      { responseId: "wake_turn" },
+    ]);
+  });
+
+  it("keeps notices standalone until work follows them", () => {
+    const prompt: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "prompt", responseId: "next_turn" }),
+      content: [{ type: "input_text", text: "Check on the reviewer." }],
+    };
+    const blocks = [prompt, notice("started"), notice("returned"), answer];
+    expect(buildBubbles(blocks.slice(0, 3), null).map((bubble) => bubble.kind)).toEqual([
+      "user",
+      "subagent_activity",
+      "subagent_activity",
+    ]);
+    expect(buildStreamed(blocks)).toMatchObject([
+      { kind: "user" },
+      {
+        kind: "assistant",
+        responseId: "parent_turn",
+        items: [{ kind: "subagent_activity" }, { kind: "subagent_activity" }, { kind: "text" }],
+      },
+    ]);
   });
 });
 

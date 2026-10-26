@@ -98,6 +98,7 @@ export type RenderItem =
       label: string;
       data: Record<string, unknown>;
     }
+  | { kind: "subagent_activity"; itemId: string | null; data: Record<string, unknown> }
   | {
       kind: "slash_command";
       itemId: string | null;
@@ -839,15 +840,23 @@ function walkBubbles(
       continue;
     }
 
-    if (isSubagentActivityBlock(b)) {
+    // A sub-agent notice joins the assistant work beside it so it folds with
+    // that work. With no work after it yet it stands alone, and the run is one
+    // re-walk region so all of it can join the work that arrives next.
+    if (isSubagentActivityBlock(b) && workAfterNotice(blocks, i) === undefined) {
       lastBubbleStart = i;
-      lastBubbleCount = 1;
-      bubbles.push({
-        kind: "subagent_activity",
-        itemId: b.ctx.itemId ?? `subagent_activity_${i}`,
-        data: b.data,
-      });
-      i += 1;
+      lastBubbleCount = 0;
+      for (; i < blocks.length && isNoticeTransparent(blocks[i]!); i += 1) {
+        const notice = blocks[i]!;
+        if (isNonRenderingBlock(notice)) expandNextAssistantResponseId = null;
+        if (!isSubagentActivityBlock(notice)) continue;
+        bubbles.push({
+          kind: "subagent_activity",
+          itemId: notice.ctx.itemId ?? `subagent_activity_${i}`,
+          data: notice.data,
+        });
+        lastBubbleCount += 1;
+      }
       continue;
     }
 
@@ -992,7 +1001,8 @@ function walkBubbles(
     // Question/plan cards split the turn on their own (see
     // `isUserInputElicitationBlock`) — they carry the turn's id, but the
     // user answering one is a boundary, not a step of the work.
-    let groupResponseId = b.ctx.responseId;
+    // A notice's own `subagent_*` id never names the turn.
+    let groupResponseId = isSubagentActivityBlock(b) ? "" : b.ctx.responseId;
     const groupStart = i;
     // Sentinel-headed groups never absorb a different turn's blocks, in
     // either direction (see the id-change handling below).
@@ -1012,8 +1022,7 @@ function walkBubbles(
         isTerminalCommandInput(cur) ||
         cur.type === "compaction" ||
         cur.type === "compaction_loading" ||
-        cur.type === "routing_decision" ||
-        isSubagentActivityBlock(cur)
+        cur.type === "routing_decision"
       )
         break;
       if (isNonRenderingBlock(cur)) {
@@ -1024,6 +1033,19 @@ function walkBubbles(
       // breaks: the work before it and the work after the answer are
       // separate stretches, each folding under its own "Worked for".
       if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
+      if (isSubagentActivityBlock(cur)) {
+        // Mid-turn, the notice stays in this bubble. When a different turn's
+        // work follows it (a lead woken by the result), it opens that turn's
+        // bubble instead, so the new turn never streams into a folded trace.
+        if (
+          i > groupStart &&
+          (groupOpenedOnSentinel || noticePrecedesOtherTurn(blocks, i, groupResponseId))
+        ) {
+          break;
+        }
+        i += 1;
+        continue;
+      }
       // A bare tool_result never renders standalone (it folds into its
       // call's card by callId) — don't let a backdated one split the
       // open bubble. Anonymous blocks never carry turn identity.
@@ -1432,10 +1454,50 @@ function isSubagentActivityBlock(
   return b.type === "native_tool" && b.toolType === "subagent_activity";
 }
 
+/**
+ * What a notice looks past to find the work beside it: other notices, and
+ * blocks that never render on their own.
+ */
+function isNoticeTransparent(b: AnyBlock): boolean {
+  return isSubagentActivityBlock(b) || isNonRenderingBlock(b) || b.type === "tool_result";
+}
+
+/**
+ * The assistant work after the notice at `index`, or `undefined` when a bubble
+ * boundary (or nothing) comes first. `skipUnnamed` also looks past work with no
+ * turn identity yet, to find the turn the work belongs to.
+ */
+function workAfterNotice(
+  blocks: AnyBlock[],
+  index: number,
+  skipUnnamed = false,
+): AnyBlock | undefined {
+  for (let k = index + 1; k < blocks.length; k += 1) {
+    const b = blocks[k]!;
+    if (isNoticeTransparent(b)) continue;
+    if (
+      !isAssistantSideBlock(b) ||
+      isStandaloneSentinelBlock(b) ||
+      isUserInputElicitationBlock(b)
+    ) {
+      return undefined;
+    }
+    if (skipUnnamed && isAnonymousRid(b.ctx.responseId)) continue;
+    return b;
+  }
+  return undefined;
+}
+
+/** Whether the work after the notice at `index` belongs to a turn other than `turnId`. */
+function noticePrecedesOtherTurn(blocks: AnyBlock[], index: number, turnId: string): boolean {
+  if (isAnonymousRid(turnId)) return false;
+  const next = workAfterNotice(blocks, index, true);
+  return next !== undefined && next.ctx.responseId !== turnId;
+}
+
 /** Filter to blocks that participate in assistant rendering. */
 function isAssistantSideBlock(b: AnyBlock): boolean {
   return (
-    !isSubagentActivityBlock(b) &&
     b.type !== "user_message" &&
     !isTerminalCommandInput(b) &&
     b.type !== "compaction" &&
@@ -1577,6 +1639,12 @@ function buildAssistantItems(
           ),
         );
       }
+      i += 1;
+      continue;
+    }
+
+    if (isSubagentActivityBlock(b)) {
+      items.push({ kind: "subagent_activity", itemId: b.ctx.itemId, data: b.data });
       i += 1;
       continue;
     }
