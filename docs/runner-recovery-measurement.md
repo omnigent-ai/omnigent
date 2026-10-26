@@ -4,6 +4,11 @@ This is a read-only operator guide for the relay recovery contract. It does
 not replace the fixed KPI3 query and does not treat a recovered stream as a
 completed turn.
 
+For failures delayed by an offline host, use the
+[host-offline attribution guide](runner-host-offline-attribution.md). Those
+failures can follow their tunnel close by 24 hours, outside a short close
+correlation window.
+
 ## Contract and parameters
 
 Every query takes these named parameters:
