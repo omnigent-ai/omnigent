@@ -39,6 +39,7 @@ from pathlib import Path
 import pytest
 import tomllib
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests.e2e._native_resume_helpers import cli_env, omnigent_console_script, spawn_cli_background
 from tests.e2e.helpers import POLL_INTERVAL_S
 
@@ -104,10 +105,11 @@ def test_codex_native_session_config_preserves_native_effort(
 
     env = cli_env()
     # Isolate the journey's filesystem state: the source ~/.codex the copy
-    # reads and the ~/.omnigent/codex-native bridge root the session's private
-    # CODEX_HOME lands in both resolve from HOME. No login is required (session
-    # prep never reaches the model), so a fresh HOME is safe here.
+    # reads resolves from HOME, and the ~/.omnigent/codex-native bridge root the
+    # session's private CODEX_HOME lands in from the data dir. No login is
+    # required (session prep never reaches the model), so a fresh HOME is safe.
     env["HOME"] = str(home)
+    env["OMNIGENT_DATA_DIR"] = str(home / ".omnigent")
     env.pop("CODEX_HOME", None)
     env.pop("XDG_CONFIG_HOME", None)
 
@@ -156,3 +158,4 @@ def test_codex_native_session_config_preserves_native_effort(
         assert (home / ".codex" / "config.toml").read_text() == user_config
     finally:
         handle.terminate()
+        reap_leaked_omnigent_processes(home / ".omnigent")

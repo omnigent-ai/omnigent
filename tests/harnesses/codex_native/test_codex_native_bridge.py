@@ -49,6 +49,7 @@ from omnigent.harnesses.codex_native.bridge import (
     write_codex_config_model,
     write_policy_hook_config,
 )
+from omnigent.process_logging import data_dir
 
 
 def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
@@ -75,12 +76,14 @@ def test_codex_terminal_interactive_requires_thread_and_enabled_composer(
     assert codex_terminal_interactive(bridge_dir, "Codex is starting") is False
 
 
-def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Path) -> None:
-    """codex launches serve-mcp with ``-I`` so the workspace can't shadow omnigent.
+def test_codex_mcp_config_overrides_isolate_the_bridge_relay(tmp_path: Path) -> None:
+    """codex launches serve-mcp with ``-I`` and the runner's data dir.
 
     The MCP server starts in the session workspace, and without ``-I`` python puts
     that cwd on ``sys.path``, so a workspace that is an omnigent checkout supplies
-    the bridge's own package. Every other native bridge passes ``-I`` here.
+    the bridge's own package. Every other native bridge passes ``-I`` here. codex
+    also drops ``OMNIGENT_DATA_DIR`` from an MCP server's env, so the relay gets it
+    pinned to find the bridge root that holds its bridge dir.
 
     :param tmp_path: Stands in for the per-session bridge dir.
     """
@@ -94,6 +97,9 @@ def test_codex_mcp_config_overrides_isolate_the_bridge_interpreter(tmp_path: Pat
         "omnigent.harnesses.claude_native.bridge",
         "serve-mcp",
     ]
+    env_prefix = "mcp_servers.omnigent.env.OMNIGENT_DATA_DIR="
+    raw_data_dir = next(o[len(env_prefix) :] for o in overrides if o.startswith(env_prefix))
+    assert json.loads(raw_data_dir) == str(data_dir())
 
 
 def _seed_active_turn(bridge_dir: Path, active_turn_id: str | None) -> None:
