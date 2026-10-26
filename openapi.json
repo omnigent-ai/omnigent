@@ -13202,6 +13202,18 @@
             }
           },
           {
+            "description": "Which `search_query` matches to return. `\"all\"` (default) returns title or content matches. `\"title\"` returns only title matches. `\"content\"` returns content matches whose title does not match, so the search palette can list the two as separate groups.",
+            "in": "query",
+            "name": "search_scope",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|title|content)$",
+              "title": "Search Scope",
+              "type": "string"
+            }
+          },
+          {
             "description": "When `False` (default), archived sessions are omitted. When `True`, archived sessions are returned alongside active ones (the sidebar groups them into an \"Archived\" section). Powers the sidebar's \"Show archived\" toggle.",
             "in": "query",
             "name": "include_archived",

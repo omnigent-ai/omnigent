@@ -162,6 +162,9 @@ def _encode_session_state(
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 
+# ``list_conversations(search_scope=...)`` values; see its docstring.
+_SEARCH_SCOPES = frozenset({"all", "title", "content"})
+
 # Upper bound on rows fetched per SQL statement when listing conversation
 # items. A deployed managed-Postgres backend failed one oversized read of a
 # large conversation (multi-megabyte pages 500'd at limit>=500 while limit<=400
@@ -2911,6 +2914,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        search_scope: str = "all",
         accessible_by: str | None = None,
         owned_by: str | None = None,
         shared_only: bool = False,
@@ -2961,6 +2965,10 @@ class SqlAlchemyConversationStore(ConversationStore):
             query. Implemented with the SQL ``LIKE`` operator
             (no FTS) so it works against both SQLite and
             Postgres without extra extensions.
+        :param search_scope: Which matches ``search_query`` returns:
+            ``"all"`` (title or content), ``"title"`` (title matches
+            only), or ``"content"`` (content matches whose title does
+            not match), so the two groups never overlap.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -2989,6 +2997,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``False`` (default) disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
+        :raises ValueError: If ``search_scope`` is not a known scope.
         """
         from omnigent.server.auth import LEVEL_OWNER
 
@@ -3014,6 +3023,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         needs_meta_filter = (accessible_by is not None) or (owned_by is not None) or shared_only
         if shared_only and accessible_by is None:
             raise ValueError("shared_only=True requires accessible_by to be set")
+        if search_scope not in _SEARCH_SCOPES:
+            raise ValueError(f"invalid search_scope: {search_scope!r}")
 
         # ACL strategy. Single-DB (the AP and Omnigent tables share one bind):
         # push the permission check into the conversations query as a
@@ -3204,7 +3215,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     .exists()
                 )
-                stmt = stmt.where(or_(title_match, content_match))
+                if search_scope == "title":
+                    stmt = stmt.where(title_match)
+                elif search_scope == "content":
+                    stmt = stmt.where(~title_match, content_match)
+                else:
+                    stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the
@@ -3336,7 +3352,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+                _fetch_search_snippets(session, row_ids, search_query)
+                if search_query and search_scope != "title"
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
