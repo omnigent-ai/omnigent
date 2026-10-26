@@ -3001,8 +3001,10 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         external_session_id: str,
         workspace: Path,
         bridge_dir: Path,
+        resume_copy: bool,
     ) -> Path:
         """Record the resume id and return a transcript path."""
+        assert not resume_copy
         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
@@ -3123,8 +3125,10 @@ async def test_auto_create_claude_terminal_resumes_a_copy_while_a_background_job
         external_session_id: str,
         workspace: Path,
         bridge_dir: Path,
+        resume_copy: bool,
     ) -> Path:
         """Record the id the transcript is rebuilt under."""
+        assert resume_copy
         del client, session_id, workspace, bridge_dir
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
@@ -3188,8 +3192,10 @@ async def test_auto_create_claude_terminal_resumes_in_place_when_the_registry_ch
         external_session_id: str,
         workspace: Path,
         bridge_dir: Path,
+        resume_copy: bool,
     ) -> Path:
         """Record the id the transcript is rebuilt under."""
+        assert not resume_copy
         del client, session_id, workspace, bridge_dir
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"
@@ -3385,8 +3391,10 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         external_session_id: str,
         workspace: Path,
         bridge_dir: Path,
+        resume_copy: bool,
     ) -> Path:
         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
+        assert not resume_copy
         del client, session_id, workspace
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"

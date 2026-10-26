@@ -50,6 +50,7 @@ def _write_session_file(
     """
     directory.mkdir(parents=True, exist_ok=True)
     path = directory / f"{pid}.json"
+    previous_mtime = path.stat().st_mtime if path.exists() else None
     path.write_text(
         json.dumps(
             {
@@ -65,6 +66,10 @@ def _write_session_file(
         ),
         encoding="utf-8",
     )
+    if previous_mtime is not None:
+        # Consecutive writes must remain observable on filesystems with coarse mtimes.
+        mtime = max(path.stat().st_mtime, previous_mtime + 1)
+        os.utime(path, (mtime, mtime))
     return path
 
 

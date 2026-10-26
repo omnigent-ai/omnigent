@@ -8882,6 +8882,7 @@ async def _auto_create_claude_terminal(
                 external_session_id=resume_session_id,
                 workspace=Path(workspace).resolve(),
                 bridge_dir=bridge_dir,
+                resume_copy=resume_session_id != session_external_id,
             )
             if _transcript is not None:
                 resume_external_session_id = resume_session_id

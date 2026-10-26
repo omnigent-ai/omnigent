@@ -3291,10 +3291,12 @@ async def test_fetch_resume_items_raises_when_5xx_persists_at_floor() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [500, 429])
+@pytest.mark.parametrize("resume_copy", [False, True])
 async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     status_code: int,
+    resume_copy: bool,
 ) -> None:
     """
     Server history unreachable + intact local transcript → resume from it.
@@ -3328,9 +3330,11 @@ async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchab
             session_id="conv_abc",
             external_session_id="sid123",
             workspace=workspace,
+            resume_copy=resume_copy,
         )
 
     assert written == local
+    assert local.with_suffix(".omnigent-resume-copy").exists() == resume_copy
     # The untouched local transcript is used as-is, never overwritten with
     # partial server state.
     assert local.read_text(encoding="utf-8") == '{"type":"user"}\n'
@@ -5977,6 +5981,9 @@ async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_ru
     assert later_args == args
     assert live_transcript.read_text(encoding="utf-8") == live_line
     copy_transcript = project_dir / f"{copy_session_id}.jsonl"
+    marker = copy_transcript.with_suffix(".omnigent-resume-copy")
+    assert marker.is_file()
+    assert not live_transcript.with_suffix(".omnigent-resume-copy").exists()
     records = [
         json.loads(line)
         for line in copy_transcript.read_text(encoding="utf-8").splitlines()
@@ -5988,7 +5995,7 @@ async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_ru
     ]
     assert {record["sessionId"] for record in records} == {copy_session_id}
     assert sorted(path.name for path in project_dir.iterdir()) == sorted(
-        [live_transcript.name, copy_transcript.name]
+        [live_transcript.name, copy_transcript.name, marker.name]
     )
     assert not default_projects.exists()
 
@@ -7519,9 +7526,11 @@ def test_align_working_directory_raises_when_recorded_path_missing(
     )
 
 
+@pytest.mark.parametrize("background", [False, True])
 def test_align_working_directory_redirect_moves_transcript_and_updates_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    background: bool,
 ) -> None:
     """
     User-approved redirect moves Claude's transcript into the current cwd.
@@ -7558,6 +7567,13 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         "",
     ]
     source.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+    if background:
+        sessions = projects_dir.parent / "sessions"
+        sessions.mkdir()
+        (sessions / f"{os.getppid()}.json").write_text(
+            json.dumps({"sessionId": external_session_id, "kind": "bg"})
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(projects_dir.parent))
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
     monkeypatch.setattr(
         claude_native,
@@ -7579,6 +7595,13 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         / claude_native._sanitize_claude_project_name(str(current_workspace.resolve()))
         / f"{external_session_id}.jsonl"
     )
+    state = read_launch_state("conv_redirect")
+    assert state is not None
+    assert state.working_directory == str(current_workspace.resolve())
+    if background:
+        assert source.read_text(encoding="utf-8") == "\n".join(original_lines) + "\n"
+        assert not target.exists()
+        return
     assert target.is_file(), f"redirect target {target} was not created"
     copied_payloads = [
         json.loads(line)
@@ -7595,9 +7618,6 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         "sessionId": external_session_id,
     }, "records without top-level cwd must be preserved aside from compact JSON formatting"
     assert not source.exists(), f"source transcript {source} should be removed after move"
-    state = read_launch_state("conv_redirect")
-    assert state is not None
-    assert state.working_directory == str(current_workspace.resolve())
 
 
 def test_align_working_directory_redirect_replaces_stale_target(

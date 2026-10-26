@@ -92,6 +92,7 @@ from omnigent.databricks_ai_gateway import (
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    RESUME_COPY_MARKER_SUFFIX,
     ClaudeNativeHookInterpreterMismatchError,
     augment_claude_args,
     bridge_dir_for_bridge_id,
@@ -2424,7 +2425,7 @@ def _redirect_claude_transcript_to_current_project(
     :param external_session_id: Claude session id / transcript stem,
         e.g. ``"02857840-6362-408f-b41f-309e396ed7c6"``.
     :param current: Current cwd, already resolved.
-    :returns: Path to the moved transcript.
+    :returns: Path to the moved transcript, or the original while a background job holds it.
     :raises click.ClickException: If the source transcript is missing
         or unsafe.
     """
@@ -2439,6 +2440,11 @@ def _redirect_claude_transcript_to_current_project(
             f"Claude transcript {external_session_id!r} was not found under "
             f"{_claude_projects_dir()}."
         )
+    if find_background_holder(external_session_id) is not None:
+        # Cold resume will rebuild a copy in the requested workspace.
+        redirect_launch_state(session_id, str(current))
+        click.echo("Keeping the background job's transcript; resuming a copy here.", err=True)
+        return source
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
     try:
@@ -5373,6 +5379,7 @@ async def _resolve_cold_resume_args(
         external_session_id=resume_session_id,
         workspace=Path.cwd().resolve(),
         bridge_dir=bridge_dir_for_bridge_id(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
+        resume_copy=resume_session_id != external_session_id,
     )
     if transcript is None:
         # No resumable records: ``claude --resume`` against an empty (or
@@ -5413,7 +5420,7 @@ def _claude_resume_session_id(external_session_id: str, *, session_id: str) -> s
     """
     try:
         holder = find_background_holder(external_session_id)
-    except Exception:  # noqa: BLE001 — a registry probe must not change how a resume launches
+    except Exception:  # A registry probe must not change how a resume launches.
         _logger.warning(
             "Could not check Claude's session registry for %s; resuming it in place",
             external_session_id,
@@ -5453,6 +5460,7 @@ async def _ensure_local_claude_resume_transcript(
     external_session_id: str,
     workspace: Path,
     bridge_dir: Path | None = None,
+    resume_copy: bool = False,
 ) -> Path | None:
     """
     Refresh Claude Code's local JSONL transcript for cold resume.
@@ -5479,6 +5487,7 @@ async def _ensure_local_claude_resume_transcript(
         what Claude computes.
     :param bridge_dir: Launch bridge path identifying the attachment cache.
         Defaults to the legacy session-id bridge when omitted.
+    :param resume_copy: Mark a temporary native copy so local import excludes it.
     :returns: Path to the local transcript that was written; ``None`` if
         *external_session_id* is not a safe transcript stem, or if the AP
         history yields no resumable records (an empty transcript would make
@@ -5507,6 +5516,8 @@ async def _ensure_local_claude_resume_transcript(
         # ClickException) still propagate: the server explicitly rejected
         # the conversation, so reviving local history is unsafe.
         if _is_resumable_claude_transcript(target):
+            if resume_copy:
+                target.with_suffix(RESUME_COPY_MARKER_SUFFIX).touch(mode=0o600)
             _logger.warning(
                 "Could not fetch server history for %r; resuming from the "
                 "existing local transcript %s",
@@ -5539,6 +5550,9 @@ async def _ensure_local_claude_resume_transcript(
         with tmp.open("w", encoding="utf-8") as handle:
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        if resume_copy:
+            # Publish the marker first so import never sees an unmarked copy.
+            target.with_suffix(RESUME_COPY_MARKER_SUFFIX).touch(mode=0o600)
         os.replace(tmp, target)
     except OSError as exc:
         raise click.ClickException(
