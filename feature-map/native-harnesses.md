@@ -371,6 +371,29 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`model-and-effort`, Claude runtime selection (own environment):**
+  `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
+  uses real Claude catalog discovery, tmux, statusLine and the runner event
+  endpoint. With the per-session options cache still cold, repeated `opus` and
+  `opus[1m]` selections retain the exact launch-pinned generation and context.
+  It then switches to a managed GLM picker ID and back, opens Claude's model
+  picker, and confirms another switch reclaims that surface successfully.
+  Run `OMNIGENT_E2E_CLAUDE_NATIVE=1 uv run --no-sync pytest tests/e2e/test_claude_native_managed_model_switch.py --reruns 0`.
+  Requires Claude Code and tmux; use a clean container if machine-managed
+  settings override the fixture's picker. It makes no model calls and does not
+  verify browser rendering or live gateway servability.
+- **`model-and-effort`, Claude browser selection and refusal (nightly):**
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
+  proves alias picks through the gear, model pill and Ctrl+Shift+M using
+  the real browser, server, owned isolated host, runner and CLI. Subsequent
+  mock requests preserve the wire model's generation; native status and
+  `requestedModel` retain `[1m]`, with a correlated `context-1m` request beta.
+  Chat and the transcript each contain the reply once.
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
+  pauses its owned CLI to force a real unconfirmed switch; a late 503 preserves
+  a newer same-value model write and its effort while the applied model stays
+  unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
+  These cases do not cover live providers or a post-refusal retry.
 - **`model-and-effort`, Pi inference bindings (component):**
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal
