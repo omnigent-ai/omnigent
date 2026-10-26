@@ -159,7 +159,7 @@ def test_azure_devops_tab_shows_provider_repo_and_pull_request(
         else page.get_by_role("complementary", name="Workspace")
     )
 
-    expect(rail.get_by_role("heading", name="Azure DevOps")).to_be_visible(timeout=30_000)
+    expect(rail.get_by_title("Azure DevOps")).to_be_visible(timeout=30_000)
     expect(rail.get_by_text("contoso/web/app", exact=False).first).to_be_visible()
     expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
     expect(rail.get_by_text("!7", exact=True)).to_be_visible()

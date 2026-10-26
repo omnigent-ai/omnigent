@@ -164,15 +164,12 @@ function PullRequestEmptyState({
   );
 }
 
-/** The provider icon with the panel title, or icon-only (provider named for screen
- *  readers) where the PR picker needs the room. */
-function PanelTitle({ copy, showTitle = false }: { copy: GitProviderCopy; showTitle?: boolean }) {
-  const Icon = copy.Icon;
+/** The panel's heading, hidden from sight (not from screen readers) where the PR
+ *  list and its controls need the room. The provider stays out of it: it belongs to
+ *  each request, so {@link PullRequestProviderIcon} carries it beside the title. */
+function PanelTitle({ showTitle = false }: { showTitle?: boolean }) {
   return (
-    <h2 className="flex shrink-0 items-center gap-2 font-medium text-ui" title={copy.label}>
-      <Icon size={14} className="shrink-0" aria-hidden />
-      {showTitle ? "Pull Requests" : <span className="sr-only">{copy.label}</span>}
-    </h2>
+    <h2 className={cn("shrink-0 font-medium text-ui", !showTitle && "sr-only")}>Pull Requests</h2>
   );
 }
 
@@ -337,6 +334,18 @@ function IconButton({
       </TooltipTrigger>
       <TooltipContent>{label}</TooltipContent>
     </Tooltip>
+  );
+}
+
+/** The request's provider, shown beside its title: a glyph, named on hover and for
+ *  screen readers. A session rarely spans providers, so it stays this quiet. */
+function PullRequestProviderIcon({ copy }: { copy: GitProviderCopy }) {
+  const Icon = copy.Icon;
+  return (
+    <span className="flex shrink-0 items-center text-muted-foreground" title={copy.label}>
+      <Icon size={14} className="shrink-0" aria-hidden />
+      <span className="sr-only">{copy.label}</span>
+    </span>
   );
 }
 
@@ -1342,7 +1351,7 @@ export function PullRequestPanel({
     <div className="flex h-full min-h-0 flex-col">
       {showTrackingControls ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} showTitle={!showingDetails} />
+          <PanelTitle showTitle={!showingDetails} />
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
             {prs.length > 0 && showingDetails && (
               <Button variant="ghost" size="sm" onClick={() => setDetailsSession(undefined)}>
@@ -1380,7 +1389,7 @@ export function PullRequestPanel({
         </div>
       ) : panelState.kind !== "ready" ? (
         <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} showTitle />
+          <PanelTitle showTitle />
           {refreshButton}
         </div>
       ) : null}
@@ -1429,7 +1438,7 @@ export function PullRequestPanel({
           info={info}
           storedPr={storesPrs && hostOffline ? selectedPr : undefined}
           notSynced={notSynced && !selectedPr}
-          showProviderIcon={!showTrackingControls}
+          showHeading={!showTrackingControls}
           refreshButton={!showTrackingControls ? refreshButton : undefined}
           emptyStateAction={
             associations?.tracking_available && linkInEmptyState ? (
@@ -1481,13 +1490,13 @@ function StoredPullRequestDetails({
   pr,
   copy,
   sandboxAsleep,
-  showProviderIcon,
+  showHeading,
   refreshButton,
 }: {
   pr: PullRequestAssociation;
   copy: GitProviderCopy;
   sandboxAsleep: boolean;
-  showProviderIcon: boolean;
+  showHeading: boolean;
   refreshButton?: React.ReactNode;
 }) {
   const title = pr.title?.trim() || `${pr.repository} ${copy.prNumberPrefix}${pr.number}`;
@@ -1507,7 +1516,7 @@ function StoredPullRequestDetails({
       <div className="flex h-full min-h-0 flex-col" data-testid="github-stored-pr">
         <div className="shrink-0 border-b border-border px-3 pt-2 pb-2">
           <div className="flex items-center gap-2">
-            {showProviderIcon && <PanelTitle copy={copy} />}
+            {showHeading && <PanelTitle />}
             <span className="block min-w-0 truncate text-xs text-muted-foreground">
               {pr.repository}
             </span>
@@ -1546,7 +1555,7 @@ function PullRequestPanelDetails({
   info,
   storedPr,
   notSynced,
-  showProviderIcon,
+  showHeading,
   refreshButton,
   emptyStateAction,
 }: {
@@ -1556,7 +1565,7 @@ function PullRequestPanelDetails({
   storedPr?: PullRequestAssociation;
   /** Offline, and the server hasn't imported the session's PRs yet. */
   notSynced?: boolean;
-  showProviderIcon: boolean;
+  showHeading: boolean;
   refreshButton?: React.ReactNode;
   emptyStateAction?: React.ReactNode;
 }) {
@@ -1751,7 +1760,7 @@ function PullRequestPanelDetails({
         pr={storedPr}
         copy={gitProviderCopy(storedPr.provider, undefined, storedPr.provider_display)}
         sandboxAsleep={sandboxAsleep}
-        showProviderIcon={showProviderIcon}
+        showHeading={showHeading}
         refreshButton={refreshButton}
       />
     );
@@ -1934,7 +1943,7 @@ function PullRequestPanelDetails({
         <div className="shrink-0 border-b border-border pb-0.5">
           <div className="px-3 pt-2">
             <div className="flex items-center gap-2">
-              {showProviderIcon && <PanelTitle copy={copy} />}
+              {showHeading && <PanelTitle />}
               <span className="block min-w-0 truncate text-xs text-muted-foreground">
                 {data.repo?.name_with_owner ?? copy.label}
                 {data.branch && (
@@ -1948,6 +1957,7 @@ function PullRequestPanelDetails({
               <div className="ml-auto shrink-0">{refreshButton}</div>
             </div>
             <div className="mt-1 flex flex-nowrap items-center gap-2">
+              <PullRequestProviderIcon copy={copy} />
               <PullRequestTitle
                 // A different PR starts fresh, so an open title edit can't outlive its PR.
                 key={data.selected_pr_url ?? pr.url}

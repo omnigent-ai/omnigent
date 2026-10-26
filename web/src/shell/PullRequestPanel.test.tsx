@@ -352,12 +352,18 @@ afterEach(() => {
 describe("PullRequestPanel", () => {
   it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
-    const heading = screen.getByRole("heading", { name: "GitHub" });
-    expect(heading).toHaveAttribute("title", "GitHub");
-    expect(screen.getByText("GitHub")).toHaveClass("sr-only");
+    // The header names the panel, never the provider.
+    const heading = screen.getByRole("heading", { name: "Pull Requests" });
+    expect(heading).not.toHaveAttribute("title");
     // Title + number live in the shared header (both tabs).
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();
     expect(screen.getByText("#6000")).toBeInTheDocument();
+    // The provider belongs to the PR, so its glyph rides in that title row.
+    const providerName = screen.getByText("GitHub");
+    expect(providerName).toHaveClass("sr-only");
+    expect(providerName.parentElement).toHaveAttribute("title", "GitHub");
+    expect(heading).not.toContainElement(providerName);
+    expect(providerName.closest("div")).toContainElement(screen.getByText("#6000"));
     // CI checks render on the Summary tab (the default) as labeled pills. A
     // zero bucket (pending) renders no pill.
     expect(screen.getByText("Checks")).toBeInTheDocument();
@@ -980,12 +986,10 @@ describe("PullRequestPanel", () => {
     renderPanel();
 
     expect(screen.getByText(/No open PR for/)).toBeInTheDocument();
-    // The empty state shows the panel title; the provider stays in the tooltip.
-    expect(screen.getByRole("heading", { name: "Pull Requests" })).toHaveAttribute(
-      "title",
-      "GitHub",
-    );
+    // The empty state shows the panel title, with no provider to name.
+    expect(screen.getByRole("heading", { name: "Pull Requests" })).not.toHaveAttribute("title");
     expect(screen.getByText("Pull Requests")).not.toHaveClass("sr-only");
+    expect(screen.queryByTitle("GitHub")).toBeNull();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
     expect(screen.getByRole("status")).toHaveTextContent("GitLab discovery failed.");
     expect(screen.queryByText("Pull requests aren’t available.")).not.toBeInTheDocument();
@@ -1285,10 +1289,10 @@ describe("PullRequestPanel", () => {
     expect(screen.getByText("No supported remote")).toBeInTheDocument();
     expect(screen.getByText("git.example.com")).toBeInTheDocument();
     expect(screen.queryByTestId("diff")).toBeNull();
-    // No provider serves the workspace, so the header names none.
+    // The header carries no provider glyph, whether or not one serves the workspace.
     const heading = screen.getByRole("heading", { name: "Pull Requests" });
-    expect(heading.querySelector("svg")).toHaveClass("lucide-git-pull-request");
-    expect(screen.queryByRole("heading", { name: "GitHub" })).toBeNull();
+    expect(heading.querySelector("svg")).toBeNull();
+    expect(screen.queryByText("GitHub")).toBeNull();
   });
 
   it("tells a GitHub Enterprise user to sign in to the remote's host", () => {
@@ -1339,8 +1343,7 @@ describe("PullRequestPanel", () => {
   describe("header when no provider is known", () => {
     const neutralHeading = () => {
       const heading = screen.getByRole("heading", { name: "Pull Requests" });
-      expect(heading.querySelector("svg")).toHaveClass("lucide-git-pull-request");
-      expect(heading.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+      expect(heading.querySelector("svg")).toBeNull();
       expect(screen.queryByText(/GitHub/)).toBeNull();
     };
 
@@ -1444,8 +1447,8 @@ describe("PullRequestPanel", () => {
       };
       renderPanel();
       const heading = screen.getByRole("heading", { name: "Pull Requests" });
-      expect(heading.querySelector("svg")).toHaveClass("lucide-git-pull-request");
-      expect(screen.queryByRole("heading", { name: "GitHub" })).toBeNull();
+      expect(heading.querySelector("svg")).toBeNull();
+      expect(screen.queryByText("GitHub")).toBeNull();
       // The picker names the PR in its own provider's style; the header does not.
       expect(screen.getByRole("list", { name: "Pull requests" })).toHaveTextContent(
         "acme/app #6000",
@@ -1455,12 +1458,14 @@ describe("PullRequestPanel", () => {
     it("keeps naming GitHub for a host that omits the provider", () => {
       // The default fixture is a ready payload with no `provider`.
       renderPanel();
-      const heading = screen.getByRole("heading", { name: "GitHub" });
-      expect(heading.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
-      expect(screen.queryByRole("heading", { name: "Pull Requests" })).toBeNull();
+      // The heading stays neutral; GitHub is named beside the PR's own title.
+      expect(screen.getByRole("heading", { name: "Pull Requests" })).toBeInTheDocument();
+      const provider = screen.getByTitle("GitHub");
+      expect(provider).toHaveTextContent("GitHub");
+      expect(provider.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
     });
 
-    it("keeps the known provider in the header while a PR switch loads", () => {
+    it("names a switched-to PR's own provider, and stays neutral while it loads", () => {
       const url = "https://forge.example.test/contoso/web/_git/app/pullrequest/7";
       state.info!.data = {
         ...state.info!.data!,
@@ -1482,11 +1487,13 @@ describe("PullRequestPanel", () => {
       };
       const { rerender } = renderPanel();
       fireEvent.click(screen.getByRole("button", { name: /contoso\/web\/app !7$/ }));
-      expect(screen.getByRole("heading", { name: "Example Forge" })).toBeInTheDocument();
+      expect(screen.getByTitle("Example Forge")).toHaveTextContent("Example Forge");
+      // Mid-switch there's no request to name, and the header never named one.
       state.info = { isLoading: true, error: null, isFetching: true };
       rerender(<PullRequestPanel conversationId="conv_1" />);
       expect(screen.getByText("Loading pull requests…")).toBeInTheDocument();
-      expect(screen.getByRole("heading", { name: "Example Forge" })).toBeInTheDocument();
+      expect(screen.getByRole("heading", { name: "Pull Requests" })).toBeInTheDocument();
+      expect(screen.queryByTitle("Example Forge")).toBeNull();
     });
   });
 
@@ -1520,10 +1527,8 @@ describe("PullRequestPanel", () => {
     it("uses the generic label and names the missing CLI", () => {
       state.info!.data = gitlab({ authenticated: false, cli: { name: "glab", available: false } });
       renderPanel();
-      expect(screen.getByRole("heading", { name: "Pull Requests" })).toHaveAttribute(
-        "title",
-        "gitlab",
-      );
+      expect(screen.getByRole("heading", { name: "Pull Requests" })).not.toHaveAttribute("title");
+      // No PR to hang the provider off, so the empty state's copy names it.
       expect(screen.getByText("gitlab CLI not found")).toBeInTheDocument();
       expect(screen.getByText("glab")).toHaveClass("font-mono");
       expect(screen.queryByRole("combobox", { name: "GitHub account" })).toBeNull();
@@ -1595,8 +1600,8 @@ describe("PullRequestPanel", () => {
     it("shows the provider, the repo, and a !-prefixed PR with no account selector", () => {
       state.info!.data = forge();
       renderPanel();
-      const heading = screen.getByRole("heading", { name: "Example Forge" });
-      expect(heading.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
+      const provider = screen.getByTitle("Example Forge");
+      expect(provider.querySelector("svg")).toHaveAttribute("aria-hidden", "true");
       expect(screen.getByText(/contoso\/web\/app/)).toBeInTheDocument();
       expect(screen.getByText("!7")).toBeInTheDocument();
       expect(screen.getByRole("link", { name: /Add the widget/ })).toHaveAttribute("href", prUrl);

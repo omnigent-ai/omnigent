@@ -227,7 +227,7 @@ def test_gitlab_panel_summary_and_diff(
             else page.get_by_role("complementary", name="Workspace")
         )
     expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
-    expect(panel.get_by_role("heading", name="GitLab", exact=True)).to_be_visible()
+    expect(panel.get_by_title("GitLab", exact=True)).to_be_visible()
     expect(panel.get_by_text("!7", exact=True)).to_be_visible()
     expect(panel.get_by_text("A widget from a nested GitLab project.", exact=True)).to_be_visible()
     expect(panel.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
