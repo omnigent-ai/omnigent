@@ -9,7 +9,6 @@ are the pre-merge gate.
 
 from __future__ import annotations
 
-import re
 from pathlib import Path
 from typing import Any
 
@@ -151,24 +150,34 @@ def test_workspace_coverage_maps_to_real_jobs_and_steps():
             assert len(steps) == 1 and not steps[0].get("continue-on-error"), consumer
 
 
-def test_required_compatibility_workflows_preserve_app_refresh_permissions():
-    import json
+@pytest.mark.parametrize(
+    "path,allowed",
+    [
+        ("uv.lock", True),
+        ("pnpm-lock.yaml", True),
+        ("tests/codex_parity/sidecar/Cargo.lock", True),
+        (".github/actions/setup-uv/action.yml", True),
+        (".github/workflows/ci.yml", True),
+        (".github/workflows/ui-snapshot-update.yml", True),
+        (".github/workflows/release-omnigent.yml", False),
+        (".github/workflows/benchmark-pr.yml", False),
+    ],
+)
+def test_app_refresh_permissions_cover_optional_and_reusable_workflows(monkeypatch, path, allowed):
+    monkeypatch.syspath_prepend(str(REPO_ROOT / ".github/scripts"))
+    from dependabot_policy import NeedsReview, require_refresh_permissions
 
-    policy = json.loads((REPO_ROOT / ".github/dependabot-automerge.json").read_text())
-    for name in policy["workflow_test_jobs"]:
-        text = (REPO_ROOT / ".github/workflows" / name).read_text()
-        workflow = yaml.safe_load(text)
-        assert not re.search(r"\bsecrets\s*(?:\.|\[)", text), name
-        assert workflow["permissions"] == {"contents": "read"}, name
-        for job_name, job in workflow["jobs"].items():
-            assert "secrets" not in job, (name, job_name)
-            permissions = job.get("permissions", workflow["permissions"])
-            assert isinstance(permissions, dict), (name, job_name)
-            writes = {key for key, value in permissions.items() if value == "write"}
-            # Trivy uploads SARIF; compatibility jobs cannot write code or releases.
-            expected = {"security-events"} if (name, job_name) == ("trivy.yml", "scan") else set()
-            assert writes == expected, (name, job_name, permissions)
-            assert all(value in {"read", "write", "none"} for value in permissions.values())
+    workflows = {
+        str(workflow.relative_to(REPO_ROOT)): workflow.read_text()
+        for workflow in (REPO_ROOT / ".github/workflows").iterdir()
+        if workflow.suffix in {".yml", ".yaml"}
+    }
+    if allowed:
+        require_refresh_permissions(workflows, {path}, "dependabot/uv/ruff")
+    else:
+        with pytest.raises(NeedsReview, match="automatic branch refresh") as raised:
+            require_refresh_permissions(workflows, {path}, "dependabot/uv/ruff")
+        assert path in str(raised.value)
 
 
 @pytest.mark.parametrize("name", ["oss-regen-on-comment.yml", "oss-regenerate-and-smoke.yml"])

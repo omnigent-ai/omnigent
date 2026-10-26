@@ -23,6 +23,7 @@ from dependabot_policy import (
     action_changes,
     evaluate_changes,
     require,
+    require_refresh_permissions,
 )
 from maintainer_approval import gh_json, latest_decisive_reviews, paginated
 
@@ -64,6 +65,25 @@ def read_file(repository: str, sha: str, path: str) -> str:
 def main_head(repository: str) -> str:
     # A PR's base.sha can lag the live target branch.
     return gh_json(["api", f"repos/{repository}/git/ref/heads/main"])["object"]["sha"]
+
+
+@cache
+def refresh_workflows(repository: str, sha: str) -> dict[str, str]:
+    tree_sha = sha
+    for part in (".github", "workflows"):
+        tree = git_object(repository, "trees", tree_sha)
+        require(not tree.get("truncated"), "Workflow inventory is incomplete")
+        entries = [entry for entry in tree["tree"] if entry["path"] == part]
+        require(len(entries) == 1 and entries[0]["mode"] == "040000", "Missing workflow inventory")
+        tree_sha = entries[0]["sha"]
+    tree = git_object(repository, "trees", tree_sha)
+    require(not tree.get("truncated"), "Workflow inventory is incomplete")
+    paths = [entry["path"] for entry in tree["tree"] if entry["path"].endswith((".yml", ".yaml"))]
+    require(bool(paths), "Missing workflow inventory")
+    return {
+        f".github/workflows/{path}": read_file(repository, sha, f".github/workflows/{path}")
+        for path in paths
+    }
 
 
 def evaluate(
@@ -502,6 +522,15 @@ def refresh_stale_base(repository: str, candidate: dict, mode: str) -> None:
         sum(len(commit["parents"]) > 1 for commit in commits) < 3,
         "Base refresh limit reached; maintainer review required",
     )
+    files = paginated(f"repos/{repository}/pulls/{candidate['number']}/files")
+    require(
+        len(files) == pull["changed_files"] and bool(files), "Incomplete changed-file inventory"
+    )
+    paths = {file["filename"] for file in files}
+    for sha in (candidate["head"], candidate["base"]):
+        require_refresh_permissions(
+            refresh_workflows(repository, sha), paths, pull["head"].get("ref")
+        )
     require_current_candidate(repository, candidate["number"], candidate)
     try:
         subprocess.run(

@@ -9,7 +9,15 @@ from urllib.parse import quote
 import pytest
 import yaml
 
-from tests.scripts.test_dependabot_automerge import BASE, HEAD, PREFIX, run_cli, set_changed_files
+from tests.scripts.test_dependabot_automerge import (
+    BASE,
+    HEAD,
+    PREFIX,
+    ROOT,
+    run_cli,
+    set_changed_files,
+    set_git_files,
+)
 from tests.scripts.test_dependabot_automerge import api as api
 from tests.scripts.test_dependabot_automerge import evaluate_fixture as evaluate_fixture
 from tests.scripts.test_dependabot_automerge import expanded_update as expanded_update
@@ -788,6 +796,11 @@ def test_shared_update_through_worker_checks_executed_consumer_step(
         lock["importers"][consumer] = copy.deepcopy(lock["importers"]["web"])
     api["files"][f"{consumer}/package.json"] = api["files"]["web/package.json"]
     save_locks(api, before, after)
+    if stale:
+        for name in ("web-tests.yml", "security-gate.yml"):
+            path = f".github/workflows/{name}"
+            workflow = (ROOT / path).read_text()
+            api["files"][path] = workflow, workflow
     set_changed_files(api, api["files"])
     jobs = api["routes"]["repos/example/project/actions/runs/16/jobs?per_page=100&page=1"]["jobs"]
     job = next(job for job in jobs if job["name"] == "web test")
@@ -795,6 +808,7 @@ def test_shared_update_through_worker_checks_executed_consumer_step(
         job["steps"] = [{"name": "Test and build workspace consumers", "conclusion": conclusion}]
     if stale:
         tip = "c" * 40
+        set_git_files(api, tip, {path: pair[0] for path, pair in api["files"].items()})
         api["routes"][f"{PREFIX}/git/ref/heads/main"]["object"]["sha"] = tip
         api["routes"][f"{PREFIX}/compare/{tip}...{HEAD}"] = {"merge_base_commit": {"sha": BASE}}
         api["routes"][f"{PREFIX}/pulls/123"]["commits"] = 1

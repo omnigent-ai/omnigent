@@ -45,6 +45,136 @@ def read_yaml(text: str) -> dict:
     return result
 
 
+def refresh_workflow_may_run(workflow: dict, paths: set[str], head_ref: str) -> bool:
+    """Exclude only triggers and path filters whose meaning is unambiguous."""
+    triggers = workflow.get("on", workflow.get(True))
+    if isinstance(triggers, str):
+        triggers = {triggers: None}
+    elif isinstance(triggers, list):
+        require(all(isinstance(event, str) for event in triggers), "Invalid workflow triggers")
+        triggers = dict.fromkeys(triggers)
+    require(isinstance(triggers, dict), "Unknown workflow triggers prevent branch refresh")
+
+    def may_match(patterns, values):
+        if patterns is None:
+            return True
+        require(
+            isinstance(patterns, list) and all(isinstance(p, str) for p in patterns),
+            "Invalid workflow filters",
+        )
+        # Negations and complex globs cannot prove that a workflow will be skipped.
+        for pattern in patterns:
+            if not re.fullmatch(r"[\w./-]+(?:/\*\*)?", pattern):
+                return True
+            if pattern.endswith("/**"):
+                if any(value.startswith(pattern[:-2]) for value in values):
+                    return True
+            elif pattern in values:
+                return True
+        return False
+
+    for event in ("pull_request", "push"):
+        if event not in triggers:
+            continue
+        trigger = triggers[event]
+        if trigger is None:
+            return True
+        require(isinstance(trigger, dict), f"Invalid {event} trigger")
+        if event == "pull_request" and "types" in trigger:
+            types = trigger["types"]
+            require(
+                isinstance(types, list) and all(isinstance(t, str) for t in types),
+                "Invalid PR event types",
+            )
+            if "synchronize" not in types:
+                continue
+        if (
+            event == "push"
+            and set(trigger) & {"tags", "tags-ignore"}
+            and not set(trigger) & {"branches", "branches-ignore"}
+        ):
+            continue
+        branch = head_ref if event == "push" else "main"
+        # A merge push can also contain main's changes, beyond the PR's file list.
+        matches_paths = event == "push" or may_match(trigger.get("paths"), paths)
+        if may_match(trigger.get("branches"), {branch}) and matches_paths:
+            return True
+    return False
+
+
+def require_refresh_permissions(workflows: dict[str, str], paths: set[str], head_ref: str) -> None:
+    """Keep candidate-code PR jobs unprivileged after an App-identity refresh."""
+    parsed = {path: read_yaml(text) for path, text in workflows.items()}
+    require(
+        isinstance(head_ref, str) and bool(head_ref), "Missing PR branch for automatic refresh"
+    )
+
+    def secret_expression(value):
+        if isinstance(value, dict):
+            return any(secret_expression(item) for pair in value.items() for item in pair)
+        if isinstance(value, list):
+            return any(secret_expression(item) for item in value)
+        # Inspect decoded scalars; expressions can contain quoted braces and YAML escapes.
+        return (
+            isinstance(value, str)
+            and "${{" in value
+            and re.search(r"\bsecrets\b", value, re.IGNORECASE) is not None
+        )
+
+    def permissions(value, location, allowed_writes=frozenset()):
+        require(
+            value == "read-all"
+            or (
+                isinstance(value, dict)
+                and all(
+                    isinstance(scope, str)
+                    and isinstance(mode, str)
+                    and (mode in {"read", "none"} or (mode == "write" and scope in allowed_writes))
+                    for scope, mode in value.items()
+                )
+            ),
+            f"{location}: privileged or unknown permissions prevent automatic branch refresh",
+        )
+
+    def inspect(path: str, stack: set[str]) -> None:
+        require(path in parsed and path not in stack, f"{path}: unresolved reusable workflow")
+        workflow = parsed[path]
+        require(
+            not secret_expression(workflow),
+            f"{path}: secret access prevents automatic branch refresh",
+        )
+        permissions(workflow.get("permissions"), path)
+        jobs = workflow.get("jobs")
+        require(isinstance(jobs, dict) and bool(jobs), f"{path}: unknown workflow jobs")
+        for name, job in jobs.items():
+            location = f"{path}:{name}"
+            require(isinstance(job, dict), f"{location}: unknown job definition")
+            require(
+                "environment" not in job and "secrets" not in job,
+                f"{location}: environment or secrets prevent automatic branch refresh",
+            )
+            # Preserve Trivy's existing SARIF upload, without granting code or OIDC writes.
+            writes = (
+                {"security-events"}
+                if (path, name) == (".github/workflows/trivy.yml", "scan")
+                else set()
+            )
+            permissions(job.get("permissions", workflow.get("permissions")), location, writes)
+            if "uses" in job:
+                reusable = job["uses"]
+                require(
+                    isinstance(reusable, str)
+                    and reusable.startswith("./.github/workflows/")
+                    and reusable.removeprefix("./") in parsed,
+                    f"{location}: unresolved reusable workflow",
+                )
+                inspect(reusable.removeprefix("./"), stack | {path})
+
+    for path, workflow in parsed.items():
+        if refresh_workflow_may_run(workflow, paths, head_ref):
+            inspect(path, set())
+
+
 def version(value: str, *, beta: bool = False) -> tuple[int, ...]:
     if beta and (match := re.fullmatch(r"0\.([0-9]+)b([0-9]+)", value)):
         return (0, int(match[1]), -1, int(match[2]))

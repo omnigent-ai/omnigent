@@ -9,6 +9,7 @@ import importlib.util
 import io
 import json
 import os
+import re
 import subprocess
 import sys
 import zipfile
@@ -56,7 +57,7 @@ def api():
         "draft": False,
         "changed_files": 1,
         "user": {"login": "dependabot[bot]", "type": "Bot"},
-        "head": {"sha": HEAD, "repo": {"full_name": REPO}},
+        "head": {"sha": HEAD, "ref": "dependabot/uv/ruff", "repo": {"full_name": REPO}},
         "base": {"sha": BASE, "ref": "main"},
         "labels": [],
     }
@@ -804,6 +805,27 @@ def test_age_uses_registry_timestamp_and_accepts_exact_boundary(policy_module, a
     policy_module.validate_release(package, api["pypi"], 7, datetime(2020, 1, 8, tzinfo=UTC))
 
 
+def set_git_files(api, commit, files):
+    """Serve Git trees and blobs for one revision without changing the PR inventory."""
+    trees = {commit: {}}
+    for path, contents in files.items():
+        parts = path.split("/")
+        tree_id = commit
+        for part in parts[:-1]:
+            child = tree_id + "/" + part
+            trees[tree_id][part] = {"path": part, "mode": "040000", "sha": child}
+            trees.setdefault(child, {})
+            tree_id = child
+        blob_id = commit + "/" + path
+        trees[tree_id][parts[-1]] = {"path": parts[-1], "mode": "100644", "sha": blob_id}
+        api["routes"][f"{PREFIX}/git/blobs/{blob_id}"] = {
+            "encoding": "base64",
+            "content": base64.b64encode(contents.encode()).decode(),
+        }
+    for sha, tree in trees.items():
+        api["routes"][f"{PREFIX}/git/trees/{sha}"] = {"tree": list(tree.values())}
+
+
 def set_changed_files(api, files, *, number=123, head=HEAD):
     """Serve real Git tree/blob shapes for each base/head fixture file."""
     api["files"] = files
@@ -813,23 +835,7 @@ def set_changed_files(api, files, *, number=123, head=HEAD):
         {"filename": path, "status": "modified"} for path in changed
     ]
     for index, commit in enumerate((BASE, head)):
-        trees = {commit: {}}
-        for path, contents in files.items():
-            parts = path.split("/")
-            tree_id = commit
-            for part in parts[:-1]:
-                child = tree_id + "/" + part
-                trees[tree_id][part] = {"path": part, "mode": "040000", "sha": child}
-                trees.setdefault(child, {})
-                tree_id = child
-            blob_id = commit + "/" + path
-            trees[tree_id][parts[-1]] = {"path": parts[-1], "mode": "100644", "sha": blob_id}
-            api["routes"][f"{PREFIX}/git/blobs/{blob_id}"] = {
-                "encoding": "base64",
-                "content": base64.b64encode(contents[index].encode()).decode(),
-            }
-        for sha, tree in trees.items():
-            api["routes"][f"{PREFIX}/git/trees/{sha}"] = {"tree": list(tree.values())}
+        set_git_files(api, commit, {path: contents[index] for path, contents in files.items()})
 
 
 @pytest.fixture
@@ -1953,13 +1959,50 @@ def test_worker_bounds_readiness_dispatch_for_each_head(tmp_path, api, condition
         "approval_pending",
         "approval_unrecoverable",
         "approval_recoverable",
+        "optional_oidc",
+        "reusable_oidc",
+        "main_oidc",
+        "workflow_inventory",
+        "missing_branch",
     ],
 )
 def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
     tip = "c" * 40
+    workflow = {
+        "on": {"pull_request": None},
+        "permissions": {"contents": "read"},
+        "jobs": {"gate": {"uses": "./.github/workflows/security-gate.yml"}},
+    }
+    gate = (ROOT / ".github/workflows/security-gate.yml").read_text()
+    optional = yaml.safe_load((ROOT / ".github/workflows/release-omnigent.yml").read_text())
+    optional["on"] = optional.pop(True)
+    optional["on"]["pull_request"]["paths"] = (
+        ["uv.lock"] if condition == "optional_oidc" else ["release-only.txt"]
+    )
+    if condition == "reusable_oidc":
+        gate = gate.replace("  contents: read", "  contents: read\n  id-token: write", 1)
+    inventory = {
+        "uv.lock": (LOCK, LOCK.replace("0.15.1", "0.15.2")),
+        ".github/workflows/ci.yml": (yaml.safe_dump(workflow), yaml.safe_dump(workflow)),
+        ".github/workflows/security-gate.yml": (gate, gate),
+        ".github/workflows/release-omnigent.yml": (
+            yaml.safe_dump(optional),
+            yaml.safe_dump(optional),
+        ),
+    }
+    set_changed_files(api, inventory)
+    main_files = {path: pair[0] for path, pair in inventory.items()}
+    if condition == "main_oidc":
+        workflow["permissions"]["id-token"] = "write"
+        main_files[".github/workflows/ci.yml"] = yaml.safe_dump(workflow)
+    set_git_files(api, tip, main_files)
+    if condition == "workflow_inventory":
+        api["routes"][f"{PREFIX}/git/trees/{tip}/.github/workflows"]["truncated"] = True
     api["routes"][f"{PREFIX}/git/ref/heads/main"]["object"]["sha"] = tip
     api["routes"][f"{PREFIX}/compare/{tip}...{HEAD}"] = {"merge_base_commit": {"sha": BASE}}
     pull = api["routes"][f"{PREFIX}/pulls/123"]
+    if condition == "missing_branch":
+        del pull["head"]["ref"]
     pull["commits"] = 1
     commits = [{"sha": HEAD, "parents": [{"sha": BASE}]}]
     if condition in {"limit", "two_merges"}:
@@ -2085,11 +2128,165 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
         "report": "CI did not test the current PR head and base",
         "approval_pending": "Waiting for Maintainer Approval",
         "approval_unrecoverable": "Approval refresh retry limit reached",
+        "optional_oidc": "release-omnigent.yml: privileged or unknown permissions",
+        "reusable_oidc": "security-gate.yml: privileged or unknown permissions",
+        "main_oidc": "ci.yml: privileged or unknown permissions",
+        "workflow_inventory": "Workflow inventory is incomplete",
+        "missing_branch": "Missing PR branch",
     }[condition]
     assert reason in process.stdout
     assert "private diagnostic text" not in process.stdout
     if condition in {"two_pages", "limit_two_pages", "incomplete_two_pages"}:
         assert ["api", f"{PREFIX}/pulls/123/commits?per_page=100&page=2"] in calls
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+def test_shared_checkout_refresh_cannot_enable_release_oidc(tmp_path, expanded_update):
+    _, api = expanded_update
+    files = {
+        path: tuple(
+            text.replace("jobs:\n", "permissions: {contents: read}\njobs:\n") for text in pair
+        )
+        for path, pair in api["files"].items()
+    }
+    release = (ROOT / ".github/workflows/release-omnigent.yml").read_text()
+    files[".github/workflows/release-omnigent.yml"] = tuple(
+        re.sub(r"actions/checkout@[a-f0-9]{40}", f"actions/checkout@{pin * 40}", release)
+        for pin in ("1", "2")
+    )
+    set_changed_files(api, files)
+    tip = "c" * 40
+    set_git_files(api, tip, {path: pair[0] for path, pair in files.items()})
+    api["routes"][f"{PREFIX}/git/ref/heads/main"]["object"]["sha"] = tip
+    api["routes"][f"{PREFIX}/compare/{tip}...{HEAD}"] = {"merge_base_commit": {"sha": BASE}}
+    api["routes"][f"{PREFIX}/pulls/123"]["commits"] = 1
+    api["routes"][f"{PREFIX}/pulls/123/commits?per_page=100&page=1"] = [
+        {"sha": HEAD, "parents": [{"sha": BASE}]}
+    ]
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert "eligible (actions/checkout==4.2.0)" in process.stdout
+    assert "release-omnigent.yml: privileged or unknown permissions" in process.stdout
+    assert not any(call[:3] == ["api", "--method", "PUT"] for call in calls)
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+
+
+@pytest.mark.parametrize(
+    "fault",
+    [
+        None,
+        "read_all",
+        "job_write",
+        "sarif_oidc",
+        "write_all",
+        "missing_permissions",
+        "environment",
+        "secrets",
+        "secret_context",
+        "secret_case",
+        "secret_object",
+        "secret_format",
+        "secret_quoted_braces",
+        "secret_yaml_escape",
+        "remote_reusable",
+        "missing_reusable",
+        "nested_reusable",
+        "cycle",
+        "invalid_permissions",
+    ],
+)
+def test_refresh_permissions_follow_optional_and_reusable_jobs(policy_module, fault):
+    path = (
+        ".github/workflows/trivy.yml"
+        if fault == "sarif_oidc"
+        else ".github/workflows/optional.yml"
+    )
+    reusable = ".github/workflows/reusable.yml"
+    workflow = {
+        "on": "pull_request",
+        "permissions": {"contents": "read"},
+        "jobs": {"scan": {"runs-on": "ubuntu-latest", "steps": [{"run": "true"}]}},
+    }
+    job = workflow["jobs"]["scan"]
+    definitions = {path: workflow}
+    if fault == "read_all":
+        workflow["permissions"] = "read-all"
+    elif fault == "job_write":
+        job["permissions"] = {"id-token": "write"}
+    elif fault == "sarif_oidc":
+        job["permissions"] = {"security-events": "write", "id-token": "write"}
+    elif fault == "write_all":
+        workflow["permissions"] = "write-all"
+    elif fault == "missing_permissions":
+        del workflow["permissions"]
+    elif fault == "environment":
+        job["environment"] = "test-pypi"
+    elif fault == "secrets":
+        job["secrets"] = "inherit"
+    elif fault == "secret_context":
+        workflow["env"] = {"CREDENTIAL": "${{ secrets['CREDENTIAL'] }}"}
+    elif fault == "secret_case":
+        workflow["env"] = {"CREDENTIAL": "${{ SeCrEtS.CREDENTIAL }}"}
+    elif fault == "secret_object":
+        workflow["env"] = {"CREDENTIALS": "${{ toJSON(secrets) }}"}
+    elif fault == "secret_format":
+        workflow["env"] = {"CREDENTIAL": "${{ format('{0}', secrets.CREDENTIAL) }}"}
+    elif fault == "secret_quoted_braces":
+        workflow["env"] = {"CREDENTIAL": "${{ format('}} {0}', secrets.CREDENTIAL) }}"}
+    elif fault == "invalid_permissions":
+        job["permissions"] = {"contents": {"unknown": "read"}}
+    elif fault in {"remote_reusable", "missing_reusable", "nested_reusable", "cycle"}:
+        workflow["jobs"] = {"call": {"uses": "./" + reusable}}
+        if fault == "remote_reusable":
+            workflow["jobs"]["call"]["uses"] = "example/project/.github/workflows/build.yml@main"
+        elif fault != "missing_reusable":
+            definitions[reusable] = {
+                "on": "workflow_call",
+                "permissions": {"contents": "read"},
+                "jobs": {"nested": {"uses": "./" + path}}
+                if fault == "cycle"
+                else {
+                    "nested": {"runs-on": "ubuntu-latest", "permissions": {"id-token": "write"}}
+                },
+            }
+    texts = {name: yaml.safe_dump(value) for name, value in definitions.items()}
+    if fault == "secret_yaml_escape":
+        texts[path] += 'env: {CREDENTIAL: "${{ \\x73ecrets.CREDENTIAL }}"}\n'
+    if fault in {None, "read_all"}:
+        policy_module.require_refresh_permissions(texts, {"uv.lock"}, "dependabot/uv/ruff")
+    else:
+        reason = "secret access" if fault.startswith("secret_") else None
+        with pytest.raises(policy_module.NeedsReview, match=reason):
+            policy_module.require_refresh_permissions(texts, {"uv.lock"}, "dependabot/uv/ruff")
+
+
+@pytest.mark.parametrize(
+    "trigger,paths,expected",
+    [
+        ({"pull_request": None}, {"uv.lock"}, True),
+        ({"pull_request": {"types": ["labeled"]}}, {"uv.lock"}, False),
+        ({"pull_request": {"paths": ["release.yml"]}}, {"uv.lock"}, False),
+        ({"pull_request": {"paths": ["web/**"]}}, {"web/package.json"}, True),
+        ({"pull_request": {"paths": ["web/**"]}}, {"uv.lock"}, False),
+        ({"pull_request": {"paths": ["**/*.yml"]}}, {"uv.lock"}, True),
+        ({"pull_request": {"paths": ["!uv.lock"]}}, {"uv.lock"}, True),
+        ({"pull_request": {"paths-ignore": ["uv.lock"]}}, {"uv.lock"}, True),
+        ({"push": None}, {"uv.lock"}, True),
+        ({"push": {"branches": ["main"]}}, {"uv.lock"}, False),
+        ({"push": {"branches": ["dependabot/**"]}}, {"uv.lock"}, True),
+        ({"push": {"tags": ["v*"]}}, {"uv.lock"}, False),
+        ({"push": {"paths": ["release.yml"]}}, {"uv.lock"}, True),
+        ({"pull_request": {"types": ["labeled"]}, "push": None}, {"uv.lock"}, True),
+        ({"workflow_call": None}, {"uv.lock"}, False),
+    ],
+)
+def test_refresh_triggers_exclude_only_proven_inactive_workflows(
+    policy_module, trigger, paths, expected
+):
+    assert (
+        policy_module.refresh_workflow_may_run({"on": trigger}, paths, "dependabot/uv/ruff")
+        is expected
+    )
 
 
 @pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)

@@ -165,11 +165,23 @@ review objections, conflicts and moved heads block recovery. API failures report
 bounded context. Report mode never updates or merges.
 
 Updates use the GitHub App identity, so subsequent events may receive ordinary
-same-repository token/secrets treatment. A config contract protects the required
-compatibility workflows: no repository secrets or code/release write permissions,
-with Trivy's existing SARIF upload permission retained. Optional preview/review
-workflows keep their own gates. Dependabot may stop rebasing after another identity
-updates its branch; conflicts can need a maintainer's `@dependabot recreate`.
+same-repository token/secrets treatment. Before updating, the worker inventories
+workflow files at both the assessed PR head and current main. Every potentially
+triggered `pull_request` synchronization or branch-push workflow, including optional
+workflows and local reusable calls, must declare read-only permissions and have no
+secret access or environment binding. Trivy retains only its existing SARIF upload
+exception. Remote, missing or cyclic reusable calls and incomplete inventories
+require manual refresh. Job conditions do not waive these checks.
+
+Only literal branch/path filters and simple directory prefixes can prove a workflow
+will not run; complex globs, negations and ignore filters are treated conservatively.
+A merge push can contain main's changes too, so PR paths cannot exclude push workflows.
+Ordinary package updates can still refresh. An Action update touching the current
+release workflow cannot: its PR job requests OIDC and binds `test-pypi`, even though
+its publish steps are skipped. Existing trusted-base preview/review workflows retain
+their own gates; this worker changes neither their definitions nor repository settings.
+Dependabot may stop rebasing after another identity updates its branch; conflicts
+can need a maintainer's `@dependabot recreate`.
 DCO skips merge commits; observe it and App-triggered CI on the first live refresh.
 
 After landing, inspect the worker summary and observe a qualifying update through
