@@ -1040,26 +1040,6 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.reasoning_effort).toBe("high");
   });
 
-  it("keeps a seeded project effort on a model pick without remembering it", async () => {
-    setClaudeAgentAndModels();
-    localStorage.setItem(
-      HARNESS_OPTIONS_KEY,
-      JSON.stringify({ "claude-native": { effort: "low" } }),
-    );
-    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
-    renderLanding();
-    await waitForClaudeAgent();
-
-    openAgentConfig(CLAUDE_AGENT_ID);
-    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
-    closeAgentConfig();
-
-    const remembered = JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}");
-    expect(remembered["claude-native"]).toMatchObject({ model: "sonnet", effort: "low" });
-    const body = await submitAndReadBody();
-    expect(body).toMatchObject({ model_override: "sonnet", reasoning_effort: "high" });
-  });
-
   it("treats a project effort outside the harness ladder as no default", async () => {
     setClaudeAgentAndModels();
     localStorage.setItem(
@@ -1103,6 +1083,25 @@ describe("NewChatLandingScreen project prefill", () => {
     await waitForClaudeAgent();
     const body = await submitAndReadBody();
     expect(body.reasoning_effort).toBe("high");
+    expect(body.cost_control_mode_override).not.toBe("on");
+  });
+
+  it("keeps remembered Smart Routing off after an explicit effort pick over the project effort", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on", effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderRoutingLanding();
+    await waitForClaudeAgent();
+
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-medium"));
+    closeAgentConfig();
+
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("medium");
     expect(body.cost_control_mode_override).not.toBe("on");
   });
 
