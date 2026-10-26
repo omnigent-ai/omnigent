@@ -29,7 +29,10 @@ and steers messages while the agent is busy.
   and a launching or failed sandbox with its stage; before launch also a
   selected sandbox and connecting.
 - `model-picker`: lists the host's live model catalog, highlights the current
-  model, and keeps the selection. Ctrl+Shift+M opens it in both composers.
+  model, and keeps the selection. Long catalogs scroll inside a compact menu
+  capped at 40% of viewport height, between 20rem and 36rem, and never taller
+  than the available space.
+  Ctrl+Shift+M opens it in both composers.
   States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model),
   a managed sandbox launching before its host is bound (its provider's default catalog).

@@ -32,6 +32,7 @@ import {
   harnessInstallableOnHost,
   harnessReadinessOnHost,
   harnessWarningBadgeText,
+  missingHarnessCredentialCopy,
   type HarnessCredentialKind,
 } from "@/lib/harnessSetup";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
@@ -582,6 +583,7 @@ function HarnessDetail({
   onFix: (mode: HarnessFixMode) => void;
 }) {
   const status = harnessStatus(entry.harness, host);
+  const credentialProblem = isCredentialProblem(status.reason);
   const mode = fixMode(status.reason);
   const canFix = canSetup && !!host && !host.sandbox_provider;
   const gateway = host?.gateway_inference?.[entry.harness] === true;
@@ -614,23 +616,27 @@ function HarnessDetail({
   );
   const credentialCard = (
     <CredentialCard
-      label={credential.label}
-      description={credential.description}
+      label={credentialProblem ? "Not signed in" : credential.label}
+      description={
+        credentialProblem && host
+          ? missingHarnessCredentialCopy(entry.harness, entry.name, host.name)
+          : credential.description
+      }
       ready={status.ready}
-      actionable={status.needsSetup && canFix}
+      warning={credentialProblem}
       showStatus={canSetup}
       statusLabel={
         status.reason === "binary-missing" || status.reason === "unconfigured"
           ? reconfigurationReason(status.reason)
           : "Needs reconfiguration"
       }
-      onClick={() => onFix(mode)}
+      onReconfigure={credentialProblem && canFix ? () => onFix(mode) : undefined}
     />
   );
   const settings = host ? (
     <div className="flex flex-col gap-6">
       {readyNotice && <ReadyNotice entry={entry} host={host} version={readyNotice.version} />}
-      {status.needsSetup && (
+      {status.needsSetup && !credentialProblem && (
         <HarnessWarning
           entry={entry}
           host={host}
@@ -673,14 +679,16 @@ function HarnessDetail({
           </>
         ) : canFix ? (
           <>
-            <HarnessWarning
-              entry={entry}
-              host={host}
-              mode={mode}
-              reason={status.reason}
-              installable={installable}
-              onFix={onFix}
-            />
+            {!credentialProblem && (
+              <HarnessWarning
+                entry={entry}
+                host={host}
+                mode={mode}
+                reason={status.reason}
+                installable={installable}
+                onFix={onFix}
+              />
+            )}
             {credentialCard}
             <StartupSettings host={host} harness={entry.harness} />
           </>
@@ -698,6 +706,10 @@ function fixMode(reason: string | null): HarnessFixMode {
   if (reason === "version-too-low") return "update";
   if (reason === "binary-missing" || reason === "unconfigured") return "install";
   return "reconfigure";
+}
+
+function isCredentialProblem(reason: string | null): boolean {
+  return reason === "needs-auth";
 }
 
 function MachineField({ host }: { host: Host }) {
@@ -729,11 +741,9 @@ function HarnessWarning({
   const copy =
     reason === "readiness-error"
       ? `${entry.name} isn’t working on ${host.name}. Run setup again to fix it.`
-      : mode === "reconfigure"
-        ? `${entry.name} can’t sign in on ${host.name}. Its credential is missing, so new sessions can’t use ${entry.name}.`
-        : mode === "update"
-          ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
-          : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
+      : mode === "update"
+        ? `${entry.name} is out of date on ${host.name}. Update it so new sessions can use ${entry.name}.`
+        : `${entry.name} isn’t set up on ${host.name}, so new sessions can’t use ${entry.name}.`;
   const action = !installable
     ? "Set up"
     : mode === "update"
@@ -887,29 +897,43 @@ function CredentialCard({
   label,
   description,
   ready,
-  actionable,
+  warning,
   showStatus,
   statusLabel,
-  onClick,
+  onReconfigure,
 }: {
   label: string;
   description: string;
   ready: boolean;
-  actionable: boolean;
+  warning: boolean;
   showStatus: boolean;
   statusLabel: string;
-  onClick: () => void;
+  onReconfigure?: () => void;
 }) {
   const body = (
     <>
-      <span className="flex size-8 shrink-0 items-center justify-center rounded-lg bg-muted">
-        <KeyRoundIcon className="size-4 text-muted-foreground" />
+      <span
+        className={cn(
+          "flex size-8 shrink-0 items-center justify-center rounded-lg",
+          warning ? "bg-amber-500/15" : "bg-muted",
+        )}
+      >
+        <KeyRoundIcon
+          className={cn(
+            "size-4",
+            warning ? "text-amber-600 dark:text-amber-500" : "text-muted-foreground",
+          )}
+        />
       </span>
       <span className="flex min-w-0 flex-1 flex-col text-left">
         <span className="text-ui font-medium">{label}</span>
         <span className="text-xs text-muted-foreground">{description}</span>
       </span>
-      {showStatus && (
+      {onReconfigure ? (
+        <span className="inline-flex h-7 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-primary px-2.5 text-ui text-primary-foreground">
+          Reconfigure
+        </span>
+      ) : showStatus ? (
         <span
           className={cn(
             "text-xs",
@@ -918,7 +942,7 @@ function CredentialCard({
         >
           {ready ? "Configured" : statusLabel}
         </span>
-      )}
+      ) : null}
     </>
   );
   return (
@@ -926,17 +950,24 @@ function CredentialCard({
       <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
         Credential
       </h2>
-      {actionable ? (
+      {onReconfigure ? (
         <button
           type="button"
-          aria-label="Reconfigure credential"
-          className="flex w-full items-center gap-3 rounded-xl border border-border p-3 transition-colors hover:bg-muted/50 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
-          onClick={onClick}
+          aria-label="Reconfigure"
+          className="flex w-full cursor-pointer items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-left transition-colors hover:bg-amber-500/15 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
+          onClick={onReconfigure}
         >
           {body}
         </button>
       ) : (
-        <div className="flex items-center gap-3 rounded-xl border border-border p-3">{body}</div>
+        <div
+          className={cn(
+            "flex items-center gap-3 rounded-xl border p-3",
+            warning ? "border-amber-500/30 bg-amber-500/10" : "border-border",
+          )}
+        >
+          {body}
+        </div>
       )}
     </section>
   );

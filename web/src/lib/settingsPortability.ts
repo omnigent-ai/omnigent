@@ -8,6 +8,7 @@
 
 import { DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY } from "./archiveWorktreePreferences";
 import { COMPOSER_SEND_SHORTCUT_STORAGE_KEY } from "./composerSendShortcutPreferences";
+import { FOLD_ASSISTANT_NARRATION_STORAGE_KEY } from "./foldNarrationPreferences";
 import {
   resetSessionWorkspaceTabSelections,
   unpinSessionWorkspaceTabs,
@@ -33,6 +34,7 @@ const EXPORTABLE_KEYS = [
   PINNED_WORKSPACE_TABS_STORAGE_KEY,
   "omnigent:default-transcript-view",
   "omnigent:hide-unconfigured-harnesses",
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
   "omnigent:default-base-branch",
   "omnigent:always-use-worktree",
   DELETE_WORKTREES_ON_ARCHIVE_STORAGE_KEY,

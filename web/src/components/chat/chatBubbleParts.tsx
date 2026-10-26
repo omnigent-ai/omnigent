@@ -85,6 +85,7 @@ import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
 import type { SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
@@ -999,6 +1000,7 @@ function AssistantBubble({
   );
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
+  const foldNarration = useFoldAssistantNarration();
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
   const queryClient = useContext(QueryClientContext);
@@ -1063,6 +1065,7 @@ function AssistantBubble({
     hasPendingElicitation,
     showsWorking,
     defaultExpanded: bubble.defaultExpanded,
+    foldNarration,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -1111,6 +1114,7 @@ function AssistantBubble({
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
             defaultExpanded={bubble.defaultExpanded}
+            foldNarration={foldNarration}
             onRetryError={recoveryDisabled ? undefined : handleRetryError}
           />
         </MessageContent>

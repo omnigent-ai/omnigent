@@ -3643,6 +3643,8 @@ async def _enrich_terminal_status_with_subagent_output(
     over the store for failures; fallback text must belong to the current
     response or follow the latest user message when no response id is present.
     A turn stopped before any output must not borrow an earlier turn's reply.
+    Explicit confirmed output, including an empty string, is authoritative
+    for native and ACP callers.
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
@@ -3671,6 +3673,8 @@ async def _enrich_terminal_status_with_subagent_output(
         context.setdefault("detail_source", "external_status_failure_detail")
         return {**data, "output": failure_detail.strip()}
     existing = data.get("output")
+    if status == "idle" and data.get("turn_completed") is True and isinstance(existing, str):
+        return data
     if current_turn_only and isinstance(existing, str) and existing.strip():
         if status == "failed":
             context.setdefault("detail_source", "external_status_output")

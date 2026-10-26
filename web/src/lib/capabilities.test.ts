@@ -187,6 +187,16 @@ describe("resolveServerInfo release features", () => {
   });
 });
 
+describe("resolveServerInfo session_search_scope", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ session_search_scope: true })).session_search_scope).toBe(true);
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).session_search_scope).toBe(false);
+  });
+});
+
 describe("resolveServerInfo archive_worktree_cleanup", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ archive_worktree_cleanup: true })).archive_worktree_cleanup).toBe(true);

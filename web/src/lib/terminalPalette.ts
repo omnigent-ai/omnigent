@@ -11,6 +11,7 @@ const TERMINAL_COLORS = {
     mutedForeground: "#71717a",
     border: "#e4e4e7",
     destructive: "#c8324c",
+    selection: "#0891b233",
   },
   dark: {
     background: "#131517",
@@ -19,11 +20,16 @@ const TERMINAL_COLORS = {
     mutedForeground: "#a1a1aa",
     border: "#27272a",
     destructive: "#e65b77",
+    selection: "#22d3ee33",
   },
 } as const;
 
-/** The terminal's background and text colors in the given scheme. */
-export function terminalSurfaceColors(isDark: boolean): { background: string; foreground: string } {
+/** The terminal's background, text and selection colors in the given scheme. */
+export function terminalSurfaceColors(isDark: boolean): {
+  background: string;
+  foreground: string;
+  selection: string;
+} {
   return isDark ? TERMINAL_COLORS.dark : TERMINAL_COLORS.light;
 }
 
@@ -42,5 +48,9 @@ export function terminalSurfaceStyle(isDark: boolean): CSSProperties {
     "--muted-foreground": colors.mutedForeground,
     "--border": colors.border,
     "--destructive": colors.destructive,
+    // The app theme's selection colors are tuned for the app's scheme and can
+    // vanish against the other one.
+    "--selection-background": colors.selection,
+    "--selection-foreground": colors.foreground,
   } as CSSProperties;
 }

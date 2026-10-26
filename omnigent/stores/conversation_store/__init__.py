@@ -174,6 +174,9 @@ def pinned_label_key(user_id: str | None) -> str:
 # match that fallback's unit.
 ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 
+# Server-owned origin, retained when a schedule's run history is deleted.
+SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -833,6 +836,7 @@ class ConversationStore(ABC):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        search_scope: str = "all",
         accessible_by: str | None = None,
         owned_by: str | None = None,
         shared_only: bool = False,
@@ -916,6 +920,12 @@ class ConversationStore(ABC):
             contains the query OR any of its items' search text
             does. Powers the sidebar's session search on
             ``GET /v1/sessions?search_query=...``.
+        :param search_scope: Which ``search_query`` matches to return:
+            ``"all"`` (title or content, the default), ``"title"``
+            (title matches only), or ``"content"`` (content matches
+            whose title does not match). ``"title"`` and ``"content"``
+            never overlap, so a search UI can list them as two groups.
+            Ignored when ``search_query`` is empty.
         :param accessible_by: When set, filter to sessions the
             user has a direct grant on in ``session_permissions``.
             Public (``"__public__"``) grants are deliberately NOT

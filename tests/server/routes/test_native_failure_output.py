@@ -222,3 +222,11 @@ async def test_idle_enrichment_retains_its_existing_behavior() -> None:
         ],
     )
     assert result["output"] == "Completed output"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("output", ["This turn's result", ""])
+async def test_confirmed_turn_output_is_not_replaced_by_other_turns(output: str) -> None:
+    data = {"status": "idle", "turn_completed": True, "output": output}
+    result = await _enrich(data, [_message("assistant", "Another turn's result", "resp_other")])
+    assert result == data

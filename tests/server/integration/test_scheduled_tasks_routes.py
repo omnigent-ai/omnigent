@@ -36,7 +36,7 @@ from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
 )
 from tests.server.conftest import ControllableMockClient
 
-pytestmark = pytest.mark.asyncio
+pytestmark = [pytest.mark.asyncio, pytest.mark.usefixtures("frozen_recurrence_clock")]
 
 
 @pytest.fixture(autouse=True)

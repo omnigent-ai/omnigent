@@ -14,6 +14,8 @@ import pytest
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
+pytestmark = pytest.mark.usefixtures("frozen_recurrence_clock")
+
 
 # scheduled_tasks.id / scheduled_task_runs.id / scheduled_task_id are Uuid16
 # columns (16 raw bytes), read back as bare 32-char hex strings. ``_uid`` maps a

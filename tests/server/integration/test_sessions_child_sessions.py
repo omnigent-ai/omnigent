@@ -23,6 +23,7 @@ import io
 import json
 import re
 import tarfile
+import threading
 from dataclasses import dataclass
 from typing import Any, NoReturn
 
@@ -32,6 +33,7 @@ import yaml
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
+from omnigent.runtime import session_stream
 from omnigent.server.routes import sessions as sessions_module
 from omnigent.server.routes.sessions import routes_events as routes_events_module
 from omnigent.stores.conversation_store.sqlalchemy_store import (
@@ -361,6 +363,91 @@ async def test_parent_session_snapshot_replays_child_pending_elicitation(
     assert prompts[0]["elicitation_id"] == "elicit_child_q1"
     assert prompts[0]["params"]["message"] == "Approve child command"
     assert prompts[0]["params"]["target_session_id"] == child.id
+
+
+async def test_late_ancestor_mirror_keeps_child_current_elicitation(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A mirror that ran late on its thread must not revert or revive the parent card."""
+    from omnigent.runtime import pending_elicitations
+
+    session = await _create_parent_session(client, agent_name="late-ancestor-mirror")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="kiro:approval",
+        agent_id=session["agent_id"],
+    )
+
+    def request(state: str) -> dict[str, Any]:
+        return {
+            "type": "response.elicitation_request",
+            "elicitation_id": "elicit_child_q1",
+            "params": {"mode": "form", "message": "Approve", "native_delivery": {"state": state}},
+        }
+
+    pending_elicitations.record_publish(child.id, request("ready"))
+    pending_elicitations.record_publish(child.id, request("sending"))
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("sending")
+    )
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    _, mirrored = pending_elicitations.lookup("elicit_child_q1", conversation_id=session["id"])
+    assert mirrored["params"]["native_delivery"] == {"state": "sending"}
+    assert mirrored["params"]["target_session_id"] == child.id
+
+    pending_elicitations.resolve(child.id, "elicit_child_q1")
+    sessions_module._publish_elicitation_resolved_to_ancestors(
+        conv_store, child.id, "elicit_child_q1"
+    )
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    assert pending_elicitations.count_for(session["id"]) == 0
+
+    # A late resolved mirror must not clear a card the child asked again.
+    pending_elicitations.record_publish(child.id, request("ready"))
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    sessions_module._publish_elicitation_resolved_to_ancestors(
+        conv_store, child.id, "elicit_child_q1"
+    )
+    assert pending_elicitations.count_for(session["id"]) == 1
+
+    # A resolution that lands while a request mirror is publishing still wins.
+    original_publish = session_stream.publish
+    entered, release = threading.Event(), threading.Event()
+
+    def paused_publish(conversation_id: str, event: dict[str, Any]) -> int:
+        if conversation_id == session["id"] and event["type"] == "response.elicitation_request":
+            entered.set()
+            assert release.wait(5)
+        return original_publish(conversation_id, event)
+
+    monkeypatch.setattr(session_stream, "publish", paused_publish)
+    request_mirror = threading.Thread(
+        target=sessions_module._publish_elicitation_request_to_ancestors,
+        args=(conv_store, child.id, request("ready")),
+    )
+    request_mirror.start()
+    assert entered.wait(5)
+    pending_elicitations.resolve(child.id, "elicit_child_q1")
+    resolved_mirror = threading.Thread(
+        target=sessions_module._publish_elicitation_resolved_to_ancestors,
+        args=(conv_store, child.id, "elicit_child_q1"),
+    )
+    resolved_mirror.start()
+    resolved_mirror.join(0.2)
+    release.set()
+    request_mirror.join(5)
+    resolved_mirror.join(5)
+    assert pending_elicitations.count_for(session["id"]) == 0
 
 
 async def test_child_sessions_zero_pending_when_index_empty(

@@ -5974,6 +5974,11 @@
             "title": "Server Version",
             "type": "string"
           },
+          "session_search_scope": {
+            "default": true,
+            "title": "Session Search Scope",
+            "type": "boolean"
+          },
           "sharing_mode": {
             "enum": [
               "on",
@@ -13199,6 +13204,18 @@
                 }
               ],
               "title": "Search Query"
+            }
+          },
+          {
+            "description": "Which `search_query` matches to return. `\"all\"` (default) returns title or content matches. `\"title\"` returns only title matches. `\"content\"` returns content matches whose title does not match; `title` and `content` never overlap. Ignored without a `search_query`.",
+            "in": "query",
+            "name": "search_scope",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|title|content)$",
+              "title": "Search Scope",
+              "type": "string"
             }
           },
           {

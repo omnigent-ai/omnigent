@@ -13,8 +13,8 @@
 //    routing/fan-out cards never fold regardless of position.
 //
 // 2. Turn folding: once settled, each work run collapses behind a
-//    "Worked" row. Assistant messages remain visible in order;
-//    pending elicitations and routing cards stay visible too.
+//    "Worked" row. Pending elicitations, routing cards and assistant
+//    messages stay visible (all but the last with opt-in `foldNarration`).
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -106,6 +106,8 @@ interface BlockRendererProps {
   showsWorking?: boolean;
   /** Start a fold containing a mid-turn user interjection open. */
   defaultExpanded?: boolean;
+  /** Opt-in: fold all but the turn's last assistant message with the work. */
+  foldNarration?: boolean;
 }
 
 /** The subset of {@link BlockRendererProps} the fold decision reads. */
@@ -119,6 +121,7 @@ type FoldInputs = Pick<
   | "hasPendingElicitation"
   | "showsWorking"
   | "defaultExpanded"
+  | "foldNarration"
 >;
 
 /**
@@ -136,7 +139,7 @@ function turnLiveness({
   isLastAssistant = false,
   hasPendingElicitation = false,
   showsWorking = false,
-}: Omit<FoldInputs, "items" | "continued">): {
+}: Omit<FoldInputs, "items" | "continued" | "foldNarration">): {
   isOwnTurnLive: boolean;
   possiblyLive: boolean;
   isTurnLive: boolean;
@@ -148,6 +151,24 @@ function turnLiveness({
   return { isOwnTurnLive, possiblyLive, isTurnLive: isOwnTurnLive || possiblyLive };
 }
 
+function isFailureItem(item: RenderItem | undefined): boolean {
+  return item?.kind === "error" || item?.kind === "retry" || item?.kind === "policy_denied";
+}
+
+/** Narration folds only in a turn that finished cleanly; otherwise it explains the outcome. */
+function foldsNarration({
+  items,
+  turnLifecycle,
+  foldNarration = false,
+}: Pick<FoldInputs, "items" | "turnLifecycle" | "foldNarration">): boolean {
+  return (
+    foldNarration &&
+    (turnLifecycle === undefined || turnLifecycle === "completed") &&
+    // A retry that later succeeded stays in the transcript; a trailing one blocks any fold.
+    !items.some((item) => item.kind === "error" || item.kind === "policy_denied")
+  );
+}
+
 /** Work folds after an assistant message or in a tool-bearing continuation. */
 function hasFoldableShape(
   items: RenderItem[],
@@ -156,13 +177,7 @@ function hasFoldableShape(
 ): boolean {
   const lastItem = items.findLast((item) => !isTrailingWrapup(item));
   // A terminal failure or denial must stay visible beside the assistant text.
-  if (
-    lastItem?.kind === "error" ||
-    lastItem?.kind === "retry" ||
-    lastItem?.kind === "policy_denied"
-  ) {
-    return false;
-  }
+  if (isFailureItem(lastItem)) return false;
   return (
     !isProvisionalTrace(items) &&
     segments.some((segment) => segment.kind === "work") &&
@@ -177,7 +192,7 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
-  const partition = partitionTurn(inputs.items);
+  const partition = partitionTurn(inputs.items, foldsNarration(inputs));
   return (
     hasFoldableShape(inputs.items, partition, inputs.continued) &&
     partition.segments.every((segment) => segment.kind === "work")
@@ -206,6 +221,7 @@ export function BlockRenderer({
   lastActivityAtS,
   showsWorking = false,
   defaultExpanded = false,
+  foldNarration = false,
   onRetryError,
 }: BlockRendererProps) {
   const { isOwnTurnLive, possiblyLive, isTurnLive } = turnLiveness({
@@ -217,8 +233,9 @@ export function BlockRenderer({
   });
 
   // A native assistant message has no reliable final-answer marker.
-  // Keep each message visible even when a later tool call follows it.
-  const partition = partitionTurn(items);
+  // Keep each message visible even when a later tool call follows it,
+  // unless the user opted into folding all but the last message.
+  const partition = partitionTurn(items, foldsNarration({ items, turnLifecycle, foldNarration }));
   const workRunCount = partition.segments.filter((segment) => segment.kind === "work").length;
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
@@ -435,15 +452,20 @@ function isTrailingWrapup(item: RenderItem): boolean {
 
 /**
  * Split work from assistant text while preserving order. Text lacks a
- * reliable final-answer marker, so every completed message stays visible.
+ * reliable final-answer marker, so every completed message stays visible
+ * unless `foldNarration` asks to keep only the last one.
  */
-function partitionTurn(items: RenderItem[]): TurnPartition {
+function partitionTurn(items: RenderItem[], foldNarration = false): TurnPartition {
   let end = items.length;
   const wrapup: RenderItem[] = [];
   while (end > 0 && isTrailingWrapup(items[end - 1]!)) {
     wrapup.unshift(items[end - 1]!);
     end -= 1;
   }
+  // Keep the last non-blank message visible, even in a continued bubble.
+  const answerIndex = foldNarration
+    ? items.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
+    : -1;
   const segments: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
     const item = items[i]!;
@@ -456,7 +478,8 @@ function partitionTurn(items: RenderItem[]): TurnPartition {
       segments.push({ kind: "exempt", item, index: i });
       continue;
     }
-    const kind = item.kind === "text" ? "text" : "work";
+    // Blank text after the answer stays with it rather than opening a second fold.
+    const kind = item.kind === "text" && (answerIndex < 0 || i >= answerIndex) ? "text" : "work";
     const previous = segments[segments.length - 1];
     if (previous?.kind === kind) previous.items.push(item);
     else segments.push({ kind, items: [item], startIndex: i });

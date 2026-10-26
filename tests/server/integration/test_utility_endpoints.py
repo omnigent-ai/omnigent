@@ -108,6 +108,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["installable_harnesses"] == []
     # Gates the web's archive worktree prompt; older servers omit it.
     assert data["archive_worktree_cleanup"] is True
+    # Gates the palette's grouped session search; older servers omit it.
+    assert data["session_search_scope"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's

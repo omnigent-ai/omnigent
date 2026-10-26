@@ -211,6 +211,63 @@ controls are separate.
 The store supports PostgreSQL, MySQL, CockroachDB, and SQLite. Cloudflare D1 cannot
 provide the transaction needed to create a run and advance its schedule together.
 
+## Debug-log events
+
+The scheduler writes structured events with `debug_event`, like the rest of the
+server. When the debug-log sink is enabled, they reach the same table as session
+lifecycle events, so dashboards compute scheduler KPIs with SQL. Claims, sessions,
+startup outcomes (including failures), and recovery results are logged at INFO; only
+operation failures, recovery timeouts, and recovery errors are WARNING or higher.
+The metrics therefore need an INFO log level. Every run event includes `task_id`,
+`run_id`, `task_workspace_id`, and `scheduled_at`; `claim_skipped` is an occurrence
+event with no `run_id`. Once a session exists, the row's `session_id` links the run
+to its session events.
+
+| Event | Logged when | Extra attributes |
+| --- | --- | --- |
+| `scheduled_run_claimed` | This server claimed a due occurrence. | `target`, `host_id`, `claim_delay_seconds` |
+| `scheduled_run_claim_skipped` | The claim did not apply: the occurrence was already claimed, or the task was edited, paused, or deleted after it was listed. | `target` (no run) |
+| `scheduled_run_session_attached` | The executor recorded the fired session with `lease.attach_session()`, or changed it. | `target`, `session_delay_seconds` |
+| `scheduled_run_startup_ended` | Startup ended on the executing server. | `target`, `outcome`, `error_code`, `prompt_delay_seconds` |
+| `scheduled_run_recovered` | Recovery inspected an expired startup. | `outcome` |
+| `scheduled_task_operation_failed` | An operation failed and will be retried. | `operation` |
+
+`startup_ended` outcomes are `running`, `failed`, or `skipped` from the executor, or
+`lease_lost`, `interrupted`, `unfinished`, or `cancelled` when startup ended without
+a result. Recovery outcomes are `running`, `failed`, `uncertain`, `superseded` (the
+run was no longer the expired startup recovery inspected), `timeout`, or `error`.
+Operations are `poll`, `initialize`, `claim`, `recovery`, `cleanup`, and
+`lease_renewal`. `claim` failures and single-task `initialize` failures include
+`task_id` and `task_workspace_id`; a failed scan has neither. Delays are seconds
+from the scheduled time to when the scheduler was asked to record the step, so
+database write time is excluded.
+
+Outcomes are logged when the database write commits, so a write that finishes
+after its caller was cancelled or timed out still logs its real result. A run can
+therefore log `timeout` and later `running` or `error`. Recovery logs `uncertain`
+on every sweep that cannot decide, so expect several per run.
+
+During shutdown the scheduler does not wait for in-flight writes, so a run whose
+`running` write committed then may never log `running`, slightly understating fire
+success. A startup cancelled before its first step logs no `startup_ended`;
+recovery logs it later.
+
+The sink stores attribute values as strings; cast delays before computing
+percentiles. Attributes whose value is `None`, such as `error_code` or
+`prompt_delay_seconds` on a non-`running` outcome, are omitted rather than stored.
+
+The design's success metrics come from these events:
+
+| Success metric | Calculation |
+| --- | --- |
+| Fire success rate | Distinct `run_id`s whose `startup_ended` or `recovered` outcome is `running` ÷ distinct claimed `run_id`s, excluding runs the executor ended as `skipped`. Occurrences missed during downtime are never claimed. |
+| Duplicate fires | Claimed `run_id`s per `(task_workspace_id, task_id, scheduled_at)`. The database's unique key keeps this at one, so the query only confirms that constraint holds. `claim_skipped` also counts edited, paused, and deleted tasks, so it is not a duplicate count. |
+| Fire delay | p90 of `session_delay_seconds`. The executor must call `lease.attach_session()`; a session passed only to `finish()` produces no fire-delay event. To exclude sandbox boot time, it must attach the session before waiting for the sandbox. |
+| Time to prompt | `prompt_delay_seconds` on `running` outcomes, by `target`. |
+| Fires per day, Arclet vs. pinned host | Claimed runs by `target`. Active tasks and owners come from `scheduled_tasks`. |
+
+Failure stages come from the executor's `error_code`.
+
 ## Code
 
 [dispatch_scheduler.py](dispatch_scheduler.py) coordinates polling, heartbeats, and

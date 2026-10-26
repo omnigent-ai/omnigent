@@ -6581,9 +6581,10 @@ def _wait_for_claude_prompt_ready(
         while a dead pane still ends it at the first liveness check, a
         :data:`_CLAUDE_LIVENESS_POLL_INTERVAL_S` in, rather than at the cap.
     :returns: None.
-    :raises ClaudeTerminalExited: If tmux affirms the pane's process has
-        exited, carrying the pane's wait-status so a clean quit is
-        distinguishable from a crash.
+    :raises ClaudeTerminalExited: If the pane is gone: tmux affirms the
+        process exited, carrying its wait-status so a clean quit is
+        distinguishable from a crash, or tmux no longer reports the pane
+        (no wait-status, so ``exit_status`` is ``None``).
     :raises ClaudeTerminalDialog: If a consent or selection dialog is holding
         the terminal (see :func:`_terminal_dialog_headline`) on two
         consecutive polls. Raised within a poll interval instead of waiting
@@ -6621,7 +6622,7 @@ def _wait_for_claude_prompt_ready(
     # while it mattered keeps the error honest.
     last_nonempty = ""
     exited_status: str | None = None
-    pane_exited = False
+    pane_gone = False
     dialog_headline: str | None = None
     sign_in_url: str | None = None
     waited_on_sign_in = False
@@ -6705,7 +6706,7 @@ def _wait_for_claude_prompt_ready(
         if now >= next_liveness_probe:
             state = _claude_pane_state(socket_path, tmux_target)
             if state.alive is False:
-                pane_exited = state.exited
+                pane_gone = True
                 exited_status = state.exit_status
                 break
             next_liveness_probe = time.monotonic() + _CLAUDE_LIVENESS_POLL_INTERVAL_S
@@ -6718,15 +6719,20 @@ def _wait_for_claude_prompt_ready(
     # with no box point at Claude never rendering the prompt (a boot crash,
     # e.g. a ``JSON Parse error``, whose text the tail then surfaces).
     waited_s = time.monotonic() - started
-    if pane_exited:
+    if pane_gone:
         # A readiness timeout's poll counts describe a box that never mounted,
-        # which reads as a rendering bug. An exited process is a different
-        # failure and its wait-status is what tells a quit from a crash.
-        status = "unknown" if exited_status is None else exited_status
+        # which reads as a rendering bug. A pane tmux no longer reports is a
+        # different failure: the terminal is gone, so a relaunch is the fix.
+        # Its wait-status, when tmux gave one, tells a quit from a crash.
+        gone = (
+            "is no longer running (exit status unknown)"
+            if exited_status is None
+            else f"has exited (status {exited_status})"
+        )
         raise ClaudeTerminalExited(
-            f"The Claude Code terminal has exited (status {status}), so the "
-            "message was not delivered. Relaunch the terminal to continue "
-            "this conversation." + _format_terminal_failure_tail(last_nonempty),
+            f"The Claude Code terminal {gone}, so the message was not delivered. "
+            "Relaunch the terminal to continue this conversation."
+            + _format_terminal_failure_tail(last_nonempty),
             exit_status=exited_status,
         )
     raise ClaudePromptTimeout(

@@ -1124,6 +1124,73 @@ function makeAnchoredComment(
 }
 
 describe("classifyAndRemapComments", () => {
+  it("uses legacy search after the Markdown remapping module fails to load", () => {
+    const comment = makeAnchoredComment({
+      id: "failed-load",
+      path: "doc.md",
+      start_index: 0,
+      end_index: 16,
+      anchor_content: "say word now",
+    });
+    const addressed = { ...comment, id: "addressed", status: "addressed" as const };
+    expect(classifyAndRemapComments([comment], "prefix say word now").open).toEqual([comment]);
+    expect(classifyAndRemapComments([comment, addressed], "prefix say word now", null)).toEqual({
+      open: [{ ...comment, start_index: 7, end_index: 19 }],
+      addressed: [addressed],
+    });
+  });
+  it("uses source-aware remapping only for open formatted Markdown anchors", () => {
+    const formatted = makeAnchoredComment({
+      id: "formatted",
+      path: "doc.md",
+      start_index: 0,
+      end_index: 16,
+      anchor_content: "say word now",
+    });
+    const literal = { ...formatted, id: "literal", end_index: 12 };
+    const addressed = { ...formatted, id: "addressed", status: "addressed" as const };
+    const remapped = { ...formatted, start_index: 7, end_index: 19 };
+    const remap = vi.fn(() => remapped);
+    const result = classifyAndRemapComments(
+      [formatted, literal, addressed],
+      "prefix say word now",
+      remap,
+    );
+    expect(result.open).toEqual([remapped, { ...literal, start_index: 7, end_index: 19 }]);
+    expect(result.addressed).toEqual([addressed]);
+    expect(remap).toHaveBeenCalledExactlyOnceWith(formatted, "prefix say word now");
+  });
+  it.each(["doc.md", "doc.markdown", "doc.MD"])(
+    "preserves a markup-spanning raw range in %s instead of relocating to a literal copy",
+    (path) => {
+      const comment = makeAnchoredComment({
+        id: "split-word",
+        path,
+        start_index: 21,
+        end_index: 27,
+        anchor_content: "word",
+      });
+
+      expect(classifyAndRemapComments([comment], "[Details](word) word wo**rd**").open).toEqual([
+        comment,
+      ]);
+    },
+  );
+
+  it.each(["file1.py", "doc.md"])("still remaps literal source selections in %s", (path) => {
+    const comment = makeAnchoredComment({
+      id: "literal-word",
+      path,
+      start_index: 0,
+      end_index: 4,
+      anchor_content: "word",
+    });
+
+    expect(classifyAndRemapComments([comment], "prefix word").open).toEqual([
+      { ...comment, start_index: 7, end_index: 11 },
+    ]);
+  });
+
   it("buckets addressed comments separately and never remaps them", () => {
     const fileContent = "AAAA\nhello world\n";
     const addressed = makeAnchoredComment({
