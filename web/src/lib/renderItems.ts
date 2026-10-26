@@ -843,7 +843,7 @@ function walkBubbles(
     // A sub-agent notice joins the assistant work beside it so it folds with
     // that work. With no work after it yet it stands alone, and the run is one
     // re-walk region so all of it can join the work that arrives next.
-    if (isSubagentActivityBlock(b) && workAfterNotice(blocks, i) === undefined) {
+    if (isSubagentActivityBlock(b) && workBesideNotice(blocks, i, 1) === undefined) {
       lastBubbleStart = i;
       lastBubbleCount = 0;
       for (; i < blocks.length && isNoticeTransparent(blocks[i]!); i += 1) {
@@ -1001,8 +1001,7 @@ function walkBubbles(
     // Question/plan cards split the turn on their own (see
     // `isUserInputElicitationBlock`) — they carry the turn's id, but the
     // user answering one is a boundary, not a step of the work.
-    // A notice's own `subagent_*` id never names the turn.
-    let groupResponseId = isSubagentActivityBlock(b) ? "" : b.ctx.responseId;
+    let groupResponseId = isSubagentActivityBlock(b) ? "" : b.ctx.responseId; // never a notice's own id
     const groupStart = i;
     // Sentinel-headed groups never absorb a different turn's blocks, in
     // either direction (see the id-change handling below).
@@ -1034,12 +1033,12 @@ function walkBubbles(
       // separate stretches, each folding under its own "Worked for".
       if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
       if (isSubagentActivityBlock(cur)) {
-        // Mid-turn, the notice stays in this bubble. When a different turn's
-        // work follows it (a lead woken by the result), it opens that turn's
-        // bubble instead, so the new turn never streams into a folded trace.
+        // A notice stays in its turn's bubble. One between two responses opens
+        // the later one's bubble: a native fold that has shown never reopens,
+        // so the new response would otherwise stream into a collapsed trace.
         if (
           i > groupStart &&
-          (groupOpenedOnSentinel || noticePrecedesOtherTurn(blocks, i, groupResponseId))
+          (groupOpenedOnSentinel || noticeSeparatesResponses(blocks, groupStart, i))
         ) {
           break;
         }
@@ -1092,8 +1091,10 @@ function walkBubbles(
 
     lastBubbleStart = groupStart;
     lastBubbleCount = 1;
-    const workedForS = turnWorkedForS(groupBlocks);
-    const lastActivityAtS = turnLastActivityAtS(groupBlocks);
+    // A notice is stamped when the sub-agent reported, not when this turn worked.
+    const workBlocks = groupBlocks.filter((bk) => !isSubagentActivityBlock(bk));
+    const workedForS = turnWorkedForS(workBlocks);
+    const lastActivityAtS = turnLastActivityAtS(workBlocks);
     // Freshest stamp in the group — server stamp on cold load, client
     // stamp while live, either clock display-only. The max tracks latest
     // activity and never jumps back for a backdated tail block.
@@ -1108,7 +1109,7 @@ function walkBubbles(
         }
       }
     }
-    const groupCreatedAtS = groupBlocks
+    const groupCreatedAtS = workBlocks
       .filter(
         (bk) =>
           bk.type !== "tool_result" || localResultKeys.has(`${bk.ctx.responseId}:${bk.callId}`),
@@ -1463,16 +1464,18 @@ function isNoticeTransparent(b: AnyBlock): boolean {
 }
 
 /**
- * The assistant work after the notice at `index`, or `undefined` when a bubble
- * boundary (or nothing) comes first. `skipUnnamed` also looks past work with no
- * turn identity yet, to find the turn the work belongs to.
+ * The nearest assistant work beside the notice at `index`, stepping `step` and
+ * never below `floor`; `undefined` when a bubble boundary (or nothing) comes
+ * first. `committedOnly` skips streaming blocks to find a server item.
  */
-function workAfterNotice(
+function workBesideNotice(
   blocks: AnyBlock[],
   index: number,
-  skipUnnamed = false,
+  step: 1 | -1,
+  committedOnly = false,
+  floor = 0,
 ): AnyBlock | undefined {
-  for (let k = index + 1; k < blocks.length; k += 1) {
+  for (let k = index + step; k >= floor && k < blocks.length; k += step) {
     const b = blocks[k]!;
     if (isNoticeTransparent(b)) continue;
     if (
@@ -1482,17 +1485,30 @@ function workAfterNotice(
     ) {
       return undefined;
     }
-    if (skipUnnamed && isAnonymousRid(b.ctx.responseId)) continue;
-    return b;
+    if (!committedOnly || isCommittedBlock(b)) return b;
   }
   return undefined;
 }
 
-/** Whether the work after the notice at `index` belongs to a turn other than `turnId`. */
-function noticePrecedesOtherTurn(blocks: AnyBlock[], index: number, turnId: string): boolean {
-  if (isAnonymousRid(turnId)) return false;
-  const next = workAfterNotice(blocks, index, true);
-  return next !== undefined && next.ctx.responseId !== turnId;
+/**
+ * A server item, whose response id is the same live and on reload. Live deltas
+ * carry the active response's id instead, and previews carry none.
+ */
+function isCommittedBlock(b: AnyBlock): boolean {
+  const { itemId, responseId } = b.ctx;
+  return itemId !== null && !itemId.startsWith(LIVE_ITEM_PREFIX) && !isAnonymousRid(responseId);
+}
+
+/**
+ * Whether the committed work on either side of the notice at `index` belongs to
+ * different responses: one stopped, and the next started after the notice.
+ */
+function noticeSeparatesResponses(blocks: AnyBlock[], groupStart: number, index: number): boolean {
+  const before = workBesideNotice(blocks, index, -1, true, groupStart);
+  const after = workBesideNotice(blocks, index, 1, true);
+  return (
+    before !== undefined && after !== undefined && before.ctx.responseId !== after.ctx.responseId
+  );
 }
 
 /** Filter to blocks that participate in assistant rendering. */

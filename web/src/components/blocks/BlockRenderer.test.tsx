@@ -1387,16 +1387,36 @@ describe("BlockRenderer dispatch", () => {
       });
 
       it.each([false, true])(
-        "keeps notices nothing has followed visible unless continued = %s",
+        "shows trailing notices only until the turn continues (continued = %s)",
         (continued) => {
           renderTurn(
-            [tool(1, "spawn_agent"), text("m1", "Waiting on Peirce."), notice("n1", "delegated")],
+            [text("m1", "Starting Peirce."), tool(1, "spawn_agent"), notice("n1", "delegated")],
             continued,
           );
-          expect(screen.getAllByRole("button", { name: "Worked" })).toHaveLength(continued ? 2 : 1);
+          expect(screen.getAllByRole("button", { name: "Worked" })).toHaveLength(1);
           expect(noticeLabels()).toEqual(continued ? [] : ["Started Peirce"]);
         },
       );
+
+      it("leaves a notice with no work beside it between the messages", () => {
+        render(
+          <MemoryRouter>
+            <BlockRenderer
+              items={[
+                tool(1, "spawn_agent"),
+                text("m1", "Peirce is recording."),
+                notice("n1", "returned"),
+                text("m2", "Peirce finished."),
+              ]}
+              sessionStatus="idle"
+              workedForS={42}
+            />
+          </MemoryRouter>,
+        );
+        expect(screen.getAllByRole("button", { name: /^Worked/ })).toHaveLength(1);
+        expect(screen.getByRole("button", { name: "Worked for 42s" })).toBeDefined();
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
+      });
 
       it("keeps a terminal error unfolded when a notice lands after it", () => {
         renderTurn([

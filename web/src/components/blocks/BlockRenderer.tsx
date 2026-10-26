@@ -479,11 +479,14 @@ function partitionTurn(
     ? items.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
     : -1;
   // Sub-agent notices nothing has followed yet are the turn's latest news. They
-  // fold once committed work, here or in a later bubble, moves past them.
+  // fold once committed output, here or in a later bubble, moves past them.
   const latestNoticesStart = continued
     ? end
     : items.findLastIndex(
-        (item, i) => i < end && item.kind !== "subagent_activity" && !isProvisionalItem(item),
+        (item, i) =>
+          i < end &&
+          item.kind !== "subagent_activity" &&
+          (isFailureItem(item) || !isProvisionalItem(item)),
       ) + 1;
   const segments: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
@@ -509,7 +512,14 @@ function partitionTurn(
     if (lastWork?.kind === "work") lastWork.items.push(...wrapup);
     else segments.push({ kind: "work", items: wrapup, startIndex: end });
   }
-  return { segments };
+  // Notices with no work beside them have no "Worked" row to fold into.
+  return {
+    segments: segments.flatMap((segment): TurnSegment[] =>
+      segment.kind === "work" && segment.items.every((item) => item.kind === "subagent_activity")
+        ? segment.items.map((item, k) => ({ kind: "exempt", item, index: segment.startIndex + k }))
+        : [segment],
+    ),
+  };
 }
 
 function isPendingElicitation(item: RenderItem): boolean {

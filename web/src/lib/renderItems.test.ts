@@ -350,6 +350,34 @@ describe("sub-agent timeline events", () => {
     ]);
   });
 
+  it("splits at a notice only where committed work changes response", () => {
+    // A live delta carries the active response's id; server items decide, as on reload.
+    const delta: AnyBlock = {
+      type: "text_chunk",
+      ctx: ctx({ responseId: "codex_step2" }),
+      text: "On ",
+    };
+    expect(buildStreamed([work, notice(), delta, answer])).toHaveLength(1);
+    // A response that starts after the notice gets its own bubble, step ids included.
+    const nextStep = text("step_two", "codex_step2", "Next step.");
+    expect(buildStreamed([work, notice(), nextStep])).toMatchObject([
+      { responseId: "parent_turn" },
+      { responseId: "codex_step2", items: [{ kind: "subagent_activity" }, { kind: "text" }] },
+    ]);
+  });
+
+  it("keeps a late notice out of the turn's timing", () => {
+    const stamped = (block: AnyBlock, createdAtS: number): AnyBlock => ({
+      ...block,
+      ctx: { ...block.ctx, createdAtS },
+    });
+    const [bubble] = buildBubbles(
+      [stamped(work, 100), stamped(answer, 130), stamped(notice(), 900)],
+      null,
+    );
+    expect(bubble).toMatchObject({ workedForS: 30, lastActivityAtS: 130, createdAtS: 130 });
+  });
+
   it("never looks past an unconfirmed user message for the next turn", () => {
     const sent: AnyBlock = {
       type: "user_message",
