@@ -5227,7 +5227,7 @@ def compaction_stream(monkeypatch: pytest.MonkeyPatch):
     return configure
 
 
-@pytest.mark.parametrize("trigger", ["manual", "auto", "hook"])
+@pytest.mark.parametrize("trigger", ["manual", "auto"])
 @pytest.mark.parametrize("stream_failure", [False, True])
 def test_compaction_stream_exports_checkpoint_without_disk(
     trigger: str, stream_failure: bool, compaction_stream
@@ -5252,18 +5252,7 @@ def test_compaction_stream_exports_checkpoint_without_disk(
         },
         {"type": "user", "uuid": "summary", "isSynthetic": True, "message": {"content": summary}},
     ]
-    if trigger == "hook":
-        compacted_turn.insert(
-            0,
-            {
-                "type": "system",
-                "subtype": "hook_started",
-                "hook_id": "compact",
-                "hook_event": "PreCompact",
-                "hook_name": "PreCompact:auto",
-            },
-        )
-    elif trigger == "auto":
+    if trigger == "auto":
         compacted_turn = compacted_turn[1:]
     if stream_failure:
         compacted_turn.append(RuntimeError("context refilled after compaction"))

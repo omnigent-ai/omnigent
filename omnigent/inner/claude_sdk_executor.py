@@ -3375,7 +3375,6 @@ class ClaudeSDKExecutor(Executor):
                             (subtype == "status" and data.get("status") == "compacting")
                             or subtype == "compact_boundary"
                             or data.get("compact_result") == "success"
-                            or getattr(system_msg, "hook_event_name", None) == "PreCompact"
                         ):
                             if not compaction_occurred:
                                 compaction_occurred = True
