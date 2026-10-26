@@ -921,6 +921,7 @@ def test_genie_readiness_honors_binary_override(
     monkeypatch.setattr(hi.shutil, "which", lambda _name: None)
     monkeypatch.setenv("OMNIGENT_GENIE_PATH", str(binary))
 
+    assert hi.harness_cli_binary(hi.GENIE_KEY) == str(binary)
     assert configured_harness_map()["genie"] == "needs-auth"
 
 
