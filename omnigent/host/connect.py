@@ -512,6 +512,10 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "LOGNAME",
         "SHELL",
         "TMPDIR",
+        # Windows' temp dirs: a runner keeps its terminal dirs where its host's
+        # orphan sweep looks for them.
+        "TEMP",
+        "TMP",
         # The daemon and runner resolve OS-keyring credentials in the user's session.
         "DBUS_SESSION_BUS_ADDRESS",
         "XDG_RUNTIME_DIR",

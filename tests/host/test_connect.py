@@ -4046,6 +4046,9 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     base = {
         "PATH": "/usr/bin:/bin",
         "HOME": "/home/alice",
+        "TMPDIR": "/tmp/alice",
+        "TEMP": r"C:\Users\alice\temp",
+        "TMP": r"C:\Users\alice\temp",
         "LANG": "en_US.UTF-8",
         "LC_CTYPE": "UTF-8",
         "DATABRICKS_CONFIG_PROFILE": "ambient",
@@ -4087,6 +4090,10 @@ def test_build_runner_env_allowlists_host_env_and_strips_secrets(tmp_path: Path)
     # Process essentials + the locale family pass through.
     assert env["PATH"] == "/usr/bin:/bin"
     assert env["HOME"] == "/home/alice"
+    # The temp dirs pass on every platform, so a runner's terminal dirs sit
+    # where its host's orphan sweep looks.
+    assert env["TMPDIR"] == "/tmp/alice"
+    assert env["TEMP"] == env["TMP"] == r"C:\Users\alice\temp"
     assert env["LANG"] == "en_US.UTF-8"
     assert env["LC_CTYPE"] == "UTF-8"
     # Databricks config selectors are allowlisted ambient passthrough —
