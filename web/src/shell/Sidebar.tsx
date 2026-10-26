@@ -1348,8 +1348,9 @@ function SidebarImpl({
                 // underneath it and can't be tapped.
                 className={cn(
                   "relative flex-1 overflow-y-auto px-2 pt-4 pb-3 max-md:pb-16",
-                  // Reserve the gutter so toggling the thumb never reflows the list.
-                  "[scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
+                  // Reserve the gutter even when the list fits, so neither the thumb
+                  // nor a section collapsing out of overflow reflows the rows.
+                  "[scrollbar-gutter:stable] [scrollbar-width:thin] [&::-webkit-scrollbar]:w-2 [&::-webkit-scrollbar-thumb]:rounded-full [&::-webkit-scrollbar-track]:bg-transparent",
                   isScrolling
                     ? "[scrollbar-color:var(--muted-foreground)_transparent] [&::-webkit-scrollbar-thumb]:bg-muted-foreground"
                     : "[scrollbar-color:transparent_transparent] [&::-webkit-scrollbar-thumb]:bg-transparent",
