@@ -8141,14 +8141,17 @@ def test_resolve_launch_effort_level_prefers_passed_effort(
     A valid pass-through ``--effort`` wins over settings.json's ``effortLevel``.
 
     Claude falls back to the wrapper's invocation ``effortLevel`` when the last
-    ``--effort`` is malformed, so any value written there must match the stamp.
+    ``--effort`` is malformed, so it must carry exactly the effort read from the args.
     """
     settings = tmp_path / "settings.json"
     settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
     monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
     assert claude_native_bridge.resolve_launch_effort_level(claude_args) == expected
     invocation = _load_invocation_settings(augment_claude_args(claude_args, bridge_dir=tmp_path))
-    assert invocation.get("effortLevel") in (None, expected)
+    settings.unlink()
+    passed_effort = claude_native_bridge.resolve_launch_effort_level(claude_args)
+    assert passed_effort in (None, expected)
+    assert invocation.get("effortLevel") == passed_effort
 
 
 # ---------------------------------------------------------------------------
