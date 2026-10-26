@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import contextlib
 import json
+import os
 import subprocess
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,96 @@ import pytest
 from omnigent.debug_logging import current_session_id_scope, record_to_row
 from omnigent.harnesses.claude_native import bridge, delivery_diagnostics
 from omnigent.native.input_diagnostics import input_delivery_scope
+
+
+@pytest.mark.parametrize(
+    ("scenario", "target_state", "owner_state"),
+    [
+        ("missing", "missing", "missing"),
+        ("removed_bridge", "missing", "missing"),
+        ("malformed", "invalid_json", "invalid"),
+        ("array", "not_object", "missing"),
+        ("oversized", "oversized", "missing"),
+        ("partial_live", "object", "present"),
+        ("partial_dead", "object", "not_running"),
+    ],
+)
+def test_missing_target_diagnostic_explains_bridge_state_without_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    scenario: str,
+    target_state: str,
+    owner_state: str,
+) -> None:
+    native = tmp_path / "private-workspace"
+    if scenario != "removed_bridge":
+        native.mkdir()
+        (native / "bridge.json").write_text(json.dumps({"active_session_id": "bridge-session"}))
+    secret = "private socket and prompt material"
+    if scenario in {"malformed", "array", "oversized"}:
+        raw = {"malformed": secret, "array": json.dumps([secret]), "oversized": "x" * 4097}
+        (native / "tmux.json").write_text(raw[scenario])
+    if scenario == "malformed":
+        (native / "owner.pid").write_text(secret)
+    if scenario.startswith("partial_"):
+        (native / "tmux.json").write_text(json.dumps({"socket_path": secret}))
+        (native / "owner.pid").write_text(str(os.getpid()))
+        if scenario == "partial_dead":
+            monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    elapsed = 0.0
+
+    def sleep(seconds: float) -> None:
+        nonlocal elapsed
+        elapsed += seconds
+
+    monkeypatch.setattr(
+        bridge,
+        "time",
+        SimpleNamespace(monotonic=lambda: elapsed, sleep=sleep),
+    )
+    with (
+        caplog.at_level("WARNING", logger=delivery_diagnostics.__name__),
+        current_session_id_scope(None if scenario == "partial_live" else "child-session"),
+        input_delivery_scope({"input_stable_id": "a" * 32}, response_id="resp_delivery"),
+        pytest.raises(bridge.TmuxSessionNotAdvertised),
+    ):
+        bridge._wait_for_tmux_info(native, timeout_s=0.1)
+    records = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", "") == "claude_native_tmux_target_timeout"
+    ]
+    assert len(records) == 1
+    row = record_to_row(records[0], "harness")
+    fields = records[0].attributes
+    assert fields["target_file_state"] == target_state
+    assert fields["owner_state"] == owner_state
+    assert fields["bridge_directory_present"] is (scenario != "removed_bridge")
+    assert fields["bridge_config_present"] is (scenario != "removed_bridge")
+    assert fields["polls"] == 2
+    assert fields["timeout_ms"] == 100
+    assert fields["input_stable_id"] == "a" * 32
+    assert fields["response_id"] == "resp_delivery"
+    assert row["session_id"] == (
+        "bridge-session" if scenario == "partial_live" else "child-session"
+    )
+    if scenario.startswith("partial_"):
+        assert fields["socket_path_present"] is True
+        assert fields["tmux_target_present"] is False
+    assert secret not in json.dumps(row)
+    assert str(native) not in json.dumps(row)
+
+
+def test_missing_target_keeps_its_error_when_diagnostics_fail(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fail_log(*args: object, **kwargs: object) -> None:
+        raise OSError("logging unavailable")
+
+    monkeypatch.setattr(delivery_diagnostics._logger, "warning", fail_log)
+    with pytest.raises(bridge.TmuxSessionNotAdvertised):
+        bridge._wait_for_tmux_info(tmp_path, timeout_s=0)
 
 
 @pytest.mark.parametrize(

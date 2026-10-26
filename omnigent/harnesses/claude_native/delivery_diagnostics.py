@@ -97,6 +97,80 @@ def record_tmux_failure(
             trace.tmux_failure[name] = value
 
 
+@_best_effort
+def record_tmux_target_timeout(
+    bridge_dir: Path,
+    *,
+    timeout_s: float,
+    polls: int,
+    session_id_reader: Callable[[Path], str | None],
+) -> None:
+    """Log bounded bridge metadata when no target arrives, without file contents or paths."""
+    from omnigent.debug_logging import current_session_id, debug_event
+    from omnigent.inner.terminal import _process_alive
+    from omnigent.native.input_diagnostics import current_input_attributes
+    from omnigent.native.native_bridge_common import OWNER_PID_FILENAME
+
+    fields: dict[str, object] = {
+        **current_input_attributes(),
+        "timeout_ms": round(timeout_s * 1000),
+        "polls": polls,
+        "bridge_directory_present": bridge_dir.is_dir(),
+        "bridge_config_present": (bridge_dir / "bridge.json").is_file(),
+    }
+    target = bridge_dir / "tmux.json"
+    try:
+        info = target.stat()
+        fields["target_file_bytes"] = info.st_size
+        fields["target_file_age_ms"] = max(0, round((time.time() - info.st_mtime) * 1000))
+        with target.open(encoding="utf-8") as stream:
+            raw = stream.read(4097)
+        if len(raw) > 4096:
+            fields["target_file_state"] = "oversized"
+        else:
+            payload = json.loads(raw)
+            fields["target_file_state"] = "object" if isinstance(payload, dict) else "not_object"
+            if isinstance(payload, dict):
+                fields["socket_path_present"] = isinstance(payload.get("socket_path"), str)
+                fields["tmux_target_present"] = isinstance(payload.get("tmux_target"), str)
+    except FileNotFoundError:
+        fields["target_file_state"] = "missing"
+    except ValueError:
+        fields["target_file_state"] = "invalid_json"
+    except OSError as exc:
+        fields["target_file_state"] = "unreadable"
+        fields["target_file_errno"] = exc.errno
+
+    try:
+        with (bridge_dir / OWNER_PID_FILENAME).open(encoding="utf-8") as stream:
+            pid = int(stream.read(32).strip())
+        fields["owner_state"] = (
+            "invalid"
+            if not 0 < pid < 2**31
+            else "present"
+            if _process_alive(pid)
+            else "not_running"
+        )
+    except FileNotFoundError:
+        fields["owner_state"] = "missing"
+    except ValueError:
+        fields["owner_state"] = "invalid"
+    except OSError:
+        fields["owner_state"] = "unreadable"
+
+    session_id = current_session_id()
+    if session_id is None:
+        with contextlib.suppress(OSError, ValueError):
+            session_id = session_id_reader(bridge_dir)
+    extra = debug_event("claude_native_tmux_target_timeout", session_id=session_id)
+    extra["attributes"] = fields
+    _logger.warning(
+        "claude_native_tmux_target_timeout %s",
+        json.dumps(fields),
+        extra=extra,
+    )
+
+
 def trace_delivery(
     *,
     session_id_reader: Callable[[Path], str | None],

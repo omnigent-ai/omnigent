@@ -6928,14 +6928,22 @@ def _wait_for_tmux_info(bridge_dir: Path, *, timeout_s: float) -> dict[str, str]
     """
     deadline = time.monotonic() + timeout_s
     path = bridge_dir / _TMUX_FILE
+    polls = 0
     while time.monotonic() < deadline:
         _check_injection_cancelled()
+        polls += 1
         payload = _read_json_file(path)
         socket_path = payload.get("socket_path") if isinstance(payload, dict) else None
         tmux_target = payload.get("tmux_target") if isinstance(payload, dict) else None
         if isinstance(socket_path, str) and isinstance(tmux_target, str):
             return {"socket_path": socket_path, "tmux_target": tmux_target}
         time.sleep(0.05)
+    delivery_diagnostics.record_tmux_target_timeout(
+        bridge_dir,
+        timeout_s=timeout_s,
+        polls=polls,
+        session_id_reader=read_active_session_id,
+    )
     raise TmuxSessionNotAdvertised(
         "Claude terminal tmux target is not advertised yet. Wait for the "
         "terminal to launch before sending messages from the web UI."
