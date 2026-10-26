@@ -308,6 +308,81 @@ async def test_skill_bundle_fetch_survives_a_deleted_ssl_cert_file(
     assert response.request.url.path == "/v1/sessions/conv_abc/agent/contents"
 
 
+@pytest.mark.parametrize("status", [200, 401, 403, 503])
+@pytest.mark.parametrize("auth_mode", ["bearer", "managed", "both", "missing"])
+async def test_skill_bundle_failure_records_auth_presence_without_contents(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+    auth_mode: str,
+) -> None:
+    import httpx
+
+    from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+
+    host = _make_host_process()
+    headers = {}
+    if auth_mode in {"bearer", "both"}:
+        headers["Authorization"] = "Bearer private-credential"
+    if auth_mode in {"managed", "both"}:
+        headers[MANAGED_HOST_TOKEN_HEADER] = "private-launch-token"
+    monkeypatch.setattr(host, "_build_connect_headers", lambda: headers)
+    requests = []
+
+    def respond(_transport: object, request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        return httpx.Response(
+            status,
+            content=b"private response body",
+            headers={"x-databricks-request-id": "00000000-0000-4000-8000-000000000001"},
+            request=request,
+        )
+
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", respond)
+    frame = HostSkillsFrame("skill-request", "claude-native", str(tmp_path), "session-123")
+    response = host._fetch_skill_bundle(frame)
+
+    assert response.status_code == status
+    assert len(requests) == 1
+    records = [r for r in caplog.records if r.message == "host_skill_bundle_fetch_failed"]
+    assert len(records) == int(status != 200)
+    if records:
+        record = records[0]
+        attrs = record.attributes
+        assert record.session_id == "session-123"
+        assert attrs["host_request_id"] == "skill-request"
+        assert attrs["http_status"] == status
+        assert attrs["authorization_present"] == (auth_mode in {"bearer", "both"})
+        assert attrs["managed_host_token_present"] == (auth_mode in {"managed", "both"})
+        assert attrs["server_request_id"] == "00000000-0000-4000-8000-000000000001"
+        assert attrs["elapsed_ms"] >= 0
+        assert "private" not in json.dumps(attrs)
+        assert str(tmp_path) not in json.dumps(attrs)
+
+
+async def test_skill_bundle_transport_failure_keeps_exception_and_does_not_retry(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    import httpx
+
+    host = _make_host_process()
+    monkeypatch.setattr(host, "_build_connect_headers", dict)
+    error = httpx.ReadTimeout("private transport detail")
+    transport = Mock(side_effect=error)
+    monkeypatch.setattr(httpx.HTTPTransport, "handle_request", transport)
+    frame = HostSkillsFrame("skill-request", "claude-native", str(tmp_path), "session-123")
+
+    with pytest.raises(httpx.ReadTimeout) as raised:
+        host._fetch_skill_bundle(frame)
+
+    assert raised.value is error
+    assert transport.call_count == 1
+    record = next(r for r in caplog.records if r.message == "host_skill_bundle_fetch_failed")
+    assert record.attributes["error_type"] == "ReadTimeout"
+    assert "private" not in json.dumps(record.attributes)
+
+
 async def test_host_skills_does_not_block_tunnel(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

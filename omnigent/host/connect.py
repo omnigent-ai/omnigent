@@ -3452,15 +3452,53 @@ class HostProcess:
         """Read the bound session bundle using this host's existing credentials."""
         from urllib.parse import quote
 
+        from omnigent.host.identity import MANAGED_HOST_TOKEN_HEADER
+
         path = quote(frame.session_id or "", safe="")
-        return httpx.get(
-            f"{self._server_url}/v1/sessions/{path}/agent/contents",
-            headers=self._build_connect_headers(),
-            timeout=10.0,
-            # httpx's default context reads SSL_CERT_FILE eagerly and fails on a
-            # deleted bundle; verify like the host tunnel does instead.
-            verify=client_ssl_context(),
-        )
+        headers = self._build_connect_headers()
+        started = time.monotonic()
+
+        def record_failure(
+            *, response: httpx.Response | None = None, error: httpx.TransportError | None = None
+        ) -> None:
+            with contextlib.suppress(Exception):
+                fields: dict[str, object] = {
+                    "host_request_id": frame.request_id,
+                    "authorization_present": bool(headers.get("Authorization")),
+                    "managed_host_token_present": bool(headers.get(MANAGED_HOST_TOKEN_HEADER)),
+                    "auth_factory_initialized": self._auth_token_factory_resolved,
+                    "elapsed_ms": round((time.monotonic() - started) * 1000),
+                }
+                if response is not None:
+                    fields["http_status"] = response.status_code
+                    request_id = response.headers.get("x-databricks-request-id", "")
+                    if re.fullmatch(
+                        r"[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}", request_id
+                    ):
+                        fields["server_request_id"] = request_id
+                if error is not None:
+                    fields["error_type"] = type(error).__name__
+                extra = debug_event("host_skill_bundle_fetch_failed", session_id=frame.session_id)
+                extra["attributes"] = fields
+                _logger.warning(
+                    "host_skill_bundle_fetch_failed",
+                    extra=extra,
+                )
+
+        try:
+            response = httpx.get(
+                f"{self._server_url}/v1/sessions/{path}/agent/contents",
+                headers=headers,
+                timeout=10.0,
+                # A deleted SSL_CERT_FILE must not break the host's existing TLS context.
+                verify=client_ssl_context(),
+            )
+        except httpx.TransportError as exc:
+            record_failure(error=exc)
+            raise
+        if not response.is_success:
+            record_failure(response=response)
+        return response
 
     async def _prewarm_model_options(self) -> bool:
         """
