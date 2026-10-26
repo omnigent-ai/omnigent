@@ -872,22 +872,35 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.getByText("Claude wants to call Bash", { exact: false })).toBeDefined();
       });
 
-      it("folds every message of a continued bubble", () => {
+      it("keeps a continued bubble's last message visible", () => {
+        // A later bubble may answer a wake or a question card, not this turn.
         const items: RenderItem[] = [
           { kind: "text", itemId: "m0", text: "Dispatching sub-agents.", final: true },
           tool(1, "Agent"),
-          { kind: "text", itemId: "m1", text: "Waiting for results.", final: true },
+          { kind: "text", itemId: "m1", text: "Here is the answer.", final: true },
         ];
         const inputs = { items, sessionStatus: "idle" as const, continued: true };
-        expect(rendersOnlyWorkedFold(inputs)).toBe(false);
-        expect(rendersOnlyWorkedFold({ ...inputs, foldNarration: true })).toBe(true);
+        expect(rendersOnlyWorkedFold({ ...inputs, foldNarration: true })).toBe(false);
         render(<BlockRenderer {...inputs} foldNarration />);
-        expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
-        expect(screen.queryByText("Waiting for results.")).toBeNull();
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.getByText("Here is the answer.")).toBeDefined();
+        expect(screen.queryByText("Dispatching sub-agents.")).toBeNull();
 
         const textOnly = { ...inputs, items: [items[0]!, items[2]!] };
-        expect(rendersOnlyWorkedFold(textOnly)).toBe(false);
-        expect(rendersOnlyWorkedFold({ ...textOnly, foldNarration: true })).toBe(true);
+        expect(rendersOnlyWorkedFold({ ...textOnly, foldNarration: true })).toBe(false);
+      });
+
+      it("keeps the last non-blank message as the answer", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Looking into it.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "The real answer.", final: true },
+          { kind: "text", itemId: "m2", text: "  \n", final: true },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.getByText("The real answer.")).toBeDefined();
+        expect(screen.queryByText("Looking into it.")).toBeNull();
       });
     });
 

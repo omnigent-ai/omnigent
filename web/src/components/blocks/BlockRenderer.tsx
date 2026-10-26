@@ -151,12 +151,11 @@ function turnLiveness({
   return { isOwnTurnLive, possiblyLive, isTurnLive: isOwnTurnLive || possiblyLive };
 }
 
-/** Work folds after an assistant message, or in a continuation with tools or folded text. */
+/** Work folds after an assistant message or in a tool-bearing continuation. */
 function hasFoldableShape(
   items: RenderItem[],
   { segments }: TurnPartition,
   continued = false,
-  foldNarration = false,
 ): boolean {
   const lastItem = items.findLast((item) => !isTrailingWrapup(item));
   // A terminal failure or denial must stay visible beside the assistant text.
@@ -172,13 +171,7 @@ function hasFoldableShape(
     segments.some((segment) => segment.kind === "work") &&
     (segments.some((segment) => segment.kind === "text") ||
       (continued &&
-        segments.some(
-          (segment) =>
-            segment.kind === "work" &&
-            segment.items.some(
-              (item) => isToolItem(item) || (foldNarration && item.kind === "text"),
-            ),
-        )))
+        segments.some((segment) => segment.kind === "work" && segment.items.some(isToolItem))))
   );
 }
 
@@ -187,12 +180,9 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
-  const partition = partitionTurn(inputs.items, {
-    foldNarration: inputs.foldNarration,
-    continued: inputs.continued,
-  });
+  const partition = partitionTurn(inputs.items, inputs.foldNarration);
   return (
-    hasFoldableShape(inputs.items, partition, inputs.continued, inputs.foldNarration) &&
+    hasFoldableShape(inputs.items, partition, inputs.continued) &&
     partition.segments.every((segment) => segment.kind === "work")
   );
 }
@@ -233,7 +223,7 @@ export function BlockRenderer({
   // A native assistant message has no reliable final-answer marker.
   // Keep each message visible even when a later tool call follows it,
   // unless the user opted into folding all but the last message.
-  const partition = partitionTurn(items, { foldNarration, continued });
+  const partition = partitionTurn(items, foldNarration);
   const workRunCount = partition.segments.filter((segment) => segment.kind === "work").length;
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
@@ -248,7 +238,7 @@ export function BlockRenderer({
     // Never fold a possibly-live bubble whose fold hasn't shown yet:
     // the terminal status edge is what folds it (see possiblyLive).
     (!possiblyLive || foldLatchedRef.current) &&
-    hasFoldableShape(items, partition, continued, foldNarration);
+    hasFoldableShape(items, partition, continued);
 
   // Debounce fold APPEARANCE on a live bubble: transient settled reads —
   // a step-wise turn's idle edge between steps, a stray bare idle before
@@ -453,22 +443,18 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * reliable final-answer marker, so every completed message stays visible
  * unless `foldNarration` asks to keep only the last one.
  */
-function partitionTurn(
-  items: RenderItem[],
-  {
-    foldNarration = false,
-    continued = false,
-  }: { foldNarration?: boolean; continued?: boolean } = {},
-): TurnPartition {
+function partitionTurn(items: RenderItem[], foldNarration = false): TurnPartition {
   let end = items.length;
   const wrapup: RenderItem[] = [];
   while (end > 0 && isTrailingWrapup(items[end - 1]!)) {
     wrapup.unshift(items[end - 1]!);
     end -= 1;
   }
-  // A continued bubble's answer lands in a later bubble, so all of its text folds.
-  const answerIndex =
-    foldNarration && !continued ? items.findLastIndex((item) => item.kind === "text") : -1;
+  // The last non-blank message stays visible even in a continued bubble: a
+  // later bubble may answer a wake or a question card, not this turn.
+  const answerIndex = foldNarration
+    ? items.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
+    : -1;
   const segments: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
     const item = items[i]!;
@@ -481,7 +467,8 @@ function partitionTurn(
       segments.push({ kind: "exempt", item, index: i });
       continue;
     }
-    const kind = item.kind === "text" && (!foldNarration || i === answerIndex) ? "text" : "work";
+    // Blank text after the answer stays with it rather than opening a second fold.
+    const kind = item.kind === "text" && (answerIndex < 0 || i >= answerIndex) ? "text" : "work";
     const previous = segments[segments.length - 1];
     if (previous?.kind === kind) previous.items.push(item);
     else segments.push({ kind, items: [item], startIndex: i });
