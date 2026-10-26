@@ -38,7 +38,7 @@ export function PullRequestCommentComposer({
         <TabsContent value="write" className="min-h-0 overflow-y-auto">
           <Textarea
             aria-label="New PR comment"
-            className="max-h-40 bg-transparent dark:bg-transparent"
+            className="max-h-40 bg-transparent focus-visible:ring-0 dark:bg-transparent"
             placeholder="Leave a comment..."
             value={draft.body}
             disabled={draft.pending}
