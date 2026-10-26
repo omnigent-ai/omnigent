@@ -9,9 +9,10 @@
 // useRenameConversation (overlaying the PATCH response after a rename), and
 // the chat store's `session.title` handler (a terminal-side `/rename`).
 
-import type { InfiniteData, QueryClient } from "@tanstack/react-query";
-import type { Conversation, ConversationsPage } from "@/hooks/useConversations";
+import type { InfiniteData, QueryClient, QueryKey } from "@tanstack/react-query";
+import type { Conversation, ConversationsPage, SessionSortBy } from "@/hooks/useConversations";
 import type { Session } from "@/lib/types";
+import { compareSessionRows } from "@/lib/sidebarData";
 
 /** Cache value shape for a `useConversations` infinite query. */
 export type ConversationsInfiniteData = InfiniteData<ConversationsPage, string | undefined>;
@@ -68,6 +69,13 @@ export interface ConversationListFilters {
    * only archived sessions. ``undefined`` is the default all-sessions list.
    */
   visibility?: "mine" | "shared" | "archived";
+  /**
+   * Project folder (`["project-sessions", name]`) the list holds, resolved
+   * from the projects list so dual-read membership can be decided locally.
+   */
+  folder?: { id: string | null; name: string };
+  /** Sort key of the list's server pages; absent means `updated_at`. */
+  sortBy?: SessionSortBy;
 }
 
 /**
@@ -179,7 +187,36 @@ export function filtersFromConversationQueryKey(key: readonly unknown[]): Conver
     // Treat null (visibility-scoped key) the same as undefined (no project filter).
     project: project ?? undefined,
     visibility: visibility as ConversationListFilters["visibility"],
+    ...(key[5] === "created_at" ? { sortBy: "created_at" as const } : {}),
   };
+}
+
+/**
+ * Dual-read project membership: the row carries the project's first-class
+ * `project_id` or its legacy `omni_project` label.
+ */
+export function isInProject(
+  conv: Pick<Conversation, "project_id" | "labels">,
+  project: { id: string | null; name: string },
+): boolean {
+  return (
+    (project.id !== null && conv.project_id === project.id) ||
+    conv.labels?.[PROJECT_LABEL_KEY] === project.name
+  );
+}
+
+/**
+ * Whether only the server can decide which rows a list holds: search lists
+ * match item content, and the archived / project-filtered lists can gain rows
+ * the client never had cached. Push frames reconcile these by refetching.
+ */
+export function serverDecidesMembership(filters: ConversationListFilters): boolean {
+  return (
+    filters.searchQuery !== "" ||
+    filters.includeArchived ||
+    filters.visibility === "archived" ||
+    Boolean(filters.project)
+  );
 }
 
 /**
@@ -212,44 +249,29 @@ function violatesKnownMembership(conv: Conversation, filters: ConversationListFi
   }
   if (!filters.includeArchived && conv.archived === true) return true;
   if (filters.project && conv.labels?.[PROJECT_LABEL_KEY] !== filters.project) return true;
+  if (filters.folder && !isInProject(conv, filters.folder)) return true;
   return false;
 }
 
 /**
- * Decide whether a field change needs server-side list reconciliation.
+ * Decide whether a field change can move rows into or out of lists the
+ * client can't evaluate (see {@link serverDecidesMembership}).
  *
- * The server owns pagination, updated_at sorting, search matches over title
- * and item content, and archive filtering. Push frames update visible row
- * fields immediately; this tells the provider when to follow with a list
- * refetch so filtered query membership and page order converge. Title
- * changes reconcile every list variant because a row absent from a search
- * query may now match it.
+ * `updated_at` is deliberately absent: every sidebar list renders through
+ * `sortConversations`, and a bump only raises a row (or, in a creation-ordered
+ * list, doesn't move it), so the loaded rows stay a prefix of the server's
+ * order without a refetch.
  *
  * @param changed - Names of wire fields that changed the cached row.
- * @param isActiveRow - Whether this row is the active chat (the one held
- *   in place by `ActiveChatOverride`). An `updated_at`-only change on it
- *   doesn't move the visible row, so it doesn't need a server resort.
- * @returns `true` when the query should be invalidated after patching.
+ * @returns `true` when membership-deciding lists should reconcile.
  */
-function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): boolean {
-  if (changed.has("archived")) return true;
-  if (changed.has("title")) return true;
-  // A labels change can move a row between project-filtered variants and the
-  // project folders (["project-sessions", …]). A session relabeled INTO the
-  // selected project isn't in that filtered cache yet, so no local patch can
-  // place it; only a server reconcile can. The unfiltered variant where the
-  // row lives detects the label change here and flags the refetch, and the
-  // caller's invalidation is prefix-wide (["conversations"]), so it reconciles
-  // the filtered variants too.
-  if (changed.has("labels")) return true;
-  // updated_at only affects the server's sort order. The active chat row is
-  // pinned at its position by ActiveChatOverride regardless of that order, so
-  // an updated_at bump on it — the common case while the user sends messages —
-  // never changes what's visible. Skip the full-list refetch it would
-  // otherwise force every tick. Any other row's updated_at still needs the
-  // server resort to move it.
-  if (changed.has("updated_at") && !isActiveRow) return true;
-  return false;
+function changedFieldsNeedRefetch(changed: Set<string>): boolean {
+  return (
+    changed.has("archived") ||
+    changed.has("title") ||
+    changed.has("labels") ||
+    changed.has("project_id")
+  );
 }
 
 /**
@@ -260,32 +282,30 @@ function changedFieldsNeedRefetch(changed: Set<string>, isActiveRow: boolean): b
  * value actually changed — pages and the top-level object keep their old
  * reference when nothing changed, so the caller can skip the
  * `setQueryData` (and the re-render) entirely. Items whose id isn't present
- * in any page are reported back via `found` so the caller can treat them as
- * structural additions (a debounced refetch), rather than guessing where to
- * insert them in the server's sort order.
+ * in any page are absent from `found`, so the caller can place them
+ * ({@link insertNewRowsIntoPages}) or leave them to a reconcile.
  *
  * @param data - The cached infinite data, or `undefined` for an unfetched
  *   query.
  * @param itemsById - Wire items keyed by conversation id.
  * @param filters - Canonical filters for this conversations query.
- * @param activeId - The active chat's conversation id (`/c/:id`), or
- *   `undefined` when not on a chat route. Its `updated_at` bumps don't force
- *   a refetch because `ActiveChatOverride` pins its visible position.
- * @returns The possibly updated data, ids found in it, and whether this
- *   query needs a server refetch after the local patch.
+ * @returns The possibly updated data, ids found in it, and whether a
+ *   membership-deciding field changed.
  */
 export function mergeItemsIntoPages(
   data: ConversationsInfiniteData | undefined,
   itemsById: Map<string, SessionListWireItem>,
   filters: ConversationListFilters,
-  activeId: string | undefined,
 ): { data: ConversationsInfiniteData | undefined; found: Set<string>; needsRefetch: boolean } {
   const found = new Set<string>();
   if (!data) return { data, found, needsRefetch: false };
+  const sortBy = filters.sortBy ?? "updated_at";
   let anyPageChanged = false;
   let needsRefetch = false;
-  const pages = data.pages.map((page) => {
+  const lastIndex = data.pages.length - 1;
+  const pages = data.pages.map((page, index) => {
     let rowChanged = false;
+    const bumped = new Set<string>();
     const nextData: Conversation[] = [];
     for (const conv of page.data) {
       const wire = itemsById.get(conv.id);
@@ -305,15 +325,25 @@ export function mergeItemsIntoPages(
         needsRefetch = true;
         continue;
       }
-      if (changedFieldsNeedRefetch(changed, conv.id === activeId)) {
+      if (changedFieldsNeedRefetch(changed)) {
         needsRefetch = true;
       }
+      if (changed.has(sortBy)) bumped.add(conv.id);
       rowChanged = true;
       nextData.push(nextConv);
     }
     if (!rowChanged) return page;
     anyPageChanged = true;
-    return { ...page, data: nextData };
+    // No sort-key change: the page order holds. An evicted anchor still exists
+    // server-side (archived or moved), so its cursor stays valid.
+    if (bumped.size === 0) return { ...page, data: nextData };
+    // Re-sort locally and repair the cursor for the new order.
+    nextData.sort((a, b) => compareSessionRows(a, b, sortBy));
+    return {
+      ...page,
+      data: nextData,
+      last_id: cursorAfterResort(page, nextData, bumped, index === lastIndex),
+    };
   });
   if (!anyPageChanged) return { data, found, needsRefetch };
   return { data: { ...data, pages }, found, needsRefetch };
@@ -358,11 +388,13 @@ export function unmarkRecentlyCreated(id: string): void {
 /**
  * Prepend brand-new rows (a create here or elsewhere, a share) to page 0 so the
  * sidebar shows them the instant the push lands, instead of after the debounced
- * refetch (which lags the search index). A new row sorts newest-first, so page 0
- * is its home. Skips: search lists (membership unknown), archived/wrong-project
- * rows, sub-agent children (`parent_session_id` — they live off the sidebar),
- * and ids the caller excludes via `skip` (e.g. an optimistic delete in flight).
- * `candidates` should already exclude rows the list holds.
+ * refetch (which lags the search index). Rendering sorts by the list's key, so
+ * page 0 is a fine home for any row newer than the oldest loaded one. Skips:
+ * search lists (membership unknown), archived/wrong-project rows, sub-agent
+ * children (`parent_session_id` — they live off the sidebar), rows that sort
+ * onto an unloaded page, and ids the caller excludes via `skip` (e.g. an
+ * optimistic delete in flight). `candidates` should already exclude rows the
+ * list holds.
  */
 export function insertNewRowsIntoPages(
   data: ConversationsInfiniteData | undefined,
@@ -375,7 +407,15 @@ export function insertNewRowsIntoPages(
   if (!data || candidates.size === 0 || filters.searchQuery) return { data, inserted: [] };
   if (filters.visibility === "archived") return { data, inserted: [] };
   const present = new Set<string>();
-  for (const page of data.pages) for (const c of page.data) present.add(c.id);
+  const sortBy = filters.sortBy ?? "updated_at";
+  let oldest: Conversation | undefined;
+  for (const page of data.pages) {
+    for (const c of page.data) {
+      present.add(c.id);
+      if (!oldest || compareSessionRows(c, oldest, sortBy) > 0) oldest = c;
+    }
+  }
+  const complete = !data.pages.at(-1)?.has_more;
   const rows: Conversation[] = [];
   for (const [id, wire] of candidates) {
     if (present.has(id) || skip?.(id)) continue;
@@ -390,6 +430,8 @@ export function insertNewRowsIntoPages(
       id,
     };
     if (conv.parent_session_id != null || violatesKnownMembership(conv, filters)) continue;
+    // Sorts after every loaded row: it belongs on a page that isn't loaded yet.
+    if (!complete && oldest && compareSessionRows(conv, oldest, sortBy) > 0) continue;
     // Ownership-aware insertion for scoped caches. `conv.owner` is null/absent
     // when the row is owned by the viewer (single-user / legacy shape) or
     // explicitly set to another user's id when the session was shared.
@@ -415,6 +457,34 @@ export function lastIdAfterFiltering(
   return rows.at(-1)?.id ?? emptyCursor;
 }
 
+/**
+ * Cursor for a re-sorted page.
+ *
+ * A legacy row-id cursor names the page's oldest loaded row; the next page is
+ * `after=<that row>`. Only such a cursor (anchored at the original tail) is
+ * repaired — an opaque token or a rewind cursor placed before retained history
+ * (see `refreshScopeWindow`) stays put. After a re-sort:
+ *   - an evicted anchor still resolves server-side (archived or moved), so the
+ *     cursor stays on it;
+ *   - otherwise the cursor follows the surviving tail, unless that tail is a row
+ *     we just bumped on a page with more to load. The server would resolve it at
+ *     its new position and replay already-loaded rows, so drop the cursor and
+ *     let the caller reconcile the list from its head.
+ */
+function cursorAfterResort(
+  page: ConversationsPage,
+  rows: Conversation[],
+  bumped: ReadonlySet<string>,
+  isLastPage: boolean,
+): string | null {
+  const anchor = page.data.at(-1)?.id;
+  if (page.last_id !== anchor) return page.last_id;
+  if (!rows.some((row) => row.id === anchor)) return page.last_id;
+  const tail = rows.at(-1)?.id ?? null;
+  if (isLastPage && page.has_more && tail !== null && bumped.has(tail)) return null;
+  return tail;
+}
+
 /** Drop matching rows while preserving opaque continuation metadata. */
 export function removeIdsFromPages(
   data: ConversationsInfiniteData | undefined,
@@ -435,6 +505,17 @@ export function removeIdsFromPages(
   });
   if (!changed) return { data, removed: false };
   return { data: { ...data, pages }, removed: true };
+}
+
+/**
+ * Keep only an infinite query's first page, so the refetch that follows costs
+ * one request instead of one per loaded page.
+ */
+export function firstPageOnly(
+  data: ConversationsInfiniteData | undefined,
+): ConversationsInfiniteData | undefined {
+  if (!data || data.pages.length <= 1) return data;
+  return { ...data, pages: data.pages.slice(0, 1), pageParams: data.pageParams.slice(0, 1) };
 }
 
 /**
@@ -463,6 +544,28 @@ export function collectConversationIds(datas: (ConversationsInfiniteData | undef
  * merge uses when overlaying rows into them.
  */
 export const PROJECT_FOLDER_FILTERS = { searchQuery: "", includeArchived: false } as const;
+
+/**
+ * Write a locally merged list back, reconciling a cursor the re-sort stranded.
+ * {@link mergeItemsIntoPages} can null a `has_more` tail page's `last_id` when a
+ * bump leaves a reordered row as that page's anchor; `getNextPageParam` then
+ * reads the page as fully loaded and paging stops. Invalidate so the list
+ * reloads with a fresh cursor; the overlay still paints first, then the refetch
+ * converges the tail.
+ */
+export function commitMergedList(
+  queryClient: QueryClient,
+  key: QueryKey,
+  prev: ConversationsInfiniteData | undefined,
+  next: ConversationsInfiniteData | undefined,
+): void {
+  if (next === prev) return;
+  queryClient.setQueryData(key, next);
+  const tail = next?.pages.at(-1);
+  if (tail?.has_more && !tail.last_id) {
+    void queryClient.invalidateQueries({ queryKey: key, exact: true });
+  }
+}
 
 /**
  * Overlay a title into every cache that holds a row for one session.
@@ -500,21 +603,19 @@ export function overlayTitleIntoCaches(
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["conversations"],
   })) {
-    // activeId only gates `needsRefetch`, which both callers ignore —
-    // they patch in place rather than refetching.
+    // Both callers ignore `needsRefetch` — they patch in place.
     const { data: next } = mergeItemsIntoPages(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
-    if (next !== data) queryClient.setQueryData(key, next);
+    commitMergedList(queryClient, key, data, next);
   }
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
-    if (next !== data) queryClient.setQueryData(key, next);
+    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS);
+    commitMergedList(queryClient, key, data, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
     old ? { ...old, title, ...(updatedAt !== undefined ? { updated_at: updatedAt } : {}) } : old,
@@ -554,15 +655,14 @@ export function overlayArchivedIntoCaches(
       data,
       itemsById,
       filtersFromConversationQueryKey(key),
-      undefined,
     );
-    if (next !== data) queryClient.setQueryData(key, next);
+    commitMergedList(queryClient, key, data, next);
   }
   for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
     queryKey: ["project-sessions"],
   })) {
-    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS, undefined);
-    if (next !== data) queryClient.setQueryData(key, next);
+    const { data: next } = mergeItemsIntoPages(data, itemsById, PROJECT_FOLDER_FILTERS);
+    commitMergedList(queryClient, key, data, next);
   }
   queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
     old ? { ...old, archived } : old,

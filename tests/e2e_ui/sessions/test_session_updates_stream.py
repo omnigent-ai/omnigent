@@ -28,14 +28,19 @@ viewport (1280×720) is desktop, so the sidebar is shown without a toggle.
 
 from __future__ import annotations
 
+import json
+import re
+import time
 import uuid
+from collections.abc import Iterator
+from urllib.parse import parse_qs, urlparse
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, Page, Request, expect
+from playwright.sync_api import Browser, Locator, Page, Request, WebSocket, expect
 
 from tests._helpers.session import post_session_bundle
-from tests.e2e_ui.conftest import _build_hello_world_bundle
+from tests.e2e_ui.conftest import TwoAgentChatSession, _build_hello_world_bundle
 
 
 @pytest.mark.compat_smoke
@@ -216,3 +221,194 @@ def test_session_created_elsewhere_appears_via_push(
         expect(page.locator(f'a[href="/c/{new_id}"]')).to_be_visible(timeout=20_000)
     finally:
         httpx.delete(f"{base_url}/v1/sessions/{new_id}", timeout=10.0)
+
+
+# ── Pushed updates must not refetch cached sidebar lists ──────────────────
+
+_PROJECT_LABEL_KEY = "omni_project"
+# Folders page by 20 (``useProjectSessions``); 22 rows gives a second ``after=`` page.
+_FOLDER_ROWS = 22
+_ASSISTANT_BUBBLE = '[data-testid="message-bubble"][data-role="assistant"]'
+# Dispatch turn + sub-agent turn + inbox auto-wake: three serial model calls.
+_RELAY_TIMEOUT_MS = 240_000
+# Longer than the server's 4 s rescan tick plus the client's 250 ms debounce.
+_SETTLE_MS = 6_000
+
+
+class SidebarTraffic:
+    """Record a page's ``GET /v1/sessions`` list requests and session-updates frames."""
+
+    def __init__(self, page: Page) -> None:
+        self.requests: list[tuple[float, str]] = []
+        self.frames: list[tuple[float, dict]] = []
+        page.on("request", self._on_request)
+        page.on("websocket", self._on_websocket)
+
+    def _on_request(self, request: Request) -> None:
+        if request.method == "GET" and "/v1/sessions?" in request.url:
+            self.requests.append((time.monotonic(), request.url))
+
+    def _on_websocket(self, socket: WebSocket) -> None:
+        if "/v1/sessions/updates" in socket.url:
+            socket.on("framereceived", self._on_frame)
+
+    def _on_frame(self, payload: str | bytes) -> None:
+        text = payload if isinstance(payload, str) else payload.decode()
+        try:
+            frame = json.loads(text)
+        except ValueError:
+            return
+        if frame.get("type") in ("snapshot", "changed", "removed"):
+            self.frames.append((time.monotonic(), frame))
+
+    def list_requests(self, since: int) -> list[str]:
+        return [url for _, url in self.requests[since:]]
+
+    def describe(self, since: int) -> str:
+        requests = [f"{t:.3f} {url}" for t, url in self.requests[since:]]
+        frames = []
+        for t, frame in self.frames:
+            items = frame.get("items") or []
+            summary = ",".join(
+                f"{item.get('id', '?')[:8]}(parent={str(item.get('parent_session_id'))[:8]},"
+                f"status={item.get('status')},updated_at={item.get('updated_at')})"
+                for item in items
+            )
+            frames.append(f"{t:.3f} {frame['type']} {summary or frame.get('ids')}")
+        return "list requests:\n  " + "\n  ".join(requests) + "\nframes:\n  " + "\n  ".join(frames)
+
+
+def file_sessions_into_project(base_url: str, project: str, count: int) -> list[str]:
+    ids: list[str] = []
+    for i in range(count):
+        resp = post_session_bundle(
+            httpx.post, f"{base_url}/v1/sessions", _build_hello_world_bundle(), timeout=30.0
+        )
+        resp.raise_for_status()
+        session_id = resp.json()["session_id"]
+        httpx.patch(
+            f"{base_url}/v1/sessions/{session_id}",
+            json={"title": f"Filed {i + 1:02d}", "labels": {_PROJECT_LABEL_KEY: project}},
+            timeout=10.0,
+        ).raise_for_status()
+        ids.append(session_id)
+    return ids
+
+
+@pytest.fixture
+def two_page_project_folder(live_server: str) -> Iterator[tuple[str, list[str]]]:
+    """A project folder with more sessions than one 20-row folder page."""
+    project = f"Load test {uuid.uuid4().hex[:6]}"
+    ids = file_sessions_into_project(live_server, project, _FOLDER_ROWS)
+    try:
+        yield project, ids
+    finally:
+        for session_id in ids:
+            httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0)
+
+
+def folder_section(page: Page, project: str) -> Locator:
+    header = page.get_by_role("button", name=project, exact=True)
+    return page.locator("section").filter(has=header)
+
+
+def expand_folder_to_all_pages(page: Page, project: str, expected_rows: int) -> None:
+    """Expand a project folder and load it past its first page."""
+    header = page.get_by_role("button", name=project, exact=True)
+    expect(header).to_be_visible(timeout=30_000)
+    if header.get_attribute("aria-expanded") != "true":
+        header.click()
+    section = folder_section(page, project)
+    rows = section.locator('a[href^="/c/"]')
+    load_more = section.get_by_role("button", name="Load more", exact=True)
+    deadline = time.monotonic() + 30.0
+    while rows.count() < expected_rows:
+        # The sentinel auto-loads the next page once it nears the viewport; the
+        # button is the fallback when the folder is short enough not to scroll.
+        if load_more.is_visible():
+            load_more.click()
+        if time.monotonic() > deadline:
+            raise AssertionError(
+                f"folder {project!r} shows {rows.count()} rows, expected {expected_rows}"
+            )
+        page.wait_for_timeout(250)
+    expect(rows).to_have_count(expected_rows)
+
+
+def send_message(page: Page, text: str) -> None:
+    composer = page.get_by_role("textbox", name=re.compile("Message the agent|Send a message"))
+    expect(composer).to_be_visible(timeout=30_000)
+    composer.fill(text)
+    page.get_by_role("button", name="Send", exact=True).click()
+
+
+def dispatch_prompt(routing_token: str) -> str:
+    return (
+        "Ask Deep Thought for the Answer to the Ultimate Question of Life, the "
+        "Universe, and Everything, then tell me exactly what it said, including "
+        f"its verification code. Routing marker: {routing_token}"
+    )
+
+
+def folder_page_reloads(urls: list[str], project: str) -> list[str]:
+    """Folder page requests with an ``after=`` cursor, i.e. an already-loaded page re-requested."""
+    return [
+        url
+        for url in urls
+        if "after=" in url and parse_qs(urlparse(url).query).get("project") == [project]
+    ]
+
+
+def test_pushed_updates_do_not_reload_loaded_sidebar_pages(
+    request: pytest.FixtureRequest,
+    browser: Browser,
+    two_agent_chat_session: TwoAgentChatSession,
+    two_page_project_folder: tuple[str, list[str]],
+) -> None:
+    """Running an agent that spawns a sub-agent must not re-page expanded folders.
+
+    Tab A opens the orchestrator session; tab B sits on the landing page where
+    the orchestrator is a non-active row. Both expand the same folder past its
+    first page. The dispatch then produces pushed ``changed`` frames: the
+    orchestrator's status/updated_at (already cached in both tabs) and the
+    sub-agent row (never in a ``kind=default`` list). Neither may make the
+    client re-request the folder's already-loaded ``after=`` page.
+    """
+    chat = two_agent_chat_session
+    project, _ = two_page_project_folder
+    page = request.getfixturevalue("page")
+    observer_ctx = browser.new_context()
+    try:
+        observer = observer_ctx.new_page()
+        traffic_a = SidebarTraffic(page)
+        traffic_b = SidebarTraffic(observer)
+
+        page.goto(f"{chat.base_url}/c/{chat.session_id}")
+        # `.first`: the Agents rail renders a second link to the open session.
+        expect(page.locator(f'a[href="/c/{chat.session_id}"]').first).to_be_visible(timeout=30_000)
+        expand_folder_to_all_pages(page, project, _FOLDER_ROWS)
+        observer.goto(f"{chat.base_url}/")
+        expect(observer.locator(f'a[href="/c/{chat.session_id}"]').first).to_be_visible(
+            timeout=30_000
+        )
+        expand_folder_to_all_pages(observer, project, _FOLDER_ROWS)
+        page.wait_for_timeout(_SETTLE_MS)
+        baseline_a = len(traffic_a.requests)
+        baseline_b = len(traffic_b.requests)
+
+        send_message(page, dispatch_prompt(chat.routing_token))
+        reply = page.locator(_ASSISTANT_BUBBLE, has_text=chat.verification_code).first
+        expect(reply).to_be_visible(timeout=_RELAY_TIMEOUT_MS)
+        page.wait_for_timeout(_SETTLE_MS)
+
+        reloads_a = folder_page_reloads(traffic_a.list_requests(baseline_a), project)
+        reloads_b = folder_page_reloads(traffic_b.list_requests(baseline_b), project)
+        assert reloads_a == [] and reloads_b == [], (
+            "pushed updates re-requested loaded folder pages\n"
+            f"orchestrator tab: {len(reloads_a)} after= reloads\n"
+            f"{traffic_a.describe(baseline_a)}\n"
+            f"landing tab: {len(reloads_b)} after= reloads\n"
+            f"{traffic_b.describe(baseline_b)}"
+        )
+    finally:
+        observer_ctx.close()
