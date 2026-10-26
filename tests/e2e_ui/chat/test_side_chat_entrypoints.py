@@ -649,9 +649,12 @@ def test_side_chat_interrupt_allows_followup_without_stopping_parent(
         _wait_for_blocked_reply(page, mock_llm_server_url, "The side chat")
 
         parent_items = _items(base_url, session_id)
-        page.get_by_test_id("side-chat-input").fill(followup)
+        side_input = page.get_by_test_id("side-chat-input")
+        side_input.fill(followup)
+        # A draft swaps Interrupt for Send, so Escape interrupts as in the main composer.
+        expect(interrupt).to_have_count(0)
         with page.expect_response(f"**/v1/sessions/{child_id}/events") as interrupted:
-            interrupt.click()
+            side_input.press("Escape")
         assert interrupted.value.ok
         assert interrupted.value.request.post_data_json["type"] == "interrupt"
         expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
