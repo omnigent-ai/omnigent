@@ -988,7 +988,7 @@ let now = Date.now();
 Date.now = () => now;
 const originalSetTimeout = global.setTimeout;
 global.setTimeout = (callback, delay, ...args) => {
-  if (delay >= 1000) {
+  if ([1000, 2000, 4000, 8000].includes(delay)) {
     retryDelays.push(delay);
     now += delay;
     queueMicrotask(() => callback(...args));
@@ -1016,7 +1016,9 @@ const pi = {
   on(name, handler) { handlers[name] = handler; },
 };
 require(extensionPath)(pi);
-const ctx = { ui: { setTitle() {}, setStatus() {}, notify() {} } };
+const notices = [];
+const ctx = { ui: { setTitle() {}, setStatus() {}, notify(text) { notices.push(text); } } };
+const settleHistory = () => new Promise(setImmediate);
 function assistantItems() {
   return posted.filter(
     (event) =>
@@ -1045,6 +1047,7 @@ def test_assistant_message_retries_with_stable_source_and_exact_text(
   };
   await handlers.message_end({ message }, ctx);
 
+  await settleHistory();
   const attempts = assistantItems();
   assert.equal(fetchCalls, 2, JSON.stringify(posted));
   assert.equal(attempts.length, 2, JSON.stringify(attempts));
@@ -1072,10 +1075,10 @@ def test_assistant_message_retries_with_stable_source_and_exact_text(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_assistant_message_failure_propagates_and_400_is_not_retried(
+def test_assistant_delivery_failure_is_reported_and_400_is_not_retried(
     tmp_path: Path,
 ) -> None:
-    """Exhausted transient failures reject, while a permanent 400 is single-shot."""
+    """Background failures notify the user; permanent errors are single-shot."""
     script = (
         _ASSISTANT_DURABILITY_HARNESS
         + r"""
@@ -1091,14 +1094,10 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
     responseId: "pi-response-transient",
     content: [{ type: "text", text: "retry then surface" }],
   };
-  let failure;
-  try {
-    await handlers.message_end({ message: transientMessage }, ctx);
-  } catch (error) {
-    failure = error;
-  }
-  assert.ok(failure, "exhausted assistant persistence must reject");
-  assert.match(String(failure && failure.message), /HTTP 503/);
+  await handlers.message_end({ message: transientMessage }, ctx);
+  await settleHistory();
+  assert.equal(notices.length, 1);
+  assert.match(diagnostics.join("\n"), /HTTP 503/);
   assert.equal(fetchCalls, 5, JSON.stringify(posted));
   assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
   assert.equal(assistantItems().length, 5, JSON.stringify(posted));
@@ -1128,14 +1127,10 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
     responseId: "pi-response-permanent",
     content: [{ type: "text", text: "bad request answer" }],
   };
-  failure = undefined;
-  try {
-    await handlers.message_end({ message: permanentMessage }, ctx);
-  } catch (error) {
-    failure = error;
-  }
-  assert.ok(failure, "permanent assistant persistence must reject");
-  assert.match(String(failure && failure.message), /HTTP 400/);
+  await handlers.message_end({ message: permanentMessage }, ctx);
+  await settleHistory();
+  assert.equal(notices.length, 2);
+  assert.match(diagnostics.join("\n"), /HTTP 400/);
   assert.equal(fetchCalls, 7, JSON.stringify(posted));
   assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
 })().catch((error) => {
@@ -1167,6 +1162,11 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
     } }],
     user: ["input", { text: "terminal prompt", source: "extension" }],
   };
+  if (kind === "tool_result") {
+    await handlers.message_update(events.tool_call[1], ctx);
+    await settleHistory();
+    posted.length = 0;
+  }
   const [handler, event] = events[kind];
   const invoke = () => handlers[handler](event, ctx);
   let status = 503;
@@ -1177,6 +1177,7 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
     return { ok: status === 204, status };
   };
   await invoke();
+  await settleHistory();
   assert.match(diagnostics.join("\n"), /Failed to persist.*HTTP 503/);
   assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
   let items = posted.filter((body) => body.type === "external_conversation_item");
@@ -1186,12 +1187,14 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
 
   status = 204;
   await invoke();
+  await settleHistory();
   items = posted.filter((body) => body.type === "external_conversation_item");
   assert.equal(items.length, 6);
   if (kind !== "user") {
     // A rejected delivery remains eligible; accepted callbacks are suppressed.
     assert.deepEqual(items[0], items[5]);
     await invoke();
+  await settleHistory();
     assert.equal(posted.filter((body) => body.type === "external_conversation_item").length, 6);
   }
   if (kind === "reasoning") {
@@ -1202,32 +1205,6 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path), kind)
-    assert result.returncode == 0, result.stdout + result.stderr
-
-
-@pytest.mark.parametrize("verdict", ["ALLOW", "DENY"])
-def test_failed_tool_history_delivery_still_checks_policy(tmp_path: Path, verdict: str) -> None:
-    script = (
-        _ASSISTANT_DURABILITY_HARNESS
-        + r"""
-(async () => {
-  let policyCalls = 0;
-  global.fetch = async (url, request) => {
-    if (url.endsWith("/events")) return { ok: false, status: 503 };
-    policyCalls += 1;
-    const result = `POLICY_ACTION_${process.argv[3]}`;
-    return { ok: true, text: async () => JSON.stringify({ result }) };
-  };
-  const result = await handlers.tool_call({
-    toolCallId: "call-denied", toolName: "bash", input: { command: "echo safe" },
-  }, ctx);
-  assert.equal(policyCalls, 1);
-  assert.equal(Boolean(result && result.block), process.argv[3] === "DENY");
-  assert.match(diagnostics.join("\n"), /Failed to persist function_call/);
-})().catch(error => { console.error(error); process.exit(1); });
-"""
-    )
-    result = _run_node(script, str(_extension_path()), str(tmp_path), verdict)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -1243,6 +1220,7 @@ def test_history_retry_stops_before_exceeding_elapsed_budget(tmp_path: Path) -> 
     return { ok: false, status: 503 };
   };
   await handlers.input({ text: "keep working", source: "extension" }, ctx);
+  await settleHistory();
   assert.equal(fetchCalls, 4);
   assert.deepEqual(retryDelays, [1000, 2000, 4000]);
   assert.equal(Date.now() - started, 27000);
@@ -1283,11 +1261,13 @@ def test_failed_history_item_preserves_later_items_and_usage(tmp_path: Path, han
     { toolCallId: "failed", content: [{ type: "text", text: "failed output" }] },
     { toolCallId: "later", content: [{ type: "text", text: "later output" }] },
   ] }, ctx);
+  await settleHistory();
   const items = accepted.filter(item => item.type === "external_conversation_item");
   assert.deepEqual(items.map(item => item.data.item_type), [
     "function_call", "reasoning", handler === "message_end" ? "message" : "function_call_output",
   ]);
   assert.ok(accepted.some(item => item.type === "external_session_usage"));
+  await settleHistory();
   assert.match(diagnostics.join("\n"), /Failed to persist function_call/);
 })().catch(error => { process.stderr.write(String(error)); process.exit(1); });
 """
@@ -1311,10 +1291,12 @@ def test_reasoning_identity_survives_lost_ack_across_callbacks(tmp_path: Path) -
   await handlers.message_update({ assistantMessageEvent: {
     type: "thinking_end", contentIndex: 0, content: "plan",
   } }, ctx);
+  await settleHistory();
   loseAck = false;
   await handlers.message_end({ message: { role: "assistant", content: [
     { type: "thinking", thinking: "plan", thinkingSignature: "different-hint" },
   ] } }, ctx);
+  await settleHistory();
   const reasoning = posted.filter(item => item.data?.item_type === "reasoning");
   assert.equal(reasoning.length, 6);
   assert.equal(new Set(reasoning.map(item => item.data.source_id)).size, 1);
@@ -1323,6 +1305,167 @@ def test_reasoning_identity_survives_lost_ack_across_callbacks(tmp_path: Path) -
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("verdict", ["ALLOW", "DENY"])
+def test_history_outage_does_not_delay_hooks_and_coalesces_callbacks(
+    tmp_path: Path, verdict: str
+) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let release, policyCalls = 0;
+  const accepted = [];
+  global.fetch = async (url, request) => {
+    if (!url.endsWith('/events')) {
+      policyCalls++;
+      return {ok: true,
+    text: async () => JSON.stringify({result: `POLICY_ACTION_${process.argv[3]}`})};
+    }
+    const body = JSON.parse(request.body);
+    if (body.type !== 'external_conversation_item') return {ok: true, status: 204};
+    if (!release) await new Promise(resolve => { release = resolve; });
+    accepted.push(body.data);
+    return {ok: true, status: 204};
+  };
+  const tool = {id: 'call-1', name: 'read', arguments: {path: 'example.txt'}};
+  const result = {toolCallId: 'call-1', content: [{type: 'text', text: 'contents'}]};
+  const message = {role: 'assistant', timestamp: 12, content: [
+    {type: 'toolCall', ...tool}, {type: 'thinking', thinking: 'plan'}, {type: 'text',
+    text: 'done'},
+  ]};
+  const watchdog = originalSetTimeout(() => { throw new Error('history blocked Pi hooks'); }, 500);
+  await handlers.input({text: 'read a file', source: 'extension'}, ctx);
+  await handlers.message_update({assistantMessageEvent: {type: 'toolcall_end',
+    toolCall: tool}}, ctx);
+  const decision = await handlers.tool_call({toolCallId: tool.id, toolName: tool.name,
+    input: tool.arguments}, ctx);
+  assert.equal(policyCalls, 1);
+  assert.equal(Boolean(decision?.block), process.argv[3] === 'DENY');
+  if (!decision?.block) await handlers.tool_result(result, ctx);
+  await handlers.message_end({message}, ctx);
+  await handlers.turn_end({message, toolResults: decision?.block ? [] : [result]}, ctx);
+  clearTimeout(watchdog);
+  assert.equal(accepted.length, 0);
+  release();
+  await handlers.session_shutdown();
+  assert.deepEqual(accepted.map(item => item.item_type), [
+    'message', 'function_call', ...(decision?.block ? [] : ['function_call_output']),
+    'reasoning', 'message',
+  ]);
+  assert.equal(new Set(accepted.map(item => item.source_id)).size, accepted.length);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), verdict)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("recover", [True, False])
+def test_result_retries_its_failed_call_before_delivery(tmp_path: Path, recover: bool) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let status = 503;
+  const accepted = [];
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    if (body.type !== 'external_conversation_item') return {ok: true, status: 204};
+    const code = body.data.item_type === 'function_call' ? status : 204;
+    if (code === 204) accepted.push(body.data.item_type);
+    return {ok: code === 204, status: code};
+  };
+  const tool = {id: 'call-1', name: 'read', arguments: {path: 'example.txt'}};
+  await handlers.message_update({assistantMessageEvent: {type: 'toolcall_end',
+    toolCall: tool}}, ctx);
+  await settleHistory();
+  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  status = process.argv[3] === 'True' ? 204 : 400;
+  const result = {toolCallId: 'call-1', content: [{type: 'text', text: 'contents'}]};
+  await handlers.tool_result(result, ctx);
+  await handlers.turn_end({message: {role: 'assistant', content: [{type: 'toolCall',
+    ...tool}]}, toolResults: [result]}, ctx);
+  await handlers.tool_result({...result, toolCallId: 'unknown'}, ctx);
+  await handlers.session_shutdown();
+  assert.deepEqual(accepted, status === 204 ? ['function_call', 'function_call_output'] : []);
+  assert.match(diagnostics.join('\n'), /Withholding result without a queued call/);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), str(recover))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("shutdown", [False, True])
+def test_history_hung_fetch_is_aborted_and_shutdown_is_bounded(
+    tmp_path: Path, shutdown: bool
+) -> None:
+    harness = _ASSISTANT_DURABILITY_HARNESS
+    if shutdown:
+        harness = harness.replace(
+            "assistantItemPostTimeoutMs: 10", "assistantItemPostTimeoutMs: 60000"
+        )
+    script = (
+        harness
+        + r"""
+(async () => {
+  let aborts = 0;
+  global.fetch = async (_url, request) => new Promise((_resolve, reject) => {
+    request.signal.addEventListener('abort', () => {
+      aborts++;
+      reject(request.signal.reason);
+    }, {once: true});
+  });
+  await handlers.input({text: 'hang', source: 'extension'}, ctx);
+  const start = performance.now();
+  await handlers.session_shutdown();
+  const elapsed = performance.now() - start;
+  assert.equal(aborts, process.argv[3] === 'True' ? 1 : 5, JSON.stringify({diagnostics,
+    retryDelays,elapsed}));
+  assert.ok(elapsed < 6500, String(elapsed));
+  if (process.argv[3] === 'True') assert.ok(elapsed >= 4900, String(elapsed));
+  assert.match(diagnostics.join('\n'), /Failed to persist/);
+  await handlers.input({text: 'after shutdown', source: 'extension'}, ctx);
+  assert.match(diagnostics.join('\n'), /History queue closed/);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), str(shutdown))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("limit", ["items", "bytes"])
+def test_history_queue_bounds_backlog(tmp_path: Path, limit: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let release;
+  const accepted = [];
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    if (!release) await new Promise(resolve => { release = resolve; });
+    accepted.push(body.data.item_data.content[0].text);
+    return {ok: true, status: 204};
+  };
+  const items = process.argv[3] === 'items';
+  const count = items ? 257 : 3;
+  for (let index = 0; index < count; index++) {
+    await handlers.input({text: items ? String(index) : 'x'.repeat(8 * 1024 * 1024),
+    source: 'extension'}, ctx);
+  }
+  assert.match(diagnostics.join('\n'), /History queue full/);
+  release();
+  await handlers.session_shutdown();
+  assert.equal(accepted.length, items ? 256 : 1);
+  if (items) assert.deepEqual(accepted, Array.from({length: 256}, (_, i) => String(i)));
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), limit)
     assert result.returncode == 0, result.stdout + result.stderr
 
 
@@ -4302,12 +4445,15 @@ const originalError = "API key auth failed for provider omnigent: " +
       kind: "failed_exit", piPid: process.pid, at: Date.now(), secret: "DO-NOT-SHOW", ...patch,
     }));
     const bodies = [];
+    let delivered;
+    const delivery = new Promise(resolve => { delivered = resolve; });
     global.fetch = async (_url, request) => {
       const body = JSON.parse(request.body);
       postedEvents.push(body);
       if (body.data && body.data.item_type === "error") {
         bodies.push(body);
         if (bodies.length === 1) throw new Error("socket closed during token resolution");
+        delivered();
       }
       return {ok: true};
     };
@@ -4315,6 +4461,8 @@ const originalError = "API key auth failed for provider omnigent: " +
       role: "assistant", provider: "omnigent", stopReason: "error", errorMessage: originalError,
       content: [],
     }}, ctx);
+    await delivery;
+    await new Promise(setImmediate);
     const error = postedEvents.find(e => e.data && e.data.item_type === "error");
     assert.ok(error);
     assert.equal(bodies.length, 2);
@@ -4332,6 +4480,7 @@ const originalError = "API key auth failed for provider omnigent: " +
         role: "assistant", provider: "omnigent", stopReason: "error", errorMessage: originalError,
         content: [], timestamp: Date.now(),
       }}, ctx);
+      await new Promise(setImmediate);
       const nextError = postedEvents.find(e => e.data && e.data.item_type === "error");
       assert.equal(nextError.data.item_data.code, "RuntimeError");
     }

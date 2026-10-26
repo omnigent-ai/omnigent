@@ -799,11 +799,18 @@ call, result and final answer should appear once. Extension regressions in
 stable item identity, later-item delivery and policy evaluation after failure; server
 idempotency is covered by
 `tests/server/integration/test_sessions_external_item_idempotency.py`.
-History retries wait 1, 2, 4 and 8 seconds, with five attempts and a 30-second
-per-item budget. After exhaustion, tool/input history failures are logged without
-blocking the tool, prompt or later items. Final assistant delivery retains its
-error signal. Transient streaming chunks are not replayed. Component checks do
-not establish desktop rendering parity.
+History delivery runs in an ordered background queue: Pi's input/tool/message
+hooks do not await its retries. Retry delays are 1, 2, 4 and 8 seconds, with five
+attempts and a 30-second per-item budget. Verify policy ALLOW/DENY still runs
+while a history POST is stalled. After a call exhausts retries, its result must
+re-send and acknowledge that call first; otherwise withhold/log the result.
+Repeated callbacks coalesce while pending; accepted items are suppressed.
+The queue and retained call cache each cap at 256 items / 16 MiB; overflow is
+logged. Shutdown drains for at most five seconds, then aborts outstanding writes.
+This is memory-only delivery, not recovery after a process crash. Final-answer
+persistence failures notify the terminal user. Deduplication requires a server
+that supports `source_id`; streaming chunks are not replayed. Component checks
+do not establish desktop rendering parity.
 
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered

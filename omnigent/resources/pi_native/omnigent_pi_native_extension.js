@@ -907,7 +907,7 @@ function assistantItemPostTimeoutMs(config) {
 }
 
 // Persisted history survives transient failures with a stable deduplication key.
-async function postConversationItem(config, data, sourceId) {
+async function postConversationItem(config, data, sourceId, signal) {
   const body = {
     type: "external_conversation_item",
     data: { ...data, source_id: boundedSourceId(sourceId) },
@@ -916,6 +916,7 @@ async function postConversationItem(config, data, sourceId) {
   let lastError;
   const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
   for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    signal?.throwIfAborted();
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
     const controller = new AbortController();
@@ -924,7 +925,11 @@ async function postConversationItem(config, data, sourceId) {
       Math.min(assistantItemPostTimeoutMs(config), remaining),
     );
     try {
-      return await postEventChecked(config, body, controller.signal);
+      return await postEventChecked(
+        config,
+        body,
+        signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+      );
     } catch (err) {
       lastError = err;
     } finally {
@@ -936,21 +941,102 @@ async function postConversationItem(config, data, sourceId) {
       Date.now() + backoff >= deadline
     )
       break;
-    await sleep(backoff);
+    signal?.throwIfAborted();
+    await sleep(backoff, signal);
     backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
   }
   throw lastError || new Error("assistant conversation item POST failed");
 }
 
-async function persistHistoryItem(config, data, sourceId) {
-  try {
-    await postConversationItem(config, data, sourceId);
-    return true;
-  } catch (error) {
-    // History failure must not block input, tools or the remaining message items.
-    console.error(`[pi-native] Failed to persist ${data.item_type} (${sourceId}):`, error);
-    return false;
+// Bound retained payloads as well as item count while the server is unavailable.
+const _HISTORY_QUEUE_MAX_ITEMS = 256;
+const _HISTORY_QUEUE_MAX_BYTES = 16 * 1024 * 1024;
+const _HISTORY_SHUTDOWN_TIMEOUT_MS = 5_000;
+
+function createHistoryQueue(config) {
+  const pending = new Map();
+  const controller = new AbortController();
+  let queuedBytes = 0;
+  let worker = null;
+  let closed = false;
+
+  async function deliver(item) {
+    if (item.accepted) return;
+    await postConversationItem(config, item.data, item.sourceId, controller.signal);
+    item.accepted = true;
+    item.onAccepted?.();
   }
+
+  async function drain() {
+    for (const [sourceId, item] of pending) {
+      if (controller.signal.aborted) break;
+      try {
+        // A result cannot overtake a call whose earlier delivery exhausted retries.
+        if (item.dependency) await deliver(item.dependency);
+        await deliver(item);
+      } catch (error) {
+        console.error(`[pi-native] Failed to persist ${item.data.item_type} (${sourceId}):`, error);
+        try {
+          item.onFailure?.(error);
+        } catch (notificationError) {
+          console.error("[pi-native] History failure notification failed:", notificationError);
+        }
+      } finally {
+        pending.delete(sourceId);
+        queuedBytes -= item.bytes;
+      }
+    }
+    if (pending.size) {
+      console.error(`[pi-native] Discarding ${pending.size} history items at shutdown`);
+      pending.clear();
+      queuedBytes = 0;
+    }
+  }
+
+  function start() {
+    worker = drain().finally(() => {
+      worker = null;
+      if (pending.size) start();
+    });
+  }
+
+  return {
+    enqueue(data, sourceId, { onAccepted, dependency, onFailure, previous } = {}) {
+      const existing = pending.get(sourceId);
+      if (existing) return existing;
+      const bytes = previous?.bytes ??
+        (Buffer.byteLength(JSON.stringify(data)) + (dependency?.bytes || 0));
+      if (
+        closed || pending.size >= _HISTORY_QUEUE_MAX_ITEMS ||
+        queuedBytes + bytes > _HISTORY_QUEUE_MAX_BYTES
+      ) {
+        const error = new Error(`History queue ${closed ? "closed" : "full"}: ${data.item_type}`);
+        console.error("[pi-native]", error);
+        try {
+          onFailure?.(error);
+        } catch (notificationError) {
+          console.error("[pi-native] History failure notification failed:", notificationError);
+        }
+        return null;
+      }
+      const item = previous || {
+        data, sourceId, onAccepted, dependency, onFailure, bytes, accepted: false,
+      };
+      pending.set(sourceId, item);
+      queuedBytes += bytes;
+      if (!worker) start();
+      return item;
+    },
+    async close() {
+      closed = true;
+      const timeout = setTimeout(() => controller.abort(), _HISTORY_SHUTDOWN_TIMEOUT_MS);
+      try {
+        while (worker) await worker;
+      } finally {
+        clearTimeout(timeout);
+      }
+    },
+  };
 }
 
 function assistantMessageSourceId(message, responseId, text) {
@@ -1468,6 +1554,8 @@ function startInboxPoller(
 module.exports = function (pi) {
   process.env.OMNIGENT_PI_NATIVE_PID = String(process.pid);
   const config = readConfig();
+  const history = createHistoryQueue(config);
+  pi.on("session_shutdown", () => history.close());
   let sequence = 0;
   let turnOrdinal = 0;
   let activeResponseId = null;
@@ -1494,6 +1582,7 @@ module.exports = function (pi) {
   const postedAssistantMessages = new Set();
   const streamedReasoningBlocks = new Set();
   const toolCallsById = new Map();
+  let toolCallBytes = 0;
   const pendingInterruptMs = 30_000;
   // Live streaming state for assistant text deltas. Pi emits
   // message_update events carrying an assistantMessageEvent of type
@@ -1923,10 +2012,9 @@ module.exports = function (pi) {
     const name = String(toolCall.name || toolCall.toolName || "");
     if (!callId || !name) return;
     const key = `${responseId}:${callId}`;
-    toolCallsById.set(callId, { key, responseId, name });
     if (postedToolCalls.has(key)) return;
-    const accepted = await persistHistoryItem(
-      config,
+    const known = toolCallsById.get(callId);
+    const item = history.enqueue(
       {
         response_id: responseId,
         item_type: "function_call",
@@ -1940,8 +2028,22 @@ module.exports = function (pi) {
         },
       },
       `pi:tool-call:${key}`,
+      {
+        onAccepted: () => postedToolCalls.add(key),
+        previous: known?.key === key ? known.item : undefined,
+      },
     );
-    if (accepted) postedToolCalls.add(key);
+    toolCallBytes -= toolCallsById.get(callId)?.item?.bytes || 0;
+    toolCallsById.delete(callId);
+    toolCallsById.set(callId, { key, responseId, name, item });
+    toolCallBytes += item?.bytes || 0;
+    while (
+      toolCallsById.size > _HISTORY_QUEUE_MAX_ITEMS || toolCallBytes > _HISTORY_QUEUE_MAX_BYTES
+    ) {
+      const oldest = toolCallsById.keys().next().value;
+      toolCallBytes -= toolCallsById.get(oldest)?.item?.bytes || 0;
+      toolCallsById.delete(oldest);
+    }
   }
 
   async function postToolResult(event, responseId) {
@@ -1951,8 +2053,13 @@ module.exports = function (pi) {
     const known = toolCallsById.get(callId);
     const key = known && known.key ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
-    const accepted = await persistHistoryItem(
-      config,
+    const dependency = known?.item ||
+      (postedToolCalls.has(key) ? { accepted: true, bytes: 0 } : null);
+    if (!dependency) {
+      console.error(`[pi-native] Withholding result without a queued call: ${callId}`);
+      return;
+    }
+    history.enqueue(
       {
         response_id: known && known.responseId ? known.responseId : responseId,
         item_type: "function_call_output",
@@ -1962,8 +2069,8 @@ module.exports = function (pi) {
         },
       },
       `pi:tool-result:${key}`,
+      { onAccepted: () => postedToolResults.add(key), dependency },
     );
-    if (accepted) postedToolResults.add(key);
   }
 
   async function postCompletedReasoning(text, responseId, keyHint, streamed) {
@@ -1978,8 +2085,7 @@ module.exports = function (pi) {
         data: { delta: text, started: true },
       });
     }
-    const accepted = await persistHistoryItem(
-      config,
+    history.enqueue(
       {
         response_id: responseId,
         item_type: "reasoning",
@@ -1990,11 +2096,11 @@ module.exports = function (pi) {
         },
       },
       `pi:reasoning:${textKey}`,
+      { onAccepted: () => {
+        postedReasoning.add(key);
+        postedReasoning.add(textKey);
+      } },
     );
-    if (accepted) {
-      postedReasoning.add(key);
-      postedReasoning.add(textKey);
-    }
   }
 
   function reasoningBlockKey(responseId, contentIndex) {
@@ -2216,6 +2322,7 @@ module.exports = function (pi) {
     postedAssistantMessages.clear();
     streamedReasoningBlocks.clear();
     toolCallsById.clear();
+    toolCallBytes = 0;
     streamedTextIndex.clear();
     finalizedTextBlocks.clear();
     streamingMessageOrdinal = 0;
@@ -2383,8 +2490,7 @@ module.exports = function (pi) {
       }
     }
     const responseId = newResponseId("user");
-    await persistHistoryItem(
-      config,
+    history.enqueue(
       {
         response_id: responseId,
         item_type: "message",
@@ -2436,8 +2542,7 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      await postConversationItem(
-        config,
+      history.enqueue(
         {
           response_id: responseId,
           item_type: "error",
@@ -2458,8 +2563,7 @@ module.exports = function (pi) {
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
-    await postConversationItem(
-      config,
+    history.enqueue(
       {
         response_id: responseId,
         item_type: "message",
@@ -2470,10 +2574,13 @@ module.exports = function (pi) {
         },
       },
       sourceId,
+      {
+        onAccepted: () => postedAssistantMessages.add(sourceId),
+        onFailure: () => ctx?.ui?.notify?.(
+          "Omnigent could not save the assistant response; see host logs.", "error",
+        ),
+      },
     );
-    // Retry a failed callback on its next delivery; only suppress duplicates
-    // after the authoritative POST has been accepted.
-    postedAssistantMessages.add(sourceId);
   });
 
   pi.on("turn_end", async (event, ctx) => {
