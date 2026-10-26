@@ -221,7 +221,12 @@ export function CommandPalette({
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
   const searching = !sessionsOnly && debouncedQuery !== "";
-  const searchOptions = { enabled: open && searching, limit: SEARCH_GROUP_PAGE_SIZE };
+  // Wait for server info so a supporting server never gets the mixed request.
+  const serverInfoLoading = serverInfo === "loading";
+  const searchOptions = {
+    enabled: open && searching && !serverInfoLoading,
+    limit: SEARCH_GROUP_PAGE_SIZE,
+  };
   const titleSearch = useSessionSearch(
     debouncedQuery,
     groupedSearch ? "title" : "all",
@@ -286,7 +291,8 @@ export function CommandPalette({
   const loadMoreError = searching
     ? searchGroups.some((group) => group.isFetchNextPageError)
     : isFetchNextPageError;
-  const searchFetching = searchGroups.some((group) => group.isFetching);
+  const searchFetching =
+    (searching && serverInfoLoading) || searchGroups.some((group) => group.isFetching);
   const retrying = searching
     ? searchGroups.some((group) => group.isError && group.isFetching)
     : isFetching;

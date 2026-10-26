@@ -165,6 +165,28 @@ _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
 # ``list_conversations(search_scope=...)`` values; see its docstring.
 _SEARCH_SCOPES = frozenset({"all", "title", "content"})
 
+# Escapes LIKE wildcards in a search query. ``/``, as SQLAlchemy's own
+# ``autoescape`` uses, sidesteps MySQL's backslash handling in string literals.
+_LIKE_ESCAPE = "/"
+
+
+def _like_contains_pattern(query: str) -> str:
+    """
+    Return a lowercase ``LIKE`` pattern matching ``query`` as a literal substring.
+
+    :param query: The user's search string, e.g. ``"50%_off"``.
+    :returns: The pattern with ``%``, ``_`` and the escape character escaped,
+        e.g. ``"%50/%/_off%"``; pass ``escape=_LIKE_ESCAPE`` alongside it.
+    """
+    escaped = (
+        query.lower()
+        .replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", f"{_LIKE_ESCAPE}%")
+        .replace("_", f"{_LIKE_ESCAPE}_")
+    )
+    return f"%{escaped}%"
+
+
 # Upper bound on rows fetched per SQL statement when listing conversation
 # items. A deployed managed-Postgres backend failed one oversized read of a
 # large conversation (multi-megabyte pages 500'd at limit>=500 while limit<=400
@@ -663,7 +685,7 @@ def _fetch_search_snippets(
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
+    pattern = _like_contains_pattern(query)
     workspace_id = current_workspace_id()
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
@@ -675,7 +697,7 @@ def _fetch_search_snippets(
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
+        SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -3191,8 +3213,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
             if search_query:
-                pattern = f"%{search_query.lower()}%"
-                title_match = func.lower(SqlConversation.title).like(pattern)
+                pattern = _like_contains_pattern(search_query)
+                title_match = func.lower(SqlConversation.title).like(pattern, escape=_LIKE_ESCAPE)
                 # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
                 # form is uncorrelated, so the match set is built for the WHOLE
                 # workspace before the outer query discards every row the caller
@@ -3212,7 +3234,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                        SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE),
                     )
                     .exists()
                 )
