@@ -235,7 +235,7 @@ elif args[:3] == ['api', '--method', 'PUT']:
     assert args == ['api', '--method', 'PUT', 'repos/example/project/pulls/123/update-branch',
                     '-f', 'expected_head_sha=' + 'a' * 40]
     if data.get('update_exit'):
-        print('gh: branch update rejected (HTTP 422)', file=sys.stderr)
+        print(data.get('update_error', 'gh: branch update rejected (HTTP 422)'), file=sys.stderr)
         sys.exit(data['update_exit'])
 elif args[:3] == ['api', '--method', 'POST']:
     assert os.environ['GH_TOKEN'] == 'test-merge-token'
@@ -804,15 +804,15 @@ def test_age_uses_registry_timestamp_and_accepts_exact_boundary(policy_module, a
     policy_module.validate_release(package, api["pypi"], 7, datetime(2020, 1, 8, tzinfo=UTC))
 
 
-def set_changed_files(api, files):
+def set_changed_files(api, files, *, number=123, head=HEAD):
     """Serve real Git tree/blob shapes for each base/head fixture file."""
     api["files"] = files
     changed = [path for path, (old, new) in files.items() if old != new]
-    api["routes"][f"{PREFIX}/pulls/123"]["changed_files"] = len(changed)
-    api["routes"][f"{PREFIX}/pulls/123/files?per_page=100&page=1"] = [
+    api["routes"][f"{PREFIX}/pulls/{number}"]["changed_files"] = len(changed)
+    api["routes"][f"{PREFIX}/pulls/{number}/files?per_page=100&page=1"] = [
         {"filename": path, "status": "modified"} for path in changed
     ]
-    for index, commit in enumerate((BASE, HEAD)):
+    for index, commit in enumerate((BASE, head)):
         trees = {commit: {}}
         for path, contents in files.items():
             parts = path.split("/")
@@ -1238,8 +1238,12 @@ def test_web_updates_preserve_security_and_compatibility(evaluate_fixture, polic
                 "integrity" if fault == "integrity" else "tarball"
             ] = "untrusted"
     elif fault == "override":
-        text = "packages: [web]\noverrides: {clsx: 2.1.1}\n"
+        text = "packages: [web]\noverrides: {clsx: '~2.0.0'}\n"
         files["pnpm-workspace.yaml"] = (text, text)
+        files["pnpm-lock.yaml"] = tuple(
+            yaml.safe_dump({**yaml.safe_load(lock), "overrides": {"clsx": "~2.0.0"}})
+            for lock in files["pnpm-lock.yaml"]
+        )
     elif fault == "shared":
         locks = [yaml.safe_load(text) for text in files["pnpm-lock.yaml"]]
         for lock in locks:
@@ -1253,7 +1257,8 @@ def test_web_updates_preserve_security_and_compatibility(evaluate_fixture, polic
     else:
         old, new = files["pnpm-lock.yaml"]
         files["pnpm-lock.yaml"] = (old, new + "\nimporters: {}\n")
-    with pytest.raises(policy_module.NeedsReview):
+    reason = "resolution violates compatibility override" if fault == "override" else ""
+    with pytest.raises(policy_module.NeedsReview, match=reason):
         evaluate()
 
 
@@ -1410,6 +1415,36 @@ def test_tested_action_transition_covers_other_occurrences(tmp_path, expanded_up
     assert any(call[:2] == ["pr", "merge"] for call in calls) == (fault is None), process.stdout
     if fault == "credential":
         assert "docker/login-action requires human review" in process.stdout
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+@pytest.mark.parametrize("action", ["docker/build-push-action", "example/unlisted-action"])
+def test_action_evidence_does_not_extend_to_unmapped_publishers(
+    evaluate_fixture, policy_module, action
+):
+    api, evaluate = evaluate_fixture
+    files = {}
+    for name in ("docker-build.yml", "oss-publish-images.yml"):
+        path = f".github/workflows/{name}"
+        old = (ROOT / path).read_text()
+        pin = "c3c9e263c25d99ce0380d002d59b67737d91b0dc"
+        new = old.replace(f"docker/build-push-action@{pin}", f"{action}@{'2' * 40}")
+        old = old.replace("docker/build-push-action@", action + "@")
+        assert old != new
+        files[path] = old, new
+    api["files"] = files
+    # Avoid making release validation the reason an uncovered occurrence fails.
+    policy_module.github_release = lambda _repository, sha, _days: (
+        "7.4.1" if sha == "2" * 40 else "7.4.0",
+        "",
+    )
+    reason = (
+        "docker/build-push-action requires human review"
+        if action == "docker/build-push-action"
+        else "has an unmapped occurrence requiring human review"
+    )
+    with pytest.raises(policy_module.NeedsReview, match=reason):
+        evaluate()
 
 
 @pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
@@ -1904,11 +1939,17 @@ def test_worker_bounds_readiness_dispatch_for_each_head(tmp_path, api, condition
         "hold",
         "head_moved",
         "two_merges",
+        "two_pages",
+        "limit_two_pages",
+        "incomplete_two_pages",
+        "check_failed",
+        "check_pending",
         "mixed_bases",
         "wrong_tip",
         "held_at_refresh",
         "objection_at_refresh",
         "update_rejected",
+        "update_rejected_without_http",
         "approval_pending",
         "approval_unrecoverable",
         "approval_recoverable",
@@ -1927,6 +1968,17 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
             for index in range(3 if condition == "limit" else 2)
         ] + commits
         pull["commits"] = len(commits)
+    elif condition in {"two_pages", "limit_two_pages", "incomplete_two_pages"}:
+        commits = [
+            {"sha": f"{index:040x}", "parents": [{"sha": BASE}]} for index in range(100)
+        ] + commits
+        for index in (0, 100) if condition != "limit_two_pages" else (0, 99, 100):
+            commits[index]["parents"].append({"sha": tip})
+        pull["commits"] = len(commits)
+        api["routes"][f"{PREFIX}/pulls/123/commits?per_page=100&page=2"] = (
+            [] if condition == "incomplete_two_pages" else commits[100:]
+        )
+        commits = commits[:100]
     elif condition == "incomplete":
         pull["commits"] = 250
     elif condition == "hold":
@@ -1947,8 +1999,15 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
         commits[-1]["sha"] = "d" * 40
     elif condition == "objection_at_refresh":
         api["reviews_after"] = [{"user": {"login": "maintainer"}, "state": "CHANGES_REQUESTED"}]
-    elif condition == "update_rejected":
+    elif condition in {"update_rejected", "update_rejected_without_http"}:
         api["update_exit"] = 1
+        if condition == "update_rejected_without_http":
+            api["update_error"] = "opaque failure with private diagnostic text"
+    elif condition in {"check_failed", "check_pending"}:
+        api["routes"]["Pre-commit checks"]["check_runs"][0].update(
+            status="in_progress" if condition == "check_pending" else "completed",
+            conclusion="failure" if condition == "check_failed" else None,
+        )
     elif condition.startswith("approval_"):
         check = api["routes"]["Maintainer Approval"]["check_runs"][0]
         if condition == "approval_pending":
@@ -1989,24 +2048,48 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
     assert process.returncode == 0, process.stderr
     updates = [call for call in calls if call[:3] == ["api", "--method", "PUT"]]
     assert bool(updates) == (
-        condition in {"green", "two_merges", "update_rejected", "approval_recoverable"}
+        condition
+        in {
+            "green",
+            "two_merges",
+            "two_pages",
+            "update_rejected",
+            "update_rejected_without_http",
+            "approval_recoverable",
+        }
     ), process.stdout
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
     assert not any(call[:3] == ["api", "--method", "POST"] for call in calls)
     reason = {
         "green": "waiting for fresh policy, scans and CI",
         "two_merges": "waiting for fresh policy, scans and CI",
+        "two_pages": "waiting for fresh policy, scans and CI",
         "approval_recoverable": "waiting for fresh policy, scans and CI",
         "mixed_bases": "one identifiable base",
         "wrong_tip": "Incomplete commit inventory",
         "held_at_refresh": "PR was put on hold",
         "objection_at_refresh": "A reviewer has requested changes",
         "update_rejected": "GitHub rejected branch refresh (HTTP 422)",
+        "update_rejected_without_http": "GitHub rejected branch refresh; inspect",
+        "check_failed": "Waiting for successful Pre-commit checks",
+        "check_pending": "Waiting for successful Pre-commit checks",
+        "failed": "Latest e2e.yml run did not succeed",
+        "pending": "Latest e2e.yml run did not succeed",
+        "advisory": "CVE-update requires human review",
+        "limit": "Base refresh limit reached",
+        "limit_two_pages": "Base refresh limit reached",
+        "incomplete": "Incomplete commit inventory",
+        "incomplete_two_pages": "Incomplete commit inventory",
+        "hold": "A hold or scan-waiver label is present",
+        "head_moved": "PR or main changed during evaluation",
+        "report": "CI did not test the current PR head and base",
         "approval_pending": "Waiting for Maintainer Approval",
         "approval_unrecoverable": "Approval refresh retry limit reached",
-    }.get(condition)
-    if reason:
-        assert reason in process.stdout
+    }[condition]
+    assert reason in process.stdout
+    assert "private diagnostic text" not in process.stdout
+    if condition in {"two_pages", "limit_two_pages", "incomplete_two_pages"}:
+        assert ["api", f"{PREFIX}/pulls/123/commits?per_page=100&page=2"] in calls
 
 
 @pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)

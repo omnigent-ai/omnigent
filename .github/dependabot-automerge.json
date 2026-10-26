@@ -121,7 +121,13 @@
       "actions/attest*",
       "actions/create-github-app-token",
       "docker/login-action",
+      "docker/build-push-action",
       "aws-actions/configure-aws-credentials"
+    ],
+    "shared_evidence": [
+      "actions/checkout",
+      "actions/download-artifact",
+      "docker/setup-buildx-action"
     ],
     "zero_minor": [
       "*"

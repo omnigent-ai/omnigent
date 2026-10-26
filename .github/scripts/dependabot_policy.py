@@ -536,15 +536,16 @@ def npm_reachable(lock: dict, sections: dict) -> set[str]:
 
 
 def npm_specifier(name: str, spec: str, workspace: dict) -> str:
+    require(isinstance(spec, str), f"{name}: npm requirement must be a string")
     if spec.startswith("catalog:"):
         catalog = spec.removeprefix("catalog:")
-        entries = (
-            workspace.get("catalogs", {}).get(catalog, {})
-            if catalog
-            else workspace.get("catalog", {})
-        )
+        catalogs = workspace.get("catalogs", {})
+        require(isinstance(catalogs, dict), "pnpm catalogs must be an object")
+        entries = catalogs.get(catalog, {}) if catalog else workspace.get("catalog", {})
+        require(isinstance(entries, dict), "pnpm catalog must be an object")
         require(name in entries, f"{name}: missing workspace catalog entry")
-        return entries[name]
+        spec = entries[name]
+        require(isinstance(spec, str), f"{name}: npm requirement must be a string")
     return spec
 
 
@@ -578,13 +579,21 @@ def npm_workspace_changes(read, policy: dict) -> tuple[dict, dict]:
     expected = copy.deepcopy(before)
     for section in ("catalog", "catalogs", "overrides"):
         old, new = expected.get(section, {}), after.get(section, {})
+        require(
+            isinstance(old, dict) and isinstance(new, dict), f"pnpm {section} must be an object"
+        )
         require(old.keys() == new.keys(), f"pnpm {section} package set changed")
         groups = [(old, new)]
         if section == "catalogs":
             groups = [(entries, new[name]) for name, entries in old.items()]
         for previous, current in groups:
+            require(
+                isinstance(previous, dict) and isinstance(current, dict),
+                "pnpm catalog must be an object",
+            )
             require(previous.keys() == current.keys(), "pnpm catalog package set changed")
             for name, spec in previous.items():
+                require(isinstance(name, str), "pnpm package name must be a string")
                 if section == "overrides" and spec != current[name]:
                     require(
                         re.fullmatch(r"(?:@[\w.-]+/)?[\w.-]+", name) is not None,
@@ -627,7 +636,10 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
             },
             "pnpm compatibility override/lock mismatch",
         )
-        for catalog, entries in lock.get("catalogs", {}).items():
+        catalogs = lock.get("catalogs", {})
+        require(isinstance(catalogs, dict), "pnpm lock catalogs must be an object")
+        for catalog, entries in catalogs.items():
+            require(isinstance(entries, dict), "pnpm lock catalog must be an object")
             for name, entry in entries.items():
                 spec = npm_specifier(
                     name, "catalog:" + (catalog if catalog != "default" else ""), workspace
@@ -919,9 +931,11 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
         ["ci.yml", "lint.yml", "web-tests.yml", "e2e.yml", "e2e-ui.yml", "docker-build.yml"],
         ["Pre-commit checks", "web test", "Browser Contract UI", "Docker build"],
     )
-    result["consumer_steps"] = [
-        step for importer in sorted(affected) for step in consumers[importer]
-    ]
+    result["consumer_steps"] = []
+    for importer in sorted(affected):
+        for step in consumers[importer]:
+            if step not in result["consumer_steps"]:
+                result["consumer_steps"].append(step)
     return result
 
 
@@ -976,6 +990,11 @@ def action_changes(read, files: set[str], policy: dict, *, for_scan: bool = Fals
             if path in policy["action_test_paths"]:
                 exercised.add((name, old_sha, new_sha))
                 workflows.add(policy["action_test_paths"][path])
+            elif not for_scan:
+                require(
+                    name in policy["actions"].get("shared_evidence", []),
+                    f"{path}: {name} has an unmapped occurrence requiring human review",
+                )
     require(bool(changes), "No action pin changes")
     if not for_scan:
         require(

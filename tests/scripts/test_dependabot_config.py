@@ -9,6 +9,7 @@ are the pre-merge gate.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any
 
@@ -148,6 +149,26 @@ def test_workspace_coverage_maps_to_real_jobs_and_steps():
             assert not jobs[0].get("continue-on-error"), consumer
             steps = [step for step in jobs[0]["steps"] if step.get("name") == consumer["step"]]
             assert len(steps) == 1 and not steps[0].get("continue-on-error"), consumer
+
+
+def test_required_compatibility_workflows_preserve_app_refresh_permissions():
+    import json
+
+    policy = json.loads((REPO_ROOT / ".github/dependabot-automerge.json").read_text())
+    for name in policy["workflow_test_jobs"]:
+        text = (REPO_ROOT / ".github/workflows" / name).read_text()
+        workflow = yaml.safe_load(text)
+        assert not re.search(r"\bsecrets\s*(?:\.|\[)", text), name
+        assert workflow["permissions"] == {"contents": "read"}, name
+        for job_name, job in workflow["jobs"].items():
+            assert "secrets" not in job, (name, job_name)
+            permissions = job.get("permissions", workflow["permissions"])
+            assert isinstance(permissions, dict), (name, job_name)
+            writes = {key for key, value in permissions.items() if value == "write"}
+            # Trivy uploads SARIF; compatibility jobs cannot write code or releases.
+            expected = {"security-events"} if (name, job_name) == ("trivy.yml", "scan") else set()
+            assert writes == expected, (name, job_name, permissions)
+            assert all(value in {"read", "write", "none"} for value in permissions.values())
 
 
 @pytest.mark.parametrize("name", ["oss-regen-on-comment.yml", "oss-regenerate-and-smoke.yml"])

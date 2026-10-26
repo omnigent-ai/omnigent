@@ -196,7 +196,7 @@ jobs:
           python3 scripts/normalize_uv_lock_registry.py --check uv.lock
           # `/regen upgrade <py pkgs>` is a targeted Python bump: leave the npm
           # lockfile alone so the PR diff stays reviewable. Plain `/regen`
-          # refreshes both lockfiles, as before.
+          # repairs both lockfiles while preserving existing npm resolutions.
           if [ "$REGEN_MODE" != "upgrade" ]; then
             pnpm install --lockfile-only --ignore-scripts
           fi

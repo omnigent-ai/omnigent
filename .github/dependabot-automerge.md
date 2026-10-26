@@ -18,7 +18,7 @@ fallback or branch-protection bypass.
 | --- | --- | --- |
 | Python | Stable patches/minors, including existing manifest floor and exact-pin increases and corresponding transitive graph updates | Full selected Python matrix, database/Windows CI, integration, full E2E/UI and production image build; PyPI artifact integrity and age |
 | JavaScript | Stable patches/minors across mapped workspace consumers, including catalogs and simple override pins | Frontend tests/types/build, browser contract, full backend/browser E2E and production image build; executed consumer steps, npm integrity and age |
-| GitHub Actions | Same-identity SHA-pin upgrades to stable minor/patch releases, exercised by PR CI | Verified upstream release pins, a mapped occurrence of each identical Action/SHA transition and required compatibility workflows |
+| GitHub Actions | Same-identity SHA-pin upgrades to stable minor/patch releases, exercised by PR CI | Verified upstream release pins, mapped occurrences (with named sharing exceptions) and required compatibility workflows |
 | Rust | Stable patches/minors in either Codex parity sidecar or omnidev, including corresponding manifest/graph updates | Actual tests for the affected workspace; sidecar updates also require browser E2E |
 | Pre-commit | Stable patches/minors of `pre-commit-hooks` | Unchanged hook settings and successful Lint |
 
@@ -26,9 +26,10 @@ Every changed version, including transitives, must qualify. Stable `0.x` minors
 and ordinary exact-pin bumps qualify with the same required CI as other updates.
 Majors, downgrades and prereleases require review, except the explicitly named
 OpenTelemetry beta-to-beta updates in the established `0.NbM` streams listed
-in `python.beta`. Entering or leaving a beta stream requires review. The same version ordering,
-cooldown, integrity, advisory and full Python CI requirements apply to those beta updates.
-An unlisted OpenTelemetry package or a different prerelease format remains manual.
+in `python.beta`. Replacing a stable resolution with a beta, or a beta with a stable
+resolution, requires review. A newly added transitive from those named streams may
+qualify. All still require cooldown, integrity, advisory and full Python CI evidence;
+unlisted packages and other prerelease formats remain manual.
 
 The policy's `manual` patterns cover harness SDKs/CLIs, native/desktop/mobile
 runtime/packaging/updater packages, publishing CLIs (`@vscode/vsce*`, `wrangler`),
@@ -55,18 +56,15 @@ simultaneous changed Python/Cargo versions, duplicate identities and other
 ambiguous resolutions require review.
 
 Mapped JavaScript consumers include web, Electron, VS Code, the extension SDK,
-the example extension and Cloudflare. Shared graph changes require the existing
-workspace test/build steps or Cloudflare dry-run/image smoke steps to have
-succeeded in the job metadata. Coverage mapped outside the required workflow set
-is rejected. Electron coverage is stubbed Node unit tests, the extension SDK is
-type-checked, and VS Code builds without `vsce package`. These steps do not validate
-desktop packaging, updater signatures, extension publishing or live deployment;
-the corresponding packaging/updater/publishing tools remain manual. An older
-green workflow without the executed steps cannot establish coverage. Unknown consumers and `.github/ci-deps` remain
-manual; the harness installers use separate locks, so passing web tests alone
-does not establish compatibility for that CLI graph. Docker images remain
-manual: repository Trivy reports do not inventory the built image. Standalone
-harness CLI pins retain their existing Dependabot exclusions.
+the example extension and Cloudflare. Shared graph changes require successful
+workspace test/build steps or Cloudflare dry-run/image smoke steps in the job
+metadata. An older green workflow without those steps is insufficient. Mappings
+outside the required workflows are rejected. Electron has stubbed Node tests,
+the SDK is type-checked and VS Code builds without `vsce package`; packaging,
+updater signatures and live publishing remain untested, so their tools stay manual.
+Unknown consumers and the separate `.github/ci-deps` CLI graph stay manual.
+Docker images also stay manual because repository Trivy reports do not inventory
+the built image. Standalone harness CLI pins retain their Dependabot exclusions.
 
 ## CI access and merge authorization
 
@@ -74,10 +72,14 @@ A verified `dependabot[bot]` PR with GitHub bot type and a same-repository head 
 start compatibility CI while Security Scan is pending. The CI gate loads trusted
 scripts from `main` without first executing a PR-supplied Action. Changed Actions
 must pass same-identity SHA-pin and upstream-release validation before dependent
-jobs execute. An identical tested Action transition may cover another workflow
-occurrence, but does not establish its privileged credential or publishing behavior;
-credential and publishing Actions remain manual. Manual-listed Actions do not
-receive this automatic CI exception.
+jobs execute. For unattended merging, every changed occurrence must be mapped to
+required PR CI. Only the exact identities in `actions.shared_evidence` may share
+an identical old/new SHA transition: `actions/checkout`, `actions/download-artifact`
+and `docker/setup-buildx-action`. These helpers retrieve source/artifacts or set
+up the builder; this is a deliberate compatibility exception, not evidence of
+live publishing behavior. There are no wildcard sharing rules. Publishing Actions,
+including `docker/build-push-action` even with `push: false`, stay manual and do
+not receive the automatic CI exception.
 The existing `skip-security-scan` waiver can also waive the Action-pin validation,
 but always excludes unattended merging. Major updates can therefore run CI while
 remaining manual to merge.
@@ -152,34 +154,23 @@ Policy changes apply to existing PRs on the next sweep because the worker reads
 those PRs after workflow changes; rerunning an old workflow retains its original
 YAML and cannot manufacture the new coverage contract.
 
-The worker refreshes stale failed approval checks only after the candidate's CI
-and advisory evidence passes. Approval does not consume retries while CI is
-pending. It can rerun workflows blocked only by failed Security Gates after the scan becomes
-green. Recovery stops at three attempts and does not retry real test failures.
-When every required workflow tested the same older base and all its checks,
-consumer steps and advisory evidence pass, the worker can ask GitHub to update
-the branch with an expected-head guard. It then waits for fresh policy, scans
-and CI, without merging in that sweep. Three merge commits in the PR exhaust
-this conservative refresh budget; incomplete histories, mixed bases, holds,
-review objections and moved heads block recovery. Approval must already pass or
-have an identifiable failure within its refresh budget; this read-only check does
-not rerun approval before fresh CI. This only updates cleanly mergeable branches;
-conflicts need review. API rejections report bounded context and stop the sweep's
-candidate processing without merging.
+The worker retries failed approval only after CI and advisories pass. It may rerun
+CI blocked solely by failed Security Gates after Security Scan passes; real test
+failures are never retried automatically. Gate recovery stops at three attempts.
+If required workflows and consumer steps are green on one older base, and approval
+is successful or recoverable, the worker can update the branch with an expected-head
+guard. It stops that sweep and waits for new policy, scans and CI. Three merge
+commits exhaust the refresh budget; incomplete inventories, mixed bases, holds,
+review objections, conflicts and moved heads block recovery. API failures report
+bounded context. Report mode never updates or merges.
 
-The update request uses the GitHub App identity. New events may therefore receive
-ordinary same-repository token/secrets treatment rather than Dependabot's restricted
-actor treatment. The required compatibility workflows currently request no
-repository secrets; optional preview/review workflows have their own gates and
-must retain them. Preserve that boundary when adding secrets or permissions.
-Dependabot may stop its own rebases after another identity updates its branch;
-conflicting follow-up updates can need a maintainer's `@dependabot recreate`.
-[DCO's upstream implementation](https://github.com/dcoapp/app/blob/828cc0b29a141821ddecd674bca0d8e634234c18/lib/dco.js#L17-L24)
-skips merge commits, and a historical Dependabot merge-commit head
-([#11360](https://github.com/omnigent-ai/omnigent/pull/11360/commits/e09925ba768d5cd6cc70e0bacc4e5f3b33007aad))
-has a successful hosted DCO check. Neither is a live
-canary of this worker's update request; observe DCO and the App-triggered checks
-on the first refreshed candidate. Report mode never refreshes or merges.
+Updates use the GitHub App identity, so subsequent events may receive ordinary
+same-repository token/secrets treatment. A config contract protects the required
+compatibility workflows: no repository secrets or code/release write permissions,
+with Trivy's existing SARIF upload permission retained. Optional preview/review
+workflows keep their own gates. Dependabot may stop rebasing after another identity
+updates its branch; conflicts can need a maintainer's `@dependabot recreate`.
+DCO skips merge commits; observe it and App-triggered CI on the first live refresh.
 
 After landing, inspect the worker summary and observe a qualifying update through
 CI access, scans, approval, automatic merge and post-merge workflows. Confirm

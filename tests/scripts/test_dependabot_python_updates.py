@@ -484,6 +484,29 @@ def test_explicit_otel_beta_families(policy_module, ordinary_policy, name, old, 
             policy_module.package_upgrade(name, old, new, ordinary_policy["python"])
 
 
+@pytest.mark.parametrize("previous", [None, "0.65b0"])
+def test_named_otel_beta_transitives_can_be_added_or_upgraded(
+    policy_module, ordinary_policy, previous
+):
+    name = "opentelemetry-instrumentation-fastapi"
+    before, after = (tomllib.loads(text) for text in (LOCK, LOCK.replace("0.15.1", "0.15.2")))
+    package = {
+        "name": name,
+        "version": "0.66b1",
+        "source": {"registry": "https://pypi.org/simple"},
+    }
+    if previous:
+        before["package"].append(dict(package, version=previous))
+        before["package"][0]["dependencies"] = [{"name": name}]
+    after["package"].append(package)
+    after["package"][0]["dependencies"] = [{"name": name}]
+    inventory = policy_module.lock_changes(before, after, ordinary_policy)
+    assert {(entry["name"], entry["version"]) for entry in inventory} == {
+        ("ruff", "0.15.2"),
+        (name, "0.66b1"),
+    }
+
+
 def test_beta_update_through_worker_still_requires_advisories(tmp_path, api):
     name = "opentelemetry-distro"
     old = LOCK.replace("ruff", name).replace("0.15.1", "0.65b0")
