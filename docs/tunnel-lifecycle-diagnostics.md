@@ -74,16 +74,29 @@ session impact or changes KPI eligibility.
   this process was accepted), `attempt` (ordinal within the reconnect
   streak), `downtime_s` (gap since the previous connection ended), `pid`.
 - `runner_tunnel_disconnected`: one row per attempt the runner retries,
-  replacing the plain retry line. A fatal exit (persistent auth or protocol
-  rejection, cancellation) raises out of the reconnect loop and is logged by
-  the caller instead. `disconnect_reason` (the bounded classifier shared with
-  the OTel counter; `local_shutdown` when the process is stopping, even if the
-  close handshake broke), `close_code`, `close_reason`, `close_rcvd_code` and
-  `close_sent_code` (which side sent a close frame; a 1006 has neither),
-  `error_type`, `connected`, `connection_age_s`, `recycle`, `backoff_reset`,
-  `delay_s`, `retry_in_s`. A clean 1000/1001 close ends the read loop without
-  an exception, so its codes and reason come from the connection's own close
-  frames.
+  replacing the plain retry line. An attempt that ends the loop instead (a
+  fatal exit, cancellation, or a shutdown request) emits
+  `runner_tunnel_attempt_finished` below and no disconnect row.
+  `disconnect_reason` (the bounded classifier shared with the OTel counter),
+  `close_code`, `close_reason`, `close_rcvd_code` and `close_sent_code` (which
+  side sent a close frame; a 1006 has neither), `error_type`, `connected`,
+  `connection_age_s`, `recycle`, `backoff_reset`, `delay_s`, `retry_in_s`. A
+  clean 1000/1001 close ends the read loop without an exception, so its codes
+  and reason come from the connection's own close frames.
+- `runner_tunnel_attempt_finished`: one row for the attempt that ends the
+  reconnect loop without a retry. `outcome` is `graceful_shutdown` (a shutdown
+  request drained and closed the live tunnel), `shutdown_after_error` (a
+  shutdown request coincided with a retryable connection error, so no retry
+  row or backoff follows), `cancelled` (the tunnel task was cancelled), or
+  `fatal` (a persistent auth or protocol rejection, or an unexpected error,
+  raised out of the loop; the caller logs it). `terminal_error_type` names the
+  exception raised by the attempt itself; an exception the awaiting caller is
+  handling is never attributed to the attempt. `source_error_type` and
+  `http_status` name the connection error that ended the attempt,
+  `disconnect_reason` uses the same classifier as the disconnect row
+  (`local_shutdown` for the shutdown and cancellation outcomes), plus
+  `connected`, `attempt`, `connection_id`, `close_code` and the heartbeat and
+  send diagnostics below.
 - `runner_session_initialized`: `recovery_turn` (`history_resume`,
   `recovery_prompt` or `none`) with its inputs `recovery_id`,
   `resume_interrupted_turn`, `suppress_recovery_turn`, `execution_seen`,
@@ -379,6 +392,12 @@ failed renewal attempt, not the cause of the preceding socket close. Check
 the exception type and subsequent handshake result: a rejected old bearer
 can keep the runner disconnected even after network connectivity returns.
 
+`runner_tunnel_token_refresh_started` and `runner_tunnel_token_refresh_finished`
+bracket each loop-top refresh; join them on `token_refresh_id`. `outcome` is
+`token_returned`, `no_token_fallback`, `error_fallback`, `raised` or
+`cancelled`, and `error_type` names only an exception raised by the refresh
+itself, not one the awaiting caller is handling.
+
 Delegated runner credentials and stored or refreshed OIDC logins do not
 require the Databricks executor to import. The SDK path loads only when
 those providers do not supply a token; an import failure there still permits
@@ -474,6 +493,8 @@ connections should add no `host_tunnel_health` rows.
 ```sh
 uv run --no-sync pytest -q tests/runner/transports/ws_tunnel/test_serve.py \
   tests/runner/transports/ws_tunnel/test_diagnostics.py \
+  tests/runner/transports/ws_tunnel/test_terminal_attempt_diagnostics.py \
+  tests/runner/transports/ws_tunnel/test_auth_refresh_diagnostics.py \
   tests/runner/transports/ws_tunnel/test_frames.py \
   tests/server/integration/test_runner_tunnel_route.py \
   tests/server/routes/test_sessions_runner_relay.py \
