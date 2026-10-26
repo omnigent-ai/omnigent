@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import contextlib
+import json
 import logging
 import threading
 from pathlib import Path
@@ -12,7 +13,9 @@ from typing import Any
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native import bridge as claude_bridge
+from omnigent.harnesses.claude_native import delivery_diagnostics
 from omnigent.harnesses.claude_native.bridge import (
     REQUEST_SESSION_ID_ENV_VAR,
     ClaudePromptTimeout,
@@ -1827,9 +1830,12 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("auth_evidence", ["observed", "unknown", "broken_sink"])
 async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    auth_evidence: str,
 ) -> None:
     """
     A launcher sign-in prompt fails the turn with the link and leaves the pane.
@@ -1840,15 +1846,29 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     """
     bridge_dir = tmp_path / "bridge"
     killed: list[Path] = []
+    monkeypatch.setenv(REQUEST_SESSION_ID_ENV_VAR, "conv_sign_in")
+    observation: delivery_diagnostics.LauncherAuthCheckAttributes | None = (
+        {
+            "launcher_auth_check_observation": "last_observed",
+            "launcher_auth_check_reason": "cli_exit",
+            "launcher_auth_check_exception_type": "none",
+            "launcher_auth_check_exit_code": 7,
+        }
+        if auth_evidence != "unknown"
+        else None
+    )
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
-        raise ClaudeSignInPending(
+        pending = ClaudeSignInPending(
             "Claude Code is waiting for a sign-in in this session's terminal, "
             "so the message was not delivered.",
             title="Claude Code can't start until you sign in to Databricks",
             remediation="Open https://signin.example.com/device and enter code HQ7M-2KPD.",
         )
+        if observation is not None:
+            pending.launcher_auth_check = observation
+        raise pending
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(
@@ -1856,6 +1876,12 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
         "kill_session",
         lambda bridge_dir_arg, *, timeout_s: killed.append(bridge_dir_arg),
     )
+    if auth_evidence == "broken_sink":
+
+        def broken_log(*args: object, **kwargs: object) -> None:
+            raise RuntimeError("logging unavailable")
+
+        monkeypatch.setattr(claude_native_executor._logger, "warning", broken_log)
 
     executor = ClaudeNativeExecutor(bridge_dir)
     events = [
@@ -1877,6 +1903,38 @@ async def test_run_turn_keeps_the_pane_when_a_sign_in_prompt_blocks_delivery(
     assert "HQ7M-2KPD" in error.remediation
     # The gate failed before the prompt was typed: the message never reached Claude Code.
     assert error.undelivered is True
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_launcher_sign_in_pending"
+    ]
+    if auth_evidence == "broken_sink":
+        assert records == []
+    else:
+        assert len(records) == 1
+        assert records[0].levelno == logging.WARNING
+        row = record_to_row(records[0], source="harness")
+        assert row["session_id"] == "conv_sign_in"
+        expected = (
+            {
+                "launcher_auth_check_observation": "last_observed",
+                "launcher_auth_check_reason": "cli_exit",
+                "launcher_auth_check_exception_type": "none",
+                "launcher_auth_check_exit_code": "7",
+            }
+            if auth_evidence == "observed"
+            else {
+                "launcher_auth_check_observation": "unknown",
+                "launcher_auth_check_reason": "unknown",
+            }
+        )
+        assert {
+            k: v for k, v in row["attributes"].items() if k.startswith("launcher_")
+        } == expected
+        assert "signin.example.com" not in json.dumps(row)
+        assert "HQ7M-2KPD" not in json.dumps(row)
+    assert "signin.example.com" not in caplog.text
+    assert "HQ7M-2KPD" not in caplog.text
 
 
 @pytest.mark.asyncio

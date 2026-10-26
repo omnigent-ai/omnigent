@@ -6,13 +6,14 @@ import contextlib
 import functools
 import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ParamSpec, TypedDict, TypeVar, cast
+from typing import Any, NotRequired, ParamSpec, TypedDict, TypeVar, cast
 
 _logger = logging.getLogger(__name__)
 _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
@@ -24,6 +25,75 @@ _QUEUED_PLACEHOLDER = "Press up to edit queued messages"
 # Written by the statusLine wrapper (see ``status.py``); read here without the bridge.
 _CONTEXT_FILE = "context.json"
 _LEADING_CHAR_CLASSES = {"/": "slash", "!": "bang", "@": "at", "#": "hash", "?": "question"}
+_AUTH_CHECK_REASONS = frozenset(
+    {"cli_exit", "missing_token", "invalid_response", "timeout", "process_error"}
+)
+_AUTH_CHECK_EXCEPTION_TYPES = frozenset(
+    {
+        "none",
+        "JSONDecodeError",
+        "TimeoutExpired",
+        "OSError",
+        "BlockingIOError",
+        "ChildProcessError",
+        "ConnectionError",
+        "BrokenPipeError",
+        "ConnectionAbortedError",
+        "ConnectionRefusedError",
+        "ConnectionResetError",
+        "FileExistsError",
+        "FileNotFoundError",
+        "InterruptedError",
+        "IsADirectoryError",
+        "NotADirectoryError",
+        "PermissionError",
+        "ProcessLookupError",
+        "TimeoutError",
+    }
+)
+_AUTH_CHECK_MARKER = re.compile(
+    r"ug_auth_check_failed reason=(?P<reason>[a-z_]+) "
+    r"exception_type=(?P<exception_type>[A-Za-z0-9_]{1,80}) "
+    r"exit_code=(?P<exit_code>none|[+-]?[0-9]{1,10})"
+)
+
+
+class LauncherAuthCheckAttributes(TypedDict):
+    """Allowlisted observations from the launcher's most recent visible auth check."""
+
+    launcher_auth_check_observation: str
+    launcher_auth_check_reason: str
+    launcher_auth_check_exception_type: NotRequired[str]
+    launcher_auth_check_exit_code: NotRequired[int | None]
+
+
+def launcher_auth_check_attributes(pane: str = "") -> LauncherAuthCheckAttributes:
+    """Read the last bounded launcher marker, without retaining terminal text."""
+    unknown: LauncherAuthCheckAttributes = {
+        "launcher_auth_check_observation": "unknown",
+        "launcher_auth_check_reason": "unknown",
+    }
+    for line in reversed(pane.splitlines()):
+        line = line.strip()
+        if not line.startswith("ug_auth_check_failed"):
+            continue
+        match = _AUTH_CHECK_MARKER.fullmatch(line)
+        if (
+            match is None
+            or match["reason"] not in _AUTH_CHECK_REASONS
+            or match["exception_type"] not in _AUTH_CHECK_EXCEPTION_TYPES
+        ):
+            return unknown
+        exit_code = None if match["exit_code"] == "none" else int(match["exit_code"])
+        if exit_code is not None and not -(2**31) <= exit_code < 2**31:
+            return unknown
+        return {
+            "launcher_auth_check_observation": "last_observed",
+            "launcher_auth_check_reason": match["reason"],
+            "launcher_auth_check_exception_type": match["exception_type"],
+            "launcher_auth_check_exit_code": exit_code,
+        }
+    return unknown
 
 
 def _best_effort(function: Callable[_Parameters, None]) -> Callable[_Parameters, None]:
