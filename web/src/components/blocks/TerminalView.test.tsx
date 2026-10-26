@@ -230,7 +230,7 @@ describe("control-mode terminal", () => {
     expect(
       terminalSessionMock.instances[0].onFileLink?.("file:///home/u/ws/src/app.ts#L42-L50"),
     ).toBe(true);
-    expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42 });
+    expect(openFile).toHaveBeenCalledWith("src/app.ts", { line: 42, endLine: 50 });
   });
 });
 
@@ -1414,6 +1414,26 @@ describe("closed bridge overlay", () => {
     // Failed resume must not remount xterm: the original closed bridge stays
     // visible so the user can retry after fixing the host.
     expect(terminalSessionMock.instances).toHaveLength(1);
+  });
+
+  it("names an offline sandbox in the resume action and its failures", async () => {
+    const onResume = vi.fn().mockRejectedValue(new Error("launch failed"));
+    render(
+      <TerminalView
+        sessionId="conv_abc"
+        terminalId="terminal_bash_s1"
+        onResume={onResume}
+        resumeTarget="sandbox"
+      />,
+    );
+    await waitFor(() => expect(terminalSessionMock.instances).toHaveLength(1));
+
+    act(() => {
+      terminalSessionMock.instances[0].onState({ kind: "closed", reason: "stopped", code: 4405 });
+    });
+    fireEvent.click(screen.getByRole("button", { name: /^resume sandbox$/i }));
+
+    await screen.findByText("Couldn't resume sandbox: launch failed");
   });
 });
 

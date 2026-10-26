@@ -17,6 +17,7 @@ which is the standard pattern for always-ASK gates in agent YAML.
 from __future__ import annotations
 
 import asyncio
+from collections.abc import Iterator
 from typing import Any
 
 import httpx
@@ -27,6 +28,25 @@ from tests.server.helpers import create_test_agent
 from tests.server.helpers import policy_tool_call_request as _tool_call_request
 
 pytestmark = pytest.mark.asyncio
+
+
+POLICY_REGISTRY = [
+    {
+        "handler": "omnigent.policies.function.make_fixed_action_callable",
+        "kind": "factory",
+    }
+]
+
+
+@pytest.fixture(autouse=True)
+def _register_test_policy_handlers() -> Iterator[None]:
+    from omnigent.policies.registry import load_registry
+
+    # HTTP uploads accept custom policies only when the server registers them.
+    load_registry([__name__])
+    yield
+    load_registry()
+
 
 # ── Guardrails specs ─────────────────────────────────────
 

@@ -41,9 +41,9 @@ docker compose down -v
 
 ## Release features
 
-Release features are deployment-wide and off by default. Enable one or more
-with the comma-separated `OMNIGENT_FEATURES` variable in `.env`, then recreate
-the server container:
+Override release-feature defaults with comma-separated names in
+`OMNIGENT_FEATURES` in `.env`: a name enables a feature, and `-name` disables
+it. Empty or unset uses the defaults. Then recreate the server container:
 
 ```dotenv
 OMNIGENT_FEATURES=usage_page
@@ -57,8 +57,9 @@ curl -s http://localhost:8000/v1/info | jq '.features'
 Known keys and their lifecycle are documented in
 [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md). Unknown keys fail
 server startup so a typo cannot silently produce the wrong rollout. To roll
-back, remove the key (or empty the variable), run `docker compose up -d` again,
-and reload the web app.
+back, add `-feature_name`, run `docker compose up -d` again, and reload the
+web app. Runner overrides such as `-claude_osc_status` must also be set on
+separately running hosts; restart their host/runners and launch fresh terminals.
 
 ## Extra built-in agents
 

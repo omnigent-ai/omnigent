@@ -37,6 +37,20 @@ def _signal_members(pgid: int, sig: int) -> None:
             os.kill(pid, sig)
 
 
+def _start_stamp(proc: psutil.Process) -> float:
+    """Clock-step-proof creation time; mirrors ``_proc._process_start_stamp``.
+
+    Kept local so this exec shim imports nothing from ``omnigent``.
+    """
+    platform_create_time = getattr(getattr(proc, "_proc", None), "create_time", None)
+    if callable(platform_create_time):
+        with contextlib.suppress(TypeError):  # psutil < 7 and non-Linux take no monotonic flag
+            stamp = platform_create_time(monotonic=True)
+            if isinstance(stamp, float):
+                return stamp
+    return proc.create_time()
+
+
 def _refresh_census(
     child: subprocess.Popen[bytes],
     census: dict[int, float],
@@ -44,7 +58,7 @@ def _refresh_census(
     """Remember currently observable descendants by PID and creation time."""
     try:
         root = psutil.Process(child.pid)
-        root_create_time = root.create_time()
+        root_create_time = _start_stamp(root)
         expected_root = census.get(child.pid)
         if expected_root is not None and root_create_time != expected_root:
             return
@@ -55,7 +69,7 @@ def _refresh_census(
         if proc.pid <= 1 or proc.pid == os.getpid():
             continue
         with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied):
-            create_time = proc.create_time()
+            create_time = _start_stamp(proc)
             expected = census.get(proc.pid)
             if expected is None:
                 census[proc.pid] = create_time
@@ -68,7 +82,7 @@ def _signal_census(census: dict[int, float], sig: int) -> None:
             continue
         try:
             proc = psutil.Process(pid)
-            if proc.create_time() != create_time:
+            if _start_stamp(proc) != create_time:
                 continue
             proc.send_signal(sig)
         except (psutil.NoSuchProcess, psutil.AccessDenied):
@@ -79,7 +93,7 @@ def _census_alive(census: dict[int, float]) -> bool:
     for pid, create_time in census.items():
         try:
             proc = psutil.Process(pid)
-            if proc.create_time() == create_time and proc.status() != psutil.STATUS_ZOMBIE:
+            if _start_stamp(proc) == create_time and proc.status() != psutil.STATUS_ZOMBIE:
                 return True
         except (psutil.NoSuchProcess, psutil.AccessDenied):
             continue

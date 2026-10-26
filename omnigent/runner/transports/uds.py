@@ -98,6 +98,7 @@ class RunnerSubprocess:
         # (including the omnigent source) are importable.
         cmd = [
             sys.executable,
+            "-P",
             "-m",
             "uvicorn",
             "--factory",

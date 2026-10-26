@@ -95,6 +95,10 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
         "import_review": False,
         "custom_agents_settings_ui": False,
         "sidebar_grouping_ui": False,
+        "workspace_content_search": False,
+        "grid_sessions_display_ui": False,
+        "automations_v2": False,
+        "splittable_terminal_view_ui": False,
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
@@ -104,6 +108,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["installable_harnesses"] == []
     # Gates the web's archive worktree prompt; older servers omit it.
     assert data["archive_worktree_cleanup"] is True
+    # Gates the palette's grouped session search; older servers omit it.
+    assert data["session_search_scope"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's

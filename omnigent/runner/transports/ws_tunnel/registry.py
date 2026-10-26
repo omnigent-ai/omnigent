@@ -231,6 +231,7 @@ class TunnelRegistry:
         *,
         max_connect_waiters_per_runner: int = 1024,
         max_connect_waiters_total: int = 8192,
+        on_retire: Callable[[str], None] | None = None,
     ) -> None:
         """
         Create an empty runner tunnel registry.
@@ -245,6 +246,9 @@ class TunnelRegistry:
             ``wait_for_runner`` futures allowed across all runner ids,
             e.g. ``8192``. Additional callers use the same bounded
             overflow path as the per-runner cap.
+        :param on_retire: Called with the runner id whenever this server
+            retires a live tunnel on purpose (:meth:`deregister` with
+            ``retire=True``), before the close reaches the runner.
         :raises ValueError: If either waiter limit is less than one.
         """
         if max_connect_waiters_per_runner < 1:
@@ -256,6 +260,7 @@ class TunnelRegistry:
         self._max_connect_waiters_per_runner = max_connect_waiters_per_runner
         self._max_connect_waiters_total = max_connect_waiters_total
         self._connect_waiter_total = 0
+        self._on_retire = on_retire
         self._lock = threading.RLock()
 
     # ── Session lifecycle ────────────────────────────────
@@ -323,13 +328,17 @@ class TunnelRegistry:
         self,
         runner_id: str,
         session: RunnerSession | None = None,
+        *,
+        retire: bool = True,
     ) -> RunnerSession | None:
         """Remove a session and abort all its in-flight requests.
 
         Called by the WS route handler when the tunnel closes for
-        any reason (clean shutdown, network error, etc.). The abort
-        ensures awaiters of in-flight requests don't hang — they
-        get a ConnectionError and propagate it up.
+        any reason (clean shutdown, network error, etc.), and by
+        server-side callers that retire a live tunnel so the runner
+        reconnects, usually to another replica. The abort ensures
+        awaiters of in-flight requests don't hang — they get a
+        ConnectionError and propagate it up.
 
         :param runner_id: Runner id to remove, e.g.
             ``"runner_0123456789abcdef"``.
@@ -337,6 +346,10 @@ class TunnelRegistry:
             deregistration only removes the registry entry if the
             current entry is this exact session object. This prevents
             stale route handlers from deleting a newer tunnel.
+        :param retire: ``True`` when this server retires a live tunnel on
+            purpose and expects the runner to reconnect, which the
+            ``on_retire`` callback reports. The tunnel route passes
+            ``False`` for its own cleanup after the socket closed.
         :returns: The removed session, or ``None`` when the runner is
             already offline or the guard did not match.
         """
@@ -364,6 +377,10 @@ class TunnelRegistry:
                 removed,
                 ConnectionError("tunnel closed before request completed"),
             )
+        # Report the deliberate retire before the close reaches the route's
+        # disconnect hook, which reads it when deciding what the loss means.
+        if retire and self._on_retire is not None:
+            self._on_retire(runner_id)
         # 1001 ("going away"), not 4003: it lands in the runner's existing
         # tunnel-recycle path (serve.py's ``_TUNNEL_RECYCLE_CLOSE_CODES``) for a
         # prompt, spread reconnect instead of an escalating backoff. Avoid 1012
@@ -472,7 +489,7 @@ class TunnelRegistry:
 
         try:
             return await asyncio.wait_for(future, timeout=timeout_s)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             return None
         finally:
             with self._lock:
@@ -769,7 +786,7 @@ class TunnelRegistry:
                             session.diagnostics.enqueued(
                                 frame, session.outbound_queue.qsize(), requested_at
                             )
-                        except Exception:  # noqa: BLE001 — recording failures are best-effort.
+                        except Exception:  # recording failures are best-effort.
                             _logger.debug(
                                 "Runner %s outbound queue diagnostics failed",
                                 session.runner_id,

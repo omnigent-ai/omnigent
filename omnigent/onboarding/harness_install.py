@@ -719,6 +719,21 @@ def harness_setup_hint(harness: str | None) -> str:
         login`"`` for native Cursor, or the ``omni setup`` hint otherwise.
     """
     spec = required_cli_for_harness(harness or "")
+    if spec is not None and spec.binary == "agy":
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.harnesses.antigravity_native.credentials import (
+            resolve_antigravity_credentials,
+        )
+
+        try:
+            resolve_antigravity_credentials()
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.INVALID_INPUT:
+                return (
+                    exc.message + " Run omni setup on the host to repair the Gemini configuration."
+                )
+        except (OSError, ValueError):
+            pass
     if spec is not None and spec.package is None and spec.install_hint:
         login = ""
         if spec.login_args:
@@ -798,6 +813,12 @@ _LOGIN_PROBE_CACHE: dict[tuple[str, str], float] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
 _LOGIN_PROBE_CACHE_TTL_S = 120.0
 _PROBE_CACHE_MAX_ENTRIES = 64
+
+
+def invalidate_harness_login_probe_cache() -> None:
+    """Force the next harness login check to call the vendor CLI."""
+    with _PROBE_CACHE_LOCK:
+        _LOGIN_PROBE_CACHE.clear()
 
 
 def _binary_signature(binary: str) -> tuple[str, int, int] | None:

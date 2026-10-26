@@ -11,6 +11,7 @@
 import { isAutoHarness, type SetupStepWire } from "@/lib/agentLabels";
 import type { Host } from "@/hooks/useHosts";
 import { isFeatureEnabled, type ServerInfo } from "@/lib/capabilities";
+import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
 
 /** Whether a step is satisfied, still needed, or not locally determinable. */
 export type SetupStepStatus = "done" | "todo" | "unknown";
@@ -52,6 +53,36 @@ export type HarnessReadinessReason =
 export interface HarnessReadinessExplanation {
   label: string;
   description: string;
+}
+
+export type HarnessCredentialKind = "isaac" | "personal";
+
+export const HARNESS_CREDENTIAL_COPY: Record<HarnessCredentialKind, HarnessReadinessExplanation> = {
+  isaac: {
+    label: "Isaac",
+    description: "Databricks-managed credential via the Unity Gateway",
+  },
+  personal: {
+    label: "Personal subscription",
+    description: "Your own plan (e.g. Claude Pro/Max, ChatGPT Plus)",
+  },
+};
+
+/** Missing-credential detail shown for a harness on a host. */
+export function missingHarnessCredentialCopy(
+  harness: string,
+  harnessName: string,
+  hostName: string,
+): string {
+  const canonicalHarness = canonicalNativeHarness(harness);
+  const credential = isCodexHarness(harness)
+    ? "ChatGPT account or API key"
+    : canonicalHarness === "claude-native" || canonicalHarness === "claude"
+      ? "Claude subscription or API key"
+      : harnessCredentialFamily(harness) !== null
+        ? "API key or gateway credential"
+        : "credentials";
+  return `No ${credential} on ${hostName}, so new sessions can’t use ${harnessName}.`;
 }
 
 export interface HarnessReadiness {
@@ -171,9 +202,7 @@ export function isSdkHarness(harness: string): boolean {
   return SDK_HARNESSES.has(harness);
 }
 
-/** Whether *harness* is a Codex spelling (bare or native). Codex is the only
- *  family whose flag-off warning copy is harness-specific ("run codex login"),
- *  so the message helper gates on this. */
+/** Whether `harness` is a Codex spelling. */
 export function isCodexHarness(harness: string): boolean {
   return harness === "codex" || harness === "codex-native" || harness === "native-codex";
 }

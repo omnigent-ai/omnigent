@@ -310,6 +310,32 @@ def pytest_addoption(parser):
 
 
 @pytest.fixture(autouse=True)
+def _no_workspace_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep tests off the network: the host's workspace probe answers "unknown".
+
+    Any CLI path that starts or checks a host daemon on a server URL probes
+    that server. Tests that need an answer patch the probe themselves.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr(
+        "omnigent.host.daemon_lifecycle.probe_workspace_id", lambda url, **_kwargs: None
+    )
+
+
+@pytest.fixture
+def frozen_recurrence_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Keep a runner stall from tripping the RRULE search's elapsed-time limit.
+
+    Searches then end only on the deterministic work budget. Tests of the time
+    limit patch this clock themselves, which overrides the frozen one.
+
+    :param monkeypatch: Pytest monkeypatch fixture.
+    """
+    monkeypatch.setattr("omnigent.server.scheduled._bounded_rrule.monotonic", lambda: 0.0)
+
+
+@pytest.fixture(autouse=True)
 def _reset_runner_catalog_cache() -> Generator[None, None, None]:
     """
     Clear smart routing's per-session runner-catalog cache after every test.
@@ -498,6 +524,15 @@ def _isolate_origin_identity(
     if "origin_identity_probe" in request.fixturenames:
         return
     monkeypatch.setattr(debug_logging, "_probe_workspace_id", lambda api_base: None)
+
+
+@pytest.fixture(autouse=True)
+def _isolate_databricks_org_pin(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Register the org pin with monkeypatch so direct os.environ writes are undone."""
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR
+
+    monkeypatch.setenv(PINNED_DATABRICKS_ORG_ENV_VAR, "")
+    monkeypatch.delenv(PINNED_DATABRICKS_ORG_ENV_VAR)
 
 
 @pytest.fixture

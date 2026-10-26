@@ -21,6 +21,7 @@ _TEXT_FIELDS = frozenset(
         "failure_decision",
         "suppression_reason",
         "native_error_category",
+        "transcript_error_context_state",
         "native_error_message",
         "native_harness",
         "native_session_id",
@@ -43,6 +44,10 @@ _TEXT_FIELDS = frozenset(
         "diagnostic_capture_state",
         "diagnostic_launch_id",
         "diagnostic_read_error_kind",
+        "exception_type",
+        "exception_cause_type",
+        "exception_context_type",
+        "native_launch_os_errno_name",
     }
 )
 _BOOL_FIELDS = frozenset(
@@ -62,6 +67,8 @@ _INT_FIELDS = frozenset(
         "diagnostic_read_offset",
         "diagnostic_lines_omitted",
         "diagnostic_bytes_omitted",
+        "native_launch_os_errno",
+        "native_launch_winerror",
     }
 )
 _TIME_FIELDS = frozenset({"native_hook_recorded_at", "diagnostic_last_read_at"})

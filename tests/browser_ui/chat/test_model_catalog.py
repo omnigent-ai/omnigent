@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import time
 from urllib.parse import urlparse
 
+import pytest
 from playwright.sync_api import Page, Request, expect
 
 from tests.browser_ui.chat.session_contract import ChatSessionContract, model_option
@@ -159,3 +161,162 @@ def test_picker_open_and_selection_do_not_refetch_catalog_or_session(
     assert patch_info.value.request.post_data_json == {"model_override": "alternate"}
     assert chat.session_patches == [{"model_override": "alternate"}]
     assert unexpected_gets == []
+
+
+def _serve_launching_sandbox(chat: ChatSessionContract, *, harness: str, wrapper: str) -> None:
+    """Back a native session whose sandbox is provisioning and has no host yet."""
+    chat.contract.json(
+        "/v1/info",
+        {
+            "accounts_enabled": False,
+            "single_user": True,
+            "needs_setup": False,
+            "managed_sandboxes_enabled": True,
+            "sandbox_provider": "agent_sandbox",
+            "sandbox_providers": ["agent_sandbox"],
+            "sandbox_provider_capabilities": {"agent_sandbox": {"default_models": True}},
+        },
+    )
+    chat.contract.json(
+        f"/v1/sandbox-providers/agent_sandbox/harnesses/{harness}/model-options",
+        {
+            "configured": False,
+            "models": [
+                model_option("gateway/opus", display_name="Opus via gateway"),
+                model_option("gateway/sonnet", display_name="Sonnet via gateway"),
+            ],
+            "configuration_revision": None,
+            "provider_label": "Gateway",
+            "default_model": None,
+            "status": "ready",
+        },
+    )
+    chat.set_catalog(harness=harness, models=[], selected_model="")
+    chat.set_health(runner_online=False, host_online=True)
+    chat.update_session(
+        created_at=time.time(),
+        host_id=None,
+        workspace=None,
+        llm_model=None,
+        labels={"omnigent.wrapper": wrapper},
+        sandbox_status={"stage": "provisioning", "provider": "agent_sandbox"},
+    )
+
+
+@pytest.mark.parametrize(
+    ("harness", "wrapper"),
+    [
+        ("claude-native", "claude-code-native-ui"),
+        ("codex-native", "codex-native-ui"),
+        ("pi-native", "pi-native-ui"),
+    ],
+)
+def test_launching_sandbox_offers_its_provider_catalog(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    harness: str,
+    wrapper: str,
+) -> None:
+    """Before its sandbox has a host, a session offers the provider's preview rows."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness=harness, wrapper=wrapper)
+    page.goto(chat.url)
+    expect(page.get_by_test_id("runner-starting-indicator").first).to_contain_text(
+        "Provisioning sandbox"
+    )
+    _open_models(page)
+
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_contain_text("Opus via gateway")
+    expect(rows.nth(1)).to_contain_text("Sonnet via gateway")
+    session_path = f"/v1/sessions/{chat.session_id}"
+    for model_id in ("gateway/sonnet", "gateway/opus"):
+        row = page.locator(f'[data-model-id="{model_id}"]')
+        if not row.is_visible():
+            _open_models(page)
+        # No runner exists to confirm the first pick, so the rows stay usable.
+        expect(row).not_to_have_attribute("aria-disabled", "true", timeout=5_000)
+        with page.expect_response(
+            lambda response: (
+                response.request.method == "PATCH"
+                and urlparse(response.url).path == session_path
+                and response.status == 200
+            )
+        ):
+            row.click()
+    # Saved for the launch to read.
+    assert chat.session_patches == [
+        {"model_override": "gateway/sonnet"},
+        {"model_override": "gateway/opus"},
+    ]
+
+
+def test_session_catalog_replaces_the_launch_preview(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """The session's own catalog wins over the provider preview once it resolves."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    _open_models(page)
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "gateway/opus")
+
+    chat.set_catalog(
+        harness="claude-native",
+        models=[
+            model_option("opus", display_name="Opus (session)", is_default=True),
+            model_option("haiku", display_name="Haiku (session)"),
+        ],
+        selected_model="opus",
+    )
+    chat.emit(
+        {
+            "event": "session.model_options",
+            "data": {"type": "session.model_options", "conversation_id": chat.session_id},
+        }
+    )
+    expect(page.locator('[data-model-id="gateway/opus"]')).to_have_count(0)
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "opus")
+    expect(rows.nth(1)).to_have_attribute("data-model-id", "haiku")
+
+
+def test_bound_host_catalog_replaces_the_launch_preview(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Once the launch binds its host, the host's catalog replaces the preview."""
+    chat = chat_session_contract
+    _serve_launching_sandbox(chat, harness="claude-native", wrapper="claude-code-native-ui")
+    page.goto(chat.url)
+    chat.wait_for_stream()
+    _open_models(page)
+    rows = page.locator('[role="menuitemcheckbox"][data-model-id]')
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "gateway/opus")
+
+    # The host lists its catalog while the session's own catalog is still empty.
+    chat.models = [
+        model_option("opus", display_name="Opus (host)"),
+        model_option("haiku", display_name="Haiku (host)"),
+    ]
+    chat.update_session(host_id=chat.host_id, model_options=[])
+    chat.emit(
+        {
+            "event": "session.sandbox_status",
+            "data": {
+                "type": "session.sandbox_status",
+                "conversation_id": chat.session_id,
+                "stage": "connecting",
+                "provider": "agent_sandbox",
+            },
+        }
+    )
+    expect(page.locator('[data-model-id="gateway/opus"]')).to_have_count(0)
+    expect(rows).to_have_count(2)
+    expect(rows.nth(0)).to_have_attribute("data-model-id", "opus")
+    expect(rows.nth(1)).to_have_attribute("data-model-id", "haiku")

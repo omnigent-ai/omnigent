@@ -14,8 +14,13 @@ from sqlalchemy.exc import StatementError
 
 from omnigent.entities import Conversation, ConversationItem, MessageData, PagedList
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
+from omnigent.native.native_coding_agents import (
+    CLAUDE_NATIVE_CODING_AGENT,
+    CODEX_NATIVE_CODING_AGENT,
+)
 from omnigent.server.routes import sessions as _sessions_mod
 from omnigent.server.routes._sessions.helpers import _truncate_error_message_label
+from omnigent.server.routes._sessions.orchestration import _build_session_response
 from omnigent.server.routes.sessions import (
     _LABEL_VALUE_MAX_LEN,
     SessionLiveness,
@@ -515,6 +520,7 @@ async def test_session_snapshot_native_sub_agent_reports_parent_without_warning(
 
     assert "did not resolve" not in caplog.text
     assert child.agent_name == "claude-native-ui"
+    assert child.labels.get("omnigent.ui") is None
     assert child.llm_model == "claude-sonnet"
 
 
@@ -3470,3 +3476,26 @@ async def test_side_chat_fork_lost_trusts_only_a_host_verdict(
     assert (
         await orchestration._codex_side_chat_fork_lost(ordinary, store, router, registry) is False
     )  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("agent", [CODEX_NATIVE_CODING_AGENT, CLAUDE_NATIVE_CODING_AGENT])
+@pytest.mark.parametrize("ownership", ["root", "mirror", "explicit_child"])
+def test_native_terminal_fallback_respects_child_ownership(agent, ownership: str) -> None:
+    parent_id = None if ownership == "root" else "parent"
+    labels = {}
+    if ownership == "mirror":
+        labels = {"omnigent.wrapper": agent.wrapper_label + "-subagent"}
+    elif ownership == "explicit_child":
+        labels = {"omnigent.wrapper": agent.wrapper_label, "omnigent.ui": "terminal"}
+    conversation = Conversation(
+        id="session",
+        root_conversation_id=parent_id or "session",
+        parent_conversation_id=parent_id,
+        agent_id="agent",
+        created_at=0,
+        updated_at=0,
+        labels=labels,
+    )
+    response = _build_session_response(conversation, [], "running", agent_name=agent.agent_name)
+    assert response.labels.get("omnigent.ui") == (None if ownership == "mirror" else "terminal")
+    assert conversation.labels == labels
