@@ -370,7 +370,7 @@ function renderSequence(
   // reasoning is the very last item in the bubble. Mirrors the
   // `streamingRunStart` rule for tool runs: the trailing live edge stays
   // expanded; once anything else lands after it, it collapses.
-  const lastIdx = items.length - 1;
+  const lastIdx = lastWorkIndex(items);
   const reasoningStreamingIdx =
     liveEdge && lastIdx >= 0 && items[lastIdx]!.kind === "reasoning" ? lastIdx : -1;
 
@@ -512,13 +512,27 @@ function partitionTurn(
     if (lastWork?.kind === "work") lastWork.items.push(...wrapup);
     else segments.push({ kind: "work", items: wrapup, startIndex: end });
   }
-  // Notices with no work beside them have no "Worked" row to fold into.
+  // A run of only notices folds with the nearest work, earlier first, as trailing
+  // wrapup does. With no work in the turn there is no row to fold into.
+  const isNoticeRun = (segment: TurnSegment): boolean =>
+    segment.kind === "work" && segment.items.every((item) => item.kind === "subagent_activity");
+  const workRuns = segments.filter((segment) => segment.kind === "work" && !isNoticeRun(segment));
   return {
-    segments: segments.flatMap((segment): TurnSegment[] =>
-      segment.kind === "work" && segment.items.every((item) => item.kind === "subagent_activity")
-        ? segment.items.map((item, k) => ({ kind: "exempt", item, index: segment.startIndex + k }))
-        : [segment],
-    ),
+    segments: segments.flatMap((segment, index): TurnSegment[] => {
+      if (segment.kind !== "work" || !isNoticeRun(segment)) return [segment];
+      const earlier = workRuns.findLast((run) => segments.indexOf(run) < index);
+      const target = earlier ?? workRuns[0];
+      if (target?.kind !== "work") {
+        return segment.items.map((item, k) => ({
+          kind: "exempt",
+          item,
+          index: segment.startIndex + k,
+        }));
+      }
+      if (earlier) target.items.push(...segment.items);
+      else target.items.unshift(...segment.items);
+      return [];
+    }),
   };
 }
 
@@ -763,18 +777,22 @@ function isToolItem(item: RenderItem): boolean {
 }
 
 /**
- * If the transcript ends in a contiguous tool run, return its start
- * index — that run is the live activity and should keep its
- * streaming tail. Otherwise return -1: the agent has spoken (or
- * reasoned) after the most recent tools, so they're no longer
- * "current".
+ * If the transcript ends in a contiguous tool run (trailing sub-agent
+ * notices aside), return its start index: that run is the live
+ * activity and should keep its streaming tail. Otherwise return -1:
+ * the agent has spoken (or reasoned) after the most recent tools, so
+ * they're no longer "current".
  */
 function findStreamingRunStart(items: RenderItem[]): number {
-  if (items.length === 0) return -1;
-  if (!isToolItem(items[items.length - 1]!)) return -1;
-  let i = items.length - 1;
+  let i = lastWorkIndex(items);
+  if (i < 0 || !isToolItem(items[i]!)) return -1;
   while (i > 0 && isToolItem(items[i - 1]!)) i -= 1;
   return i;
+}
+
+/** The live edge: a sub-agent notice landing after it doesn't end it. */
+function lastWorkIndex(items: RenderItem[]): number {
+  return items.findLastIndex((item) => item.kind !== "subagent_activity");
 }
 
 /**

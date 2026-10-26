@@ -1033,9 +1033,9 @@ function walkBubbles(
       // separate stretches, each folding under its own "Worked for".
       if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
       if (isSubagentActivityBlock(cur)) {
-        // A notice stays in its turn's bubble. One between two responses opens
-        // the later one's bubble: a native fold that has shown never reopens,
-        // so the new response would otherwise stream into a collapsed trace.
+        // A notice stays in its turn's bubble until committed work from another
+        // response follows it, then opens that response's bubble: a native fold
+        // that has shown never reopens to show the new response streaming.
         if (
           i > groupStart &&
           (groupOpenedOnSentinel || noticeSeparatesResponses(blocks, groupStart, i))
@@ -1460,7 +1460,12 @@ function isSubagentActivityBlock(
  * blocks that never render on their own.
  */
 function isNoticeTransparent(b: AnyBlock): boolean {
-  return isSubagentActivityBlock(b) || isNonRenderingBlock(b) || b.type === "tool_result";
+  return (
+    isSubagentActivityBlock(b) ||
+    isNonRenderingBlock(b) ||
+    b.type === "tool_result" ||
+    b.type === "file"
+  );
 }
 
 /**

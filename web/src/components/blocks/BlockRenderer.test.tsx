@@ -503,45 +503,56 @@ describe("BlockRenderer dispatch", () => {
     expect(sections[1]!).not.toHaveClass("mt-2");
   });
 
-  it("labels the fold with only the hidden count while the tail streams", () => {
-    // The most-recent tools render as a visible tail OUTSIDE the fold, so
-    // the fold line describes only what's hidden ("Called 2 tools") — a
-    // whole-run count would double-count the tool cards visible below.
-    const tool = (n: number): RenderItem => ({
-      kind: "tool",
-      itemId: `fc_${n}`,
-      execution: {
-        name: `tool_${n}`,
-        arguments: {},
-        argsSummary: "",
-        callId: `c_${n}`,
-        agentName: "nessie",
-        executedBy: "server",
+  it.each([false, true])(
+    "labels the fold with only the hidden count while the tail streams (notice after = %s)",
+    (noticeAfter) => {
+      // The most-recent tools render as a visible tail OUTSIDE the fold, so
+      // the fold line describes only what's hidden ("Called 2 tools") — a
+      // whole-run count would double-count the tool cards visible below.
+      // A sub-agent notice landing after the run doesn't end that live edge.
+      const tool = (n: number): RenderItem => ({
+        kind: "tool",
+        itemId: `fc_${n}`,
+        execution: {
+          name: `tool_${n}`,
+          arguments: {},
+          argsSummary: "",
+          callId: `c_${n}`,
+          agentName: "nessie",
+          executedBy: "server",
+          output: "ok",
+        },
         output: "ok",
-      },
-      output: "ok",
-      state: "output-available",
-      startedAt: null,
-      duration: undefined,
-    });
-    const items: RenderItem[] = [
-      { kind: "text", itemId: "m0", text: "Dispatching.", final: true },
-      tool(1),
-      tool(2),
-      tool(3),
-      tool(4),
-      tool(5),
-    ];
-    render(<BlockRenderer items={items} sessionStatus="running" />);
-    expect(screen.getByText("Called 2 tools")).toBeDefined();
-    expect(screen.queryByText("Called 5 tools")).toBeNull();
-    // The recent tools must be visible as a tail OUTSIDE the collapsed
-    // group — the most-recent tool renders (the collapsed group's content
-    // is unmounted), while an older one stays folded. Guards against a
-    // regression that folds everything.
-    expect(screen.getByText(/tool_5/)).toBeDefined();
-    expect(screen.queryByText(/tool_1/)).toBeNull();
-  });
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      });
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Dispatching.", final: true },
+        tool(1),
+        tool(2),
+        tool(3),
+        tool(4),
+        tool(5),
+        ...(noticeAfter
+          ? [{ kind: "subagent_activity", itemId: "n1", data: {} } satisfies RenderItem]
+          : []),
+      ];
+      render(
+        <MemoryRouter>
+          <BlockRenderer items={items} sessionStatus="running" />
+        </MemoryRouter>,
+      );
+      expect(screen.getByText("Called 2 tools")).toBeDefined();
+      expect(screen.queryByText("Called 5 tools")).toBeNull();
+      // The recent tools must be visible as a tail OUTSIDE the collapsed
+      // group — the most-recent tool renders (the collapsed group's content
+      // is unmounted), while an older one stays folded. Guards against a
+      // regression that folds everything.
+      expect(screen.getByText(/tool_5/)).toBeDefined();
+      expect(screen.queryByText(/tool_1/)).toBeNull();
+    },
+  );
 
   describe("settled-turn process fold (Worked row)", () => {
     const tool = (n: number, name = `tool_${n}`): RenderItem => ({
@@ -1398,36 +1409,69 @@ describe("BlockRenderer dispatch", () => {
         },
       );
 
-      it("leaves a notice with no work beside it between the messages", () => {
+      it.each([
+        {
+          shape: "between two messages",
+          continued: false,
+          items: [
+            tool(1, "spawn_agent"),
+            text("m1", "Peirce is recording."),
+            notice("n1", "returned"),
+            text("m2", "Peirce finished."),
+          ],
+          labels: ["Completed Peirce"],
+        },
+        {
+          shape: "before a wake marker",
+          continued: true,
+          items: [
+            tool(1, "spawn_agent"),
+            notice("n1", "delegated"),
+            text("m1", "Waiting on Peirce."),
+            notice("n2", "returned"),
+          ],
+          labels: ["Started Peirce", "Completed Peirce"],
+        },
+      ])("folds a notice run into the nearest work, $shape", ({ continued, items, labels }) => {
         render(
           <MemoryRouter>
             <BlockRenderer
-              items={[
-                tool(1, "spawn_agent"),
-                text("m1", "Peirce is recording."),
-                notice("n1", "returned"),
-                text("m2", "Peirce finished."),
-              ]}
+              items={items}
               sessionStatus="idle"
+              continued={continued}
               workedForS={42}
             />
           </MemoryRouter>,
         );
-        expect(screen.getAllByRole("button", { name: /^Worked/ })).toHaveLength(1);
-        expect(screen.getByRole("button", { name: "Worked for 42s" })).toBeDefined();
-        expect(noticeLabels()).toEqual(["Completed Peirce"]);
+        expect(noticeLabels()).toEqual([]);
+        // One timed row: the notices add no row of their own.
+        fireEvent.click(screen.getByRole("button", { name: "Worked for 42s" }));
+        expect(noticeLabels()).toEqual(labels);
       });
 
-      it("keeps a terminal error unfolded when a notice lands after it", () => {
+      it("keeps notices visible in a turn with no work to fold them into", () => {
         renderTurn([
-          text("m0", "Trying the build."),
-          tool(1, "Bash"),
-          { kind: "error", itemId: null, source: "", code: "server_error", message: "Failed." },
+          text("m1", "Peirce is recording."),
           notice("n1", "returned"),
+          text("m2", "Peirce finished."),
         ]);
         expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
         expect(noticeLabels()).toEqual(["Completed Peirce"]);
       });
+
+      it.each([null, "err_1"])(
+        "keeps a terminal error (item id %s) unfolded when a notice lands after it",
+        (itemId) => {
+          renderTurn([
+            text("m0", "Trying the build."),
+            tool(1, "Bash"),
+            { kind: "error", itemId, source: "", code: "server_error", message: "Failed." },
+            notice("n1", "returned"),
+          ]);
+          expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+          expect(noticeLabels()).toEqual(["Completed Peirce"]);
+        },
+      );
     });
 
     it("never folds the last assistant bubble while the session is running", async () => {

@@ -262,16 +262,23 @@ describe("sub-agent timeline events", () => {
   });
   const answer = text("parent_answer", "parent_turn", "The review is complete.");
 
-  // Streams `blocks` through one reuse cache, checking every prefix against a full rebuild.
+  const prompt: AnyBlock = {
+    type: "user_message",
+    ctx: ctx({ itemId: "prompt", responseId: "prompt_turn" }),
+    content: [{ type: "input_text", text: "Review the change." }],
+  };
+  // Streams `blocks` after a prompt (so the reuse cache can engage) and checks
+  // every prefix against a full rebuild. Returns the bubbles after the prompt.
   function buildStreamed(blocks: AnyBlock[]): Bubble[] {
+    const all = [prompt, ...blocks];
     const cache = createBubbleCache();
-    for (let length = 1; length < blocks.length; length++) {
-      const prefix = blocks.slice(0, length);
+    for (let length = 1; length < all.length; length++) {
+      const prefix = all.slice(0, length);
       expect(buildBubbles(prefix, null, cache)).toEqual(buildBubbles(prefix, null));
     }
-    const bubbles = buildBubbles(blocks, null, cache);
-    expect(bubbles).toEqual(buildBubbles(blocks, null));
-    return bubbles;
+    const bubbles = buildBubbles(all, null, cache);
+    expect(bubbles).toEqual(buildBubbles(all, null));
+    return bubbles.slice(1);
   }
 
   it.each([true, false])("preserves parent liveness with streaming response = %s", (streaming) => {
@@ -394,24 +401,46 @@ describe("sub-agent timeline events", () => {
   });
 
   it("keeps notices standalone until work follows them", () => {
-    const prompt: AnyBlock = {
-      type: "user_message",
-      ctx: ctx({ itemId: "prompt", responseId: "next_turn" }),
-      content: [{ type: "input_text", text: "Check on the reviewer." }],
-    };
-    const blocks = [prompt, notice("started"), notice("returned"), answer];
-    expect(buildBubbles(blocks.slice(0, 3), null).map((bubble) => bubble.kind)).toEqual([
+    const notices = [notice("started"), notice("returned")];
+    expect(buildBubbles([prompt, ...notices], null).map((bubble) => bubble.kind)).toEqual([
       "user",
       "subagent_activity",
       "subagent_activity",
     ]);
-    expect(buildStreamed(blocks)).toMatchObject([
-      { kind: "user" },
+    expect(buildStreamed([...notices, answer])).toMatchObject([
       {
         kind: "assistant",
         responseId: "parent_turn",
         items: [{ kind: "subagent_activity" }, { kind: "subagent_activity" }, { kind: "text" }],
       },
+    ]);
+    // A file block renders nothing, so it doesn't hide the work after it.
+    const file: AnyBlock = {
+      type: "file",
+      ctx: ctx({ itemId: "file" }),
+      fileId: "f",
+      filename: null,
+    };
+    expect(buildStreamed([notices[0]!, file, answer])).toMatchObject([
+      { kind: "assistant", items: [{ kind: "subagent_activity" }, { kind: "text" }] },
+    ]);
+  });
+
+  it("keeps a notice recorded before a wake marker in the turn it ended", () => {
+    const wake: AnyBlock = {
+      type: "user_message",
+      ctx: ctx({ itemId: "wake", responseId: "wake_turn" }),
+      content: [{ type: "input_text", text: "[System: sub-agent reviewer finished (completed)]" }],
+    };
+    const wakeTool = { ...work, ctx: ctx({ itemId: "wake_tool", responseId: "wake_turn" }) };
+    expect(buildStreamed([work, notice("returned"), wake, wakeTool])).toMatchObject([
+      {
+        responseId: "parent_turn",
+        continued: true,
+        items: [{ kind: "tool" }, { kind: "subagent_activity", itemId: "returned" }],
+      },
+      { kind: "user", itemId: "wake" },
+      { responseId: "wake_turn", items: [{ kind: "tool" }] },
     ]);
   });
 });
