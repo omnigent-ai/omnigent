@@ -497,7 +497,7 @@ describe("CommandPalette — title and content groups", () => {
     });
   });
 
-  it("selects a title match that renders after the content group", () => {
+  it("keeps the top row selected when title matches arrive after content matches", () => {
     setSearchGroups({
       title: { isFetching: true },
       content: searchPages([conv("content", "Notes", null, "kestrel list")]),
@@ -518,6 +518,54 @@ describe("CommandPalette — title and content groups", () => {
 
     fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
     expect(navigate).toHaveBeenCalledWith("/c/title");
+  });
+
+  it("keeps the user's selection when title matches arrive later", () => {
+    setSearchGroups({
+      title: { isFetching: true },
+      content: searchPages([
+        conv("first", "Notes", null, "kestrel list"),
+        conv("second", "Retro", null, "kestrel again"),
+      ]),
+    });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    search("kestrel");
+    const input = screen.getByTestId("command-palette-input");
+    fireEvent.keyDown(input, { key: "ArrowDown" });
+    setSearchGroups({
+      title: searchPages([conv("title", "Kestrel plan")]),
+      content: searchPages([
+        conv("first", "Notes", null, "kestrel list"),
+        conv("second", "Retro", null, "kestrel again"),
+      ]),
+    });
+    rerender(<CommandPalette {...props} />);
+
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/second");
+  });
+
+  it("selects the top row again when the palette reopens", () => {
+    setSessions([conv("c1", "Fix the parser"), conv("c2", "Deploy API")]);
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "ArrowDown" });
+    rerender(<CommandPalette {...props} open={false} />);
+    rerender(<CommandPalette {...props} />);
+
+    fireEvent.keyDown(screen.getByTestId("command-palette-input"), { key: "Enter" });
+    expect(navigate).toHaveBeenCalledWith("/c/c1");
   });
 
   it("loads more of one group without paging the other", () => {
@@ -554,6 +602,29 @@ describe("CommandPalette — title and content groups", () => {
       screen.getAllByRole("option").filter((el) => el.textContent?.includes("Deploy plan")),
     ).toHaveLength(1);
     expect(screen.getByText("Notes")).toBeTruthy();
+  });
+
+  it("retries loading more for only the group whose next page failed", () => {
+    const fetchTitlePage = vi.fn();
+    const fetchContentPage = vi.fn();
+    setSearchGroups({
+      title: {
+        ...searchPages([conv("t1", "Deploy plan")]),
+        hasNextPage: true,
+        isError: true,
+        isFetchNextPageError: true,
+        fetchNextPage: fetchTitlePage,
+      },
+      content: { ...searchPages([]), isFetching: true, fetchNextPage: fetchContentPage },
+    });
+    renderPalette();
+    search("deploy");
+
+    expect(screen.getByRole("status").textContent).toContain("Couldn't load more sessions.");
+    // A slow content request doesn't block retrying the failed title page.
+    fireEvent.click(screen.getByRole("button", { name: "Retry" }));
+    expect(fetchTitlePage).toHaveBeenCalledOnce();
+    expect(fetchContentPage).not.toHaveBeenCalled();
   });
 
   it("retries only the group whose search failed", () => {

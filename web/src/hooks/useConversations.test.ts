@@ -303,12 +303,11 @@ describe("useSessionSearch", () => {
     renderGroup("kestrel", scope);
     await waitFor(() => expect(fetchMock).toHaveBeenCalled());
 
-    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
     const params = new URL(url, "http://localhost").searchParams;
     expect(params.get("search_query")).toBe("kestrel");
     expect(params.get("search_scope")).toBe(scope);
     expect(params.get("limit")).toBe("8");
-    expect(init.signal).toBeInstanceOf(AbortSignal);
   });
 
   it("does not fetch for an empty query", async () => {

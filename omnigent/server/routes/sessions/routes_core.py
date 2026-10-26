@@ -1649,8 +1649,8 @@ def register_core_routes(
         :param search_scope: Which ``search_query`` matches to return.
             ``"all"`` (default) returns title or content matches.
             ``"title"`` returns only title matches. ``"content"``
-            returns content matches whose title does not match, so
-            the search palette can list the two as separate groups.
+            returns content matches whose title does not match;
+            ``title`` and ``content`` never overlap.
         :param include_archived: When ``False`` (default), archived
             sessions are omitted. When ``True``, archived sessions
             are returned alongside active ones (the sidebar groups

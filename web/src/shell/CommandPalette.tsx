@@ -1,13 +1,7 @@
 // Global command palette (⌘K). Command groups, sessions first:
 //
-//   • Sessions — while the query is empty, the few most-recent sessions (see
-//     IDLE_SESSION_LIMIT) so Actions stays visible without scrolling. Once the
-//     user types, server search (`GET /v1/sessions?search_query=`, debounced)
-//     over every session, which client-side filtering over one page cannot do.
-//     Listed first: the palette doubles as the sidebar's "Search" entry point.
-//   • In messages — sessions whose chat content, but not title, matches the
-//     query, each with the matching snippet. A separate group (and request)
-//     so title matches always list first, each group paging on its own.
+//   • Sessions — recent sessions when idle; server-side title matches once typing.
+//   • In messages — content-only matches with a snippet, paged separately.
 //   • Actions — static app commands (new chat, navigate, toggle panels).
 //     Filtered client-side against the live query.
 //
@@ -17,7 +11,7 @@
 
 import type React from "react";
 import { defaultFilter } from "cmdk";
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   CalendarClockIcon,
   InboxIcon,
@@ -106,6 +100,8 @@ const SESSION_SEARCH_PAGE_BATCH = 10;
 const SESSION_SEARCH_RESULT_LIMIT = 50;
 /** Rows per page of each search group; "Show more" loads the next page. */
 const SEARCH_GROUP_PAGE_SIZE = 8;
+/** Keys that move cmdk's selection; see `userMovedSelection`. */
+const SELECTION_KEYS = new Set(["ArrowUp", "ArrowDown", "Home", "End", "PageUp", "PageDown"]);
 
 interface PaletteSession {
   id: string;
@@ -287,6 +283,9 @@ export function CommandPalette({
     ? searchGroups.some((group) => group.isFetchNextPageError)
     : isFetchNextPageError;
   const searchFetching = searchGroups.some((group) => group.isFetching);
+  const retrying = searching
+    ? searchGroups.some((group) => group.isError && group.isFetching)
+    : isFetching;
   const retryLoad = (): void => {
     if (!searching) {
       void (isFetchNextPageError ? fetchNextPage() : refetch());
@@ -299,13 +298,20 @@ export function CommandPalette({
   };
 
   // The two search groups resolve independently, so a title match can render
-  // above an already-highlighted content match. Keep the top row selected.
+  // above an already-highlighted content match. Keep the top row selected
+  // until the user moves the selection for this query.
   const firstItemValue =
     visibleSessions[0]?.id ??
     contentSessions[0]?.id ??
     (filteredActions[0] ? `action:${filteredActions[0].id}` : "");
   const [selectedValue, setSelectedValue] = useState("");
-  useEffect(() => setSelectedValue(firstItemValue), [firstItemValue]);
+  const userMovedSelection = useRef(false);
+  useEffect(() => {
+    userMovedSelection.current = false;
+  }, [open, debouncedQuery]);
+  useEffect(() => {
+    if (!userMovedSelection.current) setSelectedValue(firstItemValue);
+  }, [firstItemValue, open, debouncedQuery]);
 
   const paletteLabel = sessionsOnly ? "Switch session" : "Command palette";
   const placeholder = sessionsOnly
@@ -400,6 +406,9 @@ export function CommandPalette({
           label={paletteLabel}
           value={selectedValue}
           onValueChange={setSelectedValue}
+          onKeyDown={(event) => {
+            if (SELECTION_KEYS.has(event.key)) userMovedSelection.current = true;
+          }}
         >
           {isMobile ? (
             // Search field and an explicit close button share a top row; the
@@ -432,7 +441,13 @@ export function CommandPalette({
               data-testid="command-palette-input"
             />
           )}
-          <CommandList className={isMobile ? "max-h-none flex-1" : undefined}>
+          <CommandList
+            className={isMobile ? "max-h-none flex-1" : undefined}
+            // Hovering a row selects it in cmdk, which counts as the user's pick.
+            onPointerMove={() => {
+              userMovedSelection.current = true;
+            }}
+          >
             {(loadError || (sessionsOnly && isFetching)) && (
               <p role="status" className="px-3 py-2 text-xs text-muted-foreground">
                 {loadError
@@ -444,7 +459,7 @@ export function CommandPalette({
                   <button
                     type="button"
                     className="ml-2 underline"
-                    disabled={searching ? searchFetching : isFetching}
+                    disabled={retrying}
                     onClick={retryLoad}
                   >
                     Retry

@@ -21,6 +21,9 @@ the header menu), and each place is a separate entry point.
   row pins it into that slot.
 - `rename`: from the row, the header menu, the header title, or Cmd/Ctrl+Alt+R
   on desktop; long titles are limited.
+- `search`: the sidebar's Search opens the command palette. Sessions whose title
+  matches list under **Sessions**, then sessions matching only in chat content
+  under **In messages** with a snippet; each group has its own Show more.
 - `archive`: archived sessions leave the main list and appear in the archived
   view, which can be filtered by project and paged. On a server with worktree
   cleanup, archiving a session that has a git worktree first asks whether to

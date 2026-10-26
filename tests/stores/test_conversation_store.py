@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     CompactionData,
+    Conversation,
     ErrorData,
     FunctionCallData,
     FunctionCallOutputData,
@@ -1874,24 +1875,30 @@ def test_list_conversations_search_scope_splits_title_and_content_matches(
     unrelated = conversation_store.create_conversation()
     conversation_store.update_conversation(unrelated.id, title="Unrelated")
 
-    title_page = conversation_store.list_conversations(
-        search_query="kestrel", search_scope="title"
-    )
-    assert {c.id for c in title_page.data} == {title_only.id, title_and_content.id}
-    # The title already shows the hit, so the title group skips snippets.
-    assert all(c.search_snippet is None for c in title_page.data)
+    def page_through(scope: str) -> list[Conversation]:
+        """Read every match of ``scope`` two rows at a time."""
+        rows: list[Conversation] = []
+        after: str | None = None
+        while True:
+            page = conversation_store.list_conversations(
+                search_query="kestrel", search_scope=scope, limit=2, after=after
+            )
+            rows.extend(page.data)
+            if not page.has_more:
+                return rows
+            after = page.last_id
 
-    first = conversation_store.list_conversations(
-        search_query="kestrel", search_scope="content", limit=2
-    )
-    assert first.has_more
-    rest = conversation_store.list_conversations(
-        search_query="kestrel", search_scope="content", limit=2, after=first.last_id
-    )
-    assert not rest.has_more
-    paged_ids = [c.id for c in [*first.data, *rest.data]]
-    assert paged_ids == list(reversed(content_ids))
-    assert all(c.search_snippet for c in [*first.data, *rest.data])
+    title_rows = page_through("title")
+    assert sorted(c.id for c in title_rows) == sorted([title_only.id, title_and_content.id])
+    # The title already shows the hit, so the title group skips snippets.
+    assert all(c.search_snippet is None for c in title_rows)
+
+    content_rows = page_through("content")
+    # Paging walks the same order as one unpaged read, with no repeats or gaps.
+    unpaged = conversation_store.list_conversations(search_query="kestrel", search_scope="content")
+    assert [c.id for c in content_rows] == [c.id for c in unpaged.data]
+    assert sorted(c.id for c in content_rows) == sorted(content_ids)
+    assert all(c.search_snippet for c in content_rows)
 
     all_ids = {c.id for c in conversation_store.list_conversations(search_query="kestrel").data}
     assert all_ids == {title_only.id, title_and_content.id, *content_ids}

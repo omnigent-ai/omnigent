@@ -736,7 +736,8 @@ export function useConversations(
  * One result group of the palette's session search (`?search_scope=`).
  *
  * Keyed outside `["conversations", ...]` so the sidebar's cache patching never
- * decodes it; a search result list is short-lived and refetched per query.
+ * decodes it. Nothing patches these rows, so they are never reused from cache:
+ * a session deleted or renamed since the last search must not reappear.
  */
 export function useSessionSearch(
   searchQuery: string,
@@ -759,7 +760,8 @@ export function useSessionSearch(
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
-    staleTime: 30_000,
+    staleTime: 0,
+    gcTime: 0,
     retry: (failureCount, error) =>
       !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
     enabled: enabled && searchQuery !== "",

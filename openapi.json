@@ -13202,7 +13202,7 @@
             }
           },
           {
-            "description": "Which `search_query` matches to return. `\"all\"` (default) returns title or content matches. `\"title\"` returns only title matches. `\"content\"` returns content matches whose title does not match, so the search palette can list the two as separate groups.",
+            "description": "Which `search_query` matches to return. `\"all\"` (default) returns title or content matches. `\"title\"` returns only title matches. `\"content\"` returns content matches whose title does not match; `title` and `content` never overlap.",
             "in": "query",
             "name": "search_scope",
             "required": false,
