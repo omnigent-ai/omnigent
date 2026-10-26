@@ -38,7 +38,7 @@ import tempfile
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable, Iterator, Sequence
 from contextlib import ExitStack, contextmanager, suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from types import ModuleType
 from typing import Any, NamedTuple, Protocol, TypeAlias, cast
 
@@ -70,6 +70,7 @@ from omnigent.util.reasoning_effort import CLAUDE_EFFORTS, validate_effort
 
 from ._subprocess_lifecycle import close_anyio_subprocess_transport
 from .async_utils import run_sync_on_thread
+from .claude_compaction import ClaudeCompactionTranscript, compaction_transport
 from .claude_gateway_shim import DATABRICKS_CLAUDE_ADAPTIVE_THINKING_PREFIXES, ClaudeGatewayShim
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec
 from .executor import (
@@ -894,6 +895,7 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    transcript: ClaudeCompactionTranscript = field(default_factory=ClaudeCompactionTranscript)
 
 
 @dataclass(frozen=True)
@@ -1994,7 +1996,10 @@ class ClaudeSDKExecutor(Executor):
                     original_stderr(line)
 
             options.stderr = _tee_stderr
-            client = sdk.ClaudeSDKClient(options)
+            transcript = ClaudeCompactionTranscript()
+            client = sdk.ClaudeSDKClient(
+                options, transport=compaction_transport(options, transcript)
+            )
             try:
                 # CLAUDECODE must be absent (not just empty) in the child
                 # env — otherwise the claude cli reports a nested-session
@@ -2074,6 +2079,7 @@ class ClaudeSDKExecutor(Executor):
                 loop=asyncio.get_running_loop(),
                 task=current_task,
                 effort=getattr(options, "effort", None),
+                transcript=transcript,
             )
             self._clients[session_key] = state
             return client
@@ -2821,7 +2827,7 @@ class ClaudeSDKExecutor(Executor):
             "include_hook_events": True,
             "skills": resolved.skills,
             "plugins": bundle_plugins,
-            "extra_args": {"no-session-persistence": None},
+            "extra_args": {"no-session-persistence": None, "replay-user-messages": None},
             "max_buffer_size": 10 * 1024 * 1024,
         }
         if self._system_prompt_preset == "claude_code":
@@ -2929,9 +2935,6 @@ class ClaudeSDKExecutor(Executor):
             gateway=bool(self._gateway),
         )
         compaction_occurred: bool = False
-        claude_session_id: str | None = None
-        compaction_transcript_path: pathlib.Path | None = None
-        compaction_transcript_offset: int | None = None
 
         # Track in-flight tool calls so we can emit ToolCallComplete
         # with the tool name and duration when results arrive.
@@ -2957,93 +2960,22 @@ class ClaudeSDKExecutor(Executor):
         # for ``context_tokens``. ``None`` until the first call starts.
         last_call_usage: dict[str, Any] | None = None  # type: ignore[explicit-any]
 
-        def _new_compact_summary_visible() -> bool:
-            if compaction_transcript_path is None or compaction_transcript_offset is None:
-                logger.warning(
-                    "Skipping Claude compaction checkpoint after stream failure: "
-                    "PreCompact did not provide a readable transcript boundary "
-                    "(session=%s).",
-                    claude_session_id,
-                )
-                return False
-
-            try:
-                with compaction_transcript_path.open("rb") as transcript:
-                    transcript.seek(compaction_transcript_offset)
-                    appended = transcript.read()
-            except OSError:
-                logger.warning(
-                    "Skipping Claude compaction checkpoint after stream failure: "
-                    "could not read appended transcript records (session=%s, path=%s).",
-                    claude_session_id,
-                    compaction_transcript_path,
-                    exc_info=True,
-                )
-                return False
-
-            for raw_line in appended.splitlines():
-                try:
-                    entry = json.loads(raw_line)
-                except (json.JSONDecodeError, UnicodeDecodeError):
-                    continue
-                if isinstance(entry, dict) and entry.get("isCompactSummary") is True:
-                    return True
-
-            logger.warning(
-                "Skipping Claude compaction checkpoint after stream failure: "
-                "no post-PreCompact summary record is visible yet (session=%s, path=%s).",
-                claude_session_id,
-                compaction_transcript_path,
-            )
-            return False
-
-        def _build_compaction_complete_event(
-            *, require_new_compact_summary: bool = False
-        ) -> ExecutorEvent | None:
+        def _build_compaction_complete_event() -> ExecutorEvent | None:
             from omnigent.inner.executor import CompactionComplete
 
-            assert claude_session_id is not None
-            if require_new_compact_summary and not _new_compact_summary_visible():
-                return None
-
-            compaction_tokens = 0
-            if turn_usage is not None:
-                compaction_tokens = turn_usage.get("context_tokens", 0) or 0
-
-            try:
-                from claude_agent_sdk import get_session_messages
-
-                messages = get_session_messages(claude_session_id, directory=self._cwd)
-                compacted_messages = [
-                    {
-                        "type": "message",
-                        "role": message.type,
-                        "content": message.message.get("content", []),
-                    }
-                    for message in messages
-                    if isinstance(message.message, dict)
-                ]
-            except Exception:
-                logger.warning(
-                    "Failed to read Claude post-compaction session messages "
-                    "(session=%s); preserving full server history instead of "
-                    "persisting an empty checkpoint.",
-                    claude_session_id,
-                    exc_info=True,
-                )
-                return None
-
+            compacted_messages = transcript.checkpoint_since(compaction_generation)
             if not compacted_messages:
                 logger.warning(
-                    "Claude post-compaction read returned no messages "
-                    "(session=%s); preserving full server history instead of "
-                    "persisting an empty checkpoint.",
-                    claude_session_id,
+                    "Claude compaction has no complete streamed checkpoint "
+                    "(session=%s); preserving full server history.",
+                    session_key,
                 )
                 return None
-
+            compaction_tokens = transcript.token_count
+            if turn_usage is not None:
+                compaction_tokens = turn_usage.get("context_tokens", 0) or compaction_tokens
             return CompactionComplete(
-                summary="[Claude Code compaction — context was automatically compacted]",
+                summary="[Claude Code compaction — context was compacted]",
                 token_count=compaction_tokens,
                 model=observed_model or model,
                 compacted_messages=compacted_messages,
@@ -3055,6 +2987,8 @@ class ClaudeSDKExecutor(Executor):
             options=options,
             model=model,
         )
+        transcript = self._clients[session_key].transcript
+        compaction_generation = transcript.generation
 
         # ── LLM_REQUEST policy evaluation ────────────────────────
         # If the executor adapter installed a ``_policy_evaluator``
@@ -3325,7 +3259,6 @@ class ClaudeSDKExecutor(Executor):
 
                     elif isinstance(message, sdk.ResultMessage):
                         result_msg = cast(_ResultMessageObj, message)
-                        claude_session_id = getattr(result_msg, "session_id", None)
                         logger.info(
                             "Claude CLI result received (is_error=%s)",
                             getattr(result_msg, "is_error", None),
@@ -3439,28 +3372,17 @@ class ClaudeSDKExecutor(Executor):
                                 )
                                 terminal_auth_failure = False
                                 break
-                        elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
-                            compaction_occurred = True
-                            hook_session_id = getattr(system_msg, "session_id", None)
-                            if hook_session_id is None and isinstance(data, dict):
-                                hook_session_id = data.get("session_id")
-                            if hook_session_id:
-                                claude_session_id = str(hook_session_id)
-                            hook_transcript_path = getattr(system_msg, "transcript_path", None)
-                            if hook_transcript_path is None and isinstance(data, dict):
-                                hook_transcript_path = data.get("transcript_path")
-                            if isinstance(hook_transcript_path, str) and hook_transcript_path:
-                                compaction_transcript_path = pathlib.Path(hook_transcript_path)
-                                try:
-                                    compaction_transcript_offset = (
-                                        compaction_transcript_path.stat().st_size
-                                    )
-                                except OSError:
-                                    compaction_transcript_offset = None
-                            logger.info("Claude SDK compaction detected (PreCompact hook)")
-                            from omnigent.inner.executor import CompactionStarted
+                        elif (
+                            (subtype == "status" and data.get("status") == "compacting")
+                            or subtype == "compact_boundary"
+                            or data.get("compact_result") == "success"
+                            or getattr(system_msg, "hook_event_name", None) == "PreCompact"
+                        ):
+                            if not compaction_occurred:
+                                compaction_occurred = True
+                                from omnigent.inner.executor import CompactionStarted
 
-                            yield CompactionStarted()
+                                yield CompactionStarted()
                         else:
                             logger.info("Claude CLI system message: %s", data)
             finally:
@@ -3494,10 +3416,8 @@ class ClaudeSDKExecutor(Executor):
                 stderr_text,
                 diagnostics_text,
             )
-            if compaction_occurred and claude_session_id:
-                compaction_event = _build_compaction_complete_event(
-                    require_new_compact_summary=True
-                )
+            if compaction_occurred:
+                compaction_event = _build_compaction_complete_event()
                 if compaction_event is not None:
                     yield compaction_event
             yield ExecutorError(
@@ -3529,7 +3449,7 @@ class ClaudeSDKExecutor(Executor):
             turn_usage = _usage_from_observed_call(last_call_usage, observed_model or model)
 
         if terminal_error:
-            if compaction_occurred and claude_session_id:
+            if compaction_occurred:
                 compaction_event = _build_compaction_complete_event()
                 if compaction_event is not None:
                     yield compaction_event
@@ -3559,7 +3479,7 @@ class ClaudeSDKExecutor(Executor):
             _resp_verdict = await _policy_eval("PHASE_LLM_RESPONSE", _resp_data)
             if _resp_verdict.action == "POLICY_ACTION_DENY":
                 _deny_reason = _resp_verdict.reason or "no reason given"
-                if compaction_occurred and claude_session_id:
+                if compaction_occurred:
                     compaction_event = _build_compaction_complete_event()
                     if compaction_event is not None:
                         yield compaction_event
@@ -3568,7 +3488,7 @@ class ClaudeSDKExecutor(Executor):
 
         _notify_usage_from_dict(model=model, usage=turn_usage)
 
-        if compaction_occurred and claude_session_id:
+        if compaction_occurred:
             compaction_event = _build_compaction_complete_event()
             if compaction_event is not None:
                 yield compaction_event

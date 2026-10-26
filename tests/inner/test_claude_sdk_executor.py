@@ -32,8 +32,9 @@ from omnigent.inner.executor import (
 class _SDKClient:
     """Quiet SDK lifecycle; scenarios override the interactions they exercise."""
 
-    def __init__(self, options):
+    def __init__(self, options, transport=None):
         self.options = options
+        self.transport = transport
 
     async def connect(self):
         return None
@@ -57,6 +58,9 @@ def _sdk_types():
 
         class ClaudeAgentOptions:
             def __init__(self, **kwargs):
+                from claude_agent_sdk import ClaudeAgentOptions
+
+                self.__dict__.update(ClaudeAgentOptions().__dict__)
                 self.__dict__.update(kwargs)
 
     return SDKTypes
@@ -2069,7 +2073,7 @@ class TestSystemMessages(unittest.TestCase):
             ResultMessage = _ResultMessage
 
             class ClaudeSDKClient(_SDKClient):
-                def __init__(self, options):
+                def __init__(self, options, transport=None):
                     captured_options.append(options)
 
                 async def receive_response(self):
@@ -2653,7 +2657,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             # which the spec's ``skills:`` field is the proper knob for.
             self.assertEqual(
                 query_calls[0]["extra_args"],
-                {"no-session-persistence": None},
+                {"no-session-persistence": None, "replay-user-messages": None},
             )
             # Skill remains available for configured skills; ToolSearch
             # keeps large MCP definitions deferred until they are needed.
@@ -2686,7 +2690,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             messages = []
 
             class ClaudeSDKClient(_SDKClient):
-                def __init__(self, options):
+                def __init__(self, options, transport=None):
                     captured_options["tools"] = getattr(options, "tools", None)
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
                     captured_options["system_prompt"] = options.system_prompt
@@ -2763,7 +2767,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             messages = []
 
             class ClaudeSDKClient(_SDKClient):
-                def __init__(self, options):
+                def __init__(self, options, transport=None):
                     captured_options["tools"] = getattr(options, "tools", None)
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
 
@@ -2818,7 +2822,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             messages = []
 
             class ClaudeSDKClient(_SDKClient):
-                def __init__(self, options):
+                def __init__(self, options, transport=None):
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
                     captured_options["system_prompt"] = getattr(options, "system_prompt", None)
 
@@ -2877,7 +2881,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             messages = []
 
             class ClaudeSDKClient(_SDKClient):
-                def __init__(self, options):
+                def __init__(self, options, transport=None):
                     captured_options["allowed_tools"] = getattr(options, "allowed_tools", None)
                     captured_options["system_prompt"] = getattr(options, "system_prompt", None)
 
@@ -2971,7 +2975,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             ResultMessage = _ResultMessage
 
             class ClaudeSDKClient(_SDKClient):
-                def __init__(self, options):
+                def __init__(self, options, transport=None):
                     self.options = options
                     self.index = len(created)
                     created.append(self)
@@ -3375,11 +3379,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             ToolResultBlock = _ToolResultBlock
             TextBlock = type("TextBlock", (), {})
             ThinkingBlock = type("ThinkingBlock", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
+            ClaudeAgentOptions = _sdk_types().ClaudeAgentOptions
             messages = [
                 _AssistantMessage([_ToolUseBlock("tool_1", "fail", {})]),
                 _UserMessage(
@@ -3454,11 +3454,7 @@ class TestStreamEventStreaming(unittest.TestCase):
             ToolResultBlock = _ToolResultBlock
             TextBlock = type("TextBlock", (), {})
             ThinkingBlock = type("ThinkingBlock", (), {})
-            ClaudeAgentOptions = type(
-                "ClaudeAgentOptions",
-                (),
-                {"__init__": lambda self, **kwargs: self.__dict__.update(kwargs)},
-            )
+            ClaudeAgentOptions = _sdk_types().ClaudeAgentOptions
             messages = [
                 _AssistantMessage([_ToolUseBlock("tool_1", "blocked_tool", {})]),
                 _UserMessage(
@@ -3589,7 +3585,7 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
     class _StubClient:
         """Minimal client whose connect() captures os.environ."""
 
-        def __init__(self, options):
+        def __init__(self, options, transport=None):
             """Store options for protocol compliance.
 
             :param options: SDK options object (unused by stub).
@@ -3614,7 +3610,9 @@ async def test_anthropic_api_key_stripped_during_connect(monkeypatch):
     monkeypatch.setenv("CLAUDECODE", "parent-value")
 
     executor = ClaudeSDKExecutor()
-    options = SimpleNamespace()
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    options = ClaudeAgentOptions()
     await executor._get_or_create_client(
         _StubSDK,  # type: ignore[arg-type]
         session_key="test-session",
@@ -3646,7 +3644,7 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_timeout(monke
     monkeypatch.setattr(cse, "_CONNECT_TIMEOUT_SECONDS", 0.2)
 
     class _StubClient:
-        def __init__(self, options) -> None:
+        def __init__(self, options, transport=None) -> None:
             self.options = options
             # ``_force_close_client`` reads these on the failure path.
             self._query = None
@@ -3667,7 +3665,9 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_timeout(monke
         ClaudeSDKClient = _StubClient
 
     executor = ClaudeSDKExecutor()
-    options = SimpleNamespace(stderr=None)
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    options = ClaudeAgentOptions()
 
     with pytest.raises(TimeoutError) as excinfo:
         await executor._get_or_create_client(
@@ -3979,7 +3979,7 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_error() -> No
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
 
     class _StubClient:
-        def __init__(self, options: object) -> None:
+        def __init__(self, options: object, transport=None) -> None:
             self._stderr_cb = getattr(options, "stderr", None)
             self._query = None
             self._transport = None
@@ -3996,7 +3996,9 @@ async def test_get_or_create_client_surfaces_cli_stderr_on_connect_error() -> No
         ClaudeSDKClient = _StubClient
 
     executor = ClaudeSDKExecutor()
-    options = type("Opts", (), {"stderr": None})()
+    from claude_agent_sdk import ClaudeAgentOptions
+
+    options = ClaudeAgentOptions()
 
     with pytest.raises(RuntimeError) as excinfo:
         await executor._get_or_create_client(
@@ -5164,615 +5166,165 @@ class TestToolCallPolicyGate(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# Tests: Compaction detection via PreCompact hook
+# Tests: compaction checkpoints from the CLI stream
 # ---------------------------------------------------------------------------
 
 
-def test_precompact_hook_emits_compaction_complete_with_session_messages() -> None:
-    """When PreCompact fires and a ResultMessage carries a session_id,
-    CompactionComplete is emitted with compacted_messages read from
-    the CLI's session transcript."""
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-    from omnigent.inner.executor import CompactionComplete
+@pytest.mark.parametrize("trigger", ["manual", "auto", "hook", "incomplete"])
+@pytest.mark.parametrize("stream_failure", [False, True])
+def test_compaction_stream_exports_checkpoint_without_disk(
+    trigger: str, stream_failure: bool, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A completed compaction survives a client rebuild and subsequent stream errors."""
+    import claude_agent_sdk as real_sdk
+    from claude_agent_sdk._internal.message_parser import parse_message
+    from claude_agent_sdk._internal.transport.subprocess_cli import SubprocessCLITransport
 
-    class _ResultMessage:
-        def __init__(self, session_id, result):
-            self.session_id = session_id
-            self.result = result
-            self.content = []
-            self.model = "claude-test"
-            self.usage = type(
-                "U",
-                (),
-                {
-                    "input_tokens": 500,
-                    "output_tokens": 100,
-                },
-            )()
-
-    class _SystemMessage:
-        def __init__(self, subtype, data, hook_event_name=None):
-            self.subtype = subtype
-            self.data = data
-            self.hook_event_name = hook_event_name
-
-    class _HookEventMessage(_SystemMessage):
-        pass
-
-    class _FakeSessionMessage:
-        def __init__(self, type, message):
-            self.type = type
-            self.message = message
-
-    class _FakeSDK(_sdk_types()):
-        SystemMessage = _SystemMessage
-        ResultMessage = _ResultMessage
-        messages: list = []
-
-        class ClaudeSDKClient(_SDKClient):
-            async def query(self, prompt, session_id="default"):
-                _FakeSDK.messages = [
-                    _HookEventMessage(
-                        subtype="hook_started",
-                        data={"hook_event": "PreCompact"},
-                        hook_event_name="PreCompact",
-                    ),
-                    _ResultMessage("claude-uuid-123", "compacted result"),
-                ]
-
-            async def receive_response(self):
-                for message in _FakeSDK.messages:
-                    yield message
-
-    fake_session_msgs = [
-        _FakeSessionMessage("user", {"content": [{"type": "text", "text": "hi"}]}),
-        _FakeSessionMessage("assistant", {"content": [{"type": "text", "text": "compacted"}]}),
-    ]
-
-    async def _t():
-        executor = ClaudeSDKExecutor()
-        with (
-            patch(
-                "omnigent.inner.claude_sdk_executor._ensure_sdk",
-                return_value=_FakeSDK,
-            ),
-            patch(
-                "claude_agent_sdk.get_session_messages",
-                return_value=fake_session_msgs,
-            ) as mock_get_msgs,
-        ):
-            events = [
-                e
-                async for e in executor.run_turn(
-                    [{"role": "user", "content": "hi", "session_id": "s1"}],
-                    [],
-                    "",
-                )
-            ]
-
-        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
-        assert len(compaction_events) == 1
-        ce = compaction_events[0]
-        assert ce.compacted_messages is not None
-        assert len(ce.compacted_messages) == 2
-        assert ce.compacted_messages[0]["role"] == "user"
-        assert ce.compacted_messages[1]["role"] == "assistant"
-        mock_get_msgs.assert_called_once_with("claude-uuid-123", directory=None)
-        # CompactionStarted before CompactionComplete before TurnComplete
-        from omnigent.inner.executor import CompactionStarted
-
-        started_events = [e for e in events if isinstance(e, CompactionStarted)]
-        assert len(started_events) == 1
-        turn_completes = [e for e in events if isinstance(e, TurnComplete)]
-        assert len(turn_completes) == 1
-        assert events.index(started_events[0]) < events.index(compaction_events[0])
-        assert events.index(compaction_events[0]) < events.index(turn_completes[0])
-
-    _run(_t())
-
-
-def test_precompact_exception_persists_compaction_before_executor_error(tmp_path: Path) -> None:
-    """A stream failure after PreCompact still emits the durable boundary."""
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
     from omnigent.inner.executor import CompactionComplete, CompactionStarted
 
-    class _SystemMessage:
-        def __init__(self, subtype, data, hook_event_name=None, session_id=None):
-            self.subtype = subtype
-            self.data = data
-            self.hook_event_name = hook_event_name
-            self.session_id = session_id
-
-    class _FakeSessionMessage:
-        def __init__(self, type, message):
-            self.type = type
-            self.message = message
-
-    class _FakeSDK(_sdk_types()):
-        SystemMessage = _SystemMessage
-
-        class ClaudeSDKClient(_SDKClient):
-            async def receive_response(self):
-                yield _SystemMessage(
-                    subtype="hook_started",
-                    data={
-                        "hook_event": "PreCompact",
-                        "session_id": "claude-uuid-error",
-                        "transcript_path": str(transcript_path),
-                    },
-                    hook_event_name="PreCompact",
-                    session_id="claude-uuid-error",
-                )
-                with transcript_path.open("a", encoding="utf-8") as transcript:
-                    transcript.write(
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "uuid": "compact-summary-1",
-                                "isCompactSummary": True,
-                                "message": {
-                                    "role": "user",
-                                    "content": "compacted summary",
-                                },
-                            }
-                        )
-                        + "\n"
-                    )
-                raise RuntimeError("Autocompact is thrashing: the context refilled to the limit")
-
-    fake_session_msgs = [
-        _FakeSessionMessage(
-            "assistant",
-            {"content": [{"type": "text", "text": "compacted summary"}]},
-        )
+    session_id = "c9a2d66b-163e-488d-b311-14f29fb157eb"
+    tool_use = {"type": "tool_use", "id": "call-1", "name": "Read", "input": {"path": "x"}}
+    tool_result = {"type": "tool_result", "tool_use_id": "call-1", "content": "file content"}
+    summary = "The user is investigating a file."
+    turns = [
+        [
+            {"type": "user", "uuid": "old", "message": {"content": "old verbose history"}},
+            {
+                "type": "assistant",
+                "uuid": "call",
+                "message": {"content": [tool_use], "model": "test"},
+            },
+            {"type": "user", "uuid": "result", "message": {"content": [tool_result]}},
+        ],
+        [
+            {"type": "system", "subtype": "status", "status": "compacting"},
+            {
+                "type": "system",
+                "subtype": "compact_boundary",
+                "uuid": "boundary",
+                "compact_metadata": {
+                    "trigger": trigger,
+                    "post_tokens": 123,
+                    "preserved_messages": {"anchor_uuid": "summary", "uuids": ["call", "result"]},
+                },
+            },
+            {
+                "type": "user",
+                "uuid": "summary",
+                "isSynthetic": True,
+                "message": {"content": summary},
+            },
+        ],
+        [],
+        [],
     ]
-    transcript_path = tmp_path / "session.jsonl"
-    transcript_path.write_text(
-        json.dumps(
+    if trigger == "incomplete":
+        turns[1].pop()
+    if trigger == "hook":
+        turns[1].insert(
+            0,
             {
-                "type": "user",
-                "uuid": "precompact-1",
-                "message": {"role": "user", "content": "continue"},
-            }
+                "type": "system",
+                "subtype": "hook_started",
+                "hook_id": "compact",
+                "hook_event": "PreCompact",
+                "hook_name": "PreCompact:auto",
+            },
         )
-        + "\n",
-        encoding="utf-8",
-    )
+    elif trigger == "auto":
+        turns[1] = turns[1][1:]
+    responses = iter(turns)
+    prompts = []
 
-    async def _t():
-        executor = ClaudeSDKExecutor()
-        with (
-            patch(
-                "omnigent.inner.claude_sdk_executor._ensure_sdk",
-                return_value=_FakeSDK,
-            ),
-            patch(
-                "claude_agent_sdk.get_session_messages",
-                return_value=fake_session_msgs,
-            ) as mock_get_msgs,
-        ):
-            events = [
-                event
-                async for event in executor.run_turn(
-                    [{"role": "user", "content": "continue", "session_id": "s1"}],
-                    [],
-                    "",
-                )
-            ]
+    async def raw_messages(self):
+        for frame in next(responses):
+            yield {"session_id": session_id, "parent_tool_use_id": None, **frame}
+        if stream_failure and executor._clients["s1"].transcript.generation:
+            raise RuntimeError("context refilled after compaction")
+        yield {
+            "type": "result",
+            "subtype": "success",
+            "session_id": session_id,
+            "duration_ms": 1,
+            "duration_api_ms": 1,
+            "is_error": False,
+            "num_turns": 0,
+            "total_cost_usd": 0.0,
+            "usage": {},
+        }
 
-        started = [event for event in events if isinstance(event, CompactionStarted)]
-        completed = [event for event in events if isinstance(event, CompactionComplete)]
-        errors = [event for event in events if isinstance(event, ExecutorError)]
-
-        assert len(started) == 1
-        assert len(completed) == 1
-        assert len(errors) == 1
-        assert not [event for event in events if isinstance(event, TurnComplete)]
-        assert events.index(started[0]) < events.index(completed[0])
-        assert events.index(completed[0]) < events.index(errors[0])
-        assert completed[0].compacted_messages == [
-            {
-                "type": "message",
-                "role": "assistant",
-                "content": [{"type": "text", "text": "compacted summary"}],
-            }
-        ]
-        mock_get_msgs.assert_called_once_with("claude-uuid-error", directory=None)
-
-    _run(_t())
-
-
-@pytest.mark.parametrize(
-    ("transcript_location", "expect_checkpoint"),
-    [("top_level", True), ("nested", False)],
-)
-def test_precompact_exception_sdk_wire_payload_contract(
-    tmp_path: Path,
-    transcript_location: str,
-    expect_checkpoint: bool,
-) -> None:
-    """The SDK-decoded hook payload exposes a safe transcript boundary."""
-    import claude_agent_sdk as real_sdk
-    from claude_agent_sdk._internal.message_parser import parse_message
-
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-    from omnigent.inner.executor import CompactionComplete
-
-    class _FakeSessionMessage:
-        def __init__(self, type, message):
-            self.type = type
-            self.message = message
-
-    transcript_path = tmp_path / "session.jsonl"
-    transcript_path.write_text(
-        json.dumps(
-            {
-                "type": "user",
-                "uuid": "precompact-wire-1",
-                "message": {"role": "user", "content": "continue"},
-            }
-        )
-        + "\n",
-        encoding="utf-8",
-    )
-    raw_hook_payload = {
-        "type": "system",
-        "subtype": "hook_started",
-        "hook_id": "hook-precompact-wire-1",
-        "hook_name": "PreCompact:auto",
-        "hook_event": "PreCompact",
-        "uuid": "hook-event-precompact-wire-1",
-        "session_id": "claude-uuid-wire",
-        "cwd": str(tmp_path),
-        "trigger": "auto",
-        "custom_instructions": None,
-    }
-    if transcript_location == "top_level":
-        raw_hook_payload["transcript_path"] = str(transcript_path)
-    else:
-        raw_hook_payload["input"] = {"transcript_path": str(transcript_path)}
-
-    hook_message = parse_message(raw_hook_payload)
-    assert isinstance(hook_message, real_sdk.HookEventMessage)
+    monkeypatch.setattr(SubprocessCLITransport, "read_messages", raw_messages)
 
     class _FakeSDK(_sdk_types()):
         AssistantMessage = real_sdk.AssistantMessage
         UserMessage = real_sdk.UserMessage
         SystemMessage = real_sdk.SystemMessage
         ResultMessage = real_sdk.ResultMessage
-        StreamEvent = real_sdk.StreamEvent
-
-        class ClaudeSDKClient(_SDKClient):
-            async def receive_response(self):
-                yield hook_message
-                with transcript_path.open("a", encoding="utf-8") as transcript:
-                    transcript.write(
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "uuid": "compact-summary-wire-1",
-                                "isCompactSummary": True,
-                                "message": {
-                                    "role": "user",
-                                    "content": "compacted summary",
-                                },
-                            }
-                        )
-                        + "\n"
-                    )
-                raise RuntimeError("Autocompact refilled the context")
-
-    fake_session_msgs = [
-        _FakeSessionMessage(
-            "assistant",
-            {"content": [{"type": "text", "text": "compacted summary"}]},
-        )
-    ]
-
-    async def _t():
-        executor = ClaudeSDKExecutor()
-        with (
-            patch(
-                "omnigent.inner.claude_sdk_executor._ensure_sdk",
-                return_value=_FakeSDK,
-            ),
-            patch(
-                "claude_agent_sdk.get_session_messages",
-                return_value=fake_session_msgs,
-            ) as mock_get_messages,
-        ):
-            events = [
-                event
-                async for event in executor.run_turn(
-                    [{"role": "user", "content": "continue", "session_id": "s1"}],
-                    [],
-                    "",
-                )
-            ]
-
-        checkpoints = [event for event in events if isinstance(event, CompactionComplete)]
-        assert len(checkpoints) == int(expect_checkpoint)
-        if expect_checkpoint:
-            mock_get_messages.assert_called_once_with("claude-uuid-wire", directory=None)
-        else:
-            mock_get_messages.assert_not_called()
-
-    _run(_t())
-
-
-@pytest.mark.parametrize("session_read", [[], RuntimeError("transcript not flushed")])
-def test_precompact_exception_preserves_history_without_exportable_checkpoint(
-    tmp_path: Path,
-    session_read: list[object] | Exception,
-) -> None:
-    """An empty or failed export never replaces full history with a placeholder."""
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-    from omnigent.inner.executor import CompactionComplete
-
-    transcript_path = tmp_path / "session.jsonl"
-    transcript_path.write_text("", encoding="utf-8")
-
-    class _SystemMessage:
-        def __init__(self, subtype, data, hook_event_name=None, session_id=None):
-            self.subtype = subtype
-            self.data = data
-            self.hook_event_name = hook_event_name
-            self.session_id = session_id
-
-    class _FakeSDK(_sdk_types()):
-        SystemMessage = _SystemMessage
-
-        class ClaudeSDKClient(_SDKClient):
-            async def receive_response(self):
-                yield _SystemMessage(
-                    subtype="hook_started",
-                    data={
-                        "hook_event": "PreCompact",
-                        "session_id": "claude-uuid-error",
-                        "transcript_path": str(transcript_path),
-                    },
-                    hook_event_name="PreCompact",
-                    session_id="claude-uuid-error",
-                )
-                with transcript_path.open("a", encoding="utf-8") as transcript:
-                    transcript.write(
-                        json.dumps(
-                            {
-                                "type": "user",
-                                "uuid": "compact-summary-1",
-                                "isCompactSummary": True,
-                                "message": {
-                                    "role": "user",
-                                    "content": "compacted summary",
-                                },
-                            }
-                        )
-                        + "\n"
-                    )
-                raise RuntimeError("Autocompact is thrashing: the context refilled to the limit")
-
-    async def _t():
-        executor = ClaudeSDKExecutor()
-        get_messages = (
-            patch("claude_agent_sdk.get_session_messages", side_effect=session_read)
-            if isinstance(session_read, Exception)
-            else patch("claude_agent_sdk.get_session_messages", return_value=session_read)
-        )
-        with (
-            patch(
-                "omnigent.inner.claude_sdk_executor._ensure_sdk",
-                return_value=_FakeSDK,
-            ),
-            get_messages,
-        ):
-            events = [
-                event
-                async for event in executor.run_turn(
-                    [{"role": "user", "content": "continue", "session_id": "s1"}],
-                    [],
-                    "",
-                )
-            ]
-
-        assert not [event for event in events if isinstance(event, CompactionComplete)]
-        assert len([event for event in events if isinstance(event, ExecutorError)]) == 1
-
-    _run(_t())
-
-
-def test_precompact_exception_without_new_summary_preserves_history(tmp_path: Path) -> None:
-    """PreCompact alone is not evidence that Claude finished compaction."""
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-    from omnigent.inner.executor import CompactionComplete
-
-    transcript_path = tmp_path / "session.jsonl"
-    transcript_path.write_text("", encoding="utf-8")
-
-    class _SystemMessage:
-        def __init__(self, subtype, data, hook_event_name=None, session_id=None):
-            self.subtype = subtype
-            self.data = data
-            self.hook_event_name = hook_event_name
-            self.session_id = session_id
-
-    class _FakeSDK(_sdk_types()):
-        SystemMessage = _SystemMessage
-
-        class ClaudeSDKClient(_SDKClient):
-            async def receive_response(self):
-                yield _SystemMessage(
-                    subtype="hook_started",
-                    data={
-                        "hook_event": "PreCompact",
-                        "session_id": "claude-uuid-error",
-                        "transcript_path": str(transcript_path),
-                    },
-                    hook_event_name="PreCompact",
-                    session_id="claude-uuid-error",
-                )
-                raise RuntimeError("stream failed before compaction completed")
-
-    async def _t():
-        executor = ClaudeSDKExecutor()
-        with (
-            patch(
-                "omnigent.inner.claude_sdk_executor._ensure_sdk",
-                return_value=_FakeSDK,
-            ),
-            patch("claude_agent_sdk.get_session_messages") as mock_get_messages,
-        ):
-            events = [
-                event
-                async for event in executor.run_turn(
-                    [{"role": "user", "content": "continue", "session_id": "s1"}],
-                    [],
-                    "",
-                )
-            ]
-
-        assert not [event for event in events if isinstance(event, CompactionComplete)]
-        assert len([event for event in events if isinstance(event, ExecutorError)]) == 1
-        mock_get_messages.assert_not_called()
-
-    _run(_t())
-
-
-def test_precompact_hook_emits_compaction_started_before_complete() -> None:
-    """CompactionStarted is yielded when PreCompact fires, before CompactionComplete.
-
-    This ensures clients see the in-progress signal while compaction is
-    still happening, rather than both events arriving back-to-back after
-    the turn ends.
-    """
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-    from omnigent.inner.executor import CompactionComplete, CompactionStarted
-
-    class _ResultMessage:
-        def __init__(self, session_id, result):
-            self.session_id = session_id
-            self.result = result
-            self.content = []
-            self.model = "claude-test"
-            self.usage = type(
-                "U",
-                (),
-                {"input_tokens": 500, "output_tokens": 100},
-            )()
-
-    class _SystemMessage:
-        def __init__(self, subtype, data, hook_event_name=None):
-            self.subtype = subtype
-            self.data = data
-            self.hook_event_name = hook_event_name
-
-    class _FakeSessionMessage:
-        def __init__(self, type, message):
-            self.type = type
-            self.message = message
-
-    class _FakeSDK(_sdk_types()):
-        SystemMessage = _SystemMessage
-        ResultMessage = _ResultMessage
-        messages: list = []
+        TextBlock = real_sdk.TextBlock
+        ThinkingBlock = real_sdk.ThinkingBlock
+        ToolUseBlock = real_sdk.ToolUseBlock
+        ToolResultBlock = real_sdk.ToolResultBlock
 
         class ClaudeSDKClient(_SDKClient):
             async def query(self, prompt, session_id="default"):
-                _FakeSDK.messages = [
-                    _SystemMessage(
-                        subtype="hook_started",
-                        data={"hook_event": "PreCompact"},
-                        hook_event_name="PreCompact",
-                    ),
-                    _ResultMessage("claude-uuid-456", "compacted result"),
-                ]
+                prompts.append(
+                    prompt if isinstance(prompt, str) else [item async for item in prompt]
+                )
 
             async def receive_response(self):
-                for message in _FakeSDK.messages:
-                    yield message
+                async for frame in self.transport.read_messages():
+                    yield parse_message(frame)
+
+    executor = ClaudeSDKExecutor()
 
     async def _t():
-        executor = ClaudeSDKExecutor()
         with (
+            patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK),
             patch(
-                "omnigent.inner.claude_sdk_executor._ensure_sdk",
-                return_value=_FakeSDK,
-            ),
-            patch(
-                "claude_agent_sdk.get_session_messages",
-                return_value=[
-                    _FakeSessionMessage(
-                        "user",
-                        {"content": [{"type": "text", "text": "compacted summary"}]},
-                    )
-                ],
+                "claude_agent_sdk.get_session_messages", side_effect=AssertionError("disk read")
             ),
         ):
-            events = [
-                e
-                async for e in executor.run_turn(
-                    [{"role": "user", "content": "hi", "session_id": "s1"}],
-                    [],
-                    "",
+            inputs = [{"role": "user", "content": "continue", "session_id": "s1"}]
+            first = [event async for event in executor.run_turn(inputs, [], "")]
+            assert not any(isinstance(event, CompactionComplete) for event in first)
+            events = [event async for event in executor.run_turn(inputs, [], "")]
+            started = [event for event in events if isinstance(event, CompactionStarted)]
+            completed = [event for event in events if isinstance(event, CompactionComplete)]
+            if trigger == "incomplete":
+                assert len(started) == 1
+                assert not completed
+                assert isinstance(events[-1], ExecutorError if stream_failure else TurnComplete)
+                await executor.close()
+                return
+            assert len(started) == len(completed) == 1
+            assert events.index(started[0]) < events.index(completed[0]) < len(events) - 1
+            assert isinstance(events[-1], ExecutorError if stream_failure else TurnComplete)
+            assert completed[0].token_count == 123
+            assert completed[0].compacted_messages == [
+                {"type": "message", "role": "user", "content": summary},
+                {"type": "message", "role": "assistant", "content": [tool_use]},
+                {"type": "message", "role": "user", "content": [tool_result]},
+            ]
+            if not stream_failure:
+                subsequent = [event async for event in executor.run_turn(inputs, [], "")]
+                assert not any(isinstance(event, CompactionComplete) for event in subsequent)
+            original_client = executor._clients.get("s1")
+            await executor.close_session("s1")
+            rebuilt = [
+                event
+                async for event in executor.run_turn(
+                    completed[0].compacted_messages + inputs, [], ""
                 )
             ]
-
-        started = [e for e in events if isinstance(e, CompactionStarted)]
-        completed = [e for e in events if isinstance(e, CompactionComplete)]
-        assert len(started) == 1, "expected exactly one CompactionStarted"
-        assert len(completed) == 1, "expected exactly one CompactionComplete"
-        assert events.index(started[0]) < events.index(completed[0]), (
-            "CompactionStarted must precede CompactionComplete"
-        )
-
-    _run(_t())
-
-
-def test_no_precompact_no_compaction_event() -> None:
-    """When no PreCompact hook fires, no CompactionComplete is yielded."""
-    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
-    from omnigent.inner.executor import CompactionComplete
-
-    class _ResultMessage:
-        def __init__(self, session_id, result):
-            self.session_id = session_id
-            self.result = result
-            self.content = []
-            self.model = "claude-test"
-            self.usage = type(
-                "U",
-                (),
-                {
-                    "input_tokens": 500,
-                    "output_tokens": 100,
-                },
-            )()
-
-    class _FakeSDK(_sdk_types()):
-        ResultMessage = _ResultMessage
-        messages: list = []
-
-        class ClaudeSDKClient(_SDKClient):
-            async def query(self, prompt, session_id="default"):
-                _FakeSDK.messages = [_ResultMessage(session_id, "normal result")]
-
-            async def receive_response(self):
-                for message in _FakeSDK.messages:
-                    yield message
-
-    async def _t():
-        executor = ClaudeSDKExecutor()
-        with patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_FakeSDK):
-            events = [
-                e
-                async for e in executor.run_turn(
-                    [{"role": "user", "content": "hi", "session_id": "s1"}],
-                    [],
-                    "",
-                )
-            ]
-
-        compaction_events = [e for e in events if isinstance(e, CompactionComplete)]
-        assert len(compaction_events) == 0
+            assert isinstance(rebuilt[-1], TurnComplete)
+            assert not any(isinstance(event, CompactionComplete) for event in rebuilt)
+            assert executor._clients["s1"] is not original_client
+            replay = json.dumps(prompts[-1])
+            assert summary in replay
+            assert "file content" in replay
+            assert "old verbose history" not in replay
+            await executor.close()
 
     _run(_t())
 
@@ -5980,7 +5532,7 @@ def _make_recovery_fake_sdk():
         created_clients = []
 
         class ClaudeSDKClient:
-            def __init__(self, options):
+            def __init__(self, options, transport=None):
                 self.options = options
                 self.prompts = []
                 self._query = None
