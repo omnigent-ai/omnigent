@@ -278,7 +278,9 @@ async def test_oversized_pane_snapshot_is_bounded(tmp_path: Path) -> None:
     assert len(pane_block) <= 4100, len(pane_block)
 
 
-def _required_terminal_exit(session_was_idle: bool) -> TerminalExitEvent:
+def _required_terminal_exit(
+    session_was_idle: bool, quit_before_prompt: bool = False
+) -> TerminalExitEvent:
     """Build the exit the registry publishes when the session's Claude pane dies."""
     return TerminalExitEvent(
         session_id=_CONV_ID,
@@ -291,6 +293,7 @@ def _required_terminal_exit(session_was_idle: bool) -> TerminalExitEvent:
         cwd="/work",
         last_output="Waiting for the API key helper...\n",
         session_was_idle=session_was_idle,
+        quit_before_prompt=quit_before_prompt,
     )
 
 
@@ -312,9 +315,13 @@ def _failed_statuses(conv_id: str) -> list[dict[str, Any]]:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("session_was_idle", [False, True])
+@pytest.mark.parametrize(
+    ("session_was_idle", "quit_before_prompt"),
+    [(False, False), (True, False), (False, True)],
+    ids=["mid-turn", "idle", "quit-before-prompt"],
+)
 async def test_stream_drop_after_required_terminal_exit_reports_the_exit(
-    session_was_idle: bool, caplog: pytest.LogCaptureFixture
+    session_was_idle: bool, quit_before_prompt: bool, caplog: pytest.LogCaptureFixture
 ) -> None:
     """A drop caused by the runner's own harness release names the terminal exit.
 
@@ -333,7 +340,9 @@ async def test_stream_drop_after_required_terminal_exit_reports_the_exit(
     publish: dict[str, Callable[[TerminalExitEvent], None]] = {}
     app = _make_app(
         cause="ReadError(ClosedResourceError())",
-        before_drop=lambda: publish["exit"](_required_terminal_exit(session_was_idle)),
+        before_drop=lambda: publish["exit"](
+            _required_terminal_exit(session_was_idle, quit_before_prompt)
+        ),
     )
     publish["exit"] = app.state.session_resource_registry._terminal_exit_publisher
     try:

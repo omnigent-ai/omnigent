@@ -36,7 +36,11 @@ from tests.runner.conftest import (
     _runner_client,
     _ScriptedHarnessClient,
 )
-from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+from tests.runner.helpers import (
+    NullServerClient,
+    finish_native_tui_boot,
+    make_test_terminal_instance,
+)
 
 _SESSION = "synthetic-lifecycle-session"
 
@@ -127,6 +131,9 @@ async def test_reason_survives_cleanup_and_sink_serialization_without_reclassify
     reason: str | None,
 ) -> None:
     caplog.set_level(logging.INFO)
+    finish_native_tui_boot(
+        launch.instance, launch.callbacks["on_tick"], launch.callbacks["on_idle"]
+    )
     _hook(launch, monkeypatch, "SessionStart", 100.0, source="startup")
     _hook(launch, monkeypatch, "UserPromptSubmit", 101.0, prompt="private synthetic prompt")
     _hook(launch, monkeypatch, "Stop", 102.0)

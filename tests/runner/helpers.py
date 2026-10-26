@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from pathlib import Path
 from typing import Any
 
 from omnigent.inner.os_env import OSEnvironment
 from omnigent.inner.terminal import TerminalInstance
+
+#: A Claude pane at its composer, which Claude's input-ready probe accepts.
+CLAUDE_COMPOSER_PANE = "────────────────────\n❯ \n────────────────────"
 
 
 class NullServerClient:
@@ -109,3 +113,32 @@ def make_test_terminal_instance(
         os_env=os_env,
         running=running,
     )
+
+
+def finish_native_tui_boot(
+    instance: TerminalInstance,
+    on_tick: Callable[[], None],
+    on_idle: Callable[[], None],
+    *,
+    ready_pane: str = CLAUDE_COMPOSER_PANE,
+) -> None:
+    """
+    Walk a watched native TUI through boot: its prompt renders, then its pane goes quiet.
+
+    Claude's pane drives no session status until it has booted, so a test of the
+    status a booted Claude's pane drives starts here.
+
+    :param instance: The watched terminal; its probe sees *ready_pane* for one
+        tick, and its own captured pane afterwards.
+    :param on_tick: The watcher's per-tick callback, which runs the
+        input-ready probe.
+    :param on_idle: The watcher's idle-edge callback.
+    :param ready_pane: Pane text the harness's input-ready probe accepts on
+        its first look, e.g. :data:`CLAUDE_COMPOSER_PANE`.
+    """
+    instance.last_pane_text = lambda: ready_pane  # type: ignore[method-assign]
+    try:
+        on_tick()
+    finally:
+        del instance.last_pane_text
+    on_idle()

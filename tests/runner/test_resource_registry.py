@@ -36,7 +36,11 @@ from omnigent.runner.resource_registry import (
     trim_terminal_output,
 )
 from omnigent.terminals import TerminalRegistry
-from tests.runner.helpers import make_test_terminal_instance
+from tests.runner.helpers import (
+    CLAUDE_COMPOSER_PANE,
+    finish_native_tui_boot,
+    make_test_terminal_instance,
+)
 
 
 @pytest.mark.skipif(shutil.which("tmux") is None, reason="tmux not installed")
@@ -681,11 +685,19 @@ async def _observe_native_agent_terminal_and_capture(
     terminal_registry: TerminalRegistry,
     instance: object,
     session_id: str,
+    *,
+    resource_role: str = CLAUDE_NATIVE_TERMINAL_ROLE,
+    status_publisher: Callable[[str, str, str | None], None] | None = None,
 ) -> dict[str, object]:
     """Observe *instance* as the native agent terminal, capturing its watcher.
 
     Returns the captured ``on_idle`` / ``on_activity`` / ``on_exit`` callbacks
     so a test can drive the PTY-status edges directly.
+
+    :param resource_role: Native terminal role to observe it under, e.g.
+        :data:`PI_NATIVE_TERMINAL_ROLE`.
+    :param status_publisher: Receives each published ``(session_id, status,
+        blocked_on)`` edge; ``None`` discards them.
     """
     callbacks: dict[str, object] = {}
 
@@ -708,13 +720,15 @@ async def _observe_native_agent_terminal_and_capture(
     instance.start_idle_watcher_thread = _capture_watcher  # type: ignore[attr-defined]
     # A status publisher is required for the native agent terminal's watcher to
     # wire its running/idle edges (and thus record the PTY status).
-    registry.set_session_status_publisher(lambda _sid, _status, _reason=None: None)
+    registry.set_session_status_publisher(
+        status_publisher or (lambda _sid, _status, _reason=None: None)
+    )
     await registry.observe_required_terminal(
         session_id,
         instance.name,  # type: ignore[attr-defined]
         instance.session_key,  # type: ignore[attr-defined]
         instance,
-        resource_role=CLAUDE_NATIVE_TERMINAL_ROLE,
+        resource_role=resource_role,
     )
     return callbacks
 
@@ -836,6 +850,18 @@ async def _observe_native_with_real_poller(
     return watcher.call_args.kwargs["on_tick"], statuses, registry, status_file
 
 
+def _tick_through_handback(on_tick: Callable[[], None]) -> None:
+    """Run the watcher ticks that hand status back once message delivery has ended.
+
+    The first tick's capture may predate delivery, so the watcher decides on
+    the third, once a capture taken after delivery has been diffed.
+
+    :param on_tick: The watcher's per-tick callback.
+    """
+    for _ in range(3):
+        on_tick()
+
+
 @pytest.mark.asyncio
 async def test_claude_native_wires_status_poller_tick(tmp_path: Path) -> None:
     """The claude-native watcher is wired with an ``on_tick`` that drives
@@ -892,9 +918,12 @@ async def test_parked_pane_stays_running_then_recovers_on_pane_death(tmp_path: P
     pane death retires the poller and the PTY side owns the outcome. Without
     that, the session would spin forever.
     """
-    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+    callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_parked"
     )
+    instance = registry.terminal_registry.get("conv_parked", "claude", "main")
+    assert instance is not None
+    finish_native_tui_boot(instance, callbacks["on_tick"], callbacks["on_idle"])
     poller = pollers[0]
     poller.active = True
 
@@ -1108,15 +1137,553 @@ async def test_reconnect_resync_keeps_the_exit_classification_memo(tmp_path: Pat
 async def test_pty_edges_drive_status_when_poller_inactive(tmp_path: Path) -> None:
     """With no file (poller inactive), the PTY pane edges remain the status
     source — the fallback path for old Claude versions."""
-    callbacks, statuses, pollers, _registry = await _observe_native_with_fake_poller(
+    callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
         tmp_path, "conv_fallback"
     )
+    instance = registry.terminal_registry.get("conv_fallback", "claude", "main")
+    assert instance is not None
+    finish_native_tui_boot(instance, callbacks["on_tick"], callbacks["on_idle"])
     # Poller stays inactive (file never resolved).
     assert pollers[0].active is False
 
     callbacks["on_activity"]()  # → running
     callbacks["on_idle"]()  # → idle
     # Status edges publish via loop.call_soon_threadsafe; let them drain.
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_pane_publishes_no_status_while_the_tui_boots(tmp_path: Path) -> None:
+    """Claude's startup repaints are not a turn, so they publish no status.
+
+    Published as ``running`` then ``idle``, they would read as a turn that
+    already finished. The pane drives status once Claude is quiet at its prompt.
+    """
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_boot"
+    )
+    instance = registry.terminal_registry.get("conv_boot", "claude", "main")
+    assert instance is not None
+    on_tick, on_activity, on_idle = (
+        callbacks["on_tick"],
+        callbacks["on_activity"],
+        callbacks["on_idle"],
+    )
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+
+    # The banner paints, then the pane rests before the composer appears.
+    on_tick()
+    on_activity()
+    on_idle()
+    # The composer's own repaint lands on the tick that first finds it ready.
+    instance.last_pane_text = lambda: CLAUDE_COMPOSER_PANE  # type: ignore[method-assign]
+    on_tick()
+    on_activity()
+    on_tick()
+    on_idle()
+    await asyncio.sleep(0)
+    assert statuses == []
+
+    # Booted: the pane is the agent's work again.
+    on_activity()
+    on_idle()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+async def test_message_handed_over_during_boot_publishes_once_the_tui_is_ready(
+    tmp_path: Path,
+) -> None:
+    """A message the runner holds through boot is a turn as soon as it is typed in.
+
+    A session's first message can reach the runner before the TUI is ready.
+    The banner still is not that turn, but the runner types the message the
+    moment the composer appears, without the pane ever resting in between.
+    Waiting for a quiet spell would hide the whole turn.
+    """
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_boot_turn"
+    )
+    instance = registry.terminal_registry.get("conv_boot_turn", "claude", "main")
+    assert instance is not None
+    on_tick, on_activity, on_idle = (
+        callbacks["on_tick"],
+        callbacks["on_activity"],
+        callbacks["on_idle"],
+    )
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+    registry.note_session_turn_started("conv_boot_turn")
+
+    on_tick()
+    on_activity()
+    on_idle()
+    await asyncio.sleep(0)
+    assert statuses == []
+
+    instance.last_pane_text = lambda: CLAUDE_COMPOSER_PANE  # type: ignore[method-assign]
+    on_tick()
+    on_activity()
+    on_idle()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+    # That turn's quiet ended the boot too, so a turn typed into the TUI shows.
+    on_activity()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle", "running"]
+
+
+@pytest.mark.asyncio
+async def test_pi_pane_drives_status_while_pi_starts(tmp_path: Path) -> None:
+    """Only Claude's startup output is held back from status.
+
+    Pi's runner turn ends as soon as the message is queued for its extension,
+    so pi keeps reading its status straight from the pane.
+    """
+    instance = make_test_terminal_instance("pi", "main", tmp_path)
+    terminal_registry = TerminalRegistry()
+    statuses: list[str] = []
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        SessionResourceRegistry(terminal_registry=terminal_registry),
+        terminal_registry,
+        instance,
+        "conv_pi_boot",
+        resource_role=PI_NATIVE_TERMINAL_ROLE,
+        status_publisher=lambda _sid, status, _reason=None: statuses.append(status),
+    )
+    on_tick, on_activity, on_idle = (
+        callbacks["on_tick"],
+        callbacks["on_activity"],
+        callbacks["on_idle"],
+    )
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+
+    on_tick()
+    on_activity()
+    on_idle()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("finish_boot", "pane_dead_fields", "session_was_idle", "quit_before_prompt"),
+    [
+        (False, "1|1|", False, False),
+        (False, "1||term", False, False),
+        (False, "1|0|", False, True),
+        (False, "1||int", False, True),
+        (False, "1|130|", False, True),
+        (True, "1|0|", True, False),
+    ],
+    ids=[
+        "fails-mid-boot",
+        "killed-mid-boot",
+        "exits-0-mid-boot",
+        "ctrl-c-mid-boot",
+        "handled-ctrl-c-mid-boot",
+        "exits-at-its-prompt",
+    ],
+)
+async def test_required_terminal_exit_reads_idle_only_once_the_tui_booted(
+    tmp_path: Path,
+    finish_boot: bool,
+    pane_dead_fields: str,
+    session_was_idle: bool,
+    quit_before_prompt: bool,
+) -> None:
+    """A TUI that dies before reaching its prompt failed to start, unless a person quit it.
+
+    A boot can rest mid-way (a sign-in screen, a slow MCP server), and that
+    pause is not the session going idle: an exit then must surface as a failure,
+    unless it exited 0 or a Ctrl-C ended it (SIGINT, or exit status 130). One
+    that exits after settling at its prompt is a clean shutdown.
+    """
+    callbacks, _statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_boot_exit"
+    )
+    instance = registry.terminal_registry.get("conv_boot_exit", "claude", "main")
+    assert instance is not None
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    on_tick, on_activity, on_idle, on_exit = (
+        callbacks["on_tick"],
+        callbacks["on_activity"],
+        callbacks["on_idle"],
+        callbacks["on_exit"],
+    )
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+    assert callable(on_exit)
+    on_tick()
+    on_activity()
+    on_idle()
+    if finish_boot:
+        finish_native_tui_boot(instance, on_tick, on_idle)
+    # tmux's dead-pane row: dead|exit status|signal name.
+    instance._exit_status_is_pending(pane_dead_fields)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert [(event.session_was_idle, event.quit_before_prompt) for event in exits] == [
+        (session_was_idle, quit_before_prompt)
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("delivery", "turn_left_running"),
+    [("none", False), ("open", False), ("ended", True)],
+    ids=["no-message", "delivery-open", "delivery-ended"],
+)
+async def test_quit_mid_startup_reports_a_turn_no_delivery_will_end(
+    tmp_path: Path, delivery: str, turn_left_running: bool
+) -> None:
+    """A quit while Claude starts says whether a turn shown as running needs ending.
+
+    An open delivery fails on its own once the terminal is gone; a delivered
+    message Claude was working on has nothing else to end it.
+    """
+    callbacks, _statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_quit_turn"
+    )
+    instance = registry.terminal_registry.get("conv_quit_turn", "claude", "main")
+    assert instance is not None
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    on_exit = callbacks["on_exit"]
+    assert callable(on_exit)
+    if delivery != "none":
+        registry.note_runner_turn_accepted("conv_quit_turn")
+    if delivery == "ended":
+        registry.note_runner_turn_ended("conv_quit_turn", "idle")
+    # tmux's dead-pane row for a Ctrl-C: dead|exit status|signal name.
+    instance._exit_status_is_pending("1||int")
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert [(event.quit_before_prompt, event.turn_left_running) for event in exits] == [
+        (True, turn_left_running)
+    ]
+
+
+@pytest.mark.asyncio
+async def test_message_accepted_during_boot_reads_as_working_until_claude_finishes(
+    tmp_path: Path,
+) -> None:
+    """From acceptance until Claude's turn ends, the session reads as working.
+
+    The first message can reach the runner while Claude is still booting, so
+    nothing on the terminal reflects it yet. Claude then reports idle at its
+    prompt before the runner has typed the message in; publishing that would
+    show the session done before it started.
+    """
+    callbacks, statuses, pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_accepted"
+    )
+    instance = registry.terminal_registry.get("conv_accepted", "claude", "main")
+    assert instance is not None
+    on_tick, on_activity, on_idle = (
+        callbacks["on_tick"],
+        callbacks["on_activity"],
+        callbacks["on_idle"],
+    )
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+    poller = pollers[0]
+
+    registry.note_runner_turn_accepted("conv_accepted")
+    on_tick()
+    on_activity()
+    on_idle()
+    finish_native_tui_boot(instance, on_tick, on_idle)
+    poller.active = True
+    poller.emit("idle")
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    # Typed in: Claude starts on it, and delivery hands status back.
+    poller.emit("running")
+    registry.note_runner_turn_ended("conv_accepted", "idle")
+    _tick_through_handback(on_tick)
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+    assert poller.resyncs == 1
+
+    poller.emit("idle")
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("claude_status", "next_message_fails_first", "expected_statuses"),
+    [
+        ("idle", False, ["running", "idle"]),
+        ("idle", True, ["running"]),
+        ("busy", True, ["running"]),
+    ],
+    ids=["delivery-ends", "next-message-fails-first", "busy-when-next-message-fails"],
+)
+async def test_prompt_claude_never_takes_up_reads_idle_after_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    claude_status: str,
+    next_message_fails_first: bool,
+    expected_statuses: list[str],
+) -> None:
+    """A message Claude never starts on can't leave the session reading as working.
+
+    A refused prompt leaves Claude idle with nothing new to report, so the end of
+    delivery has it report again, unless a message accepted since has failed.
+    """
+    session_id = "conv_refused"
+    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    status_file.write_text(
+        json.dumps(
+            {
+                "pid": 123,
+                "sessionId": "claude-refused",
+                "kind": "interactive",
+                "status": claude_status,
+                "statusUpdatedAt": 1000,
+            }
+        ),
+        encoding="utf-8",
+    )
+    registry.note_runner_turn_accepted(session_id)
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    registry.note_runner_turn_ended(session_id, "idle")
+    if next_message_fails_first:
+        registry.note_runner_turn_accepted(session_id)
+        registry.note_runner_turn_ended(session_id, "failed")
+    _tick_through_handback(on_tick)
+    await asyncio.sleep(0)
+    assert statuses == expected_statuses
+
+
+def _write_claude_status(status_file: Path, status: str, updated_at: int) -> None:
+    """Write Claude's ``sessions/<pid>.json`` record with a fresh mtime."""
+    status_file.write_text(
+        json.dumps(
+            {
+                "pid": 123,
+                "sessionId": "claude-late-read",
+                "kind": "interactive",
+                "status": status,
+                "statusUpdatedAt": updated_at,
+            }
+        ),
+        encoding="utf-8",
+    )
+    os.utime(status_file, (updated_at, updated_at))
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_before_handback", "expected_statuses"),
+    [("idle", ["running", "idle"]), ("busy", ["running"])],
+    ids=["prompt-refused", "claude-starts-working"],
+)
+async def test_status_file_read_first_after_delivery_waits_for_the_handback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    status_before_handback: str,
+    expected_statuses: list[str],
+) -> None:
+    """A status file first read after delivery can't end the turn before the hand-back.
+
+    Its idle may predate the message, so only the hand-back's re-read may publish one.
+    """
+    session_id = "conv_late_read"
+    on_tick, statuses, registry, status_file = await _observe_native_with_real_poller(
+        tmp_path, monkeypatch, session_id
+    )
+    _write_claude_status(status_file, "idle", 1000)
+    registry.note_runner_turn_accepted(session_id)
+    registry.note_runner_turn_ended(session_id, "idle")
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    _write_claude_status(status_file, status_before_handback, 2000)
+    on_tick()
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == expected_statuses
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("tui_booted", "next_message_fails_first", "expected_statuses"),
+    [
+        (True, False, ["running", "idle"]),
+        (True, True, ["running"]),
+        (False, False, ["running", "idle"]),
+    ],
+    ids=["delivery-ends", "next-message-fails-first", "interrupted-during-startup"],
+)
+async def test_quiet_pane_reads_idle_once_delivery_ends(
+    tmp_path: Path, tui_booted: bool, next_message_fails_first: bool, expected_statuses: list[str]
+) -> None:
+    """With only the pane to go on, a quiet spell during delivery shows after it.
+
+    That idle edge was held and doesn't recur on its own, so the end of delivery
+    reports it, even mid-startup, unless a message accepted since has failed.
+    """
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_pane_delivery"
+    )
+    instance = registry.terminal_registry.get("conv_pane_delivery", "claude", "main")
+    assert instance is not None
+    on_tick, on_activity, on_idle = (
+        callbacks["on_tick"],
+        callbacks["on_activity"],
+        callbacks["on_idle"],
+    )
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+    if tui_booted:
+        finish_native_tui_boot(instance, on_tick, on_idle)
+
+    registry.note_runner_turn_accepted("conv_pane_delivery")
+    on_activity()
+    on_idle()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    registry.note_runner_turn_ended("conv_pane_delivery", "idle")
+    if next_message_fails_first:
+        registry.note_runner_turn_accepted("conv_pane_delivery")
+        registry.note_runner_turn_ended("conv_pane_delivery", "failed")
+    _tick_through_handback(on_tick)
+    await asyncio.sleep(0)
+    assert statuses == expected_statuses
+
+
+@pytest.mark.asyncio
+async def test_pane_shows_claude_working_on_a_message_delivered_while_it_rested(
+    tmp_path: Path,
+) -> None:
+    """A pane captured before delivery can't end the turn delivery just started.
+
+    Claude rests at its prompt while the runner types, and delivery returns as
+    soon as the message leaves the input box, before the watcher has captured
+    that. Handing back on the old, quiet capture would flash the session idle.
+    """
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_rested"
+    )
+    instance = registry.terminal_registry.get("conv_rested", "claude", "main")
+    assert instance is not None
+    on_tick, on_activity, on_idle = (
+        callbacks["on_tick"],
+        callbacks["on_activity"],
+        callbacks["on_idle"],
+    )
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+    finish_native_tui_boot(instance, on_tick, on_idle)
+
+    registry.note_runner_turn_accepted("conv_rested")
+    on_activity()
+    on_idle()
+    registry.note_runner_turn_ended("conv_rested", "idle")
+    on_tick()
+    # The first capture after delivery shows Claude working on the message.
+    on_tick()
+    on_activity()
+    on_tick()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    on_idle()
+    await asyncio.sleep(0)
+    assert statuses == ["running", "idle"]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("accepted_turn_fails", [False, True], ids=["open", "already-failed"])
+async def test_idle_on_its_way_to_the_loop_cannot_overtake_an_accepted_turn(
+    tmp_path: Path, accepted_turn_fails: bool
+) -> None:
+    """A pane idle the loop hasn't sent yet can't land after an accepted turn's running.
+
+    The watcher thread commits an edge, then hands it to the loop to send. A
+    message the runner accepts in between owns status, even once it has failed.
+    """
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_overtake"
+    )
+    instance = registry.terminal_registry.get("conv_overtake", "claude", "main")
+    assert instance is not None
+    on_tick, on_activity, on_idle = (
+        callbacks["on_tick"],
+        callbacks["on_activity"],
+        callbacks["on_idle"],
+    )
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+    finish_native_tui_boot(instance, on_tick, on_idle)
+    on_activity()
+    await asyncio.sleep(0)
+    assert statuses == ["running"]
+
+    on_idle()
+    registry.note_runner_turn_accepted("conv_overtake")
+    if accepted_turn_fails:
+        registry.note_runner_turn_ended("conv_overtake", "failed")
+    await asyncio.sleep(0)
+    assert statuses == ["running", "running"]
+
+
+@pytest.mark.asyncio
+async def test_turn_the_runner_starts_during_boot_reads_idle_when_claude_finishes(
+    tmp_path: Path,
+) -> None:
+    """A runner-started turn, such as a recovery prompt at session start, ends.
+
+    Those turns reach Claude without the message route marking a turn active.
+    While Claude works on one before ever resting at its prompt, the pane is
+    that turn, not boot output, so its finish must read as idle.
+    """
+    callbacks, statuses, _pollers, registry = await _observe_native_with_fake_poller(
+        tmp_path, "conv_recovery"
+    )
+    instance = registry.terminal_registry.get("conv_recovery", "claude", "main")
+    assert instance is not None
+    on_tick, on_activity, on_idle = (
+        callbacks["on_tick"],
+        callbacks["on_activity"],
+        callbacks["on_idle"],
+    )
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+
+    registry.note_runner_turn_accepted("conv_recovery")
+    on_tick()
+    on_activity()
+    on_idle()
+    # The composer appears and the prompt is typed straight in.
+    instance.last_pane_text = lambda: CLAUDE_COMPOSER_PANE  # type: ignore[method-assign]
+    on_tick()
+    on_activity()
+    registry.note_runner_turn_ended("conv_recovery", "idle")
+    _tick_through_handback(on_tick)
+    on_idle()
     await asyncio.sleep(0)
     assert statuses == ["running", "idle"]
 
@@ -1154,9 +1721,11 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
 
     initial_activity = registry.session_activity_epoch("conv_idle")
     # The agent worked, then its turn completed (pane became quiet → idle).
+    on_tick = callbacks["on_tick"]
     on_activity = callbacks["on_activity"]
     on_idle = callbacks["on_idle"]
-    assert callable(on_activity) and callable(on_idle)
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+    finish_native_tui_boot(instance, on_tick, on_idle)
     on_activity()
     on_idle()
     # Then the pane disappeared (e.g. Claude Code exited cleanly).
@@ -1208,8 +1777,11 @@ async def test_required_terminal_exit_while_running_is_failure(
         registry, terminal_registry, instance, "conv_run"
     )
 
+    on_tick = callbacks["on_tick"]
     on_activity = callbacks["on_activity"]
-    assert callable(on_activity)
+    on_idle = callbacks["on_idle"]
+    assert callable(on_tick) and callable(on_activity) and callable(on_idle)
+    finish_native_tui_boot(instance, on_tick, on_idle)
     on_activity()
     on_exit = callbacks["on_exit"]
     assert callable(on_exit)
@@ -1367,8 +1939,10 @@ async def test_required_terminal_exit_after_new_turn_is_failure(tmp_path: Path) 
 
     # The previous turn finished (idle), then a new message starts a turn and
     # the pane crashes before the watcher emits its next ``running`` edge.
+    on_tick = callbacks["on_tick"]
     on_idle = callbacks["on_idle"]
-    assert callable(on_idle)
+    assert callable(on_tick) and callable(on_idle)
+    finish_native_tui_boot(instance, on_tick, on_idle)
     on_idle()
     registry.note_session_turn_started("conv_turn")
     on_exit = callbacks["on_exit"]

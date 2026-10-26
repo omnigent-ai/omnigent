@@ -1525,13 +1525,13 @@ class TerminalInstance:
         self._remember_exit_status(f"{dead} {status}")
         if dead == "1" and raw_signal:
             self._last_exit_signal = raw_signal[:64]
+            # tmux 3.4 names the signal in lowercase, e.g. "int".
+            name = raw_signal.upper()
             with contextlib.suppress(ValueError, KeyError):
                 self._last_exit_signal = (
                     signal.Signals(int(raw_signal)).name
                     if raw_signal.isdigit()
-                    else signal.Signals[
-                        raw_signal if raw_signal.startswith("SIG") else "SIG" + raw_signal
-                    ].name
+                    else signal.Signals[name if name.startswith("SIG") else "SIG" + name].name
                 )
         return dead == "1" and not status and not raw_signal
 

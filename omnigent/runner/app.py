@@ -1895,6 +1895,12 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        # Quit by a person before its prompt with no turn left running: not a crash. A
+        # launcher can exit 0 after Claude fails, so a recognized failure still fails.
+        if event.quit_before_prompt and not event.turn_left_running and diagnosis is None:
+            _release_required_terminal_session(event.session_id)
+            return
+
         if _shutting_down.is_set():
             # tmux died with this runner's process group on a stop signal, not
             # a crash; the server settles the turn from the dropped tunnel.
@@ -3588,13 +3594,21 @@ def create_runner_app(
         source_error: Mapping[str, object] | None = None,
         response_id: str | None = None,
     ) -> None:
+        requested_status = status
         if status == "waiting" and not (
             _server_version is not None and _version_supports_waiting_status(_server_version)
         ):
             status = "running"
         harness = _session_harness_name(conv_id)
+        if harness == "claude-native":
+            # Claude's terminal owns status after delivery; show running from acceptance.
+            if requested_status == "running":
+                resource_registry.note_runner_turn_accepted(conv_id)
+                return
+            resource_registry.note_runner_turn_ended(conv_id, requested_status)
+            if requested_status != "failed":
+                return
         if status != "failed" and harness in {
-            "claude-native",
             "pi-native",
             "cursor-native",
             "kiro-native",
@@ -3904,11 +3918,13 @@ def create_runner_app(
         _suppress_status = _desync_terminalized.get(conv_id) == _turn_bind_epoch.get(conv_id, 0)
         if _suppress_status:
             _desync_terminalized.pop(conv_id, None)
+        published_end = False
         if was_interrupted:
             _interrupted_sessions.discard(conv_id)
             _append_cancellation_items(conv_id)
             if not has_buffered and not _suppress_status:
                 _publish_turn_status(conv_id, "idle")
+                published_end = True
         elif error is not None:
             normalized_error = _normalize_turn_error(error)
             if not _suppress_status:
@@ -3919,6 +3935,7 @@ def create_runner_app(
                     source_error=error,
                     response_id=owner_response_id,
                 )
+                published_end = True
             if normalized_error.get("code") == "databricks_sign_in_pending":
                 _start_sign_in_watch(conv_id)
         else:
@@ -3930,6 +3947,11 @@ def create_runner_app(
                     for c in children
                 )
                 _publish_turn_status(conv_id, "waiting" if has_running_children else "idle")
+                published_end = True
+        if not published_end and _session_harness_name(conv_id) == "claude-native":
+            # Delivery is over even with no end status (the queued turn may never
+            # start), so Claude's idle edges can't stay held.
+            resource_registry.note_runner_turn_ended(conv_id, "idle")
         if was_interrupted:
             if conv_id in _desynced_sessions and not has_buffered:
                 # This turn was torn down by desync recovery (which sets the
@@ -6632,7 +6654,15 @@ def create_runner_app(
                 _publish_turn_status(conversation_id, "running")
 
                 if stream:
-                    response = await _stream_message_to_harness(message_body, conversation_id)
+                    try:
+                        response = await _stream_message_to_harness(message_body, conversation_id)
+                    except (Exception, asyncio.CancelledError) as exc:
+                        # End the turn as failed, so it can't stay running.
+                        detail = _client_safe_error_detail(exc, context="stream setup")
+                        _on_proxy_stream_end(
+                            conversation_id, error={"message": f"turn setup failed: {detail}"}
+                        )
+                        raise
                     if not isinstance(response, StreamingResponse):
                         _on_proxy_stream_end(
                             conversation_id,

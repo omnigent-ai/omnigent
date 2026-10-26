@@ -8202,7 +8202,17 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
         // here rather than via a bare PTY `idle`. `sessionStatus` stays
         // `waiting` (set above) and `backgroundTaskCount` is untouched, so the
         // "Working…" spinner and sidebar dot keep reflecting the background work.
-        if (event.status === "idle" || event.status === "failed" || event.status === "waiting") {
+
+        // A message still held here hasn't started a turn, so idle/waiting can't end
+        // one; a turn already streaming still ends.
+        const holdingDraft =
+          event.status !== "failed" &&
+          holdsInitialDraft(s) &&
+          s.activeResponse?.state !== "streaming";
+        if (
+          (event.status === "idle" || event.status === "failed" || event.status === "waiting") &&
+          !holdingDraft
+        ) {
           if (event.responseId !== undefined && s.activeResponse?.responseId === event.responseId) {
             patch.status = "idle";
             if (s.activeResponse.state === "streaming") settledResponseId = event.responseId;
@@ -8235,30 +8245,14 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
               };
             }
           }
-          // Clear ALL pending user messages on terminal status. Any
-          // message still pending when the session reaches idle was
-          // either consumed (input.consumed event raced ahead) or
-          // denied by policy (no input.consumed fires). In both
-          // cases, keeping it in pendingUserMessages would leave a
-          // dangling optimistic bubble in the transcript. (The
-          // "Working…" indicator no longer reads this — it tracks
-          // session.status directly — but the bubble cleanup still
-          // matters.)
-          //
-          // EXCEPT native-terminal sessions (claude/codex-native): their
-          // web message isn't persisted at POST time — it round-trips
-          // through the vendor TUI and is reconciled by the transcript
-          // forwarder's session.input.consumed event, which can arrive
-          // AFTER a transient idle/failed (Claude cold-start on resume,
-          // runner-relaunch status churn). Clearing here would drop the
-          // optimistic bubble before its consumed event lands, leaving a
-          // multi-second gap until the committed item re-renders. Native
-          // pending bubbles are reconciled by that consumed event (+ the
-          // server-side pending_inputs TTL), and native denials roll back
-          // via the POST `denied` response — so the idle-clear is never
-          // needed for them and only races the round-trip.
+          // A sent bubble still pending at turn end was consumed or denied, so drop it.
+          // Native sessions keep theirs: the consumed event can land after a transient
+          // idle, and a native denial rolls back via the POST's `denied` answer.
           if (!s.isNativeTerminalSession && s.pendingUserMessages.length > 0) {
-            patch.pendingUserMessages = [];
+            // A held message was never sent, so no turn can have consumed it.
+            patch.pendingUserMessages = s.pendingUserMessages.filter(
+              (message) => message.initialDraft !== undefined,
+            );
           }
         }
         // Surface terminal-native failures carried only by session status.

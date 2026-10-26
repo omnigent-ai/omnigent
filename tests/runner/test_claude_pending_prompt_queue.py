@@ -9,6 +9,7 @@ import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+from unittest.mock import Mock
 
 import pytest
 from fastapi import FastAPI
@@ -16,28 +17,57 @@ from fastapi import FastAPI
 from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.runner import app as runner_app
 from omnigent.runner import create_runner_app
+from omnigent.runner.resource_registry import (
+    CLAUDE_NATIVE_TERMINAL_ROLE,
+    SessionResourceRegistry,
+)
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.conftest import (
+    _drain_session_event_queue,
     _FakeProcessManager,
     _runner_client,
     _ScriptedHarnessClient,
     _sse,
 )
-from tests.runner.helpers import NullServerClient
+from tests.runner.helpers import (
+    NullServerClient,
+    finish_native_tui_boot,
+    make_test_terminal_instance,
+)
 
 
 class _SnapshotHarnessClient(_ScriptedHarnessClient):
     """Capture each turn's input before subsequent history appends."""
 
     on_dispatch: Callable[[], None] | None = None
+    # When set, each delivery stays in flight until this event is set.
+    release: asyncio.Event | None = None
 
     def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
         if self.on_dispatch is not None:
             self.on_dispatch()
-        return super().stream(method, url, json=copy.deepcopy(json), timeout=timeout)
+        delivery = super().stream(method, url, json=copy.deepcopy(json), timeout=timeout)
+        release = self.release
+        if release is None:
+            return delivery
+
+        class _HeldDelivery:
+            status_code = 200
+
+            async def __aenter__(self) -> Any:
+                await release.wait()
+                return await delivery.__aenter__()
+
+            async def __aexit__(self, *exc_info: object) -> None:
+                await delivery.__aexit__(*exc_info)
+
+        return _HeldDelivery()
 
 
-def _build_app() -> tuple[FastAPI, _SnapshotHarnessClient]:
+def _build_app(
+    resource_registry: SessionResourceRegistry | None = None,
+) -> tuple[FastAPI, _SnapshotHarnessClient]:
     spec = AgentSpec(
         spec_version=1,
         name="t",
@@ -57,6 +87,7 @@ def _build_app() -> tuple[FastAPI, _SnapshotHarnessClient]:
         process_manager=_FakeProcessManager(harness),  # type: ignore[arg-type]
         spec_resolver=resolver,
         server_client=NullServerClient(),  # type: ignore[arg-type]
+        resource_registry=resource_registry,
     )
     return app, harness
 
@@ -316,3 +347,79 @@ async def test_stop_during_drain_probe_does_not_restart_session(
         assert sid not in app.state.claude_prompt_waiters
         assert sid not in app.state.session_message_buffers
         assert harness.posted_bodies == []
+
+
+async def _watch_booted_claude_terminal(
+    registry: SessionResourceRegistry,
+    session_id: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> Callable[[], None]:
+    """
+    Watch a fake Claude terminal that has booted to its prompt.
+
+    :param registry: The runner's resource registry.
+    :param session_id: Session the terminal belongs to.
+    :param tmp_path: Scratch directory for the terminal and Claude's config.
+    :param monkeypatch: Pytest monkeypatch, to stub the terminal's watcher thread.
+    :returns: The watcher's per-tick callback.
+    """
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path / "claude"))
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    # Registered and alive, so the turn path uses it instead of launching Claude.
+    terminals = registry.terminal_registry._by_conversation.setdefault(session_id, {})
+    terminals[("claude", "main")] = instance
+
+    async def _alive() -> bool:
+        return True
+
+    monkeypatch.setattr(instance, "is_alive", _alive)
+    watcher = Mock()
+    monkeypatch.setattr(instance, "start_idle_watcher_thread", watcher)
+    monkeypatch.setattr(instance, "pane_pid_sync", lambda: None)
+    await registry.observe_required_terminal(
+        session_id, "claude", "main", instance, resource_role=CLAUDE_NATIVE_TERMINAL_ROLE
+    )
+    on_tick, on_idle = watcher.call_args.kwargs["on_tick"], watcher.call_args.kwargs["on_idle"]
+    finish_native_tui_boot(instance, on_tick, on_idle)
+    return on_tick
+
+
+@pytest.mark.asyncio
+async def test_delivery_that_leaves_a_message_queued_lets_claudes_idle_through(
+    monkeypatch: pytest.MonkeyPatch, pending_prompt: dict[str, bool], tmp_path: Path
+) -> None:
+    """A delivery ending with a message queued publishes no status, yet stops holding idle.
+
+    The queued message can wait behind a question and then be dropped by an
+    interrupt, so no later turn would end the hold.
+    """
+    registry = SessionResourceRegistry(terminal_registry=TerminalRegistry())
+    app, harness = _build_app(resource_registry=registry)
+    harness.release = asyncio.Event()
+    sid = uuid.uuid4().hex
+    pending_prompt["pending"] = False
+    monkeypatch.setattr(claude_native_bridge, "inject_interrupt", lambda *_a, **_k: None)
+    async with _runner_client(app) as client:
+        await client.post("/v1/sessions", json={"session_id": sid, "agent_id": uuid.uuid4().hex})
+        on_tick = await _watch_booted_claude_terminal(registry, sid, tmp_path, monkeypatch)
+        await client.post(f"/v1/sessions/{sid}/events", json=_message("first"))
+        await _until(lambda: len(harness.posted_bodies) == 1)
+        queued = await client.post(f"/v1/sessions/{sid}/events", json=_message("second"))
+        assert queued.json()["status"] == "buffered"
+
+        pending_prompt["pending"] = True
+        harness.release.set()
+        await _until(lambda: sid in app.state.claude_prompt_waiters)
+        await client.post(f"/v1/sessions/{sid}/events", json={"type": "interrupt"})
+        # Claude rests at its prompt; the watcher hands its status back.
+        for _ in range(3):
+            on_tick()
+        await asyncio.sleep(0)
+        statuses = [
+            event["status"]
+            for event in _drain_session_event_queue(app.state.session_event_queues.get(sid))
+            if event["type"] == "session.status"
+        ]
+
+    assert statuses == ["running", "idle"]

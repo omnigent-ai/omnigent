@@ -321,11 +321,8 @@ class ClaudeNativeExecutor(Executor):
                 exc_info=not clean_exit,
                 extra={"session_id": self._request_session_id},
             )
-            cleanup_error = self._reap_failed_turn()
-            message = describe_exception(exc)
-            if cleanup_error is not None:
-                message = f"{message} Cleanup also failed: {cleanup_error}"
-            yield ExecutorError(message=message, undelivered=True)
+            # No reap: the runner closes the dead pane once it has read how it exited.
+            yield ExecutorError(message=describe_exception(exc), undelivered=True)
             return
         except ClaudePromptTimeout as exc:
             _logger.exception(

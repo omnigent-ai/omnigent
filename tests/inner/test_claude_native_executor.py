@@ -1898,9 +1898,11 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     afterwards must still fail — the pane is gone — but logging that as an
     ERROR reports the person's own teardown as a mid-session failure. A
     pane that died on its own (any other wait-status, or none recorded)
-    keeps the ERROR and its traceback.
+    keeps the ERROR and its traceback. The dead pane is left for the runner,
+    which reads how it exited before closing it.
     """
     bridge_dir = tmp_path / "bridge"
+    reaped: list[Path] = []
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
@@ -1911,7 +1913,9 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
 
     monkeypatch.setattr(claude_native_executor, "inject_user_message", fail_inject)
     monkeypatch.setattr(
-        claude_native_executor, "kill_session", lambda bridge_dir_arg, *, timeout_s: None
+        claude_native_executor,
+        "kill_session",
+        lambda bridge_dir_arg, *, timeout_s: reaped.append(bridge_dir_arg),
     )
 
     with caplog.at_level(logging.WARNING, logger="omnigent.inner.claude_native_executor"):
@@ -1928,6 +1932,7 @@ async def test_run_turn_logs_a_closed_terminal_below_error(
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
     assert events[0].undelivered is True
+    assert reaped == []
 
     records = [r for r in caplog.records if "terminal exited" in r.getMessage()]
     assert len(records) == 1
@@ -2063,17 +2068,15 @@ async def test_run_turn_does_not_reap_unrelated_runtime_error(
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", [ClaudePromptTimeout, ClaudeTerminalExited])
 async def test_run_turn_reports_reap_failure_with_prompt_timeout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    failure: type[ClaudePromptTimeout],
 ) -> None:
     """A failed hard-stop remains visible beside the delivery error."""
 
     def fail_inject(bridge_dir_arg: Path, *, content: str, timeout_s: float = 30.0) -> None:
         del bridge_dir_arg, content, timeout_s
-        raise failure("terminal did not become ready")
+        raise ClaudePromptTimeout("terminal did not become ready")
 
     def fail_kill(bridge_dir_arg: Path, *, timeout_s: float) -> None:
         del bridge_dir_arg, timeout_s

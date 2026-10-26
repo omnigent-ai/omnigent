@@ -5845,7 +5845,7 @@ def claude_pane_ready(bridge_dir: Path) -> bool:
 
 
 def claude_pane_text_ready(pane: str) -> bool:
-    """Recognize input readiness for logging without capturing another pane."""
+    """Recognize input readiness from a pane already captured, e.g. by the terminal watcher."""
     if _MODEL_PICKER_OPEN_HINT in pane:
         return False
     if any(text in pane for text in _CONFIRM_DIALOG_HINTS):

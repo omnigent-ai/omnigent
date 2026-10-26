@@ -3945,6 +3945,10 @@ describe("chatStore — first message during native model startup", () => {
 
     handleSessionEvent({ type: "session_status", conversationId: sessionId, status: "idle" });
     expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeDefined();
+    // Claude reporting ready doesn't end a turn whose message is still held here.
+    expect(useChatStore.getState().status).toBe("streaming");
+    handleSessionEvent({ type: "session_status", conversationId: sessionId, status: "waiting" });
+    expect(useChatStore.getState().status).toBe("streaming");
     reportModel();
     await settle();
 
@@ -4701,11 +4705,17 @@ describe("chatStore — first message during native model startup", () => {
 
 describe("chatStore — sending during a model switch", () => {
   const sessionId = "conv_model_switch_send";
+  const CLAUDE_NATIVE_SESSION = {
+    harness: "claude-native",
+    labels: { "omnigent.wrapper": "claude-code-native-ui" },
+  };
 
   beforeEach(clearSessionDrafts);
   afterEach(clearSessionDrafts);
 
-  async function beginModelSwitch(): Promise<() => Promise<void>> {
+  async function beginModelSwitch(
+    session: { harness: string; labels: Record<string, string> } = CLAUDE_NATIVE_SESSION,
+  ): Promise<() => Promise<void>> {
     seedSession(sessionId, [
       userMessage("previous", "hello"),
       assistantMessage("previous", "hello"),
@@ -4723,8 +4733,7 @@ describe("chatStore — sending during a model switch", () => {
           agent_id: "agent_xyz",
           status: "idle",
           created_at: 0,
-          harness: "claude-native",
-          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          ...session,
           llm_model: "haiku",
         });
       }
@@ -4772,6 +4781,104 @@ describe("chatStore — sending during a model switch", () => {
       },
     ]);
     expect(useChatStore.getState().pendingUserMessages[0]?.initialDraft).toBeUndefined();
+  });
+
+  it.each([
+    // A native session's sent bubbles wait for their consumed event instead.
+    { kind: "native", session: CLAUDE_NATIVE_SESSION, pendingAfterTurn: ["sent", "held"] },
+    {
+      kind: "non-native",
+      session: { harness: "claude-sdk", labels: {} },
+      pendingAfterTurn: ["held"],
+    },
+  ])(
+    "still ends a running $kind turn while a message sent during it waits for the switch",
+    async ({ session, pendingAfterTurn }) => {
+      const confirmModel = await beginModelSwitch(session);
+      handleSessionEvent(
+        {
+          type: "session_status",
+          conversationId: sessionId,
+          status: "running",
+          responseId: "resp_running",
+        },
+        sessionId,
+      );
+      useChatStore.setState({
+        pendingUserMessages: [
+          { tempId: "pend_sent", content: [{ type: "input_text", text: "sent" }] },
+        ],
+      });
+      const sending = useChatStore.getState().send("held", "agent_xyz");
+      await tick();
+      expect(useChatStore.getState().pendingUserMessages.at(-1)?.initialDraft).toBeDefined();
+
+      handleSessionEvent(
+        {
+          type: "session_status",
+          conversationId: sessionId,
+          status: "idle",
+          responseId: "resp_running",
+        },
+        sessionId,
+      );
+      const afterTurn = useChatStore.getState();
+      expect(afterTurn.activeResponse).toMatchObject({
+        responseId: "resp_running",
+        state: "completed",
+      });
+      // Nothing may drop the held message.
+      expect(
+        afterTurn.pendingUserMessages.map((p) => (p.content[0] as { text: string }).text),
+      ).toEqual(pendingAfterTurn);
+
+      await confirmModel();
+      await sending;
+      expect(eventBodies()).toEqual([
+        {
+          type: "message",
+          data: expect.objectContaining({ content: [{ type: "input_text", text: "held" }] }),
+        },
+      ]);
+    },
+  );
+
+  it("leaves nothing streaming when a held send fails after the running turn ended", async () => {
+    const confirmModel = await beginModelSwitch();
+    const switchHandler = fetchMock.getMockImplementation()!;
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith(`/v1/sessions/${sessionId}/resources/files`)) {
+        return mockResponse({ detail: "attachment refused" }, { ok: false, status: 415 });
+      }
+      return switchHandler(input, init);
+    });
+    handleSessionEvent(
+      {
+        type: "session_status",
+        conversationId: sessionId,
+        status: "running",
+        responseId: "resp_running",
+      },
+      sessionId,
+    );
+    const notes = new File([new Uint8Array(4)], "notes.txt", { type: "text/plain" });
+    const sending = useChatStore.getState().send("held", "agent_xyz", [notes]);
+    await tick();
+    handleSessionEvent(
+      {
+        type: "session_status",
+        conversationId: sessionId,
+        status: "idle",
+        responseId: "resp_running",
+      },
+      sessionId,
+    );
+
+    await confirmModel();
+    await sending;
+    // The upload failed before anything was sent; no turn is left to end the send.
+    expect(useChatStore.getState()).toMatchObject({ status: "idle", pendingUserMessages: [] });
+    expect(eventBodies()).toEqual([]);
   });
 
   it("restores a stopped draft and sends only its correction after the model switch", async () => {

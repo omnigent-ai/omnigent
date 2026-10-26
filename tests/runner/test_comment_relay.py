@@ -122,6 +122,12 @@ class _StubResourceRegistry:
     def note_session_turn_started(self, session_id: str) -> None:
         """No terminal is running, so turns have no lifecycle evidence."""
 
+    def note_runner_turn_accepted(self, session_id: str) -> None:
+        """No terminal is running, so there is no status to show for the turn."""
+
+    def note_runner_turn_ended(self, session_id: str, status: str) -> None:
+        """No terminal is running, so there is no status to hand back."""
+
     def uses_copy_on_write(self, session_id: str) -> bool:
         """The stub has no sandbox environment."""
         return False

@@ -40,7 +40,11 @@ from omnigent.runner.resource_registry import (
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalListEntry, TerminalRegistry
 from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
-from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+from tests.runner.helpers import (
+    NullServerClient,
+    finish_native_tui_boot,
+    make_test_terminal_instance,
+)
 
 
 @dataclass
@@ -1805,6 +1809,8 @@ async def test_claude_native_terminal_drives_session_status_from_pane_activity(
     assert capture.on_activity is not None
     assert capture.idle_threshold_s == _CLAUDE_NATIVE_STATUS_IDLE_THRESHOLD_SECONDS
     assert capture.poll_interval_s == _CLAUDE_NATIVE_STATUS_POLL_INTERVAL_SECONDS
+    assert capture.on_tick is not None
+    finish_native_tui_boot(instance, capture.on_tick, capture.on_idle)
 
     # Two pane changes in one working stretch must yield exactly one
     # ``running`` edge — the dedupe holds. A second ``running`` here would
