@@ -14,13 +14,11 @@ from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import get_args
 
 import httpx
 
 from omnigent.codex_approval_modes import codex_permission_preset_from_thread_settings
 from omnigent.debug_logging import debug_event
-from omnigent.entities.conversation import AssistantMessagePhase
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import url_component
 from omnigent.harnesses.codex_egress import (
@@ -6438,9 +6436,9 @@ async def _post_agent_message(
         "agent": _AGENT_NAME,
         "content": [{"type": "output_text", "text": text}],
     }
-    # Codex labels progress vs. answer text; the web UI folds commentary.
+    # Codex labels progress vs. answer text; the server drops values it doesn't know.
     phase = item.get("phase")
-    if phase in _AGENT_MESSAGE_PHASES:
+    if isinstance(phase, str):
         item_data["phase"] = phase
     return await _post_external_item(
         client,
@@ -6915,8 +6913,6 @@ _TOOL_ITEM_TYPES = frozenset(_TOOL_ITEM_BUILDERS)
 # review-mode affordance, so these are mirrored as a visible assistant-message
 # marker (see :func:`_post_review_mode_marker`).
 _REVIEW_MODE_ITEM_TYPES = frozenset({"enteredReviewMode", "exitedReviewMode"})
-# Codex ``MessagePhase`` values the server accepts; newer ones are dropped.
-_AGENT_MESSAGE_PHASES = frozenset(get_args(AssistantMessagePhase))
 
 
 async def _post_external_item(

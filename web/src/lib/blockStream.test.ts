@@ -830,12 +830,16 @@ describe("BlockStream — multi-response (session-lifetime reducer)", () => {
         content: [{ type: "output_text", text: "Hi! 👋" }],
         itemId: "msg_X",
         responseId: "resp_X",
+        phase: "commentary",
       },
     ]);
 
     const textDones = blocks.filter((b): b is TextDone => b.type === "text_done");
     expect(textDones).toHaveLength(1);
     expect(textDones[0]!.fullText).toBe("Hi! 👋");
+    // The deduped message keeps its identity, so live and reloaded folds agree.
+    expect(textDones[0]!.ctx.itemId).toBe("msg_X");
+    expect(textDones[0]!.phase).toBe("commentary");
   });
 
   it("response_in_progress sets the responseId when response.created is absent", () => {

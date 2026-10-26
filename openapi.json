@@ -4151,6 +4151,23 @@
             ],
             "title": "Model"
           },
+          "phase": {
+            "anyOf": [
+              {
+                "enum": [
+                  "commentary",
+                  "partial_answer",
+                  "final_answer"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Assistant-only harness label for the message, e.g. Codex `\"commentary\"` (progress) or `\"final_answer\"`. `None` when the harness doesn't report one or reports a value this build doesn't know.",
+            "title": "Phase"
+          },
           "role": {
             "description": "`\"user\"` or `\"assistant\"`.",
             "enum": [

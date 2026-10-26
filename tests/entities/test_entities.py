@@ -94,6 +94,16 @@ def test_message_phase_is_assistant_only_and_omitted_when_unset() -> None:
         MessageData(role="user", content=[], phase="final_answer")
 
 
+def test_unknown_message_phase_reads_as_unlabelled() -> None:
+    """A phase from a newer Codex (or a newer server's row) must not reject the message."""
+    msg = parse_item_data(
+        "message",
+        {"role": "assistant", "agent": "codex-native-ui", "content": [], "phase": "summary"},
+    )
+    assert isinstance(msg, MessageData)
+    assert msg.phase is None
+
+
 def test_assistant_message_includes_agent() -> None:
     msg = MessageData(role="assistant", agent="my-agent", content=[])
     dumped = msg.model_dump(exclude_none=True)

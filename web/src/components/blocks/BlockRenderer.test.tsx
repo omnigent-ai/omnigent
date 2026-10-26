@@ -866,6 +866,17 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(2);
       });
 
+      it("folds commentary that follows the final answer", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "It is 391.", final: true, phase: "final_answer" },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Saved it.", final: true, phase: "commentary" },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getByText("It is 391.")).toBeDefined();
+        expect(screen.queryByText("Saved it.")).toBeNull();
+      });
+
       it("falls back to the last message when no answer phase is reported", () => {
         const items: RenderItem[] = [
           { kind: "text", itemId: "m0", text: "Checking.", final: true, phase: "commentary" },
@@ -876,6 +887,17 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
         expect(screen.queryByText("Checking.")).toBeNull();
         expect(screen.getByText("Still checking.")).toBeDefined();
+      });
+
+      it("decides per bubble, so a continued commentary-only bubble keeps its last message", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Checking.", final: true, phase: "commentary" },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Waiting on CI.", final: true, phase: "commentary" },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" continued foldNarration />);
+        expect(screen.queryByText("Checking.")).toBeNull();
+        expect(screen.getByText("Waiting on CI.")).toBeDefined();
       });
 
       it("leaves a single-message turn and a live turn unfolded until it settles", () => {

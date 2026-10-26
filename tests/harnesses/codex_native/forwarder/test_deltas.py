@@ -547,15 +547,17 @@ async def test_transient_delta_post_uses_one_short_attempt() -> None:
     ("codex_phase", "expected_phase"),
     [
         ("commentary", "commentary"),
+        ("partial_answer", "partial_answer"),
         ("final_answer", "final_answer"),
-        ("summary", None),
+        # The server, not the forwarder, decides which values it knows.
+        ("summary", "summary"),
         (None, None),
     ],
 )
-async def test_agent_message_forwards_known_codex_phase(
+async def test_agent_message_forwards_codex_phase(
     codex_phase: str | None, expected_phase: str | None
 ) -> None:
-    """Codex's commentary/answer label persists so the web UI can fold narration."""
+    """Codex's commentary/answer label is forwarded so the web UI can fold narration."""
     client = _RecordingClient()
     item = {"id": "item_1", "type": "agentMessage", "text": "Checking the tests."}
     if codex_phase is not None:

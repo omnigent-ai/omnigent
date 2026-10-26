@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal
+from typing import Any, Literal, get_args
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -289,7 +289,8 @@ class StartupInputOptions(BaseModel):
     background_titles_enabled: bool = False
 
 
-# Codex ``MessagePhase`` values: progress narration vs. answer text.
+# Codex ``MessagePhase`` values: progress narration vs. answer text
+# (``partial_answer`` only from newer Codex releases, e.g. 0.164).
 AssistantMessagePhase = Literal["commentary", "partial_answer", "final_answer"]
 
 
@@ -319,7 +320,7 @@ class MessageData(BaseModel):
     :param subagent_return_id: Native task id of an explicitly completed child.
     :param phase: Assistant-only harness label for the message, e.g. Codex
         ``"commentary"`` (progress) or ``"final_answer"``. ``None`` when the
-        harness doesn't report one.
+        harness doesn't report one or reports a value this build doesn't know.
     """
 
     role: Literal["user", "assistant"]
@@ -343,6 +344,12 @@ class MessageData(BaseModel):
     def reject_framework_blocks(cls, content: list[dict[str, Any]]) -> list[dict[str, Any]]:
         reject_authored_framework_notices(content)
         return content
+
+    @field_validator("phase", mode="before")
+    @classmethod
+    def drop_unknown_phase(cls, phase: object) -> object:
+        """Read an unknown phase as unlabelled so newer producers and stored rows still load."""
+        return phase if phase in get_args(AssistantMessagePhase) else None
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:

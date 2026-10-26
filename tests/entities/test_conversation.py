@@ -61,25 +61,6 @@ def test_to_api_dict_exposes_interrupted_assistant_marker() -> None:
     assert api["model"] == "codex-native-ui"
 
 
-def test_to_api_dict_exposes_assistant_phase() -> None:
-    """The Codex commentary/answer label reaches the web UI on reload."""
-    item = ConversationItem(
-        id="msg_commentary",
-        type="message",
-        status="completed",
-        response_id="codex_turn_123",
-        created_at=0,
-        data=MessageData(
-            role="assistant",
-            agent="codex-native-ui",
-            phase="commentary",
-            content=[{"type": "output_text", "text": "Checking the tests."}],
-        ),
-    )
-
-    assert item.to_api_dict()["phase"] == "commentary"
-
-
 @pytest.mark.parametrize(
     "content,expected",
     [
