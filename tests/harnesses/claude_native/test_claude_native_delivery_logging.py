@@ -464,11 +464,23 @@ def test_unreadable_status_snapshot_omits_the_claude_version(
     [
         (
             "scrollback\n──────\n❯ private draft\n  private second row\n──────\n  footer\n",
-            {"composer_box_rows": "2", "composer_box_blank_rows": "0"},
+            {
+                "composer_box_rows": "2",
+                "composer_box_blank_rows": "0",
+                "composer_first_row_glyph_only": "False",
+                "composer_pane_rows": "6",
+                "composer_pane_max_columns": "20",
+            },
         ),
         (
             "scrollback\n──────\n❯\n\n──────\n  footer\n",
-            {"composer_box_rows": "2", "composer_box_blank_rows": "1"},
+            {
+                "composer_box_rows": "2",
+                "composer_box_blank_rows": "1",
+                "composer_first_row_glyph_only": "True",
+                "composer_pane_rows": "6",
+                "composer_pane_max_columns": "10",
+            },
         ),
     ],
     ids=["two-row-draft", "glyph-row-and-blank-row"],
@@ -504,7 +516,9 @@ def test_an_uncleared_composer_logs_its_shape_without_text(
     row = record_to_row(record, source="runner")
     attrs = row["attributes"]
     assert {key: attrs[key] for key in expected} == expected
+    assert attrs["composer_box_found"] == "True"
     assert attrs["composer_box_framed"] == "True"
+    assert attrs["composer_capture_empty"] == "False"
     assert attrs["composer_rule_rows"] == "2"
     assert attrs["error_type"] == "ClaudeComposerNotCleared"
     assert "private" not in json.dumps(row)
