@@ -205,10 +205,12 @@ class CodexAppServerSilentStartTimeout(RuntimeError):
 
 @dataclass(frozen=True)
 class _CodexModelDiscoveryProcess:
-    """Short-lived Codex process plus its bounded stderr drain."""
+    """Short-lived Codex process, its bounded stderr drain and crash-reap registration."""
 
     process: asyncio.subprocess.Process
     stderr_tail: asyncio.Task[str]
+    registry_tag: str | None = None
+    owner_lock: CodexNativeProcessOwnerLock | None = None
 
 
 def _string_object_dict(value: object) -> _JsonObject | None:
@@ -1464,28 +1466,48 @@ async def _start_codex_model_discovery_process(
     config_overrides: Sequence[str] = (),
 ) -> _CodexModelDiscoveryProcess:
     """Start the isolated Codex process used only for model discovery."""
-    override_args: list[str] = []
-    for override in config_overrides:
-        override_args.extend(("-c", override))
-    process = await asyncio.create_subprocess_exec(
-        codex_path,
-        "app-server",
-        "--listen",
-        listen_url,
-        *override_args,
-        stdin=asyncio.subprocess.DEVNULL,
-        stdout=asyncio.subprocess.DEVNULL,
-        stderr=asyncio.subprocess.PIPE,
-        env=env,
-        cwd=str(cwd),
-        **_proc.spawn_kwargs(),
+    registry_tag = f"codex-model-probe-{uuid.uuid4().hex}"
+    argv = _build_native_codex_app_server_argv(
+        tagged_argv0=_tagged_codex_argv0(codex_path, registry_tag),
+        listen_url=listen_url,
+        config_overrides=config_overrides,
     )
+    # Registered like a session app-server so a Host that dies mid-probe leaves
+    # an entry the next reconcile can reap.
+    owner_lock = acquire_codex_native_process_owner_lock()
+    try:
+        process = await asyncio.create_subprocess_exec(
+            *argv,
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
+            env=env,
+            cwd=str(cwd),
+            executable=codex_path,
+            **_proc.spawn_kwargs(),
+        )
+    except BaseException:
+        if owner_lock is not None:
+            owner_lock.close()
+        raise
+    if owner_lock is not None:
+        register_codex_native_process(
+            pid=process.pid,
+            pgid=_process_group_id(process),
+            session_tag=registry_tag,
+            owner_lock_path=owner_lock.path,
+        )
     assert process.stderr is not None
     stderr_tail = asyncio.create_task(
         _capture_codex_discovery_stderr_tail(process.stderr),
         name="codex-model-discovery-stderr",
     )
-    return _CodexModelDiscoveryProcess(process=process, stderr_tail=stderr_tail)
+    return _CodexModelDiscoveryProcess(
+        process=process,
+        stderr_tail=stderr_tail,
+        registry_tag=registry_tag,
+        owner_lock=owner_lock,
+    )
 
 
 async def _capture_codex_discovery_stderr_tail(
@@ -1513,15 +1535,23 @@ async def _capture_codex_discovery_stderr_tail(
 
 
 async def _stop_codex_model_discovery_process(discovery: _CodexModelDiscoveryProcess) -> None:
-    """Terminate a discovery process and finish draining its stderr pipe."""
+    """Terminate a discovery process, drain its stderr and drop its registration."""
     process = discovery.process
-    _proc.terminate_tree(process)
     try:
-        await asyncio.wait_for(process.wait(), timeout=5.0)
-    except TimeoutError:
-        _proc.kill_tree(process)
-        await process.wait()
-    await discovery.stderr_tail
+        _proc.terminate_tree(process)
+        try:
+            await asyncio.wait_for(process.wait(), timeout=5.0)
+        except TimeoutError:
+            _proc.kill_tree(process)
+            await process.wait()
+        await discovery.stderr_tail
+    finally:
+        # Keep the entry while the child may still be alive so reconcile can
+        # reap it; the released lock is what marks it as abandoned.
+        if discovery.registry_tag is not None and process.returncode is not None:
+            unregister_codex_native_process(discovery.registry_tag)
+        if discovery.owner_lock is not None:
+            discovery.owner_lock.close()
 
 
 def _allocate_loopback_port() -> int:
@@ -1947,6 +1977,11 @@ async def codex_launch_catalog_is_stale(
     )
 
 
+def _tagged_codex_argv0(codex_path: str, registry_tag: str) -> str:
+    """Return the argv[0] carrying the crash-reap tag for a registered app-server."""
+    return f"{Path(codex_path).name} {codex_native_session_tag_cmdline_arg(registry_tag)}"
+
+
 def _build_native_codex_app_server_argv(
     *,
     tagged_argv0: str,
@@ -2077,12 +2112,8 @@ class CodexNativeAppServer:
         :returns: None.
         """
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
-        tagged_argv0 = (
-            f"{Path(self.codex_path).name} "
-            f"{codex_native_session_tag_cmdline_arg(self.process_registry_tag)}"
-        )
         argv = _build_native_codex_app_server_argv(
-            tagged_argv0=tagged_argv0,
+            tagged_argv0=_tagged_codex_argv0(self.codex_path, self.process_registry_tag),
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
         )
