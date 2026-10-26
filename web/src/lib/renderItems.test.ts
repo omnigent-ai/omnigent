@@ -24,6 +24,8 @@ import {
   createBubbleCache,
   lastRenderableAssistantIndex,
   liveCandidateAssistantIndex,
+  orderNextTurnFollowUps,
+  workingIndicatorInsertIndex,
 } from "./renderItems";
 import type { ActiveResponse } from "@/store/types";
 
@@ -59,6 +61,23 @@ function mkExec(name: string, callId: string): ToolExecution {
     agentName: "test",
     executedBy: "server",
     output: null,
+  };
+}
+
+function textDoneBlock(itemId: string, responseId: string, text: string): AnyBlock {
+  return {
+    type: "text_done",
+    ctx: ctx({ itemId, responseId }),
+    fullText: text,
+    hasCodeBlocks: false,
+  };
+}
+
+function userMessageBlock(itemId: string, text: string, responseId = ""): AnyBlock {
+  return {
+    type: "user_message",
+    ctx: ctx({ itemId, responseId }),
+    content: [{ type: "input_text", text }],
   };
 }
 
@@ -4242,6 +4261,452 @@ describe("liveCandidateAssistantIndex", () => {
       null,
     );
     expect(liveCandidateAssistantIndex(bubbles)).toBe(1);
+  });
+});
+
+describe("workingIndicatorInsertIndex", () => {
+  const streaming = (rid: string): ActiveResponse => ({
+    responseId: rid,
+    state: "streaming",
+    error: null,
+  });
+  const nextTurn = (blocks: AnyBlock[]): Bubble[] =>
+    buildBubbles(blocks, streaming("r1"), undefined, [], true, true);
+  const sentMidTurn = [
+    userMessageBlock("u1", "q"),
+    textDoneBlock("m1", "r1", "working…"),
+    userMessageBlock("u2", "follow-up"),
+  ];
+
+  it("splices above the follow-up the running turn has not read", () => {
+    expect(workingIndicatorInsertIndex(nextTurn(sentMidTurn), true)).toBe(2);
+  });
+
+  it("anchors below every fragment and trailing row of the running turn", () => {
+    // An answered AskUserQuestion card splits the running turn across bubbles.
+    const blocks: AnyBlock[] = [
+      {
+        type: "user_message",
+        ctx: ctx({ itemId: "u1", responseId: "r1" }),
+        content: [{ type: "input_text", text: "q" }],
+      },
+      {
+        type: "tool_group",
+        ctx: ctx({ responseId: "r1" }),
+        executions: [mkExec("ls", "c1")],
+        iteration: 0,
+      },
+      {
+        type: "elicitation",
+        ctx: ctx({ itemId: null, responseId: "r1" }),
+        elicitationId: "elic_ask",
+        message: "Claude wants to call **AskUserQuestion**",
+        phase: "pre_tool_use",
+        policyName: "claude_native_permission",
+        contentPreview: "AskUserQuestion({})",
+        requestedSchema: {},
+        status: "responded",
+        response: { action: "accept", content: { Framework: "React" } },
+        askUserQuestion: {
+          questions: [
+            {
+              question: "Which framework?",
+              options: [{ label: "React" }, { label: "Vue" }],
+              multiSelect: false,
+            },
+          ],
+        },
+      },
+      textDoneBlock("a1", "r1", "working…"),
+      {
+        type: "native_tool",
+        ctx: ctx({ itemId: "sub_1", responseId: "r1" }),
+        toolType: "subagent_activity",
+        label: "Sub-agent activity",
+        data: {},
+      },
+      userMessageBlock("u2", "follow-up"),
+    ];
+    const bubbles = nextTurn(blocks);
+    expect(bubbles.map((b) => b.kind)).toEqual([
+      "user",
+      "assistant",
+      "assistant",
+      "assistant",
+      "subagent_activity",
+      "user",
+    ]);
+    expect(workingIndicatorInsertIndex(bubbles, true)).toBe(5);
+  });
+
+  it.each<[string, Bubble[], boolean]>([
+    ["the indicator is hidden", nextTurn(sentMidTurn), false],
+    ["nothing trails the running turn", nextTurn(sentMidTurn.slice(0, 2)), true],
+    ["the harness steers its running turn", buildBubbles(sentMidTurn, streaming("r1")), true],
+    ["the turn has finished", buildBubbles(sentMidTurn, null, undefined, [], false, true), true],
+  ])("rides the tail (-1) when %s", (_case, bubbles, showWorking) => {
+    expect(workingIndicatorInsertIndex(bubbles, showWorking)).toBe(-1);
+  });
+});
+
+describe("buildBubbles — follow-ups read on the next turn", () => {
+  const response = (id: string, status: string) => ({
+    id,
+    status,
+    model: "assistant",
+    conversation: null,
+  });
+  const toolCall = (name: string, callId: string): StreamEvent => ({
+    type: "tool_call",
+    name,
+    arguments: {},
+    callId,
+    status: "completed",
+    agentName: "assistant",
+    itemId: `fc_${callId}`,
+    responseId: "r1",
+  });
+  const toolResult = (callId: string): StreamEvent => ({
+    type: "tool_result",
+    callId,
+    output: "ok",
+    itemId: `fco_${callId}`,
+    responseId: "",
+  });
+  const reply = (itemId: string, responseId: string, text: string): StreamEvent => ({
+    type: "message_done",
+    content: [{ type: "output_text", text }],
+    itemId,
+    responseId,
+  });
+
+  // r1 lists the workspace; the user sends u2 while r1 still has a read and its
+  // reply to go; the harness answers u2 as r2 once r1 ends.
+  const beforeFollowUp: StreamEvent[] = [
+    { type: "response_in_progress", response: response("r1", "in_progress") },
+    toolCall("ls", "c_ls"),
+    toolResult("c_ls"),
+  ];
+  const afterFollowUp: StreamEvent[] = [
+    toolCall("read", "c_read"),
+    toolResult("c_read"),
+    reply("m_r1", "r1", "Workspace inspected."),
+    { type: "response_completed", response: response("r1", "completed") },
+    { type: "response_in_progress", response: response("r2", "in_progress") },
+    reply("m_r2", "r2", "Follow-up answered."),
+    { type: "response_completed", response: response("r2", "completed") },
+  ];
+  function liveBlocks(followUps: AnyBlock[] = [userMessageBlock("u2", "follow-up")]): AnyBlock[] {
+    const sent = new BlockStream().reduceSync(beforeFollowUp).length;
+    const all = new BlockStream().reduceSync([...beforeFollowUp, ...afterFollowUp]);
+    return [
+      userMessageBlock("u1", "inspect"),
+      ...all.slice(0, sent),
+      ...followUps,
+      ...all.slice(sent),
+    ];
+  }
+
+  const summary = (bubbles: Bubble[]): string[] =>
+    bubbles.map((b) => {
+      if (b.kind === "user") return `user ${b.itemId}`;
+      if (b.kind !== "assistant") return b.kind;
+      const items = b.items.map((item) =>
+        item.kind === "tool" ? item.execution.name : item.kind === "text" ? item.text : item.kind,
+      );
+      return `${b.responseId}: ${items.join(", ")}`;
+    });
+
+  it("renders the running turn's remaining work above a follow-up sent during it", () => {
+    const blocks = liveBlocks();
+    expect(summary(buildBubbles(blocks, null, undefined, [], false, true))).toEqual([
+      "user u1",
+      "r1: ls, read, Workspace inspected.",
+      "user u2",
+      "r2: Follow-up answered.",
+    ]);
+    // Arrival order, kept for a harness that steers its running turn, renders
+    // r1's read and reply as part of the follow-up's answer.
+    expect(summary(buildBubbles(blocks, null))).toEqual([
+      "user u1",
+      "r1: ls",
+      "user u2",
+      "r2: read, Workspace inspected., Follow-up answered.",
+    ]);
+  });
+
+  it("orders reloaded history the same way", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "u1",
+        response_id: "turn_1",
+        type: "message",
+        status: "completed",
+        role: "user",
+        content: [{ type: "input_text", text: "inspect" }],
+      },
+      {
+        id: "fc_ls",
+        response_id: "r1",
+        type: "function_call",
+        status: "completed",
+        name: "ls",
+        arguments: "{}",
+        call_id: "c_ls",
+      },
+      {
+        id: "fco_ls",
+        response_id: "r1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "c_ls",
+        output: "ok",
+      },
+      {
+        id: "u2",
+        response_id: "turn_2",
+        type: "message",
+        status: "completed",
+        role: "user",
+        content: [{ type: "input_text", text: "follow-up" }],
+      },
+      {
+        id: "fc_read",
+        response_id: "r1",
+        type: "function_call",
+        status: "completed",
+        name: "read",
+        arguments: "{}",
+        call_id: "c_read",
+      },
+      {
+        id: "fco_read",
+        response_id: "r1",
+        type: "function_call_output",
+        status: "completed",
+        call_id: "c_read",
+        output: "ok",
+      },
+      {
+        id: "m_r1",
+        response_id: "r1",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Workspace inspected." }],
+      },
+      {
+        id: "m_r2",
+        response_id: "r2",
+        type: "message",
+        status: "completed",
+        role: "assistant",
+        content: [{ type: "output_text", text: "Follow-up answered." }],
+      },
+    ];
+    expect(summary(buildBubbles(itemsToBlocks(items), null, undefined, [], false, true))).toEqual([
+      "user u1",
+      "r1: ls, read, Workspace inspected.",
+      "user u2",
+      "r2: Follow-up answered.",
+    ]);
+  });
+
+  // Untracked: no active response or live turn yet blocks cache reuse.
+  it.each([true, false])(
+    "keeps the follow-up below the running turn at every step (tracked: %s)",
+    (tracked) => {
+      const blocks = liveBlocks();
+      const cache = createBubbleCache();
+      for (let length = 1; length <= blocks.length; length += 1) {
+        const prefix = blocks.slice(0, length);
+        const started = prefix.filter((b) => b.type === "response_start");
+        const ended = prefix.filter((b) => b.type === "response_end");
+        const active: ActiveResponse | null =
+          tracked && started.length > ended.length
+            ? { responseId: started.at(-1)!.ctx.responseId, state: "streaming", error: null }
+            : null;
+        const bubbles = buildBubbles(prefix, active, cache, [], tracked, true);
+        expect(bubbles).toEqual(buildBubbles(prefix, active, undefined, [], tracked, true));
+        const followUp = bubbles.findIndex((b) => b.kind === "user" && b.itemId === "u2");
+        if (followUp === -1) continue;
+        const below = bubbles.slice(followUp + 1);
+        expect(below.some((b) => b.kind === "assistant" && b.responseId === "r1")).toBe(false);
+        if (active?.responseId === "r1") {
+          expect(workingIndicatorInsertIndex(bubbles, true)).toBe(followUp);
+        }
+      }
+    },
+  );
+
+  it("holds consecutive follow-ups together in send order", () => {
+    const blocks = liveBlocks([userMessageBlock("u2", "first"), userMessageBlock("u3", "second")]);
+    expect(summary(buildBubbles(blocks, null, undefined, [], false, true))).toEqual([
+      "user u1",
+      "r1: ls, read, Workspace inspected.",
+      "user u2",
+      "user u3",
+      "r2: Follow-up answered.",
+    ]);
+  });
+
+  const turnEnds: StreamEvent[] = [
+    { type: "response_failed", response: response("r1", "failed") },
+    { type: "response_cancelled", response: response("r1", "cancelled") },
+    {
+      type: "response_incomplete",
+      response: response("r1", "incomplete"),
+      reason: "max_iterations",
+    },
+  ];
+  it.each(turnEnds)(
+    "releases the batch, system notices included, when the turn ends by $type",
+    (turnEnd) => {
+      const sent = new BlockStream().reduceSync(beforeFollowUp).length;
+      const all = new BlockStream().reduceSync([
+        ...beforeFollowUp,
+        turnEnd,
+        ...afterFollowUp.slice(-3),
+      ]);
+      const ended = [
+        userMessageBlock("u1", "inspect"),
+        ...all.slice(0, sent),
+        userMessageBlock("u2", "follow-up"),
+        userMessageBlock(
+          "u3",
+          "[System: sub-agent general-purpose finished (completed) — 1 result]",
+        ),
+        all[sent]!,
+      ];
+      const blocks = [...ended, ...all.slice(sent + 1)];
+      expect(orderNextTurnFollowUps(ended).held).toBeNull();
+      const waiting = buildBubbles(ended, null, undefined, [], true, true).filter(
+        (b) => b.kind === "user" && b.waitingForNextTurn,
+      );
+      expect(waiting).toEqual([]);
+      expect(summary(buildBubbles(blocks, null, undefined, [], false, true))).toEqual([
+        "user u1",
+        "r1: ls",
+        "user u2",
+        "user u3",
+        "r2: Follow-up answered.",
+      ]);
+    },
+  );
+
+  it("keeps Working… below a batch the next turn reads together", () => {
+    const blocks = liveBlocks([userMessageBlock("u2", "first"), userMessageBlock("u3", "second")]);
+    const r2Start = blocks.findIndex(
+      (b) => b.type === "response_start" && b.ctx.responseId === "r2",
+    );
+    const r2: ActiveResponse = { responseId: "r2", state: "streaming", error: null };
+    const started = blocks.slice(0, r2Start + 1);
+    const readingBatch = buildBubbles(started, r2, undefined, [], true, true);
+    expect(summary(readingBatch)).toEqual([
+      "user u1",
+      "r1: ls, read, Workspace inspected.",
+      "user u2",
+      "user u3",
+    ]);
+    expect(workingIndicatorInsertIndex(readingBatch, true)).toBe(-1);
+    // A message sent before r2 renders anything waits behind r2.
+    const heldBehindR2 = buildBubbles(
+      [...started, userMessageBlock("u4", "third")],
+      r2,
+      undefined,
+      [],
+      true,
+      true,
+    );
+    expect(workingIndicatorInsertIndex(heldBehindR2, true)).toBe(4);
+  });
+
+  it("keeps the running turn live above its waiting follow-up without a streaming response", () => {
+    const blocks = liveBlocks();
+    const running = blocks.slice(
+      0,
+      blocks.findIndex((b) => b.ctx.itemId === "m_r1"),
+    );
+    const bubbles = buildBubbles(running, null, undefined, [], true, true);
+    expect(summary(bubbles)).toEqual(["user u1", "r1: ls, read", "user u2"]);
+    expect(workingIndicatorInsertIndex(bubbles, true)).toBe(2);
+    expect(liveCandidateAssistantIndex(bubbles)).toBe(1);
+    // Idle, or another turn streaming, means the follow-up is no longer waiting.
+    const idle = buildBubbles(running, null, undefined, [], false, true);
+    expect(liveCandidateAssistantIndex(idle)).toBe(-1);
+    const r2: ActiveResponse = { responseId: "r2", state: "streaming", error: null };
+    const reading = buildBubbles(running, r2, undefined, [], true, true);
+    expect(workingIndicatorInsertIndex(reading, true)).toBe(-1);
+    expect(liveCandidateAssistantIndex(reading)).toBe(-1);
+  });
+
+  it("keeps a backdated tool result and a subagent row with the running turn", () => {
+    const blocks: AnyBlock[] = [
+      userMessageBlock("u1", "inspect"),
+      {
+        type: "tool_group",
+        ctx: ctx({ itemId: "fc_1", responseId: "r1" }),
+        executions: [mkExec("ls", "c_1")],
+        iteration: 0,
+      },
+      userMessageBlock("u2", "follow-up"),
+      {
+        type: "tool_result",
+        ctx: ctx({ itemId: "fco_1", responseId: "r0" }),
+        name: "ls",
+        callId: "c_1",
+        agentName: "test",
+        output: "ok",
+      },
+      {
+        type: "native_tool",
+        ctx: ctx({ itemId: "sub_1", responseId: "subagent_1" }),
+        toolType: "subagent_activity",
+        label: "Sub-agent activity",
+        data: {},
+      },
+      textDoneBlock("m_r1", "r1", "Workspace inspected."),
+    ];
+    const { blocks: ordered, held } = orderNextTurnFollowUps(blocks);
+    expect(ordered.map((b) => b.ctx.itemId)).toEqual([
+      "u1",
+      "fc_1",
+      "fco_1",
+      "sub_1",
+      "m_r1",
+      "u2",
+    ]);
+    expect(held).toEqual({ turn: "r1", from: 5 });
+  });
+
+  it("leaves arrival order alone when no turn is running or the message joined the turn", () => {
+    const ended: AnyBlock = {
+      type: "response_end",
+      ctx: ctx({ responseId: "r1" }),
+      status: "completed",
+      response: null,
+    };
+    const idle = [
+      userMessageBlock("u1", "q"),
+      textDoneBlock("m1", "r1", "a"),
+      ended,
+      userMessageBlock("u2", "next"),
+    ];
+    expect(orderNextTurnFollowUps(idle)).toEqual({ blocks: idle, held: null });
+    // Reloaded history carries no response_end, so the follow-up waits but nothing moves.
+    const reloaded = [
+      userMessageBlock("u1", "q"),
+      textDoneBlock("m1", "r1", "a"),
+      userMessageBlock("u2", "next"),
+    ];
+    expect(orderNextTurnFollowUps(reloaded).blocks).toBe(reloaded);
+    const steered = [
+      userMessageBlock("u1", "q"),
+      textDoneBlock("m1", "r1", "partial"),
+      userMessageBlock("u2", "steer", "r1"),
+      textDoneBlock("m2", "r1", "done"),
+    ];
+    expect(orderNextTurnFollowUps(steered).blocks).toBe(steered);
   });
 });
 

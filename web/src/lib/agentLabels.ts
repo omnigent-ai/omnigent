@@ -54,6 +54,8 @@ interface HarnessCatalogWire {
   // Setup steps keyed by EVERY harness spelling a session may declare (native
   // wrappers + installable non-picker ids), not just the picker rows in `data`.
   setup_steps?: Record<string, SetupStepWire[]>;
+  // Every spelling declared to read a message sent mid-turn in that turn.
+  live_steering?: string[];
 }
 
 export interface HarnessCatalog {
@@ -65,6 +67,8 @@ export interface HarnessCatalog {
   acpHarnesses: ReadonlySet<string>;
   /** harness id → declared effort family (``anthropic``, ``openai``, …). */
   effortFamilies: Record<string, string>;
+  /** spellings that steer a running turn — see {@link useLiveSteeringHarnessIds}. */
+  liveSteeringHarnesses: ReadonlySet<string> | null;
 }
 
 /** Pull each row's declared effort family; rows without one are skipped. */
@@ -77,6 +81,12 @@ export function effortFamiliesFromCatalog(
     if (typeof row.id === "string" && typeof family === "string") families[row.id] = family;
   }
   return families;
+}
+
+/** The catalog's ``live_steering`` spellings; null when an older server omits the list. */
+export function liveSteeringFromCatalog(value: unknown): ReadonlySet<string> | null {
+  if (!Array.isArray(value)) return null;
+  return new Set(value.filter((id): id is string => typeof id === "string"));
 }
 
 export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
@@ -99,6 +109,7 @@ export async function fetchHarnessCatalog(): Promise<HarnessCatalog> {
     setupSteps,
     acpHarnesses,
     effortFamilies: effortFamiliesFromCatalog(body.data ?? []),
+    liveSteeringHarnesses: liveSteeringFromCatalog(body.live_steering),
   };
 }
 
@@ -198,6 +209,33 @@ const NO_EFFORT_FAMILIES: Record<string, string> = {};
 /** harness id → declared effort family, from ``/v1/harnesses`` ``capabilities.effort``. */
 export function useHarnessEffortFamilies(enabled = true): Record<string, string> {
   return useHarnessCatalog((c) => c.effortFamilies, NO_EFFORT_FAMILIES, enabled);
+}
+
+/**
+ * Harness spellings declared to read a message sent mid-turn in that turn; any
+ * other SDK harness reads it on its next turn. Null until the catalog loads,
+ * and on a server too old to report it.
+ */
+export function useLiveSteeringHarnessIds(): ReadonlySet<string> | null {
+  return useHarnessCatalog((c) => c.liveSteeringHarnesses, null);
+}
+
+/**
+ * Whether a session's harness reads a follow-up sent mid-turn only on its next
+ * turn. Native terminal sessions, and an unknown harness or catalog, keep
+ * arrival order.
+ */
+export function readsFollowUpsOnNextTurn(
+  harness: string | null,
+  liveSteeringHarnesses: ReadonlySet<string> | null,
+  isNativeTerminalSession: boolean,
+): boolean {
+  return (
+    !isNativeTerminalSession &&
+    harness !== null &&
+    liveSteeringHarnesses !== null &&
+    !liveSteeringHarnesses.has(harness)
+  );
 }
 
 /**
