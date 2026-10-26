@@ -29,6 +29,7 @@ import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Literal
 from unittest.mock import patch
 
 import pytest
@@ -369,10 +370,12 @@ def test_codex_uses_openai_global_default(config_home: Path) -> None:
     assert env["HARNESS_CODEX_WIRE_API"] == "responses"
 
 
+@pytest.mark.parametrize("harness", ["codex", "genie"])
 @pytest.mark.parametrize("auth_source", ["spec", "global"])
 @pytest.mark.parametrize("endpoint_url", [None, "https://openrouter.ai/api/v1"])
-def test_codex_inline_api_key_routes_to_declared_endpoint(
+def test_cli_inline_api_key_routes_to_declared_endpoint(
     config_home: Path,
+    harness: Literal["codex", "genie"],
     auth_source: str,
     endpoint_url: str | None,
 ) -> None:
@@ -387,18 +390,20 @@ def test_codex_inline_api_key_routes_to_declared_endpoint(
             {"auth": {"type": "api_key", "api_key": api_key, "base_url": endpoint_url}},
         )
     spec = _make_spec(
-        harness="codex",
+        harness=harness,
         model="test-model",
         auth=auth if auth_source == "spec" else None,
     )
 
-    env = _build_codex_spawn_env(spec)
+    env = _build_genie_spawn_env(spec) if harness == "genie" else _build_codex_spawn_env(spec)
+    prefix = f"HARNESS_{harness.upper()}"
 
-    assert env["HARNESS_CODEX_GATEWAY"] == "true"
-    assert env["HARNESS_CODEX_GATEWAY_BASE_URL"] == (endpoint_url or "https://api.openai.com/v1")
-    assert shlex.split(env["HARNESS_CODEX_GATEWAY_AUTH_COMMAND"]) == ["printf", "%s", api_key]
-    assert env["HARNESS_CODEX_MODEL"] == "test-model"
-    assert env["HARNESS_CODEX_WIRE_API"] == "responses"
+    assert env[f"{prefix}_GATEWAY"] == "true"
+    assert env[f"{prefix}_GATEWAY_BASE_URL"] == (endpoint_url or "https://api.openai.com/v1")
+    assert shlex.split(env[f"{prefix}_GATEWAY_AUTH_COMMAND"]) == ["printf", "%s", api_key]
+    assert env[f"{prefix}_MODEL"] == "test-model"
+    if harness == "codex":
+        assert env["HARNESS_CODEX_WIRE_API"] == "responses"
 
 
 @pytest.mark.parametrize("fragment", [None, "wrong-key"])
