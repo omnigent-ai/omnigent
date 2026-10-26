@@ -1119,6 +1119,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         >
           <Input
             aria-label="Pull request URL"
+            autoFocus
             type="url"
             required
             value={url}
@@ -1289,7 +1290,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           emptyStateAction={
             associations?.tracking_available && linkInEmptyState ? (
               <div className="mt-2 w-full max-w-sm">
-                <Button onClick={() => setLinking(!linking)}>Link a PR</Button>
+                {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
                 {linkControls}
               </div>
             ) : (

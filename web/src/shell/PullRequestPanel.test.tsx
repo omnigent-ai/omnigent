@@ -1816,16 +1816,18 @@ describe("PullRequestPanel", () => {
     expect(description.parentElement).toContainElement(link);
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
     fireEvent.click(link);
-    expect(description.parentElement).toContainElement(
-      screen.getByRole("textbox", { name: "Pull request URL" }),
-    );
+    const input = screen.getByRole("textbox", { name: "Pull request URL" });
+    expect(description.parentElement).toContainElement(input);
+    expect(input).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
-    fireEvent.click(link);
+    fireEvent.click(screen.getByRole("button", { name: "Link a PR" }));
     fireEvent.keyDown(screen.getByRole("textbox", { name: "Pull request URL" }), {
       key: "Escape",
     });
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
   });
 
   it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {
