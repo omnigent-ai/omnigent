@@ -7,14 +7,20 @@
 // effect drops keys whose PTY has gone away once the terminal list loads.
 
 import type { RightRailTab } from "@/shell/railTabs";
+import { parseTerminalSplitState, type TerminalSplitState } from "./terminalSplitLayout";
+import type { DefaultWorkspaceTab } from "./workspaceTabPreferences";
 
-const RAIL_TABS: readonly RightRailTab[] = [
+const WORKSPACE_PANEL_TABS: readonly DefaultWorkspaceTab[] = [
   "files",
   "changes",
   "github",
   "subagents",
+];
+const RAIL_TABS: readonly RightRailTab[] = [
+  ...WORKSPACE_PANEL_TABS,
   "browser",
   "sidechat",
+  "content-search",
 ];
 
 export interface SessionWorkspaceState {
@@ -22,8 +28,10 @@ export interface SessionWorkspaceState {
   open?: boolean;
   /** User-chosen rail width (px) for this session. */
   widthPx?: number;
-  /** The selected Workspace navigation tab. */
-  rightRailTab?: RightRailTab;
+  /** Selected Workspace page, or null when no pinned or opened page is available. */
+  rightRailTab?: RightRailTab | null;
+  /** Unpinned built-in pages explicitly opened from the Workspace menu. */
+  openPanels?: DefaultWorkspaceTab[];
   /** Ordered list of open file tabs. */
   openFiles?: string[];
   /** The active file tab (null = a scope view is active). */
@@ -39,9 +47,11 @@ export interface SessionWorkspaceState {
   openSideChats?: string[];
   /** The active side-chat tab (null = a file/scope/other view is active). */
   selectedSideChatId?: string | null;
+  /** Split panes of the main terminal view; absent while unsplit. */
+  terminalSplit?: TerminalSplitState;
 }
 
-const STORAGE_KEY = "omnigent:session-workspace-state";
+export const SESSION_WORKSPACE_STATE_KEY = "omnigent:session-workspace-state";
 // Cap stored sessions so the store can't grow without bound. The
 // least-recently-touched entries (front of the array) are pruned first once the
 // cap is exceeded.
@@ -79,7 +89,18 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   const state: SessionWorkspaceState = {};
   if (typeof record.open === "boolean") state.open = record.open;
   if (isValidWidth(record.widthPx)) state.widthPx = record.widthPx;
-  if (isRailTab(record.rightRailTab)) state.rightRailTab = record.rightRailTab;
+  if (record.rightRailTab === null || isRailTab(record.rightRailTab)) {
+    state.rightRailTab = record.rightRailTab;
+  }
+  if (Array.isArray(record.openPanels)) {
+    state.openPanels = [
+      ...new Set(
+        record.openPanels.filter((value): value is DefaultWorkspaceTab =>
+          WORKSPACE_PANEL_TABS.some((tab) => tab === value),
+        ),
+      ),
+    ];
+  }
   if (Array.isArray(record.openFiles) && record.openFiles.every((p) => typeof p === "string")) {
     state.openFiles = record.openFiles as string[];
   }
@@ -119,13 +140,15 @@ function sanitize(entry: unknown): SessionWorkspaceState {
   if (record.selectedSideChatId === null || typeof record.selectedSideChatId === "string") {
     state.selectedSideChatId = record.selectedSideChatId;
   }
+  const terminalSplit = parseTerminalSplitState(record.terminalSplit);
+  if (terminalSplit) state.terminalSplit = terminalSplit;
   return state;
 }
 
 function readStore(): Store {
   if (typeof window === "undefined") return [];
   try {
-    const raw = window.localStorage.getItem(STORAGE_KEY);
+    const raw = window.localStorage.getItem(SESSION_WORKSPACE_STATE_KEY);
     if (!raw) return [];
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
@@ -145,7 +168,7 @@ function readStore(): Store {
 function writeStore(store: Store): void {
   if (typeof window === "undefined") return;
   try {
-    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(store));
+    window.localStorage.setItem(SESSION_WORKSPACE_STATE_KEY, JSON.stringify(store));
   } catch {
     // Storage quota/access errors must not break panel interactions.
   }
@@ -202,6 +225,17 @@ export function resetSessionWorkspaceTabSelections(): void {
     delete state.selectedTerminalKey;
     delete state.selectedBrowserId;
     delete state.selectedSideChatId;
+  }
+  writeStore(store);
+}
+
+/** Forget newly unpinned pages without disturbing other tabs or their selection. */
+export function unpinSessionWorkspaceTabs(tabs: readonly DefaultWorkspaceTab[]): void {
+  if (tabs.length === 0) return;
+  const store = readStore();
+  for (const { state } of store) {
+    if (tabs.some((tab) => tab === state.rightRailTab)) delete state.rightRailTab;
+    if (state.openPanels) state.openPanels = state.openPanels.filter((tab) => !tabs.includes(tab));
   }
   writeStore(store);
 }

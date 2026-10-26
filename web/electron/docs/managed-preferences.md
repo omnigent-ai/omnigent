@@ -85,7 +85,7 @@ Remote hosts need their own renewable **Omnigent** OAuth grant. Desktop browser
 sign-in and generic Arca credentials do not replace it. During explicit runner
 setup, an authentication-required result starts `isaac omni login <server-url>`
 on Arca and retries the noninteractive host command once after sign-in. The
-manual connect console asks **Sign in and retry** before doing the same.
+manual connect console does the same under the same consent click.
 Arca Companion opens the browser and routes its callback to the remote CLI;
 tokens and login output are not forwarded to the desktop renderer. Closing
 the sign-in console cancels the command. Passive auto-connect never starts login.

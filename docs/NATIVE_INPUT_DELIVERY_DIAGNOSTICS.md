@@ -37,23 +37,32 @@ producer did not supply them; do not infer ownership from timestamps alone.
 
 | Event | What it records |
 | --- | --- |
+| `native_input_received` | An authorized native-message request reached the server, before runner recovery or initialization. Contains `input_received_at_ms` and a validated `input_stable_id` when supplied; emits even without that ID. It does not establish acceptance or delivery. |
 | `native_input_enqueued` | The server queued the input. |
 | `native_input_retry_deduplicated` | A client retry reused an existing pending entry. No second delivery was requested. |
 | `native_input_forward_started` | The server began forwarding the input to the runner. |
 | `turn_dispatched` / `native_input_forward_finished` | The forwarding result. `forward_accepted` means the runner accepted the request, not that a native transcript contains it. |
 | `native_input_execution_started` / `native_input_execution_finished` | The executor call and its bounded result, including cancellation or an explicitly reported undelivered input. `executor_returned` alone does not prove a transcript record exists. `executor_stream_ended` means the executor exited without reporting a final result. |
-| `native_input_steering_started` / `native_input_steering_finished` | A direct in-band harness injection carrying its own input identity. `executor_accepted` means the executor accepted the injection; `executor_refused` means it returned false. `cancelled` means the injection was interrupted, and `error` means it raised an exception. Acceptance does not prove transcript persistence. |
+| `native_input_steering_started` / `native_input_steering_finished` | A direct in-band harness injection carrying its own input identity. `executor_accepted` means the executor accepted the injection; `executor_refused` means it returned false. `executor_ambiguous` means the harness's reply to a submission it may have accepted was lost; the runner treats the input as consumed and does not resend it. `cancelled` means the injection was interrupted, and `error` means it raised an exception. Acceptance does not prove transcript persistence. |
 | `claude_native_delivery_finished` | Claude's existing stages, verification, retries, and local delivery ID, now joined to the original input. `draft_cleared` means the submitted draft disappeared; it does not prove native transcript persistence. Other delivery outcomes remain `unknown`. |
-| `codex_native_delivery_attempt` / `codex_native_delivery_finished` | One pair per RPC, with `turn_start` or `turn_steer` and an `rpc_accepted`, `rpc_accepted_missing_turn_id`, `rpc_rejected_draining`, `rpc_error`, or `cancelled` outcome. The missing-ID outcome means the RPC returned without a nonempty turn ID. A recovered stale steer or drain rejection generates separate pairs for the rejected and retried requests. No new delivery events are emitted without an input identity. |
+| `codex_native_delivery_attempt` / `codex_native_delivery_finished` | One pair per RPC, with `turn_start` or `turn_steer` and an `rpc_accepted`, `rpc_accepted_missing_turn_id`, `rpc_rejected_draining`, `rpc_rejected_compacting`, `rpc_error`, or `cancelled` outcome. The missing-ID outcome means the RPC returned without a nonempty turn ID. A recovered stale steer, drain rejection, or compaction refusal generates separate pairs for the rejected and retried requests. No new delivery events are emitted without an input identity. |
 | `codex_native_delivery_reconnecting` | Codex explicitly refused the input while draining. One reconnect is attempted before retrying that RPC, with the same input identity. A missing or changed session, thread, or transport prevents resubmission. |
+| `codex_native_compaction_wait` | Codex explicitly refused steering during compaction. Records `waiting`, then `settled`, `timed_out`, `session_changed`, `cancelled`, or `error`. The turn ID is the refused compaction turn. |
 | `codex_app_server_draining` | Initialization was refused while draining, before a turn could be submitted. The sender's input remains undelivered. |
-| `codex_turn_injection_failed` | The input identity, RPC error code when available, and native thread context for a failed injection. `undelivered` identifies a proven drain refusal or a failure before resubmission; other RPC failures can be ambiguous about acceptance. |
+| `codex_turn_injection_failed` | The input identity, RPC error code when available, and native thread context for a failed injection. `undelivered` identifies a proven drain or compaction refusal, or a failure before resubmission; other RPC failures can be ambiguous about acceptance. `ambiguous` marks a live resubmission after compaction whose reply was lost; it is not resent. |
 | `native_input_settled` | The server's decision after durable persistence. See outcomes below. |
 | `native_input_invalid_delivery_stage` | A caller supplied an unsupported server stage. The existing stage is preserved; the caller's invalid value is not logged. |
 
 The older top-level `turn_id` on `codex_turn_injection_failed` is the initial
 bridge snapshot, also named `initial_native_turn_id`. Use the individual RPC
 records to identify the turn that accepted or rejected a retry.
+
+After a structured `cannot steer a compact turn` refusal, the executor waits
+up to 60 seconds for that turn to settle, then submits the same input once
+using the current turn state. Session, thread, or transport changes prevent
+resubmission. A timeout or repeated compaction refusal reports
+`codex_compacting` with the input undelivered; socket loss after resubmission
+remains ambiguous and does not trigger another retry.
 
 The native web runner currently buffers messages sent during an active turn
 for a continuation turn. Those messages produce `native_input_execution_*`

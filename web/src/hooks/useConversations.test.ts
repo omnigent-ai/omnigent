@@ -23,6 +23,7 @@ import {
   useBulkStopSessions,
   undoArchiveConversations,
   useConversations,
+  useSessionSearch,
   useDeleteProject,
   useProjects,
   useProjectConfig,
@@ -286,6 +287,37 @@ describe.each([undefined, "updated_at", "created_at"] as const)(
     );
   },
 );
+
+describe("useSessionSearch", () => {
+  function renderGroup(searchQuery: string, scope: "title" | "content") {
+    fetchMock.mockResolvedValue(
+      mockResponse({ data: [], first_id: null, last_id: null, has_more: false }),
+    );
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const wrapper = ({ children }: { children: ReactNode }) =>
+      createElement(QueryClientProvider, { client: queryClient }, children);
+    renderHook(() => useSessionSearch(searchQuery, scope, { limit: 8 }), { wrapper });
+  }
+
+  it.each(["title", "content"] as const)("requests the %s group of a search", async (scope) => {
+    renderGroup("kestrel", scope);
+    await waitFor(() => expect(fetchMock).toHaveBeenCalled());
+
+    const [url] = fetchMock.mock.calls[0] as [string, RequestInit];
+    const params = new URL(url, "http://localhost").searchParams;
+    expect(params.get("search_query")).toBe("kestrel");
+    expect(params.get("search_scope")).toBe(scope);
+    expect(params.get("limit")).toBe("8");
+  });
+
+  it("does not fetch for an empty query", async () => {
+    renderGroup("", "title");
+    await new Promise((resolve) => {
+      setTimeout(resolve, 0);
+    });
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
 
 describe("useConversations search timeout", () => {
   function renderSearch(searchQuery: string) {
