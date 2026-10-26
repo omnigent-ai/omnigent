@@ -886,6 +886,38 @@ def _best_effort_close(resource: _Stream | _Process) -> None:
 _CLAUDE_API_KEY_HELPER_ENV_KEY = "OMNIGENT_CLAUDE_API_KEY_HELPER"
 
 
+_THINKING_TYPES = frozenset({"adaptive", "disabled"})
+_THINKING_DISPLAYS = frozenset({"summarized", "omitted"})
+
+
+def _validate_thinking(raw: object) -> dict[str, str] | None:
+    """Validate ``ExecutorConfig.extra["thinking"]`` for the Claude Agent SDK.
+
+    :param raw: ``None``, or a mapping with ``type`` (``adaptive`` or
+        ``disabled``) and optional ``display``
+        (``summarized`` or ``omitted``), e.g.
+        ``{"type": "adaptive", "display": "summarized"}``.
+    :returns: The thinking option to pass to ``ClaudeAgentOptions``, or
+        ``None`` to leave the model's default.
+    :raises ValueError: If ``raw`` is not a valid thinking configuration.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict) or raw.get("type") not in _THINKING_TYPES:
+        raise ValueError(
+            f"thinking must be a mapping with type one of {sorted(_THINKING_TYPES)}, got {raw!r}"
+        )
+    unknown = set(raw) - {"type", "display"}
+    if unknown:
+        raise ValueError(f"thinking has unsupported keys {sorted(unknown)}")
+    display = raw.get("display")
+    if display is not None and display not in _THINKING_DISPLAYS:
+        raise ValueError(
+            f"thinking.display must be one of {sorted(_THINKING_DISPLAYS)}, got {display!r}"
+        )
+    return {key: str(value) for key, value in raw.items()}
+
+
 @dataclass
 class _ClaudeClientState:
     client: _ClaudeClient
@@ -893,6 +925,7 @@ class _ClaudeClientState:
     loop: asyncio.AbstractEventLoop | None = None
     task: asyncio.Task[None] | None = None
     effort: str | None = None
+    thinking: dict[str, str] | None = None
 
 
 @dataclass(frozen=True)
@@ -2613,6 +2646,11 @@ class ClaudeSDKExecutor(Executor):
         except ValueError as exc:
             yield ExecutorError(message=describe_exception(exc), retryable=False)
             return
+        try:
+            thinking = _validate_thinking(cfg.extra.get("thinking"))
+        except ValueError as exc:
+            yield ExecutorError(message=describe_exception(exc), retryable=False)
+            return
 
         session_key = self._session_key(messages)
         crashed_reason = self._crashed_sessions.get(session_key)
@@ -2637,8 +2675,12 @@ class ClaudeSDKExecutor(Executor):
             return
 
         state = self._clients.get(session_key)
-        if state is not None and state.effort != reasoning_effort and prompt != "/compact":
-            # Effort is a launch option. Rebuild with history for conversational
+        if (
+            state is not None
+            and (state.effort != reasoning_effort or state.thinking != thinking)
+            and prompt != "/compact"
+        ):
+            # Effort and thinking are launch options. Rebuild with history for conversational
             # turns, but let /compact operate on the existing client's context.
             await self._close_live_client(session_key)
             resume_session = False
@@ -2823,6 +2865,8 @@ class ClaudeSDKExecutor(Executor):
             and max_output_tokens <= _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS
         ):
             options_kwargs["thinking"] = {"type": "disabled"}
+        elif thinking is not None:
+            options_kwargs["thinking"] = thinking
         # Databricks opus/fable endpoints reject thinking.type="enabled"
         # (HTTP 400); they require "adaptive" instead (those tiers are
         # adaptive-only). Sonnet is fine, so scope to those tiers only.
@@ -3030,6 +3074,11 @@ class ClaudeSDKExecutor(Executor):
             options=options,
             model=model,
         )
+        # Record the requested thinking, not options.thinking: a small output
+        # cap or the Databricks adaptive pin can override the request, and the
+        # rebuild check above compares requests.
+        if (state := self._clients.get(session_key)) is not None:
+            state.thinking = thinking
 
         # ── LLM_REQUEST policy evaluation ────────────────────────
         # If the executor adapter installed a ``_policy_evaluator``

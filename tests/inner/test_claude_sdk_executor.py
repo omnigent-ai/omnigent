@@ -6146,3 +6146,89 @@ async def test_effort_changes_rebuild_client_with_history(initial_effort, compac
 
     assert len(fake_sdk.created_clients) == 3
     assert [call.args[0] for call in close.await_args_list] == fake_sdk.created_clients[:2]
+
+
+async def test_thinking_config_reaches_options_and_rebuilds_client() -> None:
+    """extra["thinking"] becomes the SDK thinking option; changing it rebuilds the client."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorConfig
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+    messages = []
+    summarized = {"type": "adaptive", "display": "summarized"}
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock),
+    ):
+        for index, thinking in enumerate([summarized, summarized, None]):
+            messages.append(
+                {"role": "user", "content": f"question {index}", "session_id": "thinking"}
+            )
+            extra = {} if thinking is None else {"thinking": thinking}
+            events = [
+                event
+                async for event in executor.run_turn(messages, [], "", ExecutorConfig(extra=extra))
+            ]
+            assert not [event for event in events if isinstance(event, ExecutorError)]
+            assert (
+                getattr(executor._clients["thinking"].client.options, "thinking", None) == thinking
+            )
+    # The repeated config reuses its client; clearing it starts a new one.
+    assert len(fake_sdk.created_clients) == 2
+
+
+async def test_thinking_disabled_by_small_output_cap_reuses_client() -> None:
+    """A thinking config overridden by a small output cap does not rebuild the client each turn."""
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorConfig
+
+    fake_sdk = _make_recovery_fake_sdk()
+    executor = ClaudeSDKExecutor()
+    messages = []
+    extra = {"thinking": {"type": "adaptive", "display": "summarized"}, "max_tokens": 512}
+    with (
+        patch("omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=fake_sdk),
+        patch.object(executor, "_force_close_client", new_callable=AsyncMock),
+    ):
+        for index in range(2):
+            messages.append({"role": "user", "content": f"question {index}", "session_id": "cap"})
+            events = [
+                event
+                async for event in executor.run_turn(messages, [], "", ExecutorConfig(extra=extra))
+            ]
+            assert not [event for event in events if isinstance(event, ExecutorError)]
+            assert executor._clients["cap"].client.options.thinking == {"type": "disabled"}
+            messages.append({"role": "assistant", "content": f"answer {index}"})
+    assert len(fake_sdk.created_clients) == 1
+
+
+@pytest.mark.parametrize(
+    "thinking",
+    [
+        "adaptive",
+        {"type": "enabled"},
+        {"type": "adaptive", "display": "full"},
+        {"type": "adaptive", "budget_tokens": 1024},
+    ],
+)
+async def test_invalid_thinking_config_is_a_permanent_error(thinking) -> None:
+    from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
+    from omnigent.inner.executor import ExecutorConfig
+
+    executor = ClaudeSDKExecutor()
+    with patch(
+        "omnigent.inner.claude_sdk_executor._ensure_sdk", return_value=_make_recovery_fake_sdk()
+    ):
+        events = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "hi"}],
+                [],
+                "",
+                ExecutorConfig(extra={"thinking": thinking}),
+            )
+        ]
+    errors = [event for event in events if isinstance(event, ExecutorError)]
+    assert len(errors) == 1 and not errors[0].retryable
+    assert "thinking" in errors[0].message
