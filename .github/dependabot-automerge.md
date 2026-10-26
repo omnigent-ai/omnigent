@@ -17,20 +17,27 @@ fallback or branch-protection bypass.
 | Category | Automatic scope | Required compatibility evidence |
 | --- | --- | --- |
 | Python | Stable patches/minors, including existing manifest floor and exact-pin increases and corresponding transitive graph updates | Full selected Python matrix, database/Windows CI, integration, full E2E/UI and production image build; PyPI artifact integrity and age |
-| Web | Stable patches/minors in the web workspace, including necessary transitive graph updates | Frontend tests/types/build, browser contract, full backend/browser E2E and production image build; npm integrity and age |
-| GitHub Actions | Same-identity SHA-pin upgrades to stable minor/patch releases, exercised by PR CI | Verified upstream release pins, mapped consuming workflow and required compatibility workflows |
+| JavaScript | Stable patches/minors across mapped workspace consumers, including catalogs and simple override pins | Frontend tests/types/build, browser contract, full backend/browser E2E and production image build; executed consumer steps, npm integrity and age |
+| GitHub Actions | Same-identity SHA-pin upgrades to stable minor/patch releases, exercised by PR CI | Verified upstream release pins, a mapped occurrence of each identical Action/SHA transition and required compatibility workflows |
 | Rust | Stable patches/minors in either Codex parity sidecar or omnidev, including corresponding manifest/graph updates | Actual tests for the affected workspace; sidecar updates also require browser E2E |
 | Pre-commit | Stable patches/minors of `pre-commit-hooks` | Unchanged hook settings and successful Lint |
 
 Every changed version, including transitives, must qualify. Stable `0.x` minors
 and ordinary exact-pin bumps qualify with the same required CI as other updates.
-Majors, downgrades and prereleases require review.
+Majors, downgrades and prereleases require review, except the explicitly named
+OpenTelemetry `0.NbM` beta packages in `python.beta`. The same version ordering,
+cooldown, integrity, advisory and full Python CI requirements apply to those beta updates.
+An unlisted OpenTelemetry package or a different prerelease format remains manual.
 
 The policy's `manual` patterns cover harness SDKs/CLIs, native/desktop/mobile
 packages, publishing/release/token Actions, and compatibility-coupled PDF
-packages. Changes to requirement operators, upper bounds, compatibility overrides, dependency
-sources, manifest scripts, Python extras/markers, workflow permissions or shell
-commands remain manual. New or removed direct dependencies remain manual;
+packages. Changes to requirement operators, upper bounds, complex compatibility overrides,
+dependency sources, manifest scripts, Python extras/markers, workflow permissions
+or shell commands remain manual. Existing catalog entries and simple override
+pins may advance within the ordinary version policy. Other workspace settings
+must remain unchanged. Simple overrides must agree with the lock and each
+affected resolution; an unchanged compatible override is not a blocker.
+New or removed direct dependencies remain manual;
 normal additions/removals of registry-backed transitive dependencies are allowed.
 A retained parallel version does not prevent upgrading one other resolution of
 the same package. Adding a parallel version must advance the highest existing
@@ -39,8 +46,13 @@ review. Retained metadata and dependency edges remain validated. Multiple
 simultaneous changed Python/Cargo versions, duplicate identities and other
 ambiguous resolutions require review.
 
-Web updates shared with another workspace consumer remain manual because the
-web suite does not establish that consumer's compatibility. Docker images remain
+Mapped JavaScript consumers include web, Electron, VS Code, the extension SDK,
+the example extension and Cloudflare. Shared graph changes require the existing
+workspace test/build steps or Cloudflare dry-run/image smoke steps to have
+succeeded in the job metadata. An older green workflow without those executed
+steps cannot establish coverage. Unknown consumers and `.github/ci-deps` remain
+manual; the harness installers use separate locks, so passing web tests alone
+does not establish compatibility for that CLI graph. Docker images remain
 manual: repository Trivy reports do not inventory the built image. Standalone
 harness CLI pins retain their existing Dependabot exclusions.
 
@@ -97,6 +109,9 @@ CI and advisory evidence as the worker. Native GitHub auto-merge therefore canno
 use structural eligibility alone to satisfy that required check. Label changes
 reevaluate approval so a hold also withdraws the automatic exception. Otto still
 requires an actual maintainer review; no internal workflow change is needed.
+The internal PR freshness updater explicitly excludes Dependabot. Keep branch
+refreshes for unattended dependency candidates in this worker; reviewed manual
+updates can continue through Otto's existing merge path.
 These reads are not atomic with GitHub's merge operation, and a previously green
 approval can outlive its assessed base in native auto-merge. Strict up-to-date
 branch protection or a merge queue is needed for that platform-level guarantee;
@@ -104,6 +119,16 @@ this change does not alter repository settings.
 
 Maintainers can still apply `skip-security-scan` for a manual merge. That waiver
 does not make the PR eligible for the unattended worker.
+
+## Lockfile regeneration
+
+The existing `/regen` and scheduled consistency repair workflows preserve pnpm's
+current lockfile instead of deleting it. Newly selected releases retain the
+workspace cooldown; unchanged pins avoid unrelated upgrades and downgrades.
+`/regen` uses uv 0.13.4, matching CI rather than the older pinned Action's default.
+These are repair paths, not a replacement dependency generator. Dependabot can
+still produce uv format/marker churn or incompatible transitive updates; those
+diffs remain manual. The evaluator never executes PR code to rewrite them.
 
 ## Existing PRs and rollout verification
 
@@ -116,6 +141,13 @@ The worker refreshes stale failed approval checks only after the candidate's CI
 and advisory evidence passes. Approval does not consume retries while CI is
 pending. It can rerun workflows blocked only by failed Security Gates after the scan becomes
 green. Recovery stops at three attempts and does not retry real test failures.
+When every required workflow tested the same older base and all its checks,
+consumer steps and advisory evidence pass, the worker can ask GitHub to update
+the branch with an expected-head guard. It then waits for fresh policy, scans
+and CI, without merging in that sweep. Three merge commits in the PR exhaust
+this conservative refresh budget; incomplete histories, mixed bases, holds,
+review objections and moved heads block recovery. This only updates cleanly
+mergeable branches; conflicts need review.
 Report mode never refreshes or merges.
 
 After landing, inspect the worker summary and observe a qualifying update through

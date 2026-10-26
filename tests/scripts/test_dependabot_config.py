@@ -130,3 +130,18 @@ def test_active_ecosystems_carry_labels_and_commit_prefix(entries: list[dict[str
             continue
         assert "dependencies" in entry.get("labels", []), entry["package-ecosystem"]
         assert entry.get("commit-message", {}).get("prefix") == "chore(deps)", entry
+
+
+def test_workspace_coverage_maps_to_real_jobs_and_steps():
+    import json
+
+    policy = json.loads((REPO_ROOT / ".github/dependabot-automerge.json").read_text())
+    for importer, coverage in policy["npm"]["consumers"].items():
+        assert (REPO_ROOT / importer / "package.json").is_file()
+        for consumer in coverage:
+            workflow = yaml.safe_load(
+                (REPO_ROOT / ".github/workflows" / consumer["workflow"]).read_text()
+            )
+            jobs = [job for job in workflow["jobs"].values() if job.get("name") == consumer["job"]]
+            assert len(jobs) == 1, consumer
+            assert any(step.get("name") == consumer["step"] for step in jobs[0]["steps"]), consumer

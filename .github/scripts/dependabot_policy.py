@@ -45,7 +45,9 @@ def read_yaml(text: str) -> dict:
     return result
 
 
-def version(value: str) -> tuple[int, ...]:
+def version(value: str, *, beta: bool = False) -> tuple[int, ...]:
+    if beta and (match := re.fullmatch(r"0\.([0-9]+)b([0-9]+)", value)):
+        return (0, int(match[1]), -1, int(match[2]))
     require(bool(re.fullmatch(r"[0-9]+(?:\.[0-9]+){0,3}", value)), f"Unstable version: {value}")
     parts = tuple(map(int, value.split(".")))
     while len(parts) > 3 and parts[-1] == 0:
@@ -53,8 +55,10 @@ def version(value: str) -> tuple[int, ...]:
     return parts + (0,) * max(0, 3 - len(parts))
 
 
-def upgrade(old: str, new: str, minor: bool = False, *, zero_minor: bool = False) -> None:
-    before, after = version(old), version(new)
+def upgrade(
+    old: str, new: str, minor: bool = False, *, zero_minor: bool = False, beta: bool = False
+) -> None:
+    before, after = version(old, beta=beta), version(new, beta=beta)
     require(after > before, f"Not an upgrade: {old} -> {new}")
     require(before[0] == after[0], "Major updates require review")
     require(
@@ -80,7 +84,13 @@ def package_upgrade(name: str, old: str, new: str, policy: dict) -> None:
     require_package(name, policy)
     minor = policy.get("default") == "minor" or matches(name, policy.get("minor", []))
     try:
-        upgrade(old, new, minor, zero_minor=matches(name, policy.get("zero_minor", [])))
+        upgrade(
+            old,
+            new,
+            minor,
+            zero_minor=matches(name, policy.get("zero_minor", [])),
+            beta=matches(name, policy.get("beta", [])),
+        )
     except NeedsReview as exc:
         raise NeedsReview(f"{name} {old} -> {new}: {exc}") from exc
 
@@ -105,7 +115,9 @@ def canonical_specifier(value: str) -> str:
 
 
 def python_requirement_upgrade(old: str, new: str, policy: dict) -> tuple[str, str, str]:
-    pattern = r"([A-Za-z0-9_.-]+)(\[[^\]]+\])?(\s*(?:>=|==)\s*)([0-9]+(?:\.[0-9]+){0,3})(.*)"
+    pattern = (
+        r"([A-Za-z0-9_.-]+)(\[[^\]]+\])?(\s*(?:>=|==)\s*)([0-9]+(?:\.[0-9]+){0,3}(?:b[0-9]+)?)(.*)"
+    )
     previous, current = re.fullmatch(pattern, old), re.fullmatch(pattern, new)
     require(
         previous is not None and current is not None,
@@ -185,8 +197,12 @@ def package_pairs(
     )
     if added and not removed and previous:
         pin = added[0]
-        baselines = [entry for entry in old if version(entry)[0] == version(pin)[0]] or list(old)
-        package_upgrade(name, max(baselines, key=version), pin, policy)
+
+        def parse(value):
+            return version(value, beta=matches(name, policy.get("beta", [])))
+
+        baselines = [entry for entry in old if parse(entry)[0] == parse(pin)[0]] or list(old)
+        package_upgrade(name, max(baselines, key=parse), pin, policy)
     pairs = [(old[pin], new[pin]) for pin in sorted(old.keys() & new.keys())]
     if removed or added:
         pairs.append((old[removed[0]] if removed else {}, new[added[0]] if added else {}))
@@ -230,7 +246,7 @@ def lock_changes(before: dict, after: dict, policy: dict, *, manifest_changes=No
                     package["source"] == {"registry": "https://pypi.org/simple"},
                     f"{name} is not from PyPI",
                 )
-                version(package["version"])
+                version(package["version"], beta=matches(name, policy["python"].get("beta", [])))
             if current:
                 changes.append(current)
             continue
@@ -326,7 +342,9 @@ def lock_changes(before: dict, after: dict, policy: dict, *, manifest_changes=No
                         f"{child} is not from PyPI",
                     )
                     require_package(child, policy["python"])
-                    version(resolved["version"])
+                    version(
+                        resolved["version"], beta=matches(child, policy["python"].get("beta", []))
+                    )
                     if old_references:
                         old_resolved = referenced_package(old_references[index], old)
                         require(
@@ -438,10 +456,14 @@ def python_changes(read, files: set[str], policy: dict) -> dict:
         "Python manifest floor has no matching lock upgrade",
     )
     for name, (_old_spec, new_spec) in manifest_changes.items():
-        floor = re.match(r"(?:>=|==)([0-9.]+)", new_spec)[1]
+        floor = re.match(r"(?:>=|==)([0-9.]+(?:b[0-9]+)?)", new_spec)[1]
         require(
             any(
-                package["name"] == name and version(package["version"]) == version(floor)
+                package["name"] == name
+                and version(
+                    package["version"], beta=matches(name, policy["python"].get("beta", []))
+                )
+                == version(floor, beta=matches(name, policy["python"].get("beta", [])))
                 for package in changes
             ),
             f"{name}: manifest floor does not match the new locked version",
@@ -508,69 +530,178 @@ def npm_reachable(lock: dict, sections: dict) -> set[str]:
     return seen
 
 
-def npm_changes(read, files: set[str], policy: dict) -> dict:
+def npm_specifier(name: str, spec: str, workspace: dict) -> str:
+    if spec.startswith("catalog:"):
+        catalog = spec.removeprefix("catalog:")
+        entries = (
+            workspace.get("catalogs", {}).get(catalog, {})
+            if catalog
+            else workspace.get("catalog", {})
+        )
+        require(name in entries, f"{name}: missing workspace catalog entry")
+        return entries[name]
+    return spec
+
+
+def npm_requirement_upgrade(name: str, old: str, new: str, policy: dict) -> None:
+    if old == new:
+        return
+    previous = re.fullmatch(r"([\^~]?)([0-9]+(?:\.[0-9]+){2})", old)
+    current = re.fullmatch(r"([\^~]?)([0-9]+(?:\.[0-9]+){2})", new)
     require(
-        files <= {"pnpm-lock.yaml", "web/package.json"} and "pnpm-lock.yaml" in files,
-        "Only web manifest and root pnpm lock updates qualify",
+        previous is not None and current is not None and previous[1] == current[1],
+        f"{name}: npm version requirement shape changed",
     )
+    package_upgrade(name, previous[2], current[2], policy)
+
+
+def npm_satisfies(pin: str, spec: str) -> bool:
+    match = re.fullmatch(r"([\^~]?)([0-9]+(?:\.[0-9]+){2})", spec)
+    require(match is not None, f"Unsupported npm requirement: {spec}")
+    prefix, floor = match.groups()
+    current, minimum = version(pin), version(floor)
+    if not prefix:
+        return current == minimum
+    if prefix == "~":
+        return current >= minimum and current[:2] == minimum[:2]
+    boundary = next((index + 1 for index, part in enumerate(minimum) if part), 3)
+    return current >= minimum and current[:boundary] == minimum[:boundary]
+
+
+def npm_workspace_changes(read, policy: dict) -> tuple[dict, dict]:
+    before, after = (read_yaml(text) for text in read("pnpm-workspace.yaml"))
+    expected = copy.deepcopy(before)
+    for section in ("catalog", "catalogs", "overrides"):
+        old, new = expected.get(section, {}), after.get(section, {})
+        require(old.keys() == new.keys(), f"pnpm {section} package set changed")
+        groups = [(old, new)]
+        if section == "catalogs":
+            groups = [(entries, new[name]) for name, entries in old.items()]
+        for previous, current in groups:
+            require(previous.keys() == current.keys(), "pnpm catalog package set changed")
+            for name, spec in previous.items():
+                if section == "overrides" and spec != current[name]:
+                    require(
+                        re.fullmatch(r"(?:@[\w.-]+/)?[\w.-]+", name) is not None,
+                        f"{name}: a compatibility override requires review",
+                    )
+                npm_requirement_upgrade(
+                    name,
+                    npm_specifier(name, spec, before),
+                    npm_specifier(name, current[name], after),
+                    policy["npm"],
+                )
+        if section in expected:
+            expected[section] = new
+    require(expected == after, "pnpm settings changed beyond version requirements")
+    return before, after
+
+
+def npm_changes(read, files: set[str], policy: dict) -> dict:
+    consumers = policy["npm"]["consumers"]
+    manifests = {f"{name}/package.json" for name in consumers}
+    require(
+        files <= {"pnpm-lock.yaml", "pnpm-workspace.yaml"} | manifests
+        and "pnpm-lock.yaml" in files,
+        "Only covered workspace manifests and root pnpm lock updates qualify",
+    )
+    workspaces = npm_workspace_changes(read, policy)
     before, after = (read_yaml(text) for text in read("pnpm-lock.yaml"))
-    allowed_sections = {"packages", "snapshots", "importers"}
+    allowed_sections = {"packages", "snapshots", "importers", "catalogs", "overrides"}
     require(
         {k: v for k, v in before.items() if k not in allowed_sections}
         == {k: v for k, v in after.items() if k not in allowed_sections},
-        "pnpm settings, catalogs or compatibility overrides changed",
+        "pnpm resolution settings changed",
     )
+    for lock, workspace in zip((before, after), workspaces, strict=True):
+        require(
+            lock.get("overrides", {})
+            == {
+                name: npm_specifier(name, spec, workspace)
+                for name, spec in workspace.get("overrides", {}).items()
+            },
+            "pnpm compatibility override/lock mismatch",
+        )
+        for catalog, entries in lock.get("catalogs", {}).items():
+            for name, entry in entries.items():
+                spec = npm_specifier(
+                    name, "catalog:" + (catalog if catalog != "default" else ""), workspace
+                )
+                require(
+                    set(entry) == {"specifier", "version"}
+                    and entry["specifier"] == spec
+                    and npm_satisfies(entry["version"], spec)
+                    and f"{name}@{entry['version']}" in lock["packages"],
+                    f"{name}: catalog/lock mismatch",
+                )
     old_packages, new_packages = before["packages"], after["packages"]
     require(
         before["importers"].keys() == after["importers"].keys(),
         "pnpm workspace membership changed",
     )
-    closures = []
-    for lock in (before, after):
-        closures.append(
-            {name: npm_reachable(lock, sections) for name, sections in lock["importers"].items()}
-        )
+    closures = [
+        {name: npm_reachable(lock, sections) for name, sections in lock["importers"].items()}
+        for lock in (before, after)
+    ]
     old_reachable = {key.split("(", 1)[0] for keys in closures[0].values() for key in keys}
-    old_web = {key.split("(", 1)[0] for key in closures[0].get("web", set())}
-    new_web = {key.split("(", 1)[0] for key in closures[1].get("web", set())}
+    covered = [
+        {
+            key.split("(", 1)[0]
+            for name, keys in closure.items()
+            if name in consumers
+            for key in keys
+        }
+        for closure in closures
+    ]
+    old_covered, new_covered = covered
     removed = old_packages.keys() - new_packages.keys()
     added = new_packages.keys() - old_packages.keys()
-    require(added <= new_web, "Added npm packages are not reachable from web")
-    require(removed & old_reachable <= old_web, "Removed npm packages have non-web consumers")
+    require(added <= new_covered, "Added npm packages are not reachable from covered consumers")
+    require(
+        removed & old_reachable <= old_covered,
+        "Removed npm packages have non-web consumers without coverage",
+    )
     for key in old_packages.keys() & new_packages.keys():
         require(old_packages[key] == new_packages[key], f"Existing npm resolution changed: {key}")
 
+    affected = set()
     for importer, sections in before["importers"].items():
-        if importer == "web":
-            continue
-        require(sections == after["importers"][importer], f"{importer}: non-web consumer changed")
-        require(
-            closures[0][importer] == closures[1][importer]
-            and all(
-                before["snapshots"][key] == after["snapshots"][key]
-                for key in closures[0][importer]
-            ),
-            f"A changed package is shared with {importer}; human review required",
+        changed = (
+            sections != after["importers"][importer]
+            or closures[0][importer] != closures[1][importer]
+            or any(
+                before["snapshots"][key] != after["snapshots"][key]
+                for key in closures[0][importer] & closures[1][importer]
+            )
         )
-
-    workspace = read_yaml(read("pnpm-workspace.yaml")[0])
+        if changed:
+            require(
+                importer in consumers,
+                f"{importer}: non-web consumer changed without mapped coverage",
+            )
+            affected.add(importer)
+    workspace = workspaces[1]
     overrides = set(workspace.get("overrides", {})) | set(before.get("overrides", {}))
 
     def eligible(name):
         require_package(name, policy["npm"])
-        # Overrides can select a parent, a version range, or a scoped package.
-        selectors = [
-            part for selector in overrides for part in re.split(r">(?=@?[A-Za-z])", selector)
-        ]
-        require(
-            not any(
-                matches(name, [selector]) or selector.startswith(name + "@")
-                for selector in selectors
-            ),
-            f"{name}: a compatibility override requires review",
-        )
+        for selector in overrides:
+            parts = re.split(r">(?=@?[A-Za-z])", selector)
+            if not any(matches(name, [part]) or part.startswith(name + "@") for part in parts):
+                continue
+            require(selector == name, f"{name}: a compatibility override requires review")
+            spec = npm_specifier(name, workspace["overrides"][name], workspace)
+            require(
+                all(
+                    npm_satisfies(pin, spec)
+                    for key in new_packages
+                    for package, pin in [key.rsplit("@", 1)]
+                    if package == name
+                ),
+                f"{name}: resolution violates compatibility override",
+            )
 
-    inventory = set(added) | (new_web - old_web)
+    inventory = set(added) | (new_covered - old_covered)
     added_versions, removed_versions, old_versions = {}, {}, {}
     for keys, index in (
         (added, added_versions),
@@ -659,7 +790,10 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
         base = key.split("(", 1)[0]
         if key in before["snapshots"] and snapshot == before["snapshots"][key]:
             continue
-        require(key in closures[1].get("web", set()), "Unreachable npm snapshot changed")
+        require(
+            any(key in closures[1].get(name, set()) for name in consumers),
+            "Unreachable npm snapshot changed",
+        )
         if base not in old_packages:
             candidates = [
                 previous
@@ -698,60 +832,55 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
                 ),
                 f"Unexplained npm peer metadata changed: {key}",
             )
-    old_manifest, new_manifest = (json.loads(text) for text in read("web/package.json"))
-    require(old_manifest.keys() == new_manifest.keys(), "Web manifest sections changed")
-    for section in ("dependencies", "devDependencies", "optionalDependencies"):
-        old = old_manifest.get(section, {})
-        new = new_manifest.get(section, {})
-        require(old.keys() == new.keys(), "Web manifest package set changed")
-        for name, spec in old.items():
-            if spec != new[name]:
-                previous_requirement = re.fullmatch(r"([\^~]?)([0-9]+(?:\.[0-9]+){2})", spec)
-                current_requirement = re.fullmatch(r"([\^~]?)([0-9]+(?:\.[0-9]+){2})", new[name])
-                require(
-                    previous_requirement is not None
-                    and current_requirement is not None
-                    and previous_requirement[1] == current_requirement[1],
-                    f"{name}: npm version requirement shape changed",
-                )
-                package_upgrade(
-                    name, previous_requirement[2], current_requirement[2], policy["npm"]
-                )
-        if section in old_manifest:
-            old_manifest[section] = new
-    require(old_manifest == new_manifest, "Web manifest scripts or other settings changed")
-    old_manifest = json.loads(read("web/package.json")[0])
-    expected = copy.deepcopy(before["importers"]["web"])
-    for section in ("dependencies", "devDependencies", "optionalDependencies"):
-        old = expected.get(section, {})
-        new = after["importers"]["web"].get(section, {})
-        require(old.keys() == new.keys(), "Web importer package set changed")
-        for name, dependency in old.items():
-            current = new[name]
-            if dependency == current:
-                continue
-            if (
-                reference(name, dependency["version"]) != reference(name, current["version"])
-                or dependency["specifier"] != current["specifier"]
-            ):
-                require(
-                    re.fullmatch(r"[\^~]?[0-9]+(?:\.[0-9]+){2}", dependency["specifier"]),
-                    f"{name}: npm version requirement needs review",
-                )
-            require(
-                dependency["specifier"] == old_manifest.get(section, {}).get(name)
-                and current["specifier"] == new_manifest.get(section, {}).get(name),
-                "Manifest/lock mismatch",
-            )
-            if re.fullmatch(r"[0-9]+(?:\.[0-9]+){2}", current["specifier"]):
-                require(
-                    reference(name, current["version"]) == f"{name}@{current['specifier']}",
-                    f"{name}: exact manifest pin does not match the lockfile",
-                )
-            replacement(name, dependency["version"], current["version"])
-            dependency["version"] = current["version"]
-            dependency["specifier"] = current["specifier"]
-    require(expected == after["importers"]["web"], "pnpm importer settings changed")
+    for importer in sorted(
+        affected | {name for name in consumers if f"{name}/package.json" in files}
+    ):
+        manifests = [json.loads(text) for text in read(f"{importer}/package.json")]
+        expected_manifest = copy.deepcopy(manifests[0])
+        expected = copy.deepcopy(before["importers"][importer])
+        for section in ("dependencies", "devDependencies", "optionalDependencies"):
+            old, new = (manifest.get(section, {}) for manifest in manifests)
+            require(old.keys() == new.keys(), f"{importer}: manifest package set changed")
+            for name, spec in old.items():
+                npm_requirement_upgrade(name, spec, new[name], policy["npm"])
+            if section in expected_manifest:
+                expected_manifest[section] = new
+            previous = expected.get(section, {})
+            current = after["importers"][importer].get(section, {})
+            require(previous.keys() == current.keys(), f"{importer}: importer package set changed")
+            for name, dependency in previous.items():
+                entry = current[name]
+                if entry == dependency and old.get(name) == new.get(name):
+                    continue
+                for index, item in enumerate((dependency, entry)):
+                    manifest_spec = manifests[index].get(section, {}).get(name)
+                    spec = item["specifier"]
+                    override = workspaces[index].get("overrides", {}).get(name)
+                    require(
+                        spec == manifest_spec
+                        or (
+                            override is not None
+                            and spec == npm_specifier(name, override, workspaces[index])
+                        ),
+                        f"{importer}: Manifest/lock mismatch",
+                    )
+                    effective = npm_specifier(name, spec, workspaces[index])
+                    # Workspace links and aliases must retain their existing identity.
+                    if dependency["version"].startswith("link:"):
+                        require(dependency == entry, "Workspace dependency link changed")
+                    else:
+                        resolved_name, pin = npm_key(reference(name, item["version"]))
+                        require(
+                            resolved_name == name and npm_satisfies(pin, effective),
+                            f"{name}: manifest pin does not match the lockfile",
+                        )
+                replacement(name, dependency["version"], entry["version"])
+                dependency.update(version=entry["version"], specifier=entry["specifier"])
+        require(
+            expected_manifest == manifests[1],
+            f"{importer}: manifest scripts or other settings changed",
+        )
+        require(expected == after["importers"][importer], "pnpm importer settings changed")
 
     for key in sorted(added | (removed & old_reachable)):
         name, _pin = npm_key(key)
@@ -776,7 +905,7 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
             f"{name}: npm integrity or source mismatch",
         )
         aged(metadata["time"][pin], policy["cooldown_days"], datetime.now(UTC))
-    return decision(
+    result = decision(
         "npm",
         [dict(zip(("name", "version"), npm_key(key), strict=True)) for key in sorted(inventory)],
         "pnpm-lock.yaml",
@@ -784,6 +913,10 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
         ["ci.yml", "lint.yml", "web-tests.yml", "e2e.yml", "e2e-ui.yml", "docker-build.yml"],
         ["Pre-commit checks", "web test", "Browser Contract UI", "Docker build"],
     )
+    result["consumer_steps"] = [
+        step for importer in sorted(affected) for step in consumers[importer]
+    ]
+    return result
 
 
 def github_release(repository: str, sha: str, days: int) -> tuple[str, str]:
@@ -834,17 +967,15 @@ def action_changes(read, files: set[str], policy: dict, *, for_scan: bool = Fals
             require(old_sha != new_sha, "Only action SHA upgrades qualify")
             changes.add((name, old_sha, new_sha))
             require_package(name, policy["actions"])
-            if not for_scan:
-                require(
-                    path in policy["action_test_paths"],
-                    f"{path}: Action changes need mapped PR CI",
-                )
             if path in policy["action_test_paths"]:
                 exercised.add((name, old_sha, new_sha))
                 workflows.add(policy["action_test_paths"][path])
     require(bool(changes), "No action pin changes")
     if not for_scan:
-        require(changes == exercised, "Each changed action must be exercised by PR CI")
+        require(
+            changes == exercised,
+            "Each changed action and SHA pair must be exercised by mapped PR CI",
+        )
     packages = []
     for name, old_sha, new_sha in sorted(changes):
         repository = "/".join(name.split("/")[:2])

@@ -230,6 +230,10 @@ elif args[:2] == ['workflow', 'run']:
 elif args[:2] == ['api', 'repos/example/project/statuses/' + 'a' * 40]:
     assert os.environ['GH_TOKEN'] == 'test-only'
     sys.exit(data.get('status_exit', 0))
+elif args[:3] == ['api', '--method', 'PUT']:
+    assert os.environ['GH_TOKEN'] == 'test-merge-token'
+    assert args == ['api', '--method', 'PUT', 'repos/example/project/pulls/123/update-branch',
+                    '-f', 'expected_head_sha=' + 'a' * 40]
 elif args[:3] == ['api', '--method', 'POST']:
     assert os.environ['GH_TOKEN'] == 'test-merge-token'
     assert args[3].endswith(('/rerun-failed-jobs', '/rerun'))
@@ -1231,7 +1235,7 @@ def test_web_updates_preserve_security_and_compatibility(evaluate_fixture, polic
     elif fault == "shared":
         locks = [yaml.safe_load(text) for text in files["pnpm-lock.yaml"]]
         for lock in locks:
-            lock["importers"]["web/electron"] = copy.deepcopy(lock["importers"]["web"])
+            lock["importers"]["uncovered/workspace"] = copy.deepcopy(lock["importers"]["web"])
         files["pnpm-lock.yaml"] = tuple(yaml.safe_dump(lock) for lock in locks)
     elif fault == "graph":
         old, new = files["pnpm-lock.yaml"]
@@ -1372,15 +1376,23 @@ def test_required_workflow_must_test_current_head_and_base(tmp_path, api, entry,
 
 
 @pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
-def test_tested_action_pin_does_not_authorize_unmapped_workflow(tmp_path, expanded_update):
+@pytest.mark.parametrize("fault", [None, "different_pin", "unmapped_only", "commands"])
+def test_tested_action_transition_covers_other_occurrences(tmp_path, expanded_update, fault):
     _, api = expanded_update
     pair = api["files"][".github/workflows/ci.yml"]
-    set_changed_files(
-        api, {".github/workflows/ci.yml": pair, ".github/workflows/release.yml": pair}
-    )
+    files = {".github/workflows/ci.yml": pair, ".github/workflows/release.yml": pair}
+    if fault == "different_pin":
+        files[".github/workflows/release.yml"] = (pair[0], pair[1].replace("2" * 40, "3" * 40))
+    elif fault == "unmapped_only":
+        del files[".github/workflows/ci.yml"]
+    elif fault == "commands":
+        files[".github/workflows/release.yml"] = (
+            pair[0],
+            pair[1] + "      - run: arbitrary-command\n",
+        )
+    set_changed_files(api, files)
     process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
-    assert "release.yml: Action changes need mapped PR CI" in process.stdout
-    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (fault is None), process.stdout
 
 
 @pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
@@ -1529,7 +1541,7 @@ def test_worker_refreshes_stale_approval_without_merging(tmp_path, api, conditio
     posts = [call for call in calls if call[:3] == ["api", "--method", "POST"]]
     assert posts == (
         [["api", "--method", "POST", f"{PREFIX}/actions/runs/90/rerun-failed-jobs"]]
-        if condition in {"eligible", "reports_pending"}
+        if condition == "eligible"
         else []
     ), process.stdout
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
@@ -1860,3 +1872,97 @@ def test_worker_bounds_readiness_dispatch_for_each_head(tmp_path, api, condition
     assert mint_token["with"]["permission-actions"] == "write"
     readiness = yaml.safe_load((ROOT / ".github/workflows/merge-ready.yml").read_text())
     assert "format('Merge Ready #{0} ({1})', inputs.pr, inputs.sha)" in readiness["run-name"]
+
+
+@pytest.mark.parametrize(
+    "condition",
+    [
+        "green",
+        "report",
+        "failed",
+        "pending",
+        "advisory",
+        "limit",
+        "incomplete",
+        "hold",
+        "head_moved",
+    ],
+)
+def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
+    tip = "c" * 40
+    api["routes"][f"{PREFIX}/git/ref/heads/main"]["object"]["sha"] = tip
+    api["routes"][f"{PREFIX}/compare/{tip}...{HEAD}"] = {"merge_base_commit": {"sha": BASE}}
+    pull = api["routes"][f"{PREFIX}/pulls/123"]
+    pull["commits"] = 1
+    commits = [{"sha": HEAD, "parents": [{"sha": BASE}]}]
+    if condition == "limit":
+        commits = [
+            {"sha": str(index) * 40, "parents": [{"sha": BASE}, {"sha": tip}]}
+            for index in range(3)
+        ] + commits
+        pull["commits"] = len(commits)
+    elif condition == "incomplete":
+        pull["commits"] = 250
+    elif condition == "hold":
+        pull["labels"] = [{"name": "hold-automerge"}]
+    elif condition == "head_moved":
+        api["pull_after"] = copy.deepcopy(pull)
+        api["pull_after"]["head"]["sha"] = "d" * 40
+    elif condition in {"failed", "pending"}:
+        run = api["routes"][
+            f"{PREFIX}/actions/workflows/e2e.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+        ]["workflow_runs"][0]
+        run.update(
+            status="in_progress" if condition == "pending" else "completed",
+            conclusion="failure" if condition == "failed" else None,
+        )
+    elif condition == "advisory":
+        api["report"]["Results"][0]["Vulnerabilities"].append(
+            {
+                "PkgName": "ruff",
+                "InstalledVersion": "0.15.2",
+                "Severity": "HIGH",
+                "VulnerabilityID": "CVE-update",
+            }
+        )
+    api["routes"][f"{PREFIX}/pulls/123/commits?per_page=100&page=1"] = commits
+    process, calls = run_cli(
+        tmp_path, api, mode="report" if condition == "report" else "merge", sweep=True
+    )
+    assert process.returncode == 0, process.stderr
+    updates = [call for call in calls if call[:3] == ["api", "--method", "PUT"]]
+    assert bool(updates) == (condition == "green"), process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)
+    if condition == "green":
+        assert "waiting for fresh policy, scans and CI" in process.stdout
+
+
+@pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
+@pytest.mark.parametrize("conclusion", ["success", "skipped", "missing"])
+def test_android_action_update_requires_unsigned_build(tmp_path, expanded_update, conclusion):
+    _, api = expanded_update
+    pair = api["files"][".github/workflows/ci.yml"]
+    set_changed_files(api, {".github/workflows/android-bundle.yml": pair})
+    api["routes"][
+        f"{PREFIX}/actions/workflows/android-bundle.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+    ] = {
+        "workflow_runs": [
+            {
+                "id": 21,
+                "head_sha": HEAD,
+                "status": "completed",
+                "conclusion": "success",
+                "pull_requests": [{"number": 123, "head": {"sha": HEAD}, "base": {"sha": BASE}}],
+            }
+        ]
+    }
+    api["routes"][f"{PREFIX}/actions/runs/21/jobs?per_page=100&page=1"] = {
+        "jobs": []
+        if conclusion == "missing"
+        else [{"name": "Build unsigned AAB", "conclusion": conclusion}]
+    }
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls) == (conclusion == "success"), (
+        process.stdout
+    )

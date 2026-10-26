@@ -34,6 +34,10 @@ REPORT_CHECKS = (
 )
 
 
+class StaleBase(NeedsReview):
+    """Completed CI used a different base from current main."""
+
+
 @cache
 def git_object(repository: str, kind: str, sha: str) -> dict:
     return gh_json(["api", f"repos/{repository}/git/{kind}/{sha}"])
@@ -257,15 +261,15 @@ def require_reports(repository: str, candidate: dict) -> None:
             and latest["conclusion"] == "success",
             f"Latest {workflow} run did not succeed",
         )
-        require(
-            any(
-                pull.get("number") == candidate["number"]
-                and pull.get("head", {}).get("sha") == head
-                and pull.get("base", {}).get("sha") == candidate["base"]
-                for pull in latest.get("pull_requests", [])
-            ),
-            f"{workflow}: CI did not test the current PR head and base; rebase the PR",
-        )
+        if not any(
+            pull.get("number") == candidate["number"]
+            and pull.get("head", {}).get("sha") == head
+            and pull.get("base", {}).get("sha") == candidate["base"]
+            for pull in latest.get("pull_requests", [])
+        ):
+            raise StaleBase(
+                f"{workflow}: CI did not test the current PR head and base; rebase the PR"
+            )
         target_jobs = (
             policy.get("cargo", {})
             .get("targets", {})
@@ -310,6 +314,21 @@ def require_reports(repository: str, candidate: dict) -> None:
                 and any(job["conclusion"] == "success" for job in matching)
                 and all(job["conclusion"] in allowed for job in matching),
                 f"{workflow}: waiting for successful {pattern} jobs",
+            )
+        for consumer in candidate.get("consumer_steps", []):
+            if consumer["workflow"] != workflow:
+                continue
+            require(
+                any(
+                    job["name"] == consumer["job"]
+                    and job["conclusion"] == "success"
+                    and any(
+                        step["name"] == consumer["step"] and step["conclusion"] == "success"
+                        for step in job.get("steps", [])
+                    )
+                    for job in jobs
+                ),
+                f"{workflow}: waiting for executed consumer step {consumer['step']}",
             )
         completed_runs[workflow] = latest
     if not candidate["target"]:
@@ -440,6 +459,52 @@ def require_current_candidate(repository: str, number: int, candidate: dict) -> 
     )
 
 
+def refresh_stale_base(repository: str, candidate: dict, mode: str) -> None:
+    if mode != "merge":
+        return
+    bases = set()
+    for workflow in required_workflows(candidate):
+        run, _jobs = latest_workflow(repository, candidate["head"], workflow)
+        for pull in run.get("pull_requests", []):
+            if (
+                pull.get("number") == candidate["number"]
+                and pull.get("head", {}).get("sha") == candidate["head"]
+            ):
+                bases.add(pull.get("base", {}).get("sha"))
+    require(len(bases) == 1 and None not in bases, "Waiting for CI on one identifiable base")
+    previous_base = bases.pop()
+    require(previous_base != candidate["base"], "CI metadata needs human inspection")
+    # Refresh only an otherwise green candidate, never to hide a failed test.
+    require_reports(repository, dict(candidate, base=previous_base))
+    commits = paginated(f"repos/{repository}/pulls/{candidate['number']}/commits")
+    pull = gh_json(["api", f"repos/{repository}/pulls/{candidate['number']}"])
+    require(
+        bool(commits)
+        and commits[-1]["sha"] == candidate["head"]
+        and pull.get("commits") == len(commits),
+        "Incomplete commit inventory",
+    )
+    require(
+        sum(len(commit["parents"]) > 1 for commit in commits) < 3,
+        "Base refresh limit reached; maintainer review required",
+    )
+    require_current_candidate(repository, candidate["number"], candidate)
+    subprocess.run(
+        [
+            "gh",
+            "api",
+            "--method",
+            "PUT",
+            f"repos/{repository}/pulls/{candidate['number']}/update-branch",
+            "-f",
+            f"expected_head_sha={candidate['head']}",
+        ],
+        check=True,
+        env=dict(os.environ, GH_TOKEN=os.environ["DEPENDABOT_MERGE_TOKEN"]),
+    )
+    raise NeedsReview("Updated branch against main; waiting for fresh policy, scans and CI")
+
+
 def sweep(repository: str, mode: str) -> None:
     if mode == "merge":
         require(
@@ -470,9 +535,16 @@ def sweep(repository: str, mode: str) -> None:
             decision = evaluate(repository, number)
             packages = ", ".join(decision["packages"])
             rows.append(f"- #{number}: eligible ({packages})")
-            require_approval(repository, decision, mode)
             refresh_failed_gates(repository, decision, mode)
-            require_reports(repository, decision)
+            try:
+                require_reports(repository, decision)
+            except StaleBase as stale:
+                try:
+                    refresh_stale_base(repository, decision, mode)
+                except NeedsReview as recovery:
+                    raise NeedsReview(f"{stale}; {recovery}") from recovery
+                raise
+            require_approval(repository, decision, mode)
             require_merge_ready(repository, decision, mode)
             if mode == "merge":
                 require_current_candidate(repository, number, decision)
