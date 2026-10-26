@@ -128,6 +128,14 @@ const MonacoDiffViewer = lazy(() =>
 // Helpers
 // ---------------------------------------------------------------------------
 
+function isFormattedMarkdownAnchor(comment: Comment): boolean {
+  return (
+    !!comment.anchor_content &&
+    detectLang(comment.path) === "markdown" &&
+    comment.end_index - comment.start_index !== comment.anchor_content.length
+  );
+}
+
 /**
  * Classify comments into open/addressed and remap open draft comments to
  * their correct absolute offsets when the file content has changed.
@@ -136,10 +144,13 @@ const MonacoDiffViewer = lazy(() =>
  *   moved, or at stored offsets if the anchor is no longer present
  *   (never silently dropped).
  * - **addressed**: handled by the agent or user (status "addressed").
+ *
+ * Markdown formatting/entity spans use the source map to avoid unrelated literal copies.
  */
 export function classifyAndRemapComments(
   comments: Comment[],
   fileContent: string,
+  remapFormatted?: ((comment: Comment, content: string) => Comment) | null,
 ): { open: Comment[]; addressed: Comment[] } {
   const open: Comment[] = [];
   const addressed: Comment[] = [];
@@ -163,6 +174,11 @@ export function classifyAndRemapComments(
     // File not yet loaded — keep at stored offsets rather than dropping.
     if (!fileContent) {
       open.push(c);
+      continue;
+    }
+    // Keep raw spans while loading; a failed import (null) uses legacy search.
+    if (isFormattedMarkdownAnchor(c) && remapFormatted !== null) {
+      open.push(remapFormatted?.(c, fileContent) ?? c);
       continue;
     }
     // Search near the stored offset first to handle the common case of a
@@ -606,9 +622,32 @@ function FileViewerBody({
 
   const allComments = useMemo(() => commentsQuery.data ?? [], [commentsQuery.data]);
   const fileContent = useMemo(() => fileQuery.data?.content ?? "", [fileQuery.data]);
+  const [remapFormatted, setRemapFormatted] = useState<
+    ((comment: Comment, content: string) => Comment) | null
+  >();
+  const needsMarkdownRemap = allComments.some(
+    (comment) => comment.status !== "addressed" && isFormattedMarkdownAnchor(comment),
+  );
+  useEffect(() => {
+    if (!needsMarkdownRemap || remapFormatted !== undefined) return;
+    let cancelled = false;
+    import("./markdownCommentRemap").then(
+      ({ remapFormattedMarkdownComment }) => {
+        if (!cancelled) setRemapFormatted(() => remapFormattedMarkdownComment);
+      },
+      (error) => {
+        if (cancelled) return;
+        console.warn("Unable to load Markdown comment remapping; using legacy search", error);
+        setRemapFormatted(null);
+      },
+    );
+    return () => {
+      cancelled = true;
+    };
+  }, [needsMarkdownRemap, remapFormatted]);
   const { open: openComments, addressed: addressedComments } = useMemo(
-    () => classifyAndRemapComments(allComments, fileContent),
-    [allComments, fileContent],
+    () => classifyAndRemapComments(allComments, fileContent, remapFormatted),
+    [allComments, fileContent, remapFormatted],
   );
 
   const handleSetActiveSelection = (selection: ActiveSelection | null) => {

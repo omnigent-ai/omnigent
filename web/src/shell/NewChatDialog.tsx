@@ -90,6 +90,7 @@ import {
   MODEL_SELECT_DEFAULT,
   MODEL_SELECT_SMART,
   defaultModelLabel,
+  nativeEffortOptions,
   nativeModelLabel,
 } from "@/components/HarnessConfigControls";
 import { ProjectLandingIcon } from "@/components/ProjectIconPicker";
@@ -2239,6 +2240,7 @@ export function NewChatLandingScreen() {
       agentId: c.agent_id,
       useWorktree: c.use_worktree,
       model: c.model,
+      effort: c.effort,
     };
   }, [
     projectParam,
@@ -3830,7 +3832,9 @@ export function NewChatLandingScreen() {
     const selectionHarness =
       selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
     if (!selectionHarness) return;
+    // Every model-picker commit also settles the effort (routing and Fusion clear it).
     userPickedModelRef.current = true;
+    userPickedEffortRef.current = true;
     if (model === MODEL_SELECT_SMART) {
       setPickedModel("");
       setPickedEffort("");
@@ -3875,8 +3879,16 @@ export function NewChatLandingScreen() {
       selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
     if (!selectionHarness) return;
     const picked = effort === EFFORT_SELECT_NONE ? "" : effort;
+    userPickedEffortRef.current = true;
     setPickedEffort(picked);
-    rememberPickerOptions(selectionHarness, { effort: picked });
+    // Record the visible routing "off" so the remembered-routing restore can't
+    // turn it back on (and drop this effort) once the project pin is released.
+    rememberPickerOptions(
+      selectionHarness,
+      smartRoutingEligible && costControlMode !== "on"
+        ? { effort: picked, routing: "off" }
+        : { effort: picked },
+    );
   };
   const handleSetPickedHarness = useCallback(
     (harness: string | null, agentId?: string) => {
@@ -3912,6 +3924,7 @@ export function NewChatLandingScreen() {
   const selectFusionModel = (modelUid: string) => {
     if (!selectedNativeHarness) return;
     userPickedModelRef.current = true;
+    userPickedEffortRef.current = true;
     setPickedModel(modelUid);
     setPickedEffort("");
     setCostControlMode(null);
@@ -4207,11 +4220,14 @@ export function NewChatLandingScreen() {
   // cache refresh must not reseed the project default over the user's choice;
   // an agent switch starts a fresh visit and re-arms the seed.
   const userPickedModelRef = useRef(false);
+  // Same guard for an explicit effort pick against the project's default effort.
+  const userPickedEffortRef = useRef(false);
   useEffect(() => {
     const prev = prevAgentIdRef.current;
     prevAgentIdRef.current = effectiveAgentId;
     if (prev === undefined || prev === null || prev === effectiveAgentId) return;
     userPickedModelRef.current = false;
+    userPickedEffortRef.current = false;
     setBypassSandbox(false);
     setCostControlMode(null);
   }, [effectiveAgentId, setCostControlMode]);
@@ -4244,6 +4260,21 @@ export function NewChatLandingScreen() {
   const projectDefaultModelValid =
     projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
       ? projectDefaultModel
+      : null;
+  // A project-configured default effort, scoped to the project's agent like the
+  // model. The seeds below validate it against the harness's effort ladder.
+  const projectDefaultEffort =
+    prefillConfig?.effort != null &&
+    prefillConfig.agentId != null &&
+    effectiveAgentId === prefillConfig.agentId
+      ? prefillConfig.effort
+      : null;
+  const projectDefaultEffortValid =
+    projectDefaultEffort != null &&
+    (
+      nativeEffortOptions(selectedNativeHarness, projectModelVocab, projectDefaultModelValid) ?? []
+    ).some((option) => option.value === projectDefaultEffort)
+      ? projectDefaultEffort
       : null;
   // Seed the harness's knobs from the user's last picks when the selected
   // harness changes (including the first mount), so a returning user starts a
@@ -4286,6 +4317,24 @@ export function NewChatLandingScreen() {
       options.some((m) => m.id === projectDefaultModel)
         ? projectDefaultModel
         : null;
+    // Project effort outranks the remembered effort when the seeded model's ladder offers it.
+    const projectEffortSeed = (
+      modelOptions: readonly NativeModelOption[],
+      model: string,
+    ): string | null =>
+      !userPickedEffortRef.current &&
+      projectDefaultEffort != null &&
+      (nativeEffortOptions(selectedNativeHarness, modelOptions, model) ?? []).some(
+        (option) => option.value === projectDefaultEffort,
+      )
+        ? projectDefaultEffort
+        : null;
+    // A seeded project effort is an explicit pin like the project model, so it
+    // turns off a routing "on" restored from a parked draft.
+    const seedEffort = (projectEffort: string | null, fallback: string) => {
+      if (projectEffort != null) _setCostControlMode((mode) => (mode === "on" ? null : mode));
+      setPickedEffort(projectEffort ?? fallback);
+    };
     if (selectedNativeHarness === "pi-native") {
       setPickedModel(
         projectSeed(piModelOptions) ??
@@ -4293,7 +4342,8 @@ export function NewChatLandingScreen() {
             ? stored.model
             : ""),
       );
-      setPickedEffort(
+      seedEffort(
+        projectEffortSeed(piModelOptions, ""),
         stored.effort != null && PI_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
           ? stored.effort
           : "",
@@ -4315,7 +4365,8 @@ export function NewChatLandingScreen() {
             ? stored.model
             : ""),
       );
-      setPickedEffort(
+      seedEffort(
+        projectEffortSeed(claudeModelOptions, ""),
         !storedRoutingOn &&
           stored.effort != null &&
           CLAUDE_NATIVE_EFFORTS.some((e) => e.value === stored.effort)
@@ -4344,7 +4395,8 @@ export function NewChatLandingScreen() {
       // ladder (the catalog default's when no model is pinned) still offers
       // it — anything else resolves to "" so a level another harness left in
       // the shared state never rides a Codex create.
-      setPickedEffort(
+      seedEffort(
+        projectEffortSeed(codexModelOptions, seededCodexModel),
         !storedRoutingOn &&
           selectedNativeHarness === "codex-native" &&
           stored.effort != null &&
@@ -4364,10 +4416,8 @@ export function NewChatLandingScreen() {
         resolve(DEVIN_NATIVE_PERMISSION_MODES, DEVIN_NATIVE_DEFAULT_PERMISSION_MODE),
       );
     }
-    // Reseed on harness changes, when the selected host's catalog resolves,
-    // and when the project's configured default model settles (its config
-    // loads async, so the first run may see it as null); capability flags are
-    // derived from the same harness and stay omitted.
+    // Reseed on harness, host-catalog, and async project model/effort changes;
+    // capability flags derive from the harness.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     sandboxInferenceConfigured,
@@ -4376,6 +4426,7 @@ export function NewChatLandingScreen() {
     codexModelOptions,
     piModelOptions,
     projectDefaultModel,
+    projectDefaultEffort,
   ]);
   useEffect(() => {
     if (!sandboxDefaultModelsEnabled || !previewHarness) return;
@@ -4390,11 +4441,15 @@ export function NewChatLandingScreen() {
         : saved.model;
     const model = sandboxCatalog?.find((row) => row.id === candidate);
     setPickedModel(model?.id ?? "");
+    const effortLevels = codexEffortLevelsForModel(sandboxCatalog ?? [], model?.id);
+    const effortCandidate =
+      !userPickedEffortRef.current &&
+      projectDefaultEffort != null &&
+      effortLevels.includes(projectDefaultEffort)
+        ? projectDefaultEffort
+        : saved.effort;
     setPickedEffort(
-      saved.effort &&
-        codexEffortLevelsForModel(sandboxCatalog ?? [], model?.id).includes(saved.effort)
-        ? saved.effort
-        : "",
+      effortCandidate && effortLevels.includes(effortCandidate) ? effortCandidate : "",
     );
   }, [
     sandboxDefaultModelsEnabled,
@@ -4403,6 +4458,7 @@ export function NewChatLandingScreen() {
     sandboxCatalog,
     pickerEdits,
     projectDefaultModel,
+    projectDefaultEffort,
     setPickedModel,
   ]);
   useEffect(() => {
@@ -4431,11 +4487,10 @@ export function NewChatLandingScreen() {
   // switch itself (the router always routes), so it's left alone.
   useEffect(() => {
     if (!selectedNativeHarness || autoRoutingSelected) return;
-    // A *valid* project-configured default model is an explicit pin: a
-    // remembered routing "on" must not re-enter routing and clear it (the
-    // setter drops the model pick when routing turns on). An invalid stored
-    // id never seeds a pin, so it must not suppress the remembered routing.
+    // A valid project model or effort is an explicit pin that remembered routing
+    // would drop; an invalid stored value seeds no pin and doesn't suppress it.
     if (projectDefaultModelValid != null && !userPickedModelRef.current) return;
+    if (projectDefaultEffortValid != null && !userPickedEffortRef.current) return;
     const storedRouting =
       (pickerEdits?.agentId === effectiveAgentId && pickerEdits.harness === selectedNativeHarness
         ? pickerEdits.options.routing
@@ -4448,6 +4503,7 @@ export function NewChatLandingScreen() {
     effectiveAgentId,
     autoRoutingSelected,
     projectDefaultModelValid,
+    projectDefaultEffortValid,
     setCostControlMode,
     pickerEdits,
   ]);

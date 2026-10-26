@@ -68,9 +68,10 @@ the header menu), and each place is a separate entry point.
   dialog with the command to run; the desktop app reconnects a local host
   itself, and starts an Arca host recognized by its saved ID or CLI-seeded name
   from the same action (the desktop's Arca console still asks before running).
-  A failed attempt opens the dialog for retry; so does an Arca that comes back
-  as a different host than the session's, with **Switch host** to move the
-  session. States: reconnecting (spinner), reconnect failed (retry), host offline.
+  A failed attempt opens the dialog for retry; so does an Arca connect after
+  which the server still lists the session's host offline (usually because Arca
+  came back as a different host), with **Switch host** to move the session.
+  States: reconnecting (spinner), reconnect failed (retry), host offline.
 - `workspace-recovery`: a missing-workspace error offers **Continue in another
   directory…**. Choose an existing host directory, optionally with a new git
   worktree of it, to fork the conversation into a new session; the original
@@ -276,9 +277,10 @@ in the chat; the dialog shows the command for this situation (for example
 when a local session is stranded). In the desktop app, **Reconnect host** acts
 directly for this machine or a recognized Arca host; Arca's connect console
 asks for confirmation before running, and a failed attempt opens the dialog,
-whose **Reconnect Arca** action retries. If Arca comes back as a different host
-than the session's, the dialog says so instead of reporting success; use
-**Switch host** to move the session to it.
+whose **Reconnect Arca** action retries. Success is reported only once the
+server lists the session's own host online; otherwise the dialog says the host
+is still offline and points to **Switch host** in case Arca came back as a
+different host.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
