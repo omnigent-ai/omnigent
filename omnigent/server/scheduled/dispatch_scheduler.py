@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from typing import Literal
 
 from omnigent.db.db_models import workspace_scope
+from omnigent.debug_logging import debug_event
 from omnigent.entities import ScheduledTask, ScheduledTaskRun
 from omnigent.server.scheduled.config import DEFAULT_SCHEDULER_CONFIG, ScheduledTaskSchedulerConfig
 from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
@@ -28,6 +29,27 @@ from omnigent.stores.scheduled_task_store.dispatch import (
 _logger = logging.getLogger(__name__)
 
 
+def _run_event(event_name: str, run: ScheduledTaskRun, **attributes: object) -> dict[str, object]:
+    """Structured debug-log event for one scheduled run, keyed by its session when known."""
+    return debug_event(
+        event_name,
+        session_id=run.conversation_id,
+        # Explicit, so run attributes can never bind to these parameters.
+        turn_id=None,
+        user_id=None,
+        task_id=run.scheduled_task_id,
+        run_id=run.id,
+        task_workspace_id=run.workspace_id,
+        scheduled_at=run.scheduled_at,
+        **attributes,
+    )
+
+
+def _seconds(value: float) -> float:
+    # Clock skew between replicas must not produce a negative delay.
+    return round(max(0.0, value), 3)
+
+
 class StartupLeaseLost(RuntimeError):
     """Startup must stop; the executor can no longer prove a live claim."""
 
@@ -42,11 +64,13 @@ class StartupLease:
         *,
         now: Callable[[], float],
         lease_seconds: int,
+        target: str | None = None,
     ) -> None:
         self.run = run
         self._store = store
         self._now = now
         self._lease_seconds = lease_seconds
+        self._target = target
         self._lock = asyncio.Lock()
         self._writes: set[asyncio.Task[None]] = set()
 
@@ -61,7 +85,20 @@ class StartupLease:
 
     async def attach_session(self, conversation_id: str) -> None:
         """Persist the session before dispatch so crash recovery can inspect it."""
+        first_session = self.run.conversation_id is None
         await self._transition("starting", conversation_id=conversation_id)
+        if first_session:
+            _logger.info(
+                "Recorded session %s for scheduled run %s",
+                conversation_id,
+                self.run.id,
+                extra=_run_event(
+                    "scheduled_run_session_attached",
+                    self.run,
+                    target=self._target,
+                    session_delay_seconds=_seconds(self._now() - self.run.scheduled_at),
+                ),
+            )
 
     async def finish(
         self,
@@ -80,6 +117,21 @@ class StartupLease:
             )
         await self._transition(
             status, conversation_id=conversation_id, error=error, error_code=error_code
+        )
+        _logger.info(
+            "Scheduled run %s startup ended with status %s",
+            self.run.id,
+            status,
+            extra=_run_event(
+                "scheduled_run_startup_ended",
+                self.run,
+                target=self._target,
+                outcome=status,
+                error_code=error_code,
+                prompt_delay_seconds=_seconds(self._now() - self.run.scheduled_at)
+                if status == "running"
+                else None,
+            ),
         )
 
     async def _transition(
@@ -257,7 +309,8 @@ class PersistentTaskScheduler:
                 await self.poll_once()
             except Exception:
                 _logger.exception(
-                    "Could not check scheduled tasks for work; will check again on the next poll"
+                    "Could not check scheduled tasks for work; will check again on the next poll",
+                    extra=debug_event("scheduled_task_operation_failed", operation="poll"),
                 )
             await asyncio.sleep(self._poll_seconds)
 
@@ -274,7 +327,8 @@ class PersistentTaskScheduler:
                 await self._initialize()
             except Exception:
                 _logger.exception(
-                    "Could not read tasks needing a next run time; retrying next poll"
+                    "Could not read tasks needing a next run time; retrying next poll",
+                    extra=debug_event("scheduled_task_operation_failed", operation="initialize"),
                 )
             await self._claim_due()
 
@@ -298,6 +352,12 @@ class PersistentTaskScheduler:
                     "Could not initialize the next run time for task %s; "
                     "will check it again on a later scan",
                     task.id,
+                    extra=debug_event(
+                        "scheduled_task_operation_failed",
+                        operation="initialize",
+                        task_id=task.id,
+                        task_workspace_id=task.workspace_id,
+                    ),
                 )
         if len(tasks) < self._batch_size:
             self._initialization_cursor = None
@@ -321,14 +381,18 @@ class PersistentTaskScheduler:
         except Exception:
             _logger.exception(
                 "Could not check runs with expired startup leases; "
-                "recovery will try again on the next poll"
+                "recovery will try again on the next poll",
+                extra=debug_event("scheduled_task_operation_failed", operation="recovery"),
             )
         try:
             self._cleanup_cursor = await asyncio.to_thread(
                 self._store.purge_deleted_tasks, after=self._cleanup_cursor, limit=self._batch_size
             )
         except Exception:
-            _logger.exception("Could not finish deleted-task cleanup; retrying next poll")
+            _logger.exception(
+                "Could not finish deleted-task cleanup; retrying next poll",
+                extra=debug_event("scheduled_task_operation_failed", operation="cleanup"),
+            )
 
     async def _reconcile(self) -> None:
         # Keep the cutoff fixed until the scan wraps so new expirations cannot
@@ -353,14 +417,22 @@ class PersistentTaskScheduler:
                             await asyncio.gather(local, return_exceptions=True)
                         with workspace_scope(run.workspace_id):
                             status = await self._on_expired(run)
-                            if status is not None:
+                            if status is None:
+                                _logger.info(
+                                    "Recovery could not yet determine the outcome of run %s",
+                                    run.id,
+                                    extra=_run_event(
+                                        "scheduled_run_recovered", run, outcome="uncertain"
+                                    ),
+                                )
+                            else:
                                 if status not in ("running", "failed"):
                                     raise ValueError(
                                         f"Invalid recovery result {status!r}. "
                                         "Expected 'running', 'failed', or None "
                                         "to check again later."
                                     )
-                                await asyncio.to_thread(
+                                recorded = await asyncio.to_thread(
                                     self._store.transition_starting_run,
                                     run,
                                     now=self._now,
@@ -372,18 +444,30 @@ class PersistentTaskScheduler:
                                     else None,
                                     error_code="startup_expired" if status == "failed" else None,
                                 )
+                                # Another server may have recorded a result first.
+                                outcome = status if recorded is not None else "superseded"
+                                _logger.info(
+                                    "Recovery recorded outcome %s for run %s",
+                                    outcome,
+                                    run.id,
+                                    extra=_run_event(
+                                        "scheduled_run_recovered", run, outcome=outcome
+                                    ),
+                                )
             except TimeoutError:
                 _logger.warning(
                     "Recovery timed out for run %s; an in-flight database update may "
                     "still complete. If the run remains starting, a later sweep "
                     "will check it again",
                     run.id,
+                    extra=_run_event("scheduled_run_recovered", run, outcome="timeout"),
                 )
             except Exception:
                 _logger.exception(
                     "Could not finish recovery for run %s after its startup lease expired; "
                     "will check the run again on a later poll",
                     run.id,
+                    extra=_run_event("scheduled_run_recovered", run, outcome="error"),
                 )
         if len(runs) < self._batch_size:
             self._recovery_cursor = None
@@ -422,6 +506,33 @@ class PersistentTaskScheduler:
                             host_id=host_id,
                             lease_seconds=self._lease_seconds,
                         )
+                    if run is None:
+                        _logger.info(
+                            "Skipped occurrence %s of task %s: it was already claimed "
+                            "or the task changed",
+                            task.next_run_at,
+                            task.id,
+                            extra=debug_event(
+                                "scheduled_run_claim_skipped",
+                                task_id=task.id,
+                                task_workspace_id=task.workspace_id,
+                                scheduled_at=task.next_run_at,
+                                target=task.execution_target,
+                            ),
+                        )
+                    else:
+                        _logger.info(
+                            "Claimed scheduled run %s for task %s",
+                            run.id,
+                            task.id,
+                            extra=_run_event(
+                                "scheduled_run_claimed",
+                                run,
+                                target=task.execution_target,
+                                host_id=run.host_id,
+                                claim_delay_seconds=_seconds(now - run.scheduled_at),
+                            ),
+                        )
                     if run is not None and not self._stopped:
                         key = (run.workspace_id, run.id)
                         startup = asyncio.create_task(self._execute(task, run))
@@ -432,10 +543,24 @@ class PersistentTaskScheduler:
                         "Could not prepare a scheduled run for task %s; "
                         "will check the task again on a later poll",
                         task.id,
+                        extra=debug_event(
+                            "scheduled_task_operation_failed",
+                            operation="claim",
+                            task_id=task.id,
+                            task_workspace_id=task.workspace_id,
+                        ),
                     )
 
     async def _execute(self, task: ScheduledTask, run: ScheduledTaskRun) -> None:
-        lease = StartupLease(self._store, run, now=self._now, lease_seconds=self._lease_seconds)
+        lease = StartupLease(
+            self._store,
+            run,
+            now=self._now,
+            lease_seconds=self._lease_seconds,
+            target=task.execution_target,
+        )
+        # Logged only if startup ends without a final status from the executor.
+        outcome = "unfinished"
         with workspace_scope(run.workspace_id):
             fire = asyncio.create_task(self._fire(task, lease))
             heartbeat = asyncio.create_task(self._heartbeat(lease))
@@ -448,12 +573,17 @@ class PersistentTaskScheduler:
                 if heartbeat in done:
                     await fire
             except StartupLeaseLost:
+                outcome = "lease_lost"
                 _logger.warning(
                     "Startup lease lost for run %s (status=%s); stopping local startup work",
                     run.id,
                     lease.run.status,
                 )
+            except asyncio.CancelledError:
+                outcome = "cancelled"
+                raise
             except Exception:
+                outcome = "interrupted"
                 # Recovery inspects runs still marked starting after lease expiry.
                 _logger.exception(
                     "Startup interrupted for run %s (status=%s); "
@@ -465,6 +595,19 @@ class PersistentTaskScheduler:
                 fire.cancel()
                 heartbeat.cancel()
                 await asyncio.gather(fire, heartbeat, return_exceptions=True)
+                if lease.run.status == "starting":
+                    _logger.info(
+                        "Scheduled run %s startup ended without a result (%s); "
+                        "recovery will check it after its lease expires",
+                        lease.run.id,
+                        outcome,
+                        extra=_run_event(
+                            "scheduled_run_startup_ended",
+                            lease.run,
+                            target=task.execution_target,
+                            outcome=outcome,
+                        ),
+                    )
 
     async def _fire(self, task: ScheduledTask, lease: StartupLease) -> None:
         await lease.check()
@@ -506,4 +649,7 @@ class PersistentTaskScheduler:
                     "last confirmed lease remains valid",
                     lease.run.id,
                     exc_info=True,
+                    extra=_run_event(
+                        "scheduled_task_operation_failed", lease.run, operation="lease_renewal"
+                    ),
                 )

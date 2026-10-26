@@ -1390,3 +1390,98 @@ async def test_restart_after_stop_starts_recovery_scan_from_the_beginning(store)
         assert scheduler._recovery_cutoff == int(clock.now())
     finally:
         await scheduler.stop()
+
+
+def _events(caplog, event_name: str) -> list[dict]:
+    return [
+        {**record.attributes, "session_id": getattr(record, "session_id", None)}
+        for record in caplog.records
+        if getattr(record, "event_name", None) == event_name
+    ]
+
+
+async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog):
+    from sqlalchemy import update
+
+    from omnigent.db.db_models import SqlScheduledTask
+
+    caplog.set_level(logging.INFO, logger="omnigent.server.scheduled.dispatch_scheduler")
+    pinned = {"execution_target": "connected_host", "host_id": uuid.uuid4().hex}
+    tasks = {
+        seed: _task(store, seed, **pinned)
+        for seed in ("delivered", "failed", "unfinished", "interrupted", "duplicate")
+    }
+    clock = FakeClock(max(task.next_run_at for task in tasks.values()) + 7)
+    # Another replica already started this occurrence; a stale cursor revisits it.
+    duplicate = tasks["duplicate"]
+    started = store.claim_scheduled_run(
+        duplicate,
+        now=duplicate.next_run_at,
+        next_run_at=duplicate.next_run_at + 3600,
+        host_id=duplicate.host_id,
+        lease_seconds=120,
+    )
+    store.transition_starting_run(started, now=clock.now, status="running")
+    with store._session_immediate("test_revisited_occurrence") as session:
+        session.execute(
+            update(SqlScheduledTask)
+            .where(SqlScheduledTask.id == duplicate.id)
+            .values(next_run_at=duplicate.next_run_at)
+        )
+    session_id = uuid.uuid4().hex
+
+    async def fire(task, lease):
+        if task.name == "delivered":
+            await lease.attach_session(session_id)
+            clock.advance(3)
+            await lease.finish("running")
+        elif task.name == "failed":
+            await lease.finish("failed", error_code="host_offline")
+        elif task.name == "interrupted":
+            raise RuntimeError("runner start failed")
+
+    recover = AsyncMock(return_value="running")
+    scheduler = PersistentTaskScheduler(store, fire, recover, now=clock.now)
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        clock.advance(120)
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+
+    names = {task.id: name for name, task in tasks.items()}
+    claimed = _events(caplog, "scheduled_run_claimed")
+    assert sorted(names[event["task_id"]] for event in claimed) == [
+        "delivered",
+        "failed",
+        "interrupted",
+        "unfinished",
+    ]
+    assert {(event["target"], event["claim_delay_seconds"]) for event in claimed} == {
+        ("connected_host", 7)
+    }
+    assert [event["task_id"] for event in _events(caplog, "scheduled_run_claim_skipped")] == [
+        duplicate.id
+    ]
+    [attached] = _events(caplog, "scheduled_run_session_attached")
+    assert (attached["session_id"], attached["session_delay_seconds"]) == (session_id, 7)
+    ended = {
+        names[event["task_id"]]: event for event in _events(caplog, "scheduled_run_startup_ended")
+    }
+    assert {name: event["outcome"] for name, event in ended.items()} == {
+        "delivered": "running",
+        "failed": "failed",
+        "unfinished": "unfinished",
+        "interrupted": "interrupted",
+    }
+    assert ended["delivered"]["prompt_delay_seconds"] == 10
+    assert ended["delivered"]["session_id"] == session_id
+    assert ended["failed"]["error_code"] == "host_offline"
+    # Both interrupted startups are handed to recovery, which preserves delivered work.
+    recovered = _events(caplog, "scheduled_run_recovered")
+    assert sorted(names[event["task_id"]] for event in recovered) == ["interrupted", "unfinished"]
+    assert {event["outcome"] for event in recovered} == {"running"}
+    claimed_runs = {event["run_id"] for event in claimed}
+    assert {event["run_id"] for event in recovered} <= claimed_runs

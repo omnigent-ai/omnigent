@@ -211,6 +211,42 @@ controls are separate.
 The store supports PostgreSQL, MySQL, CockroachDB, and SQLite. Cloudflare D1 cannot
 provide the transaction needed to create a run and advance its schedule together.
 
+## Debug-log events
+
+The scheduler writes structured events with `debug_event`, like the rest of the
+server. When the debug-log sink is enabled, they reach the same table as session
+lifecycle events, so dashboards compute scheduler KPIs with SQL. Every run event
+includes `task_id`, `run_id`, `task_workspace_id`, and `scheduled_at`. Once a
+session exists, the row's `session_id` links the run to its session events.
+
+| Event | Logged when | Extra attributes |
+| --- | --- | --- |
+| `scheduled_run_claimed` | This server claimed a due occurrence. | `target`, `host_id`, `claim_delay_seconds` |
+| `scheduled_run_claim_skipped` | The occurrence was already claimed or the task changed. | `target` (no run) |
+| `scheduled_run_session_attached` | The executor recorded the fired session. | `target`, `session_delay_seconds` |
+| `scheduled_run_startup_ended` | Startup ended on the executing server. | `target`, `outcome`, `error_code`, `prompt_delay_seconds` |
+| `scheduled_run_recovered` | Recovery inspected an expired startup. | `outcome` |
+| `scheduled_task_operation_failed` | An operation failed and will be retried. | `operation` |
+
+`startup_ended` outcomes are `running`, `failed`, or `skipped` from the executor, or
+`lease_lost`, `interrupted`, `unfinished`, or `cancelled` when startup ended
+without a result. Recovery outcomes are `running`, `failed`, `uncertain`,
+`superseded` (another server recorded a result first), `timeout`, or `error`.
+Operations are `poll`, `initialize`, `claim`, `recovery`, `cleanup`, and
+`lease_renewal`. Delays are seconds from the scheduled time.
+
+The design's success metrics come from these events:
+
+| Success metric | Calculation |
+| --- | --- |
+| Fire success rate | Distinct `run_id`s whose `startup_ended` or `recovered` outcome is `running` ÷ distinct claimed `run_id`s. Occurrences missed during downtime are never claimed. |
+| Duplicate fires | Claimed `run_id`s per `(task_workspace_id, task_id, scheduled_at)`. The database's unique key keeps this at one; `claim_skipped` shows how often it applies. |
+| Fire delay | p90 of `session_delay_seconds`. To exclude sandbox boot time, the executor must record the session before waiting for the sandbox. |
+| Time to prompt | `prompt_delay_seconds` on `running` outcomes, by `target`. |
+| Fires per day, Arclet vs. pinned host | Claimed runs by `target`. Active tasks and owners come from `scheduled_tasks`. |
+
+Failure stages come from the executor's `error_code`.
+
 ## Code
 
 [dispatch_scheduler.py](dispatch_scheduler.py) coordinates polling, heartbeats, and
