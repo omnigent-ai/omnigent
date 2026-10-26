@@ -1465,6 +1465,20 @@ class _SessionsChatReplAdapter:
         # event — always, regardless of whether send() is active.
         # Set by run_repl() to the rendering callback.
         self._on_event: Callable[[object], None] | None = None
+        # Last item / status the pump delivered: the /stream endpoint does not
+        # replay, so a reconnect reconciles everything after these from REST.
+        self._last_streamed_item_id: str | None = None
+        self._last_streamed_status: str | None = None
+        self._replayed_item_ids: set[str] = set()
+        self._replayed_status: str | None = None
+        self._replay_from_start = False
+        # Prose streamed since the renderer's last segment boundary, so a
+        # message completed inside a gap is finished rather than repeated.
+        self._streamed_text_parts: list[str] = []
+        # Full text of each message reconciliation just replayed, in order, so
+        # the tail's re-queued copy of that prose is dropped without swallowing
+        # a genuinely new message that starts streaming right after it.
+        self._pending_dup_texts: list[str] = []
         self._stream_task: asyncio.Task[None] | None = None
         self._recover_task: asyncio.Task[None] | None = None
         self._recover_lock = asyncio.Lock()
@@ -2320,14 +2334,38 @@ class _SessionsChatReplAdapter:
         never hangs even when the adapter is used without
         ``run_repl()`` (e.g. integration tests).
 
+        After a reconnect, the new subscription's first event triggers
+        :meth:`_reconcile_stream_gap`, which replays from REST whatever
+        the gap dropped.
+
         Cancelled on REPL exit via ``_stream_task.cancel()``.
         """
+        from omnigent.server.schemas import OutputItemDoneEvent as _ItemDoneEv
+        from omnigent.server.schemas import OutputTextDeltaEvent as _TextDeltaEv
         from omnigent.server.schemas import SessionStatusEvent as _StatusEv
 
         _dbg = bool(os.environ.get("OMNIGENT_SESSIONS_ADAPTER_DEBUG"))
         backoff = 0.5
         max_backoff = 5.0
+        # Each pump task streams one session; never carry another
+        # session's cursor, status or prose into this one.
+        self._last_streamed_item_id = None
+        self._last_streamed_status = None
+        self._replayed_item_ids = set()
+        self._replayed_status = None
+        self._replay_from_start = False
+        self._streamed_text_parts = []
+        self._pending_dup_texts = []
+        # Reconcile on the first subscription too, not just on reconnects: an
+        # item or terminal status committed between the seed read and the first
+        # tail-slot registration would otherwise be dropped until some later
+        # reconnect happened to recover it. The seeded cursor bounds the replay.
+        reconnecting = True
         assert self._session_id is not None
+        # Baseline the replay cursor before the first subscription, so the
+        # reconcile covers every item after it even if the gap opened before
+        # this pump ever delivered one.
+        await self._seed_stream_cursor()
         while True:
             try:
                 if _dbg:
@@ -2336,15 +2374,62 @@ class _SessionsChatReplAdapter:
                         file=sys.stderr,
                         flush=True,
                     )
+                reconcile_pending = reconnecting
+                reconnecting = True
                 async for event in self._client.sessions.stream(self._session_id):
-                    if isinstance(event, _StatusEv) and event.status in (
-                        "idle",
-                        "waiting",
-                        "failed",
-                    ):
-                        turn_done = getattr(self, "_turn_done", None)
-                        if turn_done is not None:
-                            turn_done.set()
+                    if reconcile_pending:
+                        # Reconcile once the new tail is registered: the server
+                        # registers its live-tail slot before it sends anything,
+                        # so a REST read now is never ahead of the tail and any
+                        # item seen twice is deduped.
+                        reconcile_pending = False
+                        await self._reconcile_stream_gap()
+                    if isinstance(event, _StatusEv):
+                        if event.status == self._replayed_status:
+                            # Live copy of the status reconciliation already
+                            # rendered. Consume the slot on an exact match; a
+                            # non-running mismatch keeps it so an intervening
+                            # transition cannot expose a second copy of the
+                            # reconciled status.
+                            self._replayed_status = None
+                            continue
+                        if event.status == "running":
+                            # A genuinely new turn (it is not the reconciled
+                            # status's live copy): drop replayed prose still
+                            # pending, and drop a reconciled status whose live
+                            # copy never arrived (the tail does not re-send a
+                            # status committed before this subscription) so it
+                            # cannot later dedup this turn's identical
+                            # transition into a stuck spinner.
+                            self._streamed_text_parts.clear()
+                            self._pending_dup_texts.clear()
+                            self._replayed_status = None
+                        self._last_streamed_status = event.status
+                        if event.status in ("idle", "waiting", "failed"):
+                            turn_done = getattr(self, "_turn_done", None)
+                            if turn_done is not None:
+                                turn_done.set()
+                    elif isinstance(event, _ItemDoneEv):
+                        if _commits_streamed_prose(event.item):
+                            self._streamed_text_parts.clear()
+                        item_id = event.item.get("id")
+                        if (
+                            isinstance(item_id, str)
+                            and item_id
+                            and item_id in self._replayed_item_ids
+                        ):
+                            # Live copy of a reconciled item; its queued prose
+                            # may still be arriving, so keep the dup guard.
+                            self._replayed_item_ids.discard(item_id)
+                            continue
+                        # A genuinely new live item ends the replayed-prose run.
+                        self._pending_dup_texts.clear()
+                        if isinstance(item_id, str) and item_id:
+                            self._last_streamed_item_id = item_id
+                    elif isinstance(event, _TextDeltaEv):
+                        if self._consume_replayed_delta(event.delta):
+                            continue  # duplicate of prose reconciliation replayed
+                        self._streamed_text_parts.append(event.delta)
                     if self._on_event is not None:
                         self._on_event(event)
                 # Clean close (server sent [DONE]). Reopen.
@@ -2395,6 +2480,138 @@ class _SessionsChatReplAdapter:
                     )
                 await asyncio.sleep(backoff)
                 backoff = min(backoff * 2, max_backoff)
+
+    async def _seed_stream_cursor(self) -> None:
+        """Start the replay cursor at the newest item the session already has.
+
+        Otherwise a gap before this pump delivered any item could reconcile
+        only the status and silently drop output completed meanwhile. An
+        empty session replays from the start instead. Best-effort: on failure
+        the first live item still sets the cursor.
+        """
+        assert self._session_id is not None
+        try:
+            page = await self._client.sessions.list_items(self._session_id, limit=1, order="desc")
+        except Exception as exc:  # noqa: BLE001 — best-effort seed
+            _log.debug("stream cursor seed failed: %s", exc)
+            return
+        newest = page.data[0].get("id") if page.data else None
+        if isinstance(newest, str) and newest:
+            self._last_streamed_item_id = newest
+        else:
+            self._replay_from_start = not page.data
+
+    async def _reconcile_stream_gap(self) -> None:
+        """Deliver what a /stream reconnect gap dropped.
+
+        The endpoint does not replay history, so a turn that finished while the
+        pump was reconnecting (e.g. an idle-timeout on a proxy between client
+        and server) would never render its output or end its spinner. Replays
+        items created after the last one the pump delivered, then the current
+        session status if it changed. Best-effort: failures just log.
+        """
+        from omnigent.server.schemas import OutputItemDoneEvent as _ItemDoneEv
+        from omnigent.server.schemas import OutputTextDeltaEvent as _TextDeltaEv
+        from omnigent.server.schemas import SessionStatusEvent as _StatusEv
+
+        if self._on_event is None or self._session_id is None:
+            return
+        session_id = self._session_id
+        # Live copies of an earlier gap's items cannot arrive on this tail.
+        self._replayed_item_ids.clear()
+        replayed_texts: list[str] = []
+        try:
+            cursor = self._last_streamed_item_id
+            # No cursor and no seed means the boundary is unknown: replay
+            # nothing rather than the whole history.
+            while cursor is not None or self._replay_from_start:
+                page = await self._client.sessions.list_items(
+                    session_id,
+                    limit=_LIST_ITEMS_PAGE_SIZE,
+                    after=cursor,
+                    order="asc",
+                )
+                for item in page.data:
+                    item_id = item.get("id")
+                    if isinstance(item_id, str) and item_id:
+                        self._last_streamed_item_id = item_id
+                    # User turns are rendered from session.input.* events and
+                    # never arrive on the live tail as output items.
+                    if item.get("type") == "message" and item.get("role") == "user":
+                        continue
+                    if isinstance(item_id, str) and item_id:
+                        self._replayed_item_ids.add(item_id)
+                    if item.get("type") == "message" and item.get("role") == "assistant":
+                        # The renderer skips an assistant message while its
+                        # prose is in flight, so deliver only the unseen rest.
+                        text = _output_text_of(item)
+                        streamed = "".join(self._streamed_text_parts)
+                        if streamed and len(text) > len(streamed) and text.startswith(streamed):
+                            self._on_event(
+                                _TextDeltaEv(
+                                    type="response.output_text.delta",
+                                    delta=text[len(streamed) :],
+                                )
+                            )
+                        if text:
+                            replayed_texts.append(text)
+                    if _commits_streamed_prose(item):
+                        self._streamed_text_parts.clear()
+                    self._on_event(_ItemDoneEv(type="response.output_item.done", item=item))
+                if not page.has_more or self._last_streamed_item_id == cursor:
+                    break
+                cursor = self._last_streamed_item_id
+        except StaleCursorError:
+            # The cursor item is gone (history cleared); what followed it
+            # cannot be recovered. Re-baseline so later gaps still replay.
+            self._last_streamed_item_id = None
+            self._replay_from_start = False
+            await self._seed_stream_cursor()
+        except Exception as exc:  # noqa: BLE001 — reconciliation is best-effort
+            _log.info("stream gap item reconciliation failed: %s", exc)
+        # The tail may re-queue the prose of each message replayed above; drop
+        # exactly that prose, in order, as :meth:`_consume_replayed_delta` sees it.
+        self._pending_dup_texts = replayed_texts
+        try:
+            snapshot = await self._client.sessions.get(session_id)
+            status = getattr(snapshot, "status", None)
+            if isinstance(status, str) and status != self._last_streamed_status:
+                self._last_streamed_status = status
+                self._replayed_status = status
+                if status in ("idle", "waiting", "failed"):
+                    turn_done = getattr(self, "_turn_done", None)
+                    if turn_done is not None:
+                        turn_done.set()
+                self._on_event(
+                    _StatusEv.model_validate(
+                        {"type": "session.status", "conversation_id": session_id, "status": status}
+                    )
+                )
+        except Exception as exc:  # noqa: BLE001 — reconciliation is best-effort
+            _log.info("stream gap status reconciliation failed: %s", exc)
+
+    def _consume_replayed_delta(self, delta: str) -> bool:
+        """Whether *delta* is the tail re-sending prose reconciliation replayed.
+
+        The new tail re-queues the in-flight prefix of a message that
+        reconciliation already rendered from REST. Match each queued delta
+        against the next replayed message's text, consuming it as it arrives
+        (the prefix can be shorter than, or chunked within, the full text). A
+        delta that is not that message's prose is new live output: stop
+        suppressing so a fresh message streaming right after a replayed one
+        still renders.
+        """
+        if not delta or not self._pending_dup_texts:
+            return False
+        head = self._pending_dup_texts[0]
+        if head.startswith(delta):
+            if head == delta:
+                self._pending_dup_texts.pop(0)
+            else:
+                self._pending_dup_texts[0] = head[len(delta) :]
+            return True
+        self._pending_dup_texts.clear()
+        return False
 
     async def send(
         self,
@@ -3114,6 +3331,27 @@ def _plan_output_item_render(
     return _OutputItemRenderPlan(flush_inflight_text=False, render_item=False)
 
 
+def _commits_streamed_prose(item: dict[str, object]) -> bool:
+    """Whether :func:`_plan_output_item_render` commits in-flight prose at *item*."""
+    if item.get("type") == "message":
+        return item.get("role") == "assistant"
+    return item.get("type") in _RENDERABLE_OUTPUT_ITEM_TYPES
+
+
+def _output_text_of(item: dict[str, object]) -> str:
+    """Joined ``output_text`` blocks of a ``message`` item (``""`` when none)."""
+    content = item.get("content")
+    if not isinstance(content, list):
+        return ""
+    parts: list[str] = []
+    for block in content:
+        if isinstance(block, dict) and block.get("type") == "output_text":
+            text = block.get("text")
+            if isinstance(text, str):
+                parts.append(text)
+    return "".join(parts)
+
+
 @dataclass
 class _TurnProseTracker:
     """
@@ -3194,18 +3432,9 @@ class _TurnProseTracker:
             committed streamed segment; ``False`` when the item carries
             no output text or nothing matched.
         """
-        content = item.get("content")
-        if not isinstance(content, list):
+        joined = _output_text_of(item)
+        if not joined:
             return False
-        parts: list[str] = []
-        for block in content:
-            if isinstance(block, dict) and block.get("type") == "output_text":
-                text = block.get("text")
-                if isinstance(text, str):
-                    parts.append(text)
-        if not parts:
-            return False
-        joined = "".join(parts)
         try:
             self.committed_texts.remove(joined)
         except ValueError:
@@ -6138,10 +6367,14 @@ async def _update_context_ring_estimate(
     # cl100k_base. Both values are read from the session at call
     # time, not captured at task-spawn time, so they stay current.
     llm = getattr(session, "llm_model", None) or session.model
-    tokens = count_tokens(
-        [dict(i) for i in effective],
-        llm,
-    )
+    try:
+        tokens = count_tokens([dict(i) for i in effective], llm)
+    except Exception:  # noqa: BLE001 — fire-and-forget estimate: a stale ring beats crashing the REPL
+        # count_tokens fetches a tiktoken encoding on first use; if that is
+        # unavailable (offline host), leave the ring stale rather than let this
+        # background task raise into the prompt and halt the REPL.
+        _log.debug("context ring estimate failed", exc_info=True)
+        return
     host.update_context_usage(tokens, context_window)
 
 
