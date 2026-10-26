@@ -862,10 +862,8 @@ def _global_auth_configured() -> bool:
 def _genie_provider_availability() -> HarnessAvailability:
     """Whether a genie launch resolves a provider it can route through.
 
-    Genie has no login of its own, and its spawn-env builder refuses a launch
-    with no provider, a ``subscription`` one, or a ``cli-config`` one (a
-    ``~/.codex/config.toml`` pin only codex reads). Resolving with the launch
-    resolver itself keeps the picker and the launch in agreement. Never raises.
+    Implicit Codex-owned providers defer to Genie's own CLI config. Explicit
+    bindings still require a Genie-compatible provider. Never raises.
 
     :returns: ``True`` or ``"needs-auth"``.
     """
@@ -880,6 +878,27 @@ def _genie_provider_availability() -> HarnessAvailability:
             executor=ExecutorSpec(type="omnigent", config={"harness": "genie"}),
         )
         provider = _resolve_provider_for_build(spec, harness_type="genie", for_launch=True)
+        if (
+            provider is not None
+            and provider.cli == "codex"
+            and provider.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND)
+        ):
+            from omnigent.inference_config import (
+                binding_for_harness,
+                load_runtime_inference_config,
+            )
+            from omnigent.inner.codex_executor import _codex_home_config_source_from_env
+            from omnigent.inner.genie_executor import GENIE_HOME_DIR_NAME, GENIE_HOME_ENV_VAR
+
+            if (
+                binding_for_harness(load_runtime_inference_config(load_config()), "genie")
+                is not None
+            ):
+                return HARNESS_NEEDS_AUTH
+            genie_home = _codex_home_config_source_from_env(
+                GENIE_HOME_ENV_VAR, GENIE_HOME_DIR_NAME
+            )
+            return True if (genie_home / "config.toml").is_file() else HARNESS_NEEDS_AUTH
     except Exception as exc:
         # Class-only: provider config errors may embed credential material.
         _logger.debug("readiness: genie provider check failed (%s)", type(exc).__name__)
@@ -1009,10 +1028,6 @@ def _harness_availability(canonical: str) -> HarnessAvailability:
     if IS_WINDOWS and canonical in NATIVE_HARNESSES:
         return False
     if canonical == "genie":
-        # Genie is Databricks' fork of Codex: it uses the genie binary and
-        # authenticates via an Omnigent provider, not Codex's subscription
-        # path. Report "binary-missing" like Codex so the UI can show install
-        # guidance, then "needs-auth" until a provider genie can use resolves.
         from omnigent.onboarding.harness_install import GENIE_KEY
 
         binary_state = _binary_availability_reason(GENIE_KEY)
