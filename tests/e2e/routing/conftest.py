@@ -327,7 +327,12 @@ def routing_host(
         pytest.skip(f"could not bring up an omnigent host: {exc}\nhost log tail:\n{tail}")
 
     try:
-        yield host_id
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                "omnigent.harnesses.codex_native.bridge._BRIDGE_ROOT",
+                root / "data" / "codex-native",
+            )
+            yield host_id
     finally:
         proc.send_signal(signal.SIGTERM)
         try:

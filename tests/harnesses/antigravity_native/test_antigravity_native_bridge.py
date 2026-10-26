@@ -36,6 +36,7 @@ from omnigent.harnesses.antigravity_native.bridge import (
     write_mcp_config,
     write_tmux_target,
 )
+from omnigent.process_logging import data_dir
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -1447,10 +1448,11 @@ def test_build_mcp_config_registers_omnigent_relay(tmp_path: Path) -> None:
     assert "sys_list_models" in server["enabledTools"]
     assert server["enabledTools"] == sorted(server["enabledTools"])
     assert server["env"]["TMPDIR"]
-    # The relay's HOME is pinned to the runner's real home so its bridge-root
+    # The relay's HOME and data dir are pinned to the runner's so its bridge-root
     # validation matches where the bridge dir lives, even if a future agy launch
     # path customizes process environment.
     assert server["env"]["HOME"] == str(Path.home())
+    assert server["env"]["OMNIGENT_DATA_DIR"] == str(data_dir())
 
 
 def test_build_mcp_config_defaults_python_to_current_interpreter(tmp_path: Path) -> None:

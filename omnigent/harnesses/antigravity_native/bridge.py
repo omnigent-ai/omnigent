@@ -19,6 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from omnigent.native import native_bridge_common
+from omnigent.process_logging import DATA_DIR_ENV_VAR, data_dir
 
 if TYPE_CHECKING:
     from omnigent.inner.terminal import TerminalInstance
@@ -35,7 +36,7 @@ _STATE_FILE = "state.json"
 # the tmux/TUI section at the end of this module). Written by the runner after
 # the agy terminal launches; read by the executor's first-turn bootstrap.
 _TMUX_FILE = "tmux.json"
-_BRIDGE_ROOT = Path.home() / ".omnigent" / "antigravity-native"
+_BRIDGE_ROOT = data_dir() / "antigravity-native"
 
 # Prefix of the launcher-minted placeholder conversation id (see
 # ``antigravity_native._mint_agy_conversation_id``). agy mints its own real
@@ -440,11 +441,12 @@ def build_mcp_config(
     ``<python> -I -m omnigent.harnesses.claude_native.bridge serve-mcp --bridge-dir <dir>``.
 
     **HOME pinning.** agy spawns this relay as a child. The relay validates its
-    ``--bridge-dir`` against ``bridge_root()`` (``$HOME/.omnigent/antigravity-native``),
-    which must resolve to the RUNNER's real home where the bridge dir actually
-    lives. Pinning ``HOME`` in the relay env keeps that invariant true even when a
-    future agy launch path customizes process environment. ``-I`` does not clear
-    ``HOME``; it only ignores ``PYTHON*`` vars and user site-packages.
+    ``--bridge-dir`` against ``bridge_root()`` (``<data dir>/antigravity-native``),
+    which must resolve to the RUNNER's data dir where the bridge dir actually
+    lives. Pinning ``HOME`` and ``OMNIGENT_DATA_DIR`` in the relay env keeps that
+    invariant true even when a future agy launch path customizes process
+    environment. ``-I`` does not clear either; it only ignores ``PYTHON*`` vars
+    and user site-packages.
 
     :param bridge_dir: Native Antigravity bridge directory whose relay this
         config points at.
@@ -468,9 +470,10 @@ def build_mcp_config(
                 "enabledTools": list(_AGY_ENABLED_TOOLS),
                 "env": {
                     "TMPDIR": os.environ.get("TMPDIR", "/tmp"),
-                    # Pin the relay to the RUNNER's real home so its bridge-root
-                    # validation matches where the bridge dir lives. See docstring.
+                    # Pin the relay to the RUNNER's real home and data dir so its
+                    # bridge-root validation matches where the bridge dir lives. See docstring.
                     "HOME": str(Path.home()),
+                    DATA_DIR_ENV_VAR: str(data_dir()),
                 },
             }
         }

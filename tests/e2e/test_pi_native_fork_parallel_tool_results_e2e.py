@@ -350,9 +350,7 @@ def test_pi_native_fork_rebuild_keeps_parallel_tool_results_adjacent(
                     != 0
                 )
             )
-            bridge = (
-                tmp_path / "home/.omnigent/pi-native" / bridge_dir_for_session_id(fork_id).name
-            )
+            bridge = tmp_path / "config" / "pi-native" / bridge_dir_for_session_id(fork_id).name
             session_files = list((bridge / "sessions").glob("*.jsonl"))
             assert session_files, "The fork must have written a native session before cold resume"
             for session_file in session_files:

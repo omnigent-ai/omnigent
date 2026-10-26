@@ -366,7 +366,12 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
             terminal_view = page.get_by_test_id("main-terminal-view")
             terminal = terminal_view.get_by_test_id("terminal-view")
             expect(terminal).to_have_attribute("data-state", "connected", timeout=30_000)
-            tmux = read_tmux_info(bridge_dir_for_bridge_id(session_id))
+            tmux = read_tmux_info(
+                tmp_path
+                / "data"
+                / "antigravity-native"
+                / bridge_dir_for_bridge_id(session_id).name
+            )
             assert tmux is not None
             subprocess.run(
                 ["tmux", "-S", tmux["socket_path"], "kill-session", "-t", tmux["tmux_target"]],
@@ -418,7 +423,13 @@ def test_setup_gateway_reaches_real_agy_through_fresh_local_daemon(
                         with contextlib.suppress(psutil.NoSuchProcess):
                             child.kill()
             if session_id is not None:
-                shutil.rmtree(bridge_dir_for_bridge_id(session_id), ignore_errors=True)
+                shutil.rmtree(
+                    tmp_path
+                    / "data"
+                    / "antigravity-native"
+                    / bridge_dir_for_bridge_id(session_id).name,
+                    ignore_errors=True,
+                )
             gateway.shutdown()
             thread.join(timeout=5)
 
@@ -576,4 +587,10 @@ def test_saved_credential_error_visible_through_fresh_daemon(tmp_path, page, bui
                     with contextlib.suppress(psutil.NoSuchProcess):
                         child.kill()
         if session_id is not None:
-            shutil.rmtree(bridge_dir_for_bridge_id(session_id), ignore_errors=True)
+            shutil.rmtree(
+                tmp_path
+                / "data"
+                / "antigravity-native"
+                / bridge_dir_for_bridge_id(session_id).name,
+                ignore_errors=True,
+            )

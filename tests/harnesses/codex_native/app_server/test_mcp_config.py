@@ -17,6 +17,7 @@ try:
 except ImportError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
 from omnigent.harnesses.codex_native import app_server, launch_args
+from omnigent.process_logging import data_dir
 from tests.harnesses.codex_native.app_server._support import (
     _PLAIN_TOOL_APPROVALS,
     _disable_codex_startup_rpc,
@@ -88,6 +89,7 @@ args = []
             "--bridge-dir",
             str(bridge_dir),
         ],
+        "env": {"OMNIGENT_DATA_DIR": str(data_dir())},
         "tools": _PLAIN_TOOL_APPROVALS,
     }
 
@@ -453,5 +455,6 @@ async def test_start_writes_fresh_mcp_config_without_leading_blanks(
             "--bridge-dir",
             str(bridge_dir),
         ],
+        "env": {"OMNIGENT_DATA_DIR": str(data_dir())},
         "tools": _PLAIN_TOOL_APPROVALS,
     }
