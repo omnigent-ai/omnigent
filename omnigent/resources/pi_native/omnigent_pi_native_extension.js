@@ -941,7 +941,7 @@ async function postEventWithRetry(config, body, signal) {
     await sleep(backoff, signal);
     backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
   }
-  throw lastError || new Error("assistant conversation item POST failed");
+  throw lastError || new Error(`${body.type} POST failed`);
 }
 
 // Bound retained payloads as well as item count while the server is unavailable.
@@ -983,6 +983,7 @@ function createHistoryQueue(config) {
       } finally {
         pending.delete(sourceId);
         queuedBytes -= item.bytes;
+        item.settle();
       }
     }
     if (pending.size) {
@@ -1021,19 +1022,19 @@ function createHistoryQueue(config) {
       const item = previous || {
         data, sourceId, onAccepted, dependency, onFailure, bytes, accepted: false,
       };
+      item.settled = new Promise(resolve => { item.settle = resolve; });
       pending.set(sourceId, item);
       queuedBytes += bytes;
       if (!worker) start();
       return item;
     },
     async flush() {
+      // Later prompts must not extend the ending turn's delivery barrier.
+      const settled = Promise.all([...pending.values()].map(item => item.settled));
       let timeout;
       try {
         return await Promise.race([
-          (async () => {
-            while (worker) await worker;
-            return true;
-          })(),
+          settled.then(() => true),
           new Promise(resolve => {
             timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
           }),
@@ -1578,6 +1579,7 @@ module.exports = function (pi) {
   // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
   let turnResult = null;
+  let turnOutcomeController = new AbortController();
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
   // !activeResponseId: agent_start resets activeResponseId to null and only
@@ -2245,8 +2247,8 @@ module.exports = function (pi) {
         } finally {
           if (!agentRunning) {
             await postEvent(config, {
-              type: "subagent.status",
-              data: { idle: true, response_id: responseId },
+              type: "external_session_status",
+              data: { status: "idle", turn_completed: false, response_id: responseId },
             });
           }
           compacting = false;
@@ -2328,6 +2330,8 @@ module.exports = function (pi) {
     // this loop and can still arm/replay; agent_end clears once the loop
     // completes. See F18.
     clearPendingInterrupt();
+    turnOutcomeController.abort();
+    turnOutcomeController = new AbortController();
     agentRunning = true;
     turnResult = null;
     setOmnigentStatus(config, ctx, "running");
@@ -2356,6 +2360,12 @@ module.exports = function (pi) {
 
   pi.on("agent_end", async (event, ctx) => {
     rememberContext(ctx);
+    const cancelled = ctx?.signal?.aborted || hasPendingInterrupt();
+    const outcomeSignal = turnOutcomeController.signal;
+    const endResponseId =
+      turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
+    const result = turnResult;
+    const drainedHistory = compacting ? Promise.resolve(true) : history.flush();
     clearPendingInterrupt();
     agentRunning = false;
     setOmnigentStatus(config, ctx, "idle");
@@ -2372,26 +2382,27 @@ module.exports = function (pi) {
       if (accumulateUsage(message)) changed = true;
     }
     if (changed) await postSessionUsage();
+    if (outcomeSignal.aborted) return;
     // Reuse the agent_start response_id so the web client matches the idle
     // edge and clears the "streaming" status, unblocking queued follow-ups.
-    const endResponseId =
-      turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
     // Compaction interrupts a loop without completing its delegated task.
     if (compacting) return;
-    const result = turnResult;
-    const outcome = result?.outcome ?? "failed";
+    const outcome = cancelled ? "cancelled" : result?.outcome ?? "failed";
     // Readiness is not a completed result. Older servers may ignore this observation.
     await postEvent(config, {
       type: "subagent.status",
       data: { idle: true, response_id: endResponseId },
     }, AbortSignal.timeout(assistantItemPostTimeoutMs(config)));
-    const drained = await history.flush();
+    const drained = await drainedHistory;
+    if (outcomeSignal.aborted) return;
+    // Pi continues queued steering after agent_end; the parent's dispatch is still active.
+    if (outcome === "completed" && ctx?.hasPendingMessages?.()) return;
     const deliveryFailed = !drained || (Boolean(result?.output) && !result.item?.accepted);
     const status = deliveryFailed || outcome === "failed" ? "failed" : "idle";
     const output = deliveryFailed
       ? "Omnigent could not save the Pi turn output; see host logs."
-      : (result?.output ?? "Pi turn ended without a final response.");
+      : (result?.output ?? (cancelled ? "" : "Pi turn ended without a final response."));
     try {
       await postEventWithRetry(config, {
         type: "external_session_status",
@@ -2402,8 +2413,9 @@ module.exports = function (pi) {
           output,
           ...(status === "failed" ? { failure_detail: output } : {}),
         },
-      });
+      }, outcomeSignal);
     } catch (error) {
+      if (outcomeSignal.aborted) return;
       console.error("[pi-native] Failed to deliver turn outcome:", error);
       ctx?.ui?.notify?.("Omnigent could not deliver the Pi turn outcome; see host logs.", "error");
     }

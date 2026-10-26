@@ -1364,7 +1364,18 @@ def test_history_outage_does_not_delay_hooks_and_coalesces_callbacks(
 
 
 @pytest.mark.parametrize(
-    "mode", ["saved", "rejected", "deadline", "aborted", "model-error", "empty", "no-response"]
+    "mode",
+    [
+        "saved",
+        "rejected",
+        "deadline",
+        "aborted",
+        "model-error",
+        "empty",
+        "no-response",
+        "tool-abort",
+        "early-abort",
+    ],
 )
 def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: str) -> None:
     script = (
@@ -1372,6 +1383,7 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
         + r"""
 (async () => {
   const mode = process.argv[3];
+  const aborted = ['aborted', 'tool-abort', 'early-abort'].includes(mode);
   let release;
   let completionAttempts = 0;
   global.setTimeout = (callback, delay, ...args) =>
@@ -1389,16 +1401,20 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
     return {ok: true, status: 204};
   };
   await handlers.agent_start({}, ctx);
-  if (mode !== 'no-response') {
+  if (mode.endsWith('-abort')) ctx.signal = AbortSignal.abort();
+  if (!['no-response', 'early-abort'].includes(mode)) {
     await handlers.message_end({message: {role: 'assistant', timestamp: 20,
-      stopReason: mode === 'aborted' ? 'aborted' : mode === 'model-error' ? 'error' : 'stop',
+      stopReason: mode === 'tool-abort' ? 'toolUse' : mode === 'aborted' ? 'aborted'
+        : mode === 'model-error' ? 'error' : 'stop',
       errorMessage: mode === 'model-error' ? 'Provider refused this turn' : undefined,
       content: mode === 'empty' ? [] : [{type: 'text', text: 'current result'}],
     }}, ctx);
   }
   const finished = handlers.agent_end({}, ctx);
   await settleHistory();
-  if (!['empty', 'no-response'].includes(mode)) assert.equal(completionAttempts, 0);
+  if (!['empty', 'no-response', 'early-abort'].includes(mode)) {
+    assert.equal(completionAttempts, 0);
+  }
   assert.ok(posted.some(e => e.type === 'subagent.status' && e.data.idle === true));
   if (mode === 'deadline') {
     await finished;
@@ -1410,15 +1426,82 @@ def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: 
   const terminal = posted.filter(e => e.type === 'external_session_status').at(-1).data;
   const failed = ['rejected', 'deadline', 'model-error', 'no-response'].includes(mode);
   assert.equal(terminal.status, failed ? 'failed' : 'idle');
-  assert.equal(terminal.turn_completed, !failed && mode !== 'aborted');
-  const expectedOutcome = failed ? 'failed' : mode === 'aborted' ? 'cancelled' : 'completed';
+  assert.equal(terminal.turn_completed, !failed && !aborted);
+  const expectedOutcome = failed ? 'failed' : aborted ? 'cancelled' : 'completed';
   assert.equal(terminal.turn_outcome, expectedOutcome);
-  assert.equal(terminal.output, mode === 'empty' ? '' : mode === 'no-response'
+  assert.equal(terminal.output, ['empty', 'early-abort'].includes(mode) ? ''
+    : mode === 'no-response'
     ? 'Pi turn ended without a final response.' : mode === 'model-error'
     ? 'Pi model error: Provider refused this turn' : failed
     ? 'Omnigent could not save the Pi turn output; see host logs.' : 'current result');
   if (failed) assert.equal(terminal.failure_detail, terminal.output);
   assert.equal(completionAttempts, 1);
+  await handlers.session_shutdown();
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), mode)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize(
+    "mode", ["queued-input", "queued-followup", "superseded-history", "superseded-retry"]
+)
+def test_ending_turn_does_not_wait_for_later_input_or_retry_after_supersession(
+    tmp_path: Path, mode: str
+) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const mode = process.argv[3];
+  const releases = [];
+  const accepted = [];
+  let attempts = 0;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    if (body.type === 'external_conversation_item') {
+      await new Promise(resolve => releases.push(resolve));
+    }
+    if (body.data?.turn_outcome) {
+      attempts++;
+      if (mode === 'superseded-retry') {
+        await handlers.agent_start({}, ctx);
+        return {ok: false, status: 503};
+      }
+    }
+    accepted.push(body);
+    return {ok: true, status: 204};
+  };
+  await handlers.agent_start({}, ctx);
+  const firstId = accepted.at(-1).data.response_id;
+  await handlers.message_end({message: {role: 'assistant', timestamp: 1,
+    content: [{type: 'text', text: 'first answer'}], stopReason: 'stop'}}, ctx);
+  let finished = false;
+  const ending = handlers.agent_end({}, ctx).then(() => { finished = true; });
+  await settleHistory();
+  if (mode === 'superseded-history') await handlers.agent_start({}, ctx);
+  await handlers.input({text: 'next prompt', source: 'extension'}, ctx);
+  ctx.hasPendingMessages = () => mode === 'queued-followup';
+  releases.shift()();
+  await settleHistory();
+  assert.equal(finished, true, 'ending turn waited for a later queued prompt');
+  await ending;
+  const outcomes = accepted.filter(e => e.data?.turn_outcome);
+  if (mode === 'queued-input') {
+    assert.equal(outcomes.length, 1);
+    assert.equal(outcomes[0].data.response_id, firstId);
+    assert.equal(outcomes[0].data.output, 'first answer');
+  } else {
+    assert.deepEqual(outcomes, []);
+    const statuses = accepted.filter(e => e.type === 'external_session_status');
+    assert.equal(statuses.at(-1).data.status, 'running');
+    if (mode !== 'queued-followup') {
+      assert.notEqual(statuses.at(-1).data.response_id, firstId);
+    }
+    assert.equal(attempts, mode === 'superseded-retry' ? 1 : 0);
+  }
+  releases.shift()();
   await handlers.session_shutdown();
 })().catch(error => { process.stderr.write(String(error)); process.exit(1); });
 """
@@ -4413,7 +4496,7 @@ global.fetch = async (_url, request) => {
   if (request.body) {
     const event = JSON.parse(request.body);
     posted.push(event);
-    if (outcome === "complete" && event.type === "subagent.status") await idlePosted;
+    if (outcome === "complete" && event.data?.status === "idle") await idlePosted;
   }
   return { ok: true };
 };
@@ -4461,11 +4544,9 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
     await handlers.agent_end({}, ctx);
   }
   if (outcome === "complete" || outcome === "error") {
-    assert.equal(statuses().at(-1).data.status, "running", "compaction is not task completion");
-    const idleObservations = posted.filter(
-      e => e.type === "subagent.status" && e.data.idle === true,
-    );
-    assert.equal(idleObservations.length, 1);
+    assert.equal(statuses().at(-1).data.status, "idle", "runner must leave the busy state");
+    assert.equal(statuses().at(-1).data.turn_completed, false);
+    assert.equal(statuses().at(-1).data.turn_outcome, undefined);
   } else {
     assert.equal(statuses().at(-1).data.status, "failed");
     assert.equal(statuses().at(-1).data.turn_completed, false);

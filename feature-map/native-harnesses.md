@@ -799,13 +799,19 @@ wait for its call to be accepted. Retries retain item IDs; repeated tool/message
 callbacks coalesce, while a repeated input callback is a separate prompt.
 For a Pi child, stall final-answer delivery: idle may update, but the parent
 must receive no completion until the answer is saved. Exhaust delivery and
-expect a failed result instead of an old answer. Compaction ending is only an
-idle observation, not task completion. Queue bounds, retry budgets and shutdown
+expect a failed result instead of an old answer. A later prompt must not extend
+the previous history wait; an obsolete outcome must not retry into a newer loop.
+If a follow-up is queued before delivery finishes, the parent must wait for
+that continued work and receive its final answer.
+Interrupt a running tool and expect cancellation. Compaction must leave the
+runner idle without completing the parent's task. Queue bounds, retry budgets and shutdown
 limits live in `createHistoryQueue`; delivery is memory-only. Older servers
 may omit the status-only observation and lack `source_id` deduplication.
 `tests/harnesses/pi_native/test_pi_native_extension.py` covers extension behavior;
 `tests/server/routes/test_subagent_status.py` covers status-only forwarding;
 `tests/server/routes/test_native_failure_output.py` covers result selection;
+`tests/runner/test_native_subagent_turn_outcome_delivery.py` covers runner idle
+and confirmed outcomes;
 `tests/server/integration/test_sessions_external_item_idempotency.py` covers
 persistence deduplication. These checks do not establish desktop rendering parity.
 
