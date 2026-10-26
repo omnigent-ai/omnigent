@@ -4318,9 +4318,9 @@ function sessionLocationLabel(
 ): string {
   if (!conversation.host_id) return "Local machine";
   const host = hostsById.get(conversation.host_id);
-  return host?.sandbox_provider
+  return host?.sandbox_provider && !host.sandbox_attached
     ? sandboxOptionLabel(host.sandbox_provider)
-    : (host?.name ?? conversation.host_id);
+    : (host?.display_name ?? host?.name ?? conversation.host_id);
 }
 
 /** A row's short environment: the sandbox type, this device, or "Remote"; the tooltip names the host. */

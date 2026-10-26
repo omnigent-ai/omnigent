@@ -2424,6 +2424,48 @@ async def test_info_reports_managed_sandboxes_capability(
     assert body["sandbox_provider"] == expected_provider
 
 
+@pytest.mark.parametrize("with_creation_provider", [False, True])
+async def test_info_advertises_discovery_without_creation(
+    db_uri, tmp_path, with_creation_provider
+):
+    fake = FakeSandboxLauncher(can_resume=True, reusable_hosts=True)
+    fake.supports_managed_launch = False
+    discovery_config = ManagedSandboxConfig(
+        server_url="http://test",
+        provider="modal",
+        launcher_factory=lambda: fake,
+        token_ttl_s=3600,
+        managed_launch_supported=False,
+    )
+    configs = [discovery_config]
+    if with_creation_provider:
+        creation_launcher = FakeSandboxLauncher()
+        creation_launcher.provider = "daytona"
+        configs.append(
+            replace(
+                discovery_config,
+                provider="daytona",
+                managed_launch_supported=True,
+                launcher_factory=lambda: creation_launcher,
+            )
+        )
+    config = ManagedSandboxDeployment(configs=tuple(configs))
+    app = _capability_probe_app(db_uri, tmp_path, config)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get("/v1/info")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["managed_sandboxes_enabled"] is with_creation_provider
+    assert body["sandbox_provider"] == ("daytona" if with_creation_provider else None)
+    assert body["sandbox_providers"] == (["daytona"] if with_creation_provider else [])
+    assert body["sandbox_provider_capabilities"]["modal"]["reusable_hosts"] is True
+    store = HostStore(db_uri)
+    with pytest.raises(HTTPException, match="does not support creating"):
+        await launch_managed_host(config=config, owner=_OWNER, host_store=store, provider="modal")
+    assert not fake.prepared and not fake.provisioned_names and not fake.host_starts
+    assert store.list_hosts(_OWNER) == []
+
+
 async def test_info_reports_enabled_for_injected_custom_launcher(
     db_uri: str,
     tmp_path: Path,
@@ -2699,8 +2741,10 @@ async def test_launch_without_host_config_writes_no_config(db_uri: str) -> None:
     assert not any(cmd.startswith("python3 -c") for cmd in fake.commands)
 
 
+@pytest.mark.parametrize("partial_capabilities", [False, True])
 async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_host_signature(
     db_uri: str,
+    partial_capabilities: bool,
 ) -> None:
     """
     A deployment-injected launcher whose ``start_host`` override predates the
@@ -2718,6 +2762,14 @@ async def test_launch_and_resume_without_optional_kwargs_support_legacy_start_ho
 
     class _LegacySignatureLauncher(FakeSandboxLauncher):
         """Overrides start_host with the pre-host_config explicit signature."""
+
+        @property
+        def capabilities(self):
+            from omnigent.onboarding.sandboxes.types import SandboxCapabilities
+
+            if partial_capabilities:
+                return SandboxCapabilities(resume_stopped=True)
+            return super().capabilities
 
         def start_host(
             self,
@@ -5768,13 +5820,26 @@ def contributed_acme_provider(monkeypatch: pytest.MonkeyPatch) -> None:
     reset_plugin_state_for_tests()
 
 
+@pytest.mark.parametrize("supports_creation", [False, True])
 def test_parse_contributed_provider_builds_registry_backed_factory(
     contributed_acme_provider: None,
+    monkeypatch,
+    supports_creation,
 ) -> None:
     """
     A provider contributed through the entry point group is configurable and
     serves managed sessions, without being named in this module.
     """
+    from omnigent.onboarding.sandboxes.registry import plugin_state
+
+    registry = plugin_state()
+    assert registry.providers["acme"].managed_launch_supported is True
+    registry.providers["acme"] = replace(
+        registry.providers["acme"], managed_launch_supported=supports_creation
+    )
+    # Parsing config must not construct a launcher or inspect partial capabilities.
+    original_init = _AcmeLauncher.__init__
+    monkeypatch.setattr(_AcmeLauncher, "__init__", lambda *a, **k: pytest.fail("eager launcher"))
     cfg = parse_sandbox_config(
         {
             "provider": "acme",
@@ -5785,16 +5850,17 @@ def test_parse_contributed_provider_builds_registry_backed_factory(
     assert cfg is not None
     cfg = cfg.default
     assert cfg.provider == "acme"
-    # Contributed providers register in order to serve, so the web UI must be
-    # told the sandbox option works rather than offered one that 400s.
-    assert cfg.managed_launch_supported is True
+    assert cfg.managed_launch_supported is supports_creation
     assert cfg.token_ttl_s == 1234
+    monkeypatch.setattr(_AcmeLauncher, "__init__", original_init)
 
     launcher = cfg.launcher_factory()
     assert isinstance(launcher, _AcmeLauncher)
     # The `sandbox.acme` block reached the launcher through the config_model
     # the registry documents, rather than being silently dropped.
     assert launcher.config.namespace == "sandboxes"
+    with pytest.raises(click.ClickException, match="create a sandbox"):
+        SandboxHostLauncher.provision(launcher, "unsupported")
 
 
 def test_contributed_provider_config_is_validated(
@@ -5959,3 +6025,256 @@ async def test_registration_database_failure_still_attempts_provider_cleanup(db_
         await launch_managed_host(config=_injected_config(fake), owner=_OWNER, host_store=hosts)
     assert len(fake.terminated) == 1
     assert fake.host_starts == []
+
+
+@pytest.mark.parametrize(("attach", "reusable"), [(False, False), (False, True), (True, True)])
+async def test_provider_operations_keep_the_host_owner_across_fresh_launchers(
+    db_uri, monkeypatch, attach, reusable
+):
+    from omnigent.server.managed_hosts import attach_sandbox_host, host_sandbox_is_running
+
+    store = HostStore(db_uri)
+    owners = ("account:alice", "bob@example.com")
+    box_owners = {f"existing-{index}": owner for index, owner in enumerate(owners)}
+    calls = []
+
+    def factory():
+        bound = []
+        fake = FakeSandboxLauncher(
+            can_resume=True,
+            reusable_hosts=reusable,
+            attachments=box_owners,
+            on_host_start=lambda start: store.upsert_on_connect(
+                start.host_id, start.host_name, bound[0]
+            ),
+        )
+
+        def bind(principal):
+            assert not bound, "a launcher must not be shared across operations/users"
+            bound.append(principal)
+
+        def provision(name):
+            box_owners[name] = bound[0]
+            return name
+
+        monkeypatch.setattr(fake, "bind_principal", bind)
+        monkeypatch.setattr(fake, "provision", provision)
+        for method in (
+            "prepare_for_launch",
+            "prepare",
+            "provision",
+            "attach_for_user",
+            "resume",
+            "start_host",
+            "is_running",
+            "terminate",
+        ):
+            original = getattr(fake, method)
+
+            def checked(*args, method=method, original=original, **kwargs):
+                assert len(bound) == 1, f"{method} called without an authenticated owner"
+                if method not in {"prepare_for_launch", "prepare", "provision"}:
+                    assert bound[0] == box_owners[args[0]], "controller received the wrong owner"
+                calls.append((method, bound[0]))
+                return original(*args, **kwargs)
+
+            monkeypatch.setattr(fake, method, checked)
+        return fake
+
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            provider="modal",
+            launcher_factory=factory,
+            token_ttl_s=3600,
+        )
+    )
+
+    async def use_box(index, owner):
+        if attach:
+            host_id = await attach_sandbox_host(
+                config=config,
+                owner=owner,
+                host_store=store,
+                provider="modal",
+                sandbox_id=f"existing-{index}",
+                name=f"static-{index}",
+            )
+        else:
+            launched = await launch_managed_host(config=config, owner=owner, host_store=store)
+            host_id = launched.host_id
+        host = store.get_host(host_id)
+        assert host.user_id == owner
+        assert host_sandbox_is_running(host, config) is None
+        store.set_offline(host_id)
+        await resume_managed_host(host_id, store, config)
+        assert store.is_online(host_id)
+        if not reusable:
+            await relaunch_managed_host(
+                config=config, host=store.get_host(host_id), host_store=store
+            )
+        await terminate_managed_host(store.get_host(host_id), store, config)
+
+    await asyncio.gather(*(use_box(index, owner) for index, owner in enumerate(owners)))
+    required = {"prepare_for_launch", "start_host", "resume", "is_running"}
+    required |= {"attach_for_user"} if attach else {"prepare", "provision"}
+    if not reusable:
+        required.add("terminate")
+    for owner in owners:
+        assert required <= {method for method, principal in calls if principal == owner}
+
+
+@pytest.mark.parametrize("failure", ["none", "startup", "gone", "delete-during-wake"])
+async def test_attached_sandbox_reuses_host_and_never_provisions_or_terminates(db_uri, failure):
+    from omnigent.server.managed_hosts import attach_sandbox_host
+
+    store = HostStore(db_uri)
+    box = f"devbox-{failure}"
+
+    def connect(start):
+        assert store.resolve_launch_token(start.host_id, start.token) is not None
+        store.upsert_on_connect(start.host_id, start.host_name, _OWNER)
+
+    fake = FakeSandboxLauncher(
+        can_resume=True,
+        attachments={box: _OWNER},
+        on_host_start=connect,
+        fail_on_host_start=failure == "startup",
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://srv.example.com",
+            launcher_factory=lambda: fake,
+            token_ttl_s=3600,
+            provider="modal",
+        )
+    )
+    kwargs = {
+        "config": config,
+        "owner": _OWNER,
+        "host_store": store,
+        "provider": "modal",
+        "sandbox_id": box,
+        "name": "My devbox",
+    }
+    if failure == "startup":
+        with pytest.raises(HTTPException, match="wake failed"):
+            await attach_sandbox_host(**kwargs)
+        assert len(store.list_hosts(_OWNER)) == 1
+        fake.fail_on_host_start = False
+    first, second = await asyncio.gather(
+        attach_sandbox_host(**kwargs), attach_sandbox_host(**kwargs)
+    )
+    assert first == second
+    host = store.get_host(first)
+    assert host is not None and host.sandbox_attached
+    assert len(store.list_hosts(_OWNER)) == 1
+    assert len(fake.host_starts) == 1
+    # Session deletion/failed session startup cannot remove a shared host.
+    await terminate_managed_host(host, store, config)
+    assert store.get_host(first) == host
+    with pytest.raises(HTTPException, match="cannot be replaced"):
+        await relaunch_managed_host(config=config, host=host, host_store=store)
+    store.set_offline(first)
+    if failure == "gone":
+
+        def gone(sandbox_id):
+            raise SandboxGoneError("gone")
+
+        fake.resume = gone
+        with pytest.raises(HTTPException, match="restore it"):
+            await resume_managed_host(first, store, config)
+    elif failure == "delete-during-wake":
+        fake.resume = lambda sandbox_id: store.delete_host(first)
+        with pytest.raises(HTTPException, match="attachment changed"):
+            await resume_managed_host(first, store, config)
+        assert store.get_host(first) is None
+    else:
+        await resume_managed_host(first, store, config)
+        assert store.is_online(first)
+    assert fake.provisioned_names == []
+    assert fake.terminated == []
+
+
+async def test_new_static_sandbox_always_creates_another_box(db_uri):
+    store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(
+        can_resume=True,
+        reusable_hosts=True,
+        on_host_start=lambda start: store.upsert_on_connect(
+            start.host_id, start.host_name, _OWNER
+        ),
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            provider="modal",
+            token_ttl_s=3600,
+            launcher_factory=lambda: fake,
+        )
+    )
+    first = await launch_managed_host(config=config, owner=_OWNER, host_store=store)
+    second = await launch_managed_host(config=config, owner=_OWNER, host_store=store)
+    assert first.host_id != second.host_id
+    hosts = store.list_hosts(_OWNER)
+    assert {host.sandbox_id for host in hosts} == {"sb-fake-1", "sb-fake-2"}
+    assert all(host.sandbox_attached for host in hosts)
+    assert len(fake.provisioned_names) == 2
+
+
+@pytest.mark.parametrize("reusable", [False, True])
+@pytest.mark.parametrize("startup_fails", [False, True])
+async def test_new_sandbox_records_provider_ownership_policy(db_uri, reusable, startup_fails):
+    from omnigent.server.managed_hosts import attach_sandbox_host
+
+    store = HostStore(db_uri)
+    fake = FakeSandboxLauncher(
+        can_resume=True,
+        reusable_hosts=reusable,
+        fail_on_host_start=startup_fails,
+        on_host_start=lambda start: store.upsert_on_connect(
+            start.host_id, start.host_name, _OWNER
+        ),
+    )
+    config = ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="http://test",
+            provider="modal",
+            token_ttl_s=3600,
+            launcher_factory=lambda: fake,
+        )
+    )
+    assert config.provider_ui_capabilities()["modal"].get("reusable_hosts", False) == reusable
+    if startup_fails:
+        with pytest.raises(HTTPException, match="startup failed"):
+            await launch_managed_host(config=config, owner=_OWNER, host_store=store)
+    else:
+        launched = await launch_managed_host(config=config, owner=_OWNER, host_store=store)
+        host = store.get_host(launched.host_id)
+        assert host.sandbox_attached == reusable
+        # Later configuration changes must not change a saved box's ownership.
+        fake.reusable_hosts = not reusable
+        await terminate_managed_host(host, store, config)
+    hosts = store.list_hosts(_OWNER)
+    assert len(hosts) == (1 if reusable else 0)
+    assert fake.terminated == ([] if reusable else ["sb-fake-1"])
+    if reusable:
+        assert hosts[0].sandbox_attached
+        assert store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+        fake.fail_on_host_start = False
+        fake.reusable_hosts = False
+        await resume_managed_host(hosts[0].host_id, store, config)
+        assert store.is_online(hosts[0].host_id)
+        fake.attachments = {"sb-fake-1": _OWNER}
+        assert (
+            await attach_sandbox_host(
+                config=config,
+                owner=_OWNER,
+                host_store=store,
+                provider="modal",
+                sandbox_id="sb-fake-1",
+                name="My devbox",
+            )
+            == hosts[0].host_id
+        )
+        assert len(store.list_hosts(_OWNER)) == 1

@@ -128,14 +128,19 @@ export interface ServerInfo {
    */
   sandbox_providers?: string[];
   /**
-   * UI-relevant capability flags per launch-capable provider, e.g.
+   * UI-relevant capability flags per creation or discovery provider, e.g.
    * ``{ agent_sandbox: { multi_repo: true } }``. The new-session repo picker
    * branches on these (multi-repo list vs single). A provider absent from the
    * map, or the map absent entirely, defaults every flag off.
    */
   sandbox_provider_capabilities?: Record<
     string,
-    { multi_repo?: boolean; inference_models?: boolean; default_models?: boolean }
+    {
+      multi_repo?: boolean;
+      inference_models?: boolean;
+      default_models?: boolean;
+      reusable_hosts?: boolean;
+    }
   >;
   /**
    * Connection providers this deploy has wired (config + store present),
@@ -494,14 +499,15 @@ const SANDBOX_PROVIDER_NAMES: Record<string, string> = {
 };
 
 /**
- * Label for the new-session sandbox option, named per provider.
+ * Label for the new-session sandbox option; static sandboxes use a generic label.
  *
  * Returns e.g. "Modal Sandbox" or "Databricks Sandbox" when the
  * server reports a provider, and the generic "New Sandbox" when it
  * names none (``null``) — the same wording the UI used before
  * providers were surfaced.
  */
-export function sandboxOptionLabel(provider: string | null): string {
+export function sandboxOptionLabel(provider: string | null, reusable = false): string {
+  if (reusable) return "New static sandbox";
   if (!provider) return "New Sandbox";
   const name =
     SANDBOX_PROVIDER_NAMES[provider] ?? provider.charAt(0).toUpperCase() + provider.slice(1);
@@ -519,4 +525,11 @@ export function sandboxProviderOptions(info: ServerInfo): (string | null)[] {
   const offered = info.sandbox_providers;
   if (Array.isArray(offered) && offered.length > 0) return offered;
   return [info.sandbox_provider];
+}
+
+/** Reusable providers can offer discovery without offering creation. */
+export function sandboxDiscoveryProviders(info: ServerInfo): string[] {
+  return Object.entries(info.sandbox_provider_capabilities ?? {})
+    .filter(([, capabilities]) => capabilities?.reusable_hosts === true)
+    .map(([provider]) => provider);
 }

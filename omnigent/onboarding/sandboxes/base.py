@@ -557,7 +557,6 @@ class SandboxLifecycle(ABC):
             credentials are missing and cannot be installed.
         """
 
-    @abstractmethod
     def provision(self, name: str) -> str:
         """
         Create a new sandbox and return its id.
@@ -572,18 +571,18 @@ class SandboxLifecycle(ABC):
             ``"omnigent-host"``.
         :returns: The provider-assigned (or reserved) sandbox id, e.g.
             ``"lovable-wattlebird-1530"``.
+        :raises SandboxCapabilityError: If creation is unsupported.
         :raises click.ClickException: If provisioning fails.
         """
+        raise self._capability_error("create a sandbox")
 
     def attach(self, sandbox_id: str) -> None:
         """
         Validate / refresh access to an existing sandbox so subsequent
         primitives can resolve it.
 
-        CLI-bootstrap capability — the server's managed-host flow never
-        attaches to pre-existing sandboxes, so launchers that exist
-        only for managed launches (e.g. a deployment-injected custom
-        launcher) need not override the raising default.
+        CLI-bootstrap capability. Managed attachment uses ``attach_for_user``
+        instead so the provider explicitly authorizes the server's caller.
 
         :param sandbox_id: The sandbox to attach to, e.g.
             ``"lovable-wattlebird-1530"``.
@@ -592,6 +591,27 @@ class SandboxLifecycle(ABC):
         :raises click.ClickException: If the sandbox cannot be resolved.
         """
         raise self._capability_error("attach to an existing sandbox")
+
+    def list_for_user(self, *, owner: str) -> Sequence[_sandbox_types.SandboxInfo]:
+        """Discover reusable boxes this caller may attach, without changing them.
+
+        Include boxes created outside Omnigent. Do not provision, wake, or start
+        hosts here. The default offers no discovery. Selection still requires
+        ``attach_for_user`` authorization, even for a previously listed box.
+        """
+        return ()
+
+    def attach_for_user(self, sandbox_id: str, *, owner: str) -> None:
+        """Authorize server attachment of an existing box for this caller.
+
+        Opt-in, unlike CLI ``attach`` which uses the invoking user's credentials.
+        Implementations must verify the caller may control this exact box, reject
+        missing/foreign boxes, and never provision a replacement. Raise
+        ``PermissionError`` on denial. The server records the binding, then uses
+        the existing ``resume`` and ``start_host`` methods with fresh launchers.
+        Customer authorization and HTTP transport belong in the provider plugin.
+        """
+        raise self._capability_error("attach an existing sandbox for a user")
 
     def keep_alive(self, sandbox_id: str) -> bool | None:
         """
@@ -927,6 +947,15 @@ class SandboxHostLauncher(SandboxLifecycle):
     class directly and override :meth:`start_host` without needing any exec
     transport.
     """
+
+    def bind_principal(self, principal: str) -> None:
+        """Bind the server-authenticated owner before user-scoped provider calls.
+
+        Lifecycle requests and background batches get fresh launchers bound to
+        the saved host owner. Providers may configure their controller client
+        here; deployment-wide capability discovery remains unbound. The default
+        does nothing for providers using only deployment credentials.
+        """
 
     def prepare_for_launch(self, *, agent_name: str | None = None) -> None:
         """Set request context before provider preparation, allocation, or resume.

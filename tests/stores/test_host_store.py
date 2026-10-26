@@ -51,6 +51,72 @@ def _set_updated_at(db_uri: str, host_id: str, value: int) -> None:
         session.commit()
 
 
+def test_host_keeps_legacy_positional_fields() -> None:
+    host = Host(
+        "id",
+        "box",
+        "alice",
+        "offline",
+        1,
+        2,
+        "modal",
+        "box",
+        {"codex": True},
+        "old",
+        3,
+        "generation",
+    )
+    assert host.configured_harnesses == {"codex": True}
+    assert (host.terminating_sandbox_id, host.deleted_at, host.account_generation) == (
+        "old",
+        3,
+        "generation",
+    )
+    assert host.sandbox_attached is False and host.display_name is None
+
+
+def test_reusable_host_label_preserves_identity_and_liveness(host_store, db_uri) -> None:
+    host_id = uuid.uuid4().hex
+    reserve = {
+        "host_id": host_id,
+        "name": "controller-name",
+        "user_id": "alice",
+        "provider": "static",
+        "attached_sandbox_id": "box",
+    }
+    host_store.reserve_sandbox_host(**reserve)
+    host_store.upsert_on_connect(host_id, "controller-name", "alice")
+    _set_updated_at(db_uri, host_id, 1)
+    original = host_store.get_host(host_id)
+    renamed = host_store.set_display_name(host_id, user_id="alice", display_name="My project")
+    assert renamed.name == original.name
+    assert renamed.updated_at == original.updated_at == 1
+    assert renamed.created_at == original.created_at
+    assert renamed.display_name == "My project" and not host_is_live(renamed)
+    assert host_store.set_display_name(host_id, user_id="bob", display_name="Foreign") is None
+    with workspace_scope(42):
+        assert (
+            host_store.set_display_name(host_id, user_id="alice", display_name="Foreign") is None
+        )
+    assert host_store.reserve_sandbox_host(**reserve).display_name == "My project"
+    reconnected = host_store.upsert_on_connect(host_id, "new-controller-name", "alice")
+    assert reconnected.name == "new-controller-name" and reconnected.display_name == "My project"
+    rotated = host_store.upsert_on_connect(uuid.uuid4().hex, reconnected.name, "alice")
+    assert rotated.display_name == "My project"
+    assert (
+        host_store.set_display_name(
+            rotated.host_id, user_id="alice", display_name=None
+        ).display_name
+        is None
+    )
+    host_store.delete_host(rotated.host_id, user_id="alice")
+    assert (
+        host_store.set_display_name(rotated.host_id, user_id="alice", display_name="Gone") is None
+    )
+    host_store.upsert_on_connect(host_id, "ordinary-host", "alice")
+    assert host_store.set_display_name(host_id, user_id="alice", display_name="Ordinary") is None
+
+
 @pytest.mark.parametrize("provider", [None, "kubernetes", "agent_sandbox", "modal", "lakebox"])
 @pytest.mark.parametrize("saved_profile", [False, True])
 @pytest.mark.parametrize("binding", ["unbound", "same-host", "transfer"])
@@ -940,7 +1006,7 @@ def test_stale_request_cannot_reserve_host(host_store: HostStore) -> None:
     assert host_store.get_host(_RESERVED_HOST_ID) is None
 
 
-@pytest.mark.parametrize("operation", ["reserve", "bind"])
+@pytest.mark.parametrize("operation", ["reserve", "bind", "rename"])
 def test_sandbox_metadata_cannot_cross_account_generation(
     host_store: HostStore, db_uri: str, operation: str
 ) -> None:
@@ -954,6 +1020,14 @@ def test_sandbox_metadata_cannot_cross_account_generation(
             )
         )
     reserved = _reserve(host_store)
+    if operation == "rename":
+        with engine.begin() as connection:
+            connection.execute(
+                update(SqlHost)
+                .where(SqlHost.host_id == _RESERVED_HOST_ID)
+                .values(sandbox_attached=True)
+            )
+        reserved = host_store.get_host(_RESERVED_HOST_ID)
     with engine.begin() as connection:
         connection.execute(
             update(SqlUser)
@@ -965,6 +1039,10 @@ def test_sandbox_metadata_cannot_cross_account_generation(
     with pytest.raises(OmnigentError, match="authority has been revoked"):
         if operation == "reserve":
             _reserve(host_store)
+        elif operation == "rename":
+            host_store.set_display_name(
+                _RESERVED_HOST_ID, user_id="alice@example.test", display_name="Renamed"
+            )
         else:
             host_store.bind_sandbox(_RESERVED_HOST_ID, provider="modal", sandbox_id="environment")
     assert host_store.get_host(_RESERVED_HOST_ID) == reserved
@@ -1866,3 +1944,81 @@ def test_replace_managed_host_sandbox_refuses_cross_owner(db_uri: str) -> None:
     assert resolved.sandbox_id == "sb-m7"
     # Bob's token never armed Alice's host: it does not match the stored digest.
     assert store.resolve_launch_token("58f80f7592c6a72ba121eb5aedde8a82", "bob-token-7") is None
+
+
+@pytest.mark.parametrize("removal", ["detach", "account"])
+def test_attached_sandbox_ownership_survives_host_lifecycle(host_store, db_uri, removal):
+    from omnigent.server.accounts_store import SqlAlchemyAccountStore
+
+    accounts = SqlAlchemyAccountStore(db_uri)
+    accounts.create_user_with_password("alice", "test-password-hash")
+    host = host_store.reserve_sandbox_host(
+        host_id=_RESERVED_HOST_ID,
+        name="devbox",
+        user_id="alice",
+        provider="modal",
+        attached_sandbox_id="existing-box",
+    )
+    assert host is not None and host.sandbox_attached
+    assert HostStore(db_uri).get_host(host.host_id) == host
+    assert host_store.list_current_managed_sandbox_hosts_page(after=None, limit=10) == []
+    assert not host_store.detach_stale_managed_sandbox(
+        host.host_id,
+        sandbox_id=host.sandbox_id,
+        expected_updated_at=host.updated_at,
+    )
+    with pytest.raises(ValueError, match="externally owned"):
+        host_store.replace_managed_host_sandbox(
+            host_id=host.host_id,
+            user_id="alice",
+            token="new",
+            provider="modal",
+            sandbox_id="replacement",
+            token_expires_at=now_epoch() + 100,
+        )
+    # An ordinary reservation cannot claim an externally owned box.
+    assert (
+        host_store.reserve_sandbox_host(
+            host_id=host.host_id,
+            name="devbox",
+            user_id="alice",
+            provider="modal",
+        )
+        is None
+    )
+    assert host_store.delete_host(host.host_id, user_id="bob") is None
+    if removal == "detach":
+        host_store.delete_host(host.host_id)
+    else:
+        SqlAlchemyAccountStore(db_uri).delete_user("alice")
+    assert host_store.get_host(host.host_id) is None
+    assert host_store.list_terminating_managed_sandbox_hosts_page(after=None, limit=10) == []
+
+
+@pytest.mark.parametrize("pending", [False, True])
+def test_attachment_cannot_claim_a_managed_sandbox_generation(host_store, pending):
+    managed = host_store.register_managed_host(
+        host_id="ef" * 16,
+        name="per-session",
+        user_id="alice",
+        token="launch",
+        provider="modal",
+        sandbox_id="managed-box",
+        token_expires_at=now_epoch() + 100,
+    )
+    if pending:
+        assert host_store.detach_stale_managed_sandbox(
+            managed.host_id,
+            sandbox_id="managed-box",
+            expected_updated_at=managed.updated_at,
+        )
+    assert (
+        host_store.reserve_sandbox_host(
+            host_id=_RESERVED_HOST_ID,
+            name="devbox",
+            user_id="alice",
+            provider="modal",
+            attached_sandbox_id="managed-box",
+        )
+        is None
+    )

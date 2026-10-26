@@ -86,11 +86,11 @@ export function HarnessCredentialForm({
         setGatewayUrl("");
         setGatewayKey("");
         if (ready) {
-          showToast(`${display} is ready on ${host.name}.`);
+          showToast(`${display} is ready on ${host.display_name ?? host.name}.`);
           onDone(result);
         } else {
           showToast(
-            `Saved, but ${display} still needs setup on ${host.name}. Try another option.`,
+            `Saved, but ${display} still needs setup on ${host.display_name ?? host.name}. Try another option.`,
             { duration: 0 },
           );
         }
@@ -142,7 +142,7 @@ export function HarnessCredentialForm({
             >
               {command}
             </button>{" "}
-            on {host?.name}.
+            on {host?.display_name ?? host?.name}.
           </p>
         </CredentialOption>
       ),

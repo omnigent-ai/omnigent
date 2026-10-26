@@ -25,7 +25,7 @@ from typing import Any
 
 from fastapi import APIRouter, HTTPException, Query, Request
 from packaging.version import InvalidVersion, Version
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field
 
 from omnigent.db.utils import now_epoch
 from omnigent.debug_logging import (
@@ -78,6 +78,27 @@ from omnigent.server.schemas import SessionGitOptions
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore, host_is_live
 from omnigent.stores.permission_store import PermissionStore
+
+
+class RenameSandboxRequest(BaseModel):
+    """Null clears the user-owned label; registration names remain unchanged."""
+
+    model_config = ConfigDict(extra="forbid")
+    display_name: str | None = Field(
+        ...,
+        min_length=1,
+        max_length=64,
+        pattern=r"^[^\s\x00-\x1f\x7f](?:[^\x00-\x1f\x7f]*[^\s\x00-\x1f\x7f])?$",
+    )
+
+
+class AttachSandboxRequest(BaseModel):
+    """The provider checks access to this opaque sandbox ID for the caller."""
+
+    provider: str = Field(min_length=1, max_length=32)
+    sandbox_id: str = Field(min_length=1, max_length=256)
+    name: str = Field(min_length=1, max_length=64, pattern=r"^\S(?:.*\S)?$")
+
 
 _logger = logging.getLogger(__name__)
 
@@ -710,6 +731,88 @@ def create_hosts_router(
     flags = feature_flags or resolve_feature_flags()
     router = APIRouter()
 
+    @router.get("/hosts/sandboxes")
+    async def discover_sandboxes(
+        request: Request, provider: str = Query(min_length=1, max_length=32)
+    ) -> dict[str, list[dict[str, str | None]]]:
+        """List the caller's reusable boxes, including those not registered as hosts."""
+        from omnigent.server.managed_hosts import discover_sandbox_hosts
+
+        owner = require_user(request, auth_provider) or "local"
+        config = getattr(request.app.state, "sandbox_config", None)
+        if config is None:
+            raise HTTPException(400, "sandbox providers are not configured")
+        boxes = await discover_sandbox_hosts(config=config, owner=owner, provider=provider)
+        return {
+            "sandboxes": [
+                {
+                    "sandbox_id": box.sandbox_id,
+                    "name": box.name or box.sandbox_id,
+                    "state": box.state,
+                }
+                for box in boxes
+            ]
+        }
+
+    @router.post("/hosts/attach")
+    async def attach_host(request: Request, body: AttachSandboxRequest) -> dict[str, str]:
+        """Attach a caller-authorized existing sandbox as a reusable host."""
+        from omnigent.server.managed_hosts import attach_sandbox_host
+
+        owner = require_user(request, auth_provider) or "local"
+        config = getattr(request.app.state, "sandbox_config", None)
+        if config is None:
+            raise HTTPException(400, "sandbox providers are not configured")
+        host_id = await attach_sandbox_host(
+            config=config,
+            owner=owner,
+            host_store=host_store,
+            provider=body.provider,
+            sandbox_id=body.sandbox_id,
+            name=body.name,
+        )
+        return {"host_id": host_id}
+
+    @router.post("/hosts/{host_id}/wake")
+    async def wake_attached_host(request: Request, host_id: str) -> dict[str, str]:
+        """Wake an attached box before browsing its directories or starting sessions."""
+        from omnigent.server.managed_hosts import host_resume_supported, resume_managed_host
+
+        owner = require_user(request, auth_provider) or "local"
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None or host.user_id != owner:
+            raise HTTPException(404, "host not found")
+        config = getattr(request.app.state, "sandbox_config", None)
+        if not host.sandbox_attached or not host_resume_supported(host, config):
+            raise HTTPException(409, "host does not support waking an attached sandbox")
+        await resume_managed_host(host_id, host_store, config)
+        return {"host_id": host_id}
+
+    @router.delete("/hosts/{host_id}")
+    async def detach_host(request: Request, host_id: str) -> dict[str, str]:
+        """Remove a reusable attachment and its credentials without deleting the box."""
+        owner = require_user(request, auth_provider) or "local"
+        host = await asyncio.to_thread(host_store.get_host, host_id)
+        if host is None or host.user_id != owner:
+            raise HTTPException(404, "host not found")
+        if not host.sandbox_attached:
+            raise HTTPException(409, "only attached sandbox hosts can be detached here")
+        await asyncio.to_thread(host_store.delete_host, host_id, user_id=owner)
+        return {"host_id": host_id}
+
+    @router.patch("/hosts/{host_id}")
+    async def rename_sandbox_host(
+        request: Request, host_id: str, body: RenameSandboxRequest
+    ) -> dict[str, str | None]:
+        """Rename an owned reusable host without contacting its controller."""
+        owner = require_user(request, auth_provider) or "local"
+        host = await asyncio.to_thread(
+            host_store.set_display_name, host_id, user_id=owner, display_name=body.display_name
+        )
+        if host is None:
+            raise HTTPException(404, "reusable host not found")
+        return {"host_id": host.host_id, "display_name": host.display_name}
+
     @router.get("/hosts")
     async def list_hosts(request: Request) -> dict[str, list[dict[str, Any]]]:
         """List all hosts owned by the authenticated user.
@@ -750,14 +853,13 @@ def create_hosts_router(
                 {
                     "host_id": host.host_id,
                     "name": host.name,
+                    "display_name": host.display_name,
                     "owner": host.user_id,
                     "status": "online" if host_is_live(host, now=now) else "offline",
-                    # Non-None marks a server-managed sandbox host (e.g.
-                    # "modal"). Clients use it to hide sandbox-backed
-                    # hosts from manual host pickers — they are launch
-                    # targets the server creates on demand, not
-                    # user-connectable machines.
+                    # Only sandboxes marked reusable appear in host pickers.
                     "sandbox_provider": host.sandbox_provider,
+                    "sandbox_id": host.sandbox_id,
+                    "sandbox_attached": host.sandbox_attached,
                     "configured_harnesses": host.configured_harnesses,
                     # Held in memory from the host's connect handshake, not the
                     # hosts row. ``None`` means this replica has no report yet —
@@ -798,11 +900,12 @@ def create_hosts_router(
         return {
             "host_id": host.host_id,
             "name": host.name,
+            "display_name": host.display_name,
             "owner": host.user_id,
             "status": "online" if host_is_live(host) else "offline",
-            # Same semantics as list_hosts: non-None marks a
-            # server-managed sandbox host (e.g. "modal").
             "sandbox_provider": host.sandbox_provider,
+            "sandbox_id": host.sandbox_id,
+            "sandbox_attached": host.sandbox_attached,
             "configured_harnesses": host.configured_harnesses,
             # Same semantics as list_hosts: reported on connect and held in
             # memory, so ``None`` is "no report on this replica yet".

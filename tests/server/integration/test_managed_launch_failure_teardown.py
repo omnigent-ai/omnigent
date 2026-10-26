@@ -404,3 +404,21 @@ async def test_runner_connect_timeout_failure_tears_down_managed_sandbox(
     await _wait_for_sandbox_teardown(env, fake, launched_host_ids[0])
     assert fake.terminated == ["sb-fake-1"]
     del tunnels
+
+
+async def test_deleting_one_session_keeps_attached_host_and_other_session(teardown_env):
+    env = teardown_env
+    host = env.host_store.reserve_sandbox_host(
+        host_id="cd" * 16,
+        name="Devbox",
+        user_id="local",
+        provider="modal",
+        attached_sandbox_id="existing-box",
+    )
+    sessions = [env.conv_store.create_conversation(agent_id=None) for _ in range(2)]
+    for session in sessions:
+        env.conv_store.set_host_id(session.id, host.host_id, "/work")
+    deleted = await env.client.delete(f"/v1/sessions/{sessions[0].id}")
+    assert deleted.status_code == 200, deleted.text
+    assert env.host_store.get_host(host.host_id) == host
+    assert env.conv_store.get_conversation(sessions[1].id).host_id == host.host_id

@@ -1491,6 +1491,33 @@ describe("Sidebar session list", () => {
       expected: "Modal Sandbox",
     },
     {
+      title: "static sandbox label",
+      hostId: "host_static",
+      hosts: [
+        {
+          host_id: "host_static",
+          name: "managed-box",
+          display_name: "My project",
+          sandbox_provider: "static",
+          sandbox_attached: true,
+        },
+      ],
+      expected: "My project",
+    },
+    {
+      title: "unnamed static sandbox",
+      hostId: "host_static",
+      hosts: [
+        {
+          host_id: "host_static",
+          name: "managed-box",
+          sandbox_provider: "static",
+          sandbox_attached: true,
+        },
+      ],
+      expected: "managed-box",
+    },
+    {
       title: "unknown host fallback",
       hostId: "host_missing",
       hosts: [],

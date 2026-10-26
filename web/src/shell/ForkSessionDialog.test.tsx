@@ -2,7 +2,7 @@ import { testAgent } from "@/test/agentFixtures";
 import type * as ReactRouterDomModule from "react-router-dom";
 import type * as WorkspacePickerModule from "./WorkspacePicker";
 
-import { cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { MemoryRouter } from "react-router-dom";
@@ -31,6 +31,7 @@ import {
 } from "@/hooks/useHostFilesystem";
 
 const navigateMock = vi.fn();
+vi.mock("@/hooks/useViewerId", () => ({ useViewerId: () => "local" }));
 vi.mock("react-router-dom", async (importOriginal) => {
   const actual = await importOriginal<typeof ReactRouterDomModule>();
   return { ...actual, useNavigate: () => navigateMock };
@@ -1433,6 +1434,98 @@ describe("ForkSessionDialog", () => {
       openHostSelect();
       fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
     }
+
+    it.each([false, true])(
+      "discovers a clone target with creation enabled=%s",
+      async (creation) => {
+        setHosts([]);
+        const fetchMock = vi.spyOn(globalThis, "fetch").mockImplementation(async (input, init) => {
+          if (String(input).includes("/v1/hosts/sandboxes?provider=static")) {
+            return new Response(
+              JSON.stringify({ sandboxes: [{ sandbox_id: "existing-box", name: "Existing box" }] }),
+            );
+          }
+          if (String(input).endsWith("/v1/hosts/attach")) {
+            expect(JSON.parse(init?.body as string)).toEqual({
+              provider: "static",
+              sandbox_id: "existing-box",
+              name: "Existing box",
+            });
+            setHosts([
+              host(),
+              host({
+                host_id: "host_existing",
+                name: "Existing box",
+                sandbox_attached: true,
+                sandbox_provider: "static",
+                sandbox_id: "existing-box",
+              }),
+              host({
+                host_id: "host_other",
+                name: "Other box",
+                status: "offline",
+                sandbox_attached: true,
+              }),
+            ]);
+            return new Response(JSON.stringify({ host_id: "host_existing" }));
+          }
+          throw new Error(`Unexpected request: ${input}`);
+        });
+        try {
+          renderDialog({
+            ...CODING,
+            info: {
+              managed_sandboxes_enabled: creation,
+              sandbox_provider: creation ? "static" : null,
+              sandbox_providers: creation ? ["static"] : [],
+              sandbox_provider_capabilities: { static: { reusable_hosts: true } },
+            },
+          });
+          openHostSelect();
+          expect(screen.queryByTestId("fork-session-sandbox-option") !== null).toBe(creation);
+          const options = screen.getAllByRole("option");
+          expect(options.at(-1)).toHaveTextContent("Existing Static Sandbox");
+          fireEvent.click(screen.getByRole("option", { name: "Existing Static Sandbox" }));
+          fireEvent.click(await screen.findByRole("button", { name: /Existing box/ }));
+          await waitFor(() =>
+            expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent(
+              "Existing box",
+            ),
+          );
+          expect(
+            screen.queryByRole("dialog", { name: "Choose existing static sandbox" }),
+          ).not.toBeInTheDocument();
+          expect(forkSessionMock).not.toHaveBeenCalled();
+          expect(screen.queryByText("Edit", { exact: true })).not.toBeInTheDocument();
+          openHostSelect();
+          expect(
+            within(screen.getByTestId("fork-session-host-option-host_1")).queryByText("Edit"),
+          ).not.toBeInTheDocument();
+          const offline = screen.getByTestId("fork-session-host-option-host_other");
+          fireEvent.keyDown(offline, { key: "Enter" });
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Existing box");
+          fireEvent.keyDown(offline, { key: "ArrowRight" });
+          expect(screen.getByRole("textbox", { name: "Sandbox name" })).toHaveAttribute(
+            "placeholder",
+            "Other box",
+          );
+          fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+          await waitFor(() => expect(screen.getByTestId("fork-session-host-select")).toHaveFocus());
+          expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Existing box");
+          expect(screen.getByTestId("fork-session-host-select")).not.toHaveTextContent("Edit");
+          openHostSelect();
+          fireEvent.click(
+            within(screen.getByTestId("fork-session-host-option-host_existing")).getByText("Edit", {
+              exact: true,
+            }),
+          );
+          expect(screen.getByRole("dialog", { name: "Rename static sandbox" })).toBeInTheDocument();
+          fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+        } finally {
+          fetchMock.mockRestore();
+        }
+      },
+    );
 
     it("hides the sandbox option on a server that can't provision one", () => {
       // Fails closed, mirroring the new-session picker: a server with no
