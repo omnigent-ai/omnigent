@@ -22,6 +22,7 @@ import {
   getSessionUsage,
   importLocalSessions,
   interrupt,
+  launchManagedHost,
   listRunners,
   openSessionStream,
   postEvent,
@@ -559,6 +560,53 @@ describe("forkSession", () => {
   it("surfaces a non-ok response as a thrown error (e.g. 403 no access)", async () => {
     fetchMock.mockResolvedValueOnce(mockJsonResponse({}, { ok: false, status: 403 }));
     await expect(forkSession("conv_src")).rejects.toThrow(/403/);
+  });
+});
+
+describe("launchManagedHost", () => {
+  const moved = { id: "conv_1", agent_id: "agent_1", status: "idle", created_at: 1, items: [] };
+
+  it("omits the provider and repository a move leaves to the server", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(moved));
+
+    const session = await launchManagedHost("conv 1", { provider: null, workspace: null });
+
+    const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(url).toBe("/v1/sessions/conv%201/managed-host");
+    expect(init.method).toBe("POST");
+    expect(new Headers(init.headers).get("Content-Type")).toBe("application/json");
+    expect(JSON.parse(init.body as string)).toEqual({});
+    expect(session.id).toBe("conv_1");
+  });
+
+  it("sends the provider, repository and new host id", async () => {
+    fetchMock.mockResolvedValueOnce(mockJsonResponse(moved));
+
+    await launchManagedHost("conv_1", {
+      provider: "arclet",
+      workspace: "https://github.com/org/repo#main",
+      hostId: "0123456789abcdef0123456789abcdef",
+    });
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      sandbox_provider: "arclet",
+      workspace: "https://github.com/org/repo#main",
+      host_id: "0123456789abcdef0123456789abcdef",
+    });
+  });
+
+  it("rejects with the server's reason", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockJsonResponse(
+        { error: { code: "conflict", message: "This session has no host to move from" } },
+        { ok: false, status: 409, statusText: "Conflict" },
+      ),
+    );
+
+    await expect(
+      launchManagedHost("conv_1", { provider: null, workspace: null }),
+    ).rejects.toMatchObject({ status: 409, code: "conflict" });
   });
 });
 

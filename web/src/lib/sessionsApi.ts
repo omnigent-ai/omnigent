@@ -1008,6 +1008,45 @@ export async function launchRunner(
 }
 
 /**
+ * Move an existing session onto a new server-provisioned sandbox:
+ * ``POST /v1/sessions/{sessionId}/managed-host``.
+ *
+ * The sandbox counterpart of {@link launchRunner}, so the session's runner
+ * must be released first (`updateSession(id, { runnerId: "" })`). Returns as
+ * soon as the launch is scheduled: `hostId` / `workspace` stay null and the
+ * sandbox status reads "provisioning" until the sandbox host registers.
+ *
+ * @param sessionId - The runner-released session to move, e.g. "conv_abc".
+ * @param sandbox.provider - One of the server's configured sandbox providers;
+ *   `null` takes its first.
+ * @param sandbox.workspace - `<url>[#<branch>]` repository cloned into the
+ *   sandbox; `null` gives the session an empty sandbox.
+ * @param sandbox.hostId - Id for the new sandbox host, as on a managed
+ *   create; omitted, the server mints one.
+ * @returns The session snapshot once the move is accepted.
+ * @throws ApiError carrying the server's reason (e.g. an unconfigured
+ *   provider) so the dialog can surface it inline.
+ */
+export async function launchManagedHost(
+  sessionId: string,
+  sandbox: { provider: string | null; workspace: string | null; hostId?: string },
+): Promise<Session> {
+  const body: { sandbox_provider?: string; workspace?: string; host_id?: string } = {};
+  if (sandbox.provider !== null) body.sandbox_provider = sandbox.provider;
+  if (sandbox.workspace !== null) body.workspace = sandbox.workspace;
+  if (sandbox.hostId !== undefined) body.host_id = sandbox.hostId;
+  const res = await authenticatedFetch(
+    `/v1/sessions/${encodeURIComponent(sessionId)}/managed-host`,
+    {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    },
+  );
+  return sessionFromWire(await readJsonOrThrow<SessionResponseWire>(res));
+}
+
+/**
  * PATCH mutable session properties.
  *
  * `null` on `reasoningEffort` / `modelOverride` sends the server's

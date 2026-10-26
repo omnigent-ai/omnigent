@@ -89,8 +89,8 @@ import {
   SANDBOX_REPO_LABEL_KEY,
   composeSandboxWorkspace,
   deriveRepoName,
-  isValidSandboxRepoUrl,
   normalizeWorkspacePath,
+  sandboxRepoProblem,
   sessionsSharingDirectory,
   splitSandboxWorkspace,
 } from "./NewChatDialog";
@@ -1117,17 +1117,8 @@ function SupportedForkSessionForm({
               message: `This provider clones only one repository, but the source has ${sourceSandboxRepos.length}. Pick one that supports several.`,
             };
       }
-      if (sandboxRepoUrl.trim() === "") {
-        return sandboxRepoBranch.trim() === ""
-          ? null
-          : { field: "sandboxRepo", message: "Add the repository this branch belongs to." };
-      }
-      return isValidSandboxRepoUrl(sandboxRepoUrl)
-        ? null
-        : {
-            field: "sandboxRepo",
-            message: "Enter a repository URL like https://github.com/org/repo.",
-          };
+      const repoProblem = sandboxRepoProblem(sandboxRepoUrl, sandboxRepoBranch);
+      return repoProblem === null ? null : { field: "sandboxRepo", message: repoProblem };
     }
     if (!isCodingSource) return null;
     if (!selectedHostOnline) {
