@@ -21,7 +21,7 @@ shell terminal panel:
     scrollbar;
   - turning word wrap off switches the line to horizontal scrolling;
   - with Settings > Terminal theme pinned to dark under a light app, the
-    reloaded panel renders in the dark terminal palette.
+    reloaded panel renders in the dark terminal palette, selection included.
 
 On the buggy build the line overflows horizontally by hundreds of
 pixels, so the final assertion fails — that failure is the reproduction.
@@ -256,3 +256,9 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
     terminal = page.get_by_test_id("shell-tool-terminal")
     expect(terminal).to_have_attribute("data-terminal-theme", "dark")
     expect(terminal).to_have_css("background-color", "rgb(19, 21, 23)")
+    # Selected text stays light on the dark panel instead of taking the light
+    # app's dark selection text.
+    selected_text = terminal.evaluate(
+        "(el) => getComputedStyle(el.querySelector('pre code span'), '::selection').color"
+    )
+    assert selected_text == "rgb(228, 228, 231)"

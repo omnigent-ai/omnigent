@@ -44,14 +44,14 @@ export const WS_CLOSE_WRONG_REPLICA = 4400;
  * Return an xterm `ITheme` object matched to the app's light or dark palette.
  */
 export function terminalTheme(isDark: boolean): ITheme {
-  const { background: bg, foreground } = terminalSurfaceColors(isDark);
+  const { background: bg, foreground, selection } = terminalSurfaceColors(isDark);
   return isDark
     ? {
         background: bg,
         foreground,
         cursor: "#22d3ee",
         cursorAccent: bg,
-        selectionBackground: "#22d3ee33",
+        selectionBackground: selection,
         black: "#09090b",
         brightBlack: "#71717a",
       }
@@ -60,7 +60,7 @@ export function terminalTheme(isDark: boolean): ITheme {
         foreground,
         cursor: "#0891b2",
         cursorAccent: bg,
-        selectionBackground: "#0891b233",
+        selectionBackground: selection,
         black: "#18181b",
         brightBlack: "#e4e4e7",
         // CLIs that assume a dark terminal paint primary text with ANSI
