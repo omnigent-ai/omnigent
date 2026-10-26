@@ -325,6 +325,7 @@ export function ProjectSettingsDialog({
     effort !== NONE && effortLadderKnown(model) && !effortInLadder(effortOptions, effort)
       ? NONE
       : effort;
+  const effortDropped = effort !== NONE && effortValue === NONE;
   const storedEffortMissing = effortValue !== NONE && !effortInLadder(effortOptions, effortValue);
   const effortPickerEmpty = (effortOptions ?? []).length === 0 && effortValue === NONE;
   const selectModel = (next: string) => {
@@ -584,9 +585,11 @@ export function ProjectSettingsDialog({
             <Field
               label="Effort"
               hint={
-                effortPickerEmpty
-                  ? "Pick a model or connect a host to see effort levels."
-                  : "Default reasoning effort for new sessions with this agent"
+                effortDropped
+                  ? `The saved effort (${normalizeEffortLabel(effort)}) isn't available for this model; saving clears it.`
+                  : effortPickerEmpty
+                    ? "Pick a model or connect a host to see effort levels."
+                    : "Default reasoning effort for new sessions with this agent"
               }
             >
               <Select

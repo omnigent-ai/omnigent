@@ -525,6 +525,7 @@ describe("ProjectSettingsDialog", () => {
       expect(screen.getByTestId("project-settings-model")).toHaveTextContent("GPT mini"),
     );
     expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
+    expect(screen.getByText(/saved effort \(xHigh\) isn't available/)).toBeInTheDocument();
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenLastCalledWith("p_1", {
@@ -536,6 +537,7 @@ describe("ProjectSettingsDialog", () => {
     // Switching to a model that has xhigh must not bring the hidden level back.
     await pickSelectOption("project-settings-model", "GPT-5.5");
     expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
+    expect(screen.queryByText(/saved effort/)).not.toBeInTheDocument();
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
       expect(updateMock).toHaveBeenLastCalledWith("p_1", {

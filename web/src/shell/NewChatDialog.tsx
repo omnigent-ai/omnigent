@@ -3801,7 +3801,12 @@ export function NewChatLandingScreen() {
                 pickedModel || codexModelOptions.find((option) => option.isDefault)?.id,
               ).map((value) => ({ value, label: normalizeEffortLabel(value) }))
             : [];
-  const rememberPickerOptions = (harness: string, options: HarnessOptions) => {
+  // `persisted` is what reaches localStorage; it defaults to the in-memory edit.
+  const rememberPickerOptions = (
+    harness: string,
+    options: HarnessOptions,
+    persisted: HarnessOptions = options,
+  ) => {
     const previous = pickerEdits;
     setPickerEdits({
       agentId: effectiveAgentId,
@@ -3814,12 +3819,18 @@ export function NewChatLandingScreen() {
         ...options,
       },
     });
-    writeHarnessOption(harness, options);
+    writeHarnessOption(harness, persisted);
   };
   const selectPickerModel = (model: string) => {
     const selectionHarness =
       selectedNativeHarness ?? (sandboxHasModelCatalog ? previewHarness : null);
     if (!selectionHarness) return;
+    // An effort seeded from the project config isn't the user's own pick, so a
+    // model commit must not remember it for sessions outside the project.
+    const effortFromProject =
+      !userPickedEffortRef.current &&
+      projectDefaultEffort != null &&
+      pickedEffort === projectDefaultEffort;
     // Every model-picker commit also settles the effort (routing and Fusion clear it).
     userPickedModelRef.current = true;
     userPickedEffortRef.current = true;
@@ -3860,7 +3871,11 @@ export function NewChatLandingScreen() {
     setPickedModel(picked);
     setPickedEffort(effort);
     setCostControlMode(null);
-    rememberPickerOptions(selectionHarness, { model: picked, effort, routing: "off" });
+    rememberPickerOptions(
+      selectionHarness,
+      { model: picked, effort, routing: "off" },
+      effortFromProject ? { model: picked, routing: "off" } : undefined,
+    );
   };
   const selectPickerEffort = (effort: string) => {
     const selectionHarness =

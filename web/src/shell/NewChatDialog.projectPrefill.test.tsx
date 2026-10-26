@@ -1040,6 +1040,26 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.reasoning_effort).toBe("high");
   });
 
+  it("keeps a seeded project effort on a model pick without remembering it", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderLanding();
+    await waitForClaudeAgent();
+
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Sonnet" }));
+    closeAgentConfig();
+
+    const remembered = JSON.parse(localStorage.getItem(HARNESS_OPTIONS_KEY) ?? "{}");
+    expect(remembered["claude-native"]).toMatchObject({ model: "sonnet", effort: "low" });
+    const body = await submitAndReadBody();
+    expect(body).toMatchObject({ model_override: "sonnet", reasoning_effort: "high" });
+  });
+
   it("treats a project effort outside the harness ladder as no default", async () => {
     setClaudeAgentAndModels();
     localStorage.setItem(
