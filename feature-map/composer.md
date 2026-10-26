@@ -101,7 +101,8 @@ and steers messages while the agent is busy.
   into the composer at the caret; ⌘/Ctrl+Alt+V toggles it unless focus is in a
   terminal or code editor. While listening, Enter keeps the dictated text and
   Escape discards it. The button is absent when neither the browser nor the
-  server can transcribe.
+  server can transcribe; the desktop app's browser engine cannot, so there the
+  button appears only when the connected server advertises dictation.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
 - `blocked-start`: hovering or focusing disabled Start explains the missing
@@ -186,7 +187,10 @@ and steers messages while the agent is busy.
 - For Codex plugin skills, type `$<skill-name>` in Chat and select the
   namespaced suggestion. The vendor terminal owns its own completion menu.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
-  message box; press Enter to keep the text or Escape to discard it.
+  message box; press Enter to keep the text or Escape to discard it. In the
+  desktop app the button appears only when the connected server has dictation
+  enabled. A side chat's composer ("Ask a side question...") shows the same
+  button under the same rule; the shortcut belongs to the main composer.
 - Send while the agent is working to queue a message, then steer it.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
   page in the same project. Selecting **/new** in Commands also opens it.
@@ -277,7 +281,8 @@ and steers messages while the agent is busy.
   to select it; for Databricks, first enter the workspace URL and choose
   **Connect workspace**. Bearer-token services require **Manage MCP accounts**
   before selection. Use **Reconnect** if a selected service loses its connection.
-- Dictate with the microphone button or ⌘/Ctrl+Alt+V before the first send.
+- Dictate with the microphone button or ⌘/Ctrl+Alt+V before the first send,
+  under the same desktop rule as above.
 - Open the agent picker's custom agents, then Create custom agent → Import
   bundle: pick a `.tar.gz` agent bundle. It installs, closes the dialog, and
   selects the agent, which stays listed after a reload. A rejected bundle (for
@@ -507,6 +512,18 @@ Other connection providers alone do not enable the managed MCP picker.
 - **`dictation`, new-session composer:** no browser-level coverage. Manually:
   on the landing page, click the microphone (or press ⌘/Ctrl+Alt+V), speak,
   and expect the text in the message box; Escape restores the previous draft.
+- **`dictation`, desktop:**
+  `web/electron/e2e/desktop_dictation_availability.e2e.js` (new-session
+  composer only), run from `web/electron` after building the SPA
+  (`OMNIGENT_PW_NO_SANDBOX=1 OMNIGENT_PYTHON=../../.venv/bin/python xvfb-run -a
+  node --test e2e/desktop_dictation_availability.e2e.js`): no mic against a
+  server without dictation, then the mic dictating through a fake-engine
+  server. Manually, for the in-session, new-session and side-chat composers:
+  connect the desktop app to a default `omnigent server` (`/v1/info` reports
+  `dictation_available: false`) and expect no mic and ⌘/Ctrl+Alt+V to do
+  nothing; restart the server with
+  `OMNIGENT_DICTATION_ENGINE=fake`, reconnect, and expect the mic, the listening
+  state on click, and the fake transcript in the message box.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
@@ -640,7 +657,7 @@ Other connection providers alone do not enable the managed MCP picker.
 - Managed MCP browser tests stub launch and authentication. They prove composer
   wiring; the HTTP integration test proves the real provider boundary.
 - Dictation normally uses browser speech recognition, with server fallback
-  when unavailable or a network error occurs. The desktop app prefers the
-  server when available. A verification instance without a transcription engine
-  depends on browser support; a missing microphone there does not prove that
-  dictation is unavailable on a configured server.
+  when unavailable or a network error occurs. The desktop app uses only the
+  server and hides the button without it. A verification instance without a
+  transcription engine depends on browser support; a missing microphone there
+  does not prove that dictation is unavailable on a configured server.
