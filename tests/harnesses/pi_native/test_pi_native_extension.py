@@ -982,6 +982,23 @@ fs.writeFileSync(
 );
 process.env.OMNIGENT_PI_NATIVE_CONFIG = configPath;
 
+// Advance retry delays only; request timeouts still use real timers.
+const retryDelays = [];
+let now = Date.now();
+Date.now = () => now;
+const originalSetTimeout = global.setTimeout;
+global.setTimeout = (callback, delay, ...args) => {
+  if (delay >= 1000) {
+    retryDelays.push(delay);
+    now += delay;
+    queueMicrotask(() => callback(...args));
+    return {};
+  }
+  return originalSetTimeout(callback, delay, ...args);
+};
+const diagnostics = [];
+console.error = (...args) => diagnostics.push(args.map(String).join(" "));
+
 const posted = [];
 let fetchCalls = 0;
 const responses = [];
@@ -1082,8 +1099,9 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
   }
   assert.ok(failure, "exhausted assistant persistence must reject");
   assert.match(String(failure && failure.message), /HTTP 503/);
-  assert.equal(fetchCalls, 3, JSON.stringify(posted));
-  assert.equal(assistantItems().length, 3, JSON.stringify(posted));
+  assert.equal(fetchCalls, 5, JSON.stringify(posted));
+  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
+  assert.equal(assistantItems().length, 5, JSON.stringify(posted));
   assert.equal(
     new Set(assistantItems().map((item) => item.data.source_id)).size,
     1,
@@ -1097,7 +1115,7 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
     return { ok: true, status: 204 };
   };
   await handlers.message_end({ message: transientMessage }, ctx);
-  assert.equal(fetchCalls, 4, JSON.stringify(posted));
+  assert.equal(fetchCalls, 6, JSON.stringify(posted));
 
   global.fetch = async (_url, request) => {
     posted.push(JSON.parse(request.body));
@@ -1118,7 +1136,8 @@ def test_assistant_message_failure_propagates_and_400_is_not_retried(
   }
   assert.ok(failure, "permanent assistant persistence must reject");
   assert.match(String(failure && failure.message), /HTTP 400/);
-  assert.equal(fetchCalls, 5, JSON.stringify(posted));
+  assert.equal(fetchCalls, 7, JSON.stringify(posted));
+  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
 })().catch((error) => {
   console.error(error && error.stack ? error.stack : error);
   process.exit(1);
@@ -1157,22 +1176,23 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
     if (body.type !== "external_conversation_item") return { ok: true, status: 204 };
     return { ok: status === 204, status };
   };
-  await assert.rejects(invoke, /HTTP 503/);
+  await invoke();
+  assert.match(diagnostics.join("\n"), /Failed to persist.*HTTP 503/);
+  assert.deepEqual(retryDelays, [1000, 2000, 4000, 8000]);
   let items = posted.filter((body) => body.type === "external_conversation_item");
-  assert.equal(items.length, 3);
+  assert.equal(items.length, 5);
   assert.ok(items[0].data.source_id);
-  assert.deepEqual(items[0], items[1]);
-  assert.deepEqual(items[1], items[2]);
+  for (const item of items) assert.deepEqual(item, items[0]);
 
   status = 204;
   await invoke();
   items = posted.filter((body) => body.type === "external_conversation_item");
-  assert.equal(items.length, 4);
+  assert.equal(items.length, 6);
   if (kind !== "user") {
     // A rejected delivery remains eligible; accepted callbacks are suppressed.
-    assert.deepEqual(items[0], items[3]);
+    assert.deepEqual(items[0], items[5]);
     await invoke();
-    assert.equal(posted.filter((body) => body.type === "external_conversation_item").length, 4);
+    assert.equal(posted.filter((body) => body.type === "external_conversation_item").length, 6);
   }
   if (kind === "reasoning") {
     const deltas = posted.filter((body) => body.type === "external_output_reasoning_delta");
@@ -1185,7 +1205,8 @@ def test_history_items_retry_without_losing_identity(tmp_path: Path, kind: str) 
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-def test_failed_tool_history_delivery_still_checks_policy(tmp_path: Path) -> None:
+@pytest.mark.parametrize("verdict", ["ALLOW", "DENY"])
+def test_failed_tool_history_delivery_still_checks_policy(tmp_path: Path, verdict: str) -> None:
     script = (
         _ASSISTANT_DURABILITY_HARNESS
         + r"""
@@ -1194,14 +1215,111 @@ def test_failed_tool_history_delivery_still_checks_policy(tmp_path: Path) -> Non
   global.fetch = async (url, request) => {
     if (url.endsWith("/events")) return { ok: false, status: 503 };
     policyCalls += 1;
-    return { ok: true, text: async () => JSON.stringify({ result: "POLICY_ACTION_DENY" }) };
+    const result = `POLICY_ACTION_${process.argv[3]}`;
+    return { ok: true, text: async () => JSON.stringify({ result }) };
   };
   const result = await handlers.tool_call({
     toolCallId: "call-denied", toolName: "bash", input: { command: "echo safe" },
   }, ctx);
   assert.equal(policyCalls, 1);
-  assert.equal(result.block, true);
+  assert.equal(Boolean(result && result.block), process.argv[3] === "DENY");
+  assert.match(diagnostics.join("\n"), /Failed to persist function_call/);
 })().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), verdict)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_history_retry_stops_before_exceeding_elapsed_budget(tmp_path: Path) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const started = Date.now();
+  global.fetch = async () => {
+    fetchCalls += 1;
+    now += 5000;
+    return { ok: false, status: 503 };
+  };
+  await handlers.input({ text: "keep working", source: "extension" }, ctx);
+  assert.equal(fetchCalls, 4);
+  assert.deepEqual(retryDelays, [1000, 2000, 4000]);
+  assert.equal(Date.now() - started, 27000);
+  assert.match(diagnostics.join("\n"), /Failed to persist message/);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("handler", ["message_end", "turn_end"])
+def test_failed_history_item_preserves_later_items_and_usage(tmp_path: Path, handler: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const handler = process.argv[3];
+  const accepted = [];
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    const failed = body.data?.item_data?.call_id === "failed";
+    if (!failed) accepted.push(body);
+    return { ok: !failed, status: failed ? 503 : 204 };
+  };
+  const message = {
+    role: "assistant", timestamp: 42, model: "test-model",
+    usage: { input: 10, output: 2 },
+    content: [
+      { type: "toolCall", id: "failed", name: "read", arguments: {} },
+      { type: "toolCall", id: "later", name: "read", arguments: {} },
+      { type: "thinking", thinking: "plan" },
+      { type: "text", text: "answer" },
+    ],
+  };
+  await handlers[handler]({ message, toolResults: [
+    { toolCallId: "failed", content: [{ type: "text", text: "failed output" }] },
+    { toolCallId: "later", content: [{ type: "text", text: "later output" }] },
+  ] }, ctx);
+  const items = accepted.filter(item => item.type === "external_conversation_item");
+  assert.deepEqual(items.map(item => item.data.item_type), [
+    "function_call", "reasoning", handler === "message_end" ? "message" : "function_call_output",
+  ]);
+  assert.ok(accepted.some(item => item.type === "external_session_usage"));
+  assert.match(diagnostics.join("\n"), /Failed to persist function_call/);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), handler)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def test_reasoning_identity_survives_lost_ack_across_callbacks(tmp_path: Path) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  let loseAck = true;
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.data?.item_type === "reasoning" && loseAck) throw new Error("lost ack");
+    return { ok: true, status: 204 };
+  };
+  await handlers.message_update({ assistantMessageEvent: {
+    type: "thinking_end", contentIndex: 0, content: "plan",
+  } }, ctx);
+  loseAck = false;
+  await handlers.message_end({ message: { role: "assistant", content: [
+    { type: "thinking", thinking: "plan", thinkingSignature: "different-hint" },
+  ] } }, ctx);
+  const reasoning = posted.filter(item => item.data?.item_type === "reasoning");
+  assert.equal(reasoning.length, 6);
+  assert.equal(new Set(reasoning.map(item => item.data.source_id)).size, 1);
+  assert.equal(posted.filter(item => item.type === "external_output_reasoning_delta").length, 1);
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
 """
     )
     result = _run_node(script, str(_extension_path()), str(tmp_path))

@@ -796,11 +796,14 @@ Cross-harness journeys:
 from the native terminal and complete a tool turn, then reload Chat. Each prompt,
 call, result and final answer should appear once. Extension regressions in
 `tests/harnesses/pi_native/test_pi_native_extension.py` cover bounded retry,
-stable item identity and policy evaluation after delivery failure; server
+stable item identity, later-item delivery and policy evaluation after failure; server
 idempotency is covered by
 `tests/server/integration/test_sessions_external_item_idempotency.py`.
-A prolonged outage still surfaces a delivery failure; transient streaming chunks
-are not replayed. Component checks do not establish desktop rendering parity.
+History retries wait 1, 2, 4 and 8 seconds, with five attempts and a 30-second
+per-item budget. After exhaustion, tool/input history failures are logged without
+blocking the tool, prompt or later items. Final assistant delivery retains its
+error signal. Transient streaming chunks are not replayed. Component checks do
+not establish desktop rendering parity.
 
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered

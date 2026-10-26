@@ -832,9 +832,10 @@ function headers(config) {
   };
 }
 
-const _ASSISTANT_ITEM_MAX_ATTEMPTS = 3;
-const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 50;
-const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 250;
+const _ASSISTANT_ITEM_MAX_ATTEMPTS = 5;
+const _ASSISTANT_ITEM_INITIAL_BACKOFF_MS = 1_000;
+const _ASSISTANT_ITEM_MAX_BACKOFF_MS = 8_000;
+const _ASSISTANT_ITEM_RETRY_BUDGET_MS = 30_000;
 const _ASSISTANT_ITEM_POST_TIMEOUT_MS = 5_000;
 
 function boundedSourceId(sourceId) {
@@ -913,11 +914,14 @@ async function postConversationItem(config, data, sourceId) {
   };
   let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
   let lastError;
+  const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
   for (let attempt = 1; attempt <= _ASSISTANT_ITEM_MAX_ATTEMPTS; attempt += 1) {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
     const controller = new AbortController();
     const timeout = setTimeout(
       () => controller.abort(),
-      assistantItemPostTimeoutMs(config),
+      Math.min(assistantItemPostTimeoutMs(config), remaining),
     );
     try {
       return await postEventChecked(config, body, controller.signal);
@@ -928,13 +932,25 @@ async function postConversationItem(config, data, sourceId) {
     }
     if (
       attempt === _ASSISTANT_ITEM_MAX_ATTEMPTS ||
-      !isRetryableAssistantError(lastError)
+      !isRetryableAssistantError(lastError) ||
+      Date.now() + backoff >= deadline
     )
       break;
     await sleep(backoff);
     backoff = Math.min(backoff * 2, _ASSISTANT_ITEM_MAX_BACKOFF_MS);
   }
   throw lastError || new Error("assistant conversation item POST failed");
+}
+
+async function persistHistoryItem(config, data, sourceId) {
+  try {
+    await postConversationItem(config, data, sourceId);
+    return true;
+  } catch (error) {
+    // History failure must not block input, tools or the remaining message items.
+    console.error(`[pi-native] Failed to persist ${data.item_type} (${sourceId}):`, error);
+    return false;
+  }
 }
 
 function assistantMessageSourceId(message, responseId, text) {
@@ -1909,7 +1925,7 @@ module.exports = function (pi) {
     const key = `${responseId}:${callId}`;
     toolCallsById.set(callId, { key, responseId, name });
     if (postedToolCalls.has(key)) return;
-    await postConversationItem(
+    const accepted = await persistHistoryItem(
       config,
       {
         response_id: responseId,
@@ -1925,7 +1941,7 @@ module.exports = function (pi) {
       },
       `pi:tool-call:${key}`,
     );
-    postedToolCalls.add(key);
+    if (accepted) postedToolCalls.add(key);
   }
 
   async function postToolResult(event, responseId) {
@@ -1935,7 +1951,7 @@ module.exports = function (pi) {
     const known = toolCallsById.get(callId);
     const key = known && known.key ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
-    await postConversationItem(
+    const accepted = await persistHistoryItem(
       config,
       {
         response_id: known && known.responseId ? known.responseId : responseId,
@@ -1947,7 +1963,7 @@ module.exports = function (pi) {
       },
       `pi:tool-result:${key}`,
     );
-    postedToolResults.add(key);
+    if (accepted) postedToolResults.add(key);
   }
 
   async function postCompletedReasoning(text, responseId, keyHint, streamed) {
@@ -1955,14 +1971,14 @@ module.exports = function (pi) {
     const textKey = `${responseId}:text:${fingerprint(text)}`;
     const key = `${responseId}:${keyHint || fingerprint(text)}`;
     if (postedReasoning.has(key) || postedReasoning.has(textKey)) return;
-    if (!streamed && !postedReasoning.has(`delta:${key}`)) {
-      postedReasoning.add(`delta:${key}`);
+    if (!streamed && !postedReasoning.has(`delta:${textKey}`)) {
+      postedReasoning.add(`delta:${textKey}`);
       await postEvent(config, {
         type: "external_output_reasoning_delta",
         data: { delta: text, started: true },
       });
     }
-    await postConversationItem(
+    const accepted = await persistHistoryItem(
       config,
       {
         response_id: responseId,
@@ -1973,10 +1989,12 @@ module.exports = function (pi) {
           content: [{ type: "reasoning_text", text }],
         },
       },
-      `pi:reasoning:${key}`,
+      `pi:reasoning:${textKey}`,
     );
-    postedReasoning.add(key);
-    postedReasoning.add(textKey);
+    if (accepted) {
+      postedReasoning.add(key);
+      postedReasoning.add(textKey);
+    }
   }
 
   function reasoningBlockKey(responseId, contentIndex) {
@@ -2293,20 +2311,14 @@ module.exports = function (pi) {
     rememberContext(ctx);
     const blocked = replayPendingInterrupt(ctx);
     const responseId = currentResponseId();
-    let historyError;
-    try {
-      await postToolCall(
-        {
-          id: event && event.toolCallId,
-          name: event && event.toolName,
-          arguments: event && event.input,
-        },
-        responseId,
-      );
-    } catch (error) {
-      // Persistence failure must not skip the tool's policy check.
-      historyError = error;
-    }
+    await postToolCall(
+      {
+        id: event && event.toolCallId,
+        name: event && event.toolName,
+        arguments: event && event.input,
+      },
+      responseId,
+    );
     if (blocked) {
       return { block: true, reason: "Interrupted by user" };
     }
@@ -2316,7 +2328,6 @@ module.exports = function (pi) {
     // ASK policies, a double prompt. Pi's own built-in tools (read/shell/etc)
     // are NOT bridged and stay gated here.
     if (bridgedTools.has((event && event.toolName) || "")) {
-      if (historyError) throw historyError;
       return;
     }
     // Evaluate TOOL_CALL policy via the Omnigent server's session-level HTTP
@@ -2335,7 +2346,6 @@ module.exports = function (pi) {
         reason: verdict.reason || "blocked by Omnigent policy",
       };
     }
-    if (historyError) throw historyError;
   });
 
   pi.on("tool_result", async (event, ctx) => {
@@ -2373,7 +2383,7 @@ module.exports = function (pi) {
       }
     }
     const responseId = newResponseId("user");
-    await postConversationItem(
+    await persistHistoryItem(
       config,
       {
         response_id: responseId,
