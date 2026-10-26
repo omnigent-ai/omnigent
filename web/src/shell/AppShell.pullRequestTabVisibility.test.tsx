@@ -16,6 +16,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
+import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
 
 vi.mock("@/hooks/useConversations", async (importOriginal) => ({
   ...(await importOriginal<typeof UseConversationsModule>()),
@@ -236,22 +237,33 @@ describe("opening Pull Requests from the composer", () => {
     expect(screen.getByRole("button", { name: "Open PR" })).toBeInTheDocument();
   });
 
-  it("opens the desktop Pull Requests tab without mounting the mobile panel", () => {
-    renderShell();
+  it.each([true, false])(
+    "opens the desktop Pull Requests tab without mounting the mobile panel (pinned: %s)",
+    (isPinned) => {
+      if (!isPinned) writePinnedWorkspaceTabs(["files", "changes", "subagents"]);
+      renderShell();
 
-    fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
+      fireEvent.click(screen.getByRole("button", { name: "Open PR" }));
 
-    const workspace = screen.getByRole("complementary", { name: "Workspace" });
-    expect(within(workspace).getByRole("tab", { name: "Pull Requests" })).toHaveAttribute(
-      "aria-selected",
-      "true",
-    );
-    expect(within(workspace).getByTestId("github-panel")).toBeInTheDocument();
-    expect(readSessionWorkspaceState("conv_ws").open).toBe(true);
-    const drawer = screen.getByTestId("github-panel-drawer");
-    expect(drawer).toHaveAttribute("data-state", "closed");
-    expect(within(drawer).queryByTestId("github-panel")).not.toBeInTheDocument();
-  });
+      const workspace = screen.getByRole("complementary", { name: "Workspace" });
+      expect(within(workspace).getByRole("tab", { name: "Pull Requests" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
+      expect(within(workspace).getByTestId("github-panel")).toBeInTheDocument();
+      expect(
+        within(workspace).queryAllByRole("button", { name: "Close Pull Requests" }),
+      ).toHaveLength(isPinned ? 0 : 1);
+      expect(readSessionWorkspaceState("conv_ws")).toMatchObject({
+        open: true,
+        rightRailTab: "github",
+        openPanels: isPinned ? [] : ["github"],
+      });
+      const drawer = screen.getByTestId("github-panel-drawer");
+      expect(drawer).toHaveAttribute("data-state", "closed");
+      expect(within(drawer).queryByTestId("github-panel")).not.toBeInTheDocument();
+    },
+  );
 
   it("closes the mobile Pull Requests drawer when navigating to another session", () => {
     vi.mocked(isMobileViewport).mockReturnValue(true);

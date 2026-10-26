@@ -12,6 +12,10 @@ required-version = ">=0.11.8"
 # `--refresh`, or a dependency change).
 exclude-newer = "P7D"
 
+# An exemption only relaxes uv.lock: mirrors that embargo young releases resolve
+# the pyproject.toml floors, so keep floors below an exempted release unless the
+# mirror serves it (`just check-internal-mirror`, see CONTRIBUTING.md).
+#
 # Per-package cooldown exemptions (each scoped to one package, a fixed date
 # just past its publish time, so the global P7D supply-chain cooldown still
 # guards every other dependency):
@@ -29,4 +33,9 @@ exclude-newer = "P7D"
 #   <51, which unblocks cryptography 50.0.0 (CVE-2026-69247); 3.16.0 is also
 #   above the mlflow AI Gateway SSRF range <=3.15.2 (CVE-2026-71211). Drop once
 #   aged past P7D (2026-09-11).
-exclude-newer-package = { cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }
+# - databricks-sdk: 0.153.0 (published 2026-10-15) is the first release with
+#   streaming Sandbox command execution, which the Databricks Sandbox provider
+#   uses. Drop once aged past P7D (2026-10-22).
+# - certifi: 2026.10.19 (tagged 2026-10-20) removes the roots chaining to the
+#   compromised eMudhra intermediate CAs. Drop once aged past P7D (2026-10-28).
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z", databricks-sdk = "2026-10-16T00:00:00Z", cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }

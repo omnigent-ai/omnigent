@@ -45,7 +45,6 @@ delete process.env.no_proxy;
 delete process.env.NO_PROXY;
 
 const deps = desktopDepsAvailable();
-const RECORD_DIR = path.join(__dirname, "recordings", "desktop-session-expiry-browser-view");
 
 // The fake workspace sign-in page the gate serves once the session expires.
 // The anchor navigates back to "/" so "signing back in" is a plain click.
@@ -233,10 +232,14 @@ describe(
   { skip: deps.ok ? false : `missing deps: ${deps.missing.join(", ")}` },
   () => {
     let tmpDir;
+    let recordDir;
     let server;
     let gate;
 
     before(async () => {
+      recordDir =
+        process.env.OMNIGENT_DESKTOP_RECORD_DIR ||
+        fs.mkdtempSync(path.join(os.tmpdir(), "desktop-session-expiry-"));
       tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), "omni-desktop-e2e-"));
       server = await spawnServer(tmpDir);
       gate = await startAuthGate(server.serverUrl);
@@ -251,10 +254,11 @@ describe(
     it(
       "logged-out reload does not leave the browser view painting over the window",
       { timeout: 300_000 },
-      async () => {
+      async (t) => {
+        t.diagnostic(`Recordings: ${recordDir}`);
         // Boot straight onto the gated server (the failure is past connect).
-        const { electronApp, userDataDir } = await launchDesktop({
-          recordDir: RECORD_DIR,
+        const { electronApp, userDataDir, stopDisplayCapture } = await launchDesktop({
+          recordDir,
           serverUrl: gate.url,
         });
         let attachedOnLoginPage;
@@ -331,7 +335,8 @@ describe(
           );
         } finally {
           await electronApp.close();
-          saveRecording(RECORD_DIR, "before-expiry-overlay");
+          await stopDisplayCapture();
+          saveRecording(recordDir, "before-expiry-overlay");
           fs.rmSync(userDataDir, { recursive: true, force: true });
         }
 

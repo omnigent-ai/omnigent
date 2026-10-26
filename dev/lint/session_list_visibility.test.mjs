@@ -146,7 +146,7 @@ for (const [filename, missing] of [
         "",
       )
       .replace(/    visibility,\n    pinned: "true",/, '    pinned: "true",')
-      .replace(/^\s*query\.set\("visibility", "all"\);\n/gm, "");
+      .replace(/^\s*query\.set\("visibility", "(?:all|mine|shared|archived)"\);\n/gm, "");
     assert.equal(analyzeSource(filename, mutated).length, missing);
   });
 }

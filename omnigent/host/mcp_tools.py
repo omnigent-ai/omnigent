@@ -228,6 +228,7 @@ async def _probe_worker(payload: str) -> McpProbeResult:
         env["PYTHONPATH"] = os.environ["PYTHONPATH"]
     process = await asyncio.create_subprocess_exec(
         sys.executable,
+        "-P",
         "-m",
         "omnigent.host.mcp_tools",
         stdin=asyncio.subprocess.PIPE,
@@ -266,7 +267,7 @@ def _failure_status(exc: BaseException) -> str:
         return "needs_auth"
     if isinstance(exc, (TimeoutError, httpx.TimeoutException)):
         return "timeout"
-    if isinstance(exc, BaseExceptionGroup):  # noqa: F821 — Python >=3.12
+    if isinstance(exc, BaseExceptionGroup):
         for child in exc.exceptions:
             status = _failure_status(child)
             if status != "unreachable":

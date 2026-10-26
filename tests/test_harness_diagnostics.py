@@ -9,6 +9,7 @@ import pytest
 from omnigent.harnesses.diagnostics import (
     bounded_diagnostic_tail,
     detect_sign_in_prompt,
+    launcher_password_prompt,
     sanitize_diagnostic_text,
     sign_in_next_step,
 )
@@ -385,3 +386,22 @@ def test_sign_in_next_step_names_the_agent_and_carries_no_address() -> None:
         "sign-in completes; then send your message again."
     )
     assert "http" not in step
+
+
+@pytest.mark.parametrize(
+    ("screen", "expected"),
+    [
+        ("Enter password to configure settings for Claude Code.\nPassword:", True),
+        ("Installing launcher...\n[sudo] password for alice: \n\n", True),
+        # The launcher moved past the prompt.
+        ("Password:\nSettings configured.\n", False),
+        ("Use a strong password: at least 12 characters.\n", False),
+        ("", False),
+        (None, False),
+    ],
+)
+def test_launcher_password_prompt_reads_only_the_last_line(
+    screen: str | None, expected: bool
+) -> None:
+    """Only a password prompt the launcher is still waiting on counts."""
+    assert launcher_password_prompt(screen) is expected

@@ -35,7 +35,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests._helpers.session import post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
 from tests.e2e_ui.conftest import (
     _ensure_runner_online,
     configure_mock_llm,
@@ -170,7 +170,7 @@ def pr_probe_session(
 
     name = f"pr_track_probe_{uuid.uuid4().hex[:8]}"
     model = f"pr-track-probe-{uuid.uuid4().hex[:8]}"
-    create_resp = post_session_bundle(
+    create_resp = post_operator_session(
         httpx.post, f"{live_server}/v1/sessions", _agent_bundle(name, model, str(ws)), timeout=30.0
     )
     create_resp.raise_for_status()

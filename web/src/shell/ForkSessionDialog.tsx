@@ -1442,6 +1442,38 @@ function SupportedForkSessionForm({
       )}
     </div>
   );
+  const worktreeField = (
+    <div className="flex flex-col gap-1">
+      <label
+        htmlFor="fork-session-branch"
+        className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground"
+      >
+        <GitBranchIcon className="size-3.5" />
+        Git worktree (optional)
+      </label>
+      <input
+        id="fork-session-branch"
+        type="text"
+        value={branchName}
+        onChange={(e) => setBranchName(e.target.value)}
+        placeholder="feature/my-branch"
+        data-testid="fork-session-branch-input"
+        className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
+      />
+      <p className="text-sm text-muted-foreground">
+        {usingSourceWorktree
+          ? "The clone starts in the original session's existing worktree for this " +
+            "branch. Name a different branch to work in an isolated copy."
+          : workspaceRecovery
+            ? "Creates a git worktree for a new branch of the picked repository, so the " +
+              "session continues in its own directory. Leave blank to start in the picked " +
+              "directory."
+            : "Creates a git worktree for a new branch in an isolated directory — " +
+              "keeps the clone from fighting the original over the same files. Leave " +
+              "blank to start in the picked directory."}
+      </p>
+    </div>
+  );
 
   return (
     <>
@@ -1575,6 +1607,9 @@ function SupportedForkSessionForm({
         )}
 
         {directoryAtTop && directoryField}
+        {/* Recovery never inherits the missing worktree's branch, so a new
+              worktree is offered beside the directory it would branch from. */}
+        {workspaceRecovery && worktreeField}
 
         <div className="flex flex-col gap-1.5">
           <label htmlFor="fork-session-agent" className="text-sm font-medium text-muted-foreground">
@@ -1707,10 +1742,11 @@ function SupportedForkSessionForm({
               {conflictingSessions.length === 1
                 ? "1 other agent is"
                 : `${conflictingSessions.length} other agents are`}{" "}
-              working in this directory, so writes may conflict.
-              {!workspaceRecovery && (
+              working in this directory, so writes may conflict.{" "}
+              {workspaceRecovery ? (
+                "Name a git branch to work in an isolated copy."
+              ) : (
                 <>
-                  {" "}
                   Name a {usingSourceWorktree ? "different git branch" : "git branch"} under
                   Advanced settings to work in an isolated copy.
                 </>
@@ -1858,33 +1894,7 @@ function SupportedForkSessionForm({
               {isCodingSource && !sandboxSelected && !workspaceRecovery && (
                 <>
                   {!directoryAtTop && directoryField}
-
-                  <div className="flex flex-col gap-1">
-                    <label
-                      htmlFor="fork-session-branch"
-                      className="flex items-center gap-1.5 text-sm font-medium text-muted-foreground"
-                    >
-                      <GitBranchIcon className="size-3.5" />
-                      Git worktree (optional)
-                    </label>
-                    <input
-                      id="fork-session-branch"
-                      type="text"
-                      value={branchName}
-                      onChange={(e) => setBranchName(e.target.value)}
-                      placeholder="feature/my-branch"
-                      data-testid="fork-session-branch-input"
-                      className="rounded-md border border-input bg-background px-3 py-2 font-mono text-sm outline-none transition-colors focus-visible:border-ring"
-                    />
-                    <p className="text-sm text-muted-foreground">
-                      {usingSourceWorktree
-                        ? "The clone starts in the original session's existing worktree for this " +
-                          "branch. Name a different branch to work in an isolated copy."
-                        : "Creates a git worktree for a new branch in an isolated directory — " +
-                          "keeps the clone from fighting the original over the same files. Leave " +
-                          "blank to start in the picked directory."}
-                    </p>
-                  </div>
+                  {worktreeField}
                 </>
               )}
             </div>
@@ -2003,7 +2013,7 @@ export function ForkSessionDialog({
           </DialogTitle>
           <DialogDescription className={workspaceRecovery ? undefined : "sr-only"}>
             {workspaceRecovery
-              ? "Choose an existing directory to continue this conversation in a new session. Files from the missing workspace won’t be restored."
+              ? "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored."
               : cloneDescription}
           </DialogDescription>
         </DialogHeader>

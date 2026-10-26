@@ -31,11 +31,13 @@ from typing import Any, Literal
 import httpx
 from pydantic import TypeAdapter
 
+from omnigent.harness_availability import harness_launch_availability
 from omnigent.server.schemas import ServerStreamEvent
 
+from ._agent_catalog import AgentCatalogEntry, RegisteredAgent, RegisteredAgentCatalog
 from ._child_status import child_summary_busy
 from ._errors import OmnigentError, raise_for_status, require_json_object, response_body
-from ._timeouts import _SSE_TIMEOUT
+from ._timeouts import _HOST_LAUNCH_READ_TIMEOUT_S, _SSE_TIMEOUT
 from ._types import PaginatedList
 
 # Default recursion cap for the sub-agent tree helpers. Mirrors web's
@@ -181,6 +183,7 @@ class Session:
         returned with ``visibility="archived"`` or with
         ``visibility="all", include_archived=True``. ``False`` for normal
         sessions.
+    :param host_id: Host owning this session's runner, or ``None`` when unbound.
     """
 
     id: str
@@ -202,6 +205,7 @@ class Session:
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     archived: bool = False
+    host_id: str | None = None
 
     @classmethod
     def from_dict(cls, raw: dict[str, Any]) -> Session:
@@ -238,6 +242,7 @@ class Session:
             last_task_error=raw.get("last_task_error"),
             external_session_id=raw.get("external_session_id"),
             archived=bool(raw.get("archived", False)),
+            host_id=raw.get("host_id"),
         )
 
 
@@ -328,18 +333,20 @@ class SessionListItem:
 
 
 @dataclass(frozen=True)
-class RegisteredAgent:
+class LaunchHost:
     """
-    A server-registered agent resolved by display name.
+    A connected host the server can launch a session's runner on.
 
-    :param id: The agent's durable identifier, e.g. ``"ag_abc123"``.
-    :param harness: Harness the agent runs on, e.g.
-        ``"openai-agents"``. ``None`` when the server did not report
-        one.
+    :param host_id: Durable host identifier.
+    :param name: Display name; the id when the host reported none.
+    :param launchable: Whether it can run the requested harness (or hasn't said).
+    :param unavailable_reason: Why not, e.g. ``"binary-missing"``; ``None`` when launchable.
     """
 
-    id: str
-    harness: str | None = None
+    host_id: str
+    name: str
+    launchable: bool = True
+    unavailable_reason: str | None = None
 
 
 class SessionsNamespace:
@@ -450,6 +457,7 @@ class SessionsNamespace:
         labels: dict[str, str] | None = None,
         reasoning_effort: str | None = None,
         workspace: str | None = None,
+        host_id: str | None = None,
     ) -> Session:
         """
         Create a new session bound to an already-registered agent.
@@ -470,9 +478,11 @@ class SessionsNamespace:
             effort, e.g. ``"high"``. ``None`` uses the agent default.
         :param workspace: Optional absolute starting cwd to record on
             the session, e.g. ``"/Users/corey/projects/myapp"``.
+        :param host_id: Launch the runner on this host; read timeout is at least
+            3660 seconds. Longer or unlimited client timeouts are retained.
         :returns: The newly created :class:`Session` snapshot.
-        :raises OmnigentError: If the server returns a non-2xx
-            status.
+        :raises OmnigentError: If the server returns a non-2xx status,
+            or a host-targeted create times out before its outcome is known.
         """
         body: dict[str, Any] = {"agent_id": agent_id}
         if title is not None:
@@ -483,7 +493,27 @@ class SessionsNamespace:
             body["reasoning_effort"] = reasoning_effort
         if workspace is not None:
             body["workspace"] = workspace
-        resp = await self._http.post(f"{self._base}/v1/sessions", json=body)
+        if host_id is not None:
+            body["host_id"] = host_id
+        timeout = httpx.Timeout(self._http.timeout)
+        if host_id is not None and timeout.read is not None:
+            timeout.read = max(timeout.read, _HOST_LAUNCH_READ_TIMEOUT_S)
+        try:
+            resp = await self._http.post(f"{self._base}/v1/sessions", json=body, timeout=timeout)
+        except httpx.TimeoutException as exc:
+            if host_id is None:
+                raise
+            if isinstance(exc, (httpx.ConnectTimeout, httpx.PoolTimeout)):
+                raise OmnigentError(
+                    f"Timed out connecting to the server to launch a runner on host {host_id!r} "
+                    "(POST /v1/sessions). The launch request was not sent; "
+                    "check the server connection and retry."
+                ) from exc
+            raise OmnigentError(
+                f"Timed out waiting for runner launch on host {host_id!r} "
+                "(POST /v1/sessions). The launch may still complete on the server; "
+                "check the host's runners before retrying."
+            ) from exc
         raise_for_status(resp.status_code, response_body(resp))
         created = require_json_object(resp, "POST /v1/sessions")
         return Session.from_dict(created)
@@ -494,74 +524,51 @@ class SessionsNamespace:
 
         Used by clients that only know the name the user picked — the
         remote-URL chat picker lists names, but session creation binds
-        by id. ``GET /v1/agents`` lists only server-registered
-        (``session_id IS NULL``) agents, so a session-scoped agent is
-        not resolvable this way and raises ``LookupError``.
+        by id. Searches server agents (``GET /v1/agents``), then the
+        caller's own (``scope=user``, from ``omnigent agent add``); a
+        session-scoped agent is not resolvable this way and raises
+        ``LookupError``.
 
         Follows the listing cursor, so an agent past the first page
-        still resolves. The only quiet end of the walk is the server
-        reporting ``has_more`` false; a stalled listing raises instead
-        of masquerading as a clean miss.
+        still resolves. A walk ends quietly when the server reports
+        ``has_more`` false, or when the ``scope=user`` listing answers
+        401, 403, 404 or 422 (no usable user agents); a stalled listing
+        raises instead of masquerading as a clean miss.
 
         :param agent_name: Agent display name, e.g. ``"hello_world"``.
         :returns: The matching agent's id and advertised harness.
-        :raises OmnigentError: If the listing returns a non-2xx status,
-            or reports ``has_more`` with a missing or non-advancing
+        :raises OmnigentError: If a listing returns another non-2xx
+            status, or reports ``has_more`` with a missing or non-advancing
             ``last_id`` cursor (a stalled walk, not an absent agent).
         :raises LookupError: If no registered agent has that name.
         """
-        # Cap the miss-path name list: a large deployment should not
-        # build thousands of names just to render one error message.
-        names: list[str] = []
-        truncated = False
-        after: str | None = None
-        while True:
-            params: dict[str, str | int] = {"limit": 1000}
-            if after is not None:
-                params["after"] = after
-            resp = await self._http.get(f"{self._base}/v1/agents", params=params)
-            raise_for_status(resp.status_code, response_body(resp))
-            listing = require_json_object(resp, "GET /v1/agents")
-            data = listing.get("data", [])
-            for item in data if isinstance(data, list) else []:
-                if not isinstance(item, dict):
-                    continue
-                name = item.get("name")
-                if name == agent_name:
-                    harness = item.get("harness")
-                    return RegisteredAgent(
-                        id=str(item["id"]),
-                        harness=str(harness) if isinstance(harness, str) else None,
-                    )
-                if isinstance(name, str):
-                    if len(names) < 50:
-                        names.append(name)
-                    else:
-                        truncated = True
-            if not listing.get("has_more"):
-                break
-            last_id = listing.get("last_id")
-            if not last_id:
-                # Server reports more pages but provides no cursor to advance
-                # — raise rather than silently stopping, so callers can
-                # distinguish a pagination stall from "agent not found".
-                raise OmnigentError(
-                    f"agent listing stalled: server returned has_more=True but"
-                    f" no last_id cursor (searched so far: {', '.join(names) or '<none>'})"
-                )
-            next_after = str(last_id)
-            if next_after == after:
-                # A cursor that does not advance would page forever; raise
-                # instead of looping on the same page.
-                raise OmnigentError(
-                    f"agent listing stalled: server repeated cursor {next_after!r}"
-                    f" with has_more=True (searched so far: {', '.join(names) or '<none>'})"
-                )
-            after = next_after
-        available = ", ".join(names) + (", …" if truncated else "")
+        agents = await self.list_registered_agents(stop_at=agent_name)
+        for agent in agents:
+            if agent.name == agent_name:
+                return RegisteredAgent(id=agent.id, harness=agent.harness)
+        names = [agent.name for agent in agents]
+        available = ", ".join(names[:50]) + (", ..." if len(names) > 50 else "")
         raise LookupError(
             f"No agent named {agent_name!r} is registered on this server. Available: {available}"
         )
+
+    async def list_registered_agents(
+        self, *, stop_at: str | None = None
+    ) -> list[AgentCatalogEntry]:
+        """List server and user registrations with server-first name precedence.
+
+        :param stop_at: Stop after a validated page containing this name.
+        :returns: Unique registrations in catalog order.
+        :raises OmnigentError: On failed requests, malformed rows or stalled pagination.
+        """
+        catalog = RegisteredAgentCatalog(stop_at=stop_at)
+        while not catalog.done:
+            resp = await self._http.get(f"{self._base}/v1/agents", params=catalog.params)
+            if catalog.skip_unavailable_scope(resp.status_code):
+                break
+            raise_for_status(resp.status_code, response_body(resp))
+            catalog.add_page(require_json_object(resp, "GET /v1/agents"))
+        return list(catalog.entries.values())
 
     async def resolve_online_runner(
         self,
@@ -618,6 +625,53 @@ class SessionsNamespace:
             if wanted & names:
                 return runner_id
         return unknown_harness
+
+    async def list_launch_hosts(
+        self,
+        *,
+        harness: str | None = None,
+    ) -> list[LaunchHost]:
+        """
+        List the caller's connected hosts a runner could be launched on, with readiness.
+
+        Skip sandbox hosts and use ``harness_launch_availability`` so readiness
+        matches the server. Unknown readiness counts as launchable.
+
+        :param harness: Harness the session needs, e.g. ``"claude-sdk"``.
+        :returns: Online hosts in listing order; empty when there are none.
+        :raises OmnigentError: If the listing returns a non-2xx status.
+        """
+        resp = await self._http.get(f"{self._base}/v1/hosts")
+        raise_for_status(resp.status_code, response_body(resp))
+        listing = require_json_object(resp, "GET /v1/hosts")
+        hosts = listing.get("hosts")
+        if not isinstance(hosts, list):
+            raise OmnigentError("GET /v1/hosts returned an unexpected hosts listing")
+
+        result: list[LaunchHost] = []
+        for item in hosts:
+            if not isinstance(item, dict) or item.get("status") != "online":
+                continue
+            if item.get("sandbox_provider") is not None:
+                continue
+            host_id = item.get("host_id")
+            if not isinstance(host_id, str) or not host_id:
+                continue
+            name = item.get("name")
+            display = name if isinstance(name, str) and name else host_id
+            readiness = item.get("configured_harnesses")
+            available, reason = harness_launch_availability(
+                harness, readiness if isinstance(readiness, dict) else None
+            )
+            result.append(
+                LaunchHost(
+                    host_id,
+                    display,
+                    available is not False,
+                    reason if available is False else None,
+                )
+            )
+        return result
 
     async def list(
         self,

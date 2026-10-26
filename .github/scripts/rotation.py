@@ -138,7 +138,7 @@ def _report_todays_assignees(now_utc: datetime.datetime) -> None:
 
 
 def main() -> None:
-    now_utc = datetime.datetime.now(datetime.timezone.utc)
+    now_utc = datetime.datetime.now(datetime.UTC)
 
     print(f"Today's watch by timezone (as of {now_utc:%Y-%m-%d %H:%M UTC}):")
     _report_todays_assignees(now_utc)

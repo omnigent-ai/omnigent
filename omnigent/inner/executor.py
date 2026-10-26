@@ -469,6 +469,11 @@ class MessageSplit:
     transient: list[Message]
 
 
+def without_tool_history(messages: list[Message]) -> list[Message]:
+    """Drop ``tool_call`` / ``tool_result`` items, which only a fresh-session replay uses."""
+    return [msg for msg in messages if msg.get("role") not in ("tool_call", "tool_result")]
+
+
 def split_transient_tail(
     messages: list[Message],
 ) -> MessageSplit:
@@ -641,6 +646,14 @@ def classify_tool_result(
 # ---------------------------------------------------------------------------
 
 
+class InjectionDeliveryAmbiguous(Exception):
+    """A live message may already have reached the harness, so it must not be resent.
+
+    :meth:`Executor.enqueue_session_message` raises this when the harness's reply
+    to a submission it may have accepted was lost.
+    """
+
+
 class Executor:
     """Abstract interface for LLM backends and agent harnesses.
 
@@ -680,6 +693,14 @@ class Executor:
         """
         return False
 
+    def replays_tool_history(self) -> bool:
+        """Whether history handed to this executor keeps recorded tool calls and outputs.
+
+        Off by default: an executor that renders history as prompt text would
+        inline every tool output on each fresh session.
+        """
+        return False
+
     def max_context_tokens(self) -> int | None:
         return None
 
@@ -697,7 +718,10 @@ class Executor:
         return False
 
     async def enqueue_session_message(self, session_key: str, content: EnqueuedContent) -> bool:  # noqa: ARG002 — default no-op; subclasses override to support live queueing
-        """Send a new user message to a live session without interrupting it, if supported."""
+        """Send a new user message to a live session without interrupting it, if supported.
+
+        :raises InjectionDeliveryAmbiguous: The harness may have accepted the message.
+        """
         return False
 
     def supports_live_message_queue(self) -> bool:
