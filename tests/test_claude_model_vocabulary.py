@@ -5,6 +5,7 @@ import pytest
 from omnigent.models.claude_model_vocabulary import (
     claude_model_alias,
     claude_model_command_arg,
+    is_claude_model_alias,
     model_vocabulary_env,
     normalized_model_id,
     picker_command_values,
@@ -201,6 +202,23 @@ def test_bracket_marker_on_a_non_alias_is_not_an_argument() -> None:
     # A dangling bracket is not a marker; on a pinned env nothing else
     # claims it either (the bare-login segment fallback is separate).
     assert claude_model_alias("sonnet[", _PINNED_ENV) is None
+
+
+@pytest.mark.parametrize(
+    ("model", "expected"),
+    [
+        ("sonnet", True),
+        ("Opus", True),
+        ("opus[1m]", True),
+        ("sonnet[", False),
+        ("gpt-5.5[1m]", False),
+        ("claude-opus-4-7", False),
+        ("system.ai.claude-haiku-5-5", False),
+    ],
+)
+def test_only_family_aliases_count_as_aliases(model: str, expected: bool) -> None:
+    """A family alias or its bracket variant counts; a model id never does."""
+    assert is_claude_model_alias(model) is expected
 
 
 def test_served_alias_pins_pick_the_newest_served_id_per_family() -> None:

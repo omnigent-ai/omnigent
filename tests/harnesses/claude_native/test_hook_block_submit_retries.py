@@ -185,7 +185,7 @@ async def test_unconfirmed_terminal_refusal_remains_an_executor_error(
     from omnigent.inner.executor import ExecutorError
     from omnigent.runtime import pending_inputs
 
-    async def refused(*_args: object) -> None:
+    async def refused(*_args: object, **_kwargs: object) -> None:
         raise bridge.ClaudeSubmitBlockedUnconfirmed("Web delivery could not be confirmed.")
 
     pending_inputs.reset_for_tests()

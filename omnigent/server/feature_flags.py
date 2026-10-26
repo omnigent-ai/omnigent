@@ -29,6 +29,7 @@ class Feature(StrEnum):
     CUSTOM_AGENTS_SETTINGS_UI = "custom_agents_settings_ui"
     SIDEBAR_GROUPING_UI = "sidebar_grouping_ui"
     CLAUDE_OSC_STATUS = "claude_osc_status"
+    CLAUDE_MOD_CHANNEL = "claude_mod_channel"
     WORKSPACE_CONTENT_SEARCH = "workspace_content_search"
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
@@ -125,6 +126,16 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         review_by_release="0.20.0",
         frontend_visible=False,
         default_enabled=True,
+    ),
+    FeatureDefinition(
+        feature=Feature.CLAUDE_MOD_CHANNEL,
+        description=(
+            "Claude-native sessions drive prompts, model, effort and compact through"
+            " the omnigent-bridge mod, with tmux as the fallback"
+        ),
+        owner="runner",
+        review_by_release="0.21.0",
+        frontend_visible=False,
     ),
     FeatureDefinition(
         feature=Feature.WORKSPACE_CONTENT_SEARCH,
