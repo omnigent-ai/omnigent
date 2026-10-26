@@ -39,6 +39,7 @@ from omnigent.runner.transports.ws_tunnel.serve import dispatch_via_asgi
 from omnigent.runner.transports.ws_tunnel.transport import WSTunnelTransport
 from omnigent.server import tunnel_handshake
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
+from omnigent.server.disconnect_evidence import DisconnectEvidence
 from omnigent.server.routes.runner_tunnel import create_runner_tunnel_router
 from tests.budgets import budget
 from tests.runner.helpers import NullServerClient
@@ -485,6 +486,42 @@ async def test_abnormal_peer_disconnect_preserves_code_during_registry_cleanup(
     assert ends[0]["code"] == 1006
     assert ends[0]["reason"] == ""
     assert route_app.registry.get(_RUNNER_ID) is None
+
+
+@pytest.mark.parametrize(
+    ("end", "code", "category"),
+    [("peer-1006", 1006, "abnormal"), ("server-retire", 1001, "server_closed")],
+)
+async def test_drop_evidence_survives_the_routes_registry_cleanup(
+    end: str, code: int, category: str
+) -> None:
+    """The cleanup close ``deregister`` records must not relabel a runner's own drop."""
+    registry = TunnelRegistry()
+    ended: list[RunnerSession] = []
+
+    async def on_disconnect(_runner_id: str, session: RunnerSession) -> None:
+        ended.append(session)
+
+    app = FastAPI()
+    app.include_router(
+        create_runner_tunnel_router(registry, on_runner_disconnect=on_disconnect), prefix="/v1"
+    )
+    communicator = await _connect_route(app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, registry, connection_id="conn-evidence")
+        if end == "peer-1006":
+            await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        else:
+            registry.deregister(_RUNNER_ID)
+        await asyncio.wait_for(communicator.future, timeout=budget(1.0))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+    [session] = ended
+    evidence = DisconnectEvidence.from_session(session)
+    assert evidence is not None
+    assert (evidence.close_code, evidence.close_reason_category) == (code, category)
 
 
 async def test_simultaneous_retirement_and_peer_disconnect_logs_once(

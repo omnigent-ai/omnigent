@@ -4,10 +4,12 @@ from __future__ import annotations
 
 import logging
 from types import SimpleNamespace
+from typing import cast
 
 import pytest
 
 from omnigent.runner.transports.ws_tunnel.frames import RUNNER_IDLE_SHUTDOWN_CLOSE_REASON
+from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelEnd
 from omnigent.server import disconnect_evidence
 from omnigent.server.disconnect_evidence import DisconnectEvidence
 from omnigent.server.routes._sessions import helpers
@@ -16,48 +18,64 @@ from omnigent.server.schemas import ErrorDetail
 _DETAIL = "Runner disconnected unexpectedly."
 
 
-def _session(**fields: object) -> SimpleNamespace:
-    base = {
-        "connected_at": 1_000.0,
-        "close_code": None,
-        "close_reason": None,
-        "peer_close_code": None,
-        "peer_close_reason": None,
+def _session(end: TunnelEnd | None) -> RunnerSession:
+    return cast(RunnerSession, SimpleNamespace(connected_at=1_000.0, ended=end))
+
+
+def _end(**fields: object) -> TunnelEnd:
+    base: dict[str, object] = {
+        "at": 1_013.25,
+        "peer_code": None,
+        "peer_reason": None,
+        "server_code": None,
     }
     base.update(fields)
-    return SimpleNamespace(**base)
+    return TunnelEnd(**base)  # type: ignore[arg-type]
 
 
-def test_drop_evidence_names_abnormal_close_without_free_text() -> None:
-    session = _session(peer_close_code=1006, peer_close_reason="host went to sleep, dave's laptop")
+@pytest.mark.parametrize(
+    ("end", "code", "category"),
+    [
+        (_end(peer_code=1006), 1006, "abnormal"),
+        (_end(peer_code=1006, peer_reason="host went to sleep, dave's laptop"), 1006, "abnormal"),
+        (
+            _end(peer_code=1000, peer_reason=RUNNER_IDLE_SHUTDOWN_CLOSE_REASON),
+            1000,
+            "idle_shutdown",
+        ),
+        (_end(peer_code=1001, peer_reason="runner shutting down"), 1001, "runner_closed"),
+        (_end(server_code=4003), 4003, "server_closed"),
+        # A peer reply to a close this server requested first is still the server's close.
+        (_end(server_code=1001, peer_code=1006), 1006, "server_closed"),
+        (_end(), None, "none"),
+    ],
+    ids=[
+        "reasonless-1006",
+        "1006-with-text",
+        "idle-shutdown",
+        "runner-close",
+        "server-close",
+        "server-then-peer",
+        "no-close",
+    ],
+)
+def test_drop_evidence_is_a_bounded_category(
+    end: TunnelEnd, code: int | None, category: str
+) -> None:
+    evidence = DisconnectEvidence.from_session(_session(end))
 
-    evidence = DisconnectEvidence.from_session(session, now=1_013.25)
-
-    assert evidence.close_code == 1006
-    assert evidence.close_reason_category == "runner_closed"
+    assert evidence is not None
+    assert (evidence.close_code, evidence.close_reason_category) == (code, category)
     assert evidence.connection_age_s == 13.25
     attributes = evidence.log_attributes(hold_s=86400.0, hold_outcome="expired")
-    assert attributes == {
-        "drop_disconnected_at": "1970-01-01T00:16:53.250+00:00",
-        "drop_close_code": "1006",
-        "drop_close_reason_category": "runner_closed",
-        "drop_connection_age_s": "13.25",
-        "hold_s": "86400.0",
-        "hold_outcome": "expired",
-    }
+    assert attributes["drop_disconnected_at"] == "1970-01-01T00:16:53.250+00:00"
+    assert attributes["drop_close_code"] == ("unknown" if code is None else str(code))
+    assert attributes["hold_s"] == "86400.0"
     assert "dave" not in repr(attributes)
 
 
-def test_idle_shutdown_and_server_close_are_categories_not_text() -> None:
-    idle = _session(peer_close_code=1000, peer_close_reason=RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)
-    assert DisconnectEvidence.from_session(idle, now=1_001.0).close_reason_category == (
-        "idle_shutdown"
-    )
-    server = _session(close_code=4003, close_reason="shard reassigned for host 1234")
-    evidence = DisconnectEvidence.from_session(server, now=1_001.0)
-    assert evidence.close_code == 4003
-    assert evidence.close_reason_category == "server_closed"
-    assert evidence.log_attributes(hold_s=None, hold_outcome=None)["hold_s"] == "none"
+def test_a_session_without_an_end_snapshot_has_no_evidence() -> None:
+    assert DisconnectEvidence.from_session(_session(None)) is None
 
 
 def test_failure_row_carries_drop_attributes(caplog: pytest.LogCaptureFixture) -> None:

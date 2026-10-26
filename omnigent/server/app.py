@@ -4080,7 +4080,7 @@ def create_app(
                 runner_id,
                 reference_stamp,
                 idle_shutdown=idle_shutdown,
-                evidence=DisconnectEvidence.from_session(connection, now=time.time()),
+                evidence=DisconnectEvidence.from_session(connection),
             ),
             name=f"runner-disconnect-grace-{runner_id}",
         )
