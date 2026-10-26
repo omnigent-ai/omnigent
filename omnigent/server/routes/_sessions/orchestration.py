@@ -7705,6 +7705,17 @@ async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
         return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
 
 
+def _codex_side_chat_thread_id(conv: Conversation) -> str | None:
+    """Return the parent app-server thread that runs a Codex child's turns, if forwardable."""
+    from omnigent.server.routes._sessions.common import (
+        _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
+    )
+
+    if not _is_codex_native_subagent(conv) or not conv.parent_conversation_id:
+        return None
+    return (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY) or None
+
+
 async def _forward_codex_side_chat_turn(
     conv: Conversation,
     body: SessionEventInput,
@@ -7878,7 +7889,7 @@ async def _dispatch_session_event_to_runner_impl(
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
-    if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
+    if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
         # the child thread echo, staying the single writer).

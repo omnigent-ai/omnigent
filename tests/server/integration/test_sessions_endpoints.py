@@ -10506,6 +10506,61 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
         _session_status_cache.pop(child_id, None)
 
 
+async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A side-chat follow-up must not start a runner session (and terminal) for the child."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    child_response = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert child_response.status_code == 202, child_response.text
+    child_id = child_response.json()["child_session_id"]
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(child_id, "native-runner")
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(202)
+
+    initialize = AsyncMock(return_value=True)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+    content = [{"type": "input_text", "text": "and why?"}]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner))
+        response = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={"type": "message", "data": {"role": "user", "content": content}},
+        )
+
+    assert response.status_code == 202, response.text
+    initialize.assert_not_awaited()
+    assert forwarded == [
+        (
+            f"/v1/sessions/{parent['id']}/events",
+            {"type": "message", "content": content, "codex_side_thread_id": "thread_side"},
+        )
+    ]
+
+
 async def test_interrupt_forward_success_keeps_stop_fence(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

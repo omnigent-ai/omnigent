@@ -17987,6 +17987,100 @@ describe("chatStore — client-side message queue", () => {
     },
   );
 
+  it("queues a side chat's follow-up on its own entry and drains it when that turn ends", async () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main", sessionStatus: "running" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+    seedConversationsCache([conv("conv_main", "running"), conv("conv_side", "idle")]);
+    const posts = (id: string) =>
+      fetchMock.mock.calls
+        .filter(
+          ([u, init]) =>
+            u === `/v1/sessions/${id}/events` && (init as RequestInit)?.method === "POST",
+        )
+        .map(([, init]) => JSON.parse((init as RequestInit).body as string));
+
+    useChatStore.getState().enqueueMessage("side follow-up", undefined, undefined, "conv_side");
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({
+        text: "side follow-up",
+        conversationId: "conv_side",
+        agentId: "agent_side",
+      }),
+    ]);
+    // The side chat's entry owns this queue, not the sidebar-driven background flush.
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    expect(posts("conv_side")).toEqual([]);
+
+    side.setState({ sessionStatus: "idle" });
+    await tick();
+    expect(posts("conv_side")).toEqual([
+      expect.objectContaining({
+        type: "message",
+        data: expect.objectContaining({
+          content: [{ type: "input_text", text: "side follow-up" }],
+        }),
+      }),
+    ]);
+    expect(posts("conv_main")).toEqual([]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
+  it("drains an idle side chat's queue when a held head is released", async () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+    useChatStore.getState().enqueueMessage("held follow-up", undefined, undefined, "conv_side");
+    useChatStore.setState((s) => ({
+      queuedMessages: s.queuedMessages.map((m) => ({ ...m, waitingForHost: true })),
+    }));
+    side.setState({ sessionStatus: "idle" });
+    await tick();
+    const sidePosts = () =>
+      fetchMock.mock.calls.filter(
+        ([u, init]) =>
+          u === "/v1/sessions/conv_side/events" && (init as RequestInit)?.method === "POST",
+      );
+    expect(sidePosts()).toEqual([]);
+
+    // The release only edits the app-global queue, never the side chat's entry.
+    useChatStore.getState().releaseHostHeldMessages("conv_side");
+    await tick();
+    expect(sidePosts()).toHaveLength(1);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("restores a taken side-chat queue ahead of newer follow-ups and drains it", async () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+    useChatStore.getState().enqueueMessage("first follow-up", undefined, undefined, "conv_side");
+    const taken = useChatStore.getState().clearQueuedMessages("conv_side");
+    await tick();
+    useChatStore.setState((s) => ({
+      queuedMessages: [
+        ...s.queuedMessages,
+        { queueId: "q_newer", text: "newer follow-up", conversationId: "conv_side" },
+      ],
+    }));
+
+    useChatStore.getState().restoreQueuedMessages(taken);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "first follow-up",
+      "newer follow-up",
+    ]);
+    side.setState({ sessionStatus: "idle" });
+    await tick();
+    const sidePosts = fetchMock.mock.calls.filter(
+      ([u, init]) =>
+        u === "/v1/sessions/conv_side/events" && (init as RequestInit)?.method === "POST",
+    );
+    expect(sidePosts).toHaveLength(1);
+    expect(String((sidePosts[0][1] as RequestInit).body)).toContain("first follow-up");
+  });
+
   it.each(
     ["compaction_completed", "compaction_failed", "pi_compact_unavailable"].flatMap((terminal) =>
       [false, true].map((background) => [terminal, background] as const),

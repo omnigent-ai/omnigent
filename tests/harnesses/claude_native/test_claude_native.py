@@ -269,9 +269,11 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     }
     args = spec["args"]
-    assert args[:9] == [
+    assert args[:11] == [
         "-u",
         "ANTHROPIC_API_KEY",
+        "-u",
+        "ANTHROPIC_AUTH_TOKEN",
         "-u",
         "CLAUDECODE",
         "claude",
@@ -285,6 +287,28 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert "hooks" in settings
     assert "modelOverrides" not in settings
+
+
+def test_claude_terminal_request_without_helper_preserves_credentials(
+    tmp_path, monkeypatch
+) -> None:
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "CLAUDE_CODE_USE_GATEWAY": "1",
+            "ANTHROPIC_AUTH_TOKEN": "test-token",
+            "ANTHROPIC_API_KEY": "test-key",
+        },
+    )
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=config,
+    )
+
+    assert body["spec"]["args"][:3] == ["-u", "CLAUDECODE", "claude"]
+    assert body["spec"]["env"]["ANTHROPIC_AUTH_TOKEN"] == "test-token"
+    assert body["spec"]["env"]["ANTHROPIC_API_KEY"] == "test-key"
 
 
 def test_native_config_does_not_infer_overrides_from_routable_models() -> None:
@@ -375,9 +399,11 @@ def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch)
     )
 
     args = body["spec"]["args"]
-    assert args[:9] == [
+    assert args[:11] == [
         "-u",
         "ANTHROPIC_API_KEY",
+        "-u",
+        "ANTHROPIC_AUTH_TOKEN",
         "-u",
         "CLAUDECODE",
         "claude",
