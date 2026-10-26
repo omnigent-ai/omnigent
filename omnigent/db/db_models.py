@@ -1463,8 +1463,9 @@ class SqlScheduledTask(OmnigentBase):
         deterministic id at fire time, so there is nothing to pin).
     :param timezone: IANA timezone the trigger is evaluated in, e.g.
         ``"America/Los_Angeles"``.
-    :param state: Lifecycle state — ``active``/``paused``/``deleted``.
-        The scheduler only dispatches ``active`` tasks.
+    :param state: Lifecycle state — ``active``/``paused``/``deleted``/``completed``.
+        The scheduler only dispatches ``active`` tasks; ``completed`` schedules
+        have no remaining occurrences.
         Stored as a stable int code (see omnigent.db.enum_codecs
         SCHEDULED_TASK_STATE); the store converts to/from the string name at the
         row↔entity boundary. Defaults to ``active``.
@@ -1538,7 +1539,7 @@ class SqlScheduledTask(OmnigentBase):
     host_id: Mapped[str | None] = mapped_column(Uuid16, nullable=True)
     timezone: Mapped[str] = mapped_column(String(64), nullable=False, server_default="UTC")
     # Enum stored as a stable int code (see omnigent.db.enum_codecs
-    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3). The
+    # SCHEDULED_TASK_STATE: active=1, paused=2, deleted=3, completed=4). The
     # store converts to/from the string name at the row↔entity boundary.
     state: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default="1")
     last_run_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
@@ -1549,7 +1550,7 @@ class SqlScheduledTask(OmnigentBase):
     updated_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
 
     __table_args__ = (
-        CheckConstraint("state IN (1, 2, 3)", name="ck_scheduled_tasks_state"),
+        CheckConstraint("state IN (1, 2, 3, 4)", name="ck_scheduled_tasks_lifecycle_state"),
         CheckConstraint("execution_target IN (1, 2)", name="ck_scheduled_tasks_execution_target"),
         Index("ix_scheduled_tasks_due", "state", "next_run_at", "workspace_id", "id"),
         # Covers a user's task listing ordered by creation time.

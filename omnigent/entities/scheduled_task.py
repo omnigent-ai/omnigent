@@ -64,7 +64,8 @@ class ScheduledTask:
     :param host_id: Specific connected host to run on. ``None`` only for legacy
         or invalid rows.
     :param state: Lifecycle state — one of ``"active"``, ``"paused"``,
-        ``"deleted"``. Defaults to ``"active"``.
+        ``"deleted"``, or ``"completed"`` once a schedule has no remaining
+        occurrences. Defaults to ``"active"``.
     :param last_run_at: Unix epoch seconds of the most recent firing, or
         ``None`` if it has never fired.
     :param last_run_conversation_id: Conversation created by the most recent

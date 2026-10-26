@@ -112,6 +112,7 @@ SCHEDULED_TASK_STATE: dict[str, int] = {
     "active": 1,
     "paused": 2,
     "deleted": 3,
+    "completed": 4,
 }
 
 SCHEDULED_TASK_EXECUTION_TARGET: dict[str, int] = {
