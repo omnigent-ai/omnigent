@@ -23,6 +23,7 @@ from omnigent.harnesses.claude_native.bridge import (
     ClaudeTerminalExited,
     ClaudeUserPromptPending,
     TmuxSessionNotAdvertised,
+    advance_queued_prompts,
     cancellable_injection,
     has_pending_user_prompt,
     inject_slash_command,
@@ -30,11 +31,14 @@ from omnigent.harnesses.claude_native.bridge import (
     is_auth_slash_command,
     kill_session,
     read_active_session_id,
+    read_claude_session_id,
     read_claude_status_model,
     read_launch_model,
     read_model_env,
     read_model_picker_values,
+    start_queued_prompts,
 )
+from omnigent.harnesses.claude_native.submit_verification import PromptQueue
 from omnigent.inner.executor import (
     EnqueuedContent,
     Executor,
@@ -55,11 +59,14 @@ from omnigent.models.claude_model_vocabulary import claude_model_command_arg, no
 
 _logger = logging.getLogger(__name__)
 
-# How long a turn waits for the person to answer a Claude question or permission
-# prompt that held its message before anything was typed. Inside the server's
-# 600 s pending-input lifetime, so a message still held at the end is reported.
+# Longest a message is held untyped, behind a queued /-led message or a Claude prompt;
+# inside the server's 600 s pending-input lifetime, so a message still held is reported.
 _ANSWER_HOLD_S = 8 * 60.0
 _ANSWER_POLL_S = 1.0
+_INACTIVE_SESSION_MESSAGE = (
+    "Claude native session is no longer active after /clear; "
+    "open the latest conversation and retry."
+)
 
 
 class ClaudeNativeExecutor(Executor):
@@ -97,6 +104,10 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` when the model actually changes. Seeded lazily from the
         # spawn ``launch_model`` on the first turn (``None`` = not yet known).
         self._applied_model: str | None = None
+        # Claude Code's prompt queue, followed through its transcript log.
+        self._prompt_queue: PromptQueue | None = None
+        # Queued prompts already held for as long as allowed.
+        self._released_prompts: set[int] = set()
 
     def supports_streaming(self) -> bool:
         """:returns: ``False`` because output is emitted by the transcript forwarder."""
@@ -130,8 +141,11 @@ class ClaudeNativeExecutor(Executor):
             # run_turn's short-circuit answers it with the `omni setup`
             # guidance instead of spending a model turn on it.
             return False
+        deadline = asyncio.get_running_loop().time() + _ANSWER_HOLD_S
         try:
             async with self._inject_lock:
+                if not await self._wait_for_queued_slash_prompt(deadline):
+                    return False
                 await self._inject_prompt(text, framework_notices(content))
         except RuntimeError:
             return False
@@ -143,9 +157,16 @@ class ClaudeNativeExecutor(Executor):
         notices: list[str],
         wanted_model: str | None,
         wanted_model_arg: str | None,
-    ) -> None:
-        """Apply a routed ``/model`` switch, then inject the message, in one lock hold."""
+        hold_deadline: float,
+    ) -> bool:
+        """
+        Apply a routed ``/model`` switch, then inject the message, in one lock hold.
+
+        :returns: ``False``, with nothing typed, once this session no longer owns the pane.
+        """
         async with self._inject_lock:
+            if not await self._wait_for_queued_slash_prompt(hold_deadline):
+                return False
             context_path = self._bridge_dir / CLAUDE_FRAMEWORK_CONTEXT_FILE
             context_path.unlink(missing_ok=True)
             if wanted_model_arg is not None:
@@ -167,6 +188,7 @@ class ClaudeNativeExecutor(Executor):
                 # comparison is against what routing asked for.
                 self._applied_model = wanted_model
             await self._inject_prompt(text, notices)
+        return True
 
     async def _wait_for_answer(self, deadline: float) -> bool:
         """
@@ -194,6 +216,72 @@ class ClaudeNativeExecutor(Executor):
             if not pending:
                 return True
         return False
+
+    async def _wait_for_queued_slash_prompt(self, deadline: float) -> bool:
+        """
+        Hold the next message while a message starting with ``/`` may wait in Claude's queue.
+
+        Claude folds later queued messages into the running turn ahead of it. Past
+        *deadline* the message is delivered anyway, and the prompts it waited for
+        hold nothing more.
+
+        :param deadline: Event-loop time the hold ends at.
+        :returns: Whether this session still owns the pane after the hold.
+        """
+        loop = asyncio.get_running_loop()
+        queue = await self._follow_queue()
+        held_session = queue.boundary.native_session_id if queue else None
+        held = self._holds(queue)
+        if held:
+            _logger.info(
+                "claude-native: holding the message until Claude takes a queued /-led message",
+                extra={"session_id": self._request_session_id},
+            )
+            while self._holds(queue) and loop.time() < deadline:
+                await asyncio.sleep(_ANSWER_POLL_S)
+                queue = await self._follow_queue()
+            if queue is not None and self._holds(queue):
+                _logger.warning(
+                    "claude-native: a queued /-led message is still waiting; delivering anyway",
+                    extra={"session_id": self._request_session_id},
+                )
+                self._released_prompts.update(prompt.offset for prompt in queue.prompts)
+            # /clear starts a new native session before this session gives up the pane.
+            native_session = await asyncio.to_thread(read_claude_session_id, self._bridge_dir)
+            if native_session != held_session:
+                return False
+        return _session_is_active(self._bridge_dir, self._request_session_id)
+
+    async def _follow_queue(self) -> PromptQueue | None:
+        """Advance :attr:`_prompt_queue`, starting at the transcript's end when there is none."""
+        if self._prompt_queue is not None:
+            try:
+                self._prompt_queue = await asyncio.to_thread(
+                    advance_queued_prompts, self._bridge_dir, self._prompt_queue
+                )
+            except (OSError, ValueError, RuntimeError):
+                # Unreadable for now: keep what the log showed last.
+                return self._prompt_queue
+        if self._prompt_queue is None:
+            try:
+                self._prompt_queue = await asyncio.to_thread(
+                    start_queued_prompts, self._bridge_dir
+                )
+            except (OSError, ValueError, RuntimeError):
+                self._prompt_queue = None
+        queue = self._prompt_queue
+        if queue is None or not queue.prompts:
+            self._released_prompts.clear()
+        return queue
+
+    def _holds(self, queue: PromptQueue | None) -> bool:
+        """Whether a ``/``-led prompt that may still be queued holds the next message."""
+        return queue is not None and any(
+            prompt.offset not in self._released_prompts
+            and prompt.text is not None
+            and prompt.text.strip().startswith("/")
+            for prompt in queue.prompts
+        )
 
     async def _inject_prompt(self, text: str, notices: list[str]) -> None:
         """Inject user text with one-shot context while holding the injection lock."""
@@ -242,12 +330,7 @@ class ClaudeNativeExecutor(Executor):
         """
         del tools, system_prompt
         if not _session_is_active(self._bridge_dir, self._request_session_id):
-            yield ExecutorError(
-                message=(
-                    "Claude native session is no longer active after /clear; "
-                    "open the latest conversation and retry."
-                )
-            )
+            yield ExecutorError(message=_INACTIVE_SESSION_MESSAGE)
             return
         text = _latest_user_text(messages, self._bridge_dir)
         notices = _latest_framework_notices(messages)
@@ -293,20 +376,21 @@ class ClaudeNativeExecutor(Executor):
         # ``/model`` only accepts this session's picker values, aliases, and
         # custom slot; anything else is ignored and the pane keeps its model.
         wanted_model_arg = self._model_command_arg(wanted_model)
+        delivered = False
+        hold_deadline = asyncio.get_running_loop().time() + _ANSWER_HOLD_S
         try:
             with telemetry.span("claude_native.inject"):
-                answer_deadline: float | None = None
                 while True:
                     try:
-                        await self._inject_turn(text, notices, wanted_model, wanted_model_arg)
+                        delivered = await self._inject_turn(
+                            text, notices, wanted_model, wanted_model_arg, hold_deadline
+                        )
                         break
                     except ClaudeUserPromptPending as exc:
                         # Refused before anything was typed: wait for the answer and retry.
                         if not exc.nothing_typed:
                             raise
-                        if answer_deadline is None:
-                            answer_deadline = asyncio.get_running_loop().time() + _ANSWER_HOLD_S
-                        if not await self._wait_for_answer(answer_deadline):
+                        if not await self._wait_for_answer(hold_deadline):
                             raise
                         wanted_model_arg = self._model_command_arg(wanted_model)
         except ClaudeTerminalExited as exc:
@@ -389,6 +473,9 @@ class ClaudeNativeExecutor(Executor):
                 extra={"session_id": self._request_session_id},
             )
             yield ExecutorError(message=describe_exception(exc))
+            return
+        if not delivered:
+            yield ExecutorError(message=_INACTIVE_SESSION_MESSAGE, undelivered=True)
             return
         yield TurnComplete(response=None)
 

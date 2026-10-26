@@ -74,9 +74,12 @@ from omnigent.harnesses.claude_native.failure_telemetry import claude_failure_co
 from omnigent.harnesses.claude_native.message_display_hook import MESSAGE_DELTAS_FILE
 from omnigent.harnesses.claude_native.status import CONTEXT_RAW_FILE
 from omnigent.harnesses.claude_native.submit_verification import (
+    PromptQueue,
     SubmitBoundary,
+    advance_prompt_queue,
     capture_submit_boundary,
     has_matching_hook_refusal,
+    start_prompt_queue,
 )
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
@@ -4634,17 +4637,22 @@ def _fresh_matching_hook_block(
     bridge_dir: Path, boundary: SubmitBoundary, submitted_text: str
 ) -> bool:
     """A matching refusal prevents retries; it never establishes input ownership."""
-    if read_claude_session_id(bridge_dir) != boundary.native_session_id:
-        return False
-    path = read_transcript_path(bridge_dir)
-    try:
-        if path is None or path.resolve() != boundary.path:
-            return False
-    except (OSError, ValueError, RuntimeError):
+    if not _boundary_is_current(bridge_dir, boundary):
         return False
     return has_matching_hook_refusal(
         boundary, submitted_text, normalize_prompt=_unwrap_pasted_content_markers
     )
+
+
+def _boundary_is_current(bridge_dir: Path, boundary: SubmitBoundary) -> bool:
+    """Whether hooks still report the session and transcript *boundary* was pinned to."""
+    if read_claude_session_id(bridge_dir) != boundary.native_session_id:
+        return False
+    path = read_transcript_path(bridge_dir)
+    try:
+        return path is not None and path.resolve() == boundary.path
+    except (OSError, ValueError, RuntimeError):
+        return False
 
 
 def _count_unknown_command_rejections(pane: str, needle: str) -> int:
@@ -5927,6 +5935,46 @@ def has_pending_user_prompt(bridge_dir: Path) -> bool:
     if not isinstance(socket_path, str) or not isinstance(target, str):
         return False
     return _user_prompt_visible(_capture_pane(socket_path, target))
+
+
+def start_queued_prompts(bridge_dir: Path) -> PromptQueue | None:
+    """
+    Start following Claude Code's prompt queue at the end of the session's transcript.
+
+    :param bridge_dir: The session's native bridge directory.
+    :returns: The queue, or ``None`` before hooks name the session and transcript.
+    :raises OSError: When the transcript cannot be read now.
+    """
+    transcript_path = read_transcript_path(bridge_dir)
+    native_session_id = read_claude_session_id(bridge_dir)
+    if transcript_path is None or native_session_id is None:
+        return None
+    return start_prompt_queue(transcript_path, native_session_id)
+
+
+def advance_queued_prompts(bridge_dir: Path, queue: PromptQueue) -> PromptQueue | None:
+    """
+    Follow Claude Code's prompt queue past *queue*'s boundary.
+
+    ``None`` once the session or transcript changed, or the pane's process exited:
+    the queue lives only in that process.
+
+    :param bridge_dir: The session's native bridge directory.
+    :param queue: The queue followed so far, from :func:`start_queued_prompts`.
+    :returns: The advanced queue; non-text entries have ``None`` text.
+    :raises OSError: When the transcript cannot be read now.
+    """
+    if not _boundary_is_current(bridge_dir, queue.boundary):
+        return None
+    info = _read_json_file(bridge_dir / _TMUX_FILE)
+    socket_path, target = info.get("socket_path"), info.get("tmux_target")
+    if (
+        isinstance(socket_path, str)
+        and isinstance(target, str)
+        and _claude_pane_state(socket_path, target).alive is False
+    ):
+        return None
+    return advance_prompt_queue(queue)
 
 
 def auto_mode_billing_notice_visible(pane: str) -> bool:
