@@ -1282,8 +1282,10 @@ describe("WorkspacePanel mobile side chats", () => {
       expect(useChatStore.getState().sideChatDrafts.conv_side_b).toBe("Keep this question");
       expect(sideQueue()).toEqual([followUp]);
 
+      const queuedDuringStop = { ...followUp, queueId: "q_late", text: "Queued while closing" };
       stop.mockImplementationOnce(async () => {
         queuedAtStop.push(sideQueue());
+        useChatStore.setState((s) => ({ queuedMessages: [...s.queuedMessages, queuedDuringStop] }));
         return { queued: false };
       });
       fireEvent.click(within(surface).getByRole("button", { name: "Close Side chat 2" }));

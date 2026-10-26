@@ -1092,8 +1092,9 @@ function WorkspacePanelImpl({
         return;
       }
     }
-    // The tab is gone, so its unsent text/attachments and any seeded question
-    // that never got to send have nowhere to return to.
+    // The tab is gone, so its unsent text/attachments, follow-ups queued during the
+    // stop, and any seeded question that never got to send have nowhere to return to.
+    useChatStore.getState().clearQueuedMessages(childId);
     useChatStore.getState().clearSideChatComposer(childId);
     useChatStore.getState().clearSideChatDraft(childId);
     sideChats.close(childId);
