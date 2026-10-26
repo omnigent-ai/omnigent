@@ -200,6 +200,7 @@ map an area, remove it here in the same change.
   terminal touch scroll are mapped)
 - Onboarding and host import review: `tests/e2e_ui/onboarding/` (only the
   import review modal's link to Harnesses is mapped)
+- Settings → Models & providers (host provider CRUD, per-agent pins): `tests/e2e_ui/settings/`
 - Visual snapshots: `tests/e2e_ui/visual/`
 
 **CLI commands:**

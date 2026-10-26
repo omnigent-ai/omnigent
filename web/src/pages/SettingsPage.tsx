@@ -278,6 +278,8 @@ import { SettingsCustomAgentsSection } from "./settings/SettingsCustomAgentsSect
 // Admin-only management surfaces, rendered as the Members / Policies settings
 // sub-categories. Visible to admins in all modes (accounts, OIDC, single-user).
 // Lazy-loaded to keep the settings chunk small.
+import { ModelProvidersSection } from "@/components/modelProviders/ModelProvidersSection";
+
 const MembersPage = lazy(() =>
   import("@/pages/MembersPage").then((m) => ({ default: m.MembersPage })),
 );
@@ -365,6 +367,7 @@ export function SettingsPage() {
           )}
         </Section>
       )}
+      {section === "models" && <ModelProvidersSection />}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
