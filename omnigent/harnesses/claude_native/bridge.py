@@ -4803,6 +4803,11 @@ def wait_for_input_ready(
     )
 
 
+@delivery_diagnostics.trace_delivery(
+    session_id_reader=read_active_session_id,
+    cancelled_error=ClaudeInjectionCancelled,
+    content_argument="command",
+)
 @_serialize_bridge_injection
 def inject_slash_command(
     bridge_dir: Path,
@@ -4866,12 +4871,15 @@ def inject_slash_command(
         if not confirm_hint:
             raise ValueError("auto_confirm needs the confirm_hint its dialog renders")
         dialog_hint = confirm_hint
+    delivery_diagnostics.start_attempt()
+    delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
     # Same reclaim-then-wait as inject_user_message: a surface left occupying
     # the composer would swallow the clearing keys and command, and a TUI that
     # has not mounted its input box yet would drop them.
+    delivery_diagnostics.set_stage("waiting_for_prompt")
     _reclaim_and_wait_for_prompt(
         bridge_dir,
         socket_path,
@@ -4879,6 +4887,7 @@ def inject_slash_command(
         timeout_s=timeout_s,
         ready_timeout_s=ready_timeout_s,
     )
+    delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
@@ -4887,32 +4896,56 @@ def inject_slash_command(
     # concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
+    delivery_diagnostics.set_stage("clearing_composer")
     _clear_composer(socket_path, tmux_target)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
+    delivery_diagnostics.set_stage("typing_command")
     _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, command)
     # Same delivery hazards as inject_user_message: a coalesced or dropped
     # Enter leaves the command drafted while the persisted session value
     # claims it applied. Wait for the command to render, submit, verify it
     # left the box; an unidentifiable draft falls through to a blind submit.
     needle = _submit_needle(command)
+    delivery_diagnostics.set_stage("waiting_for_draft")
     draft_seen = False
-    deadline = time.monotonic() + _PASTE_COMMIT_TIMEOUT_S
+    pane = ""
+    polls = 0
+    empty_captures = 0
+    paste_wait_started = time.monotonic()
+    deadline = paste_wait_started + _PASTE_COMMIT_TIMEOUT_S
     while time.monotonic() < deadline:
         pane = _capture_pane(socket_path, tmux_target)
+        polls += 1
+        empty_captures += not pane.strip()
         _raise_if_user_prompt_pending(bridge_dir, pane)
         if _draft_in_input_box(pane, needle):
             draft_seen = True
             break
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+    delivery_diagnostics.record_draft(
+        pane=pane,
+        needle=needle,
+        prompt_glyph=_CLAUDE_PROMPT_GLYPH,
+        draft_seen=draft_seen,
+        start=paste_wait_started,
+        polls=polls,
+        empty_captures=empty_captures,
+    )
     time.sleep(_PASTE_SETTLE_S)
+    delivery_diagnostics.set_stage("checking_pending_prompt")
     if has_pending_user_prompt(bridge_dir):
         raise ClaudeUserPromptPending(
             "Claude is waiting for an explicit answer; settings command not sent."
         )
+    delivery_diagnostics.set_stage("submitting")
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Enter")
+    delivery_diagnostics.record_details(
+        submit_sent=True, verification="pending" if draft_seen else "unverified"
+    )
     if draft_seen:
         # Retry only while the command remains drafted and no user decision
         # is pending. A dialog replacing the composer counts as submission.
+        delivery_diagnostics.set_stage("verifying_submit")
         if not _verify_submit_accepted(
             socket_path,
             tmux_target,
@@ -4926,6 +4959,7 @@ def inject_slash_command(
                 "input box). The command was not delivered."
             )
     if dialog_hint is not None:
+        delivery_diagnostics.set_stage("confirming_dialog")
         _confirm_tui_dialog(socket_path, tmux_target, hint=dialog_hint, bridge_dir=bridge_dir)
 
 

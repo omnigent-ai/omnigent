@@ -12,7 +12,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ParamSpec, TypedDict, TypeVar, cast
+from typing import Any, Literal, ParamSpec, TypedDict, TypeVar, cast
 
 _logger = logging.getLogger(__name__)
 _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
@@ -101,6 +101,7 @@ def trace_delivery(
     *,
     session_id_reader: Callable[[Path], str | None],
     cancelled_error: type[Exception],
+    content_argument: Literal["content", "command"] = "content",
 ) -> Callable[[_InjectionFunction], _InjectionFunction]:
     """Collect one delivery summary without importing the bridge or its dependencies."""
 
@@ -108,7 +109,7 @@ def trace_delivery(
         """Collect metadata in memory; emit one summary after the injection lock is released."""
 
         @functools.wraps(function)
-        def wrapped(bridge_dir: Path, *, content: str, **kwargs: Any) -> Any:
+        def wrapped(bridge_dir: Path, **kwargs: Any) -> Any:
             try:
                 # Hooks import this module on every invocation; keep the sink lazy.
                 from omnigent.debug_logging import current_session_id, debug_event
@@ -124,11 +125,11 @@ def trace_delivery(
                 )
                 token = _prompt_delivery_trace.set(trace)
             except Exception:  # noqa: BLE001 — trace setup must not prevent delivery
-                return function(bridge_dir, content=content, **kwargs)
+                return function(bridge_dir, **kwargs)
             outcome = "returned"
             error_type = None
             try:
-                return function(bridge_dir, content=content, **kwargs)
+                return function(bridge_dir, **kwargs)
             except BaseException as exc:
                 outcome = "interrupted" if isinstance(exc, cancelled_error) else "error"
                 error_type = type(exc).__name__
@@ -143,6 +144,8 @@ def trace_delivery(
                     )
                     level = logging.WARNING if outcome != "returned" or uncertain else logging.INFO
                     if _logger.isEnabledFor(level):
+                        content = kwargs.get(content_argument, "")
+                        content = content if isinstance(content, str) else ""
                         normalized = content.replace("\r\n", "\n").replace("\r", "\n")
                         fields = {
                             **trace.input_attributes,
@@ -174,13 +177,24 @@ def trace_delivery(
                             fields["error_type"] = error_type
                         if len(trace.attempts) > 1:
                             fields["attempts"] = json.dumps(trace.attempts)
-                        extra = debug_event(
-                            "claude_native_delivery_finished", session_id=trace.session_id
+                        event_name = (
+                            "claude_native_control_finished"
+                            if content_argument == "command"
+                            else "claude_native_delivery_finished"
                         )
+                        if content_argument == "command":
+                            operation = content.split(maxsplit=1)[0] if content else ""
+                            fields["control_kind"] = (
+                                operation.removeprefix("/")
+                                if operation in {"/model", "/effort", "/compact"}
+                                else "other"
+                            )
+                        extra = debug_event(event_name, session_id=trace.session_id)
                         extra["attributes"] = fields
                         _logger.log(
                             level,
-                            "claude_native_delivery_finished %s",
+                            "%s %s",
+                            event_name,
                             json.dumps(fields),
                             extra=extra,
                         )

@@ -32,6 +32,18 @@ from omnigent.native.input_diagnostics import input_delivery_scope
         ("pending_before_paste", "not_started", "error"),
         ("pending_before_submit", "not_started", "error"),
         ("cancelled", "not_started", "interrupted"),
+        ("control_normal", "draft_absent", "returned"),
+        ("control_session_fallback", "draft_absent", "returned"),
+        ("control_unknown_command", "draft_absent", "returned"),
+        ("control_retry", "draft_absent", "returned"),
+        ("control_no_draft", "unverified", "returned"),
+        ("control_timeout", "draft_still_present", "error"),
+        ("control_empty_capture", "inconclusive_capture", "error"),
+        ("control_transport_error", "not_started", "error"),
+        ("control_startup_error", "not_started", "error"),
+        ("control_pending_before_paste", "not_started", "error"),
+        ("control_cancelled", "not_started", "interrupted"),
+        ("control_cancelled_after_submit", "pending", "interrupted"),
     ],
 )
 def test_delivery_diagnostics(
@@ -42,7 +54,11 @@ def test_delivery_diagnostics(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
 ) -> None:
+    is_control = scenario.startswith("control_")
+    scenario = scenario.removeprefix("control_")
     secret = "private customer prompt"
+    if is_control:
+        secret = "/model " + secret
     if scenario == "unknown_command":
         secret = "/private-customer-command"
     content = "\n" + secret if scenario == "blank_line" else secret
@@ -62,6 +78,8 @@ def test_delivery_diagnostics(
     def sleep(seconds: float) -> None:
         nonlocal elapsed
         elapsed += seconds
+        if scenario == "cancelled_after_submit" and enters:
+            raise bridge.ClaudeInjectionCancelled(secret)
 
     def ready(*args: object, **kwargs: object) -> None:
         sleep(0.02)
@@ -79,7 +97,11 @@ def test_delivery_diagnostics(
         if args[-1] == "Space":
             pane = "──────\n❯ \n──────\n"
         elif args[0] == "send-keys" and "-l" in args:
-            pane = "❯ "
+            if is_control and args[-1] == content and scenario == "transport_error":
+                raise RuntimeError(secret)
+            pane = "❯ " + (
+                content if is_control and args[-1] == content and scenario != "no_draft" else ""
+            )
         if args[0] == "paste-buffer":
             if scenario == "transport_error":
                 raise RuntimeError(secret)
@@ -122,6 +144,12 @@ def test_delivery_diagnostics(
             json.dumps({"active_session_id": "bridge-session"})
         )
 
+    def inject() -> None:
+        if is_control:
+            bridge.inject_slash_command(tmp_path, command=content)
+        else:
+            bridge.inject_user_message(tmp_path, content=content)
+
     with (
         caplog.at_level("INFO", logger=delivery_diagnostics.__name__),
         current_session_id_scope(None if scenario == "session_fallback" else "child-session"),
@@ -136,21 +164,25 @@ def test_delivery_diagnostics(
         ),
     ):
         if outcome == "returned":
-            bridge.inject_user_message(tmp_path, content=content)
+            inject()
         else:
-            expected = bridge.ClaudeInjectionCancelled if scenario == "cancelled" else RuntimeError
+            expected = (
+                bridge.ClaudeInjectionCancelled if outcome == "interrupted" else RuntimeError
+            )
             if scenario.startswith("pending_"):
                 expected = bridge.ClaudeUserPromptPending
             match = "capture is unavailable" if scenario == "empty_capture" else None
             with pytest.raises(expected, match=match):
-                bridge.inject_user_message(tmp_path, content=content)
+                inject()
 
     records = [
         r for r in caplog.records if getattr(r, "event_name", "").startswith("claude_native_")
     ]
     assert len(records) == 1
     record = records[0]
-    assert record.event_name == "claude_native_delivery_finished"
+    assert record.event_name == (
+        "claude_native_control_finished" if is_control else "claude_native_delivery_finished"
+    )
     attrs = record.attributes
     assert attrs["verification"] == verification
     assert attrs["outcome"] == outcome
@@ -178,7 +210,7 @@ def test_delivery_diagnostics(
         assert enters == 1
         assert pane == "❯ "
         assert attrs["submit_sent"] is True
-    if scenario == "unknown_command":
+    if scenario == "unknown_command" and not is_control:
         assert enters == 2
         assert attrs["attempt"] == 2
         attempts = json.loads(row["attributes"]["attempts"])
@@ -187,11 +219,19 @@ def test_delivery_diagnostics(
         assert all(attempt["verification"] == "draft_absent" for attempt in attempts)
 
     assert attrs["content_leading_char"] == (
-        "slash" if scenario == "unknown_command" else "letter"
+        "slash" if is_control or scenario == "unknown_command" else "letter"
     )
     assert attrs["content_word_count"] == len(secret.split())
     assert attrs["content_non_ascii"] is False
     assert "claude_code_version" not in attrs
+    if is_control:
+        assert attrs["control_kind"] == ("other" if scenario == "unknown_command" else "model")
+        assert attrs["attempt"] == 1
+    if scenario == "cancelled_after_submit":
+        assert attrs["stage"] == "verifying_submit"
+        assert attrs["submit_sent"] is True
+        assert attrs["draft_seen"] is True
+        assert enters == 1
 
     if scenario in {"normal", "empty_capture"}:
         assert attrs["draft_queued_placeholder_visible"] is False
@@ -227,7 +267,7 @@ def test_delivery_diagnostics(
     if scenario in {"startup_error", "cancelled"}:
         assert attrs["stage"] == "waiting_for_prompt"
     elif scenario == "transport_error":
-        assert attrs["stage"] == "pasting"
+        assert attrs["stage"] == ("typing_command" if is_control else "pasting")
     elif scenario.startswith("pending_"):
         assert attrs["stage"] == "checking_pending_prompt"
         assert attrs["submit_sent"] is False
