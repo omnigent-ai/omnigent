@@ -51,6 +51,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_unmirrored_codex_settings,
     update_active_turn_id,
 )
+from omnigent.harnesses.codex_native.diagnostics import collect_codex_rpc_failure_diagnostics
 from omnigent.inner.codex_goal_command import (
     goal_objective_from_content,
     goal_objective_length_error,
@@ -198,14 +199,17 @@ async def _connect_to_app_server(state: CodexNativeBridgeState) -> CodexAppServe
             ),
         )
         return None
-    except (OSError, WebSocketException):
+    except (OSError, WebSocketException) as exc:
         _logger.exception(
             "Codex native app-server unreachable: socket=%s",
             state.socket_path,
             extra=debug_event(
                 "codex_app_server_unreachable",
                 session_id=state.session_id,
+                turn_id=None,
+                user_id=None,
                 thread_id=state.thread_id,
+                **collect_codex_rpc_failure_diagnostics(client, exc),
             ),
         )
         return None
@@ -665,6 +669,7 @@ class CodexNativeExecutor(Executor):
                             "codex_turn_injection_failed",
                             session_id=state.session_id,
                             turn_id=state.active_turn_id,
+                            user_id=None,
                             initial_native_turn_id=state.active_turn_id,
                             thread_id=state.thread_id,
                             rpc_error_code=exc.code
@@ -672,6 +677,7 @@ class CodexNativeExecutor(Executor):
                             else None,
                             stage="native_rpc",
                             outcome="ambiguous" if ambiguous else "error",
+                            **collect_codex_rpc_failure_diagnostics(client, exc),
                         )
                     ),
                 )
@@ -955,6 +961,7 @@ class CodexNativeExecutor(Executor):
                                     "codex_turn_injection_failed",
                                     session_id=state.session_id,
                                     turn_id=state.active_turn_id,
+                                    user_id=None,
                                     initial_native_turn_id=state.active_turn_id,
                                     thread_id=state.thread_id,
                                     rpc_error_code=(
@@ -964,6 +971,7 @@ class CodexNativeExecutor(Executor):
                                     ),
                                     stage="native_rpc",
                                     outcome="undelivered" if undelivered else "error",
+                                    **collect_codex_rpc_failure_diagnostics(client, exc),
                                 )
                             ),
                         )

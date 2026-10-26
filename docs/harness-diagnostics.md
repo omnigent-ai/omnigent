@@ -304,6 +304,22 @@ row is the only record of the original silent process.
 
 ## Native turn failure evidence
 
+Codex executor failures add transport evidence to the existing
+`codex_app_server_unreachable` and `codex_turn_injection_failed` records.
+`rpc_connection_phase` distinguishes the WebSocket handshake, `initialize`,
+and a ready connection. Reader state, up to four exception classes, observed
+close codes, HTTP handshake status and OS errno contain no addresses or payloads.
+RPC tracebacks retain the receiver's original exception and the method/request ID.
+
+On Linux and macOS, `executor_fd_count` counts at most 4,096 descriptors;
+`executor_fd_count_capped` indicates a lower bound. The directory probe itself
+can contribute one descriptor. Soft/hard limits and probe errors are recorded
+even when descriptor exhaustion prevents enumeration. These fields describe
+the Omnigent executor process, not the separate Codex app-server; they do not
+establish the cause of an app-server-reported file-limit error. No descriptor
+names, additional stderr, or request content are collected. Delivery and retry
+decisions are unchanged.
+
 Failed `external_session_status` events accept optional `failure_context`
 metadata. The server adds it to the existing `session_turn_failed` log without
 changing status, error codes, displayed text, or failure classification. Unknown
