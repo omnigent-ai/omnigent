@@ -2510,7 +2510,11 @@ def test_genie_without_usable_provider_fails_loud(
 @pytest.mark.parametrize("kind", ["subscription", "cli-config"])
 @pytest.mark.parametrize("selection", ["default", "family-default", "fallback"])
 def test_genie_implicit_codex_provider_uses_own_credentials(
-    config_home: Path, kind: str, selection: str, tmp_path: Path
+    config_home: Path,
+    kind: str,
+    selection: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Starting Genie with a Codex default keeps Genie's own CLI credentials."""
     provider = {"kind": kind, "cli": "codex", "model_provider": "Databricks"}
@@ -2528,11 +2532,13 @@ def test_genie_implicit_codex_provider_uses_own_credentials(
     }
     from omnigent.inner import genie_harness
 
-    with (
-        patch.dict(os.environ, env, clear=True),
-        patch("omnigent.inner.genie_executor._find_genie_cli", return_value="/usr/bin/genie"),
-    ):
-        executor = genie_harness._build_genie_executor()
+    with monkeypatch.context() as env_patch:
+        for name in tuple(os.environ):
+            env_patch.delenv(name)
+        for name, value in env.items():
+            env_patch.setenv(name, value)
+        with patch("omnigent.inner.genie_executor._find_genie_cli", return_value="/usr/bin/genie"):
+            executor = genie_harness._build_genie_executor()
     assert executor._codex_config_overrides == []
 
 
