@@ -879,11 +879,65 @@ describe("BlockRenderer dispatch", () => {
           elicitation("pending", null),
           { kind: "text", itemId: "m1", text: "Waiting on you.", final: true },
         ];
-        render(<BlockRenderer items={parked} sessionStatus="idle" foldNarration />);
+        const parkedView = render(
+          <BlockRenderer items={parked} sessionStatus="idle" foldNarration />,
+        );
         expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
         expect(screen.queryByText("Need approval.")).toBeNull();
         expect(screen.getByText("Waiting on you.")).toBeDefined();
         expect(screen.getByText("Claude wants to call Bash", { exact: false })).toBeDefined();
+
+        // A fold that has shown stays latched, so mount the parked turn fresh.
+        parkedView.unmount();
+        render(
+          <BlockRenderer
+            items={parked}
+            sessionStatus="idle"
+            isLastAssistant
+            hasPendingElicitation
+            foldNarration
+          />,
+        );
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(screen.getByText("Need approval.")).toBeDefined();
+      });
+
+      it("keeps narration visible in a turn that failed or hit a denial", () => {
+        const denied: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Trying the deploy.", final: true },
+          tool(1, "Bash"),
+          { kind: "policy_denied", itemId: null, reason: "Blocked.", phase: "request" },
+          { kind: "text", itemId: "m1", text: "Deploy was blocked.", final: true },
+        ];
+        const view = render(<BlockRenderer items={denied} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.getByText("Trying the deploy.")).toBeDefined();
+        expect(screen.getByText("Deploy was blocked.")).toBeDefined();
+
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Starting the build.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Partial output.", final: true },
+        ];
+        for (const turnLifecycle of ["failed", "cancelled", "incomplete"] as const) {
+          view.rerender(
+            <BlockRenderer
+              items={items}
+              sessionStatus="idle"
+              turnLifecycle={turnLifecycle}
+              foldNarration
+            />,
+          );
+          expect(screen.getByText("Starting the build.")).toBeDefined();
+          expect(
+            rendersOnlyWorkedFold({
+              items,
+              sessionStatus: "idle",
+              turnLifecycle,
+              foldNarration: true,
+            }),
+          ).toBe(false);
+        }
       });
 
       it("keeps a continued bubble's last message visible", () => {

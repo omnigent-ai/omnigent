@@ -151,6 +151,23 @@ function turnLiveness({
   return { isOwnTurnLive, possiblyLive, isTurnLive: isOwnTurnLive || possiblyLive };
 }
 
+function isFailureItem(item: RenderItem | undefined): boolean {
+  return item?.kind === "error" || item?.kind === "retry" || item?.kind === "policy_denied";
+}
+
+/** Narration folds only in a turn that finished cleanly; otherwise it explains the outcome. */
+function foldsNarration({
+  items,
+  turnLifecycle,
+  foldNarration = false,
+}: Pick<FoldInputs, "items" | "turnLifecycle" | "foldNarration">): boolean {
+  return (
+    foldNarration &&
+    (turnLifecycle === undefined || turnLifecycle === "completed") &&
+    !items.some(isFailureItem)
+  );
+}
+
 /** Work folds after an assistant message or in a tool-bearing continuation. */
 function hasFoldableShape(
   items: RenderItem[],
@@ -159,13 +176,7 @@ function hasFoldableShape(
 ): boolean {
   const lastItem = items.findLast((item) => !isTrailingWrapup(item));
   // A terminal failure or denial must stay visible beside the assistant text.
-  if (
-    lastItem?.kind === "error" ||
-    lastItem?.kind === "retry" ||
-    lastItem?.kind === "policy_denied"
-  ) {
-    return false;
-  }
+  if (isFailureItem(lastItem)) return false;
   return (
     !isProvisionalTrace(items) &&
     segments.some((segment) => segment.kind === "work") &&
@@ -180,7 +191,7 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
-  const partition = partitionTurn(inputs.items, inputs.foldNarration);
+  const partition = partitionTurn(inputs.items, foldsNarration(inputs));
   return (
     hasFoldableShape(inputs.items, partition, inputs.continued) &&
     partition.segments.every((segment) => segment.kind === "work")
@@ -223,7 +234,7 @@ export function BlockRenderer({
   // A native assistant message has no reliable final-answer marker.
   // Keep each message visible even when a later tool call follows it,
   // unless the user opted into folding all but the last message.
-  const partition = partitionTurn(items, foldNarration);
+  const partition = partitionTurn(items, foldsNarration({ items, turnLifecycle, foldNarration }));
   const workRunCount = partition.segments.filter((segment) => segment.kind === "work").length;
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
