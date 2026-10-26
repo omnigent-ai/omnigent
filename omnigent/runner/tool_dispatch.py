@@ -3480,7 +3480,8 @@ async def _execute_session_create(
     Maps a 404 to ``agent_not_found`` and 401/403 to ``access_denied``.
 
     :param args: Parsed arguments; exactly one of ``agent_id`` /
-        ``config_path`` required, ``title`` / ``message`` optional.
+        ``config_path`` required, ``title`` / ``message`` / ``model`` /
+        ``reasoning_effort`` optional in both modes.
     :param server_client: HTTP client pointed at the Omnigent server; ``None``
         returns an error string.
     :param conversation_id: The caller's session id — the forced parent;
@@ -3531,18 +3532,6 @@ async def _execute_session_create(
         if not isinstance(message, str) or not message.strip() or len(message) > 8000:
             return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
     if has_config_path:
-        # The multipart create carries only the config bundle, so an effort
-        # passed here would never reach the child. Refuse instead of dropping it.
-        if args.get("reasoning_effort") is not None:
-            return json.dumps(
-                {
-                    "error": (
-                        "sys_session_create 'reasoning_effort' is supported only "
-                        "with 'agent_id'; the 'config_path' create cannot carry "
-                        "it. Set the effort in the config you upload instead."
-                    )
-                }
-            )
         return await _session_create_from_config_path(
             str(config_path),
             args,
@@ -3807,7 +3796,8 @@ async def _upload_config_bundle(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title``.
+    :param args: Parsed tool arguments; optional ``title``, ``model``
+        (sent as ``model_override``) and ``reasoning_effort``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param agent_spec: The calling agent's spec, for os_env resolution.
@@ -3831,9 +3821,15 @@ async def _upload_config_bundle(
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
     metadata: _JsonObject = {"parent_session_id": conversation_id}
-    title = args.get("title")
-    if isinstance(title, str) and title:
-        metadata["title"] = title
+    # Same per-session fields the agent_id create sends; the server validates them.
+    for arg_name, metadata_key in (
+        ("title", "title"),
+        ("model", "model_override"),
+        ("reasoning_effort", "reasoning_effort"),
+    ):
+        value = args.get(arg_name)
+        if isinstance(value, str) and value:
+            metadata[metadata_key] = value
     try:
         resp = await server_client.post(
             "/v1/sessions",

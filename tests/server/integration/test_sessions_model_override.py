@@ -10,13 +10,14 @@ runner-path forwarding is verified here by stubbing
 
 from __future__ import annotations
 
+import json
 from typing import Any
 from unittest.mock import patch
 
 import httpx
 import pytest
 
-from tests.server.helpers import create_test_agent
+from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
 
@@ -362,6 +363,78 @@ async def test_bundle_create_inherits_spec_reasoning_effort(
     owning = await client.get(f"/v1/sessions/{agent['_session_id']}")
     assert owning.status_code == 200
     assert owning.json()["reasoning_effort"] == "high"
+
+
+async def _post_bundle_create(
+    client: httpx.AsyncClient, metadata: dict[str, Any]
+) -> httpx.Response:
+    """
+    POST a multipart create whose bundle pins its own model and effort.
+
+    :param client: The test HTTP client.
+    :param metadata: The metadata JSON part, e.g. ``{"model_override": "m"}``.
+    :returns: The raw create response.
+    """
+    bundle = build_agent_bundle(
+        name="bundled",
+        executor={
+            "type": "omnigent",
+            "config": {"harness": "claude-sdk"},
+            "model": "databricks-claude-opus-4-6",
+            "reasoning_effort": "high",
+        },
+        include_llm=False,
+    )
+    return await client.post(
+        "/v1/sessions",
+        data={"metadata": json.dumps(metadata)},
+        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
+    )
+
+
+async def test_bundle_create_with_model_override_persists(
+    client: httpx.AsyncClient,
+) -> None:
+    """Bundle-create ``model_override`` and effort win over the bundle's own.
+
+    ``sys_session_create`` with ``config_path`` uploads a bundle; its ``model``
+    and ``reasoning_effort`` are session-level, like the JSON create's, so the
+    runner reads them from the row instead of the spec defaults.
+    """
+    resp = await _post_bundle_create(
+        client, {"model_override": "databricks-claude-sonnet-4-6", "reasoning_effort": "low"}
+    )
+    assert resp.status_code == 201, resp.text
+
+    get = await client.get(f"/v1/sessions/{resp.json()['session_id']}")
+    assert get.status_code == 200
+    assert get.json()["model_override"] == "databricks-claude-sonnet-4-6"
+    assert get.json()["reasoning_effort"] == "low"
+
+
+@pytest.mark.parametrize(
+    "bad_model",
+    [
+        pytest.param("claude; rm -rf /", id="shell-metacharacters"),
+        pytest.param("--model=evil", id="flag-shaped"),
+        pytest.param("   ", id="whitespace-only"),
+    ],
+)
+async def test_bundle_create_rejects_malformed_model_override(
+    client: httpx.AsyncClient,
+    bad_model: str,
+) -> None:
+    """Bundle-create ``model_override`` outside the model-id charset 400s.
+
+    Same trust boundary as the JSON create: the value becomes a ``--model``
+    argv element on the runner, so no row may persist it.
+
+    :param bad_model: The malformed override under test.
+    """
+    resp = await _post_bundle_create(client, {"model_override": bad_model})
+    assert resp.status_code == 400, (
+        f"model_override {bad_model!r} should 400, got {resp.status_code}: {resp.text}"
+    )
 
 
 class _CaptureClient:

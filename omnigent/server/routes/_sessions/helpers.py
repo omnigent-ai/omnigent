@@ -84,6 +84,7 @@ from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
 from omnigent.host.frames import RUNNER_LOG_TAIL_HEADING
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.models.model_metadata import concrete_reported_model
+from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
     FailureContext,
     failure_log_attributes,
@@ -10147,10 +10148,18 @@ def _parse_session_create_metadata(metadata: str) -> SessionCreateMetadata:
             "session metadata",
             EFFORT_VALUES,
         )
+        # Reaches native CLIs as a ``--model`` argv element, like the JSON create's.
+        model_override = (
+            validate_model_override(parsed.model_override)
+            if parsed.model_override is not None
+            else None
+        )
         # Bounds-check the native-terminal args; raises ValueError
         # (wrapped below) on a malformed or oversized list.
         _validate_terminal_launch_args(parsed.terminal_launch_args)
-        return parsed.model_copy(update={"reasoning_effort": reasoning_effort})
+        return parsed.model_copy(
+            update={"reasoning_effort": reasoning_effort, "model_override": model_override}
+        )
     except (ValidationError, ValueError) as exc:
         raise OmnigentError(
             f"invalid session metadata: {exc}",
