@@ -1197,6 +1197,7 @@ describe("PullRequestPanel", () => {
     }));
     info.selected_account = "personal";
     renderPanel();
+    fireEvent.click(screen.getByRole("button", { name: "acme/app #6000" }));
     const emptyState = screen.getByText("Can’t reach the upstream repo").parentElement;
     const link = screen.getByRole("link", { name: "Open the PR on GitHub" });
     expect(emptyState).toContainElement(link);
@@ -1446,7 +1447,7 @@ describe("PullRequestPanel", () => {
       expect(heading.querySelector("svg")).toHaveClass("lucide-git-pull-request");
       expect(screen.queryByRole("heading", { name: "GitHub" })).toBeNull();
       // The picker names the PR in its own provider's style; the header does not.
-      expect(screen.getByRole("combobox", { name: "Session pull request" })).toHaveTextContent(
+      expect(screen.getByRole("list", { name: "Pull requests" })).toHaveTextContent(
         "acme/app #6000",
       );
     });
@@ -1480,6 +1481,7 @@ describe("PullRequestPanel", () => {
         ],
       };
       const { rerender } = renderPanel();
+      fireEvent.click(screen.getByRole("button", { name: /contoso\/web\/app !7$/ }));
       expect(screen.getByRole("heading", { name: "Example Forge" })).toBeInTheDocument();
       state.info = { isLoading: true, error: null, isFetching: true };
       rerender(<PullRequestPanel conversationId="conv_1" />);
@@ -1624,11 +1626,10 @@ describe("PullRequestPanel", () => {
         "placeholder",
         "Pull request URL",
       );
-      const picker = screen.getByRole("combobox", { name: "Session pull request" });
-      expect(picker).toHaveTextContent("contoso/web/app !7 — Add the widget");
-      fireEvent.click(picker);
+      const picker = screen.getByRole("list", { name: "Pull requests" });
+      expect(picker).toHaveTextContent("contoso/web/app !7 · Add the widget");
       expect(
-        screen.getByRole("option", {
+        screen.getByRole("button", {
           name: "other.example.test/fabrikam/api/svc !12 (from branch)",
         }),
       ).toBeVisible();
@@ -1675,6 +1676,7 @@ describe("PullRequestPanel", () => {
         prs: [association()],
       };
       renderPanel();
+      fireEvent.click(screen.getByRole("button", { name: /contoso\/web\/app !7/ }));
       expect(screen.getByText("No supported remote")).toBeInTheDocument();
       expect(screen.getByRole("link", { name: "Open the PR on Example Forge" })).toHaveAttribute(
         "href",
@@ -2151,7 +2153,94 @@ describe("derivePullRequestPanelState", () => {
 });
 
 describe("session PR selection", () => {
-  it("keeps the selector and repository identity while PR details load or fail", async () => {
+  it.each([
+    ["ready", {}, true],
+    ["draft", { is_draft: true }, false],
+    ["blocked", { merge_state_status: "BLOCKED" }, false],
+    ["unknown", { merge_state_status: "UNKNOWN" }, false],
+    ["unsupported checks", { checks_supported: false }, false],
+    ["merged", { state: "MERGED" }, false],
+    [
+      "auto merge",
+      { auto_merge: { enabled_at: "today", enabled_by: "ada", merge_method: "SQUASH" } },
+      false,
+    ],
+  ] as const)(
+    "shows a compact merge action only when eligible: %s",
+    (_name, overrides, expected) => {
+      const pr = {
+        ...state.info!.data!.pr!,
+        checks: { total: 1, passing: 1, failing: 0, pending: 0, runs: [] },
+        merge_state_status: "CLEAN",
+        head_sha: "head",
+        ...overrides,
+      };
+      Object.assign(state.info!.data!, {
+        pr,
+        capabilities: { merging: true },
+        tracking_available: true,
+        prs: [
+          {
+            url: pr.url,
+            repository: "example/repo",
+            host: "github.com",
+            number: pr.number,
+            relationship: "created",
+          },
+        ],
+      });
+      renderPanel();
+      expect(!!screen.queryByRole("button", { name: "Merge" })).toBe(expected);
+      expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    },
+  );
+
+  it.each(["failing", "pending", "cancelled", "partial", "read-only"])(
+    "keeps check counts instead of merge for %s",
+    async (reason) => {
+      const pr = {
+        ...state.info!.data!.pr!,
+        merge_state_status: "CLEAN",
+        head_sha: "head",
+        checks: {
+          total: 1,
+          passing: 1,
+          failing: 0,
+          pending: 0,
+          runs: [{ name: "Build", bucket: "passing" as const, url: null }],
+          ...(reason === "partial"
+            ? { partial: true }
+            : reason !== "read-only"
+              ? { [reason]: 1 }
+              : {}),
+        },
+      };
+      state.canEdit = reason !== "read-only";
+      Object.assign(state.info!.data!, {
+        pr,
+        capabilities: { merging: true },
+        tracking_available: true,
+        prs: [
+          {
+            url: pr.url,
+            repository: "example/repo",
+            host: "github.com",
+            number: pr.number,
+            relationship: "created",
+          },
+        ],
+      });
+      renderPanel();
+      expect(screen.queryByRole("button", { name: "Merge" })).toBeNull();
+      const passed = screen.getByRole("button", { name: "1 passed" });
+      expect(passed).toHaveTextContent(/^1$/);
+      fireEvent.pointerEnter(passed);
+      fireEvent.mouseOver(passed);
+      expect(await screen.findByText("Build")).toBeVisible();
+    },
+  );
+
+  it("opens rows and returns to the list while details load or fail", async () => {
     const user = userEvent.setup();
     const one = "https://github.com/example/one/pull/42";
     const two = "https://github.com/example/two/pull/42";
@@ -2189,67 +2278,32 @@ describe("session PR selection", () => {
       },
     };
     const { rerender } = renderPanel();
-    const picker = screen.getByRole("combobox", { name: "Session pull request" });
-    expect(picker).toHaveTextContent("example/one #42 — First repository");
-    expect(picker).not.toHaveAttribute("title");
-    await user.hover(picker);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "example/one #42 — First repository",
-    );
-    await user.unhover(picker);
-    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
-    await user.click(picker);
-    await waitFor(() =>
-      expect(
-        screen.getByRole("option", { name: "example/one #42 — First repository" }),
-      ).toHaveAttribute("aria-selected", "true"),
-    );
-    const secondOption = screen.getByRole("option", {
-      name: "example/two #42 — Second repository",
-    });
-    expect(secondOption).toBeVisible();
-    expect(secondOption).not.toHaveAttribute("title");
-    await user.hover(secondOption);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "example/two #42 — Second repository",
-    );
-    await user.click(secondOption);
-    expect(picker).toHaveTextContent("example/two #42 — Second repository");
-    expect(picker).not.toHaveAttribute("title");
-    expect(screen.queryByRole("listbox")).not.toBeInTheDocument();
+    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "example/two #42 — Second repository" }));
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
-    await user.hover(picker);
-    expect(await screen.findByRole("tooltip")).toHaveTextContent(
-      "example/two #42 — Second repository",
-    );
-    await user.unhover(picker);
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
+    expect(screen.getByRole("button", { name: "All pull requests (2)" })).toBeVisible();
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_1" />);
-    expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
-    expect(picker).toHaveTextContent("example/two #42 — Second repository");
     expect(screen.getByText("Loading pull requests…")).toBeInTheDocument();
-    expect(screen.queryByText("First repository")).not.toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Link a PR" })).toBeEnabled();
     expect(screen.getByRole("button", { name: "Unlink PR" })).toBeEnabled();
-    expect(screen.getByRole("button", { name: "Refresh" })).toHaveTextContent(/^$/);
-    expect(screen.queryByRole("link", { name: "Open the PR on GitHub" })).toBeNull();
 
     state.info = { isLoading: false, error: new Error("Metadata unavailable"), isFetching: false };
     rerender(<PullRequestPanel conversationId="conv_1" />);
-    expect(screen.getByRole("combobox", { name: "Session pull request" })).toBe(picker);
-    expect(picker).toHaveTextContent("example/two #42 — Second repository");
-    const errorMessage = screen.getByText(/Metadata unavailable/);
-    const fallback = screen.getByRole("link", { name: "Open the PR on GitHub" });
-    expect(errorMessage.parentElement).toContainElement(fallback);
-    expect(fallback).toHaveAttribute("href", two);
-    await user.click(picker);
-    await user.click(screen.getByRole("option", { name: "example/one #42 — First repository" }));
+    expect(screen.getByRole("link", { name: "Open the PR on GitHub" })).toHaveAttribute(
+      "href",
+      two,
+    );
+    await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "example/one #42 — First repository" }));
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_other" />);
-    expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
+    expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
   });
 
   it("shows the server's stored PRs and lets them be unlinked while the host is offline", async () => {
@@ -2529,11 +2583,12 @@ describe("session PR selection", () => {
         ],
       });
       renderPanel();
-      const picker = screen.getByRole("combobox", { name: "Session pull request" });
-      expect(picker).toHaveTextContent(/^example\/one #42$/);
+      const picker = screen.getByRole("list", { name: "Pull requests" });
+      expect(screen.getByRole("button", { name: "example/one #42" })).toHaveTextContent(
+        /^example\/one #42$/,
+      );
       expect(picker).not.toHaveAttribute("title");
-      fireEvent.click(picker);
-      expect(screen.getByRole("option", { name: "example/one #42" })).toBeVisible();
+      expect(screen.getByRole("button", { name: "example/one #42" })).toBeVisible();
     },
   );
 
@@ -2554,12 +2609,11 @@ describe("session PR selection", () => {
       ],
     });
     renderPanel();
-    const picker = screen.getByRole("combobox", { name: "Session pull request" });
+    const picker = screen.getByRole("list", { name: "Pull requests" });
     const label = "github.example.com/example/one #42 (from branch) — Fix session selection";
-    expect(picker).toHaveTextContent(label);
+    expect(picker).toHaveTextContent(label.replace(" — ", " · "));
     expect(picker).not.toHaveAttribute("title");
-    fireEvent.click(picker);
-    expect(screen.getByRole("option", { name: label })).toBeVisible();
+    expect(screen.getByRole("button", { name: label })).toBeVisible();
   });
 
   it("passes the selected PR and revisions into file queries", () => {

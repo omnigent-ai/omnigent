@@ -28,6 +28,7 @@ import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
+  ArrowLeftIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   ChevronsDownUpIcon,
@@ -79,7 +80,6 @@ import {
 } from "@/components/ui/select";
 import { Separator } from "@/components/ui/separator";
 import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
-import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { useResizableColumn } from "@/hooks/useResizableColumn";
 import {
@@ -120,7 +120,7 @@ import {
   PullRequestTitle,
 } from "./PullRequestDetails";
 import { PullRequestLabels } from "./PullRequestLabels";
-import { PullRequestMerge } from "./PullRequestMerge";
+import { mergeButtonState, PullRequestMerge } from "./PullRequestMerge";
 import { PullRequestReviewers } from "./PullRequestReviewers";
 
 // Shiki bundled themes matching the app's editor look; the concrete side is
@@ -566,7 +566,9 @@ function CheckPill({
   runs,
   icon,
   className,
+  compact = false,
 }: {
+  compact?: boolean;
   label: string;
   count: number;
   /** All checks; filtered to this pill's bucket for the hover list. */
@@ -583,13 +585,14 @@ function CheckPill({
       <HoverCardTrigger asChild>
         <button
           type="button"
+          aria-label={`${count} ${label}`}
           className={cn(
             "inline-flex cursor-pointer items-center gap-0.5 rounded-full border px-1.5 py-px text-xs tabular-nums",
             className,
           )}
         >
           {icon}
-          {count} {label}
+          {count} {!compact && label}
         </button>
       </HoverCardTrigger>
       <HoverCardContent
@@ -725,6 +728,59 @@ function PullRequestCommentCard({
   );
 }
 
+function PullRequestCheckCounts({
+  checks,
+  compact = false,
+}: {
+  checks: PullRequestChecks;
+  compact?: boolean;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <CheckPill
+        compact={compact}
+        label="passed"
+        count={checks.passing}
+        runs={checks.runs.filter((r) => r.bucket === "passing")}
+        icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
+        className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
+      />
+      <CheckPill
+        compact={compact}
+        label="pending"
+        count={checks.pending}
+        runs={checks.runs.filter((r) => r.bucket === "pending")}
+        icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
+        className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
+      />
+      <CheckPill
+        compact={compact}
+        label="failed"
+        count={checks.failing}
+        runs={checks.runs.filter((r) => r.bucket === "failing")}
+        icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
+        className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
+      />
+      <CheckPill
+        compact={compact}
+        label="cancelled"
+        count={checks.cancelled ?? 0}
+        runs={checks.runs.filter((r) => r.bucket === "cancelled")}
+        icon={<BanIcon className="size-2.5 text-muted-foreground" />}
+        className="border-border bg-muted text-muted-foreground"
+      />
+      <CheckPill
+        compact={compact}
+        label="skipped"
+        count={checks.skipped ?? 0}
+        runs={checks.runs.filter((r) => r.bucket === "skipped")}
+        icon={<CircleMinusIcon className="size-2.5 text-muted-foreground" />}
+        className="border-border bg-muted text-muted-foreground"
+      />
+    </div>
+  );
+}
+
 /** The Summary tab body: reviewers beside labels, then CI checks with the Merge button, then
  *  the PR description, with dividers between. When the token can't read check runs, the
  *  Checks area says so instead of counts. */
@@ -778,43 +834,7 @@ function PullRequestSummaryTab({
                   </p>
                 )
               )}
-              <div className="flex flex-wrap items-center gap-1.5">
-                <CheckPill
-                  label="passed"
-                  count={checks.passing}
-                  runs={checks.runs.filter((r) => r.bucket === "passing")}
-                  icon={<CircleCheckIcon className="size-2.5 text-green-600 dark:text-green-400" />}
-                  className="border-green-500/25 bg-green-500/10 text-green-700 dark:text-green-400"
-                />
-                <CheckPill
-                  label="pending"
-                  count={checks.pending}
-                  runs={checks.runs.filter((r) => r.bucket === "pending")}
-                  icon={<CircleDotIcon className="size-2.5 text-amber-600 dark:text-amber-400" />}
-                  className="border-amber-500/25 bg-amber-500/10 text-amber-700 dark:text-amber-400"
-                />
-                <CheckPill
-                  label="failed"
-                  count={checks.failing}
-                  runs={checks.runs.filter((r) => r.bucket === "failing")}
-                  icon={<CircleXIcon className="size-2.5 text-red-600 dark:text-red-400" />}
-                  className="border-red-500/25 bg-red-500/10 text-red-700 dark:text-red-400"
-                />
-                <CheckPill
-                  label="cancelled"
-                  count={checks.cancelled ?? 0}
-                  runs={checks.runs.filter((r) => r.bucket === "cancelled")}
-                  icon={<BanIcon className="size-2.5 text-muted-foreground" />}
-                  className="border-border bg-muted text-muted-foreground"
-                />
-                <CheckPill
-                  label="skipped"
-                  count={checks.skipped ?? 0}
-                  runs={checks.runs.filter((r) => r.bucket === "skipped")}
-                  icon={<CircleMinusIcon className="size-2.5 text-muted-foreground" />}
-                  className="border-border bg-muted text-muted-foreground"
-                />
-              </div>
+              <PullRequestCheckCounts checks={checks} />
             </section>
           )}
           {merge}
@@ -1039,6 +1059,104 @@ type Associations = Pick<
   "prs" | "tracking_available" | "selected_pr_url" | "provider" | "provider_display"
 >;
 
+function PullRequestListRow({
+  conversationId,
+  association,
+  onSelect,
+}: {
+  conversationId: string;
+  association: PullRequestAssociation;
+  onSelect: () => void;
+}) {
+  const info = usePullRequestInfo(conversationId, { poll: true, prUrl: association.url });
+  const canEdit = useCanEdit(conversationId);
+  const data = info.data ? normalizePullRequestInfo(info.data) : undefined;
+  const pr = data?.pr?.url === association.url ? data.pr : undefined;
+  const checks = pr?.checks;
+  const mergeState = pr ? mergeButtonState(pr) : undefined;
+  const ready =
+    canEdit &&
+    !info.error &&
+    data?.capabilities.merging &&
+    pr?.state === "OPEN" &&
+    !pr.is_draft &&
+    pr.checks_supported !== false &&
+    checks &&
+    !checks.partial &&
+    checks.failing === 0 &&
+    checks.pending === 0 &&
+    !checks.cancelled &&
+    mergeState?.kind === "ready";
+  const title = (pr?.title ?? association.title)?.trim();
+  const identity = pullRequestLabel({ ...association, title: null });
+  const label = title ? `${identity} — ${title}` : identity;
+  return (
+    <li className="flex min-w-0 items-center gap-2 rounded-md px-2 hover:bg-muted/50">
+      <button
+        type="button"
+        onClick={onSelect}
+        title={label}
+        aria-label={label}
+        className="flex min-w-0 flex-1 items-center gap-2 py-3 text-left text-ui focus-visible:outline-ring"
+      >
+        <GitPullRequestIcon
+          aria-hidden
+          className={cn(
+            "size-4 shrink-0",
+            !pr || pr.is_draft
+              ? "text-muted-foreground"
+              : pr.state === "OPEN"
+                ? "text-green-600"
+                : pr.state === "MERGED"
+                  ? "text-purple-500"
+                  : "text-red-500",
+          )}
+        />
+        <span className="truncate">
+          <span className="text-muted-foreground">{identity}</span>
+          {title && (
+            <>
+              {" "}
+              · <span className="font-medium">{title}</span>
+            </>
+          )}
+        </span>
+      </button>
+      <div className="flex max-w-[45%] shrink-0 flex-wrap items-center justify-end gap-1 text-xs text-muted-foreground">
+        {ready && pr ? (
+          <PullRequestMerge
+            compact
+            conversationId={conversationId}
+            prUrl={association.url}
+            pr={pr}
+          />
+        ) : info.error ? (
+          <span title={String(info.error)}>Status unavailable</span>
+        ) : !pr ? (
+          <span>{info.isLoading ? "Loading…" : "Status unavailable"}</span>
+        ) : pr.state !== "OPEN" ? (
+          <span>{pr.state === "MERGED" ? "Merged" : "Closed"}</span>
+        ) : (
+          <>
+            {pr.is_draft && <span>Draft</span>}
+            {checks && <PullRequestCheckCounts checks={checks} compact />}
+            {checks?.partial || pr.checks_supported === false ? (
+              <span title="Some checks could not be loaded">Incomplete checks</span>
+            ) : (
+              checks?.total === 0 &&
+              !pr.is_draft && (
+                <span title={mergeState && "hint" in mergeState ? mergeState.hint : undefined}>
+                  No checks
+                </span>
+              )
+            )}
+          </>
+        )}
+      </div>
+    </li>
+  );
+}
+
 export function PullRequestPanel({
   conversationId,
   active = true,
@@ -1049,10 +1167,8 @@ export function PullRequestPanel({
 }) {
   const isMobileViewport = useIsMobileViewport();
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
-  const [prPickerOpen, setPrPickerOpen] = useState(false);
-  const [prPickerTooltipOpen, setPrPickerTooltipOpen] = useState(false);
-  // Select focuses rows on both pointer hover and keyboard navigation.
-  const [focusedPrUrl, setFocusedPrUrl] = useState<string>();
+  const [detailsSession, setDetailsSession] = useState<string>();
+  const showingDetails = detailsSession === conversationId;
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
@@ -1226,74 +1342,12 @@ export function PullRequestPanel({
     <div className="flex h-full min-h-0 flex-col">
       {showTrackingControls ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle copy={copy} showTitle={prs.length === 0} />
+          <PanelTitle copy={copy} showTitle={!showingDetails} />
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
-            {prs.length > 0 && (
-              <TooltipProvider>
-                <Select
-                  open={prPickerOpen}
-                  onOpenChange={(open) => {
-                    setPrPickerOpen(open);
-                    setPrPickerTooltipOpen(false);
-                    setFocusedPrUrl(undefined);
-                  }}
-                  value={selected ?? associations.selected_pr_url ?? ""}
-                  onValueChange={changeSelection}
-                >
-                  <Tooltip
-                    open={prPickerTooltipOpen && !prPickerOpen}
-                    onOpenChange={(open) => setPrPickerTooltipOpen(open && !prPickerOpen)}
-                  >
-                    <TooltipTrigger asChild>
-                      <SelectTrigger
-                        aria-label="Session pull request"
-                        className="min-w-0 flex-1 *:data-[slot=select-value]:block *:data-[slot=select-value]:truncate"
-                      >
-                        <SelectValue />
-                      </SelectTrigger>
-                    </TooltipTrigger>
-                    {selectedPr && (
-                      <TooltipContent className="wrap-anywhere">
-                        {pullRequestLabel(selectedPr, associations.provider)}
-                      </TooltipContent>
-                    )}
-                  </Tooltip>
-                  <SelectContent
-                    position="popper"
-                    align="start"
-                    className="w-(--radix-select-trigger-width)"
-                    onKeyDown={(event) => {
-                      if (event.key === "Escape") setPrPickerOpen(false);
-                    }}
-                  >
-                    {prs.map((pr) => (
-                      <Tooltip key={pr.url} open={prPickerOpen && focusedPrUrl === pr.url}>
-                        <TooltipTrigger asChild>
-                          <SelectItem
-                            value={pr.url}
-                            onFocus={() => setFocusedPrUrl(pr.url)}
-                            onBlur={() =>
-                              setFocusedPrUrl((current) =>
-                                current === pr.url ? undefined : current,
-                              )
-                            }
-                            className="*:[span]:last:block *:[span]:last:min-w-0 *:[span]:last:truncate"
-                          >
-                            {pullRequestLabel(pr, associations.provider)}
-                          </SelectItem>
-                        </TooltipTrigger>
-                        <TooltipContent
-                          side={isMobileViewport ? "bottom" : "left"}
-                          className="wrap-anywhere"
-                          style={isMobileViewport ? { pointerEvents: "none" } : undefined}
-                        >
-                          {pullRequestLabel(pr, associations.provider)}
-                        </TooltipContent>
-                      </Tooltip>
-                    ))}
-                  </SelectContent>
-                </Select>
-              </TooltipProvider>
+            {prs.length > 0 && showingDetails && (
+              <Button variant="ghost" size="sm" onClick={() => setDetailsSession(undefined)}>
+                <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
+              </Button>
             )}
             <div className="ml-auto flex shrink-0 items-center gap-1">
               <TooltipProvider delayDuration={0}>
@@ -1307,7 +1361,7 @@ export function PullRequestPanel({
                 >
                   <PlusIcon className="size-3.5" aria-hidden="true" />
                 </IconButton>
-                {selectedPr && (
+                {selectedPr && showingDetails && (
                   <IconButton
                     label="Unlink PR"
                     disabled={unlink.isPending}
@@ -1349,6 +1403,26 @@ export function PullRequestPanel({
         </p>
       ) : null}
       <div className="min-h-0 flex-1">
+        {prs.length > 0 && !showingDetails ? (
+          <ul aria-label="Pull requests" className="h-full overflow-y-auto p-2">
+            {prs.map((pr) => (
+              <PullRequestListRow
+                key={pr.url}
+                conversationId={conversationId}
+                association={{
+                  ...pr,
+                  provider: pr.provider ?? associations?.provider ?? undefined,
+                  provider_display:
+                    pr.provider_display ?? associations?.provider_display ?? undefined,
+                }}
+                onSelect={() => {
+                  changeSelection(pr.url);
+                  setDetailsSession(conversationId);
+                }}
+              />
+            ))}
+          </ul>
+        ) : (
         <PullRequestPanelDetails
           key={`${conversationId}:${selected ?? ""}`}
           conversationId={conversationId}
@@ -1378,6 +1452,7 @@ export function PullRequestPanel({
             )
           }
         />
+        )}
       </div>
     </div>
   );
