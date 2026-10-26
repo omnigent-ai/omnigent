@@ -543,12 +543,20 @@ def test_post_top_level_pr_comment(
     base_url, session_id = seeded_session
     _stub_github(page, pr_count=2)
     pr_url = _INFO["pr"]["url"]
+    comments = [
+        {
+            **_INFO["pr"]["comments"][0],
+            "body": f"Earlier comment {index + 1}",
+            "url": f"{pr_url}#comment-{index}",
+        }
+        for index in range(30)
+    ]
     info = {
         **_INFO,
         "selected_pr_url": pr_url,
         "capabilities": {"comment_posting": True},
         "selected_account": "octocat",
-        "pr": {**_INFO["pr"], "comments": list(_INFO["pr"]["comments"])},
+        "pr": {**_INFO["pr"], "comments": comments},
     }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda route: route.fulfill(json=info))
     posts = []
@@ -579,21 +587,48 @@ def test_post_top_level_pr_comment(
     else:
         page.get_by_test_id("composer-pr-link").click()
     tabs = panel.get_by_role("tablist", name="Pull request", exact=True)
-    tabs.get_by_role("tab", name="Comments 1", exact=True).click()
+    tabs.get_by_role("tab", name="Comments 30", exact=True).click()
     textbox = panel.get_by_role("textbox", name="New PR comment")
+    post_button = panel.get_by_role("button", name="Post comment", exact=True)
+    expect(textbox).to_be_in_viewport()
+    expect(post_button).to_be_in_viewport()
+    feed = panel.get_by_role("region", name="PR comments", exact=True)
+    assert feed.evaluate("el => el.scrollHeight > el.clientHeight")
+    composer_top = textbox.evaluate("el => el.getBoundingClientRect().top")
+    feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    expect(panel.get_by_text("Earlier comment 30", exact=True)).to_be_in_viewport()
+    assert textbox.evaluate("el => el.getBoundingClientRect().top") == pytest.approx(
+        composer_top, abs=1
+    )
+    feed.evaluate("el => { el.scrollTop = 0; }")
+    expect(panel.get_by_text("Earlier comment 1", exact=True)).to_be_in_viewport()
+    textbox.fill("Preview paragraph.\n\n" * 80)
+    panel.get_by_role("tab", name="Preview", exact=True).click()
+    expect(post_button).to_be_in_viewport()
+    assert feed.evaluate("el => el.clientHeight") > 0
+    if mobile:
+        page.set_viewport_size({"width": 390, "height": 540})
+        expect(post_button).to_be_in_viewport()
+        assert feed.evaluate("el => el.clientHeight") > 0
+        page.set_viewport_size({"width": 390, "height": 900})
+    panel.get_by_role("tab", name="Write", exact=True).click()
     textbox.fill("**Thanks for reviewing!**")
     tabs.get_by_role("tab", name="Summary", exact=True).click()
-    tabs.get_by_role("tab", name="Comments 1", exact=True).click()
+    tabs.get_by_role("tab", name="Comments 30", exact=True).click()
     expect(textbox).to_have_value("**Thanks for reviewing!**")
     panel.get_by_role("tab", name="Preview", exact=True).click()
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
     page.screenshot(path=str(tmp_path / f"comment-{entry}-preview.png"))
     panel.get_by_role("button", name="Post comment", exact=True).click()
-    expect(tabs.get_by_role("tab", name="Comments 2", exact=True)).to_be_visible()
+    expect(tabs.get_by_role("tab", name="Comments 31", exact=True)).to_be_visible()
+    feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
     panel.get_by_role("tab", name="Write", exact=True).click()
     expect(textbox).to_have_value("")
     panel.get_by_role("button", name="Refresh", exact=True).click()
     expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_visible()
+    feed.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+    expect(panel.get_by_text("Thanks for reviewing!", exact=True)).to_be_in_viewport()
+    expect(post_button).to_be_in_viewport()
     assert posts == [{"pr_url": pr_url, "body": "**Thanks for reviewing!**"}]
     page.screenshot(path=str(tmp_path / f"comment-{entry}-posted.png"))

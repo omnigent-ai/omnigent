@@ -1768,13 +1768,20 @@ function PullRequestPanelDetails({
           />
         </TabsContent>
 
-        <TabsContent value="comments" className="min-h-0 flex-1 overflow-y-auto">
-          <PullRequestCommentsTab
-            comments={comments}
-            hasComposer={canPostComment}
-            commentsPartial={pr.comments_partial}
-            providerLabel={copy.label}
-          />
+        <TabsContent value="comments" className="flex min-h-0 flex-1 flex-col overflow-hidden">
+          <div
+            role="region"
+            aria-label="PR comments"
+            tabIndex={0}
+            className="min-h-0 flex-1 overflow-y-auto"
+          >
+            <PullRequestCommentsTab
+              comments={comments}
+              hasComposer={canPostComment}
+              commentsPartial={pr.comments_partial}
+              providerLabel={copy.label}
+            />
+          </div>
           {canPostComment && data.selected_pr_url && (
             <PullRequestCommentComposer
               key={`${conversationId}:${data.selected_pr_url}`}

@@ -24,23 +24,24 @@ export function PullRequestCommentComposer({
   const tooLong = pullRequestCommentTooLong(draft.body);
   return (
     <form
-      className="space-y-2 border-t p-3"
+      className="flex max-h-[60%] shrink-0 flex-col gap-2 border-t bg-background p-3"
       onSubmit={(event) => {
         event.preventDefault();
         post();
       }}
     >
-      <p className="text-ui text-muted-foreground">
+      <p className="shrink-0 text-ui text-muted-foreground">
         {account ? `Comment as ${account}` : "Comment using the host’s GitHub account"}
       </p>
-      <Tabs value={tab} onValueChange={setTab}>
-        <TabsList>
+      <Tabs value={tab} onValueChange={setTab} className="min-h-0">
+        <TabsList className="shrink-0">
           <TabsTrigger value="write">Write</TabsTrigger>
           <TabsTrigger value="preview">Preview</TabsTrigger>
         </TabsList>
-        <TabsContent value="write">
+        <TabsContent value="write" className="min-h-0 overflow-y-auto">
           <Textarea
             aria-label="New PR comment"
+            className="max-h-40"
             placeholder="Leave a comment… Markdown is supported."
             value={draft.body}
             disabled={draft.pending}
@@ -48,7 +49,7 @@ export function PullRequestCommentComposer({
             rows={4}
           />
         </TabsContent>
-        <TabsContent value="preview">
+        <TabsContent value="preview" className="min-h-0 overflow-y-auto">
           {draft.body.trim() ? (
             <MessageResponse components={PULL_REQUEST_MARKDOWN_COMPONENTS}>
               {draft.body}
@@ -68,7 +69,12 @@ export function PullRequestCommentComposer({
           {draft.error}
         </p>
       )}
-      <Button type="submit" size="sm" disabled={draft.pending || !draft.body.trim() || tooLong}>
+      <Button
+        type="submit"
+        size="sm"
+        className="shrink-0 self-start"
+        disabled={draft.pending || !draft.body.trim() || tooLong}
+      >
         {draft.pending ? "Posting…" : "Post comment"}
       </Button>
     </form>
