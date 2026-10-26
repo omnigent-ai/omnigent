@@ -1257,7 +1257,7 @@ def test_web_updates_preserve_security_and_compatibility(evaluate_fixture, polic
     else:
         old, new = files["pnpm-lock.yaml"]
         files["pnpm-lock.yaml"] = (old, new + "\nimporters: {}\n")
-    reason = "resolution violates compatibility override" if fault == "override" else ""
+    reason = "resolution violates compatibility override" if fault == "override" else None
     with pytest.raises(policy_module.NeedsReview, match=reason):
         evaluate()
 
