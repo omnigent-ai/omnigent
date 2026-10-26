@@ -1479,8 +1479,15 @@ function PullRequestPanelDetails({
     );
   }, [files]);
 
+  // Jumping to a collapsed file also expands it, so the click lands on its diff.
   const jumpTo = useCallback((path: string) => {
     setActivePath(path);
+    setCollapsedPaths((prev) => {
+      if (!prev.has(path)) return prev;
+      const next = new Set(prev);
+      next.delete(path);
+      return next;
+    });
     sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
   }, []);
 

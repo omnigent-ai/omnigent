@@ -11829,6 +11829,39 @@ describe("managed sandbox gateway preview", () => {
     });
   }
 
+  it.each([
+    ["high", "high"],
+    ["xhigh", undefined],
+  ])(
+    "seeds project effort %s against the gateway model's ladder",
+    async (projectEffort, sentEffort) => {
+      preview();
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      useProjectsMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: [{ id: "proj_alpha", name: "Alpha" }],
+      });
+      useProjectConfigMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: { agent_id: "a2", model: astra.id, effort: projectEffort },
+      });
+      renderLanding(
+        {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "arclet",
+          sandbox_provider_capabilities: { arclet: { default_models: true } },
+        },
+        "/?project=Alpha",
+      );
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBe(astra.id);
+      expect(body.reasoning_effort).toBe(sentEffort);
+    },
+  );
+
   it("offers gateway models without a host and carries Codex model and effort into create", async () => {
     preview();
     authenticatedFetchMock.mockResolvedValue({
