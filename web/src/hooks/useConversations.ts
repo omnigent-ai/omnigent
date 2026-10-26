@@ -733,15 +733,12 @@ export function useConversations(
 }
 
 /**
- * One result group of the palette's session search (`?search_scope=`).
- *
- * Keyed outside `["conversations", ...]` so the sidebar's cache patching never
- * decodes it. Nothing patches these rows, so they are never reused from cache:
- * a session deleted or renamed since the last search must not reappear.
+ * One palette search group; keyed outside `["conversations"]`, which patches rows
+ * live. Dropped once unobserved, so a later search never shows a stale row.
  */
 export function useSessionSearch(
   searchQuery: string,
-  searchScope: Exclude<SessionSearchScope, "all">,
+  searchScope: SessionSearchScope,
   { enabled = true, limit = 10 }: { enabled?: boolean; limit?: number } = {},
 ) {
   const queryClient = useQueryClient();

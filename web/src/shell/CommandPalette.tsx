@@ -1,13 +1,6 @@
-// Global command palette (⌘K). Command groups, sessions first:
-//
-//   • Sessions — recent sessions when idle; server-side title matches once typing.
-//   • In messages — content-only matches with a snippet, paged separately.
-//   • Actions — static app commands (new chat, navigate, toggle panels).
-//     Filtered client-side against the live query.
-//
-// cmdk's own filtering is disabled (`shouldFilter={false}`): the server filters
-// sessions, and we filter the (tiny, static) action list ourselves so both
-// groups react to the same input.
+// ⌘K palette: Sessions (recent, or title matches), In messages (content matches), Actions.
+// Sessions are searched server-side (one loaded page can't find older ones), so
+// cmdk filtering is off and the static actions are filtered here.
 
 import type React from "react";
 import { defaultFilter } from "cmdk";
@@ -29,6 +22,7 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Dialog, DialogContent, DialogTitle } from "@/components/ui/dialog";
@@ -223,10 +217,20 @@ export function CommandPalette({
 
   const { data, isFetching, isError, refetch, hasNextPage, fetchNextPage, isFetchNextPageError } =
     useConversations("", false, { enabled: open });
+  const serverInfo = useServerInfo();
+  // Older servers ignore `search_scope`, so they get one mixed group instead.
+  const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
   const searching = !sessionsOnly && debouncedQuery !== "";
   const searchOptions = { enabled: open && searching, limit: SEARCH_GROUP_PAGE_SIZE };
-  const titleSearch = useSessionSearch(debouncedQuery, "title", searchOptions);
-  const contentSearch = useSessionSearch(debouncedQuery, "content", searchOptions);
+  const titleSearch = useSessionSearch(
+    debouncedQuery,
+    groupedSearch ? "title" : "all",
+    searchOptions,
+  );
+  const contentSearch = useSessionSearch(debouncedQuery, "content", {
+    ...searchOptions,
+    enabled: searchOptions.enabled && groupedSearch,
+  });
   const loadedPages = data?.pages.length ?? 0;
   useEffect(() => {
     if (
@@ -353,13 +357,24 @@ export function CommandPalette({
     </CommandItem>
   );
 
-  const renderShowMore = (scope: "title" | "content", group: typeof titleSearch): React.ReactNode =>
+  const renderShowMore = (
+    scope: "title" | "content",
+    group: typeof titleSearch,
+    rows: readonly PaletteSession[],
+  ): React.ReactNode =>
     group.hasNextPage &&
     !group.isFetchNextPageError && (
       <CommandItem
         value={`more:${scope}`}
         disabled={group.isFetchingNextPage}
-        onSelect={() => void group.fetchNextPage()}
+        onSelect={() => {
+          // This row vanishes after the last page, so park the selection on
+          // the group's last row; the next ArrowDown reaches the new rows.
+          userMovedSelection.current = true;
+          const lastRow = rows.at(-1);
+          if (lastRow) setSelectedValue(lastRow.id);
+          void group.fetchNextPage();
+        }}
         className="pl-6 text-muted-foreground"
       >
         {group.isFetchingNextPage ? "Loading…" : "Show more"}
@@ -444,8 +459,10 @@ export function CommandPalette({
           <CommandList
             className={isMobile ? "max-h-none flex-1" : undefined}
             // Hovering a row selects it in cmdk, which counts as the user's pick.
-            onPointerMove={() => {
-              userMovedSelection.current = true;
+            onPointerMove={(event) => {
+              if ((event.target as Element).closest("[cmdk-item]")) {
+                userMovedSelection.current = true;
+              }
             }}
           >
             {(loadError || (sessionsOnly && isFetching)) && (
@@ -473,13 +490,13 @@ export function CommandPalette({
             {sessions.length > 0 && (
               <CommandGroup heading="Sessions">
                 {visibleSessions.map(renderSession)}
-                {searching && renderShowMore("title", titleSearch)}
+                {searching && renderShowMore("title", titleSearch, visibleSessions)}
               </CommandGroup>
             )}
             {contentSessions.length > 0 && (
               <CommandGroup heading="In messages">
                 {contentSessions.map(renderSession)}
-                {renderShowMore("content", contentSearch)}
+                {renderShowMore("content", contentSearch, contentSessions)}
               </CommandGroup>
             )}
             {sessionsOnly && sessions.length > visibleSessions.length && (

@@ -922,6 +922,7 @@ class ConversationStore(ABC):
             (title matches only), or ``"content"`` (content matches
             whose title does not match). ``"title"`` and ``"content"``
             never overlap, so a search UI can list them as two groups.
+            Ignored when ``search_query`` is empty.
         :param accessible_by: When set, filter to sessions the
             user has a direct grant on in ``session_permissions``.
             Public (``"__public__"``) grants are deliberately NOT

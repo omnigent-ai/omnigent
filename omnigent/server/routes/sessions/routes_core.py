@@ -1650,7 +1650,8 @@ def register_core_routes(
             ``"all"`` (default) returns title or content matches.
             ``"title"`` returns only title matches. ``"content"``
             returns content matches whose title does not match;
-            ``title`` and ``content`` never overlap.
+            ``title`` and ``content`` never overlap. Ignored without
+            a ``search_query``.
         :param include_archived: When ``False`` (default), archived
             sessions are omitted. When ``True``, archived sessions
             are returned alongside active ones (the sidebar groups

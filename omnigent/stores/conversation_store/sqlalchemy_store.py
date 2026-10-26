@@ -2968,7 +2968,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param search_scope: Which matches ``search_query`` returns:
             ``"all"`` (title or content), ``"title"`` (title matches
             only), or ``"content"`` (content matches whose title does
-            not match), so the two groups never overlap.
+            not match), so the two groups never overlap. Ignored when
+            ``search_query`` is empty.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
