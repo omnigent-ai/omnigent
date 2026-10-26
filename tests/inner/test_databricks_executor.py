@@ -2827,8 +2827,45 @@ def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
 
     source = _ReusedDatabricksTokenSource()
     assert source.current_token() is None
+    assert source.failure_reason == "not logged in"
     available["ok"] = True
     assert source.current_token() == "tok-late"
+    assert source.failure_reason is None
+
+
+def test_reused_token_source_clears_failure_after_cached_mint_succeeds(monkeypatch):
+    """A mint failure on resolved auth is cleared once that cached auth mints again."""
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _DatabricksBearerAuth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    mint_succeeds = {"ok": False}
+
+    class _Cfg:
+        def authenticate(self):
+            if not mint_succeeds["ok"]:
+                raise DatabricksAuthError("token endpoint unavailable")
+            return {"Authorization": "Bearer tok-recovered"}
+
+    resolutions = []
+
+    def _fake_resolve(profile=None, *, host=None):
+        resolutions.append(host)
+        return _DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    source = _ReusedDatabricksTokenSource()
+    assert source.current_token() is None
+    assert source.failure_reason is not None
+    mint_succeeds["ok"] = True
+    assert source.current_token() == "tok-recovered"
+    assert len(resolutions) == 1, "the recovered mint must come from the cached auth"
+    assert source.failure_reason is None
 
 
 def test_reused_token_source_logs_first_failure_until_resolution_succeeds(monkeypatch, caplog):
@@ -2856,12 +2893,21 @@ def test_reused_token_source_logs_first_failure_until_resolution_succeeds(monkey
     )
 
     source = _ReusedDatabricksTokenSource()
+    reasons = []
     with caplog.at_level("INFO", logger="omnigent.inner.databricks_executor"):
         for _ in range(4):
             assert source.current_token() is None
+            reasons.append(source.failure_reason)
 
     messages = [r.getMessage() for r in caplog.records if "SDK auth unavailable" in r.getMessage()]
     assert messages == [
         "Databricks SDK auth unavailable: DatabricksAuthError: not logged in",
         "Databricks SDK auth unavailable: DatabricksAuthError: not logged in",
+    ]
+    # Every failure, logged or not, stays available for the caller's error message.
+    assert reasons == [
+        "not logged in",
+        "profile DEFAULT not found",
+        "Databricks authentication failed for profile None. Run: databricks auth login",
+        "not logged in",
     ]

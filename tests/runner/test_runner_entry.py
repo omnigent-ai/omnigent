@@ -36,6 +36,7 @@ from omnigent.runner._entry import (
     _install_crash_logging,
     _install_signal_handlers,
     _load_runner_idle_timeout_s_from_config,
+    _LocalAuthTokenFactory,
     _make_auth_token_factory,
     _make_managed_mint_factory,
     _ManagedMintTokenFactory,
@@ -3627,6 +3628,47 @@ def test_auth_token_factory_refreshes_expired_oidc_token(
     assert factory is not None
     assert factory() == "refreshed-jwt"
     assert refresh_calls, "the refresh path must have run"
+
+
+def test_runner_auth_block_reason_prefers_lapsed_stored_login(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Callbacks fail closed naming the re-login step; a lapsed Omnigent login outranks the SDK."""
+    from omnigent.inner.databricks_executor import DatabricksAuthError
+
+    def _sdk_not_logged_in(*_args: object, **_kwargs: object) -> None:
+        raise DatabricksAuthError("Databricks profile None is not authenticated.")
+
+    monkeypatch.setattr("omnigent.cli_auth.load_token", lambda _url, **_kw: None)
+    monkeypatch.setattr("omnigent.cli_auth.refresh_stored_token", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.stored_token_status", lambda _url: "expired")
+    monkeypatch.setattr("omnigent.cli_auth.load_databricks_workspace_host", lambda _url: None)
+    monkeypatch.setattr("omnigent.cli_auth.databricks_request_headers", lambda *a, **k: {})
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _sdk_not_logged_in
+    )
+    auth = _RunnerDatabricksAuth(
+        _LocalAuthTokenFactory("https://omnigent.example.com"),
+        server_url="https://omnigent.example.com",
+    )
+
+    def _callback_error() -> str:
+        transport = httpx.MockTransport(lambda _request: httpx.Response(200))
+        with httpx.Client(auth=auth, transport=transport) as client:
+            with pytest.raises(httpx.RequestError) as blocked:
+                client.get("https://omnigent.example.com/v1/me")
+        return str(blocked.value)
+
+    lapsed_login = _callback_error()
+    assert lapsed_login.startswith(
+        "Databricks token refresh returned no token: the stored login expired; run `"
+    )
+    assert lapsed_login.endswith("login https://omnigent.example.com` to re-authenticate")
+
+    monkeypatch.setattr("omnigent.cli_auth.stored_token_status", lambda _url: "absent")
+    assert _callback_error() == (
+        "Databricks token refresh returned no token: Databricks profile None is not authenticated."
+    )
 
 
 @pytest.mark.parametrize(

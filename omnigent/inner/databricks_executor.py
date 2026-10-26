@@ -878,7 +878,11 @@ def _resolve_databricks_auth_for_host(host: str) -> tuple[_DatabricksBearerAuth,
 
 
 class _ReusedDatabricksTokenSource:
-    """Reuse SDK auth, re-resolving it after a token mint fails."""
+    """Reuse SDK auth, re-resolving it after a token mint fails.
+
+    ``failure_reason`` keeps the latest credential error, e.g. ``"... Run:
+    databricks auth login"``, so callers can show it when no token is returned.
+    """
 
     def __init__(self, server_url: str | None = None, *, host: str | None = None) -> None:
         if server_url is not None and host is not None:
@@ -887,6 +891,7 @@ class _ReusedDatabricksTokenSource:
         self._host = host
         self._auth: _DatabricksBearerAuth | None = None
         self._failure_logged = False
+        self.failure_reason: str | None = None
 
     def _resolve(self) -> _DatabricksBearerAuth | None:
         """Resolve fresh SDK auth, returning ``None`` on credential failure.
@@ -910,11 +915,13 @@ class _ReusedDatabricksTokenSource:
                 else:
                     auth = _resolve_databricks_auth()[0]
         except (DatabricksAuthError, ImportError, ValueError) as exc:
+            self.failure_reason = str(exc)
             if not self._failure_logged:
                 self._failure_logged = True
                 logger.info("Databricks SDK auth unavailable: %s: %s", type(exc).__name__, exc)
             return None
         self._failure_logged = False
+        self.failure_reason = None
         return auth
 
     def current_token(self) -> str | None:
@@ -922,16 +929,20 @@ class _ReusedDatabricksTokenSource:
         cached = self._auth
         if cached is not None:
             try:
-                return cached.current_token()
+                token = cached.current_token()
             except DatabricksAuthError:
                 self._auth = None
+            else:
+                self.failure_reason = None
+                return token
         auth = self._resolve()
         if auth is None:
             return None
         self._auth = auth
         try:
             return auth.current_token()
-        except DatabricksAuthError:
+        except DatabricksAuthError as exc:
+            self.failure_reason = str(exc)
             return None
 
 
