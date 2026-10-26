@@ -477,12 +477,9 @@ def _upsert_labels(
     """
     Atomically UPSERT multiple labels on one conversation.
 
-    Dialect-aware: SQLite and PostgreSQL-family databases support
-    ``INSERT ... ON CONFLICT ... DO UPDATE``, so we use
-    their dedicated INSERT builders. Other dialects fall
-    back to a SELECT-then-INSERT/UPDATE path, which is
-    race-safe inside one transaction under SERIALIZABLE or
-    (for SQLite) its default single-writer semantics.
+    Uses native UPSERT statements for SQLite, MySQL, and PostgreSQL-family
+    databases. Other dialects fall back to SELECT-then-INSERT/UPDATE and
+    require the caller to serialize competing writes.
 
     :param session: Active SQLAlchemy session (the atomic
         unit of work).
@@ -520,14 +517,11 @@ def _upsert_prepared_labels(
         }
         for key, value in updates.items()
     ]
-    if dialect == "sqlite" or is_postgresql_family(dialect):
+    if dialect in {"sqlite", "mysql"} or is_postgresql_family(dialect):
         _dialect_upsert_labels(session, dialect, rows)
         return
-    # Generic dialect fallback — SELECT-then-INSERT/UPDATE in
-    # one transaction. Safe for the v1 "one active workflow
-    # per conversation" invariant (POLICIES.md §10); the
-    # SQLite / Postgres dialect-specific paths above give
-    # true atomic UPSERT for the supported production dbs.
+    # Unsupported dialects require caller-serialized writes to avoid
+    # racing the existence check against another transaction's insert.
     for row in rows:
         existing = session.get(
             SqlConversationLabel,
@@ -550,21 +544,19 @@ def _dialect_upsert_labels(
     dialect: str,
     rows: list[dict[str, Any]],
 ) -> None:
-    """
-    Dialect-specific UPSERT path for SQLite / PostgreSQL-family databases.
+    """Execute the dialect's atomic UPSERT for a batch of labels."""
+    if dialect == "mysql":
+        from sqlalchemy.dialects.mysql import insert as mysql_insert
 
-    Extracted from ``_upsert_labels`` so the two branches
-    (which use different ``insert`` builders producing
-    incompatible type variances at the mypy level) each live
-    in their own narrow scope. The outer function selects the
-    branch; this one executes it.
+        mysql_stmt = mysql_insert(SqlConversationLabel).values(rows)
+        session.execute(
+            mysql_stmt.on_duplicate_key_update(
+                value=mysql_stmt.inserted.value,
+                updated_at=mysql_stmt.inserted.updated_at,
+            )
+        )
+        return
 
-    :param session: Active SQLAlchemy session.
-    :param dialect: ``"sqlite"``, ``"postgresql"``, or ``"cockroachdb"`` (the
-        outer function gates all other dialects onto the
-        generic fallback path).
-    :param rows: Pre-built row dicts to upsert.
-    """
     # Typed as Any to sidestep the mypy variance issue between
     # the two dialect-specific ``Insert`` classes; the runtime
     # shape of both classes is identical for our use.
@@ -1516,8 +1508,8 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         Single-transaction batched UPSERT — either every key
         lands or none do (POLICIES.md §6.3). The dialect-aware
-        path dispatches to ``INSERT ... ON CONFLICT`` on
-        SQLite / PostgreSQL; other dialects fall back to
+        path uses native UPSERT on SQLite, MySQL, and
+        PostgreSQL; other dialects fall back to
         SELECT-then-INSERT/UPDATE inside the same transaction.
         Empty updates is a no-op.
 

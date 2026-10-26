@@ -148,6 +148,71 @@ def test_set_labels_many_keys_atomic(
     assert got.labels == updates
 
 
+def test_mysql_concurrent_label_upserts(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """Concurrent first writes update both values and timestamps without a race."""
+    from concurrent.futures import ThreadPoolExecutor
+    from threading import Barrier
+
+    from sqlalchemy import event, select
+
+    from omnigent.db.db_models import SqlConversationLabel
+
+    engine = conversation_store._conv_engine
+    if engine.dialect.name != "mysql":
+        pytest.skip("requires OMNIGENT_TEST_DB_URI pointing to MySQL")
+    conversation = conversation_store.create_conversation()
+    conversation_store.set_labels(conversation.id, {"preserved": "original"}, updated_at=100)
+    before_insert = Barrier(2, timeout=10)
+    waiting_connections = set()
+
+    def collide_first_inserts(connection, cursor, statement, parameters, context, many):
+        if (
+            statement.startswith("INSERT INTO conversation_labels")
+            and connection not in waiting_connections
+        ):
+            waiting_connections.add(connection)
+            before_insert.wait()
+
+    event.listen(engine, "before_cursor_execute", collide_first_inserts)
+    try:
+        with ThreadPoolExecutor(max_workers=2) as pool:
+            writes = [
+                pool.submit(
+                    conversation_store.set_labels,
+                    conversation.id,
+                    {
+                        "error_code": value,
+                        "error_message": value,
+                        f"writer_{value}": value,
+                    },
+                    updated_at=timestamp,
+                )
+                for value, timestamp in (("first", 200), ("second", 300))
+            ]
+            for write in writes:
+                write.result(timeout=20)
+    finally:
+        event.remove(engine, "before_cursor_execute", collide_first_inserts)
+
+    with conversation_store._conv_session("test_setup") as session:
+        rows = session.execute(
+            select(
+                SqlConversationLabel.key,
+                SqlConversationLabel.value,
+                SqlConversationLabel.updated_at,
+            ).where(SqlConversationLabel.conversation_id == conversation.id)
+        ).all()
+    labels = {key: (value, timestamp) for key, value, timestamp in rows}
+    assert len(labels) == 5
+    assert labels["preserved"] == ("original", 100)
+    assert labels["writer_first"] == ("first", 200)
+    assert labels["writer_second"] == ("second", 300)
+    assert labels["error_code"] in (("first", 200), ("second", 300))
+    assert labels["error_code"] == labels["error_message"]
+
+
 # ── Survival across conversation_items churn ───────────
 
 
@@ -279,21 +344,25 @@ async def test_delete_conversation_cascades_to_labels(
 # ── Isolation across conversations ─────────────────────
 
 
+@pytest.mark.parametrize("other_workspace_id", [0, 42])
 def test_labels_isolated_across_conversations(
     conversation_store: SqlAlchemyConversationStore,
+    other_workspace_id: int,
 ) -> None:
-    """Writes on one conversation do not leak to another.
-    Guards against a missing ``conversation_id`` filter in
-    either the read path or the write path."""
+    """Labels remain isolated, including matching conversation ids in other workspaces."""
+    from omnigent.db.db_models import workspace_scope
+
     a = conversation_store.create_conversation()
-    b = conversation_store.create_conversation()
     conversation_store.set_labels(a.id, {"integrity": "0"})
-    conversation_store.set_labels(b.id, {"integrity": "1"})
+    with workspace_scope(other_workspace_id):
+        b = conversation_store.create_conversation(
+            conversation_id=a.id if other_workspace_id else None,
+        )
+        conversation_store.set_labels(b.id, {"integrity": "initial"})
+        conversation_store.set_labels(b.id, {"integrity": "1"})
+        got_b = conversation_store.get_conversation(b.id)
     got_a = conversation_store.get_conversation(a.id)
-    got_b = conversation_store.get_conversation(b.id)
     assert got_a is not None and got_b is not None
-    # Each conversation has its own label state — proves
-    # both SELECT and UPSERT filter by conversation_id.
     assert got_a.labels == {"integrity": "0"}
     assert got_b.labels == {"integrity": "1"}
 
