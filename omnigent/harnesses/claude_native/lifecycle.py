@@ -65,13 +65,24 @@ def _path(bridge_dir: Path, launch_id: str) -> Path:
 
 def _read(path: Path) -> dict[str, object] | None:
     """Bound input and reject links/devices before reading any persisted evidence."""
+    entry: os.stat_result | None = None
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        if hasattr(os, "O_NOFOLLOW"):
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        else:
+            # Windows: refuse links and junctions by lstat; the opened file must be that entry.
+            entry = os.lstat(path)
+            fd = os.open(path, os.O_RDONLY | getattr(os, "O_BINARY", 0))
     except FileNotFoundError:
         return None
     try:
         info = os.fstat(fd)
-        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+        if entry is None:
+            trusted = info.st_uid == os.getuid()
+        else:
+            reparse = getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+            trusted = not reparse and os.path.samestat(entry, info)
+        if not stat.S_ISREG(info.st_mode) or not trusted or info.st_nlink != 1:
             raise ValueError("Lifecycle input is not an owned regular file")
         raw = os.read(fd, _MAX_BYTES + 1)
     finally:

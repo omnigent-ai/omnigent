@@ -450,7 +450,9 @@ def test_lifecycle_reader_rejects_linked_nonregular_and_oversize_input(
     _hook(monkeypatch, directory, "SessionEnd", 101.0, reason="logout")
     path = directory / f"lifecycle-{trace.launch_id}.json"
     if kind == "oversize":
-        path.write_bytes(path.read_bytes().ljust(lifecycle._MAX_BYTES, b" "))
+        content = path.read_bytes()
+        padding = lifecycle._MAX_BYTES - len(content)
+        path.write_bytes(content + b"\r\n" * (padding // 2) + b" " * (padding % 2))
         assert _read(launch)["session_end_reason"] == "logout"
         with path.open("ab") as stream:
             stream.write(b" ")
