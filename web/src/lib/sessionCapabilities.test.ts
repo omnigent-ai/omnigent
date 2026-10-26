@@ -1,9 +1,12 @@
 import { describe, expect, it } from "vitest";
 
 import {
+  CONNECTED_HOSTS_FORK_TARGET,
   effortLevelsForFamily,
+  FORK_TARGETS_LABEL_KEY,
   SANDBOX_FORK_UNSUPPORTED,
   SANDBOX_SWITCH_HOST_UNSUPPORTED,
+  SANDBOX_TARGET_FORK_UNSUPPORTED,
   sessionActionRestrictions,
   supportsEffortControl,
 } from "./sessionCapabilities";
@@ -41,6 +44,37 @@ describe("session action restrictions", () => {
         { labels: { "omnigent.host_type": "managed" } },
         { sandbox_provider: "modal" },
       ),
+    ).toEqual({
+      forkDisabledReason: SANDBOX_FORK_UNSUPPORTED,
+      switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+    });
+  });
+
+  it.each([
+    ["managed snapshot", { "omnigent.host_type": "managed" }, null],
+    ["Arclet host", {}, "arclet"],
+    ["Databricks Sandbox host", {}, "lakebox"],
+  ])(
+    "limits a restricted source detected by %s to connected hosts when labeled",
+    (_source, labels, provider) => {
+      expect(
+        sessionActionRestrictions(
+          { labels: { ...labels, [FORK_TARGETS_LABEL_KEY]: CONNECTED_HOSTS_FORK_TARGET } },
+          { sandbox_provider: provider },
+        ),
+      ).toEqual({
+        forkDisabledReason: undefined,
+        sandboxForkDisabledReason: SANDBOX_TARGET_FORK_UNSUPPORTED,
+        switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,
+      });
+    },
+  );
+
+  it("keeps the restriction for an unrecognized fork-targets label", () => {
+    expect(
+      sessionActionRestrictions({
+        labels: { "omnigent.host_type": "managed", [FORK_TARGETS_LABEL_KEY]: "sandboxes" },
+      }),
     ).toEqual({
       forkDisabledReason: SANDBOX_FORK_UNSUPPORTED,
       switchHostDisabledReason: SANDBOX_SWITCH_HOST_UNSUPPORTED,

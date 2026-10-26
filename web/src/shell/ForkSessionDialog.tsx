@@ -702,10 +702,13 @@ function ForkRunConfig({
  * @param onClose - Closes the host dialog (Cancel, and after a
  *   successful fork).
  */
-export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionForm>[0]) {
-  const { forkDisabledReason } = useSessionActionRestrictions(props.sourceSessionId, {
-    hostId: props.sourceHostId,
-  });
+export function ForkSessionForm(
+  props: Omit<Parameters<typeof SupportedForkSessionForm>[0], "connectedHostsOnly">,
+) {
+  const { forkDisabledReason, sandboxForkDisabledReason } = useSessionActionRestrictions(
+    props.sourceSessionId,
+    { hostId: props.sourceHostId },
+  );
   if (forkDisabledReason) {
     const loading = forkDisabledReason === SESSION_ACTIONS_LOADING;
     return (
@@ -736,7 +739,12 @@ export function ForkSessionForm(props: Parameters<typeof SupportedForkSessionFor
       </>
     );
   }
-  return <SupportedForkSessionForm {...props} />;
+  return (
+    <SupportedForkSessionForm
+      {...props}
+      connectedHostsOnly={sandboxForkDisabledReason !== undefined}
+    />
+  );
 }
 
 function SupportedForkSessionForm({
@@ -747,6 +755,7 @@ function SupportedForkSessionForm({
   sourceGitBranch,
   upToResponseId,
   workspaceRecovery = false,
+  connectedHostsOnly = false,
   onClose,
 }: {
   sourceSessionId: string;
@@ -756,6 +765,8 @@ function SupportedForkSessionForm({
   sourceGitBranch?: string | null;
   upToResponseId?: string | null;
   workspaceRecovery?: boolean;
+  /** The source can't fork into a new sandbox, so only hosts are offered. */
+  connectedHostsOnly?: boolean;
   onClose: () => void;
 }) {
   const navigate = useNavigate();
@@ -837,7 +848,10 @@ function SupportedForkSessionForm({
   // NewChatDialog uses for its own sandbox option.
   const info = useServerInfo();
   const managedSandboxesEnabled =
-    !workspaceRecovery && info !== "loading" && info.managed_sandboxes_enabled;
+    !workspaceRecovery &&
+    !connectedHostsOnly &&
+    info !== "loading" &&
+    info.managed_sandboxes_enabled;
   // One picker row per configured provider; a single-provider server
   // yields exactly one.
   const sandboxProviderRows = useMemo(
