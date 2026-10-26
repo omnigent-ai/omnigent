@@ -8122,6 +8122,7 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
         (("--effort", "low", "--model", "opus", "--effort", "xhigh"), "xhigh"),
         (("--model", "opus"), "high"),
         (("--effort", "ultra"), "high"),
+        (("--effort", "xhigh", "--effort", "ultra"), "high"),
     ],
 )
 def test_resolve_launch_effort_level_prefers_passed_effort(

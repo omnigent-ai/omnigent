@@ -8541,8 +8541,8 @@ def resolve_launch_effort_level(claude_args: tuple[str, ...]) -> str | None:
     """
     Return the effort the wrapped ``claude`` will run at for ``claude_args``.
 
-    A pass-through ``--effort`` wins (last valid occurrence, as for Claude
-    itself); otherwise fall back to :func:`read_user_effort_level`.
+    The last pass-through ``--effort`` wins, as for Claude itself, when it
+    names a valid effort; otherwise fall back to :func:`read_user_effort_level`.
 
     :param claude_args: Pass-through Claude CLI args, e.g.
         ``("--effort", "xhigh")``.

@@ -55,6 +55,10 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         # Explicit --model in pass-through args WINS (joined form): the
         # ``--model=X`` spelling must also suppress the override default.
         (None, "claude-opus-4-7", ["--model=sonnet"], ("--model=sonnet",)),
+        # A pass-through --effort (either form) is the one Claude runs at,
+        # so the persisted effort must not add a second, conflicting flag.
+        ("high", None, ["--effort", "xhigh"], ("--effort", "xhigh")),
+        ("high", None, ["--verbose", "--effort=max"], ("--verbose", "--effort=max")),
         # Full ordering: effort prefix, then pass-through, then the
         # model default last. A different order would mean the assembly
         # logic changed and the launch command no longer matches the CLI.
@@ -90,6 +94,8 @@ from omnigent.runner.subagent_routing import AUTO_HARNESS_LABEL_KEY
         "model-default-appended",
         "explicit-model-space-wins",
         "explicit-model-joined-wins",
+        "explicit-effort-space-wins",
+        "explicit-effort-joined-wins",
         "full-ordering",
         "all-none",
         "empty-passthrough-still-adds-model",
