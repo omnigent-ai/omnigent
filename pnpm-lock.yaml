@@ -44,7 +44,7 @@ overrides:
   brace-expansion@>=1.0.0 <2.0.0: 1.1.21
   brace-expansion@>=2.0.0 <3.0.0: 2.1.7
   brace-expansion@>=5.0.0 <6.0.0: 5.0.12
-  markdown-it@>=14.0.0 <15.0.0: 14.3.2
+  markdown-it@>=14.0.0 <15.0.0: 14.3.3
   proxy-addr@>=2.0.0 <3.0.0: 2.0.8
   source-map-js@>=1.0.0 <2.0.0: 1.2.2
   '@shikijs/core': 4.5.0
@@ -7086,8 +7086,8 @@ packages:
     resolution: {integrity: sha512-o5vL7aDWatOTX8LzaS1WMoaoxIiLRQJuIKKe2wAw6IeULDHaqbiqiggmx+pKvZDb1Sj+pE46Sn1T7lCqfFtg1Q==}
     engines: {node: '>=16'}
 
-  markdown-it@14.3.2:
-    resolution: {integrity: sha512-sHHjZ5fJKlgrG4qns2YwVcdNep35h5fERrfkD2YNsb9UFk0UIHarbiTaHKVMlPuWAoiilyK8Fv/jAm11slsY7Q==}
+  markdown-it@14.3.3:
+    resolution: {integrity: sha512-L//tDAkjTjJCU6pBUSBTgs3Kg4InVaZuUZog/b6V12UKhcDQ7S78877ibbCanRExwPuYP1CZD7Gd2dxSy1GXRg==}
     hasBin: true
 
   markdown-table@3.0.4:
@@ -14527,7 +14527,7 @@ snapshots:
       hosted-git-info: 4.1.0
       jsonc-parser: 3.3.1
       leven: 3.1.0
-      markdown-it: 14.3.2
+      markdown-it: 14.3.3
       mime: 1.6.0
       minimatch: 10.2.5
       parse-semver: 1.1.1
@@ -17039,7 +17039,7 @@ snapshots:
 
   markdown-extensions@2.0.0: {}
 
-  markdown-it@14.3.2:
+  markdown-it@14.3.3:
     dependencies:
       argparse: 2.0.1
       entities: 4.5.0

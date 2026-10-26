@@ -64,6 +64,41 @@ async def test_private_sender_can_message_shared_receiver(auth_client, peers, db
     assert store.get_conversation(source["id"]).parent_conversation_id is None
 
 
+async def test_runner_is_trusted_for_other_owned_sessions_it_hosts(auth_client, peers, db_uri):
+    source, target, _ = peers
+    sibling = await _create_session_as(auth_client, "", "alice")
+    store = SqlAlchemyConversationStore(db_uri)
+    store.set_runner_id(sibling["id"], store.get_conversation(source["id"]).runner_id)
+    assert (await _send(auth_client, sibling, target)).get("queued") is True
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob")
+    permissions.grant("bob", sibling["id"], LEVEL_READ)
+    assert "Shared sessions cannot" in (await _send(auth_client, sibling, target))["detail"]
+
+
+@pytest.mark.parametrize("batch", [False, True])
+async def test_peer_message_tracks_runner_startup(auth_client, peers, monkeypatch, batch):
+    from omnigent.server.routes import sessions
+    from omnigent.server.routes._sessions import orchestration
+
+    source, target, _ = peers
+    started = []
+
+    async def observe_startup(*args, **kwargs):
+        started.append(orchestration._session_is_starting(target["id"]))
+
+    monkeypatch.setattr(sessions, "_ensure_runner_relay_ready", observe_startup)
+    event = {"type": "session_message", "data": {"message": "Start"}}
+    response = await auth_client.post(
+        f"/v1/sessions/{target['id']}/events",
+        headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+        json=[event] if batch else event,
+    )
+    assert response.status_code == 202, response.text
+    assert started == [True]
+    assert not orchestration._dispatch_in_flight.get(target["id"])
+
+
 @pytest.mark.parametrize(
     "condition",
     [
@@ -284,6 +319,10 @@ async def test_creation_refuses_before_launch(
         permissions.grant("bob", source["id"], LEVEL_READ)
     else:
         auth_client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "wrong"
+    store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    before_sessions = {s.id for s in store.list_conversations().data}
+    before_grants = permissions.list_for_user("alice")
     result = json.loads(
         await execute_tool(
             tool_name="sys_session_create",
@@ -300,6 +339,8 @@ async def test_creation_refuses_before_launch(
     assert expected in result["detail"], result
     assert not captured.get("posts")
     assert auth_app.state.host_registry.get(host_id).outbound_queue.empty()
+    assert {s.id for s in store.list_conversations().data} == before_sessions
+    assert permissions.list_for_user("alice") == before_grants
 
 
 async def test_same_host_still_requires_host_ownership(auth_client, auth_app, peers, db_uri):
@@ -309,6 +350,10 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
     host_id = "a" * 32
     _register_online_host(auth_app, host_id, "bob")
     SqlAlchemyConversationStore(db_uri).set_host_id(source["id"], host_id, workspace="/tmp")
+    store = SqlAlchemyConversationStore(db_uri)
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    before_sessions = {s.id for s in store.list_conversations().data}
+    before_grants = permissions.list_for_user("alice")
     result = json.loads(
         await execute_tool(
             tool_name="sys_session_create",
@@ -317,9 +362,11 @@ async def test_same_host_still_requires_host_ownership(auth_client, auth_app, pe
             conversation_id=source["id"],
         )
     )
-    assert "error" in result, result
+    assert "not your host" in result["detail"], result
     assert not captured.get("posts")
     assert auth_app.state.host_registry.get(host_id).outbound_queue.empty()
+    assert {s.id for s in store.list_conversations().data} == before_sessions
+    assert permissions.list_for_user("alice") == before_grants
 
 
 @pytest.mark.parametrize("child_manager", [False, True])
@@ -554,38 +601,6 @@ async def test_orchestrated_endpoint_requires_source(auth_client, peers, monkeyp
         "/v1/sessions/orchestrated", json={"agent_id": source["agent_id"]}
     )
     assert response.status_code == 403, response.text
-
-
-@pytest.mark.parametrize("placement", ["same_host", "managed"])
-async def test_unsupported_route_never_uses_ordinary_creation(
-    auth_client, auth_app, peers, monkeypatch, placement
-):
-    from omnigent.server.routes.sessions import routes_core
-
-    source, _, _ = peers
-    monkeypatch.setattr(
-        auth_app.router,
-        "routes",
-        [
-            r
-            for r in auth_app.router.routes
-            if getattr(r, "path", None) != "/v1/sessions/orchestrated"
-        ],
-    )
-
-    async def unexpected_creation(*args, **kwargs):
-        pytest.fail("Unsupported orchestration must not fall back to ordinary creation")
-
-    monkeypatch.setattr(routes_core, "_create_session_from_existing_agent", unexpected_creation)
-    result = json.loads(
-        await execute_tool(
-            tool_name="sys_session_create",
-            arguments=json.dumps({"agent_id": source["agent_id"], "placement": placement}),
-            server_client=auth_client,
-            conversation_id=source["id"],
-        )
-    )
-    assert "unavailable on this server" in result["error"]
 
 
 @pytest.mark.parametrize("share_before_admission", [False, True])

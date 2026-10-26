@@ -5644,6 +5644,52 @@ def test_build_connect_headers_retains_auth_factory(
     assert token_calls == [1, 1, 1]
 
 
+@pytest.mark.parametrize("status", [401, 403, "redirect", 503])
+@pytest.mark.parametrize("login_repaired", [False, True])
+async def test_rejected_host_bearer_rediscovers_repaired_credentials(
+    monkeypatch: pytest.MonkeyPatch, status: int | str, login_repaired: bool
+) -> None:
+    """Auth refusals discard the resolver; an outage keeps its warm cache."""
+    import omnigent.runner._entry as entry_mod
+
+    credential = "rejected-token"
+    resolved: list[str] = []
+
+    def make_factory(*, server_url: str | None = None) -> Callable[[], str]:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        resolved.append(credential)
+        cached = credential
+        return lambda: cached
+
+    rejection = (
+        InvalidURI("https://example.test/oidc/authorize", "scheme isn't ws or wss")
+        if status == "redirect"
+        else _invalid_status(status)
+    )
+    spy = _ConnectSpy([rejection, rejection])
+    _patch_connect(monkeypatch, spy)
+    monkeypatch.setattr(entry_mod, "_make_auth_token_factory", make_factory)
+    monkeypatch.delenv("OMNIGENT_HOST_TOKEN", raising=False)
+    host = _host()
+    host._ever_connected = True
+    with pytest.raises(type(rejection)):
+        await host._connect_and_serve()
+
+    if login_repaired:
+        credential = "repaired-token"
+    with pytest.raises(type(rejection)):
+        await host._connect_and_serve()
+
+    auth_rejected = status != 503
+    expected_token = credential if auth_rejected else "rejected-token"
+    assert [call["additional_headers"]["Authorization"] for call in spy.calls] == [
+        "Bearer rejected-token",
+        f"Bearer {expected_token}",
+    ]
+    assert resolved == (["rejected-token", credential] if auth_rejected else ["rejected-token"])
+
+
 def test_build_connect_headers_slice_key_only_on_workspace_host(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -9490,6 +9536,103 @@ def test_github_reviewer_ops_are_served_on_host(
         "-f",
         "reviewers[]=octocat",
     ]
+
+
+def test_github_details_update_is_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host renames the PR when the runner is offline, as the session's tracked PR."""
+    from omnigent.host.frames import HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    sent: list[dict[str, str]] = []
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        sent.append(json.loads(Path(argv[argv.index("--input") + 1]).read_text()))
+        return 0, json.dumps({"title": "Renamed", "body": "Body"}), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+    try:
+        edited = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="details-update",
+                op="github_details_update",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "title": " Renamed ", "body": None},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+
+    assert edited.status == "ok", edited
+    assert edited.payload == {
+        "object": "session.github.pr_details",
+        "title": "Renamed",
+        "body": "Body",
+    }
+    assert sent == [{"title": "Renamed"}]
+
+
+def test_github_attachment_upload_is_served_on_host(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The host decodes the tunnelled file and uploads it when the runner is offline."""
+    import base64
+
+    from omnigent.host.frames import HostFsResultFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+    from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    png = b"\x89PNG\r\n\x1a\n" + b"\x00" * 8
+    uploaded: list[bytes] = []
+    asset = "https://github.com/user-attachments/assets/1234"
+
+    def gh(argv: list[str], **_kwargs: object) -> tuple[int, str, str]:
+        if argv[-2:] == ["--jq", ".id"]:
+            return 0, "7", ""
+        uploaded.append(Path(argv[argv.index("--input") + 1]).read_bytes())
+        return 0, json.dumps({"url": asset}), ""
+
+    monkeypatch.setattr(github_resource, "_gh", gh)
+    url = "https://github.com/example/one/pull/42"
+    SessionPrRegistry("session").record(
+        [PullRequestRef.from_url(url)], relationship="created", source="test"
+    )
+    host = _make_host_process()
+
+    def write(content: str) -> HostFsResultFrame:
+        return host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="attachment",
+                op="github_attachment_upload",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "name": "shot.png", "content_base64": content},
+            )
+        )
+
+    try:
+        ok = write(base64.b64encode(png).decode())
+        garbled = write("not base64!")
+    finally:
+        _cleanup_host(host)
+
+    assert ok.status == "ok", ok
+    assert ok.payload["url"] == asset
+    assert uploaded == [png]
+    assert (garbled.status, garbled.error_status) == ("error", 400)
+    assert "base64" in garbled.error
 
 
 def test_fs_search_reuses_the_changed_files_snapshot_across_requests(

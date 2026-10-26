@@ -112,6 +112,7 @@ dependencies = [
     # python-build-standalone interpreters whose OpenSSL has no default cert
     # path; previously only transitive, pinned here now that we import it.
     # 2026.10.19 drops the roots behind the compromised eMudhra intermediates.
+    # custom-lint: disable-next=young-dependency-floor -- CA security fix; proxy serves it
     "certifi>=2026.10.19",
     # Protobuf schema for the AI-gateway routing API
     # (omnigent/api/routing/v1/routing.proto).

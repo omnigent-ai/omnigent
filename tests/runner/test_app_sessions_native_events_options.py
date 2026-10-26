@@ -1701,6 +1701,55 @@ async def test_events_compact_on_opencode_native_503_when_summarize_raises(
 
 
 @pytest.mark.asyncio
+async def test_events_clear_on_opencode_native_waits_for_an_idle_reap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ``/clear`` relaunches OpenCode only after a reap holding the terminal lock finishes.
+
+    The relaunch reuses the session's tool relay before it registers the new pane;
+    interleaved with a reap, the reap would close the relay the new pane uses.
+    """
+    from omnigent.runner.app import _session_event_queues_ref
+    from tests.runner.helpers import make_test_terminal_instance
+
+    conv_id = f"conv_{uuid.uuid4().hex[:12]}"
+    terminal_registry = TerminalRegistry()
+    instance = make_test_terminal_instance("opencode", "main", tmp_path)
+    terminal_registry._by_conversation[conv_id] = {("opencode", "main"): instance}
+    relaunches: list[str] = []
+
+    async def _record_relaunch(session_id: str, *args: object, **kwargs: object) -> None:
+        del args, kwargs
+        relaunches.append(session_id)
+
+    monkeypatch.setattr(native_controls, "_auto_create_opencode_terminal", _record_relaunch)
+    app, _pm = await _build_app_for_spec(
+        _harness_spec("opencode-native"), terminal_registry=terminal_registry
+    )
+    async with _runner_client(app) as http_client:
+        create_resp = await http_client.post(
+            "/v1/sessions",
+            json={"session_id": conv_id, "agent_id": "880b5afda28ad55ff74cbeb9b5fc67fb"},
+        )
+        assert create_resp.status_code == 201, create_resp.text
+        _drain_session_event_queue(_session_event_queues_ref.get(conv_id))
+        lock = app.state.native_terminal_ensure_locks["opencode"].setdefault(
+            conv_id, asyncio.Lock()
+        )
+        async with lock:
+            clear = asyncio.create_task(
+                http_client.post(f"/v1/sessions/{conv_id}/events", json={"type": "clear"})
+            )
+            await asyncio.sleep(0.2)
+            assert not relaunches, "/clear relaunched OpenCode while the lock was held"
+        resp = await clear
+        assert resp.status_code == 200, resp.text
+        assert relaunches == [conv_id]
+
+
+@pytest.mark.asyncio
 async def test_events_compact_on_non_native_session_is_204_noop(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

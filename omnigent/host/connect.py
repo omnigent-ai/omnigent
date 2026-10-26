@@ -9,6 +9,8 @@ the server.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import errno
 import functools
@@ -3868,6 +3870,30 @@ class HostProcess:
                 add=params.get("add", []),
                 remove=params.get("remove", []),
             )
+        if op == "github_details_update":
+            return pr_resource.update_pr_details(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                title=params.get("title"),
+                body=params.get("body"),
+            )
+        if op == "github_attachment_upload":
+            # JSON frames carry no raw bytes, so the server sends the file base64-encoded.
+            encoded = params.get("content_base64")
+            try:
+                content = (
+                    base64.b64decode(encoded, validate=True) if isinstance(encoded, str) else b""
+                )
+            except binascii.Error as exc:
+                raise ValueError("Expected base64-encoded file content") from exc
+            return pr_resource.upload_pr_attachment(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                name=params.get("name"),
+                content=content,
+            )
         raise ValueError(f"unknown fs write op: {op!r}")
 
     async def _handle_create_worktree(
@@ -4536,6 +4562,10 @@ class HostProcess:
             )
             ws = await ws_cm.__aenter__()
         except (InvalidURI, InvalidStatus) as exc:
+            if isinstance(exc, InvalidURI) or exc.response.status_code in (401, 403):
+                # Rediscover repaired credentials instead of reusing a rejected SDK cache.
+                self._auth_token_factory = None
+                self._auth_token_factory_resolved = False
             # The upgrade itself was rejected. Fail loud on permanent
             # failures (auth / authorization / outdated server); let the
             # reconnect loop retry transient ones.

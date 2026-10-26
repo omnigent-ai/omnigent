@@ -22,7 +22,8 @@ workers on its host or a new managed sandbox. This is behind the disabled-by-def
   An owner can still message a long-lived private manager directly.
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
-  falling back to ordinary creation. A delivery timeout is uncertain and must not auto-retry.
+  falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
+  acknowledgements are uncertain and must not auto-retry.
 
 ## How to get to it (user POV)
 
@@ -54,7 +55,8 @@ can supply their own provider through the existing launcher interface.
   tests/server/integration/test_session_orchestration.py --reruns 0` checks the
   authenticated routes, ownership stores, refusal matrix and managed request /
   durable startup contract with simulated provisioning. It covers default provider
-  selection for OSS and embedding configurations, and an absent orchestration route.
+  selection for OSS and embedding configurations. Runner tests cover an absent
+  orchestration route without falling back to ordinary creation.
   Two ASGI replicas sharing a database verify host routing for root, child and
   side-chat destinations with the production runner client/auth and a simulated
   ingress. Queue tests check refusal before saving and replay after sharing.
@@ -70,16 +72,26 @@ can supply their own provider through the existing launcher interface.
 - Same host also means the same workspace, inherited together from the host-bound
   ancestor for child managers. Separate sessions do not isolate filesystem edits.
   Managed creation reserves its routing host ID when supported by the server.
+  If the same-host worker is created but its first task is not confirmed, the
+  result includes a top-level error and the created session ID. Inspect that
+  session before continuing; do not automatically create a replacement or resend.
 - Independent creation uses `/v1/sessions/orchestrated`, which requires a source;
   older servers cannot silently accept the request as ordinary session creation.
 - A shared receiver can continue working but cannot message back while shared.
 - Privacy checks govern these tools. They do not confine arbitrary code holding
   owner credentials or sanitize shared content the manager reads.
 - The source token authenticates its runner, not an exact session within that
-  runner. Stable-ID runner pools using allow-listed tunnel tokens are unsupported;
+  runner. Runners are trusted for every session they host: another private owned
+  session on the same runner can be named as the source. Stable-ID runner pools
+  using allow-listed tunnel tokens are unsupported;
   this gate requires token-derived runner IDs and refuses other bindings.
+- Side chats currently use their own sharing permissions; copied history from
+  a shared source is not a privacy restriction. Whether to inherit source-sharing
+  restrictions is an open product decision before activation.
 - Peer messages carry only task text and owner attribution. They do not forward
   per-event model/tool overrides or a caller-supplied delivery ID.
+  The textual source prefix is a display hint, not an authorization credential
+  or authenticated provenance. Other users can copy it into ordinary messages.
 - Admission is the final source check before delivery or saving a startup task.
   Successfully queued tasks can finish after the sender is shared; replay retains
   normal destination permissions and policy checks. The check and subsequent

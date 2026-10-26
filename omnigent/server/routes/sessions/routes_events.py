@@ -182,6 +182,7 @@ from omnigent.server.routes._sessions.helpers import (
     _build_skill_slash_command_policy_body,
     _dispatch_skill_slash_command_to_runner,
     _evaluate_output_policy,
+    _extract_user_text_from_event,
     _filesystem_attachment_in_history,
     _filesystem_attachment_policy,
     _forward_session_change_to_runner,
@@ -891,7 +892,9 @@ def register_events_routes(
                                     request,
                                     session_id,
                                     event,
-                                    in_flight=in_flight if event.type == "message" else None,
+                                    in_flight=in_flight
+                                    if event.type in {"message", "session_message"}
+                                    else None,
                                 )
                             )
                         continue
@@ -906,7 +909,7 @@ def register_events_routes(
                 request,
                 session_id,
                 body,
-                in_flight=in_flight if body.type == "message" else None,
+                in_flight=in_flight if body.type in {"message", "session_message"} else None,
             )
 
     router.include_router(event_router)
@@ -1285,6 +1288,23 @@ def register_events_routes(
                 parse_client_side_tool_specs(body.tools)
             except ValueError as exc:
                 raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+        if body.type == "message" and body.data.get("role", "user") == "user":
+            from omnigent.harnesses.claude_native.bridge import is_auth_slash_command
+
+            if is_auth_slash_command(_extract_user_text_from_event(body)) and (
+                await asyncio.to_thread(
+                    _native_pane_harness,
+                    conv,
+                    agent_store=agent_store,
+                    agent_cache=agent_cache,
+                )
+                == "claude-native"
+            ):
+                raise OmnigentError(
+                    "Claude Code's /login and /logout commands require its terminal. "
+                    "Run omni setup on the host to sign in or out, then retry.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
         if (
             body.type == _RETRY_SESSION_TYPE
             or (body.type == "message" and body.data.get("role") == "user")
@@ -1345,7 +1365,8 @@ def register_events_routes(
                     permission_store,
                     target_id=session_id,
                 )
-            # A saved task is accepted work; sharing later does not revoke it.
+            # Identity is needed for deferred authorization; a saved task stays
+            # accepted after later sharing.
             saved = await startup.enqueue(
                 session_id, body, user_id=user_id, headers=request.headers, first=False
             )
@@ -3274,13 +3295,9 @@ def register_events_routes(
                     exc_info=True,
                 )
         if peer_message:
-            if not isinstance(request, Request):
-                raise OmnigentError(
-                    "Session messages require a runner HTTP request", code=ErrorCode.FORBIDDEN
-                )
             await asyncio.to_thread(
                 require_orchestration_source,
-                request,
+                cast(Request, request),
                 user_id,
                 conversation_store,
                 permission_store,

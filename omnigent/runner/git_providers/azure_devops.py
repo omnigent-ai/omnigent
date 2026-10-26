@@ -1201,6 +1201,35 @@ class AzureDevOpsPullRequests:
         """
         raise ValueError("Editing Azure DevOps pull request reviewers is not supported yet.")
 
+    def edit_details(
+        self,
+        root: str,  # noqa: ARG002 - details editing is unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - details editing is unsupported
+        *,
+        title: str | None,  # noqa: ARG002 - details editing is unsupported
+        body: str | None,  # noqa: ARG002 - details editing is unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps title and description editing is not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Editing Azure DevOps pull request descriptions is not supported yet.")
+
+    def upload_attachment(
+        self,
+        root: str,  # noqa: ARG002 - attachment uploads are unsupported
+        reference: PullRequestRef,  # noqa: ARG002 - attachment uploads are unsupported
+        *,
+        name: str,  # noqa: ARG002 - attachment uploads are unsupported
+        content_type: str,  # noqa: ARG002 - attachment uploads are unsupported
+        content: bytes,  # noqa: ARG002 - attachment uploads are unsupported
+    ) -> dict[str, Any]:
+        """Reject the request: Azure DevOps attachment uploads are not supported.
+
+        :raises ValueError: Always.
+        """
+        raise ValueError("Attaching files to Azure DevOps pull requests is not supported yet.")
+
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``az repos pr`` command, in order."""
         return azure_devops_observer.shell_pr_operations(segments)

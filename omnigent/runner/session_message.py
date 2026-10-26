@@ -44,6 +44,8 @@ async def execute_message_tool(
                 response = await post_on_host(
                     client, path, host_id=None, headers=headers, json=payload, timeout=60
                 )
+        if response.status_code >= 500 or response.status_code in (408, 429):
+            raise httpx.HTTPError("Delivery acknowledgement unavailable")
     except (httpx.HTTPError, ValueError):
         return json.dumps(
             {"error": "Delivery could not be confirmed; do not automatically resend"}
@@ -51,7 +53,10 @@ async def execute_message_tool(
     if response.is_error:
         return json.dumps({"error": "Session message refused", "detail": response.text[:1000]})
     try:
-        return json.dumps(response.json())
+        acknowledgement = response.json()
+        if not isinstance(acknowledgement, dict):
+            raise ValueError("Expected a delivery acknowledgement object")
+        return json.dumps(acknowledgement)
     except ValueError:
         return json.dumps(
             {"error": "Delivery could not be confirmed; do not automatically resend"}

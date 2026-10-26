@@ -113,6 +113,7 @@ from omnigent.tools.builtins.timer import (
     # schema advertises.
     validate_timer_set_args,
 )
+from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 from omnigent.util.session_lifecycle import (
@@ -320,6 +321,7 @@ _SESSION_QUERY_TOOLS = frozenset(
 )
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+_UI_TOOLS = frozenset({UiOpenFileTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
 # tool schema so the dispatcher can never drift from the published contract.
@@ -479,6 +481,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     | _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _UI_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -600,6 +603,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetInfoTool,
             SysSessionRenameTool,
             SysSessionMessageTool,
+            UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -878,6 +882,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _UI_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
     | _WEB_READ_TOOLS
@@ -3594,7 +3599,7 @@ async def _execute_session_create(
     if not isinstance(data.get("id"), str) or not data["id"]:
         return json.dumps({"error": "server did not return a child session id"})
     if placement != "child":
-        handle = {
+        handle: dict[str, object] = {
             "conversation_id": data["id"],
             "kind": "default",
             "status": data.get("status") or "created",
@@ -3604,13 +3609,21 @@ async def _execute_session_create(
         if placement == "same_host" and args.get("message"):
             from omnigent.runner.session_message import execute_message_tool
 
-            handle["initial_message"] = json.loads(
+            initial_message = json.loads(
                 await execute_message_tool(
                     {"session_id": data["id"], "message": args["message"]},
                     server_client,
                     conversation_id,
                 )
             )
+            handle["initial_message"] = initial_message
+            if initial_message.get("error"):
+                handle["status"] = "created_initial_message_failed"
+                handle["error"] = (
+                    "Session created, but its first task was not confirmed; "
+                    "inspect this session before continuing. Do not create a replacement; "
+                    "do not automatically resend the task."
+                )
         return json.dumps(handle)
     return _finalize_created_session(
         data,
@@ -5988,6 +6001,30 @@ async def _session_list_via_rest(
     )
 
 
+async def _open_file_via_rest(
+    args: _JsonObject,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Validate and forward a UI request using only the calling session's identity."""
+    if server_client is None or not conversation_id:
+        return json.dumps({"error": "ui_open_file requires server access and a session id"})
+    try:
+        body = OpenFileRequest.model_validate(args)
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/ui/open-file",
+            json=body.model_dump(),
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or type(result.get("subscribers")) is not int:
+            return json.dumps({"error": "ui_open_file returned an invalid delivery response"})
+        return json.dumps(result)
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"error": f"ui_open_file failed: {exc}"})
+
+
 async def _rename_current_session_via_rest(
     args: _JsonObject,
     conversation_id: str | None,
@@ -6766,6 +6803,8 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
             )
+        elif tool_name in _UI_TOOLS:
+            output = await _open_file_via_rest(args, conversation_id, server_client)
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
             output = await _rename_current_session_via_rest(
                 args,

@@ -59,6 +59,27 @@ _MERGE_METHODS = frozenset({"merge", "squash", "rebase"})
 _COMMIT_SHA = re.compile(r"[0-9a-f]{40}(?:[0-9a-f]{24})?")
 # Bounds one reviewer edit's request body; the panel sends one reviewer at a time.
 _MAX_REVIEWER_EDIT = 100
+# GitHub's limits on a pull request's title and description.
+_MAX_TITLE_CHARS = 256
+_MAX_BODY_CHARS = 65536
+# GitHub's image limit. Videos may be 100 MB there, but the server and host
+# tunnels each carry the file base64-encoded (a third larger) in one 100 MB frame.
+_MAX_IMAGE_ATTACHMENT_BYTES = 10 * 1024 * 1024
+_MAX_VIDEO_ATTACHMENT_BYTES = 70 * 1024 * 1024
+# Leading bytes of each media type GitHub accepts as an attachment, with its extension.
+_ATTACHMENT_SIGNATURES: tuple[tuple[int, bytes, str, str], ...] = (
+    (0, b"\x89PNG\r\n\x1a\n", "image/png", "png"),
+    (0, b"\xff\xd8\xff", "image/jpeg", "jpg"),
+    (0, b"GIF87a", "image/gif", "gif"),
+    (0, b"GIF89a", "image/gif", "gif"),
+    (0, b"\x1a\x45\xdf\xa3", "video/webm", "webm"),
+)
+# ISO media files (``ftyp`` at byte 4) name their format in the next four bytes;
+# only video brands count, so HEIC and AVIF photos aren't sent as MP4.
+_QUICKTIME_BRAND = b"qt  "
+_MP4_BRANDS = frozenset(
+    (b"isom", b"iso2", b"iso4", b"iso5", b"iso6", b"mp41", b"mp42", b"avc1", b"dash", b"M4V ")
+)
 
 _DISCOVERY_POOL = ThreadPoolExecutor(max_workers=4, thread_name_prefix="pr-discovery")
 _DISCOVERY_LOCK = Lock()
@@ -780,6 +801,124 @@ def update_pr_reviewers(
         raise ValueError(f"Edit at most {_MAX_REVIEWER_EDIT} reviewers at once")
     facet, reference = _reviewer_target(session_id, pr_url)
     return facet.edit_reviewers(root, reference, add=add_refs, remove=remove_refs)
+
+
+def _details_target(
+    session_id: str | None, pr_url: str | None
+) -> tuple[PullRequestFacet, SessionPullRequest]:
+    """Return the selected tracked PR and its facet, which must support details editing."""
+    return _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.details_editing,
+        unselected="Select a pull request to edit its title or description",
+        unsupported="Editing {kind} titles and descriptions is not supported",
+    )
+
+
+def update_pr_details(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    title: object = None,
+    body: object = None,
+) -> dict[str, Any]:
+    """Replace the selected PR's title and/or description.
+
+    :param title: The new title, or ``None`` to keep it; surrounding space is dropped.
+    :param body: The new description in markdown, or ``None`` to keep it.
+    :returns: A ``session.github.pr_details`` with the PR's resulting title and body.
+    :raises ValueError: On a blank or oversized title, an oversized body, neither
+        field set, without a selected tracked PR, or when the provider refuses.
+    """
+    if title is not None and not isinstance(title, str):
+        raise ValueError("Expected title to be a string")
+    if body is not None and not isinstance(body, str):
+        raise ValueError("Expected body to be a string")
+    if title is None and body is None:
+        raise ValueError("Expected a title or body to update")
+    if title is not None:
+        title = title.strip()
+        if not title:
+            raise ValueError("A pull request title cannot be empty")
+        if len(title) > _MAX_TITLE_CHARS:
+            raise ValueError(f"A pull request title can be at most {_MAX_TITLE_CHARS} characters")
+    if body is not None and len(body) > _MAX_BODY_CHARS:
+        raise ValueError(f"A pull request description can be at most {_MAX_BODY_CHARS} characters")
+    facet, reference = _details_target(session_id, pr_url)
+    return facet.edit_details(root, reference, title=title, body=body)
+
+
+def _attachment_media_type(content: bytes) -> tuple[str, str] | None:
+    """Return the ``(content_type, extension)`` the bytes start with, or ``None``."""
+    for offset, signature, content_type, extension in _ATTACHMENT_SIGNATURES:
+        if content[offset : offset + len(signature)] == signature:
+            return content_type, extension
+    if content[:4] == b"RIFF" and content[8:12] == b"WEBP":
+        return "image/webp", "webp"
+    if content[4:8] == b"ftyp":
+        if content[8:12] == _QUICKTIME_BRAND:
+            return "video/quicktime", "mov"
+        if content[8:12] in _MP4_BRANDS:
+            return "video/mp4", "mp4"
+    return None
+
+
+def _attachment_name(name: object, extension: str) -> str:
+    """A file name for the upload, ending in ``extension`` as GitHub requires."""
+    stem = name.rsplit("/", 1)[-1].rsplit("\\", 1)[-1] if isinstance(name, str) else ""
+    stem = stem.rsplit(".", 1)[0] if "." in stem else stem
+    stem = re.sub(r"[^\w.-]+", "-", stem).strip("-.")[:100] or "attachment"
+    return f"{stem}.{extension}"
+
+
+def upload_pr_attachment(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    name: object = None,
+    content: bytes = b"",
+) -> dict[str, Any]:
+    """Upload an image or video to embed in the selected PR's description.
+
+    The media type comes from the content, not the client, since GitHub stores
+    whatever type it is told.
+
+    :param name: The file's name; its extension is replaced to match the content.
+    :returns: A ``session.github.pr_attachment`` with the ``url`` to embed.
+    :raises ValueError: On an empty, unsupported, or oversized file, without a
+        selected tracked PR, or when the provider refuses the upload.
+    """
+    if not content:
+        raise ValueError("The attachment is empty")
+    media = _attachment_media_type(content)
+    if media is None:
+        raise ValueError("Attach a PNG, JPEG, GIF, or WebP image, or an MP4, MOV, or WebM video")
+    content_type, extension = media
+    limit = (
+        _MAX_VIDEO_ATTACHMENT_BYTES
+        if content_type.startswith("video/")
+        else _MAX_IMAGE_ATTACHMENT_BYTES
+    )
+    if len(content) > limit:
+        kind = "A video" if content_type.startswith("video/") else "An image"
+        raise ValueError(f"{kind} can be at most {limit // (1024 * 1024)} MB")
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.attachment_uploads,
+        unselected="Select a pull request to attach files to",
+        unsupported="Attaching files to a {kind} is not supported",
+    )
+    return facet.upload_attachment(
+        root,
+        reference,
+        name=_attachment_name(name, extension),
+        content_type=content_type,
+        content=content,
+    )
 
 
 def pr_changed_files(

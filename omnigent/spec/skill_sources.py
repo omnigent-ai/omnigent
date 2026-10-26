@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import stat
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
@@ -449,42 +450,46 @@ def _plugin_install_paths(
     return out
 
 
-# Claude Code's plugin command loader stops at these bounds; so does the menu.
-_MAX_PLUGIN_COMMAND_BYTES = 1024 * 1024
-_MAX_PLUGIN_COMMAND_DEPTH = 32
-_MAX_PLUGIN_COMMAND_DIRS = 4096
-_PLUGIN_COMMAND_SUMMARY_CHARS = 100
+# Claude Code's command-loader bounds; the ``.claude/commands`` walk reuses them as a safety net.
+_MAX_COMMAND_BYTES = 1024 * 1024
+_MAX_COMMAND_DEPTH = 32
+_MAX_COMMAND_DIRS = 4096
+_COMMAND_SUMMARY_CHARS = 100
 
 
-def _plugin_command_summary(body: str) -> str:
+def _command_summary(body: str) -> str:
     """Claude Code's fallback label: the first non-empty body line, heading marker dropped."""
     for line in body.splitlines():
         text = re.sub(r"^#+\s+", "", line.strip())
         if text:
-            if len(text) > _PLUGIN_COMMAND_SUMMARY_CHARS:
-                return text[: _PLUGIN_COMMAND_SUMMARY_CHARS - 3] + "..."
+            if len(text) > _COMMAND_SUMMARY_CHARS:
+                return text[: _COMMAND_SUMMARY_CHARS - 3] + "..."
             return text
     return ""
 
 
-def _parse_plugin_command(command_md: Path, segments: tuple[str, ...]) -> SkillSpec | None:
-    """Parse one plugin command file the way Claude Code names and labels it.
+def _parse_command(
+    command_md: Path, segments: tuple[str, ...], *, name_from_frontmatter: bool
+) -> SkillSpec | None:
+    """Parse one command file the way Claude Code names and labels it.
 
     *segments* is the command's path under its commands root, e.g.
-    ``("reports", "weekly")`` for ``commands/reports/weekly.md``; a frontmatter
-    ``name`` replaces the last segment. Frontmatter is optional and the
-    description falls back to the body's first line. Commands carry no
-    ``skill_dir`` because sibling command files are not skill resources.
+    ``("reports", "weekly")`` for ``commands/reports/weekly.md``. With
+    *name_from_frontmatter* (plugin commands), a frontmatter ``name`` replaces
+    the last segment; Claude Code ignores it for ``.claude/commands`` files.
+    Frontmatter is optional and the description falls back to the body's first
+    line. Commands carry no ``skill_dir`` because sibling command files are not
+    skill resources.
 
     :returns: The command, or ``None`` for an unreadable or oversized file.
     """
     try:
-        if command_md.stat().st_size > _MAX_PLUGIN_COMMAND_BYTES:
-            _log.warning("Skipping oversized plugin command %s", command_md)
+        if command_md.stat().st_size > _MAX_COMMAND_BYTES:
+            _log.warning("Skipping oversized command %s", command_md)
             return None
         text = command_md.read_text(encoding="utf-8")
     except (OSError, UnicodeDecodeError) as exc:
-        _log.warning("Skipping unreadable plugin command %s: %s", command_md, exc)
+        _log.warning("Skipping unreadable command %s: %s", command_md, exc)
         return None
     *parents, name = segments
     description = ""
@@ -503,7 +508,7 @@ def _parse_plugin_command(command_md: Path, segments: tuple[str, ...]) -> SkillS
                 frontmatter = None
         if isinstance(frontmatter, dict):
             raw_name = frontmatter.get("name")
-            if isinstance(raw_name, str) and raw_name.strip():
+            if name_from_frontmatter and isinstance(raw_name, str) and raw_name.strip():
                 name = raw_name.strip()
             raw = frontmatter.get("description")
             if isinstance(raw, str):
@@ -511,7 +516,7 @@ def _parse_plugin_command(command_md: Path, segments: tuple[str, ...]) -> SkillS
             user_invocable = not _falsey_flag(frontmatter.get("user-invocable", True))
     return SkillSpec(
         name=":".join((*parents, name)),
-        description=description or _plugin_command_summary(body),
+        description=description or _command_summary(body),
         content=body.strip(),
         skill_dir=None,
         user_invocable=user_invocable,
@@ -574,7 +579,7 @@ def _discover_plugin_commands(
         return entry.name[:-3] if entry.name.endswith(".md") else entry.name
 
     def _add(command_md: Path, segments: tuple[str, ...]) -> None:
-        spec = _parse_plugin_command(command_md, segments)
+        spec = _parse_command(command_md, segments, name_from_frontmatter=True)
         if spec is not None:
             out.append(spec)
 
@@ -582,7 +587,7 @@ def _discover_plugin_commands(
         # *prefix* names the children; *own* names the directory itself when it holds a skill.md.
         nonlocal scanned, bounded
         scanned += 1
-        if len(prefix) >= _MAX_PLUGIN_COMMAND_DEPTH or scanned > _MAX_PLUGIN_COMMAND_DIRS:
+        if len(prefix) >= _MAX_COMMAND_DEPTH or scanned > _MAX_COMMAND_DIRS:
             if not bounded:
                 _log.warning(
                     "Plugin %r: commands beyond the walk's bounds skipped: %s", key, directory
@@ -628,6 +633,120 @@ def _discover_plugin_commands(
             _add(source, (_stem(source),))
         else:
             _log.warning("Plugin %r: declared command path %s is missing or not .md", key, source)
+    return out
+
+
+def _claude_command_roots(ctx: SkillSourceContext) -> list[Path]:
+    """
+    The ``commands`` directories Claude Code reads, in its load order.
+
+    The user tier comes first, then the workspace and its ancestors up to the
+    repository root, stopping short of the home directory as Claude Code does.
+    Claude Code walks ``.claude/skills`` differently, so the two walks differ too.
+    """
+    roots = [_claude_user_dir(ctx) / "commands"]
+    if not ctx.roots:
+        return roots
+    home = ctx.home.resolve()
+    workspace = ctx.roots[0].resolve()
+    for directory in (workspace, *workspace.parents):
+        if directory == home:
+            break
+        roots.append(directory / ".claude" / "commands")
+        if (directory / ".git").exists():
+            break
+    return roots
+
+
+def _discover_claude_commands(
+    commands_dir: Path, seen_files: set[tuple[int, int]]
+) -> list[SkillSpec]:
+    """
+    Read one ``.claude/commands`` root the way Claude Code's loader names it.
+
+    Each ``*.md`` file is the command named by its path joined with ``:``
+    (``ops/deploy.md`` is ``ops:deploy``). A directory holding a ``skill.md`` is
+    the one command named by that directory, though its subdirectories still
+    load. Symlinks are followed, and a file already in *seen_files* (device,
+    inode) is skipped so a file reached twice loads once.
+    """
+    if not commands_dir.is_dir():
+        return []
+    out: list[SkillSpec] = []
+    visited: set[tuple[int, int]] = set()
+    bounded = False
+
+    def _report(exc: OSError) -> None:
+        _log.warning("Skipping unreadable commands dir: %s", exc)
+
+    for current, dirnames, filenames in os.walk(commands_dir, onerror=_report, followlinks=True):
+        directory = Path(current)
+        relative = directory.relative_to(commands_dir).parts
+        try:
+            info = directory.stat()
+        except OSError:
+            dirnames.clear()
+            continue
+        if (info.st_dev, info.st_ino) in visited:
+            # A symlink loop, or a second link to a directory already read.
+            dirnames.clear()
+            continue
+        visited.add((info.st_dev, info.st_ino))
+        if len(relative) >= _MAX_COMMAND_DEPTH or len(visited) > _MAX_COMMAND_DIRS:
+            if not bounded:
+                _log.warning("Commands beyond the walk's bounds skipped: %s", directory)
+            bounded = True
+            dirnames.clear()
+            continue
+        dirnames.sort()
+        markdown: list[tuple[str, os.stat_result]] = []
+        for name in sorted(filenames):
+            if not name.endswith(".md"):
+                continue
+            try:
+                file_info = (directory / name).stat()
+            except OSError:  # a dangling symlink
+                continue
+            if stat.S_ISREG(file_info.st_mode):
+                markdown.append((name, file_info))
+        skill_md = next((entry for entry in markdown if entry[0].lower() == "skill.md"), None)
+        if skill_md is not None:
+            # As in Claude Code, a skill.md at the root names the root itself (``/commands``).
+            name, file_info = skill_md
+            entries = [(name, file_info, relative or (commands_dir.name,))]
+        else:
+            entries = [
+                (name, file_info, (*relative, name.removesuffix(".md")))
+                for name, file_info in markdown
+            ]
+        for name, file_info, segments in entries:
+            if (file_info.st_dev, file_info.st_ino) in seen_files:
+                continue
+            seen_files.add((file_info.st_dev, file_info.st_ino))
+            spec = _parse_command(directory / name, segments, name_from_frontmatter=False)
+            if spec is not None:
+                out.append(spec)
+    return out
+
+
+def _claude_code_commands(ctx: SkillSourceContext) -> list[SkillSpec]:
+    """
+    Claude Code's ``.claude/commands`` entries, personal before project.
+
+    Reading the user tier first lets a personal command win a name collision
+    with a project one, as in Claude Code. Commands obey ``skills_filter`` like
+    host skills: ``"none"`` (which launches Claude without user or project
+    settings) lists none, and a list selects by name.
+    """
+    if ctx.skills_filter == "none":
+        return []
+    filter_names = set(ctx.skills_filter) if isinstance(ctx.skills_filter, list) else None
+    seen_files: set[tuple[int, int]] = set()
+    out: list[SkillSpec] = []
+    for commands_dir in _claude_command_roots(ctx):
+        for spec in _discover_claude_commands(commands_dir, seen_files):
+            if filter_names is None or skill_matches_names(spec, filter_names):
+                out.append(spec)
     return out
 
 
@@ -684,11 +803,12 @@ def select_claude_portable_skills(
 
 def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
     """
-    Claude host skills plus enabled plugins.
+    Claude host skills and commands plus enabled plugins.
 
     Native Claude loads its own tiers before the bridged ``.agents`` skills,
-    so an existing Claude command wins a collision. SDK discovery retains
-    the generic host walk.
+    so a native skill wins a collision with a bridged one. Its ``.claude/commands``
+    entries come after the skills, which win a same-named command as they do
+    in Claude Code. SDK discovery retains the generic host walk.
     """
     if ctx.is_native:
         # Claude still loads every native skill when a named subset is requested.
@@ -696,12 +816,16 @@ def claude_host_skills(ctx: SkillSourceContext) -> list[SkillSpec]:
             replace(ctx, skills_filter="all") if isinstance(ctx.skills_filter, list) else ctx
         )
         native = _claude_code_skills(native_ctx)
-        standalone = [
-            skill
-            for skill in native
-            if not isinstance(ctx.skills_filter, list)
-            or skill_matches_names(skill, ctx.skills_filter)
-        ] + select_claude_portable_skills(_claude_code_skills(ctx, ".agents"), native)
+        standalone = (
+            [
+                skill
+                for skill in native
+                if not isinstance(ctx.skills_filter, list)
+                or skill_matches_names(skill, ctx.skills_filter)
+            ]
+            + select_claude_portable_skills(_claude_code_skills(ctx, ".agents"), native)
+            + _claude_code_commands(ctx)
+        )
     else:
         standalone = _generic_host_skills(ctx)
     return standalone + _claude_plugin_skills(ctx)

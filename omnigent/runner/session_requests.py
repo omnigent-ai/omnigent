@@ -5,6 +5,7 @@ from typing import Any
 import httpx
 
 from omnigent.cli_auth import OMNIGENT_SLICE_KEY_HEADER, databricks_request_headers
+from omnigent.stores.conversation_store import SIDE_CHAT_LABEL_KEY, SIDE_CHAT_SOURCE_LABEL_KEY
 from omnigent.util.uuid import uuid_to_bytes
 
 # Local httpx metadata, never sent as an HTTP header.
@@ -39,6 +40,8 @@ def is_wrong_replica(response: httpx.Response) -> bool:
 
 async def session_host_id(client: httpx.AsyncClient, session_id: str) -> str | None:
     """Resolve a target's host using authorized snapshots, including child inheritance."""
+    from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
+
     visited: set[str] = set()
     shared_runner_id: str | None = None
     for _ in range(16):
@@ -59,15 +62,13 @@ async def session_host_id(client: httpx.AsyncClient, session_id: str) -> str | N
         snapshot = response.json()
         if shared_runner_id is not None and snapshot.get("runner_id") != shared_runner_id:
             return None
-        labels = snapshot.get("labels", {})
-        host_id = snapshot.get("host_id") or snapshot.get("labels", {}).get(
-            "omnigent.sandbox.requested_host_id"
-        )
+        labels = snapshot.get("labels") or {}
+        host_id = snapshot.get("host_id") or labels.get(REQUESTED_HOST_ID_LABEL_KEY)
         if host_id:
             return str(host_id)
         parent = snapshot.get("parent_session_id")
-        if not parent and labels.get("omnigent.side_chat") == "1":
-            parent = labels.get("omnigent.side_chat.source_id")
+        if not parent and labels.get(SIDE_CHAT_LABEL_KEY) == "1":
+            parent = labels.get(SIDE_CHAT_SOURCE_LABEL_KEY)
             shared_runner_id = snapshot.get("runner_id")
         if not parent:
             break

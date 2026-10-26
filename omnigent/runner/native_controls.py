@@ -341,6 +341,7 @@ def build_native_controls(
     _model_dialog_watchers: set[asyncio.Task[None]],
     _native_cost_popup_config_file: Callable[[str, str], Coroutine[Any, Any, Path]],
     _native_pane_status: dict[str, str],
+    _opencode_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _publish_turn_status: _PublishTurnStatusFn,
     _resolve_session_agent_spec: Callable[[str], Coroutine[Any, Any, AgentSpec | None]],
@@ -1959,14 +1960,16 @@ def build_native_controls(
         except OmnigentError:
             spec = None
         try:
-            await _auto_create_opencode_terminal(
-                conv_id,
-                resource_registry,
-                _publish_event,
-                agent_spec=spec,
-                server_client=server_client,
-                ensure_comment_relay=_ensure_comment_relay_started,
-            )
+            # The idle pane reaper holds this lock while it releases the relay this reuses.
+            async with _opencode_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock()):
+                await _auto_create_opencode_terminal(
+                    conv_id,
+                    resource_registry,
+                    _publish_event,
+                    agent_spec=spec,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                )
         except Exception as exc:  # noqa: BLE001 - report relaunch failure to caller.
             return JSONResponse(
                 status_code=503,

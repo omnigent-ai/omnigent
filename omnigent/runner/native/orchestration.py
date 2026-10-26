@@ -362,6 +362,10 @@ _COST_POPUP_REPOP_TASKS: set[asyncio.Task[object]] = set()
 # One-shot readiness observers for runner-owned native terminals. Strong
 # references keep the tasks alive after session creation returns.
 _TERMINAL_INTERACTIVE_TASKS: set[asyncio.Task[None]] = set()
+
+# Tool-relay starts that follow a Claude terminal launch, kept referenced
+# until they finish.
+_CLAUDE_RELAY_START_TASKS: set[asyncio.Task[None]] = set()
 _TERMINAL_INTERACTIVE_TIMEOUT_S = 180.0
 _TERMINAL_INTERACTIVE_POLL_INTERVAL_S = 0.15
 # Sign-in may stay open indefinitely; limit its liveness subprocess rate.
@@ -10169,7 +10173,7 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
     """
     if ctx.server_client is None:
         raise ValueError("claude-native launch requires a bound server_client")
-    return await _auto_create_claude_terminal(
+    view = await _auto_create_claude_terminal(
         ctx.session_id,
         ctx.resource_registry,
         ctx.publish_event,
@@ -10185,6 +10189,39 @@ async def _launch_claude(ctx: NativeLaunchContext) -> SessionResourceView:
         record_launch_config=ctx.record_launch_config,
         rebind_bridge=ctx.rebind_bridge,
     )
+    _start_claude_relay_after_launch(ctx)
+    return view
+
+
+def _start_claude_relay_after_launch(ctx: NativeLaunchContext) -> None:
+    """Start the session's tool relay in the background after a Claude launch.
+
+    An idle reap closes the relay with the pane, and a pane re-created from the
+    Terminal view gets no turn to start it again. A relay already serving the
+    session is reused, so the start that session creation also runs is harmless.
+
+    :param ctx: The launch context the terminal was built from.
+    :returns: None.
+    """
+    ensure_comment_relay = ctx.ensure_comment_relay
+    if ensure_comment_relay is None:
+        return
+    session_id = ctx.session_id
+    labels = ctx.session_init.snapshot.labels if ctx.session_init is not None else None
+
+    async def _start() -> None:
+        try:
+            await ensure_comment_relay(session_id, session_labels=labels)
+        except Exception:
+            _logger.exception(
+                "Failed to start comment relay for %s",
+                session_id,
+                extra={"session_id": session_id},
+            )
+
+    task = asyncio.create_task(_start(), name=f"claude-comment-relay:{session_id}")
+    _CLAUDE_RELAY_START_TASKS.add(task)
+    task.add_done_callback(_CLAUDE_RELAY_START_TASKS.discard)
 
 
 async def _launch_native_terminal(

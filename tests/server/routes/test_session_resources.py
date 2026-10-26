@@ -3303,6 +3303,82 @@ async def test_github_pr_edit_relays_the_runner_refusal(
 
 
 @pytest.mark.asyncio
+async def test_github_attachment_forwards_the_bytes_and_relays_the_refusal(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The file's raw bytes reach the runner with the PR and name, under the upload wait."""
+    from omnigent.runner import github_resource
+    from omnigent.server.routes.sessions import routes_resources
+
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/attachments"
+    pr_url = "https://github.com/acme/widgets/pull/17"
+    asset = {
+        "object": "session.github.pr_attachment",
+        "url": "https://github.com/user-attachments/assets/1",
+    }
+    fake_runner = _FakeRunnerClient()
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+    forwarded: list[tuple[str, dict[str, str], bytes, float | None]] = []
+    answers = [httpx.Response(200, json=asset), httpx.Response(400, json={"detail": "No push"})]
+
+    async def post(
+        url: str,
+        *,
+        params: dict[str, str],
+        content: bytes,
+        headers: dict[str, str],
+        timeout: float | None = None,
+    ) -> httpx.Response:
+        assert headers == {"Content-Type": "application/octet-stream"}
+        forwarded.append((url, params, content, timeout))
+        return answers.pop(0)
+
+    fake_runner.post = post  # type: ignore[method-assign]
+    upload = {"file": ("shot.png", b"\x89PNG-bytes", "image/png")}
+
+    uploaded = await client.post(path, data={"pr_url": pr_url}, files=upload)
+    refused = await client.post(path, data={"pr_url": pr_url}, files=upload)
+    monkeypatch.setattr(routes_resources, "_MAX_PR_ATTACHMENT_BYTES", 4)
+    oversized = await client.post(path, data={"pr_url": pr_url}, files=upload)
+
+    assert (uploaded.status_code, uploaded.json()) == (200, asset)
+    assert (refused.status_code, refused.json()["detail"]) == (400, "No push")
+    assert oversized.status_code == 413
+    assert (
+        forwarded
+        == [
+            (
+                path,
+                {"pr_url": pr_url, "name": "shot.png"},
+                b"\x89PNG-bytes",
+                routes_resources._PR_ATTACHMENT_PROXY_TIMEOUT_S,
+            )
+        ]
+        * 2
+    )
+    assert (
+        github_resource._ATTACHMENT_REQUEST_SECONDS
+        < routes_resources._PR_ATTACHMENT_PROXY_TIMEOUT_S
+    )
+
+
+def test_pr_attachments_fit_one_tunnel_frame() -> None:
+    """The largest attachment, base64-encoded, fits a runner or host tunnel frame.
+
+    A bigger frame is refused with close code 1009, which drops every request on
+    that tunnel. The host's ``websockets.connect`` uses the same 100 MB limit.
+    """
+    from omnigent.runner import pr_resource
+    from omnigent.server.routes.sessions import routes_resources
+    from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
+
+    largest = routes_resources._MAX_PR_ATTACHMENT_BYTES
+    assert largest == pr_resource._MAX_VIDEO_ATTACHMENT_BYTES
+    encoded_length = 4 * -(-largest // 3)  # base64's exact output length
+    assert encoded_length < RUNNER_TUNNEL_MAX_MESSAGE_BYTES * 0.95
+
+
+@pytest.mark.asyncio
 async def test_github_merge_relays_the_runner_refusal(client: httpx.AsyncClient) -> None:
     """A refused merge keeps the runner's status and message, with the PR edit wait."""
     from omnigent.server.routes.sessions import routes_resources
@@ -4141,13 +4217,16 @@ async def test_filesystem_write_proxies_to_runner(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("fail_first_wake", [False, True])
-async def test_filesystem_save_reconnects_runner_on_live_host(
+@pytest.mark.parametrize("operation", ["save", "download"])
+async def test_filesystem_operation_reconnects_runner_on_live_host(
     client: httpx.AsyncClient,
     app: FastAPI,
+    tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     fail_first_wake: bool,
+    operation: str,
 ) -> None:
-    """Save (or Retry after a failed wake) reconnects before forwarding the edit."""
+    """Save and Download reconnect before forwarding, including Retry after a failed wake."""
     from dataclasses import replace
     from types import SimpleNamespace
 
@@ -4168,7 +4247,19 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
         HostHelloFrame(version="0.1.0-test", frame_protocol_version=1, name="save-host"),
         owner=None,
     )
-    fake_runner = _FakeRunnerClient(payload=_fs_write_payload())
+    payload = bytes(range(256))
+    (tmp_path / "download.bin").write_bytes(payload)
+    runner = FastAPI()
+    runner_calls: list[tuple[str, str]] = []
+
+    @runner.api_route(_FS_ROUTE, methods=["GET", "PUT"], response_model=None)
+    async def _serve(request: Request) -> FileResponse | JSONResponse:
+        runner_calls.append((request.method, request.url.path))
+        if request.method == "GET":
+            assert request.query_params["download"] == "true"
+            return FileResponse(tmp_path / "download.bin", filename="download.bin")
+        return JSONResponse(_fs_write_payload())
+
     connected = False
 
     class _SleepingRouter(_FakeRunnerRouter):
@@ -4180,14 +4271,12 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
             assert conversation is not None and conversation.runner_id == "runner_new"
             return super().client_for_session_resources(session_id, conversation=conversation)
 
-    router = _SleepingRouter(fake_runner)
-    set_runner_router(router)  # type: ignore[arg-type]
     attempts = 0
 
     async def _launch(*_args: Any, **_kwargs: Any) -> Any:
         nonlocal connected, attempts
         attempts += 1
-        assert fake_runner.calls == []
+        assert runner_calls == []
         if fail_first_wake and attempts == 1:
             raise OmnigentError("wake timed out", code=ErrorCode.RUNNER_UNAVAILABLE)
         # Recovery replaces the row: forwarding with the old binding would fail.
@@ -4212,22 +4301,32 @@ async def test_filesystem_save_reconnects_runner_on_live_host(
     url = f"/v1/sessions/{session_id}/resources/environments/default/filesystem/new.txt"
     body = {"content": "edited without a chat message", "encoding": "utf-8"}
 
-    if fail_first_wake:
-        failed = await client.put(url, json=body)
-        assert failed.status_code == 503
-        assert fake_runner.calls == []
+    method = "PUT" if operation == "save" else "GET"
+    request_kwargs = {"json": body} if operation == "save" else {"params": {"download": "true"}}
+    async with _runner_app_client(runner) as fake_runner:
+        set_runner_router(_SleepingRouter(fake_runner))  # type: ignore[arg-type]
+        if fail_first_wake:
+            failed = await client.request(method, url, **request_kwargs)
+            assert failed.status_code == 503
+            assert failed.json()["error"]["message"] == "wake timed out"
+            assert runner_calls == []
 
-    response = await client.put(url, json=body)
-    assert response.status_code == 200
-    assert fake_runner.calls == [("PUT", url)]
+        response = await client.request(method, url, **request_kwargs)
+    assert response.status_code == 200, response.text
+    if operation == "download":
+        assert response.content == payload
+        assert response.headers["content-disposition"] == 'attachment; filename="download.bin"'
+    assert runner_calls == [(method, url)]
     assert attempts == (2 if fail_first_wake else 1)
     assert store.appended_items == []
 
 
 @pytest.mark.asyncio
-async def test_filesystem_save_authorizes_before_reconnecting(
+@pytest.mark.parametrize("operation", ["save", "download"])
+async def test_filesystem_operation_authorizes_before_reconnecting(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    operation: str,
 ) -> None:
     """An invalid session must not trigger runner recovery."""
     from unittest.mock import AsyncMock
@@ -4236,9 +4335,11 @@ async def test_filesystem_save_authorizes_before_reconnecting(
 
     wake = AsyncMock()
     monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
-    response = await client.put(
-        "/v1/sessions/missing/resources/environments/default/filesystem/new.txt",
-        json={"content": "hello", "encoding": "utf-8"},
+    url = "/v1/sessions/missing/resources/environments/default/filesystem/new.txt"
+    response = (
+        await client.put(url, json={"content": "hello", "encoding": "utf-8"})
+        if operation == "save"
+        else await client.get(url, params={"download": "true"})
     )
     assert response.status_code == 404
     wake.assert_not_awaited()
@@ -9164,8 +9265,7 @@ class _OfflineRunnerClient:
         del params, timeout
         raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
 
-    async def post(self, url: str, *, json: Any = None, timeout: float | None = None) -> Any:
-        del json, timeout
+    async def post(self, url: str, **_kwargs: Any) -> Any:
         raise OmnigentError(f"runner is not connected ({url})", code=ErrorCode.RUNNER_UNAVAILABLE)
 
 
@@ -9837,6 +9937,12 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
             {"add": [], "remove": [{"login": "octocat", "kind": "user"}]},
         ),
         (
+            "/details",
+            {"title": "Renamed"},
+            "github_details_update",
+            {"title": "Renamed", "body": None},
+        ),
+        (
             "/merge",
             {"merge_method": "squash", "expected_head": "a" * 40},
             "github_merge",
@@ -9873,6 +9979,42 @@ async def test_pr_edit_reaches_offline_host(
     assert captured["op"] == op
     assert captured["session_id"] == _OFFLINE_SESSION
     assert captured["params"] == {"pr_url": url, **params}
+
+
+@pytest.mark.asyncio
+async def test_pr_attachment_reaches_offline_host_base64_encoded(
+    offline_env_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With the runner offline the file crosses the host tunnel, within the frame limit."""
+    import base64
+
+    from omnigent.server.routes import _host_filesystem
+    from omnigent.server.routes.sessions import routes_resources
+
+    captured: list[dict[str, Any]] = []
+    asset = {
+        "object": "session.github.pr_attachment",
+        "url": "https://github.com/user-attachments/assets/1",
+    }
+
+    async def write(**kwargs: Any) -> dict[str, Any]:
+        captured.append(kwargs)
+        return asset
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write)
+    path = f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/attachments"
+    url = "https://github.com/example/second/pull/42"
+    upload = {"file": ("shot.png", b"\x89PNG-bytes", "image/png")}
+
+    uploaded = await offline_env_client.post(path, data={"pr_url": url}, files=upload)
+
+    assert (uploaded.status_code, uploaded.json()) == (200, asset), uploaded.text
+    [call] = captured
+    assert call["op"] == "github_attachment_upload"
+    assert call["timeout"] == routes_resources._PR_ATTACHMENT_PROXY_TIMEOUT_S
+    params = call["params"]
+    assert (params["pr_url"], params["name"]) == (url, "shot.png")
+    assert base64.b64decode(params["content_base64"]) == b"\x89PNG-bytes"
 
 
 @pytest.mark.asyncio

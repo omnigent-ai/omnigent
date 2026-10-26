@@ -47,7 +47,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.entities import Conversation, ResolvedAccess, SessionPermission
-from omnigent.errors import OmnigentError
+from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.runtime import _globals, set_runner_client, set_runner_router
 from omnigent.server.auth import (
     LEVEL_EDIT,
@@ -705,6 +705,56 @@ async def test_workspace_reads_allow_view_only_when_shared(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("email", "routing_error", "status", "error_code"),
+    [
+        ("viewer@example.com", None, 200, None),
+        ("viewer@example.com", ErrorCode.RUNNER_UNAVAILABLE, 403, ErrorCode.FORBIDDEN),
+        ("owner@example.com", ErrorCode.WRONG_REPLICA, 400, ErrorCode.WRONG_REPLICA),
+    ],
+)
+async def test_shared_download_does_not_wake_without_edit_access_or_on_wrong_replica(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    email: str,
+    routing_error: str | None,
+    status: int,
+    error_code: str | None,
+) -> None:
+    """Shared viewers can download live files; recovery needs edit access and the right replica."""
+    from unittest.mock import AsyncMock
+
+    from omnigent.server.routes.sessions import routes_resources
+
+    payload = b"shared file"
+    transport = httpx.MockTransport(
+        lambda _request: httpx.Response(
+            200,
+            stream=httpx.ByteStream(payload),
+            headers={"Content-Disposition": 'attachment; filename="report.txt"'},
+        )
+    )
+    wake = AsyncMock()
+    monkeypatch.setattr(routes_resources, "ensure_runner_connected", wake)
+    async with httpx.AsyncClient(transport=transport, base_url="http://runner") as runner:
+        lookup = AsyncMock(return_value=runner)
+        if routing_error is not None:
+            lookup.side_effect = OmnigentError("runner unavailable here", code=routing_error)
+        monkeypatch.setattr(routes_resources, "_get_runner_client_for_resource_access", lookup)
+        response = await client.get(
+            "/v1/sessions/conv_open/resources/environments/default/filesystem/report.txt",
+            params={"download": "true"},
+            headers={"X-Forwarded-Email": email},
+        )
+    assert response.status_code == status, response.text
+    if error_code is None:
+        assert response.content == payload
+    else:
+        assert response.json()["error"]["code"] == error_code
+    wake.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("url_tmpl", _CONTENT_READ_PATHS, ids=_CONTENT_READ_IDS)
 async def test_workspace_reads_stay_open_to_edit_collaborators(
     client: httpx.AsyncClient,
@@ -945,6 +995,8 @@ _MERGE_PATH = "/v1/sessions/conv_share/resources/github/merge"
 _MERGE_OPTIONS_PATH = "/v1/sessions/conv_share/resources/github/merge-options"
 _DISABLE_AUTO_MERGE_PATH = "/v1/sessions/conv_share/resources/github/disable-auto-merge"
 _MERGE_BODY = {"pr_url": _LABELS_PR_URL, "merge_method": "squash", "expected_head": "a" * 40}
+_DETAILS_PATH = "/v1/sessions/conv_share/resources/github/details"
+_ATTACHMENTS_PATH = "/v1/sessions/conv_share/resources/github/attachments"
 
 
 @pytest.mark.asyncio
@@ -986,14 +1038,57 @@ async def test_pr_merge_routes_require_edit(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
+    "caller,expected",
+    [("owner@example.com", 200), ("viewer@example.com", 403)],
+    ids=["edit-allowed", "read-denied"],
+)
+async def test_pr_details_route_requires_edit(
+    client: httpx.AsyncClient,
+    runner_client: _RecordingRunnerClient,
+    caller: str,
+    expected: int,
+) -> None:
+    """Editing the title or description acts as the host's account, so viewers are refused."""
+    edited = await client.post(
+        _DETAILS_PATH,
+        json={"pr_url": _LABELS_PR_URL, "title": "Renamed", "session_id": "untrusted"},
+        headers={"X-Forwarded-Email": caller},
+    )
+
+    assert edited.status_code == expected, edited.text
+    expected_posts = [
+        (_DETAILS_PATH, {"pr_url": _LABELS_PR_URL, "title": "Renamed", "body": None})
+    ]
+    assert runner_client.posts == ([] if expected == 403 else expected_posts)
+
+
+@pytest.mark.asyncio
+async def test_pr_attachment_upload_refuses_viewers_before_the_runner(
+    client: httpx.AsyncClient, runner_client: _RecordingRunnerClient
+) -> None:
+    """An upload lands on the provider as the host's account, so viewers cannot send one."""
+    uploaded = await client.post(
+        _ATTACHMENTS_PATH,
+        data={"pr_url": _LABELS_PR_URL},
+        files={"file": ("shot.png", b"\x89PNG", "image/png")},
+        headers={"X-Forwarded-Email": "viewer@example.com"},
+    )
+
+    assert uploaded.status_code == 403
+    assert runner_client.posts == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
     "path,body",
     [
         (_LABELS_PATH, {"pr_url": _LABELS_PR_URL, "add": ["bug"]}),
         (_REVIEWERS_PATH, {"pr_url": _LABELS_PR_URL, "add": [_REVIEWER]}),
+        (_DETAILS_PATH, {"pr_url": _LABELS_PR_URL, "title": "Renamed"}),
         (_MERGE_PATH, _MERGE_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ],
-    ids=["labels", "reviewers", "merge", "disable-auto-merge"],
+    ids=["labels", "reviewers", "details", "merge", "disable-auto-merge"],
 )
 async def test_pr_edit_requires_a_json_body(
     client: httpx.AsyncClient,

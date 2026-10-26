@@ -1,7 +1,8 @@
 import type * as TerminalsModule from "@/hooks/useTerminals";
 import type * as SessionsApi from "@/lib/sessionsApi";
 import { type ComponentProps, useContext, useState } from "react";
-import { cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, within, waitFor } from "@testing-library/react";
+import { emitUiOpenFile } from "@/lib/uiFileRequests";
 import { MemoryRouter } from "react-router-dom";
 import { afterEach, expect, it, vi } from "vitest";
 import { FileViewerContext } from "@/shell/FileViewerContext";
@@ -138,6 +139,28 @@ afterEach(() => {
   fixture.terminals = [];
   fixture.terminalPending = false;
   vi.restoreAllMocks();
+});
+
+it("opens agent-requested files only in the active workspace and respects navigation guards", () => {
+  render(
+    <MemoryRouter>
+      <TooltipProvider>
+        <RearrangeableGrid
+          grid={{ id: "ui-files", layout: splitGrid("first", "first", "second", "right")! }}
+        />
+      </TooltipProvider>
+    </MemoryRouter>,
+  );
+  act(() => emitUiOpenFile({ type: "ui_open_file", path: "background.md" }, "second"));
+  expect(screen.getByTestId("workspace-second")).not.toHaveTextContent("background.md");
+  act(() => emitUiOpenFile({ type: "ui_open_file", path: "guide.md" }, "first"));
+  expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
+  fireEvent.click(
+    within(screen.getByRole("region", { name: "first (active)" })).getByText("Block navigation"),
+  );
+  act(() => emitUiOpenFile({ type: "ui_open_file", path: "blocked.md" }, "first"));
+  expect(screen.getByTestId("workspace-first")).toHaveTextContent("guide.md");
+  expect(screen.getByTestId("workspace-first")).not.toHaveTextContent("blocked.md");
 });
 
 it("keeps cell views, input, permissions and shortcut targets independent", async () => {

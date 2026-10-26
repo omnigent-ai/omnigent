@@ -47,6 +47,8 @@ NO_CAPABILITIES = {
     "label_editing": False,
     "merging": False,
     "reviewer_editing": False,
+    "details_editing": False,
+    "attachment_uploads": False,
 }
 LEGACY_FIELDS = {"gh_available", "authenticated", "accounts", "selected_account"}
 CHANGES = [

@@ -31,7 +31,8 @@ and steers messages while the agent is busy.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. Ctrl+Shift+M opens it in both composers.
   States: catalog loading, delayed catalog,
-  alias vs. full model ID, refused switch (the pill keeps the applied model).
+  alias vs. full model ID, refused switch (the pill keeps the applied model),
+  a managed sandbox launching before its host is bound (its provider's default catalog).
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
@@ -61,10 +62,23 @@ and steers messages while the agent is busy.
   `slash_command` so it runs on an in-process harness. A native terminal side
   chat shows no menu and sends slash text to the vendor TUI.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
-  suggestions with a read-only list of MCP servers enabled for that session and
-  links to harness Settings with the session’s host preselected. Host-native entries are limited to the
-  active harness, and a host lookup failure leaves known agent entries visible.
-  It is absent before a session starts and from side chat.
+  suggestions with the MCP servers enabled for that session and links to harness
+  Settings with the session’s host preselected. Host-native entries are limited
+  to the active harness, and a host lookup failure leaves known agent entries
+  visible. It is absent before a session starts and from side chat. When the
+  server has the MCP registry on, each registry service row also shows its
+  account state. States: connected; sign-in required, with an inline **Sign in**
+  that runs the popup sign-in and flips the row to connected, or a **Sign in
+  from Settings** link for a service that needs a typed token or workspace URL;
+  unavailable, for a service the account no longer sees; signing in; failed or
+  cancelled, reported on the row with Sign in available again. A host-native
+  server, including one pinned by an organization's managed Claude config,
+  shows connected or sign-in required when the host's sign-in manager
+  reports it (via `~/.omnigent/mcp-auth-status.json`, see
+  `docs/MCP_AUTH_STATUS.md`); its **Sign
+  in** opens the reported URL in a new tab and the panel re-reads the host
+  inventory every few seconds until the row is connected. Custom agent servers
+  carry no account state.
 - `codex-plugin-skills`: typing `$` lists enabled Codex plugin skills in both
   composers, including cached plugins whose marketplace inventory is unavailable.
   Selecting a row inserts its namespaced identifier.
@@ -79,6 +93,9 @@ and steers messages while the agent is busy.
   server can transcribe.
 - `send-shortcut`: Enter or Mod+Enter, chosen in settings; only one gesture sends.
   Shift+Enter and Alt/Option+Enter insert a newline in both composers.
+- `blocked-start`: hovering or focusing disabled Start explains the missing
+  setup. Clicking, tapping, or trying to submit pins that explanation until
+  dismissed or the missing setup is completed.
 - `list-formatting`: typing `-`, `*`, `1.` or `1)` then Space at the start of a
   line indents it as a list item; the newline gesture continues the list
   (numbers increment) and ends it after an empty item.
@@ -97,7 +114,8 @@ and steers messages while the agent is busy.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
-  untouched draft; user edits remain.
+  untouched draft; user edits remain. The "Something went wrong" card from the
+  failed POST clears once the delivered message appears, live or on reconnect.
 - `managed-first-input`: submitting a new managed session saves its first input
   and attachments before provisioning. Follow-ups sent during startup are saved
   in order too. They run even if the creating browser closes; reopening shows
@@ -140,13 +158,20 @@ and steers messages while the agent is busy.
   dial, distinct from the new-session composer's effort choice.
 - Press Ctrl+Shift+M (Ctrl on every platform) to open the model picker without
   the gear; press Ctrl+Shift+L to focus the message box.
+- In a new native session on a managed sandbox, open the model picker while it
+  shows **Provisioning sandbox…**: it lists the provider's default catalog, the
+  rows the new-session picker offered, until the session's host or its own
+  catalog can answer. A pick is saved for the launch.
 - For a Codex session, open the Terminal view and change effort there, then
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
   dropping them on the transcript.
 - Select `/mcp` to replace the suggestions with the MCP servers enabled for the
-  session. An empty list points to Settings; the command is absent on the
-  new-session composer.
+  session. A registry service that needs sign-in shows **Sign in**; click it
+  and finish the popup, or follow **Sign in from Settings** for a token or
+  workspace service. A host server that needs sign-in shows **Sign in** too,
+  opening the page its host reported in a new tab. An empty list points to Settings; the command is absent
+  on the new-session composer.
 - For Codex plugin skills, type `$<skill-name>` in Chat and select the
   namespaced suggestion. The vendor terminal owns its own completion menu.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
@@ -165,6 +190,10 @@ and steers messages while the agent is busy.
 
 **New-session composer** (landing page, or New session):
 
+- Write a prompt or attach a file before choosing a working directory. Hover
+  or focus disabled Start to see what is missing; click, tap, or press Enter to
+  keep the tooltip open. Click elsewhere or press Escape to dismiss it. Choose
+  a directory to clear the tooltip and enable Start.
 - Open `/?prompt=Explain%20this%20code`. Check that the
   draft is filled and editable, no session starts until Send, and an embedded
   deployment stays under its mount path. Browser proof:
@@ -268,6 +297,14 @@ managed MCP services. Use a fictional local OAuth provider for live sign-in
 checks and allow popups; the browser tests below stub the catalog and callbacks.
 Other connection providers alone do not enable the managed MCP picker.
 
+- **`blocked-start`:** on a fresh new-session page with no working directory,
+  enter a prompt or attach a file. Hover disabled Start, click it, then move
+  away: its tooltip should stay visible. Check dismissal by outside click,
+  Escape, or tabbing away from focused Start, plus Tab focus and Enter submission;
+  no session should be created.
+  Choose a working directory and check that the tooltip disappears and Start
+  enables. Repeat with a phone viewport and touch input. Component coverage:
+  `web/src/shell/NewChatDialog.test.tsx`.
 - **`offline-hosts`:**
   `tests/e2e_ui/start_session/test_start_session.py::test_start_session_keeps_offline_host_selected`
   covers the connected-host and managed-sandbox variants with stubbed host responses.
@@ -296,7 +333,12 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_lists_only_live_databricks_models`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_updates_after_delayed_catalog`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_highlights_the_reported_model`,
-  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_alias_selection_persists`
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_alias_selection_persists`.
+  A launching sandbox's provider catalog (Claude, Codex, and Pi) and its
+  replacement by the host's or the session's own catalog:
+  `tests/browser_ui/chat/test_model_catalog.py::test_launching_sandbox_offers_its_provider_catalog`,
+  `tests/browser_ui/chat/test_model_catalog.py::test_bound_host_catalog_replaces_the_launch_preview`,
+  `tests/browser_ui/chat/test_model_catalog.py::test_session_catalog_replaces_the_launch_preview`
 - **`model-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_model_flows_prelaunch.py::test_claude_default_entry_names_the_true_default`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
@@ -394,6 +436,25 @@ Other connection providers alone do not enable the managed MCP picker.
   its loading status stays visible alongside agent entries; a session without a
   known host shows unavailable status rather than an empty inventory. Click
   **Go to Settings** and confirm the session’s harness and host are selected.
+  Registry states: `web/src/components/SlashCommandMenu.test.tsx` covers the
+  row labels, the Sign in / Signing in… / error renderings and the Settings
+  link; `ChatPage.composer.test.tsx` covers the catalog join (sign-in from the
+  panel through to Connected, cancellation with retry, the Settings link for a
+  token service, an unavailable service, a catalog read failure, and no
+  registry read when the server has it off or no row needs it);
+  `web/src/hooks/useMcpRegistry.test.tsx` covers the sign-in hook's abort and
+  confirmation paths, and a reopened panel shows no state from the previous
+  open. Host account state: `tests/host/test_mcp_inventory.py` (the status
+  file), `tests/host/test_frames.py` (what survives the tunnel),
+  `tests/server/routes/test_mcp_servers.py` (the route) and
+  `ChatPage.composer.test.tsx` (row state, the new-tab Sign in, polling).
+  Manually, on a host whose sign-in manager writes the status file, expect a
+  host row to read **Sign-in required** with a Sign in that opens the reported
+  page, and to flip to **Connected** within 5s of the file changing. With the
+  registry on, attach an OAuth service
+  that is not connected, select `/mcp`, expect **Sign-in required** and
+  **Sign in**, complete the popup and expect **Connected**; cancel it instead
+  and expect the message on the row with Sign in still offered.
 - **`codex-plugin-skills`, both composers:**
   `tests/e2e_ui/chat/test_codex_plugin_skills.py::test_plugin_skill_in_both_composers_after_inventory_failure`
   installs an enabled local plugin using the real Codex CLI, moves away its
@@ -466,6 +527,10 @@ Other connection providers alone do not enable the managed MCP picker.
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport
   for the desktop entry point. The restore/delivery ordering and preservation of
   user edits are covered in `web/src/pages/ChatPage.composer.test.tsx`.
+  `tests/e2e_ui/mobile/test_offline_send_failure_card.py::test_failure_card_clears_once_reconnect_recovers_the_delivered_send`
+  cuts the browser's network while the server holds the send for a runner
+  relaunch, then checks the failure card clears when the reconnect shows the
+  delivered turn.
 - **`managed-first-input`, new-session composer (own environments):**
   `tests/e2e_ui/start_session/test_managed_first_input_tab_close.py::test_managed_first_input_runs_after_browser_closes`
   closes the entire browser during provisioning, on both the creating replica

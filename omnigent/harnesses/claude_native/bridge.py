@@ -1925,14 +1925,16 @@ def _account_home_dir() -> Path:
 
 def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | None = None) -> None:
     """
-    Pre-accept Claude Code's first-run trust + onboarding prompts.
+    Pre-accept Claude Code's first-run trust, onboarding, and mode prompts.
 
-    Claude Code blocks on two TUI prompts the first time it launches in
+    Claude Code blocks on TUI prompts the first time it launches in
     a new context: a global onboarding flow (theme / login) gated by the
     top-level ``hasCompletedOnboarding`` key in its global config
-    (:func:`claude_global_config_path`, usually ``~/.claude.json``), and a
+    (:func:`claude_global_config_path`, usually ``~/.claude.json``), a
     per-directory "Do you trust the files in this folder?" dialog gated
-    by ``projects["<abs cwd>"].hasTrustDialogAccepted``. Neither fires a
+    by ``projects["<abs cwd>"].hasTrustDialogAccepted``, and a "Make auto
+    mode your default permission mode?" question gated by
+    ``hasSeenAutoDefaultNudge``. None fires a
     ``PermissionRequest`` hook, so on a host-spawned (web-UI-driven)
     session there is nobody at the terminal to answer them: Claude hangs
     and the web UI shows nothing. This is acute with
@@ -1941,10 +1943,10 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     rooted at the home directory, whose interactively accepted trust
     Claude keeps for that session only.
 
-    Seed both gating keys idempotently so the launch never blocks. Only
-    those two keys are written; all other global config state (the
+    Seed the gating keys idempotently so the launch never blocks. Only
+    those keys are written; all other global config state (the
     user's own onboarding choices, project history, MCP config, OAuth
-    account) is preserved, and the file is left untouched when both keys
+    account) is preserved, and the file is left untouched when all keys
     are already set. This deliberately does NOT skip per-tool permission
     prompts — those still route to the web UI via the ``PermissionRequest``
     hook; only the unhookable startup gates are pre-accepted.
@@ -1996,6 +1998,11 @@ def ensure_claude_workspace_trusted(workspace: Path, env: Mapping[str, str] | No
     # has never run Claude Code interactively.
     if data.get("hasCompletedOnboarding") is not True:
         data["hasCompletedOnboarding"] = True
+        changed = True
+    # Startup question offering to make auto the default mode, asked when the
+    # user's own settings pin another default. Declining it sets only this key.
+    if data.get("hasSeenAutoDefaultNudge") is not True:
+        data["hasSeenAutoDefaultNudge"] = True
         changed = True
 
     # Per-directory trust gate. Claude keys its ``projects`` map by the
@@ -6130,19 +6137,40 @@ def _composer_row(pane: str) -> str | None:
     :returns: The row's text, e.g. ``"❯ fix the bug"`` or ``"!"`` in shell
         mode, or ``None`` when no input box is on screen.
     """
+    rows = _composer_rows(pane)
+    return rows[0] if rows else None
+
+
+def _composer_rows(pane: str) -> list[str]:
+    """
+    Return every row inside Claude Code's live input box, or ``[]``.
+
+    The first row is :func:`_composer_row`'s glyph row; the rest are the
+    continuation rows down to the box's closing rule. A multi-line draft
+    can render below the glyph row — a collapsed paste shows a blank
+    ``❯`` with ``[Pasted text #1 +N lines]`` on the next row. Rows below
+    the box (the mode footer, a status line, a dialog) are never included:
+    when no closing rule follows the glyph row, the box's extent is
+    unknown, so only the glyph row is returned. A draft continuing below
+    the glyph row of such a clipped box is then not seen, and delivery
+    falls back to its unverified submit.
+
+    :param pane: Captured pane text from :func:`_capture_pane`.
+    :returns: The framed rows, e.g. ``["❯", "[Pasted text #1 +7 lines]"]``.
+    """
     non_empty = [line for line in pane.splitlines() if line.strip()]
-    rules = [idx for idx, line in enumerate(non_empty) if _is_box_rule(line)]
+    rules = _composer_frame_rule_indices(non_empty)
     if not rules:
-        return None
+        return []
     candidates = [rules[-2] + 1] if len(rules) >= 2 else []
     candidates.append(rules[-1] + 1)
     for idx in candidates:
         if idx >= len(non_empty):
             continue
-        row = non_empty[idx]
-        if row.strip()[:1] in _COMPOSER_MODE_GLYPHS:
-            return row
-    return None
+        if non_empty[idx].strip()[:1] in _COMPOSER_MODE_GLYPHS:
+            end = next((rule for rule in rules if rule > idx), idx + 1)
+            return non_empty[idx:end]
+    return []
 
 
 class _ComposerBox(NamedTuple):
@@ -6154,6 +6182,19 @@ class _ComposerBox(NamedTuple):
     #: Whether the closing rule was on screen, so ``rows`` is the whole box
     #: rather than the part of it above the bottom of the pane.
     framed: bool
+
+
+def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
+    """Keep frame edges, excluding further-indented rule text in a draft.
+
+    The last two rules can be a frame edge and a draft line; the less-indented
+    rule identifies the frame in both a complete and a clipped input box.
+    """
+    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if len(rules) < 2:
+        return rules
+    frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
+    return [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
 
 
 def _composer_box(pane: str) -> _ComposerBox | None:
@@ -6170,7 +6211,7 @@ def _composer_box(pane: str) -> _ComposerBox | None:
         screen, or ``None`` when no input box is on screen.
     """
     lines = pane.splitlines()
-    rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    rules = _composer_frame_rule_indices(lines)
     if not rules:
         return None
     if len(rules) >= 2:
@@ -6372,14 +6413,19 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
     """
     Return whether the pasted draft is visible in Claude's input box.
 
-    Looks only at the **last** line containing
-    :data:`_CLAUDE_PROMPT_GLYPH` — the live input box always sits at
-    the bottom of the pane, below the transcript, so this never
-    matches the submitted message's transcript echo. The draft counts
-    as visible when the text after the glyph contains *needle* (small
-    pastes render verbatim) or the
-    :data:`_PASTED_PLACEHOLDER_PREFIX` placeholder (Claude Code
-    collapses large pastes).
+    Reads the framed input box (:func:`_composer_rows`): the glyph row
+    plus the rows under it down to the closing rule, since a collapsed
+    paste can render as a blank ``❯`` with the placeholder one row
+    below. Rows above the frame, such as the submitted message's
+    transcript echo, are never read. Without a frame on screen it falls
+    back to the text after the **last** :data:`_CLAUDE_PROMPT_GLYPH` in
+    the pane, as before; that row can be an echo or a dialog row. The draft
+    counts as visible when that text contains *needle* (small pastes
+    render verbatim) or the :data:`_PASTED_PLACEHOLDER_PREFIX`
+    placeholder (Claude Code collapses large pastes).
+    Whitespace is ignored, so a needle wrapped across rows still matches,
+    and so are Unicode control and format characters (e.g. U+FEFF), which
+    Claude Code keeps in the draft but does not render.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
     :param needle: Marker from :func:`_submit_needle`, e.g.
@@ -6387,13 +6433,36 @@ def _draft_in_input_box(pane: str, needle: str) -> bool:
         only the paste placeholder is then considered.
     :returns: ``True`` when the draft is still sitting in the input box.
     """
-    glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
-    if not glyph_lines:
-        return False
-    tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
+    rows = _composer_rows(pane)
+    if rows and _CLAUDE_PROMPT_GLYPH in rows[0]:
+        tail = "\n".join([rows[0].split(_CLAUDE_PROMPT_GLYPH, 1)[1], *rows[1:]])
+    else:
+        glyph_lines = [line for line in pane.splitlines() if _CLAUDE_PROMPT_GLYPH in line]
+        if not glyph_lines:
+            return False
+        tail = glyph_lines[-1].rsplit(_CLAUDE_PROMPT_GLYPH, 1)[1]
     if _PASTED_PLACEHOLDER_PREFIX in tail:
         return True
-    return bool(needle) and needle in tail
+    target = _comparable_draft_text(needle)
+    return bool(target) and target in _comparable_draft_text(tail)
+
+
+def _comparable_draft_text(text: str) -> str:
+    """
+    Reduce draft text to the characters a pane capture can be matched on.
+
+    A long draft wraps, so the needle can straddle rows: whitespace is
+    dropped, which also rejoins a word that a hard wrap split mid-token.
+    Control and format characters (categories ``Cc``/``Cf``, e.g. U+FEFF)
+    are dropped too: Claude Code keeps them in the draft but never renders
+    them, so a needle that kept them could not match the pane.
+
+    :param text: Needle or captured input-box text, e.g. ``"\ufefffix it"``.
+    :returns: The comparable text, e.g. ``"fixit"``.
+    """
+    return "".join(
+        ch for ch in text if not ch.isspace() and unicodedata.category(ch) not in {"Cc", "Cf"}
+    )
 
 
 def _format_terminal_failure_tail(pane: str) -> str:

@@ -110,7 +110,9 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("failure", ["timeout", "non_json"])
+@pytest.mark.parametrize(
+    "failure", ["timeout", "non_json", "null", "list", 408, 429, 500, 502, 503, 504]
+)
 @pytest.mark.parametrize("after_routing", [False, True])
 async def test_message_timeout_is_not_retried(failure, after_routing):
     requests = []
@@ -123,6 +125,10 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
             return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
         if failure == "non_json":
             return httpx.Response(202, text="Accepted")
+        if failure in ("null", "list"):
+            return httpx.Response(202, text="null" if failure == "null" else "[]")
+        if isinstance(failure, int):
+            return httpx.Response(failure)
         raise httpx.ReadTimeout("uncertain")
 
     async with httpx.AsyncClient(
@@ -136,6 +142,66 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
         )
     assert "do not automatically resend" in result
     assert len(requests) == (2 if after_routing else 1)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [403, 502])
+async def test_same_host_first_task_failure_returns_created_session(status):
+    session_id = uuid4().hex
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        if request.url.path.endswith("/events"):
+            return httpx.Response(status, text="First task unavailable")
+        return httpx.Response(201, json={"id": session_id})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_create",
+                arguments=json.dumps(
+                    {"agent_id": "worker", "placement": "same_host", "message": "Start"}
+                ),
+                server_client=client,
+                conversation_id=uuid4().hex,
+            )
+        )
+    assert result["conversation_id"] == session_id
+    assert result["status"] == "created_initial_message_failed"
+    assert "Session created" in result["error"]
+    assert "do not automatically resend" in result["error"]
+    assert result["initial_message"]["error"]
+    assert len(requests) == 2
+
+
+@pytest.mark.asyncio
+async def test_message_routing_accepts_null_snapshot_labels():
+    requests = []
+
+    def respond(request):
+        if request.method == "GET":
+            return httpx.Response(200, json={"labels": None})
+        requests.append(request)
+        if len(requests) == 1:
+            return httpx.Response(400, json={"error": {"code": "wrong_replica"}})
+        return httpx.Response(202, json={"queued": True})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(respond), base_url="http://server"
+    ) as client:
+        result = json.loads(
+            await execute_tool(
+                tool_name="sys_session_message",
+                arguments=json.dumps({"session_id": uuid4().hex, "message": "Start"}),
+                server_client=client,
+                conversation_id=uuid4().hex,
+            )
+        )
+    assert result == {"queued": True}
+    assert len(requests) == 2
 
 
 @pytest.mark.asyncio

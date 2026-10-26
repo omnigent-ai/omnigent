@@ -69,6 +69,7 @@ _ALWAYS_PRESENT_TOOLS: frozenset[str] = frozenset(
         # Peer messaging is advertised for every agent; the server
         # enforces the orchestration flag and source authorization.
         "sys_session_message",
+        "ui_open_file",
         # Read-only agent discovery tools are likewise always available
         # (global, permission-bounded reads of any accessible session's
         # agent / bundle).

@@ -35,7 +35,10 @@ implements them separately, so a fix for one harness does not reach the others.
   clicking it opens that file in the workspace viewer without expanding the
   row. Absolute paths open workspace-relative under the session root and
   host-absolute outside it; they stay plain text until the root is known.
-  Shell commands and multi-file patches have no file link.
+  Shell commands and multi-file patches have no file link. A shell row shows
+  the command (a script's first line and "+N lines") and expands to a
+  terminal panel with the command, its output and exit status, in the
+  Settings terminal theme.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.
@@ -43,6 +46,9 @@ implements them separately, so a fix for one harness does not reach the others.
   stay in that thread, and closing it leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
+- `idle-reap`: a finished native pane left alone past the idle window closes
+  with its forwarder, helper server and tool relay; the next message brings it
+  back with the conversation. Kimi is exempt; live work and open prompts stay.
 - `subagent-discovery`: Claude children appear under the agent that spawned
   them, including delayed spawns; an unresolved spawn does not keep an idle
   runner re-reading unchanged conversations.
@@ -136,6 +142,13 @@ Probes run only on expansion.
 shown for a newly connected or requested host → See more. The modal auto-opens
 only when the server enables the `import_review` release feature.
 
+**Idle reap:** finish a turn, then leave the session alone past the idle window:
+a web session with its Terminal view open but untouched or its tabs closed, a
+sub-agent an orchestrator dispatched and never reopened, or a CLI-launched
+`omnigent <name>` whose local terminal sits without keystrokes. The Terminal
+view loses the pane; the next message from Chat, the orchestrator, or the CLI
+brings it back with the conversation.
+
 **Interrupted session:** observe startup before the first message, a running
 turn, and Stop separately. For an offline host use the reconnect paths in
 [sessions](./sessions.md); a detached terminal has its own paths in
@@ -175,8 +188,13 @@ skill when one is linked above.
 Claude Code also reads machine-wide managed settings outside `CLAUDE_CONFIG_DIR`.
 Native Claude mock fixtures reject a managed `ANTHROPIC_BASE_URL` pointing away
 from the mock before creating the session, including in workflow-owned runs.
-This is a blocked prerequisite, not a skipped or passing acceptance check. Use
-a clean container or CI runner without that override; do not edit machine policy.
+For a journey that needs scripted replies, this is a blocked prerequisite, not
+a skipped or passing acceptance check. Use a clean container or CI runner
+without that override; do not edit machine policy. A journey that only needs
+some reply (such as `idle-reap`) can run live through the managed gateway
+instead: remove the instance's mock Claude provider (`repro-claude` in
+`$VERIFY_ENV/config/config.yaml`) so the session uses the managed credential,
+and label the evidence live with the model the pane shows.
 The render-parity journey additionally requires each web and terminal prompt
 marker to reach the mock under the configured model. A rendered reply or a
 background request alone is not routing evidence.
@@ -343,6 +361,28 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`model-and-effort`, Pi inference bindings (component):**
+  `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
+  checks default/literal inputs and generated picker options, including a literal
+  ID beginning with `omnigent/`; bare and picker-qualified unlisted IDs are rejected.
+  `tests/runtime/test_inference_routing.py::test_pi_picker_preserves_models_with_colliding_ids`
+  checks both picker rows when a bare ID and a prefixed literal collide. The allowed
+  picker target wins; an exact literal is a fallback when that target is not allowed.
+  Literal fallback requires an allowlist; decoding without one is unchanged.
+  Browser acceptance is separate: select each row in the new-session composer,
+  launch, and confirm Pi reports the model that row represents.
+- **`model-and-effort`, Pi thinking compatibility (own environment):**
+  With the CI-pinned Pi on PATH, run
+  `uv run --no-sync pytest tests/e2e/omnigent/test_pi_thinking_compatibility_e2e.py --reruns 0 -q`.
+  Real SDK CLI and native provider-launch/print paths send requests to the shared
+  mock provider: Opus 5.5 clamps off to adaptive/low, Sonnet honors high, and
+  Haiku retains off and uses budget-based thinking at high. An inference-bound
+  Opus `[1m]` ID stays intact while receiving the same clamp. Catalog, dated,
+  regional and vendor variants use `tests/test_pi_model_compatibility.py`.
+  Known budget models override native Pi's existing adaptive default; unlisted
+  models keep that default. Run `tests/e2e/test_pi_native_model_scope_e2e.py`
+  for real TUI picker and effort/tool-turn regression checks with a mock provider.
+  These prove process behavior, not browser controls or live serving compatibility.
 - **`model-and-effort`:**
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_claude_picker_omits_aliases_the_cli_picker_does_not_offer`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
@@ -631,6 +671,23 @@ Cross-harness journeys:
 - **`cleanup`:** no single cross-harness test. For each harness in scope, start
   a session, stop it (and separately cancel one during startup), then confirm
   no helper process from that session is still running.
+- **`idle-reap`:** start the instance with `OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S=60`
+  in the environment of `verify-env start`; the runner log then shows
+  `native pane reaper started (idle_timeout=60.0s`. A host-launched runner also
+  needs `OMNIGENT_RUNNER_ENV_PASSTHROUGH=OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S`.
+  Finish one turn in each harness in scope and stop typing in its pane. A pane
+  counts as busy for 120 s after its screen last changed and the reaper scans
+  every 60 s, so expect the reap 3 to 5 minutes later. Record the Terminal view,
+  then check the runner log for `reaping idle native pane for conversation <id>`,
+  that `tool_relay.json` is gone from the session's bridge directory, and that no
+  `codex app-server` or `opencode serve` for the session remains. Send one more
+  message and check the pane returns with the earlier turn. Component tests,
+  plain `uv run --no-sync pytest --reruns 0`: `tests/terminals/test_pane_reaper.py`
+  (busy evidence, re-create during a reap, registry coverage) and
+  `tests/runner/test_comment_relay.py::test_idle_pane_reap_closes_comment_relay`.
+  `tests/server/integration/test_codex_model_change_after_idle_reap.py` covers
+  Codex reap-then-resume through a real server with a scripted app-server, not
+  the Codex CLI; it crashes an xdist worker, so run it with `-p no:xdist`.
 - **`working-status`, opencode-native interrupt (plain `uv run pytest`, no
   vendor model):**
   `tests/runner/test_native_subagent_turn_outcome_delivery.py::test_interrupt_then_quiescence_idle_delivers_cancelled_with_output`
@@ -760,6 +817,12 @@ separate compatibility gaps; these automated checks do not prove live Gemini.
 - Claude directory grants cover only the displayed directories for the session.
   A symlink may require both its visible and resolved paths. A mode switch alone
   does not grant directory access, and read-only rules are separate grants.
+- Idle reap: an open Terminal view spares a pane only for 120 s after human
+  input, so leaving it open does not keep the pane. With the default one-hour
+  window an idle top-level runner can exit first and clean everything up,
+  which hides a leak; use the short window. The reaper logs reaps, not spared
+  panes: for one that never goes, check for a screen that keeps changing, a
+  fresh approval marker, and a `running` record the server still agrees with.
 - Needing sign-in and not being installed are different states with different
   prompts. Reproduce on a host with the same credential situation as the reporter.
 - Some harnesses have a sign-in flow of their own when launched outside
