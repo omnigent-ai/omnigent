@@ -341,9 +341,11 @@ def _decode_attachment_block(block: Mapping[str, object]) -> tuple[bytes, str] |
     if not isinstance(data_uri, str) or not data_uri.startswith("data:"):
         if block.get("file_id"):
             _logger.error(
-                "Native executor received unresolved file_id %s — "
-                "content resolver may not have run",
-                block["file_id"],
+                "Native executor received unresolved file_id — content resolver may not have run",
+                extra=debug_event(
+                    "native_attachment_unresolved",
+                    file_id_sha256=_file_id_fingerprint(block["file_id"]),
+                ),
             )
         return None
 
@@ -643,11 +645,45 @@ def codex_resize_metadata_path(path: Path, source_metadata: object) -> Path:
     return alias
 
 
+def _file_id_fingerprint(file_id: object) -> str:
+    """Correlate attachment failures without recording file identifiers."""
+    return hashlib.sha256(str(file_id).encode()).hexdigest()
+
+
+def _attachment_response_evidence(response: httpx.Response) -> dict[str, object]:
+    """Describe known failure envelopes without retaining response text."""
+    evidence: dict[str, object] = {"response_bytes": len(response.content)}
+    request_id = response.headers.get("x-request-id", "")
+    if re.fullmatch(r"[0-9a-fA-F-]{16,64}", request_id):
+        evidence["server_request_id"] = request_id
+    if len(response.content) > 4096:
+        evidence["response_kind"] = "oversized"
+        return evidence
+    try:
+        payload = response.json()
+    except ValueError:
+        evidence["response_kind"] = "non_json" if response.content else "empty"
+        return evidence
+    error = payload.get("error") if isinstance(payload, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if message == "File not found":
+        kind = "file_not_found"
+    elif message == "Conversation not found" or (
+        isinstance(message, str) and message.startswith("Session not found:")
+    ):
+        kind = "session_not_found"
+    else:
+        kind = "other_json"
+    evidence["response_kind"] = kind
+    return evidence
+
+
 async def _read_attachment_resource(
     client: httpx.AsyncClient,
     path: str,
     *,
     session_id: str,
+    file_id_sha256: str,
     stage: str,
     timeout_s: float,
 ) -> httpx.Response:
@@ -669,6 +705,7 @@ async def _read_attachment_resource(
                 extra=debug_event(
                     "native_attachment_read_retry",
                     session_id=session_id,
+                    file_id_sha256=file_id_sha256,
                     stage=stage,
                     attempt=attempt,
                     http_status=status,
@@ -684,6 +721,7 @@ async def _read_attachment_resource(
                     extra=debug_event(
                         "native_attachment_read_recovered",
                         session_id=session_id,
+                        file_id_sha256=file_id_sha256,
                         stage=stage,
                         attempts=attempt,
                     ),
@@ -717,6 +755,7 @@ async def resolve_file_id_block(
         keep the original block and a visible marker can surface downstream.
     """
     file_id = str(block.get("file_id"))
+    file_id_sha256 = _file_id_fingerprint(file_id)
     base = (
         f"/v1/sessions/{urllib.parse.quote(session_id, safe='')}"
         f"/resources/files/{urllib.parse.quote(file_id, safe='')}"
@@ -725,25 +764,44 @@ async def resolve_file_id_block(
     try:
         async with asyncio.timeout(_ATTACHMENT_RESOLVE_TIMEOUT_S):
             meta_resp = await _read_attachment_resource(
-                client, base, session_id=session_id, stage=stage, timeout_s=10.0
+                client,
+                base,
+                session_id=session_id,
+                file_id_sha256=file_id_sha256,
+                stage=stage,
+                timeout_s=10.0,
             )
             stage = "content"
             content_resp = await _read_attachment_resource(
-                client, f"{base}/content", session_id=session_id, stage=stage, timeout_s=30.0
+                client,
+                f"{base}/content",
+                session_id=session_id,
+                file_id_sha256=file_id_sha256,
+                stage=stage,
+                timeout_s=30.0,
             )
     except (httpx.HTTPError, TimeoutError) as exc:
+        response_evidence = (
+            _attachment_response_evidence(exc.response)
+            if isinstance(exc, httpx.HTTPStatusError)
+            else {}
+        )
         _logger.warning(
             "Attachment %s read failed",
             stage,
             extra=debug_event(
                 "native_attachment_read_failed",
                 session_id=session_id,
+                file_id_sha256=file_id_sha256,
                 stage=stage,
                 http_status=exc.response.status_code
                 if isinstance(exc, httpx.HTTPStatusError)
                 else None,
                 exception_type=type(exc).__name__,
                 deadline_exceeded=isinstance(exc, TimeoutError),
+                server_request_id=response_evidence.get("server_request_id"),
+                response_kind=response_evidence.get("response_kind"),
+                response_bytes=response_evidence.get("response_bytes"),
             ),
         )
         return None

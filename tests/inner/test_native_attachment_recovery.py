@@ -2,6 +2,7 @@
 
 import asyncio
 import base64
+import hashlib
 import json
 import logging
 from collections import Counter
@@ -151,12 +152,26 @@ async def test_attachment_resolution_deadline_releases_a_stalled_request(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("body", "kind"),
+    [
+        ("private-response", "non_json"),
+        ('{"error":{"message":"File not found"}}', "file_not_found"),
+        ('{"error":{"message":"Conversation not found"}}', "session_not_found"),
+        ('{"error":{"message":"private-response"}}', "other_json"),
+        ("private-response" * 1000, "oversized"),
+    ],
+    ids=["non_json", "missing_file", "missing_session", "unknown_json", "large_body"],
+)
 async def test_attachment_failure_diagnostics_omit_file_and_response_contents(
     caplog: pytest.LogCaptureFixture,
+    body: str,
+    kind: str,
 ) -> None:
+    request_id = "0123456789abcdef0123456789abcdef"
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(
-            lambda request: httpx.Response(404, text="private-response")
+            lambda request: httpx.Response(404, text=body, headers={"X-Request-Id": request_id})
         ),
         base_url="https://private.example.test",
     ) as client:
@@ -171,5 +186,9 @@ async def test_attachment_failure_diagnostics_omit_file_and_response_contents(
     assert row["session_id"] == "session-example"
     assert row["attributes"]["http_status"] == "404"
     assert row["attributes"]["stage"] == "metadata"
+    assert row["attributes"]["response_kind"] == kind
+    assert row["attributes"]["server_request_id"] == request_id
+    assert row["attributes"]["file_id_sha256"] == hashlib.sha256(b"private-file").hexdigest()
+    assert row["attributes"]["response_bytes"] == str(len(body))
     assert "private-" not in json.dumps(row)
     assert "private.example.test" not in json.dumps(row)
