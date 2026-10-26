@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 from websockets.asyncio.client import ClientConnection
+from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosedError, ConnectionClosedOK
 
 from omnigent.harnesses.codex_native import app_server
@@ -17,6 +18,7 @@ from omnigent.harnesses.codex_native.app_server import (
     CodexAppServerClient,
     CodexAppServerResponseError,
 )
+from omnigent.harnesses.codex_native.diagnostics import collect_codex_rpc_failure_diagnostics
 
 
 @pytest.mark.parametrize(
@@ -87,6 +89,44 @@ async def test_rejected_request_traceback_identifies_rpc(method: str) -> None:
     rendered = "".join(traceback.format_exception(exc))
     assert exc.__notes__[0] in rendered
     assert "private prompt" not in rendered
+
+
+@pytest.mark.parametrize("failed_method", ["initialize", "turn/start"])
+async def test_disconnected_request_preserves_receiver_cause_and_phase(failed_method: str) -> None:
+    async def peer(socket: ServerConnection) -> None:
+        async for raw in socket:
+            message = json.loads(raw)
+            if message["method"] == failed_method:
+                await socket.close(code=1011, reason="private upstream detail")
+                return
+            if "id" in message:
+                await socket.send(json.dumps({"id": message["id"], "result": {}}))
+
+    async with serve(peer, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        client = CodexAppServerClient(ws_url=f"ws://127.0.0.1:{port}")
+        try:
+            with pytest.raises(ConnectionError) as caught:
+                async with asyncio.timeout(5):
+                    await client.connect()
+                    await client.request("turn/start", {"input": "private input"})
+            assert isinstance(caught.value.__cause__, ConnectionClosedError)
+            assert caught.value.__notes__ == [
+                f"Codex app-server RPC: method={failed_method} "
+                f"request_id={1 if failed_method == 'initialize' else 2}"
+            ]
+            snapshot = collect_codex_rpc_failure_diagnostics(client, caught.value)
+            assert snapshot["rpc_connection_phase"] == (
+                "initialize" if failed_method == "initialize" else "ready"
+            )
+            assert snapshot["rpc_reader_state"] == "failed"
+            assert snapshot["rpc_reader_error_type"] == "ConnectionClosedError"
+            assert snapshot["rpc_close_received_code"] == 1011
+            assert snapshot["rpc_error_type_1"] == "ConnectionClosedError"
+            assert "private" not in str(snapshot)
+            assert client._pending_requests == {}
+        finally:
+            await client.close()
 
 
 @pytest.mark.parametrize(
