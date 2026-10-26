@@ -25,18 +25,26 @@ fallback or branch-protection bypass.
 Every changed version, including transitives, must qualify. Stable `0.x` minors
 and ordinary exact-pin bumps qualify with the same required CI as other updates.
 Majors, downgrades and prereleases require review, except the explicitly named
-OpenTelemetry `0.NbM` beta packages in `python.beta`. The same version ordering,
+OpenTelemetry beta-to-beta updates in the established `0.NbM` streams listed
+in `python.beta`. Entering or leaving a beta stream requires review. The same version ordering,
 cooldown, integrity, advisory and full Python CI requirements apply to those beta updates.
 An unlisted OpenTelemetry package or a different prerelease format remains manual.
 
 The policy's `manual` patterns cover harness SDKs/CLIs, native/desktop/mobile
-packages, publishing/release/token Actions, and compatibility-coupled PDF
-packages. Changes to requirement operators, upper bounds, complex compatibility overrides,
+runtime/packaging/updater packages, publishing CLIs (`@vscode/vsce*`, `wrangler`),
+publishing/release/token/credential Actions, and compatibility-coupled PDF packages.
+The deliberate KaTeX, Shiki, Vite and Tailwind compatibility pins also stay manual;
+Shiki family updates need a coordinated maintainer review. Changes to requirement operators, upper bounds, complex compatibility overrides,
 dependency sources, manifest scripts, Python extras/markers, workflow permissions
 or shell commands remain manual. Existing catalog entries and simple override
 pins may advance within the ordinary version policy. Other workspace settings
 must remain unchanged. Simple overrides must agree with the lock and each
 affected resolution; an unchanged compatible override is not a blocker.
+Catalog and override requirements support exact, `^` and `~` stable versions only.
+An unsupported resolved catalog requirement fails closed even when unchanged,
+so it can block otherwise ordinary npm updates until the policy supports it.
+Registry integrity, cooldown and advisory checks cover the changed resolved package
+inventory; unused requirement floors do not create a package artifact to inspect.
 New or removed direct dependencies remain manual;
 normal additions/removals of registry-backed transitive dependencies are allowed.
 A retained parallel version does not prevent upgrading one other resolution of
@@ -49,8 +57,12 @@ ambiguous resolutions require review.
 Mapped JavaScript consumers include web, Electron, VS Code, the extension SDK,
 the example extension and Cloudflare. Shared graph changes require the existing
 workspace test/build steps or Cloudflare dry-run/image smoke steps to have
-succeeded in the job metadata. An older green workflow without those executed
-steps cannot establish coverage. Unknown consumers and `.github/ci-deps` remain
+succeeded in the job metadata. Coverage mapped outside the required workflow set
+is rejected. Electron coverage is stubbed Node unit tests, the extension SDK is
+type-checked, and VS Code builds without `vsce package`. These steps do not validate
+desktop packaging, updater signatures, extension publishing or live deployment;
+the corresponding packaging/updater/publishing tools remain manual. An older
+green workflow without the executed steps cannot establish coverage. Unknown consumers and `.github/ci-deps` remain
 manual; the harness installers use separate locks, so passing web tests alone
 does not establish compatibility for that CLI graph. Docker images remain
 manual: repository Trivy reports do not inventory the built image. Standalone
@@ -62,7 +74,10 @@ A verified `dependabot[bot]` PR with GitHub bot type and a same-repository head 
 start compatibility CI while Security Scan is pending. The CI gate loads trusted
 scripts from `main` without first executing a PR-supplied Action. Changed Actions
 must pass same-identity SHA-pin and upstream-release validation before dependent
-jobs execute. Manual-listed Actions do not receive this automatic CI exception.
+jobs execute. An identical tested Action transition may cover another workflow
+occurrence, but does not establish its privileged credential or publishing behavior;
+credential and publishing Actions remain manual. Manual-listed Actions do not
+receive this automatic CI exception.
 The existing `skip-security-scan` waiver can also waive the Action-pin validation,
 but always excludes unattended merging. Major updates can therefore run CI while
 remaining manual to merge.
@@ -146,9 +161,25 @@ consumer steps and advisory evidence pass, the worker can ask GitHub to update
 the branch with an expected-head guard. It then waits for fresh policy, scans
 and CI, without merging in that sweep. Three merge commits in the PR exhaust
 this conservative refresh budget; incomplete histories, mixed bases, holds,
-review objections and moved heads block recovery. This only updates cleanly
-mergeable branches; conflicts need review.
-Report mode never refreshes or merges.
+review objections and moved heads block recovery. Approval must already pass or
+have an identifiable failure within its refresh budget; this read-only check does
+not rerun approval before fresh CI. This only updates cleanly mergeable branches;
+conflicts need review. API rejections report bounded context and stop the sweep's
+candidate processing without merging.
+
+The update request uses the GitHub App identity. New events may therefore receive
+ordinary same-repository token/secrets treatment rather than Dependabot's restricted
+actor treatment. The required compatibility workflows currently request no
+repository secrets; optional preview/review workflows have their own gates and
+must retain them. Preserve that boundary when adding secrets or permissions.
+Dependabot may stop its own rebases after another identity updates its branch;
+conflicting follow-up updates can need a maintainer's `@dependabot recreate`.
+[DCO's upstream implementation](https://github.com/dcoapp/app/blob/828cc0b29a141821ddecd674bca0d8e634234c18/lib/dco.js#L17-L24)
+skips merge commits, and a historical Dependabot merge-commit head
+([#11360](https://github.com/omnigent-ai/omnigent/pull/11360/commits/e09925ba768d5cd6cc70e0bacc4e5f3b33007aad))
+has a successful hosted DCO check. Neither is a live
+canary of this worker's update request; observe DCO and the App-triggered checks
+on the first refreshed candidate. Report mode never refreshes or merges.
 
 After landing, inspect the worker summary and observe a qualifying update through
 CI access, scans, approval, automatic merge and post-merge workflows. Confirm

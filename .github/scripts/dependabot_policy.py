@@ -58,6 +58,11 @@ def version(value: str, *, beta: bool = False) -> tuple[int, ...]:
 def upgrade(
     old: str, new: str, minor: bool = False, *, zero_minor: bool = False, beta: bool = False
 ) -> None:
+    if beta:
+        require(
+            ("b" in old) == ("b" in new),
+            "Entering or leaving a beta stream requires review",
+        )
     before, after = version(old, beta=beta), version(new, beta=beta)
     require(after > before, f"Not an upgrade: {old} -> {new}")
     require(before[0] == after[0], "Major updates require review")
@@ -686,6 +691,7 @@ def npm_changes(read, files: set[str], policy: dict) -> dict:
     def eligible(name):
         require_package(name, policy["npm"])
         for selector in overrides:
+            # Parent>child selectors constrain both sides of the dependency edge.
             parts = re.split(r">(?=@?[A-Za-z])", selector)
             if not any(matches(name, [part]) or part.startswith(name + "@") for part in parts):
                 continue

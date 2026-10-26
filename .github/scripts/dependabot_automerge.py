@@ -147,13 +147,12 @@ def latest_check(repository: str, head: str, name: str) -> dict:
     return max(runs, key=lambda run: run["id"])
 
 
-def require_approval(repository: str, candidate: dict, mode: str) -> None:
-    if mode != "merge":
-        return
+def approval_refresh_run(repository: str, candidate: dict) -> str | None:
+    """Identify a recoverable approval failure without dispatching or consuming retries."""
     check = latest_check(repository, candidate["head"], "Maintainer Approval")
     require(check["status"] == "completed", "Waiting for Maintainer Approval")
     if check["conclusion"] == "success":
-        return
+        return None
     require(check["conclusion"] == "failure", "Maintainer Approval needs human intervention")
     match = re.fullmatch(
         rf"https://github.com/{re.escape(repository)}/actions/runs/(\d+)/job/\d+",
@@ -170,6 +169,15 @@ def require_approval(repository: str, candidate: dict, mode: str) -> None:
         "Approval workflow cannot be refreshed",
     )
     require(run["run_attempt"] < 3, "Approval refresh retry limit reached; inspect the run")
+    return run_id
+
+
+def require_approval(repository: str, candidate: dict, mode: str) -> None:
+    if mode != "merge":
+        return
+    run_id = approval_refresh_run(repository, candidate)
+    if run_id is None:
+        return
     # Cooldown expiry and mode changes do not generate a new PR event.
     subprocess.run(
         [
@@ -243,6 +251,11 @@ def require_merge_ready(repository: str, candidate: dict, mode: str) -> None:
 
 def require_reports(repository: str, candidate: dict) -> None:
     head = candidate["head"]
+    workflows = required_workflows(candidate)
+    require(
+        all(step["workflow"] in workflows for step in candidate.get("consumer_steps", [])),
+        "Consumer coverage references a workflow outside the required set",
+    )
     for name in (*REPORT_CHECKS, *candidate["checks"]):
         latest = latest_check(repository, head, name)
         require(
@@ -253,7 +266,7 @@ def require_reports(repository: str, candidate: dict) -> None:
     # path-filtered check as skippable while its workflow is being created.
     completed_runs = {}
     policy = json.loads(POLICY.read_text())
-    for workflow in sorted(required_workflows(candidate)):
+    for workflow in sorted(workflows):
         latest, jobs = latest_workflow(repository, head, workflow)
         require(
             latest["head_sha"] == head
@@ -476,6 +489,7 @@ def refresh_stale_base(repository: str, candidate: dict, mode: str) -> None:
     require(previous_base != candidate["base"], "CI metadata needs human inspection")
     # Refresh only an otherwise green candidate, never to hide a failed test.
     require_reports(repository, dict(candidate, base=previous_base))
+    approval_refresh_run(repository, candidate)
     commits = paginated(f"repos/{repository}/pulls/{candidate['number']}/commits")
     pull = gh_json(["api", f"repos/{repository}/pulls/{candidate['number']}"])
     require(
@@ -489,19 +503,29 @@ def refresh_stale_base(repository: str, candidate: dict, mode: str) -> None:
         "Base refresh limit reached; maintainer review required",
     )
     require_current_candidate(repository, candidate["number"], candidate)
-    subprocess.run(
-        [
-            "gh",
-            "api",
-            "--method",
-            "PUT",
-            f"repos/{repository}/pulls/{candidate['number']}/update-branch",
-            "-f",
-            f"expected_head_sha={candidate['head']}",
-        ],
-        check=True,
-        env=dict(os.environ, GH_TOKEN=os.environ["DEPENDABOT_MERGE_TOKEN"]),
-    )
+    try:
+        subprocess.run(
+            [
+                "gh",
+                "api",
+                "--method",
+                "PUT",
+                f"repos/{repository}/pulls/{candidate['number']}/update-branch",
+                "-f",
+                f"expected_head_sha={candidate['head']}",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+            env=dict(os.environ, GH_TOKEN=os.environ["DEPENDABOT_MERGE_TOKEN"]),
+        )
+    except subprocess.CalledProcessError as exc:
+        status = re.search(r"HTTP (\d{3})", exc.stderr or "")
+        detail = f" (HTTP {status[1]})" if status else ""
+        raise NeedsReview(
+            f"GitHub rejected branch refresh{detail}; "
+            "inspect conflicts, permissions and current head"
+        ) from exc
     raise NeedsReview("Updated branch against main; waiting for fresh policy, scans and CI")
 
 

@@ -456,6 +456,12 @@ wheels = [
     [
         ("opentelemetry-distro", "0.65b0", "0.66b1", True),
         ("opentelemetry-instrumentation-fastapi", "0.66b0", "0.66b1", True),
+        ("opentelemetry-distro", "0.66.0", "0.67.0", True),
+        ("opentelemetry-distro", "0.66.0", "0.67b1", False),
+        ("opentelemetry-distro", "0.66b1", "0.67.0", False),
+        ("opentelemetry-distro", "0.66b1", "0.67.0b1", False),
+        ("opentelemetry-distro", "0.66b1", "0.67a1", False),
+        ("opentelemetry-distro", "0.66b1", "0.67b1.post1", False),
         ("opentelemetry-distro", "0.66b1", "0.65b0", False),
         ("opentelemetry-distro", "0.66b1", "0.66rc1", False),
         ("opentelemetry-instrumentation-unlisted", "0.65b0", "0.66b1", False),

@@ -234,6 +234,9 @@ elif args[:3] == ['api', '--method', 'PUT']:
     assert os.environ['GH_TOKEN'] == 'test-merge-token'
     assert args == ['api', '--method', 'PUT', 'repos/example/project/pulls/123/update-branch',
                     '-f', 'expected_head_sha=' + 'a' * 40]
+    if data.get('update_exit'):
+        print('gh: branch update rejected (HTTP 422)', file=sys.stderr)
+        sys.exit(data['update_exit'])
 elif args[:3] == ['api', '--method', 'POST']:
     assert os.environ['GH_TOKEN'] == 'test-merge-token'
     assert args[3].endswith(('/rerun-failed-jobs', '/rerun'))
@@ -270,6 +273,11 @@ elif args[0] == 'api':
                         for line in (root / 'calls.jsonl').read_text().splitlines())
             if count > data.get('pull_after_reads', 1):
                 value = data['pull_after']
+        if endpoint.endswith('/pulls/123/reviews?per_page=100&page=1') and 'reviews_after' in data:
+            count = sum(json.loads(line) == args
+                        for line in (root / 'calls.jsonl').read_text().splitlines())
+            if count > 1:
+                value = data['reviews_after']
         if endpoint.endswith('/git/ref/heads/main') and 'main_after' in data:
             count = sum(json.loads(line) == args
                         for line in (root / 'calls.jsonl').read_text().splitlines())
@@ -1376,7 +1384,9 @@ def test_required_workflow_must_test_current_head_and_base(tmp_path, api, entry,
 
 
 @pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
-@pytest.mark.parametrize("fault", [None, "different_pin", "unmapped_only", "commands"])
+@pytest.mark.parametrize(
+    "fault", [None, "different_pin", "unmapped_only", "commands", "credential"]
+)
 def test_tested_action_transition_covers_other_occurrences(tmp_path, expanded_update, fault):
     _, api = expanded_update
     pair = api["files"][".github/workflows/ci.yml"]
@@ -1390,9 +1400,16 @@ def test_tested_action_transition_covers_other_occurrences(tmp_path, expanded_up
             pair[0],
             pair[1] + "      - run: arbitrary-command\n",
         )
+    if fault == "credential":
+        files = {
+            path: tuple(text.replace("actions/checkout", "docker/login-action") for text in pair)
+            for path, pair in files.items()
+        }
     set_changed_files(api, files)
     process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
     assert any(call[:2] == ["pr", "merge"] for call in calls) == (fault is None), process.stdout
+    if fault == "credential":
+        assert "docker/login-action requires human review" in process.stdout
 
 
 @pytest.mark.parametrize("expanded_update", ["npm"], indirect=True)
@@ -1886,6 +1903,15 @@ def test_worker_bounds_readiness_dispatch_for_each_head(tmp_path, api, condition
         "incomplete",
         "hold",
         "head_moved",
+        "two_merges",
+        "mixed_bases",
+        "wrong_tip",
+        "held_at_refresh",
+        "objection_at_refresh",
+        "update_rejected",
+        "approval_pending",
+        "approval_unrecoverable",
+        "approval_recoverable",
     ],
 )
 def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
@@ -1895,19 +1921,50 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
     pull = api["routes"][f"{PREFIX}/pulls/123"]
     pull["commits"] = 1
     commits = [{"sha": HEAD, "parents": [{"sha": BASE}]}]
-    if condition == "limit":
+    if condition in {"limit", "two_merges"}:
         commits = [
             {"sha": str(index) * 40, "parents": [{"sha": BASE}, {"sha": tip}]}
-            for index in range(3)
+            for index in range(3 if condition == "limit" else 2)
         ] + commits
         pull["commits"] = len(commits)
     elif condition == "incomplete":
         pull["commits"] = 250
     elif condition == "hold":
         pull["labels"] = [{"name": "hold-automerge"}]
-    elif condition == "head_moved":
+    elif condition in {"head_moved", "held_at_refresh"}:
         api["pull_after"] = copy.deepcopy(pull)
-        api["pull_after"]["head"]["sha"] = "d" * 40
+        api["pull_after_reads"] = 2
+        if condition == "head_moved":
+            api["pull_after"]["head"]["sha"] = "d" * 40
+        else:
+            api["pull_after"]["labels"] = [{"name": "hold-automerge"}]
+    elif condition == "mixed_bases":
+        run = api["routes"][
+            f"{PREFIX}/actions/workflows/e2e.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
+        ]["workflow_runs"][0]
+        run["pull_requests"][0]["base"]["sha"] = "d" * 40
+    elif condition == "wrong_tip":
+        commits[-1]["sha"] = "d" * 40
+    elif condition == "objection_at_refresh":
+        api["reviews_after"] = [{"user": {"login": "maintainer"}, "state": "CHANGES_REQUESTED"}]
+    elif condition == "update_rejected":
+        api["update_exit"] = 1
+    elif condition.startswith("approval_"):
+        check = api["routes"]["Maintainer Approval"]["check_runs"][0]
+        if condition == "approval_pending":
+            check.update(status="in_progress", conclusion=None)
+        else:
+            check.update(
+                conclusion="failure",
+                details_url=f"https://github.com/{REPO}/actions/runs/90/job/1",
+            )
+            api["routes"][f"{PREFIX}/actions/runs/90"] = {
+                "path": ".github/workflows/maintainer-approval.yml",
+                "event": "pull_request_target",
+                "status": "completed",
+                "conclusion": "failure",
+                "run_attempt": 3 if condition == "approval_unrecoverable" else 1,
+            }
     elif condition in {"failed", "pending"}:
         run = api["routes"][
             f"{PREFIX}/actions/workflows/e2e.yml/runs?head_sha={HEAD}&event=pull_request&per_page=100"
@@ -1931,14 +1988,29 @@ def test_worker_refreshes_only_green_stale_candidates(tmp_path, api, condition):
     )
     assert process.returncode == 0, process.stderr
     updates = [call for call in calls if call[:3] == ["api", "--method", "PUT"]]
-    assert bool(updates) == (condition == "green"), process.stdout
+    assert bool(updates) == (
+        condition in {"green", "two_merges", "update_rejected", "approval_recoverable"}
+    ), process.stdout
     assert not any(call[:2] == ["pr", "merge"] for call in calls)
-    if condition == "green":
-        assert "waiting for fresh policy, scans and CI" in process.stdout
+    assert not any(call[:3] == ["api", "--method", "POST"] for call in calls)
+    reason = {
+        "green": "waiting for fresh policy, scans and CI",
+        "two_merges": "waiting for fresh policy, scans and CI",
+        "approval_recoverable": "waiting for fresh policy, scans and CI",
+        "mixed_bases": "one identifiable base",
+        "wrong_tip": "Incomplete commit inventory",
+        "held_at_refresh": "PR was put on hold",
+        "objection_at_refresh": "A reviewer has requested changes",
+        "update_rejected": "GitHub rejected branch refresh (HTTP 422)",
+        "approval_pending": "Waiting for Maintainer Approval",
+        "approval_unrecoverable": "Approval refresh retry limit reached",
+    }.get(condition)
+    if reason:
+        assert reason in process.stdout
 
 
 @pytest.mark.parametrize("expanded_update", ["github-actions"], indirect=True)
-@pytest.mark.parametrize("conclusion", ["success", "skipped", "missing"])
+@pytest.mark.parametrize("conclusion", ["success", "skipped", "missing", "failure"])
 def test_android_action_update_requires_unsigned_build(tmp_path, expanded_update, conclusion):
     _, api = expanded_update
     pair = api["files"][".github/workflows/ci.yml"]
@@ -1966,3 +2038,15 @@ def test_android_action_update_requires_unsigned_build(tmp_path, expanded_update
     assert any(call[:2] == ["pr", "merge"] for call in calls) == (conclusion == "success"), (
         process.stdout
     )
+
+
+def test_consumer_coverage_outside_required_workflows_fails_closed(policy_module):
+    worker = importlib.import_module("dependabot_automerge")
+    candidate = {
+        "head": HEAD,
+        "ecosystem": "npm",
+        "workflows": ["web-tests.yml"],
+        "consumer_steps": [{"workflow": "unrequired.yml"}],
+    }
+    with pytest.raises(ValueError, match="Consumer coverage references a workflow outside"):
+        worker.require_reports(REPO, candidate)

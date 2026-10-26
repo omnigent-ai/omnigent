@@ -42,10 +42,27 @@
       "@cursor/*",
       "electron",
       "@electron/*",
+      "electron-builder*",
+      "electron-updater",
+      "electron-winstaller",
+      "electron-publish",
+      "dmg-builder",
+      "app-builder-*",
+      "builder-util*",
+      "@vscode/vsce*",
+      "wrangler",
       "@capacitor/*",
       "react-native",
       "react-pdf",
-      "pdfjs-dist"
+      "pdfjs-dist",
+      "katex",
+      "shiki",
+      "@shikijs/*",
+      "vite",
+      "tailwindcss",
+      "@tailwindcss/vite",
+      "@tailwindcss/node",
+      "@tailwindcss/postcss"
     ],
     "zero_minor": [
       "*"
@@ -102,7 +119,9 @@
       "release-drafter/release-drafter",
       "googleapis/release-please-action",
       "actions/attest*",
-      "actions/create-github-app-token"
+      "actions/create-github-app-token",
+      "docker/login-action",
+      "aws-actions/configure-aws-credentials"
     ],
     "zero_minor": [
       "*"
