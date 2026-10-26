@@ -26,6 +26,8 @@ interface SessionImportState {
   error: string | null;
   /** Run one import; resolves when the stream settles. Ignored while one is in flight. */
   start: (request: SessionImportRequest, queryClient: QueryClient) => Promise<void>;
+  /** Record that the result's already-imported session was unarchived. */
+  markExistingSessionRestored: (sessionId: string) => void;
 }
 
 // The server persists each session as its frame arrives, so the sidebar list
@@ -60,4 +62,12 @@ export const useSessionImportStore = create<SessionImportState>((set, get) => ({
     // Newly imported sessions land in the sidebar list.
     await queryClient.invalidateQueries({ queryKey: ["conversations"] });
   },
+  markExistingSessionRestored: (sessionId) =>
+    set((state) => {
+      const existing = state.result?.alreadyImportedSession;
+      if (!state.result || existing?.id !== sessionId) return {};
+      return {
+        result: { ...state.result, alreadyImportedSession: { ...existing, archived: false } },
+      };
+    }),
 }));

@@ -117,6 +117,7 @@ from omnigent.stores.conversation_store.overrides import (
 from omnigent.stores.conversation_store.overrides import (
     encode_session_overrides as _encode_session_overrides,
 )
+from omnigent.util.uuid import InvalidUuidError
 
 _logger = logging.getLogger(__name__)
 
@@ -161,6 +162,40 @@ def _encode_session_state(
 # to the connection's next pooled use. Longer than the client's own
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
+
+# Token length bounds for exact-id search: the max is the external_session_id
+# column width; the min keeps short words off the id lookup.
+_SESSION_ID_SEARCH_MIN_LEN = 8
+_SESSION_ID_SEARCH_MAX_LEN = 128
+
+# Caps split-DB matches for one harness id; import dedup keeps this to
+# roughly one session per source.
+_EXTERNAL_SESSION_ID_MATCH_LIMIT = 50
+
+
+def _session_id_search_terms(search_query: str) -> tuple[str | None, str | None]:
+    """Return the session ids a pasted search query could name.
+
+    :param search_query: The raw search text, e.g. ``"  conv_<32 hex>  "``.
+    :returns: ``(conversation_id, external_session_id)``: the bare hex form of an
+        Omnigent id, and the token if it has a digit, ``-`` or ``_``; else ``None``.
+    """
+    token = search_query.strip()
+    if not _SESSION_ID_SEARCH_MIN_LEN <= len(token) <= _SESSION_ID_SEARCH_MAX_LEN:
+        return None, None
+    if any(character.isspace() for character in token):
+        return None, None
+    conversation_id: str | None = None
+    # Other id types' prefixes (``ag_``, ``host_``, ...) never name a session.
+    has_conv_prefix = token[:5].lower() == "conv_"
+    if "_" not in token or has_conv_prefix:
+        try:
+            conversation_id = uuid_to_bytes(token[5:] if has_conv_prefix else token).hex()
+        except InvalidUuidError:
+            conversation_id = None
+    looks_like_id = any(character.isdigit() or character in "-_" for character in token)
+    return conversation_id, token if looks_like_id else None
+
 
 # Upper bound on rows fetched per SQL statement when listing conversation
 # items. A deployed managed-Postgres backend failed one oversized read of a
@@ -2897,6 +2932,46 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         run_write_transaction(self._conv_session_immediate, "delete_label", write)
 
+    def _external_session_id_match(
+        self, external_session_id: str, qualifying_ids: list[str] | None
+    ) -> Any | None:
+        """Build a ``conversations`` filter for one exact harness session id.
+
+        Single-DB uses a correlated EXISTS on the metadata primary key. Split-DB
+        probes *qualifying_ids*, and skips the match when the list is unscoped.
+
+        :param external_session_id: Exact source harness id, e.g. a Claude
+            session uuid.
+        :param qualifying_ids: Permission-qualifying conversation ids already
+            prefetched for a split-DB list, or ``None``.
+        :returns: A boolean SQL expression over :class:`SqlConversation`, or
+            ``None`` when this list cannot match harness ids.
+        """
+        if self._conv_engine is self._engine:
+            return (
+                select(SqlConversationMetadata.id)
+                .where(
+                    SqlConversationMetadata.workspace_id == SqlConversation.workspace_id,
+                    SqlConversationMetadata.id == SqlConversation.id,
+                    SqlConversationMetadata.external_session_id == external_session_id,
+                )
+                .exists()
+            )
+        if qualifying_ids is None:
+            return None
+        id_stmt = (
+            select(SqlConversationMetadata.id)
+            .where(
+                SqlConversationMetadata.workspace_id == current_workspace_id(),
+                SqlConversationMetadata.id.in_(qualifying_ids),
+                SqlConversationMetadata.external_session_id == external_session_id,
+            )
+            .limit(_EXTERNAL_SESSION_ID_MATCH_LIMIT)
+        )
+        with self._session("list_conversations") as meta_sess:
+            matching_ids = list(meta_sess.execute(id_stmt).scalars())
+        return SqlConversation.id.in_(matching_ids)
+
     def list_conversations(
         self,
         limit: int = 20,
@@ -2961,6 +3036,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             query. Implemented with the SQL ``LIKE`` operator
             (no FTS) so it works against both SQLite and
             Postgres without extra extensions.
+            A query that is one id-shaped token also matches the
+            session with that exact id or exact harness
+            ``external_session_id``.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -3204,7 +3282,17 @@ class SqlAlchemyConversationStore(ConversationStore):
                     )
                     .exists()
                 )
-                stmt = stmt.where(or_(title_match, content_match))
+                search_matches: list[Any] = [title_match, content_match]
+                conversation_id_term, external_id_term = _session_id_search_terms(search_query)
+                if conversation_id_term is not None:
+                    search_matches.append(SqlConversation.id == conversation_id_term)
+                if external_id_term is not None:
+                    external_match = self._external_session_id_match(
+                        external_id_term, qualifying_ids
+                    )
+                    if external_match is not None:
+                        search_matches.append(external_match)
+                stmt = stmt.where(or_(*search_matches))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the

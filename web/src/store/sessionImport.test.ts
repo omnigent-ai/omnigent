@@ -18,6 +18,7 @@ const DONE: LocalImportResult = {
   failed: 0,
   sessions: [],
   failures: [],
+  alreadyImportedSession: null,
 };
 
 /** A stream the test settles by hand, so the in-flight state can be inspected. */
@@ -56,6 +57,20 @@ afterEach(() => {
 });
 
 describe("useSessionImportStore", () => {
+  it("marks only the reported already-imported session as restored", () => {
+    const existing = { id: "c9", title: "Planning thread", archived: true, canUnarchive: true };
+    useSessionImportStore.setState({ result: { ...DONE, alreadyImportedSession: existing } });
+
+    useSessionImportStore.getState().markExistingSessionRestored("c1");
+    expect(useSessionImportStore.getState().result?.alreadyImportedSession).toEqual(existing);
+
+    useSessionImportStore.getState().markExistingSessionRestored("c9");
+    expect(useSessionImportStore.getState().result?.alreadyImportedSession).toEqual({
+      ...existing,
+      archived: false,
+    });
+  });
+
   it("exposes the in-flight import and the imported count until the stream settles", async () => {
     const stream = pendingImport();
     const queryClient = new QueryClient();

@@ -10,6 +10,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import { BACKGROUND_SESSION_TITLES_STORAGE_KEY } from "@/lib/backgroundSessionTitlesPreferences";
+import { writeRetentionDays } from "@/lib/retentionPreferences";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import * as host from "@/lib/host";
 import {
@@ -40,6 +41,11 @@ const mocks = vi.hoisted(() => ({
   me: { id: "alice", is_admin: false } as { id: string; is_admin: boolean } | null,
   conversations: [] as Conversation[],
   conversationQuery: vi.fn(),
+  conversationSearch: vi.fn(),
+  // Server-side search results keyed by the exact query the hook receives.
+  searchResults: {} as Record<string, Conversation[]>,
+  // When true, a new search key serves no rows for one render, like a real fetch.
+  searchInFlight: false,
   // Optional multi-page dataset (array of per-page row arrays) for pagination
   // tests. When unset the mock serves a single page of `conversations`.
   pages: undefined as Conversation[][] | undefined,
@@ -48,6 +54,8 @@ const mocks = vi.hoisted(() => ({
   projectNames: [] as string[],
   hasNextPage: false,
   fetchNextPage: vi.fn(),
+  // When set, `mutateAsync` rejects with it (a failed unarchive).
+  archiveAsyncError: null as Error | null,
 }));
 
 vi.mock("next-themes", () => ({
@@ -79,25 +87,31 @@ vi.mock("@/hooks/useConversations", async () => {
   // A stateful mock that emulates useInfiniteQuery pagination: it tracks how
   // many pages are "loaded" and reveals the next on fetchNextPage, so a click
   // on "Load more" re-renders with more rows (as the real hook would).
-  const { useState } = await import("react");
+  const { useEffect, useState } = await import("react");
   return {
     PROJECT_LABEL_KEY: "omni_project",
     // The Archived view drives the visible list from this hook; filter on the
     // fourth (`project`) arg so the mock mirrors the server-side ?project=
     // scoping.
     useConversations: (
-      _searchQuery?: string,
+      searchQuery?: string,
       includeArchived?: boolean,
       _options?: unknown,
       project?: string,
       visibility?: "mine" | "shared" | "archived",
     ) => {
       mocks.conversationQuery({ includeArchived, project, visibility });
+      mocks.conversationSearch(searchQuery ?? "");
       // `mocks.pages` (array of per-page row arrays) drives multi-page tests;
       // otherwise serve a single page of `mocks.conversations`.
-      const source = mocks.pages ?? [mocks.conversations];
+      const source = searchQuery
+        ? [mocks.searchResults[searchQuery] ?? []]
+        : (mocks.pages ?? [mocks.conversations]);
       const [shown, setShown] = useState(1);
-      const pages = source.slice(0, shown).map((rows) => ({
+      const [fetchedSearch, setFetchedSearch] = useState(searchQuery);
+      useEffect(() => setFetchedSearch(searchQuery), [searchQuery]);
+      const inFlight = mocks.searchInFlight && fetchedSearch !== searchQuery;
+      const pages = (inFlight ? [] : source.slice(0, shown)).map((rows) => ({
         data: project ? rows.filter((c) => c.labels?.["omni_project"] === project) : rows,
       }));
       return {
@@ -121,6 +135,12 @@ vi.mock("@/hooks/useConversations", async () => {
       mutate: (vars: { id: string; archived: boolean }, opts?: { onSuccess?: () => void }) => {
         mocks.archiveMutate(vars, opts);
         opts?.onSuccess?.();
+      },
+      mutateAsync: (vars: { id: string; archived: boolean }) => {
+        mocks.archiveMutate(vars);
+        return mocks.archiveAsyncError
+          ? Promise.reject(mocks.archiveAsyncError)
+          : Promise.resolve();
       },
       isPending: false,
     }),
@@ -234,6 +254,9 @@ beforeEach(() => {
   mocks.bulkDeleteMutate.mockReset();
   mocks.fetchNextPage.mockReset();
   mocks.conversationQuery.mockReset();
+  mocks.conversationSearch.mockReset();
+  mocks.searchResults = {};
+  mocks.searchInFlight = false;
   mocks.theme = "system";
   mocks.isEmbedded = false;
   mocks.accountsEnabled = true;
@@ -245,6 +268,7 @@ beforeEach(() => {
   mocks.pages = undefined;
   mocks.projectNames = [];
   mocks.hasNextPage = false;
+  mocks.archiveAsyncError = null;
   delete (window as unknown as Record<string, unknown>).omnigentDesktop;
 });
 afterEach(() => {
@@ -1290,7 +1314,7 @@ describe("SettingsPage", () => {
     expect(localStorage.getItem("omnigent:default-base-branch")).toBeNull();
   });
 
-  it("lists archived sessions and unarchives on click", () => {
+  it("lists archived sessions and unarchives on click", async () => {
     mocks.conversations = [
       conv("conv_active"),
       conv("conv_archived", { archived: true, title: "Old chat" }),
@@ -1311,8 +1335,124 @@ describe("SettingsPage", () => {
       id: "conv_archived",
       archived: false,
     });
-    // Unarchiving opens the restored session (the mock mutate runs onSuccess).
-    expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived");
+    // Unarchiving opens the restored session once the mutation settles.
+    await waitFor(() =>
+      expect(screen.getByTestId("location").textContent).toBe("/c/conv_archived"),
+    );
+  });
+
+  it("searches archived sessions server-side by a pasted session ID and unarchives the match", async () => {
+    const imported = conv("conv_imported", { archived: true, title: "Imported planning" });
+    mocks.conversations = [conv("conv_other", { archived: true, title: "Other chat" }), imported];
+    mocks.searchResults = { "claude-harness-1": [imported] };
+    renderPage("/settings/archived");
+
+    expect(mocks.conversationSearch).toHaveBeenLastCalledWith("");
+    expect(screen.getAllByTestId("archived-row")).toHaveLength(2);
+
+    fireEvent.change(screen.getByTestId("archived-search"), {
+      target: { value: "  claude-harness-1 " },
+    });
+    // Debounced, then trimmed before it reaches the server query.
+    await waitFor(() =>
+      expect(mocks.conversationSearch).toHaveBeenLastCalledWith("claude-harness-1"),
+    );
+    const rows = screen.getAllByTestId("archived-row");
+    expect(rows).toHaveLength(1);
+    expect(within(rows[0]).getByText("Imported planning")).toBeInTheDocument();
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: undefined,
+      visibility: "archived",
+    });
+
+    fireEvent.click(within(rows[0]).getByTestId("unarchive-conversation"));
+    expect(mocks.archiveMutate.mock.calls[0][0]).toEqual({
+      id: "conv_imported",
+      archived: false,
+    });
+    await waitFor(() =>
+      expect(screen.getByTestId("location").textContent).toBe("/c/conv_imported"),
+    );
+  });
+
+  it("shows a search-specific empty state and composes search with the project filter", async () => {
+    mocks.projectNames = ["Alpha"];
+    mocks.conversations = [
+      conv("conv_a", { archived: true, title: "Alpha chat", labels: { omni_project: "Alpha" } }),
+    ];
+    renderPage("/settings/archived");
+
+    fireEvent.change(screen.getByTestId("archived-search"), { target: { value: "missing-id-9" } });
+    await waitFor(() =>
+      expect(screen.getByTestId("archived-empty")).toHaveTextContent(
+        "No archived sessions match “missing-id-9”.",
+      ),
+    );
+
+    fireEvent.change(screen.getByTestId("archived-project-filter"), {
+      target: { value: "project:Alpha" },
+    });
+    expect(mocks.conversationQuery).toHaveBeenLastCalledWith({
+      includeArchived: true,
+      project: "Alpha",
+      visibility: undefined,
+    });
+    expect(mocks.conversationSearch).toHaveBeenLastCalledWith("missing-id-9");
+    expect(screen.getByTestId("archived-empty")).toHaveTextContent(
+      "No archived sessions match “missing-id-9” in this project.",
+    );
+
+    // Clearing the search restores the unfiltered project list.
+    fireEvent.change(screen.getByTestId("archived-search"), { target: { value: "" } });
+    await waitFor(() => expect(screen.getAllByTestId("archived-row")).toHaveLength(1));
+  });
+
+  it("stays on the archived list when unarchiving fails", async () => {
+    mocks.conversations = [conv("conv_archived", { archived: true, title: "Old chat" })];
+    mocks.archiveAsyncError = new Error("network down");
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("unarchive-conversation"));
+    expect(mocks.archiveMutate).toHaveBeenCalledWith({ id: "conv_archived", archived: false });
+    // Let the rejected mutation settle before checking nothing navigated.
+    await act(async () => {
+      await Promise.resolve();
+    });
+    expect(screen.getByTestId("location").textContent).toBe("/settings/archived");
+  });
+
+  it("scopes the expired-session banner and its delete to the active search", async () => {
+    writeRetentionDays(30);
+    const expired = conv("conv_expired", { archived: true, title: "Stale import", owner: null });
+    mocks.conversations = [
+      expired,
+      conv("conv_expired_other", { archived: true, title: "Stale other", owner: null }),
+    ];
+    mocks.searchResults = { "harness-7": [expired] };
+    try {
+      renderPage("/settings/archived");
+      expect(
+        screen.getByText(/2 expired sessions past the 30-day retention period/),
+      ).toBeInTheDocument();
+
+      fireEvent.change(screen.getByTestId("archived-search"), { target: { value: "harness-7" } });
+      await waitFor(() =>
+        expect(
+          screen.getByText(
+            /1 expired session matching your search past the 30-day retention period/,
+          ),
+        ).toBeInTheDocument(),
+      );
+      fireEvent.click(screen.getByTestId("delete-expired"));
+      expect(
+        screen.getByText(/1 owned archived session matching your search older than 30 days/),
+      ).toBeInTheDocument();
+      fireEvent.click(screen.getByRole("button", { name: "Delete 1 session" }));
+      expect(mocks.bulkDeleteMutate).toHaveBeenCalledWith({ ids: ["conv_expired"] });
+    } finally {
+      writeRetentionDays(null);
+    }
   });
 
   it("deletes an archived session after confirming, with no row-click navigation", () => {
@@ -1595,6 +1735,35 @@ describe("SettingsPage", () => {
 
     fireEvent.click(screen.getByRole("button", { name: "Deselect all" }));
     expect(screen.getByText("None selected")).toBeInTheDocument();
+  });
+
+  it("bulk actions during a search touch only the matching rows", async () => {
+    const match = conv("a2", { archived: true, title: "Chat B" });
+    mocks.conversations = [
+      conv("a1", { archived: true, title: "Chat A" }),
+      match,
+      conv("a3", { archived: true, title: "Chat C" }),
+    ];
+    mocks.searchResults = { "harness-b": [match] };
+    mocks.searchInFlight = true;
+    renderPage("/settings/archived");
+
+    fireEvent.click(screen.getByTestId("archived-toggle-selection"));
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByText("3 selected")).toBeInTheDocument();
+
+    // The search fetch briefly empties the list, which clears the selection.
+    fireEvent.change(screen.getByTestId("archived-search"), { target: { value: "harness-b" } });
+    await waitFor(() => expect(screen.getAllByTestId("archived-row")).toHaveLength(1));
+    expect(screen.getByText("None selected")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Select all" }));
+    expect(screen.getByText("1 selected")).toBeInTheDocument();
+
+    fireEvent.click(screen.getByTestId("archived-bulk-unarchive"));
+    expect(mocks.bulkArchiveMutate).toHaveBeenCalledWith(
+      { ids: ["a2"], archived: false },
+      expect.anything(),
+    );
   });
 
   it("hides the Select button when there are no archived sessions", () => {
