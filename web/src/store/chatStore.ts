@@ -158,6 +158,7 @@ import {
   isClaudeAgentMessageContent,
   isSystemUserContent,
   taskNotificationMarkerContent,
+  withoutAttachedMarkers,
 } from "@/lib/systemMessage";
 import {
   isNativeTerminalSession as isNativeTerminalSessionFn,
@@ -1497,7 +1498,12 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
     // One deadline at a time: the launch's while the sandbox starts, then the model's.
     let timer: ReturnType<typeof setTimeout> | undefined;
     let deadline: "launch" | "model" | undefined;
+    // Counts armed deadlines, so a model re-read can tell whether a newer one replaced it.
+    let armedDeadlines = 0;
+    let settled = false;
     const finish = (ready: boolean, error?: Error) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       unsubscribe();
       unsubscribeDisposed();
@@ -1508,9 +1514,26 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
       if (deadline === phase) return;
       clearTimeout(timer);
       deadline = phase;
-      timer = setTimeout(() => finish(false, new Error(message)), ms);
+      const armed = ++armedDeadlines;
+      timer = setTimeout(() => {
+        if (phase === "launch") {
+          finish(false, new Error(message));
+          return;
+        }
+        // The stream does not replay `session.model`, so a report this tab missed
+        // (a dropped stream, a sleeping laptop) would fail a ready runner's message.
+        // `catch` first: a failed read must still reach the final check below.
+        void adoptSnapshotModel(conversationId)
+          .catch(() => undefined)
+          .then(() => {
+            check();
+            // A launch during the read re-armed the deadlines; the newer one applies.
+            if (armedDeadlines === armed) finish(false, new Error(message));
+          });
+      }, ms);
     };
     const check = () => {
+      if (settled) return;
       const entry = conversationRegistry.peek(conversationId);
       const state = entry?.getState();
       if (
@@ -1557,6 +1580,35 @@ function waitForInitialDispatch(conversationId: string, tempId: string): Promise
     });
     check();
   });
+}
+
+/** Settle a seeded model from a snapshot, under the condition `sessionBindingPatch` uses at bind. */
+function snapshotModelPatch(
+  session: Session,
+  s: Pick<ConversationState, "sessionModelSeeded">,
+): Partial<ConversationState> {
+  return s.sessionModelSeeded && session.llmModel != null
+    ? { llmModel: session.llmModel, sessionModelSeeded: false }
+    : {};
+}
+
+/** Adopt the model a fresh session snapshot shows, in case this tab's stream missed it. */
+async function adoptSnapshotModel(conversationId: string): Promise<void> {
+  const entry = conversationRegistry.peek(conversationId);
+  if (entry === undefined) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), ACTIVE_SESSION_STATUS_RECONCILE_TIMEOUT_MS);
+  let session: Session;
+  try {
+    session = await getSessionSlim(conversationId, { signal: controller.signal });
+  } catch {
+    return;
+  } finally {
+    clearTimeout(timeout);
+  }
+  // A conversation reopened under the same id during the read is a different entry.
+  if (entry.disposed) return;
+  entrySetter(entry)((s) => snapshotModelPatch(session, s));
 }
 
 /**
@@ -2912,18 +2964,29 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       failSet((s) => ({
         pendingUserMessages: s.pendingUserMessages.filter((p) => p.tempId !== tempId),
       }));
+      // A delivered send needs no card. One the server never answered may still
+      // arrive, so its card names the send for the commit that retracts it.
+      const sentText = failGet().isNativeTerminalSession ? messageContentText(content) : "";
+      const failureCard: ErrorBlock | null = deliveredDespiteFailure
+        ? null
+        : {
+            ...makeClientErrorBlock(message, code),
+            ...(serverRefused
+              ? {}
+              : { unansweredSend: { stableId, ...(sentText ? { text: sentText } : {}) } }),
+          };
       if (!alreadyStreaming) {
         if (failGet().activeResponse !== null) {
           // A response bubble already exists (the turn started, then failed)
           // — mark it failed so the error rides on that bubble.
           finalizeActive(failSet, "failed", message, null);
-        } else if (!callerHandlesError) {
+        } else if (!callerHandlesError && failureCard !== null) {
           // No response bubble to carry the failure — the turn never started
           // (e.g. the runner never came online, so POST /events 503'd). Append
           // a standalone error block so the user sees WHY nothing happened
           // instead of being left on a silent, empty composer. Skipped when the
           // caller owns the error UX (it surfaces the failure elsewhere).
-          failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+          failSet((s) => ({ blocks: [...s.blocks, failureCard] }));
         }
         failSet({
           status: "idle",
@@ -2938,8 +3001,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
         // to see. Surface it WITHOUT touching the turn lifecycle: finalizeActive
         // would fail a live response, and settling status would end a turn that
         // is still running. Skipped when the caller owns the error UX.
-        if (!callerHandlesError) {
-          failSet((s) => ({ blocks: [...s.blocks, makeClientErrorBlock(message, code)] }));
+        if (!callerHandlesError && failureCard !== null) {
+          failSet((s) => ({ blocks: [...s.blocks, failureCard] }));
         }
       }
     } finally {
@@ -5152,6 +5215,9 @@ function reconnectStatusPatch(
     sessionStatus: session.status,
     ...mcpStartupSnapshotPatch(session, s, launchBeforeFetch),
     ...launchSnapshotPatch(session, s),
+    // A `session.model` missed in the gap would otherwise hold a first
+    // message on `waitForInitialDispatch` until its deadline.
+    ...snapshotModelPatch(session, s),
   };
   // Recover the background-shell tally across the gap too, so the spinner
   // returns to "N background tasks still running" rather than vanishing on reconnect.
@@ -5532,9 +5598,17 @@ async function rehydrateWindowOnReconnect(
   const freshBlocks = itemsToBlocks(fresh.items);
   const snapshotPending = pendingElicitationBlocksFromSnapshot(session);
   const freshItemIds = new Set(fresh.items.map((it) => it.id));
+  const gapUserTexts = committedUserTextsOf(
+    freshBlocks.filter((b) => b.ctx.itemId && !preGapIds.has(b.ctx.itemId)),
+  );
   set((s) => {
     const rid = s.activeResponse?.state === "streaming" ? s.activeResponse.responseId : null;
-    const currentBlocks = withoutNativePreviews(s.blocks, snapshotNativeMessageIds);
+    const currentBlocks = withoutDeliveredSendFailureCards(
+      withoutNativePreviews(s.blocks, snapshotNativeMessageIds),
+      freshItemIds,
+      gapUserTexts,
+      session,
+    );
     const tail = currentBlocks.filter((b) => {
       if (b.ctx.itemId) return !preGapIds.has(b.ctx.itemId);
       // Elicitation/error blocks aren't items, so the fresh fetch can't recreate them.
@@ -5739,6 +5813,12 @@ async function reconcileOnReconnect(
       nextBlocks =
         at >= 0 ? [...kept.slice(0, at), ...unseen, ...kept.slice(at)] : [...kept, ...unseen];
     }
+    nextBlocks = withoutDeliveredSendFailureCards(
+      nextBlocks,
+      snapshotItemIds,
+      committedUserTextsOf(unseen),
+      session,
+    );
     // Recover elicitation state the dead socket swallowed: gap-fired
     // prompts, gap-resolved cards, and re-parked prompts whose card
     // was auto-cleared. Items can't resupply these (elicitations are
@@ -7337,6 +7417,41 @@ function reconcileSendDraftWithSnapshot(
 }
 
 /**
+ * Drop the failure cards of unanswered sends that have since committed.
+ *
+ * A send commits under its stable id, except on a native terminal: the mirror
+ * has its own id and prepends markers for uploads, so a new message whose text
+ * is otherwise the send's delivers it, one send per message. Older messages
+ * don't count, as they can say the same thing. A send the snapshot records the
+ * runner refusing keeps its card.
+ *
+ * @param blocks - The conversation's blocks.
+ * @param committedIds - Ids of items known committed.
+ * @param newUserTexts - Normalized texts of user messages new since the cards.
+ * @param snapshot - The snapshot that supplied the commits, if any.
+ * @returns `blocks` itself when no card is dropped.
+ */
+function withoutDeliveredSendFailureCards(
+  blocks: AnyBlock[],
+  committedIds: ReadonlySet<string>,
+  newUserTexts: readonly string[],
+  snapshot?: Session,
+): AnyBlock[] {
+  const unclaimedTexts = newUserTexts.map(withoutAttachedMarkers);
+  const kept = blocks.filter((block) => {
+    const send = block.type === "error" ? block.unansweredSend : undefined;
+    if (send === undefined) return true;
+    if (snapshot !== undefined && snapshotRefusesSend(snapshot, send.stableId)) return true;
+    if (committedIds.has(send.stableId)) return false;
+    const claimed = send.text === undefined ? -1 : unclaimedTexts.indexOf(send.text);
+    if (claimed === -1) return true;
+    unclaimedTexts.splice(claimed, 1);
+    return false;
+  });
+  return kept.length === blocks.length ? blocks : kept;
+}
+
+/**
  * Build the committed user-message content from a consumed event,
  * preserving optimistic file blocks the native transcript drops.
  *
@@ -8200,9 +8315,25 @@ export function handleSessionEvent(event: StreamEvent, streamConversationId?: st
       applyToConversation({ startupPending: false });
       // This committed item may be a send whose POST failed client-side —
       // its arrival proves that send was delivered, so retract the draft
-      // before it (re)populates the composer with an already-sent prompt.
+      // before it (re)populates the composer with an already-sent prompt,
+      // and drop the send's failure card.
       if (inFlightSends.has(event.itemId)) inFlightSends.set(event.itemId, true);
-      applyToConversation((s) => retractDeliveredSendDraft(s, new Set([event.itemId]), "consumed"));
+      applyToConversation((s) => {
+        const committedIds = new Set([event.itemId]);
+        // A late copy of an item already shown is not a new message.
+        const content = hasCommittedItem(s.blocks, event.itemId)
+          ? null
+          : userContentFromEvent(event);
+        const blocks = withoutDeliveredSendFailureCards(
+          s.blocks,
+          committedIds,
+          content === null ? [] : [messageContentText(content)],
+        );
+        return {
+          ...retractDeliveredSendDraft(s, committedIds, "consumed"),
+          ...(blocks === s.blocks ? {} : { blocks }),
+        };
+      });
       // Hidden meta inputs stay hidden — except a background-task wake,
       // which `userContentFromEvent` re-labels as a system marker.
       if (event.isMeta === true && userContentFromEvent(event) === null) return;

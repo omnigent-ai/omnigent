@@ -11,7 +11,7 @@ import uuid
 
 import pytest
 
-from omnigent.db.db_models import workspace_scope
+from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 
 
@@ -1870,9 +1870,12 @@ def test_deleted_cleanup_pages_past_live_claims_across_tasks(store, monkeypatch)
             assert all(run.status == "starting" for run in runs)
 
 
-@pytest.mark.parametrize("limit, resume", [(1, False), (10, False), (1, True)])
+@pytest.mark.parametrize(
+    "limit, resume, retried_workspaces",
+    [(1, False, [31]), (10, False, [31]), (1, True, [31, 31])],
+)
 def test_deleted_cleanup_passes_failing_task_and_retries_on_next_scan(
-    store, monkeypatch, caplog, limit, resume
+    store, monkeypatch, caplog, limit, resume, retried_workspaces
 ):
     tasks = []
     for workspace in (31, 32):
@@ -1893,8 +1896,6 @@ def test_deleted_cleanup_passes_failing_task_and_retries_on_next_scan(
     attempted = []
 
     def purge(task_id, *, after=None):
-        from omnigent.db.db_models import current_workspace_id
-
         workspace = current_workspace_id()
         attempted.append(workspace)
         if workspace == 31 and failing:
@@ -1919,6 +1920,8 @@ def test_deleted_cleanup_passes_failing_task_and_retries_on_next_scan(
         cursor = store.purge_deleted_tasks(after=cursor, limit=limit)
         if cursor is None:
             break
-    assert attempted[2:] and all(workspace == 31 for workspace in attempted[2:])
+    else:
+        pytest.fail("Cleanup did not finish after the failure cleared")
+    assert attempted[2:] == retried_workspaces
     with workspace_scope(31):
         assert store.get(tasks[0].id) is None

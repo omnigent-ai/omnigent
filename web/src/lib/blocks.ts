@@ -461,6 +461,12 @@ export interface ErrorBlock {
   cause?: string;
   /** Optional concrete next step to fix it, e.g. a command to run. */
   remediation?: string;
+  /**
+   * The send behind a client-only card whose POST got no answer: the message
+   * may still arrive, and its commit retracts the card. `text` is set on a
+   * native terminal, whose mirrored message carries no stable id.
+   */
+  unansweredSend?: { stableId: string; text?: string };
 }
 
 /**

@@ -1115,6 +1115,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
         >
           <Input
             aria-label="Pull request URL"
+            autoFocus
             type="url"
             required
             value={url}
@@ -1287,7 +1288,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           emptyStateAction={
             associations?.tracking_available && linkInEmptyState ? (
               <div className="mt-2 w-full max-w-sm">
-                <Button onClick={() => setLinking(!linking)}>Link a PR</Button>
+                {!linking && <Button onClick={() => setLinking(true)}>Link a PR</Button>}
                 {linkControls}
               </div>
             ) : (
@@ -1478,8 +1479,15 @@ function PullRequestPanelDetails({
     );
   }, [files]);
 
+  // Jumping to a collapsed file also expands it, so the click lands on its diff.
   const jumpTo = useCallback((path: string) => {
     setActivePath(path);
+    setCollapsedPaths((prev) => {
+      if (!prev.has(path)) return prev;
+      const next = new Set(prev);
+      next.delete(path);
+      return next;
+    });
     sectionEls.current.get(path)?.scrollIntoView({ block: "start" });
   }, []);
 

@@ -942,14 +942,20 @@ describe("PullRequestPanel", () => {
     for (const diff of diffs) expect(diff.closest(".github-diff-stack")).not.toBeNull();
   });
 
-  it("jumps to a file's section when its sidebar row is clicked", async () => {
+  it("jumps to and expands a file's section when its sidebar row is clicked", async () => {
     renderChanges();
     await screen.findAllByTestId("diff");
+    fireEvent.click(screen.getByRole("button", { name: /app\.ts/, expanded: true }));
+    expect(screen.getAllByTestId("diff").map((d) => d.getAttribute("data-path"))).toEqual([
+      "hello.py",
+    ]);
     // Both the sidebar row and the section header are buttons matching the
     // name; the sidebar row (which scrolls) is first in the DOM.
     const row = screen.getAllByRole("button", { name: /app\.ts/ })[0];
     fireEvent.click(row);
     expect(scrollIntoView).toHaveBeenCalledWith({ block: "start" });
+    expect(screen.getByRole("button", { name: /app\.ts/, expanded: true })).toBeInTheDocument();
+    expect(screen.getAllByTestId("diff")).toHaveLength(2);
   });
 
   it("collapses a file's diff when its section header is clicked", async () => {
@@ -1878,16 +1884,18 @@ describe("PullRequestPanel", () => {
     expect(description.parentElement).toContainElement(link);
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
     fireEvent.click(link);
-    expect(description.parentElement).toContainElement(
-      screen.getByRole("textbox", { name: "Pull request URL" }),
-    );
+    const input = screen.getByRole("textbox", { name: "Pull request URL" });
+    expect(description.parentElement).toContainElement(input);
+    expect(input).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
-    fireEvent.click(link);
+    fireEvent.click(screen.getByRole("button", { name: "Link a PR" }));
     fireEvent.keyDown(screen.getByRole("textbox", { name: "Pull request URL" }), {
       key: "Escape",
     });
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
   });
 
   it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {

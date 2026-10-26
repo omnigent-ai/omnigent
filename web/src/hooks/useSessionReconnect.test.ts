@@ -2,11 +2,14 @@ import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 
+import { fetchHosts } from "@/hooks/useHosts";
+import type { Host } from "@/hooks/useHosts";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import { connectArcaHost, controlHost, getHostIdentity, isElectronShell } from "@/lib/nativeBridge";
 import type { ArcaConnectResult, HostActionResult, HostIdentity } from "@/lib/nativeBridge";
 import { useSessionReconnect } from "./useSessionReconnect";
 
+vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn() }));
 vi.mock("@/lib/nativeBridge", () => ({
   connectArcaHost: vi.fn(),
   controlHost: vi.fn(),
@@ -18,6 +21,10 @@ vi.mock("sonner", () => ({
 }));
 
 const localSession = { sessionId: "session", hostId: "this-mac", isOwner: true };
+
+function hostRow(hostId: string, status: Host["status"]): Host {
+  return { host_id: hostId, name: hostId, owner: "e2e", status };
+}
 
 function deferred<T>() {
   let resolve!: (value: T) => void;
@@ -33,6 +40,7 @@ beforeEach(() => {
   vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: true, hostId: "this-mac" });
   vi.mocked(controlHost).mockResolvedValue({ ok: true });
   vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
+  vi.mocked(fetchHosts).mockResolvedValue([hostRow("arca-host", "online")]);
   writeArcaHostId(null);
 });
 afterEach(() => {
@@ -215,15 +223,25 @@ describe("useSessionReconnect", () => {
     expect(readArcaHostId()).toBe("arca-host");
   });
 
-  it.each([false, true])(
-    "keeps the dialog open when Arca comes back as a different host (already running: %s)",
-    async (alreadyRunning) => {
+  it.each([
+    { label: "started, identity read", alreadyRunning: false, identityHostId: "current-arca-host" },
+    { label: "running, identity read", alreadyRunning: true, identityHostId: "current-arca-host" },
+    { label: "running, identity unreadable", alreadyRunning: true, identityHostId: null },
+  ])(
+    "keeps the dialog open when Arca comes back as a different host ($label)",
+    async ({ alreadyRunning, identityHostId }) => {
       writeArcaHostId("previous-arca-host");
       vi.mocked(connectArcaHost).mockResolvedValue({
         ok: true,
         alreadyRunning,
-        identity: { serverUrl: "https://example.test", hostId: "current-arca-host" },
+        ...(identityHostId === null
+          ? {}
+          : { identity: { serverUrl: "https://example.test", hostId: identityHostId } }),
       });
+      vi.mocked(fetchHosts).mockResolvedValue([
+        hostRow("arca-host", "offline"),
+        hostRow("current-arca-host", "online"),
+      ]);
       const { result } = renderHook(() =>
         useSessionReconnect({ ...localSession, hostId: "arca-host", hostName: "e2e's arca" }),
       );
@@ -238,9 +256,29 @@ describe("useSessionReconnect", () => {
       expect(result.current.arcaReconnect?.reconnecting).toBe(false);
       expect(toast.success).not.toHaveBeenCalled();
       expect(toast.dismiss).toHaveBeenCalledWith("progress");
-      expect(readArcaHostId()).toBe("current-arca-host");
+      expect(readArcaHostId()).toBe(identityHostId ?? "previous-arca-host");
     },
   );
+
+  it("keeps the dialog open when it can't check the session's host", async () => {
+    writeArcaHostId("arca-host");
+    vi.mocked(fetchHosts).mockRejectedValue(new Error("503 Service Unavailable"));
+    const { result } = renderHook(() =>
+      useSessionReconnect({ ...localSession, hostId: "arca-host" }),
+    );
+
+    await act(async () => {
+      await result.current.reconnect();
+    });
+
+    expect(result.current.dialogOpen).toBe(true);
+    expect(result.current.arcaReconnect?.error).toBe(
+      "Couldn't check whether this session's host is back online. Try again.",
+    );
+    expect(result.current.arcaReconnect?.reconnecting).toBe(false);
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.dismiss).toHaveBeenCalledWith("progress");
+  });
 
   it("does not treat another remote host as Arca", async () => {
     const { result } = renderHook(() =>
@@ -338,6 +376,29 @@ describe("useSessionReconnect", () => {
 
     await act(async () => {
       pending.resolve({ ok: false, error: "Old failure" });
+      await reconnect;
+    });
+    expect(result.current.dialogOpen).toBe(false);
+    expect(result.current.arcaReconnect).toBeUndefined();
+    expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it("ignores the host check after navigating to another session", async () => {
+    writeArcaHostId("arca-host");
+    const hosts = deferred<Host[]>();
+    vi.mocked(fetchHosts).mockReturnValue(hosts.promise);
+    const { result, rerender } = renderHook(useSessionReconnect, {
+      initialProps: { ...localSession, hostId: "arca-host" },
+    });
+    let reconnect!: Promise<void>;
+    await act(async () => {
+      reconnect = result.current.reconnect();
+    });
+    expect(fetchHosts).toHaveBeenCalledOnce();
+    rerender({ ...localSession, sessionId: "other-session", hostId: "other-host" });
+
+    await act(async () => {
+      hosts.resolve([hostRow("arca-host", "offline")]);
       await reconnect;
     });
     expect(result.current.dialogOpen).toBe(false);

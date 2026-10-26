@@ -383,6 +383,20 @@ export function splitEnvPrefix(command: string): { env: string; rest: string } {
   return { env: match[0], rest };
 }
 
+/**
+ * A script's first line for a collapsed row, and how many more non-blank lines
+ * follow it. Leading comment lines are skipped: the first line is always top
+ * level, so a `#` there starts a comment.
+ */
+export function shellCommandPreview(script: string): { firstLine: string; moreLines: number } {
+  const lines = script
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  const shown = lines.find((line) => !line.startsWith("#")) ?? lines[0] ?? "";
+  return { firstLine: shown.replace(/\s*\\$/, ""), moreLines: Math.max(0, lines.length - 1) };
+}
+
 function categorizeCall(call: ToolRunCall): RunCategory | "other" {
   const name = stripOmnigentPrefix(call.name);
   const category = RUN_CATEGORIES[name] ?? "other";
