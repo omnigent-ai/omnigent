@@ -215,8 +215,10 @@ provide the transaction needed to create a run and advance its schedule together
 
 The scheduler writes structured events with `debug_event`, like the rest of the
 server. When the debug-log sink is enabled, they reach the same table as session
-lifecycle events, so dashboards compute scheduler KPIs with SQL. Every run event
-includes `task_id`, `run_id`, `task_workspace_id`, and `scheduled_at`. Once a
+lifecycle events, so dashboards compute scheduler KPIs with SQL. Events are logged
+at INFO, so a server log level of WARNING or higher keeps only failures and
+timeouts. Every run event includes `task_id`, `run_id`, `task_workspace_id`, and
+`scheduled_at`; `claim_skipped` is an occurrence event with no `run_id`. Once a
 session exists, the row's `session_id` links the run to its session events.
 
 | Event | Logged when | Extra attributes |
@@ -233,15 +235,24 @@ session exists, the row's `session_id` links the run to its session events.
 without a result. Recovery outcomes are `running`, `failed`, `uncertain`,
 `superseded` (the run was no longer the expired startup recovery inspected),
 `timeout`, or `error`. Operations are `poll`, `initialize`, `claim`, `recovery`,
-`cleanup`, and `lease_renewal`. Delays are seconds from the scheduled time.
+`cleanup`, and `lease_renewal`. `initialize` failures for a single task include
+`task_id` and `task_workspace_id`; a failed scan has neither. Delays are seconds
+from the scheduled time to when the scheduler was asked to record the step, so
+database write time is excluded.
 
 Outcomes are logged when the database write commits, so a write that finishes
 after its caller was cancelled or timed out still logs its real result. A run can
-therefore log `timeout` and later `running`. Recovery logs `uncertain` on every
-sweep that cannot decide, so expect several per run.
+therefore log `timeout` and later `running` or `error`. Recovery logs `uncertain`
+on every sweep that cannot decide, so expect several per run.
+
+This holds while the server keeps running. During shutdown, the scheduler does
+not wait for in-flight writes, so a run can log `cancelled` or `unfinished` even
+though its `running` write committed, and a cancelled startup that never took its
+first step logs no `startup_ended`. Recovery still logs these runs later, and the
+success rate counts distinct runs, so this affects only the cancellation counts.
 
 The sink stores attribute values as strings; cast delays before computing
-percentiles. Attributes whose value is `None`, such as `error_code` or
+percentiles. Whole-second delays may appear as `7` or `7.0`. Attributes whose value is `None`, such as `error_code` or
 `prompt_delay_seconds` on a non-`running` outcome, are omitted rather than stored.
 
 The design's success metrics come from these events:

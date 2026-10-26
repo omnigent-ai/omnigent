@@ -111,9 +111,9 @@ class ScheduledTaskRun:
         UUID string).
     :param status: Lifecycle state — one of ``"scheduled"``, ``"starting"``, ``"running"``,
         ``"succeeded"``, ``"failed"``, ``"skipped"``.
-    :param scheduled_at: Unix epoch seconds the fire worker began handling this
-        firing, stamped before dispatch. Not the nominal recurrence time the run
-        was due at, which is not recorded.
+    :param scheduled_at: Unix epoch seconds. Persistent dispatch records the
+        occurrence's scheduled time; legacy timers record when the fire worker
+        began handling the firing, before dispatch.
     :param conversation_id: Conversation created by this firing, or ``None``
         before dispatch / after the conversation is deleted.
     :param fired_at: Unix epoch seconds dispatch began, or ``None``.

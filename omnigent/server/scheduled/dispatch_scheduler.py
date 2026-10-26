@@ -34,7 +34,7 @@ def _run_event(event_name: str, run: ScheduledTaskRun, **attributes: object) -> 
     return debug_event(
         event_name,
         session_id=run.conversation_id,
-        # Fails loudly if a run attribute reuses a debug_event parameter name.
+        # Explicit so a clashing attribute raises instead of overriding.
         turn_id=None,
         user_id=None,
         task_id=run.scheduled_task_id,
@@ -49,7 +49,8 @@ def _log_recovery_result(
     run: ScheduledTaskRun, status: str, transition: asyncio.Future[ScheduledTaskRun | None]
 ) -> None:
     if transition.cancelled() or transition.exception() is not None:
-        return  # The awaiting sweep logs errors; a later sweep retries the run.
+        # Failures are logged by the sweep, or by _log_late_recovery_failure after a timeout.
+        return
     # None means the run was no longer the expired startup recovery inspected.
     outcome = status if transition.result() is not None else "superseded"
     _logger.info(
@@ -58,6 +59,20 @@ def _log_recovery_result(
         run.id,
         extra=_run_event("scheduled_run_recovered", run, outcome=outcome),
     )
+
+
+def _log_late_recovery_failure(
+    run: ScheduledTaskRun, transition: asyncio.Future[ScheduledTaskRun | None]
+) -> None:
+    error = None if transition.cancelled() else transition.exception()
+    if error is not None:
+        _logger.error(
+            "Recovery update for run %s failed after its sweep timed out; "
+            "a later sweep will check the run again",
+            run.id,
+            exc_info=(type(error), error, error.__traceback__),
+            extra=_run_event("scheduled_run_recovered", run, outcome="error"),
+        )
 
 
 def _seconds(value: float) -> float:
@@ -101,6 +116,8 @@ class StartupLease:
     async def attach_session(self, conversation_id: str) -> None:
         """Persist the session before dispatch so crash recovery can inspect it."""
         first_session = self.run.conversation_id is None
+        # Measured at the call, so database time is not counted as fire delay.
+        recorded_at = self._now()
 
         def log_session() -> None:
             if first_session:
@@ -112,7 +129,7 @@ class StartupLease:
                         "scheduled_run_session_attached",
                         self.run,
                         target=self._target,
-                        session_delay_seconds=_seconds(self._now() - self.run.scheduled_at),
+                        session_delay_seconds=_seconds(recorded_at - self.run.scheduled_at),
                     ),
                 )
 
@@ -134,6 +151,8 @@ class StartupLease:
                 "or 'skipped' when execution is intentionally skipped."
             )
 
+        finished_at = self._now()
+
         def log_outcome() -> None:
             _logger.info(
                 "Scheduled run %s startup ended with status %s",
@@ -145,7 +164,7 @@ class StartupLease:
                     target=self._target,
                     outcome=status,
                     error_code=error_code,
-                    prompt_delay_seconds=_seconds(self._now() - self.run.scheduled_at)
+                    prompt_delay_seconds=_seconds(finished_at - self.run.scheduled_at)
                     if status == "running"
                     else None,
                 ),
@@ -216,7 +235,13 @@ class StartupLease:
                 self.run = run
                 # Runs even if the caller was cancelled, so committed outcomes are logged.
                 if committed is not None:
-                    committed()
+                    try:
+                        committed()
+                    except Exception:
+                        # The write already committed; logging must not fail the caller.
+                        _logger.exception(
+                            "Could not log the committed update for run %s", self.run.id
+                        )
             finally:
                 self._lock.release()
 
@@ -451,6 +476,7 @@ class PersistentTaskScheduler:
         for run in runs:
             assert run.lease_expires_at is not None
             self._recovery_cursor = (run.lease_expires_at, run.workspace_id, run.id)
+            transition: asyncio.Future[ScheduledTaskRun | None] | None = None
             try:
                 async with asyncio.timeout(self._recovery_seconds):
                     if await self._owns_host(run.workspace_id, run.host_id):
@@ -506,6 +532,11 @@ class PersistentTaskScheduler:
                     run.id,
                     extra=_run_event("scheduled_run_recovered", run, outcome="timeout"),
                 )
+                if transition is not None:
+                    # Nothing awaits the update any more; report a late failure.
+                    transition.add_done_callback(
+                        lambda done, run=run: _log_late_recovery_failure(run, done)
+                    )
             except Exception:
                 _logger.exception(
                     "Could not finish recovery for run %s after its startup lease expired; "
