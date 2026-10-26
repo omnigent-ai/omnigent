@@ -139,8 +139,31 @@ def test_build_claude_native_base_args(
         # No resume id → no --resume (fresh launch, or no local
         # transcript could be synthesized).
         (None, None, ["--verbose"], None, ("--verbose",)),
+        # The wrapper persists the first prompt alongside reusable flags.
+        # Reopening the transcript must not send that prompt again.
+        (
+            "high",
+            "claude-opus-4-7",
+            ["INITIAL_ONCE", "--model", "sonnet", "--mcp-config", "mcp.json"],
+            "sid-123",
+            (
+                "--resume",
+                "sid-123",
+                "--effort",
+                "high",
+                "--model",
+                "sonnet",
+                "--mcp-config",
+                "mcp.json",
+            ),
+        ),
     ],
-    ids=["resume-only", "resume-first-ordering", "no-resume"],
+    ids=[
+        "resume-only",
+        "resume-first-ordering",
+        "no-resume",
+        "resume-drops-prompt",
+    ],
 )
 def test_build_claude_native_base_args_resume_prefix(
     reasoning_effort: str | None,
@@ -169,6 +192,18 @@ def test_build_claude_native_base_args_resume_prefix(
         )
         == expected
     )
+
+
+def test_build_claude_native_base_args_drops_saved_prompt_when_transcript_unavailable() -> None:
+    """A failed transcript restore still must not replay a persisted prompt."""
+    args = _build_claude_native_base_args(
+        reasoning_effort=None,
+        model_override=None,
+        terminal_launch_args=["INITIAL_ONCE", "--model", "sonnet"],
+        cold_resume=True,
+    )
+
+    assert args == ("--model", "sonnet")
 
 
 def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resume() -> None:
