@@ -1324,7 +1324,7 @@ function LandingNavigationProbe() {
 }
 
 function renderLanding(
-  infoOverrides: Partial<ServerInfo> = {},
+  infoOverrides: Partial<ServerInfo> | "loading" = {},
   route = "/",
   onRender?: ProfilerOnRenderCallback,
   strictMode = false,
@@ -1332,7 +1332,8 @@ function renderLanding(
   const client = new QueryClient({
     defaultOptions: { queries: { retry: false } },
   });
-  const info: ServerInfo = {
+  const overrides = infoOverrides === "loading" ? {} : infoOverrides;
+  const resolvedInfo: ServerInfo = {
     accounts_enabled: false,
     single_user: false,
     login_url: null,
@@ -1349,16 +1350,16 @@ function renderLanding(
     // gateway-gating cases below were written against (off-gateway family → no
     // routing). Cases that exercise the built-in judge pass the field
     // explicitly.
-    smart_routing_sources: { external: infoOverrides.smart_routing_enabled === true, oss: false },
-    features: { harness_install: infoOverrides.harness_install_enabled === true },
+    smart_routing_sources: { external: overrides.smart_routing_enabled === true, oss: false },
+    features: { harness_install: overrides.harness_install_enabled === true },
     harness_install_enabled: false,
     installable_harnesses: [],
     dictation_available: false,
-    ...infoOverrides,
+    ...overrides,
   };
   return render(
     <QueryClientProvider client={client}>
-      <CapabilitiesProvider info={info}>
+      <CapabilitiesProvider info={infoOverrides === "loading" ? "loading" : resolvedInfo}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[route]}>
             <LandingNavigationProbe />
@@ -11632,6 +11633,114 @@ describe("managed sandbox inference models", () => {
       expect(body.inference_configuration_revision).toBeUndefined();
     },
   );
+
+  it("offers Codex a model choice on a sandbox without an inference catalog", () => {
+    mockHosts([]);
+    renderLanding({
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+    });
+    openAgentModels("a2");
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/);
+    const menu = screen
+      .getByTestId("new-chat-landing-agent-models")
+      .closest<HTMLElement>('[role="menu"]')!;
+    expect(within(menu).queryByText("Models unavailable")).toBeNull();
+    expect(within(menu).queryAllByTestId(/^new-chat-landing-agent-model-/)).not.toHaveLength(0);
+  });
+
+  function sandboxModelMenu(): HTMLElement {
+    return screen
+      .getByTestId("new-chat-landing-agent-models")
+      .closest<HTMLElement>('[role="menu"]')!;
+  }
+
+  it.each([
+    ["Codex", "a2"],
+    ["Devin", "a3"],
+    ["Pi", "a4"],
+  ])(
+    "launches %s with the harness default from a sandbox without inference config",
+    async (name, agentId) => {
+      mockHosts([]);
+      mockAgents([
+        ...DEFAULT_LANDING_AGENTS,
+        testAgent("a3", "devin-native-ui", { display_name: "Devin", harness: "devin-native" }),
+        testAgent("a4", "pi-native-ui", { display_name: "Pi", harness: "pi-native" }),
+      ]);
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      renderLanding({
+        managed_sandboxes_enabled: true,
+        sandbox_provider: "agent_sandbox",
+        sandbox_provider_capabilities: { agent_sandbox: { multi_repo: true } },
+      });
+      openAgentModels(agentId);
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        new RegExp(name),
+      );
+      const menu = sandboxModelMenu();
+      expect(within(menu).queryByText("Models unavailable")).toBeNull();
+      const modelRows = within(menu)
+        .queryAllByTestId(/^new-chat-landing-agent-model-/)
+        .filter((row) => row.getAttribute("role") === "menuitemcheckbox");
+      expect(modelRows.map((row) => row.dataset.testid)).toEqual([
+        "new-chat-landing-agent-model-default",
+      ]);
+      expect(modelRows[0]).toHaveAttribute("aria-checked", "true");
+      closeMenu();
+      const { body } = await submitAndReadBody();
+      expect(body.host_type).toBe("managed");
+      expect(body.model_override).toBeUndefined();
+    },
+  );
+
+  it("offers the harness default when inference discovery reports the harness unconfigured", async () => {
+    mockHosts([]);
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as Response);
+    renderConfiguredSandbox({ managed_sandboxes_enabled: true, sandbox_provider: "agent_sandbox" });
+    openAgentModels("a2");
+    expect(useSandboxModelOptions).toHaveBeenLastCalledWith(
+      "agent_sandbox",
+      "codex-native",
+      "a2",
+      null,
+      true,
+    );
+    const menu = sandboxModelMenu();
+    expect(within(menu).queryByText("Models unavailable")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-agent-model-default")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.host_type).toBe("managed");
+    expect(body.model_override).toBeUndefined();
+    expect(body.inference_configuration_revision).toBeUndefined();
+  });
+
+  it("waits for server capabilities before offering a restored sandbox the harness default", () => {
+    mockHosts([]);
+    const info = {
+      managed_sandboxes_enabled: true,
+      sandbox_provider: "agent_sandbox",
+      sandbox_provider_capabilities: { agent_sandbox: { inference_models: true } },
+    };
+    renderLanding(info).unmount();
+    renderLanding("loading");
+    openAgentModels("a2");
+    const menu = sandboxModelMenu();
+    expect(within(menu).getByText("Loading models…")).toBeInTheDocument();
+    expect(within(menu).queryByText("Models unavailable")).toBeNull();
+    expect(screen.queryByTestId("new-chat-landing-agent-model-default")).toBeNull();
+  });
 
   it("does not preview inference for an ordinary host on an opted-in server", () => {
     preview(catalog, new Error("Gateway unavailable"));
