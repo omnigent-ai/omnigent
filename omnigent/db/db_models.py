@@ -1667,3 +1667,136 @@ class SqlScheduledTaskRun(OmnigentBase):
             "conversation_id",
         ),
     )
+
+
+class SqlSessionLinkEpoch(OmnigentBase):
+    """Invalidate all of an endpoint's approvals in one bounded write."""
+
+    __tablename__ = "session_link_epochs"
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    generation: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    blocked: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+
+
+class SqlSessionLink(OmnigentBase):
+    """A human-approved direction; the generation changes on every reconnect."""
+
+    __tablename__ = "session_links"
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    source_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    target_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    generation: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    source_generation: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    target_generation: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    approved_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    approver_generation: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    approved_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    # Retain revocation so an old request can never borrow a later approval.
+    revoked_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    __table_args__ = (Index("ix_session_links_target", "workspace_id", "target_id", "source_id"),)
+
+
+class SqlSessionInputAuthority(OmnigentBase):
+    """Immutable human identity captured at authenticated input ingestion."""
+
+    __tablename__ = "session_input_authorities"
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    session_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    requester: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_generation: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    runner_id: Mapped[str] = mapped_column(String(64), nullable=False)
+    parent_request_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    captured_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    request_count: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+
+
+class SqlLinkedRequest(OmnigentBase):
+    """A retained request and its one-way handoff receipt."""
+
+    __tablename__ = "linked_requests"
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    source_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    target_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    source_permission_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    target_permission_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    link_generation: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    approved_by: Mapped[str] = mapped_column(String(128), nullable=False)
+    requester: Mapped[str] = mapped_column(String(128), nullable=False)
+    account_generation: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    input_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    parent_request_id: Mapped[str | None] = mapped_column(Uuid16(), nullable=True)
+    root_request_id: Mapped[str] = mapped_column(Uuid16(), nullable=False)
+    depth: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    reply_count: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    operation_hash: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    payload_hash: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    # Payloads live in the artifact store under a key derived from workspace/id.
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    expires_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    delivery_state: Mapped[int] = mapped_column(SmallInteger, nullable=False)
+    accepted_runner_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    accepted_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    __table_args__ = (
+        Index(
+            "ix_linked_requests_operation",
+            "workspace_id",
+            "source_id",
+            "operation_hash",
+            unique=True,
+        ),
+        Index(
+            "ix_linked_requests_handoff",
+            "workspace_id",
+            "source_id",
+            "target_id",
+            "link_generation",
+            "delivery_state",
+            "expires_at",
+            "id",
+        ),
+        *(
+            Index(
+                f"ix_linked_requests_lease_{scope}",
+                "workspace_id",
+                column,
+                "delivery_state",
+                "expires_at",
+                "id",
+            )
+            for scope, column in (
+                ("source", "source_id"),
+                ("target", "target_id"),
+                ("source_acl", "source_permission_id"),
+                ("target_acl", "target_permission_id"),
+                ("requester", "requester"),
+                ("approver", "approved_by"),
+            )
+        ),
+    )
+
+
+class SqlLinkedReply(OmnigentBase):
+    """Explicitly addressed replies, deduplicated independently of turn completion."""
+
+    __tablename__ = "linked_replies"
+    workspace_id: Mapped[int] = mapped_column(BigInteger, primary_key=True)
+    request_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    operation_hash: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    payload_hash: Mapped[bytes] = mapped_column(_CKSUM32, nullable=False)
+    sequence: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    created_at: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    published_at: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    __table_args__ = (
+        Index(
+            "ix_linked_replies_operation",
+            "workspace_id",
+            "request_id",
+            "operation_hash",
+            unique=True,
+        ),
+        Index("ix_linked_replies_sequence", "workspace_id", "request_id", "sequence", unique=True),
+    )
