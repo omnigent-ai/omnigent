@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from packaging.version import Version
@@ -235,11 +236,11 @@ def test_login_probe_caches_positive_verdicts_with_ttl(
     assert len(runs) == 2
 
 
-def test_invalidate_login_probe_cache_forces_fresh_positive_probe(
+def test_invalidate_probe_caches_forces_fresh_login_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """Manual readiness refreshes must not reuse a cached login verdict."""
-    hi.invalidate_harness_login_probe_cache()
+    hi.invalidate_harness_probe_caches()
     monkeypatch.setattr(hi.shutil, "which", lambda name: f"/usr/local/bin/{name}")
     runs: list[list[str]] = []
 
@@ -253,11 +254,11 @@ def test_invalidate_login_probe_cache_forces_fresh_positive_probe(
 
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
-    hi.invalidate_harness_login_probe_cache()
+    hi.invalidate_harness_probe_caches()
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert hi.harness_cli_logged_in(ANTHROPIC_FAMILY) is True
     assert len(runs) == 2
-    hi.invalidate_harness_login_probe_cache()
+    hi.invalidate_harness_probe_caches()
 
 
 def test_login_probe_never_caches_negative_verdicts(
@@ -315,8 +316,7 @@ def test_version_probe_caches_by_binary_signature(
 ) -> None:
     """``--version`` parses cache against (path, mtime, size); failures don't.
 
-    The output is a pure function of the binary bytes, so a swap (upgrade)
-    must re-probe and an unchanged binary must never be probed twice.
+    A changed executable must re-probe even while the cached version is fresh.
     """
     binary = tmp_path / "fake-cli"
     binary.write_text("#!/bin/sh\n", encoding="utf-8")
@@ -345,6 +345,47 @@ def test_version_probe_caches_by_binary_signature(
     os.utime(binary, ns=(1, 1))
     assert hi._harness_cli_version_string(spec, str(binary)) == "1.2.3"
     assert len(runs) == 3
+
+
+@pytest.mark.parametrize("refresh", ["expiry", "manual", "install"])
+def test_version_probe_refreshes_an_unchanged_launcher(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, refresh: str
+) -> None:
+    """Upgrading a launcher's delegated executable must restore readiness."""
+    binary = tmp_path / "codex"
+    binary.write_text("#!/bin/sh\n", encoding="utf-8")
+    spec = hi.harness_install_spec(OPENAI_FAMILY)
+    assert spec is not None and spec.min_version is not None
+    monkeypatch.setattr(hi, "resolve_cli_binary", lambda _name: str(binary))
+    monkeypatch.setattr(hi.shutil, "which", lambda _name: "/usr/bin/npm")
+    monkeypatch.setenv("PATH", str(tmp_path))
+    now = 100.0
+    monkeypatch.setattr(hi, "time", SimpleNamespace(monotonic=lambda: now))
+    version = "0.1.0"
+    probes = 0
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        nonlocal probes
+        if argv == [str(binary), "--version"]:
+            probes += 1
+            return subprocess.CompletedProcess(argv, 0, f"codex-cli {version}\n", "")
+        assert argv == hi.harness_install_command(OPENAI_FAMILY)
+        return subprocess.CompletedProcess(argv, 0)
+
+    monkeypatch.setattr(hi.subprocess, "run", run)
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    version = spec.min_version
+    assert not hi.harness_cli_installed(OPENAI_FAMILY)
+    assert probes == 1
+    if refresh == "expiry":
+        now += 60.0
+    elif refresh == "manual":
+        hi.invalidate_harness_probe_caches()
+    else:
+        assert hi.try_install_harness_cli(OPENAI_FAMILY).installed
+    assert hi.harness_cli_installed(OPENAI_FAMILY)
+    assert hi.harness_cli_version(OPENAI_FAMILY)[0] == version
+    assert probes == 2
 
 
 @pytest.mark.parametrize("returncode", [1, -15])

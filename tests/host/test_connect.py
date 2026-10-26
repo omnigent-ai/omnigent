@@ -4932,7 +4932,7 @@ def test_handle_create_dir_expands_tilde(tmp_path: Path, monkeypatch) -> None:
 async def test_handle_refresh_harnesses_bypasses_cache_and_returns_fresh_maps(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A forced refresh invalidates login cache before the full re-probe."""
+    """A forced refresh invalidates CLI probe caches before the full re-probe."""
     import omnigent.host.connect as connect
 
     calls: list[str] = []
@@ -4948,7 +4948,7 @@ async def test_handle_refresh_harnesses_bypasses_cache_and_returns_fresh_maps(
         calls.append("gateway")
         return {"codex-native": False}
 
-    monkeypatch.setattr(connect, "invalidate_harness_login_probe_cache", _invalidate)
+    monkeypatch.setattr(connect, "invalidate_harness_probe_caches", _invalidate)
     monkeypatch.setattr(connect, "configured_harness_map", _configured)
     monkeypatch.setattr(connect, "gateway_inference_map", _gateway)
 

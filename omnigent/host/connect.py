@@ -146,7 +146,7 @@ from omnigent.onboarding.harness_install import (
     harness_cli_installed,
     harness_cli_version,
     harness_setup_hint,
-    invalidate_harness_login_probe_cache,
+    invalidate_harness_probe_caches,
     try_install_harness_cli,
     ui_install_key,
 )
@@ -3104,9 +3104,9 @@ class HostProcess:
     def _handle_refresh_harnesses(
         self, frame: HostRefreshHarnessesFrame
     ) -> HostRefreshHarnessesResultFrame:
-        """Force a full readiness probe, bypassing periodic and login caches."""
+        """Force a full readiness probe, bypassing periodic and CLI probe caches."""
         try:
-            invalidate_harness_login_probe_cache()
+            invalidate_harness_probe_caches()
             configured = configured_harness_map()
             gateway = gateway_inference_map()
         except Exception as exc:
