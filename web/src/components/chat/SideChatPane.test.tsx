@@ -822,6 +822,17 @@ describe("side-chat interrupt", () => {
     expect(useChatStore.getState().sessionStatus).toBe("running");
   });
 
+  it("interrupts from Escape and keeps the draft", () => {
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Keep this draft" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, "codex_turn_side");
+    expect(send).not.toHaveBeenCalled();
+    expect(input).toHaveValue("Keep this draft");
+  });
+
   it("steers a follow-up into the running side chat when Always steer is on", () => {
     writeAlwaysSteer(true);
     renderPane(<SideChatPane childId={childId} />);
@@ -992,8 +1003,10 @@ describe("side-chat interrupt", () => {
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Wait for this turn" } });
     fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.keyDown(input, { key: "Escape" });
 
     expect(send).not.toHaveBeenCalled();
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
     expect(input).toHaveValue("Wait for this turn");
     expect(screen.queryByTestId("side-chat-send")).toBeNull();
     expect(screen.getByRole("button", { name: "Interrupt session" })).toBeEnabled();

@@ -860,7 +860,7 @@ function SideChatComposer({
     }
     if (slashCompletion.handleKey(event, intent)) return;
     // Escape interrupts the running turn and keeps the draft, as in the main composer.
-    if (event.key === "Escape" && !pending && busy) {
+    if (event.key === "Escape" && queues && busy) {
       event.preventDefault();
       interruptSideChat();
       return;
