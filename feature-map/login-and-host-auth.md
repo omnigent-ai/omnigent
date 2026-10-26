@@ -15,6 +15,11 @@ be able to write resources without a separate Omnigent account.
 - `login-auto-detect`: `omnigent login <url>` detects the server's sign-in mode.
   States: accounts, OIDC, header mode, Databricks-fronted, and a workspace URL
   with an org selector.
+- `workspace-selector-validation`: a URL's `?o=` routes the current command
+  without replacing saved login details. Login and launch auth probes compare
+  it with the server's workspace header, even on HTTP 200; a mismatch names both
+  workspaces and asks for the full URL. Only successful verification saves the
+  selector. Servers without the header retain their existing login behavior.
 - `cli-browser-ticket-consent`: an OIDC sign-in opens a ticket-specific browser
   login and then an **Authorize sign-in** page. Compare its code with the CLI,
   choose **Approve** to complete sign-in, or **Deny** to stop it. Signing in
@@ -133,6 +138,14 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   (starts its own accounts server; run with plain `uv run pytest`).
 - **`profile-selection`:**
   `tests/e2e/test_host_auth_prefers_user_over_m2m_sp_e2e.py::test_resolve_auth_for_host_must_not_select_m2m_sp_over_user_profile`
+- **`workspace-selector-validation`:**
+  `tests/e2e/test_host_inline_login.py::test_login_rejects_truncated_workspace_selector`
+  runs the real CLI and local server behind the existing mock HTTPS workspace,
+  using a test-owned PAT and CA. The proxy accepts the bearer but reports a
+  different workspace. Login must fail without changing auth/config files; a
+  corrected URL must succeed. This tests CLI, HTTP and file boundaries, not a
+  live Databricks deployment. The login and backend unit suites cover cached,
+  refreshed and header-auth responses, omitted headers, and process-local routing.
 - **`expired-credential`:**
   `tests/e2e/test_expired_databricks_credential_launch.py::test_expired_databricks_credential_offers_reauth_not_edge_403`
 - **Pending host sign-in:**
@@ -160,6 +173,15 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
   `tests/host/test_service.py::test_service_entry_waits_while_another_daemon_serves_the_workspace`.
   A real check needs two URLs that reach one workspace, so run it only in a
   private-network sandbox against a disposable server.
+- **Background harness credentials (own environment, installed Codex/Claude SDK):**
+  `tests/e2e/test_background_host_harness_credentials.py` compares real foreground
+  and background hosts. Saved provider env references and named passthrough keep
+  the configured harness ready; unreferenced keys remain filtered. Uses isolated
+  homes and synthetic credentials without model requests. The Claude SDK case
+  needs bubblewrap when machine-managed settings exist. This covers fresh hosts;
+  existing-daemon refresh and installed OS services need separate verification.
+  `tests/host/test_service.py::test_service_persists_explicit_host_credentials_privately`
+  checks launchd/systemd file contents and permissions with service commands mocked.
 - **`host-inline-login` (own environment, Linux):** run
   `uv run --no-sync pytest tests/e2e/test_host_inline_login.py --reruns 0 -q`.
   It starts an isolated real server and a local HTTPS mock workspace, then
@@ -242,6 +264,10 @@ Never run these commands against the real `~/.omnigent` or `~/.databrickscfg`.
 
 ## Gotchas
 
+- Background hosts capture their environment when started; restart the host after
+  changing forwarded credentials. `host enable` saves explicitly forwarded values
+  in plaintext in the per-user service definition, readable only by its owner
+  (0600), so the service can retain them across logins.
 - **Find out which credential kind the reporter's host uses before trusting a
   root cause.** A user OAuth login refreshes itself and a personal access
   token does not, so a story about a "stale pinned token" can be true for one

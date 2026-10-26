@@ -36,6 +36,10 @@ Payload contract:
 - With ``reviewer_editing``, the review candidates are a ``list`` of
   ``{login, kind, name}`` with ``has_more``, and a reviewer edit returns a
   ``session.github.pr_reviewers`` with the PR's resulting ``reviewers``.
+- With ``details_editing``, a title or description edit returns a
+  ``session.github.pr_details`` with the PR's resulting ``title`` and ``body``.
+- With ``attachment_uploads``, an uploaded image or video returns a
+  ``session.github.pr_attachment`` with the ``url`` to embed in the description.
 - Changed files are a ``list`` of ``session.github.changed_file`` objects:
   ``path``, ``name``, ``status`` (``created``, ``modified``, ``deleted``, or
   ``renamed``), ``lines_added``, and ``lines_removed``. The PR diff is a
@@ -92,6 +96,8 @@ PR_LABELS_OBJECT = "session.github.pr_labels"
 MERGE_OPTIONS_OBJECT = "session.github.merge_options"
 PR_MERGE_OBJECT = "session.github.pr_merge"
 PR_REVIEWERS_OBJECT = "session.github.pr_reviewers"
+PR_DETAILS_OBJECT = "session.github.pr_details"
+PR_ATTACHMENT_OBJECT = "session.github.pr_attachment"
 # Info ``reason`` when no provider recognizes the workspace's git remote.
 UNSUPPORTED_REMOTE = "unsupported_remote"
 # PR diff ``unavailable_reason`` when the PR's repository is not the workspace's.
@@ -120,6 +126,10 @@ class ProviderCapabilities:
     :ivar reviewer_editing: The user can request and withdraw reviews through
         :meth:`PullRequestFacet.review_candidates` and
         :meth:`PullRequestFacet.edit_reviewers`.
+    :ivar details_editing: The user can edit the PR's title and description
+        through :meth:`PullRequestFacet.edit_details`.
+    :ivar attachment_uploads: The user can upload images and videos to embed in
+        the description through :meth:`PullRequestFacet.upload_attachment`.
     """
 
     account_switching: bool
@@ -129,6 +139,8 @@ class ProviderCapabilities:
     label_editing: bool = False
     merging: bool = False
     reviewer_editing: bool = False
+    details_editing: bool = False
+    attachment_uploads: bool = False
 
     def to_json(self) -> dict[str, bool]:
         """Return the capabilities as the payload's ``capabilities`` object."""
@@ -213,6 +225,8 @@ class ShellPrOp:
         Replaces generic JSON/bare-URL extraction for this operation.
     :ivar parse_result: Optional parser that also needs structured tool results.
         Takes precedence over ``parse_output`` and generic extraction.
+    :ivar resolve_result: Optional lookup for identities absent from command output.
+        Runs in the background after success, separately from immediate PR operations.
     """
 
     tracks: bool
@@ -221,6 +235,7 @@ class ShellPrOp:
     content_only: bool
     parse_output: Callable[[str], Sequence[PullRequestRef]] | None = None
     parse_result: Callable[[object], Sequence[PullRequestRef]] | None = None
+    resolve_result: Callable[[object], Sequence[PullRequestRef]] | None = None
 
 
 @runtime_checkable
@@ -426,6 +441,44 @@ class PullRequestFacet(Protocol):
         lists that are not both empty. Withdrawing a request the PR lacks is not an error.
 
         :returns: A ``session.github.pr_reviewers`` with the PR's resulting ``reviewers``.
+        :raises ValueError: With a user-facing message when the provider refuses.
+        """
+        ...
+
+    def edit_details(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        title: str | None,
+        body: str | None,
+    ) -> dict[str, Any]:
+        """Replace the PR's title and/or description; ``None`` leaves that field as is.
+
+        The orchestrator calls it only with ``details_editing``, with a non-blank
+        ``title`` or a ``body`` set.
+
+        :returns: A ``session.github.pr_details`` with the PR's resulting ``title`` and ``body``.
+        :raises ValueError: With a user-facing message when the provider refuses.
+        """
+        ...
+
+    def upload_attachment(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        name: str,
+        content_type: str,
+        content: bytes,
+    ) -> dict[str, Any]:
+        """Upload an image or video for the PR's description without changing the PR.
+
+        The orchestrator calls it only with ``attachment_uploads``, with a
+        ``content_type`` it detected from ``content`` and a ``name`` whose
+        extension matches it.
+
+        :returns: A ``session.github.pr_attachment`` with the ``url`` to embed.
         :raises ValueError: With a user-facing message when the provider refuses.
         """
         ...

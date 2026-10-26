@@ -26,6 +26,10 @@
 //                                  the users and teams a review can be requested from.
 //   useUpdatePullRequestReviewers — POST /resources/github/reviewers
 //                                  request reviews / withdraw pending requests.
+//   useUpdatePullRequestDetails  — POST /resources/github/details
+//                                  replace the selected PR's title and/or description.
+//   uploadPullRequestAttachment  — POST /resources/github/attachments
+//                                  upload an image or video to embed in the description.
 //
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
@@ -185,6 +189,10 @@ export interface PullRequestCapabilities {
   merging?: boolean;
   /** Reviews can be requested and pending requests withdrawn; absent from older hosts. */
   reviewer_editing?: boolean;
+  /** The PR's title and description can be edited; absent from older hosts. */
+  details_editing?: boolean;
+  /** Images and videos can be uploaded into the description; absent from older hosts. */
+  attachment_uploads?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -696,18 +704,30 @@ export interface PullRequestRepoLabels {
 /** GET or POST one of the selected PR's editable resources, e.g. `labels`. */
 async function fetchPullRequestEditResource<T>(
   conversationId: string,
-  resource: "labels" | "reviewers" | "merge-options" | "merge" | "disable-auto-merge",
-  request: { prUrl: string } | { body: unknown },
+  resource:
+    | "labels"
+    | "reviewers"
+    | "details"
+    | "attachments"
+    | "merge-options"
+    | "merge"
+    | "disable-auto-merge",
+  request: { prUrl: string } | { body: unknown } | { form: FormData },
 ): Promise<T> {
   const path = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}`;
   const response =
     "prUrl" in request
       ? await authenticatedFetch(`${path}${prQuery(request.prUrl)}`)
-      : await authenticatedFetch(path, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(request.body),
-        });
+      : await authenticatedFetch(
+          path,
+          "form" in request
+            ? { method: "POST", body: request.form }
+            : {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(request.body),
+              },
+        );
   if (response.status === 503 && (await isRunnerUnavailable503(response))) {
     throw new RunnerOfflineError();
   }
@@ -968,5 +988,68 @@ export function useUpdatePullRequestReviewers(conversationId: string) {
       );
     },
     onError: () => queryClient.invalidateQueries({ queryKey: infoKey }),
+  });
+}
+
+/** A title and/or description edit; an omitted field keeps its current value. */
+export interface PullRequestDetailsChange {
+  prUrl: string;
+  title?: string;
+  body?: string;
+}
+
+interface PullRequestDetails {
+  object: "session.github.pr_details";
+  title: string;
+  body: string;
+}
+
+/**
+ * Replace the selected PR's title and/or description through the runner or host
+ * fallback. A success writes GitHub's resulting title and body into the info cache.
+ */
+export function useUpdatePullRequestDetails(conversationId: string) {
+  const queryClient = useQueryClient();
+  const infoKey = ["github-info", conversationId];
+  return useMutation({
+    mutationKey: ["github-details-update", conversationId],
+    scope: { id: `github-details-${conversationId}` },
+    mutationFn: (change: PullRequestDetailsChange) =>
+      fetchPullRequestEditResource<PullRequestDetails>(conversationId, "details", {
+        body: { pr_url: change.prUrl, title: change.title, body: change.body },
+      }),
+    onSuccess: async ({ title, body }, change) => {
+      // A poll that started before the edit landed would bring the old text back.
+      await queryClient.cancelQueries({ queryKey: infoKey });
+      queryClient.setQueriesData<NormalizedPullRequestInfo>({ queryKey: infoKey }, (info) =>
+        info?.pr && info.selected_pr_url === change.prUrl
+          ? { ...info, pr: { ...info.pr, title, body } }
+          : info,
+      );
+    },
+  });
+}
+
+/** An uploaded description attachment. */
+export interface PullRequestAttachment {
+  object: "session.github.pr_attachment";
+  /** The URL to embed in the description. */
+  url: string;
+  /** The file name the provider stored, with an extension matching its type. */
+  name: string;
+  content_type: string;
+}
+
+/** Upload an image or video for the selected PR's description; the PR itself is unchanged. */
+export function uploadPullRequestAttachment(
+  conversationId: string,
+  prUrl: string,
+  file: File,
+): Promise<PullRequestAttachment> {
+  const form = new FormData();
+  form.append("pr_url", prUrl);
+  form.append("file", file, file.name || "attachment");
+  return fetchPullRequestEditResource<PullRequestAttachment>(conversationId, "attachments", {
+    form,
   });
 }

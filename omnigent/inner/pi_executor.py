@@ -68,16 +68,19 @@ from omnigent.models import model_catalog
 from omnigent.models.model_metadata import ModelWireAPI
 from omnigent.models.pi_model_compatibility import (
     SYSTEM_AI_RESPONSES_KEYWORDS,
+    PiModelEntry,
     databricks_model_aliases,
     enrich_databricks_model_catalog,
     pi_generic_model_json_entry,
     pi_model_is_reasoning,
     pi_model_json_entry,
+    pi_model_with_thinking_defaults,
     unsupported_in_pi,
 )
 from omnigent.onboarding.provider_config import CHAT_WIRE_API, RESPONSES_WIRE_API
 from omnigent.pi_prompt import pi_prompt_args
 from omnigent.runner.identity import OMNIGENT_SESSION_ENV_VAR
+from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
 from omnigent.util.json_types import JsonValue
@@ -191,6 +194,12 @@ class ToolExecutor(Protocol):
 NativePolicyGate: TypeAlias = Callable[  # type: ignore[explicit-any]
     [str, dict[str, Any]],
     Awaitable[dict[str, Any]] | dict[str, Any],
+]
+
+# ExecutorAdapter connects Pi dialogs to ctx.elicit. Return the typed result
+# so the extension can handle a decline without aborting the turn.
+FormElicitationHandler: TypeAlias = Callable[
+    [str, ElicitationRequestParams], Awaitable[ElicitationResult]
 ]
 
 
@@ -862,7 +871,10 @@ def _build_models_json(
             registered_model = replace(catalog_model, id=model)
         # ``JsonObject`` is the open bag this builder assembles; a TypedDict is
         # not assignable to it (dict value types are invariant), so copy.
-        entry: _JsonObject = dict(pi_model_json_entry(registered_model))
+        model_entry: PiModelEntry = pi_model_json_entry(registered_model)
+        if provider_name == "databricks-anthropic":
+            model_entry = pi_model_with_thinking_defaults(model_entry)
+        entry: _JsonObject = dict(model_entry)
         provider_models[provider_name].append(entry)
     config: _PiModelsConfig = {
         "providers": {
@@ -957,11 +969,17 @@ def _build_models_json(
                 url == provider["baseUrl"] and not _is_databricks_gateway_base_url(url)
                 for url in (base_urls or {}).values()
             ):
-                entry = dict(pi_generic_model_json_entry(model))
+                model_entry = pi_generic_model_json_entry(model)
             else:
-                entry = {"id": model, "input": ["text", "image"]}
-                if pi_model_is_reasoning(model):
-                    entry["reasoning"] = True
+                model_entry = {"id": model, "input": ["text", "image"]}
+                if pi_model_is_reasoning(model) or (
+                    provider["api"] == "anthropic-messages"
+                    and model_catalog.model_family_token(model) == "claude"
+                ):
+                    model_entry["reasoning"] = True
+            if provider["api"] == "anthropic-messages":
+                model_entry = pi_model_with_thinking_defaults(model_entry)
+            entry = dict(model_entry)
             provider["models"] = [*provider["models"], entry]
     for provider_config in config["providers"].values():
         if _is_databricks_ai_gateway_url(provider_config["baseUrl"]):
@@ -2197,6 +2215,7 @@ class PiExecutor(Executor):
         self._bundle_context = _read_pi_bundle_context(bundle_dir) if context_files else None
         # Set by Session._wire_sdk_executor().
         self._tool_executor: ToolExecutor | None = None
+        self._form_elicitation_handler: FormElicitationHandler | None = None
 
         self._databricks_host = self._gateway_host_override or ""
         self._databricks_token = ""
@@ -3192,4 +3211,56 @@ class PiExecutor(Executor):
                     return
                 continue
 
+            if event_type == "extension_ui_request":
+                try:
+                    await self._handle_extension_ui_request(event, rpc)
+                except Exception as exc:  # noqa: BLE001 — executor boundary
+                    await self._evict_rpc(session_key, rpc)
+                    yield ExecutorError(message=f"Failed to answer Pi extension UI request: {exc}")
+                    return
+                continue
+
             logger.debug("PiExecutor: ignoring event type=%s", event_type)
+
+    async def _handle_extension_ui_request(
+        self,
+        event: dict[str, Any],
+        rpc: _PiRpcSession,
+    ) -> None:
+        """Park a Pi extension dialog on the web UI and write the RPC reply."""
+        from omnigent.pi_extension_ui import (
+            is_dialog_method,
+            is_fire_and_forget_method,
+            timeout_seconds,
+            to_elicitation_params,
+            to_ui_response,
+        )
+
+        method = event.get("method")
+        if is_fire_and_forget_method(method) or not is_dialog_method(method):
+            return
+        try:
+            params = to_elicitation_params(event)
+        except ValueError:
+            logger.debug("PiExecutor: malformed extension_ui_request: %s", event)
+            await rpc.send_command(to_ui_response(event, None))
+            return
+        handler = self._form_elicitation_handler
+        result = None
+        if handler is not None:
+            timeout_s = timeout_seconds(event)
+            request_id = event.get("id")
+            elicitation_id = f"elicit_pi_{request_id or secrets.token_hex(16)}"
+            try:
+                if timeout_s is not None:
+                    result = await asyncio.wait_for(
+                        handler(elicitation_id, params), timeout=timeout_s
+                    )
+                else:
+                    result = await handler(elicitation_id, params)
+            except TimeoutError:
+                result = None
+            except Exception:
+                logger.exception("PiExecutor: form elicitation handler failed")
+                result = None
+        await rpc.send_command(to_ui_response(event, result))

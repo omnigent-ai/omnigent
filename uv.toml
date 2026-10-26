@@ -12,6 +12,10 @@ required-version = ">=0.11.8"
 # `--refresh`, or a dependency change).
 exclude-newer = "P7D"
 
+# An exemption only relaxes uv.lock: mirrors that embargo young releases resolve
+# the pyproject.toml floors, so keep floors below an exempted release unless the
+# mirror serves it (`just check-internal-mirror`, see CONTRIBUTING.md).
+#
 # Per-package cooldown exemptions (each scoped to one package, a fixed date
 # just past its publish time, so the global P7D supply-chain cooldown still
 # guards every other dependency):
@@ -34,6 +38,4 @@ exclude-newer = "P7D"
 #   uses. Drop once aged past P7D (2026-10-22).
 # - certifi: 2026.10.19 (tagged 2026-10-20) removes the roots chaining to the
 #   compromised eMudhra intermediate CAs. Drop once aged past P7D (2026-10-28).
-# - pillow: 13.0.0 fixes image-decoder advisories affecting 12.x.
-#   Drop once aged past P7D (2026-10-24).
-exclude-newer-package = { pillow = "2026-10-17T00:00:00Z", certifi = "2026-10-21T00:00:00Z", databricks-sdk = "2026-10-16T00:00:00Z", cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }
+exclude-newer-package = { certifi = "2026-10-21T00:00:00Z", databricks-sdk = "2026-10-16T00:00:00Z", cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }

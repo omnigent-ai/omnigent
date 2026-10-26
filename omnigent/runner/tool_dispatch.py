@@ -112,6 +112,7 @@ from omnigent.tools.builtins.timer import (
     # schema advertises.
     validate_timer_set_args,
 )
+from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 from omnigent.util.session_lifecycle import (
@@ -319,6 +320,7 @@ _SESSION_QUERY_TOOLS = frozenset(
 )
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+_UI_TOOLS = frozenset({UiOpenFileTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
 # tool schema so the dispatcher can never drift from the published contract.
@@ -477,6 +479,7 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _UI_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -490,9 +493,8 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
     # and see ONLY this relay surface — without this union member the
-    # feature is dead for its real target. ToolManager auto-registers these
-    # framework-owned schemas for every spec, so the native relay surface is
-    # session-static and always includes them.
+    # feature is dead for its real target. The relay filters ToolManager's
+    # schemas, so they appear unless the spec sets ``tool_groups.browser: false``.
     | _BROWSER_TOOLS
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
@@ -598,6 +600,7 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
             SysSessionRenameTool,
+            UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -875,6 +878,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _UI_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
     | _WEB_READ_TOOLS
@@ -5918,6 +5922,30 @@ async def _session_list_via_rest(
     )
 
 
+async def _open_file_via_rest(
+    args: _JsonObject,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Validate and forward a UI request using only the calling session's identity."""
+    if server_client is None or not conversation_id:
+        return json.dumps({"error": "ui_open_file requires server access and a session id"})
+    try:
+        body = OpenFileRequest.model_validate(args)
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/ui/open-file",
+            json=body.model_dump(),
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or type(result.get("subscribers")) is not int:
+            return json.dumps({"error": "ui_open_file returned an invalid delivery response"})
+        return json.dumps(result)
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"error": f"ui_open_file failed: {exc}"})
+
+
 async def _rename_current_session_via_rest(
     args: _JsonObject,
     conversation_id: str | None,
@@ -6692,6 +6720,8 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
             )
+        elif tool_name in _UI_TOOLS:
+            output = await _open_file_via_rest(args, conversation_id, server_client)
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
             output = await _rename_current_session_via_rest(
                 args,

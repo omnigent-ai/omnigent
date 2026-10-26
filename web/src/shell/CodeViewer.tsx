@@ -614,6 +614,14 @@ export function CodeViewer({
     [content, showMonaco, isRenderedPreview],
   );
 
+  // The cited line (or range) highlighted in the Shiki view, clamped to the file.
+  const citedLines = position
+    ? {
+        start: Math.min(Math.max(1, position.line), rawLines.length),
+        end: Math.min(Math.max(position.line, position.endLine ?? position.line), rawLines.length),
+      }
+    : null;
+
   const revealedPositionRef = useRef<FilePosition | undefined>(undefined);
   useEffect(() => {
     if (
@@ -1165,8 +1173,7 @@ export function CodeViewer({
               }}
               className={cn(
                 (isCurrentMatch ||
-                  (position &&
-                    lineNum === Math.min(Math.max(1, position.line), rawLines.length))) &&
+                  (citedLines && lineNum >= citedLines.start && lineNum <= citedLines.end)) &&
                   "bg-yellow-200/40 dark:bg-yellow-700/30",
               )}
             >

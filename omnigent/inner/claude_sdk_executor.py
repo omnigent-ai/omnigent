@@ -116,6 +116,54 @@ _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 _ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
 
+CLAUDE_AUTH_FAILED_CODE = "claude_sdk_auth_failed"
+CLAUDE_AUTH_FAILED_TITLE = "Claude Code could not authenticate"
+# Failed ResultMessages carry no structured auth signal (unlike api_retry's
+# status), so Claude Code's (2.1.x) failure wording is the only input. A bare
+# "Run /login" is insufficient: billing/device-enrollment errors suggest it too.
+_CLAUDE_AUTH_FAILURE_MARKERS = (
+    "failed to authenticate",
+    "authentication failed",
+    "authentication_error",
+    "not authenticated",
+    "not logged in",
+    "not signed in",
+    "login expired",
+    "please login again",
+    "run /login to sign in",
+    "run /login to authenticate",
+    "run /login and sign in",
+    "oauth session expired",
+    "oauth token revoked",
+    "credential is expired or revoked",
+    "invalid api key",
+    "disabled api key authentication",
+)
+
+# Claude Code ends its failure lines with "." or a " \u00b7 Run /login" clause.
+_TRAILING_PUNCTUATION = ".!: \u00b7"
+
+
+def is_claude_auth_failure_text(text: str) -> bool:
+    """Whether *text* is Claude Code reporting that it could not authenticate."""
+    normalized = " ".join(text.replace("`", "").lower().split())
+    return any(marker in normalized for marker in _CLAUDE_AUTH_FAILURE_MARKERS)
+
+
+def _claude_auth_remediation(*, databricks_profile: bool, gateway: bool) -> str:
+    """The next step for a Claude Code authentication failure in this transport mode."""
+    if databricks_profile:
+        return "Check your selected ~/.databrickscfg profile."
+    if gateway:
+        return (
+            "Check your provider's base URL and auth command (ANTHROPIC_BASE_URL / gateway auth)."
+        )
+    return (
+        "Sign in to Claude Code on the host that runs this agent (`claude auth login`), "
+        f"or run `{cli_invocation()} setup` there to give the agent a Claude API key or gateway."
+    )
+
+
 # ---------------------------------------------------------------------------
 # TypeAliases for Omnigent JSON-shaped boundary values. The SDK exchanges
 # heterogeneous dicts at the transport and tool boundaries — named aliases
@@ -2850,6 +2898,11 @@ class ClaudeSDKExecutor(Executor):
         observed_model: str | None = None
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
+        terminal_auth_failure = False
+        auth_remediation = _claude_auth_remediation(
+            databricks_profile=self._gateway_uses_databricks_profile,
+            gateway=bool(self._gateway),
+        )
         compaction_occurred: bool = False
         claude_session_id: str | None = None
         compaction_transcript_path: pathlib.Path | None = None
@@ -3261,7 +3314,14 @@ class ClaudeSDKExecutor(Executor):
                                 self._agent_name,
                                 failure_text,
                             )
-                            terminal_error = failure_text
+                            terminal_auth_failure = is_claude_auth_failure_text(failure_text)
+                            # Keep the next step in the message too: the REPL and
+                            # SDK stream render only code/message.
+                            terminal_error = (
+                                f"{failure_text.rstrip(_TRAILING_PUNCTUATION)}. {auth_remediation}"
+                                if terminal_auth_failure
+                                else failure_text
+                            )
                         elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
@@ -3331,23 +3391,12 @@ class ClaudeSDKExecutor(Executor):
                                 error_status in {401, 403}
                                 or retry_error == "authentication_failed"
                             ):
-                                if self._gateway_uses_databricks_profile:
-                                    auth_hint = "Check your selected ~/.databrickscfg profile."
-                                elif self._gateway:
-                                    auth_hint = (
-                                        "Check your provider's base URL and auth command "
-                                        "(ANTHROPIC_BASE_URL / gateway auth)."
-                                    )
-                                else:
-                                    auth_hint = (
-                                        "Check your Claude CLI login status "
-                                        "(`claude /status`) or API key configuration."
-                                    )
                                 terminal_error = (
                                     "Claude SDK provider authentication failed"
                                     f" ({retry_error}, status={error_status}). "
-                                    f"{auth_hint}"
+                                    f"{auth_remediation}"
                                 )
+                                terminal_auth_failure = True
                                 break
 
                             if error_status == 404:
@@ -3363,6 +3412,7 @@ class ClaudeSDKExecutor(Executor):
                                     f"({retry_error}, status={error_status}). "
                                     f"{endpoint_hint}"
                                 )
+                                terminal_auth_failure = False
                                 break
                         elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
                             compaction_occurred = True
@@ -3458,7 +3508,16 @@ class ClaudeSDKExecutor(Executor):
                 compaction_event = _build_compaction_complete_event()
                 if compaction_event is not None:
                     yield compaction_event
-            yield ExecutorError(message=terminal_error, usage=turn_usage)
+            if terminal_auth_failure:
+                yield ExecutorError(
+                    message=terminal_error,
+                    usage=turn_usage,
+                    code=CLAUDE_AUTH_FAILED_CODE,
+                    title=CLAUDE_AUTH_FAILED_TITLE,
+                    remediation=auth_remediation,
+                )
+            else:
+                yield ExecutorError(message=terminal_error, usage=turn_usage)
             return
 
         # ── LLM_RESPONSE policy evaluation ───────────────────────

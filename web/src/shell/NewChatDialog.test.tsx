@@ -34,7 +34,7 @@ import type * as NativeBridgeModule from "@/lib/nativeBridge";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
-import { MemoryRouter } from "react-router-dom";
+import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 
 import {
@@ -702,6 +702,14 @@ describe("sandbox repository helpers", () => {
     // Embedded fragment/whitespace belongs in the branch input, not here.
     ["https://github.com/org/repo#main", false],
     ["https://github.com/org/a repo", false],
+    // Embedded credentials: the server refuses these so a token never lands
+    // in a session label or Pod spec, and refusing here keeps it out of the
+    // create request too.
+    ["https://user:token@github.com/org/repo", false],
+    ["https://token@github.com/org/repo", false],
+    ["git@user:token@github.com:org/repo", false],
+    // A host with only slashes for a path is what the server calls unusable.
+    ["https://github.com//", false],
   ])("isValidSandboxRepoUrl(%j) === %j", (url, expected) => {
     expect(isValidSandboxRepoUrl(url)).toBe(expected);
   });
@@ -1297,6 +1305,24 @@ function mockClaudeModels(
   );
 }
 
+function LandingNavigationProbe() {
+  const location = useLocation();
+  const navigate = useNavigate();
+  return (
+    <>
+      <output data-testid="landing-location">
+        {location.pathname + location.search + location.hash}
+      </output>
+      <button type="button" onClick={() => navigate("?debug=1")}>
+        Change unrelated query
+      </button>
+      <button type="button" onClick={() => navigate("?prompt=Another+request")}>
+        Open another prompt link
+      </button>
+    </>
+  );
+}
+
 function renderLanding(
   infoOverrides: Partial<ServerInfo> = {},
   route = "/",
@@ -1335,6 +1361,7 @@ function renderLanding(
       <CapabilitiesProvider info={info}>
         <TooltipProvider>
           <MemoryRouter initialEntries={[route]}>
+            <LandingNavigationProbe />
             {onRender ? (
               <Profiler id="landing" onRender={onRender}>
                 <NewChatLandingScreen />
@@ -1355,6 +1382,75 @@ function tooltipKeys(tooltip: HTMLElement): string[] {
     (key) => key.textContent ?? "",
   );
 }
+
+describe("prompt URL handoff", () => {
+  beforeEach(setupLandingMocks);
+
+  it("prefills prompt without starting a session", () => {
+    const prompt = 'src/example.ts\nExplain a + b & fix "λ" <script> as plain text';
+    renderLanding({}, `/?${new URLSearchParams({ prompt, o: "123" })}#composer`);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue(prompt);
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/?o=123#composer");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+  });
+
+  it("preserves unrelated query parameters while consuming prompt", () => {
+    renderLanding({}, "/?prompt=Linked&task=Unrelated");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked");
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/?task=Unrelated");
+  });
+
+  it("does not treat task as a prompt parameter", () => {
+    renderLanding({}, "/?task=Unrelated");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("");
+    expect(screen.getByTestId("landing-location")).toHaveTextContent("/?task=Unrelated");
+  });
+
+  it("keeps edits when unrelated query parameters change", () => {
+    renderLanding({}, "/?prompt=Initial");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Edited by the user" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Change unrelated query" }));
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Edited by the user");
+    fireEvent.click(screen.getByRole("button", { name: "Open another prompt link" }));
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Another request");
+  });
+
+  it("overrides an old draft with a new link, then restores subsequent edits", () => {
+    const first = renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Old draft" },
+    });
+    first.unmount();
+    const linked = renderLanding({}, "/?prompt=Linked+request", undefined, true);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Linked request");
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Revised link" },
+    });
+    linked.unmount();
+    renderLanding();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Revised link");
+  });
+
+  it.each(["", "   ", "\n\t"])("ignores an empty prompt (%j) without erasing a draft", (prompt) => {
+    const first = renderLanding();
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Keep my draft" },
+    });
+    first.unmount();
+    renderLanding({}, `/?${new URLSearchParams({ prompt })}`);
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep my draft");
+  });
+
+  it("preserves a deployment prefix and project context", () => {
+    renderLanding({}, "/omnigent/?project=docs&prompt=Review+this&o=123#composer");
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Review this");
+    expect(screen.getByTestId("landing-location")).toHaveTextContent(
+      "/omnigent/?project=docs&o=123#composer",
+    );
+  });
+});
 
 /** Open the picker and commit (select + close) an agent by clicking its row. */
 /** Drop the mounted landing screen + its in-memory draft, keeping localStorage. */
@@ -5854,6 +5950,96 @@ describe("NewChatLandingScreen", () => {
 
     expect(await screen.findByRole("tooltip")).toHaveTextContent("Enter a message to get started");
   });
+
+  it.each(["message", "attachment"] as const)(
+    "keeps the missing-directory tooltip readable for a %s draft until dismissed or resolved",
+    async (draftKind) => {
+      const user = userEvent.setup();
+      localStorage.removeItem(RECENT_KEY);
+      useHostFilesystemMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: { entries: [], truncated: false },
+      } as unknown as ReturnType<typeof useHostFilesystem>);
+      renderLanding();
+      const input = screen.getByTestId("new-chat-landing-input");
+      if (draftKind === "message") {
+        fireEvent.change(input, { target: { value: "inspect the repo" } });
+      } else {
+        fireEvent.change(screen.getByTestId("new-chat-landing-file-input"), {
+          target: { files: [new File(["notes"], "notes.txt", { type: "text/plain" })] },
+        });
+      }
+      const reason = "Please choose a host and working directory";
+      expect(screen.queryByText(reason)).not.toBeInTheDocument();
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      const trigger = submit.parentElement!;
+      expect(submit).toBeDisabled();
+      await user.hover(trigger);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.pointerDown(trigger, { pointerType: "mouse", button: 0 });
+      fireEvent.click(trigger);
+      expect(screen.getByRole("tooltip")).toBeVisible();
+      await user.unhover(trigger);
+      expect(screen.getByRole("tooltip")).toBeVisible();
+      await user.click(input);
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+
+      expect(trigger).toHaveAttribute("role", "group");
+      expect(trigger).toHaveAttribute("aria-disabled", "true");
+      expect(trigger).toHaveAttribute("tabindex", "0");
+      act(() => trigger.focus());
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+
+      await user.click(input);
+      await user.keyboard("{Enter}");
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(reason);
+      fireEvent.pointerLeave(trigger, { pointerType: "mouse" });
+      expect(screen.getByRole("tooltip")).toBeVisible();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-chip"));
+      fireEvent.click(screen.getByTestId("new-chat-landing-workspace-open-folder"));
+      const pathInput = screen.getByTestId("workspace-picker-path-input");
+      fireEvent.change(pathInput, { target: { value: "/work/repo" } });
+      fireEvent.keyDown(pathInput, { key: "Enter" });
+      fireEvent.click(screen.getByTestId("workspace-picker-select"));
+      await waitFor(() => expect(submit).toBeEnabled());
+      expect(screen.queryByText(reason)).not.toBeInTheDocument();
+      expect(trigger).toHaveAttribute("tabindex", "-1");
+      expect(trigger).not.toHaveAttribute("aria-disabled");
+    },
+  );
+
+  it.each(["{Enter}", "[Space]"])(
+    "pins the explanation with %s on the wrapper and hands focus to Start when ready",
+    async (key) => {
+      const user = userEvent.setup();
+      renderLanding();
+      await waitFor(() =>
+        expect(screen.getByTestId("new-chat-landing-workspace-chip")).toHaveTextContent("repo"),
+      );
+      const submit = screen.getByTestId("new-chat-landing-submit");
+      const trigger = submit.parentElement!;
+      act(() => trigger.focus());
+      await user.keyboard("{Escape}");
+      await waitFor(() => expect(screen.queryByRole("tooltip")).not.toBeInTheDocument());
+      await user.keyboard(key);
+      expect(await screen.findByRole("tooltip")).toHaveTextContent(
+        "Enter a message to get started",
+      );
+      expect(trigger).toHaveFocus();
+      expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+      fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+        target: { value: "inspect the repo" },
+      });
+      expect(submit).toBeEnabled();
+      expect(submit).toHaveFocus();
+      expect(screen.queryByRole("tooltip")).not.toBeInTheDocument();
+    },
+  );
 
   it("shows the default shortcut in the new-chat submit tooltip", async () => {
     renderLanding();
@@ -10876,6 +11062,24 @@ describe("claude-code default permission mode (payload anchor for Auto)", () => 
   afterEach(() => {
     cleanup();
     localStorage.clear();
+  });
+
+  it("keeps the launch mode unchanged and leaves Shift+Tab to focus traversal", async () => {
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-workspace-chip").textContent).toContain("repo"),
+    );
+    selectAgent("a1");
+    const chip = screen.getByTestId("new-chat-landing-permission-chip");
+    expect(chip).toBeEnabled();
+    const selectedMode = chip.textContent;
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "unfinished draft" } });
+
+    expect(fireEvent.keyDown(input, { key: "Tab", shiftKey: true })).toBe(true);
+    expect(chip.textContent).toBe(selectedMode);
+    expect(input).toHaveValue("unfinished draft");
+    expect(input).not.toHaveAttribute("aria-keyshortcuts");
   });
 
   it("omits terminal_launch_args when the permission mode is left on Default", async () => {

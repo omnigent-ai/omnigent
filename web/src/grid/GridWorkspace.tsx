@@ -190,10 +190,7 @@ export function RearrangeableGrid({
 }) {
   const { layout } = grid;
   const sessionIds = gridSessionIds(layout);
-  const [selectedSessionId, setSelectedSessionId] = useState(sessionIds[0]);
-  const activeSessionId = sessionIds.includes(selectedSessionId)
-    ? selectedSessionId
-    : sessionIds[0];
+  const { selectedSessionId: activeSessionId, selectSession } = useGridSessions()!;
   const workspaceKey = `grid:${grid.id}`;
   const [workspace, setWorkspace] = useState(() => {
     const saved = readSessionWorkspaceState(workspaceKey);
@@ -202,10 +199,13 @@ export function RearrangeableGrid({
   useEffect(() => writeSessionWorkspaceState(workspaceKey, workspace), [workspaceKey, workspace]);
   const [maximized, setMaximized] = useState(false);
   const [workspaceTarget, setWorkspaceTarget] = useState<HTMLDivElement | null>(null);
-  const openWorkspace = useCallback((sessionId: string) => {
-    setSelectedSessionId(sessionId);
-    setWorkspace((previous) => ({ ...previous, open: true }));
-  }, []);
+  const openWorkspace = useCallback(
+    (sessionId: string) => {
+      selectSession(sessionId);
+      setWorkspace((previous) => ({ ...previous, open: true }));
+    },
+    [selectSession],
+  );
   const container = useRef<HTMLDivElement>(null);
   const [containerWidth, setContainerWidth] = useState(0);
   useEffect(() => {
@@ -345,7 +345,7 @@ export function RearrangeableGrid({
                 sessionId={sessionId}
                 area={area}
                 selected={sessionId === activeSessionId}
-                onActivate={() => setSelectedSessionId(sessionId)}
+                onActivate={() => selectSession(sessionId)}
                 workspaceTarget={workspaceTarget}
                 workspacePanel={workspacePanel}
                 onOpenWorkspace={() => openWorkspace(sessionId)}
@@ -407,7 +407,6 @@ export function GridWorkspace({
         className="relative flex min-h-0 min-w-0 flex-1"
         onDragOver={preventLinkDrop}
         onDropCapture={preventLinkDrop}
-        data-grid-session={grids.enabled ? grids.conversationId : undefined}
       >
         {content}
       </div>

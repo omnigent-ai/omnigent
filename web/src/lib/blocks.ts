@@ -461,6 +461,12 @@ export interface ErrorBlock {
   cause?: string;
   /** Optional concrete next step to fix it, e.g. a command to run. */
   remediation?: string;
+  /**
+   * The send behind a client-only card whose POST got no answer: the message
+   * may still arrive, and its commit retracts the card. `text` is set on a
+   * native terminal, whose mirrored message carries no stable id.
+   */
+  unansweredSend?: { stableId: string; text?: string };
 }
 
 /**
@@ -700,6 +706,8 @@ export interface ElicitationBlock {
    * ``setMode(auto)``). Absent/false for all other elicitations.
    */
   allowAutoMode?: boolean;
+  /** Native directories the user may explicitly allow for this session. */
+  permissionDirectories?: string[];
   /**
    * Claude-native non-edit tool prompts only: present when the card
    * should render an "Approve & don't ask again for <host|tool>" button

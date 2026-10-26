@@ -1479,6 +1479,32 @@ def register_resource_routes(
             remove=body.get("remove", []),
         )
 
+    @app.post("/v1/sessions/{session_id}/resources/github/details")
+    async def update_github_details_route(session_id: str, request: Request) -> JSONResponse:
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _github_call(
+            session_id,
+            "update_pr_details",
+            pr_url=body["pr_url"],
+            title=body.get("title"),
+            body=body.get("body"),
+        )
+
+    @app.post("/v1/sessions/{session_id}/resources/github/attachments")
+    async def upload_github_attachment_route(
+        session_id: str, request: Request, pr_url: str, name: str = ""
+    ) -> JSONResponse:
+        # The server forwards the file's raw bytes, already capped at its size limit.
+        return await _github_call(
+            session_id,
+            "upload_pr_attachment",
+            pr_url=pr_url,
+            name=name,
+            content=await request.body(),
+        )
+
     @app.get(
         "/v1/sessions/{session_id}/resources/environments"
         "/{environment_id}/filesystem/{relative_path:path}"
@@ -1698,7 +1724,15 @@ def register_resource_routes(
                     chunk = await asyncio.to_thread(fobj.read, min(64 * 1024, remaining))
                     if not chunk:
                         # Ending short of Content-Length would hand the client
-                        # a silently incomplete file; abort the transfer instead.
+                        # a silently incomplete file; abort the transfer instead
+                        # so the connection drops and the client sees a failure.
+                        _logger.warning(
+                            "Download of %s aborted: file shrank while streaming "
+                            "(sent %d of %d announced bytes)",
+                            resolved.name,
+                            size - remaining,
+                            size,
+                        )
                         raise RuntimeError(f"{resolved.name} shrank during download")
                     remaining -= len(chunk)
                     yield chunk

@@ -25,6 +25,16 @@ test LOC; fewer lines alone do not establish adequate coverage.
 - Run the relevant tests before submitting. Document unrelated pre-existing
   failures in the PR description.
 
+## Dependency changes
+
+When raising a dependency floor or adding a dependency, keep it installable from
+package mirrors that embargo new releases (see the dependency notes in
+`CONTRIBUTING.md`) and run `just check-internal-mirror` when you can reach the
+Databricks PyPI proxy. If a mirror lacks the version you need, keep the floor
+below it and pin the newer release only in `uv.lock`; do not work around the
+mirror with a local or temporary index. Never add the `dependency-floor-approved`
+label yourself; a human maintainer adds it after checking the mirror.
+
 ## Committing
 
 Run the `pre-commit` hook before committing (`pre-commit run --all-files`, or

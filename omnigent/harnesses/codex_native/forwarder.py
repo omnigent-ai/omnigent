@@ -75,6 +75,7 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -2500,6 +2501,12 @@ async def _maybe_rotate_session_on_thread_started(
         old_session_id,
         new_session_id,
         new_thread_id,
+    )
+    await post_clear_supersession(
+        ap_client,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        agent_name=_AGENT_NAME,
     )
     return True
 

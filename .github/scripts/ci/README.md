@@ -24,6 +24,11 @@ parent. It needs no API inventory or additional token permissions. Push,
 scheduled and manually dispatched runs retain full coverage. Existing workflow
 path filters still apply.
 
+Whenever the web test job runs, it also tests and builds the VS Code extension,
+checks the web extension SDK and example, and runs the Electron Node suites.
+These consumer checks run in both focused dependency CI and full CI, including
+catalog additions and pushes to main. PR runs also validate changed npm peers.
+
 The UI filter uses pytest's resolved fixture closure, so tests depending on
 `mocked_native_codex_session` indirectly are included. Filtering happens before
 sharding. An empty selection or a skipped selected test fails. Keep new sidecar

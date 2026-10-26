@@ -675,6 +675,25 @@
         "title": "Body_upload_session_file_v1_sessions__session_id__resources_files_post",
         "type": "object"
       },
+      "Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          },
+          "pr_url": {
+            "title": "Pr Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pr_url",
+          "file"
+        ],
+        "title": "Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post",
+        "type": "object"
+      },
       "BrandingInfo": {
         "properties": {
           "app_name": {
@@ -3867,10 +3886,32 @@
       "McpServerSummary": {
         "description": "An MCP server a harness loads on the host, without secrets.",
         "properties": {
+          "auth_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "connected",
+                  "sign_in_required"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Account state reported by the host's sign-in manager: `connected` or `sign_in_required`; `None` when nothing reports one.",
+            "title": "Auth Status"
+          },
           "harness": {
             "description": "Harness family that loads it: `claude`, `codex`, or `cursor`.",
             "title": "Harness",
             "type": "string"
+          },
+          "managed": {
+            "default": false,
+            "description": "Whether an organization pins this server for every user on the host (Claude Code's enterprise MCP config), so it is not the user's to edit.",
+            "title": "Managed",
+            "type": "boolean"
           },
           "name": {
             "description": "Server name as configured, e.g. `\"github\"`.",
@@ -3894,6 +3935,18 @@
             "description": "Config scope; always `user` today.",
             "title": "Scope",
             "type": "string"
+          },
+          "sign_in_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the user finishes signing in; only with `sign_in_required`, and only an http(s) URL carrying no credentials.",
+            "title": "Sign In Url"
           },
           "source_id": {
             "anyOf": [
@@ -4374,6 +4427,39 @@
           }
         },
         "title": "NativeUsageBaseline",
+        "type": "object"
+      },
+      "OpenFileRequest": {
+        "additionalProperties": false,
+        "description": "A workspace-relative file to show, without reading or modifying it.",
+        "properties": {
+          "path": {
+            "description": "Workspace-relative file path.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "OpenFileRequest",
+        "type": "object"
+      },
+      "OpenFileResponse": {
+        "description": "Delivery to live streams is not an acknowledgement from a file viewer.",
+        "properties": {
+          "subscribers": {
+            "format": "int64",
+            "title": "Subscribers",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "subscribers"
+        ],
+        "title": "OpenFileResponse",
         "type": "object"
       },
       "OutputFileDoneEvent": {
@@ -5991,7 +6077,8 @@
             "turn.cancelled": "#/components/schemas/TurnCancelledEvent",
             "turn.completed": "#/components/schemas/TurnCompletedEvent",
             "turn.failed": "#/components/schemas/TurnFailedEvent",
-            "turn.started": "#/components/schemas/TurnStartedEvent"
+            "turn.started": "#/components/schemas/TurnStartedEvent",
+            "ui.open_file": "#/components/schemas/UiOpenFileEvent"
           },
           "propertyName": "type"
         },
@@ -6106,6 +6193,9 @@
           },
           {
             "$ref": "#/components/schemas/BrowserActionRequestEvent"
+          },
+          {
+            "$ref": "#/components/schemas/UiOpenFileEvent"
           },
           {
             "$ref": "#/components/schemas/PolicyDeniedEvent"
@@ -9500,6 +9590,39 @@
           "session_id"
         ],
         "title": "TurnStartedEvent",
+        "type": "object"
+      },
+      "UiOpenFileEvent": {
+        "description": "Ask current session viewers to open a workspace-relative file; never replayed.",
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "ui.open_file",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "path"
+        ],
+        "title": "UiOpenFileEvent",
         "type": "object"
       },
       "UpdateCodexGoalStatusRequest": {
@@ -16757,6 +16880,58 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/attachments": {
+      "post": {
+        "description": "Upload an image or video to embed in the selected PR's description.\n\nThe file goes to the provider without being kept by Omnigent, and the PR\nis unchanged until a description that links it is saved. Falls back to\nthe host tunnel when the runner is offline.\n\n**Parameters**\n\n- `pr_url` \u2014 The selected PR, which must be tracked by the session.\n- `file` \u2014 The image or video.\n\n**Returns:** A `session.github.pr_attachment` with the `url` to embed.",
+        "operationId": "upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Session Github Attachment",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/changes": {
       "get": {
         "description": "List the PR's changed files (empty when the branch has no PR).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
@@ -16810,6 +16985,48 @@
           }
         },
         "summary": "List Session Github Changes",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/details": {
+      "post": {
+        "description": "Replace the selected PR's title and/or description.\n\nUses the host's provider account; served by the runner when it's online,\nelse by the host over its tunnel.\n\n**Returns:** A `session.github.pr_details` with the PR's resulting title and body.",
+        "operationId": "update_session_github_details_v1_sessions__session_id__resources_github_details_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Details",
         "tags": [
           "session_resources"
         ]
@@ -17548,6 +17765,59 @@
           }
         },
         "summary": "Stream Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/ui/open-file": {
+      "post": {
+        "description": "Ask current viewers to open a workspace-relative file.\n\nRequires session edit access. Requests are transient and never replayed.\nThe subscriber count measures stream delivery, not successful display:\nbackground subscribers may ignore the request, and the viewer retains\nits normal filesystem permissions, error handling and unsaved-edit guard.",
+        "operationId": "open_file_v1_sessions__session_id__ui_open_file_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenFileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenFileResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Open File",
         "tags": [
           "sessions"
         ]

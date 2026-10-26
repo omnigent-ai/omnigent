@@ -84,6 +84,13 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     pullRequestReviewersMutationKey: original.pullRequestReviewersMutationKey,
     usePullRequestReviewCandidates: vi.fn(() => state.reviewCandidates),
     useUpdatePullRequestReviewers: () => state.updateReviewers,
+    useUpdatePullRequestDetails: () => ({
+      mutate: vi.fn(),
+      reset: vi.fn(),
+      isPending: false,
+      isError: false,
+    }),
+    uploadPullRequestAttachment: vi.fn(),
     usePullRequestInfo: vi.fn(() => state.info),
     usePullRequestChangedFiles: vi.fn(() => state.changes),
     usePullRequestDiff: () => ({
@@ -405,6 +412,61 @@ describe("PullRequestPanel", () => {
     expect(
       screen.getByRole("listitem", { name: "Team platform-team: Approved" }),
     ).toBeInTheDocument();
+  });
+
+  describe("title and description editing", () => {
+    const prUrl = "https://github.com/acme/app/pull/6000";
+
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = prUrl;
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        details_editing: true,
+        attachment_uploads: true,
+      };
+    });
+
+    it("opens the title and description editors on the selected PR", () => {
+      renderPanel();
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit title" }));
+      expect(screen.getByRole("textbox", { name: "Pull request title" })).toHaveValue(
+        state.info!.data!.pr!.title,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      expect(screen.getByRole("textbox", { name: "Pull request description" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Attach images or videos" })).toBeInTheDocument();
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without details editing",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+      [
+        "a host that names no selected PR",
+        () => {
+          delete state.info!.data!.selected_pr_url;
+        },
+      ],
+    ])("offers no title or description editing to %s", (_caller, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.queryByRole("button", { name: "Edit title" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Edit description" })).not.toBeInTheDocument();
+    });
   });
 
   describe("reviewer editing", () => {

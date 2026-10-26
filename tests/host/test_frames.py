@@ -268,6 +268,139 @@ def test_mcp_servers_frames_round_trip(
     assert decode_host_frame(encode_host_frame(frame)) == frame
 
 
+def test_a_managed_server_still_reads_as_user_scope_for_an_older_server() -> None:
+    """``scope`` is a closed set on the server side, so managed-ness travels beside it.
+
+    An older server pins ``scope`` to ``"user"`` and would reject the whole inventory
+    for any other value, hiding every server on an upgraded host.
+    """
+    from typing import Literal
+
+    from pydantic import BaseModel
+
+    class OldMcpServerSummary(BaseModel):
+        """The model as it stands on a server that predates this field."""
+
+        name: str
+        harness: str
+        transport: Literal["stdio", "http"]
+        scope: Literal["user"]
+        plugin: str | None = None
+        source_id: str | None = None
+        url_host: str | None = None
+
+    wire = {
+        "name": "linear",
+        "harness": "claude",
+        "transport": "http",
+        "scope": "user",
+        "managed": "true",
+    }
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.mcp_servers_result",
+                "request_id": "r",
+                "status": "ok",
+                "mcp_servers": [wire],
+            }
+        )
+    )
+    assert isinstance(frame, HostMcpServersResultFrame)
+    assert frame.mcp_servers == [wire]
+    # The extra key is ignored rather than fatal, because Pydantic ignores unknown fields.
+    assert OldMcpServerSummary.model_validate(frame.mcp_servers[0]).scope == "user"
+
+
+def test_mcp_servers_result_carries_account_state_through_the_tunnel() -> None:
+    """Account state must survive encode/decode, or `/mcp` never sees it."""
+    frame = HostMcpServersResultFrame(
+        "r",
+        "ok",
+        mcp_servers=[
+            {
+                "name": "linear",
+                "harness": "claude",
+                "transport": "http",
+                "scope": "user",
+                "auth_status": "sign_in_required",
+                "sign_in_url": "https://auth.example.com/start?state=abc",
+            }
+        ],
+    )
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "reported,expected",
+    [
+        ({"auth_status": "connected"}, {"auth_status": "connected"}),
+        # A URL is only passed on while sign-in is due, and only when a browser opens it.
+        (
+            {"auth_status": "connected", "sign_in_url": "https://a.b/go"},
+            {"auth_status": "connected"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "javascript:alert(1)"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "//auth.example.com/go"},
+            {"auth_status": "sign_in_required"},
+        ),
+        # Credentials in the URL would be published to the browser and sit in the DOM.
+        (
+            {
+                "auth_status": "sign_in_required",
+                "sign_in_url": "https://user:pw@auth.example.com/go",
+            },
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "https:// auth.example.com/go"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "https://auth.example.com/go\n"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "https:///go"},
+            {"auth_status": "sign_in_required"},
+        ),
+        # urlsplit raises on an unclosed IPv6 literal; that must not reject the frame.
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "http://[::1"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": 7},
+            {"auth_status": "sign_in_required"},
+        ),
+        # A state this build does not know degrades to "nothing reported".
+        ({"auth_status": "expired", "sign_in_url": "https://a.b/go"}, {}),
+        ({"auth_status": None}, {}),
+        ({}, {}),
+    ],
+)
+def test_mcp_servers_result_validates_reported_account_state(
+    reported: dict[str, object], expected: dict[str, str]
+) -> None:
+    server = {"name": "linear", "harness": "claude", "transport": "http", "scope": "user"}
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.mcp_servers_result",
+                "request_id": "r",
+                "status": "ok",
+                "mcp_servers": [{**server, **reported}],
+            }
+        )
+    )
+    assert isinstance(frame, HostMcpServersResultFrame)
+    assert frame.mcp_servers == [{**server, **expected}]
+
+
 def test_mcp_servers_result_keeps_only_allow_listed_fields() -> None:
     frame = decode_host_frame(
         json.dumps(
