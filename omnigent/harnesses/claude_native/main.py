@@ -977,8 +977,8 @@ def _claude_model_probe_invocation(
     env.pop("DATABRICKS_CONFIG_PROFILE", None)
     env.pop(_CLAUDE_CODE_NESTED_SESSION_ENV, None)
     env.pop(_CLAUDE_NONESSENTIAL_TRAFFIC_ENV, None)
-    if claude_config is not None and claude_config.api_key_helper:
-        env.pop(_ANTHROPIC_API_KEY_ENV, None)
+    for name in native_claude_auth_env_unset(claude_config):
+        env.pop(name, None)
     return command, launch_args, env
 
 
@@ -1524,6 +1524,15 @@ def claude_launch_catalog_is_stale(claude_config: ClaudeNativeUcodeConfig | None
     )
 
 
+def native_claude_auth_env_unset(
+    claude_config: ClaudeNativeUcodeConfig | None,
+) -> tuple[str, ...]:
+    """Credentials that would override the explicitly configured auth helper."""
+    if claude_config is not None and claude_config.api_key_helper:
+        return (_ANTHROPIC_API_KEY_ENV, "ANTHROPIC_AUTH_TOKEN")
+    return ()
+
+
 def build_native_claude_terminal_env(
     claude_config: ClaudeNativeUcodeConfig | None,
 ) -> dict[str, str]:
@@ -1553,14 +1562,12 @@ def build_native_claude_terminal_env(
         terminal_env[_CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV] = "true"
         terminal_env[_CLAUDE_CODE_DISABLE_AGENT_VIEW_ENV] = "1"
         terminal_env[_CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY_ENV] = "1"
-    # On the apiKeyHelper path the credential reaches Claude Code via the
-    # helper; a raw ANTHROPIC_API_KEY here re-triggers Claude Code's "Detected a
-    # custom API key" menu, which hangs tmux delivery. Fail loud if one leaks.
-    if claude_config is not None and claude_config.api_key_helper:
-        if _ANTHROPIC_API_KEY_ENV in terminal_env:
+    # A raw credential can override the helper or open Claude's API-key menu.
+    for name in native_claude_auth_env_unset(claude_config):
+        if name in terminal_env:
             raise RuntimeError(
                 "native-claude: apiKeyHelper is configured but the terminal env "
-                f"carries a raw {_ANTHROPIC_API_KEY_ENV}; the credential must reach "
+                f"carries a raw {name}; the credential must reach "
                 "Claude Code via the helper, not the environment."
             )
     return terminal_env
@@ -6653,7 +6660,7 @@ def _claude_terminal_request(
         # Remove provider/session variables that can override the
         # ucode apiKeyHelper or make Claude think it is nested.
         unset_env_vars = [
-            _ANTHROPIC_API_KEY_ENV,
+            *native_claude_auth_env_unset(claude_config),
             _CLAUDE_CODE_NESTED_SESSION_ENV,
         ]
         env_args = [part for var in unset_env_vars for part in ("-u", var)]

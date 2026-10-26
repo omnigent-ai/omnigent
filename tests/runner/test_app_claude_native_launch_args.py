@@ -381,16 +381,8 @@ def test_build_claude_native_base_args_carries_pinned_permission_mode_into_resum
     )
 
 
-def test_claude_terminal_env_unset_masks_key_with_api_key_helper() -> None:
-    """An apiKeyHelper launch strips the raw key + nested-session marker.
-
-    When the credential reaches Claude Code via an ``apiKeyHelper``, a raw
-    ``ANTHROPIC_API_KEY`` in the child env makes Claude open its custom-API-
-    key confirmation menu, and the first web message is typed into that menu
-    instead of the chat composer. The key must not leak into the terminal
-    child; ``CLAUDECODE`` is stripped alongside it to avoid a nested-session
-    error. ``DATABRICKS_CONFIG_PROFILE`` is always dropped.
-    """
+def test_claude_terminal_env_unset_masks_credentials_with_api_key_helper() -> None:
+    """Ambient keys and tokens must not override the selected helper."""
     config = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BASE_URL": "https://gateway.example/anthropic"},
         api_key_helper="printf %s sk-gateway",
@@ -398,22 +390,19 @@ def test_claude_terminal_env_unset_masks_key_with_api_key_helper() -> None:
     )
     env_unset = _claude_terminal_env_unset(config)
     assert "ANTHROPIC_API_KEY" in env_unset
+    assert "ANTHROPIC_AUTH_TOKEN" in env_unset
+    assert "CLAUDE_CODE_OAUTH_TOKEN" not in env_unset
     assert "CLAUDECODE" in env_unset
     assert "DATABRICKS_CONFIG_PROFILE" in env_unset
 
 
-def test_claude_terminal_env_unset_without_helper_keeps_key() -> None:
-    """No apiKeyHelper preserves the raw key but strips nested-session state.
-
-    Claude's own-login path (``None`` config) and a Bedrock-style config have
-    no ``apiKeyHelper``, so this helper does not strip ``ANTHROPIC_API_KEY``.
-    ``CLAUDECODE`` must still be absent because Claude Code rejects nested
-    launches in every auth mode.
-    """
+def test_claude_terminal_env_unset_without_helper_keeps_credentials() -> None:
+    """Native login, Bedrock, and token-only gateways keep their credentials."""
     expected = ["DATABRICKS_CONFIG_PROFILE", "CLAUDECODE"]
     own_login_env_unset = _claude_terminal_env_unset(None)
     assert own_login_env_unset == expected
     assert "ANTHROPIC_API_KEY" not in own_login_env_unset
+    assert "ANTHROPIC_AUTH_TOKEN" not in own_login_env_unset
     bedrock_like = ClaudeNativeUcodeConfig(
         env={"ANTHROPIC_BEDROCK_BASE_URL": "https://bedrock.example"},
         api_key_helper=None,
@@ -422,6 +411,12 @@ def test_claude_terminal_env_unset_without_helper_keeps_key() -> None:
     bedrock_env_unset = _claude_terminal_env_unset(bedrock_like)
     assert bedrock_env_unset == expected
     assert "ANTHROPIC_API_KEY" not in bedrock_env_unset
+    assert "ANTHROPIC_AUTH_TOKEN" not in bedrock_env_unset
+    token_only = ClaudeNativeUcodeConfig(
+        env={"CLAUDE_CODE_USE_GATEWAY": "1", "ANTHROPIC_AUTH_TOKEN": "test-token"},
+    )
+    assert _claude_terminal_env_unset(token_only) == expected
+    assert build_native_claude_terminal_env(token_only)["ANTHROPIC_AUTH_TOKEN"] == "test-token"
 
 
 def test_native_launch_passes_synthesized_model_as_flag() -> None:
@@ -486,25 +481,20 @@ def test_routed_launch_model_reaches_the_terminal_env_as_the_custom_slot() -> No
     )
 
 
-def test_build_native_claude_terminal_env_rejects_raw_key_on_helper_path() -> None:
-    """The env-build seam fails loud if a raw key rides the apiKeyHelper path.
-
-    ``_claude_terminal_env_unset`` strips the raw key from the terminal child
-    only because ``build_native_claude_terminal_env`` never emits one on the
-    helper path. Pin that invariant mechanically: if a future config injects a
-    raw ``ANTHROPIC_API_KEY`` into the terminal env while an ``apiKeyHelper`` is
-    configured, the build must raise rather than silently reintroduce Claude
-    Code's custom-API-key menu hang.
-    """
+@pytest.mark.parametrize("credential", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_build_native_claude_terminal_env_rejects_credentials_on_helper_path(
+    credential: str,
+) -> None:
+    """Config overrides must not reintroduce credentials that bypass the helper."""
     leaking = ClaudeNativeUcodeConfig(
         env={
             "ANTHROPIC_BASE_URL": "https://gateway.example/anthropic",
-            "ANTHROPIC_API_KEY": "sk-leaked",
+            credential: "sk-leaked",
         },
         api_key_helper="printf %s sk-gateway",
         model="gateway-served-claude",
     )
-    with pytest.raises(RuntimeError, match="ANTHROPIC_API_KEY"):
+    with pytest.raises(RuntimeError, match=credential):
         build_native_claude_terminal_env(leaking)
 
 
@@ -531,6 +521,7 @@ def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
     env_unset = _claude_terminal_env_unset(config)
     assert "DATABRICKS_CONFIG_PROFILE" in env_unset
     assert "ANTHROPIC_API_KEY" in env_unset
+    assert "ANTHROPIC_AUTH_TOKEN" in env_unset
     assert "CLAUDECODE" in env_unset
 
     # The built terminal env preserves the gateway endpoint and never emits a
