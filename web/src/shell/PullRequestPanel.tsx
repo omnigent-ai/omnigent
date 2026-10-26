@@ -1091,13 +1091,13 @@ function PullRequestListRow({
   const identity = pullRequestLabel({ ...association, title: null });
   const label = title ? `${identity} — ${title}` : identity;
   return (
-    <li className="flex min-w-0 items-center gap-2 rounded-md px-2 hover:bg-muted/50">
+    <li className="flex min-w-0 items-center gap-2 rounded-md px-1.5 hover:bg-muted/50">
       <button
         type="button"
         onClick={onSelect}
         title={label}
         aria-label={label}
-        className="flex min-w-0 flex-1 items-center gap-2 py-3 text-left text-ui focus-visible:outline-ring"
+        className="flex min-w-0 flex-1 items-center gap-2 py-2 text-left text-ui focus-visible:outline-ring"
       >
         <GitPullRequestIcon
           aria-hidden
@@ -1135,7 +1135,7 @@ function PullRequestListRow({
         ) : !pr ? (
           <span>{info.isLoading ? "Loading…" : "Status unavailable"}</span>
         ) : pr.state !== "OPEN" ? (
-          <span>{pr.state === "MERGED" ? "Merged" : "Closed"}</span>
+          <PullRequestStatus state={pr.state} />
         ) : (
           <>
             {pr.is_draft && <span>Draft</span>}
@@ -1404,7 +1404,7 @@ export function PullRequestPanel({
       ) : null}
       <div className="min-h-0 flex-1">
         {prs.length > 0 && !showingDetails ? (
-          <ul aria-label="Pull requests" className="h-full overflow-y-auto p-2">
+          <ul aria-label="Pull requests" className="h-full overflow-y-auto">
             {prs.map((pr) => (
               <PullRequestListRow
                 key={pr.url}
