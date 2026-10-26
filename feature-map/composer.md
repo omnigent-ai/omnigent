@@ -304,6 +304,9 @@ pickers, seeded from the source session when its harness family is kept.
 **Mobile** (either composer on a phone-sized viewport): the same controls with
 collapsed labels.
 
+**Side chat** (from an existing session): choose **+ → Start a new side chat**
+in the composer, then click the microphone beside **Ask a side question…**.
+
 ## Driving it with the repro environment
 
 Preconditions: a running instance (`verify-env start`, then `verify-env
@@ -518,9 +521,13 @@ Other connection providers alone do not enable the managed MCP picker.
   server's fake transcription engine, which only the test's own server enables;
   run it with plain `uv run pytest`. It covers the button, the hotkey, Enter
   keeping the text, Escape discarding it, and insertion at the caret.
-- **`dictation`, new-session composer:** no browser-level coverage. Manually:
-  on the landing page, click the microphone (or press ⌘/Ctrl+Alt+V), speak,
-  and expect the text in the message box; Escape restores the previous draft.
+- **`dictation`, both composers and side chat (own environment):**
+  `tests/e2e_ui/chat/test_dictation.py::test_speech_service_denial_falls_back_to_client_audio`
+  covers a browser speech service refusing access while the client microphone
+  remains available, through the button and hotkey on both composers and the
+  side-chat microphone button. It streams client audio through the fake server
+  engine and keeps the transcript on Enter.
+  Manually on the landing page: dictate, then press Escape to restore the previous draft.
 - **`send-shortcut`:**
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_submit_with_mod_enter_persists_and_is_the_only_send_gesture`,
   `tests/e2e_ui/chat/test_composer_submit_shortcut.py::test_alt_enter_inserts_newline_in_both_composers`
@@ -667,7 +674,10 @@ Other connection providers alone do not enable the managed MCP picker.
 - Managed MCP browser tests stub launch and authentication. They prove composer
   wiring; the HTTP integration test proves the real provider boundary.
 - Dictation normally uses browser speech recognition, with server fallback
-  when unavailable or a network error occurs. The desktop app prefers the
+  when unavailable or the browser speech service fails. Audio still comes from
+  the client device; choosing a remote host does not change the microphone.
+  Denying microphone permission must not start a fallback recording.
+  The desktop app prefers the
   server when available. A verification instance without a transcription engine
   depends on browser support; a missing microphone there does not prove that
   dictation is unavailable on a configured server.
