@@ -514,6 +514,11 @@
   );
 }
 
+/* Only the active grid pane keeps the glow. */
+[data-grid-session][data-active="false"] .side-chat-backdrop {
+  background: none;
+}
+
 /* Fixed default icon geometry: a 14px glyph centered in a 16px SVG box. */
 .ui-icon {
   box-sizing: border-box;
@@ -827,12 +832,11 @@ html[data-electron-mac] {
   html[data-electron-mac] .conversations-sidebar.is-peek .sidebar-header-row {
     display: none;
   }
-  /* The settings sidebar swaps the header row for a "Back" row, which would now
-   * sit under the traffic lights. Push it below them — it has no cluster to
-   * align beside the lights, so it clears them vertically instead. */
-  html[data-electron-mac] .settings-sidebar-header {
-    padding-top: calc(var(--mac-titlebar-height) + 0.5rem);
-  }
+}
+/* The settings sidebar's "Back" row, docked or in the phone drawer, has no
+ * cluster to align beside the lights, so it clears them vertically instead. */
+html[data-electron-mac] .settings-sidebar-header {
+  padding-top: calc(var(--mac-titlebar-height) + 0.5rem);
 }
 /* Match the full desktop header; controls opt out of dragging below. */
 html[data-electron-mac] .electron-drag-strip {
@@ -880,6 +884,17 @@ html[data-electron-mac]
   aside[aria-label="Workspace"][data-maximized]
   .workspace-tab-strip {
   padding-left: calc(var(--mac-traffic-light-width) + 5rem);
+}
+/* Below md the phone header and drawer carry their own controls, so drop the
+ * title-bar cluster and start those headers right of the lights. */
+@media (width < 48rem) {
+  html[data-electron-mac] .electron-sidebar-header-actions {
+    display: none;
+  }
+  html[data-electron-mac] .traffic-light-clearance,
+  html[data-electron-mac] .sidebar-header-row {
+    padding-left: var(--mac-traffic-light-width);
+  }
 }
 /* Drag regions ignore z-order, so controls and overlays need counter-regions.
  * Scoped from <html> to cover portals outside AppShell on macOS only. */
@@ -1346,9 +1361,8 @@ html[data-electron-mac] .breadcrumb-folder {
 }
 
 /* The virtualized transcript holds its own read position across history
- * prepends and in-flow changes above the list (Transcript.tsx). Its rows are
- * absolutely positioned, so native anchoring can't see them and would only
- * double-count the in-flow part. */
+ * prepends, row re-measures and changes above the list (Transcript.tsx), so
+ * native anchoring would double-count each of them. */
 [data-virtualized-transcript] {
   overflow-anchor: none;
 }

@@ -2540,6 +2540,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         error = await asyncio.wait_for(_failed(), timeout=budget(5.0))
         assert error["code"] == "runner_disconnected"
         assert ("did not come back within" in error["message"]) == (scenario == "expired")
+        assert ("came back without the runner" in error["message"]) == (
+            scenario == "host_back_without_runner"
+        )
     finally:
         if reconnect is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):

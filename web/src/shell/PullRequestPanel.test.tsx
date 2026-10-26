@@ -18,6 +18,7 @@ import type {
   PullRequestDiffResponse,
   PullRequestInfo,
   PullRequestRepoLabels,
+  PullRequestReviewCandidates,
 } from "@/hooks/usePullRequests";
 
 const state = vi.hoisted(() => ({
@@ -57,6 +58,13 @@ const state = vi.hoisted(() => ({
     error: null as Error | null,
   },
   updateLabels: { mutate: vi.fn(), isError: false, error: null as Error | null },
+  reviewCandidates: {
+    data: undefined as PullRequestReviewCandidates | undefined,
+    isPending: true,
+    isError: false,
+    error: null as Error | null,
+  },
+  updateReviewers: { mutate: vi.fn(), isError: false, error: null as Error | null },
 }));
 
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
@@ -68,6 +76,21 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     pullRequestLabelsMutationKey: original.pullRequestLabelsMutationKey,
     usePullRequestRepoLabels: vi.fn(() => state.repoLabels),
     useUpdatePullRequestLabels: () => state.updateLabels,
+    usePullRequestMergeOptions: () => ({ data: undefined, isPending: true, isError: false }),
+    useMergePullRequest: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    useDisablePullRequestAutoMerge: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    applyPullRequestReviewerChange: original.applyPullRequestReviewerChange,
+    pullRequestReviewerKey: original.pullRequestReviewerKey,
+    pullRequestReviewersMutationKey: original.pullRequestReviewersMutationKey,
+    usePullRequestReviewCandidates: vi.fn(() => state.reviewCandidates),
+    useUpdatePullRequestReviewers: () => state.updateReviewers,
+    useUpdatePullRequestDetails: () => ({
+      mutate: vi.fn(),
+      reset: vi.fn(),
+      isPending: false,
+      isError: false,
+    }),
+    uploadPullRequestAttachment: vi.fn(),
     usePullRequestInfo: vi.fn(() => state.info),
     usePullRequestChangedFiles: vi.fn(() => state.changes),
     usePullRequestDiff: () => ({
@@ -118,6 +141,7 @@ import {
   usePullRequestInfo,
   usePullRequestChangedFiles,
   usePullRequestRepoLabels,
+  usePullRequestReviewCandidates,
 } from "@/hooks/usePullRequests";
 
 import {
@@ -292,6 +316,38 @@ describe("PullRequestPanel", () => {
     expect(screen.getByText(/66\s*passed/)).toBeInTheDocument();
     expect(screen.getByText(/2\s*failed/)).toBeInTheDocument();
     expect(screen.queryByText(/pending/)).toBeNull();
+    expect(screen.queryByRole("button", { name: /cancelled|skipped/ })).toBeNull();
+  });
+
+  it("shows cancelled and skipped checks as separate grey pills listing their jobs", async () => {
+    const user = userEvent.setup();
+    state.info!.data!.pr!.checks = {
+      passing: 0,
+      failing: 0,
+      pending: 0,
+      cancelled: 1,
+      skipped: 2,
+      total: 3,
+      runs: [
+        { name: "cancelled job", bucket: "cancelled", url: null },
+        { name: "skipped job", bucket: "skipped", url: null },
+        { name: "another skipped job", bucket: "skipped", url: null },
+      ],
+    };
+    renderPanel();
+
+    for (const label of ["1 cancelled", "2 skipped"]) {
+      expect(screen.getByRole("button", { name: label })).toHaveClass(
+        "bg-muted",
+        "text-muted-foreground",
+        "rounded-full",
+      );
+    }
+    expect(screen.queryByRole("button", { name: /passed|failed|pending/ })).toBeNull();
+
+    await user.hover(screen.getByRole("button", { name: "2 skipped" }));
+    const rows = await screen.findAllByRole("listitem");
+    expect(rows.map((row) => row.textContent)).toEqual(["skipped job", "another skipped job"]);
   });
 
   it("shows each assigned reviewer with its current state and team kind", () => {
@@ -358,6 +414,128 @@ describe("PullRequestPanel", () => {
     ).toBeInTheDocument();
   });
 
+  describe("title and description editing", () => {
+    const prUrl = "https://github.com/acme/app/pull/6000";
+
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = prUrl;
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        details_editing: true,
+        attachment_uploads: true,
+      };
+    });
+
+    it("opens the title and description editors on the selected PR", () => {
+      renderPanel();
+
+      fireEvent.click(screen.getByRole("button", { name: "Edit title" }));
+      expect(screen.getByRole("textbox", { name: "Pull request title" })).toHaveValue(
+        state.info!.data!.pr!.title,
+      );
+      fireEvent.click(screen.getByRole("button", { name: "Edit description" }));
+      expect(screen.getByRole("textbox", { name: "Pull request description" })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Attach images or videos" })).toBeInTheDocument();
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without details editing",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+      [
+        "a host that names no selected PR",
+        () => {
+          delete state.info!.data!.selected_pr_url;
+        },
+      ],
+    ])("offers no title or description editing to %s", (_caller, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.queryByRole("button", { name: "Edit title" })).not.toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Edit description" })).not.toBeInTheDocument();
+    });
+  });
+
+  describe("reviewer editing", () => {
+    const prUrl = "https://github.com/acme/app/pull/6000";
+
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = prUrl;
+      state.info!.data!.pr!.reviewers = [
+        { login: "alice", kind: "user", state: "PENDING" },
+        { login: "bob", kind: "user", state: "APPROVED" },
+      ];
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        reviewer_editing: true,
+      };
+    });
+
+    it("wires the rows and the picker to the selected PR", () => {
+      renderPanel();
+
+      fireEvent.click(screen.getByRole("button", { name: "Withdraw review request from alice" }));
+      expect(state.updateReviewers.mutate).toHaveBeenLastCalledWith({
+        prUrl,
+        add: [],
+        remove: [{ login: "alice", kind: "user", state: "PENDING" }],
+      });
+      fireEvent.click(screen.getByRole("button", { name: "Re-request review from bob" }));
+      expect(state.updateReviewers.mutate).toHaveBeenLastCalledWith({
+        prUrl,
+        add: [{ login: "bob", kind: "user", state: "APPROVED" }],
+        remove: [],
+      });
+      expect(usePullRequestReviewCandidates).toHaveBeenLastCalledWith("conv_1", prUrl, false);
+      fireEvent.click(screen.getByRole("button", { name: "Request reviewers" }));
+      expect(usePullRequestReviewCandidates).toHaveBeenLastCalledWith("conv_1", prUrl, true);
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without reviewer editing",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+      [
+        "a host that names no selected PR",
+        () => {
+          delete state.info!.data!.selected_pr_url;
+        },
+      ],
+    ])("shows reviewers read-only for %s", (_caller, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.getByRole("listitem", { name: "alice: Pending" })).toBeInTheDocument();
+      expect(screen.queryByRole("button", { name: "Request reviewers" })).toBeNull();
+      expect(screen.queryByRole("button", { name: /review request from|review from/ })).toBeNull();
+    });
+  });
+
   describe("labels", () => {
     const prUrl = "https://github.com/acme/app/pull/6000";
     const bug = { name: "bug", color: "d73a4a", description: "Something isn't working" };
@@ -398,6 +576,14 @@ describe("PullRequestPanel", () => {
       expect(
         labels.compareDocumentPosition(checks) & Node.DOCUMENT_POSITION_FOLLOWING,
       ).toBeTruthy();
+      // Reviewers and labels share one row, split by a vertical divider, above a divider.
+      const row = reviewers.parentElement!.parentElement!;
+      expect(row).toContainElement(labels);
+      expect(row.querySelector('[data-slot="separator"]')).toHaveAttribute(
+        "data-orientation",
+        "vertical",
+      );
+      expect(row.nextElementSibling).toHaveAttribute("data-slot", "separator");
     });
 
     it("wires editing to the selected PR: chips remove, and the picker loads on open", () => {
@@ -455,6 +641,90 @@ describe("PullRequestPanel", () => {
       renderPanel();
 
       expect(screen.queryByRole("heading", { name: "Labels" })).toBeNull();
+    });
+  });
+
+  describe("merge button", () => {
+    beforeEach(() => {
+      state.info!.data!.selected_pr_url = "https://github.com/acme/app/pull/6000";
+      state.info!.data!.pr!.head_sha = "a".repeat(40);
+      state.info!.data!.pr!.merge_state_status = "CLEAN";
+      state.info!.data!.pr!.auto_merge = null;
+      state.info!.data!.capabilities = {
+        account_switching: true,
+        base_remote_selection: true,
+        line_counts: true,
+        linked_pr_diff: true,
+        merging: true,
+      };
+    });
+
+    it("sits below the checks and opens the merge dialog", () => {
+      renderPanel();
+
+      const merge = screen.getByRole("region", { name: "Merge" });
+      const checks = screen.getByText("Checks").closest("section")!;
+      expect(checks.compareDocumentPosition(merge) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      fireEvent.click(within(merge).getByRole("button", { name: "Merge pull request" }));
+      expect(screen.getByText("Merge pull request #6000?")).toBeInTheDocument();
+    });
+
+    it("divides the metadata from the description", () => {
+      renderPanel();
+
+      const divider = [...document.querySelectorAll('[data-slot="separator"]')].at(-1)!;
+      const merge = screen.getByRole("region", { name: "Merge" });
+      const description = screen.getByText("Description").closest("section")!;
+      expect(
+        merge.compareDocumentPosition(divider) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+      expect(
+        divider.compareDocumentPosition(description) & Node.DOCUMENT_POSITION_FOLLOWING,
+      ).toBeTruthy();
+    });
+
+    it.each([
+      [
+        "a view-only collaborator",
+        () => {
+          state.canEdit = false;
+        },
+      ],
+      [
+        "a host without merging",
+        () => {
+          delete state.info!.data!.capabilities;
+        },
+      ],
+      [
+        "a provider that can't merge",
+        () => {
+          state.info!.data!.capabilities!.merging = false;
+        },
+      ],
+      [
+        "a host that doesn't report the merge state",
+        () => {
+          delete state.info!.data!.pr!.merge_state_status;
+        },
+      ],
+      [
+        "a closed PR",
+        () => {
+          state.info!.data!.pr!.state = "CLOSED";
+        },
+      ],
+      [
+        "a merged PR",
+        () => {
+          state.info!.data!.pr!.state = "MERGED";
+        },
+      ],
+    ])("is hidden for %s", (_case, setup) => {
+      setup();
+      renderPanel();
+
+      expect(screen.queryByRole("region", { name: "Merge" })).toBeNull();
     });
   });
 
@@ -606,7 +876,9 @@ describe("PullRequestPanel", () => {
       "Checks can’t be read with this GitHub token. Fine-grained personal access tokens can’t read check runs; use a classic token or a GitHub App.",
     );
     expect(screen.queryByText(/Some checks are unavailable/)).toBeNull();
-    expect(screen.queryByRole("button", { name: /passed|failed|pending/ })).toBeNull();
+    expect(
+      screen.queryByRole("button", { name: /passed|failed|pending|cancelled|skipped/ }),
+    ).toBeNull();
     expect(screen.getByText("No description provided.")).toBeInTheDocument();
   });
 
@@ -1606,16 +1878,18 @@ describe("PullRequestPanel", () => {
     expect(description.parentElement).toContainElement(link);
     expect(screen.queryByRole("combobox", { name: "Session pull request" })).toBeNull();
     fireEvent.click(link);
-    expect(description.parentElement).toContainElement(
-      screen.getByRole("textbox", { name: "Pull request URL" }),
-    );
+    const input = screen.getByRole("textbox", { name: "Pull request URL" });
+    expect(description.parentElement).toContainElement(input);
+    expect(input).toHaveFocus();
+    expect(screen.queryByRole("button", { name: "Link a PR" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
-    fireEvent.click(link);
+    fireEvent.click(screen.getByRole("button", { name: "Link a PR" }));
     fireEvent.keyDown(screen.getByRole("textbox", { name: "Pull request URL" }), {
       key: "Escape",
     });
     expect(screen.queryByRole("textbox", { name: "Pull request URL" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Link a PR" })).toBeInTheDocument();
   });
 
   it("shows the diff immediately when unifiedLineCount is at the threshold", async () => {

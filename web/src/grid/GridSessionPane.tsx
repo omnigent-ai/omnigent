@@ -6,6 +6,7 @@ import { Maximize2Icon, XIcon } from "lucide-react";
 import { SideChatPane } from "@/components/chat/SideChatPane";
 import { Button } from "@/components/ui/button";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
+import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { useChildSessions } from "@/hooks/useChildSessions";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useCanEdit } from "@/hooks/usePermissions";
@@ -47,6 +48,7 @@ import {
 import type { RightRailTab } from "@/shell/railTabs";
 import type { ChangedSort } from "@/shell/FlatFileList";
 import { WorkspacePanel } from "@/shell/WorkspacePanel";
+import { citedFilePosition } from "@/shell/filePositionState";
 import { useGridSessions } from "./GridSessionsContext";
 
 export type GridWorkspacePanelProps = Pick<
@@ -212,9 +214,7 @@ export function GridSessionPane({
     (path: string, options?: OpenFileOptions) => {
       navigateWorkspace(path, options, () => {
         onOpenWorkspace();
-        setPosition(
-          options?.line === undefined ? undefined : { line: options.line, column: options.column },
-        );
+        setPosition(citedFilePosition(options));
         setWorkspace((previous) => ({
           ...previous,
           selectedFilePath: path,
@@ -227,6 +227,7 @@ export function GridSessionPane({
     },
     [navigateWorkspace, onOpenWorkspace],
   );
+  useUiOpenFile(sessionId, selected && canBrowse, openFile);
   const selectTab = useCallback(
     (rightRailTab: RightRailTab | null) => {
       navigateWorkspace("", undefined, () =>
@@ -319,14 +320,14 @@ export function GridSessionPane({
           onFocusCapture={onActivate}
           className={cn(
             "relative flex min-h-0 min-w-0 flex-col overflow-hidden rounded-lg border bg-background",
-            selected && "border-brand-accent/50 ring-1 ring-brand-accent/50",
+            selected && "border-brand-accent/50 shadow-lg",
             isDragging && "opacity-50",
           )}
         >
           <header
             className={cn(
               "flex h-8 shrink-0 items-center border-b px-1",
-              selected && "bg-brand-accent/50",
+              selected && "bg-brand-accent/10",
             )}
           >
             <button
@@ -336,7 +337,10 @@ export function GridSessionPane({
               {...listeners}
               aria-label={`Move ${title}`}
               title="Drag to another cell to swap positions"
-              className="h-full min-w-0 flex-1 touch-none cursor-grab truncate px-1 text-left text-sm leading-normal font-medium select-none active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-ring"
+              className={cn(
+                "h-full min-w-0 flex-1 touch-none cursor-grab truncate px-1 text-left text-sm leading-normal font-medium select-none active:cursor-grabbing focus-visible:outline-2 focus-visible:outline-ring",
+                !selected && "text-muted-foreground",
+              )}
             >
               {title}
             </button>

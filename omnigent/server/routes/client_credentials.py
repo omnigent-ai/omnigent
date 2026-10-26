@@ -369,7 +369,7 @@ def _warn_if_sub_is_a_real_account(permission_store: PermissionStore | None, sub
         return
     try:
         accounts = permission_store.list_users(limit=_ACCOUNT_SCAN_LIMIT)
-    except Exception:  # noqa: BLE001 (advisory scan, must never gate the mount)
+    except Exception:
         _logger.debug(
             "client-credentials: could not scan the roster to check whether %s=%r is a "
             "real account",

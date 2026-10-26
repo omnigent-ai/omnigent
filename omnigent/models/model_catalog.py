@@ -587,7 +587,7 @@ def resolve_model_provider(spec: object, harness: str | None) -> ResolvedModelPr
     """
     try:
         return _resolve_model_provider_unsafe(spec, harness)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         from omnigent.errors import OmnigentError
 
         _logger.debug("model provider resolution failed for harness %r", harness, exc_info=True)
@@ -1205,7 +1205,7 @@ def _worker_row(
     harness = spec_harness(spec)
     try:
         listing = list_models_for_worker(spec, harness, transport=transport)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         _logger.debug("worker model enumeration failed", exc_info=True)
         listing = ModelListing(
             source=NONE_KIND,

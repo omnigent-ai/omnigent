@@ -29,7 +29,7 @@ from dataclasses import dataclass
 
 import httpx
 import pytest
-from playwright.sync_api import Browser, Page, expect
+from playwright.sync_api import Browser, Locator, Page, expect
 
 from tests._helpers.browser import user_page
 from tests._helpers.session import post_session_bundle
@@ -130,6 +130,18 @@ def shared(
                 respawned_runner.wait(timeout=5)
 
 
+def _drag_select_text(page: Page, text: Locator) -> None:
+    """Select *text* with a mouse drag, the gesture that opens the reply popup."""
+    box = text.bounding_box()
+    assert box is not None, "text to select is not laid out"
+    y = box["y"] + box["height"] / 2
+    page.mouse.move(box["x"] + 2, y)
+    page.mouse.down()
+    page.mouse.move(box["x"] + box["width"] - 2, y, steps=8)
+    page.mouse.up()
+    assert page.evaluate("() => window.getSelection()?.toString().trim() ?? ''")
+
+
 def _goto_expecting_snapshot(page: Page, base_url: str, session_id: str) -> int:
     """Navigate to the session and return the snapshot GET's status code.
 
@@ -190,6 +202,10 @@ def test_share_grant_downgrade_revoke_journey(
         # The owner's already-open tab receives Bob's message over the
         # live stream (no reload): the collab-realtime broadcast path.
         expect(owner_page.locator(_BUBBLE, has_text=marker).first).to_be_visible(timeout=30_000)
+        # An editor is offered a reply to selected text; the READ stage below
+        # repeats the gesture against a locked composer.
+        _drag_select_text(bob_page, bob_page.locator(_ASSISTANT).first.locator("p").first)
+        expect(bob_page.get_by_role("button", name="Reply ↵")).to_be_visible()
 
         # ── Downgrade to READ: composer locks after reload ───────
         shared.owner.put(
@@ -200,6 +216,10 @@ def test_share_grant_downgrade_revoke_journey(
         readonly = bob_page.get_by_placeholder(_READONLY_PLACEHOLDER)
         expect(readonly).to_be_visible(timeout=15_000)
         expect(readonly).to_be_disabled()
+        # A viewer who cannot send must not be offered a reply to the selection.
+        _drag_select_text(bob_page, bob_page.locator(_ASSISTANT).first.locator("p").first)
+        bob_page.wait_for_timeout(1_000)
+        expect(bob_page.get_by_role("button", name="Reply ↵")).to_have_count(0)
         # The API agrees: posting a turn with READ is 403 (has SOME
         # access, so forbidden rather than 404).
         send = shared.bob.post(

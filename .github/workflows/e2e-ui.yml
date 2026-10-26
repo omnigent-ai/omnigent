@@ -72,8 +72,6 @@ jobs:
       contents: read
       pull-requests: read
 
-  # Compute the shard matrix once. A skipped run (draft / fork pull_request)
-  # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
   # Shared with e2e.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
   setup:
     name: UI coverage scope
@@ -241,10 +239,9 @@ jobs:
 
   e2e-ui:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
-    # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
-    # `ready_for_review` re-fires when a draft is converted.
+    # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: [setup, build-sidecar]
+    if: needs.setup.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     timeout-minutes: 60
     strategy:

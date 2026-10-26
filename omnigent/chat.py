@@ -1920,7 +1920,7 @@ def _stop_headless_session(*, base_url: str, session_id: str) -> None:
     # Teardown must never turn a completed run into a failed one.
     try:
         _stop_session_on_server(base_url=base_url, session_id=session_id)
-    except Exception:  # noqa: BLE001 — best-effort cleanup
+    except Exception:  # best-effort cleanup
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
@@ -2657,7 +2657,7 @@ async def _stop_launched_session(client: OmnigentClient, session_id: str) -> Non
     # Teardown must never turn a completed run into a failed one.
     try:
         await client.sessions.post_event(session_id, {"type": "stop_session", "data": {}})
-    except Exception:  # noqa: BLE001 — best-effort cleanup
+    except Exception:  # best-effort cleanup
         logger.debug("could not stop session %s after one-shot run", session_id, exc_info=True)
 
 
@@ -3308,6 +3308,15 @@ def _materialize_override_bundle(source: Path, overrides: ChatOverrides) -> Path
             raise click.ClickException(
                 f"{source}: expected YAML mapping at top level, got {type(raw).__name__}"
             )
+        if source.is_file() and isinstance(raw.get("instructions"), str):
+            from omnigent.inner.loader import _resolve_instructions
+
+            instructions = _resolve_instructions(raw["instructions"], source.parent)
+            if instructions is not None and instructions != raw["instructions"]:
+                # A newline marks one-line file contents as inline text on reload.
+                if instructions and "\n" not in instructions:
+                    instructions += "\n"
+                raw["instructions"] = instructions
         _apply_overrides_to_raw(raw, overrides)
         target.write_text(yaml.safe_dump(raw, default_flow_style=False), encoding="utf-8")
         materialized = target if source.is_file() else target.parent

@@ -1747,7 +1747,11 @@ def test_dependency_readiness_workflow_covers_evidence_and_authorization_events(
         (ROOT / ".github/workflows/maintainer-approval.yml").read_text()
     )
     assert approval_workflow["jobs"]["approve"]["permissions"]["statuses"] == "write"
-    approval_step = approval_workflow["jobs"]["approve"]["steps"][-1]
+    approval_step = next(
+        s
+        for s in approval_workflow["jobs"]["approve"]["steps"]
+        if s.get("name") == "Require maintainer approval"
+    )
     for parser_step in (
         next(s for s in steps if s.get("id") == "parser"),
         next(

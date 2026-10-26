@@ -342,6 +342,30 @@ describe("HostBadge", () => {
     },
   );
 
+  it("names an Arclet in the composer tooltip by its own host name", async () => {
+    useHostsMock.mockReturnValue({
+      data: [host({ name: "omnigent-arclet-1234567890", sandbox_provider: "arclet" })],
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.focus(screen.getByTestId("composer-host-select"));
+    const tooltip = await screen.findByTestId("composer-host-tooltip");
+    expect(tooltip).toHaveTextContent("Host: Arclet Sandbox");
+    expect(tooltip).toHaveTextContent("Name: omnigent-arclet-1234567890");
+    expect(tooltip).toHaveTextContent("Status: Connected");
+  });
+
+  it("keeps another sandbox's managed-* name out of the composer tooltip", async () => {
+    useHostsMock.mockReturnValue({
+      data: [host({ name: "managed-abc123", sandbox_provider: "lakebox" })],
+    });
+    render(<HostBadge sessionId="conv_1" appearance="composer" />);
+    fireEvent.focus(screen.getByTestId("composer-host-select"));
+    const tooltip = await screen.findByTestId("composer-host-tooltip");
+    expect(tooltip).toHaveTextContent("Host: Databricks Sandbox");
+    expect(tooltip).not.toHaveTextContent("Name:");
+    expect(tooltip).not.toHaveTextContent("managed-abc123");
+  });
+
   it("names no host in the composer tooltip for an unbound session", async () => {
     useSessionMock.mockReturnValue({ session: { hostId: null }, isLoading: false, error: null });
     render(<HostBadge sessionId="conv_1" appearance="composer" />);

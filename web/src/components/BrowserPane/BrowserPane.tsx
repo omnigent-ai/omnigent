@@ -18,12 +18,31 @@
 import {
   ChevronLeftIcon,
   ChevronRightIcon,
+  CookieIcon,
   RotateCwIcon,
   SquareDashedMousePointerIcon,
   WrenchIcon,
 } from "lucide-react";
 import { useCallback, useEffect, useRef, useState } from "react";
-import { supportsBrowser } from "@/lib/nativeBridge";
+import { toast } from "sonner";
+import { Button } from "@/components/ui/button";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from "@/components/ui/select";
+import type { ChromeCookieImportResult, ChromeCookiePreviewResult } from "@/lib/nativeBridge";
+import { getDesktopFeatures, supportsBrowser } from "@/lib/nativeBridge";
 import { normalizeTypedUrl } from "@/lib/normalizeTypedUrl";
 import { cn } from "@/lib/utils";
 
@@ -64,6 +83,13 @@ interface BrowserPaneBridge {
   browserGoForward?: (conversationId: string) => Promise<NavResult>;
   browserReload?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   openBrowserDevTools?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Local Chrome profiles holding cookies for the current site (metadata only). */
+  browserChromeCookiePreview?: (conversationId: string) => Promise<ChromeCookiePreviewResult>;
+  /** Copy the current site's Chrome cookies into this conversation's session. */
+  browserChromeCookieImport?: (
+    conversationId: string,
+    args: { profileId: string; expectedHost: string; scope?: string },
+  ) => Promise<ChromeCookieImportResult>;
   browserEnableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   browserDisableDesignMode?: (conversationId: string) => Promise<{ ok: boolean; error?: string }>;
   onBrowserViewCreated?: (callback: (payload: { conversationId: string }) => void) => () => void;
@@ -92,6 +118,24 @@ function getBridge(): BrowserPaneBridge | null {
   if (!supportsBrowser()) return null;
   const w = window as unknown as { omnigentDesktop?: BrowserPaneBridge };
   return w.omnigentDesktop ?? null;
+}
+
+/**
+ * Scopes the user may target for one Chrome profile: the page's host first,
+ * then only the parent domains that profile actually holds a domain cookie for
+ * (main-derived; the shell rejects anything else).
+ */
+function cookieScopeOptions(
+  preview: ChromeCookiePreviewResult | null,
+  profileId: string,
+): string[] {
+  const profile =
+    preview?.profiles?.find((candidate) => candidate.id === profileId) ?? preview?.profiles?.[0];
+  if (profile?.scopes && profile.scopes.length > 0) {
+    return profile.scopes.map((entry) => entry.host);
+  }
+  if (preview?.scopes && preview.scopes.length > 0) return preview.scopes;
+  return preview?.host ? [preview.host] : [];
 }
 
 export interface BrowserPaneProps {
@@ -134,6 +178,21 @@ export function BrowserPane({
   // routing lives in AppShell. This flag only drives the button + enable/disable IPC.
   const [designMode, setDesignMode] = useState(false);
   const designModeRef = useRef(false);
+  // "Import cookies from Chrome" needs BOTH an optional bridge method (older
+  // shells predate it) and the shell's desktop feature flag (macOS only).
+  const [cookieImportSupported, setCookieImportSupported] = useState(false);
+  const [cookiePreview, setCookiePreview] = useState<ChromeCookiePreviewResult | null>(null);
+  const [cookieProfileId, setCookieProfileId] = useState("");
+  const [cookieScope, setCookieScope] = useState("");
+  const [cookieBusy, setCookieBusy] = useState(false);
+
+  // Switching profiles can drop the scope the previous one offered; keep the
+  // state (and therefore the import request) on a scope that is still offered.
+  useEffect(() => {
+    if (!cookiePreview) return;
+    const offered = cookieScopeOptions(cookiePreview, cookieProfileId);
+    if (offered.length > 0 && !offered.includes(cookieScope)) setCookieScope(offered[0]);
+  }, [cookiePreview, cookieProfileId, cookieScope]);
 
   // Track existence through create/close events and a remount probe.
   // Host attach/detach events do not change whether the retained page exists.
@@ -260,6 +319,96 @@ export function BrowserPane({
       setDesignMode(true);
     }
   }, [conversationId, designMode]);
+
+  // Probe the shell's feature gate once: the bridge method alone doesn't mean
+  // the machine can decrypt Chrome's cookies (Windows/Linux report false).
+  useEffect(() => {
+    if (!browserSupported) return;
+    const bridge = getBridge();
+    if (!bridge?.browserChromeCookiePreview || !bridge.browserChromeCookieImport) return;
+    let cancelled = false;
+    void getDesktopFeatures().then((features) => {
+      if (!cancelled) setCookieImportSupported(features?.chromeCookieImport === true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, [browserSupported]);
+
+  // Step 1: ask main what Chrome holds for THIS site (metadata only — the
+  // Keychain prompt belongs to the import, not to opening the dialog).
+  const handlePreviewChromeCookies = useCallback(async () => {
+    const bridge = getBridge();
+    if (!bridge?.browserChromeCookiePreview) return;
+    setCookieBusy(true);
+    try {
+      const preview = await bridge.browserChromeCookiePreview(conversationId);
+      if (!preview?.ok) {
+        toast.error(preview?.error || "Couldn't look for Chrome cookies.");
+        return;
+      }
+      const profiles = preview.profiles ?? [];
+      if (!preview.host || profiles.length === 0) {
+        toast.info(`No Chrome cookies found for ${preview.host ?? "this site"}.`);
+        return;
+      }
+      // Prefer a profile that actually holds cookies for this page.
+      const preferred = profiles.find((profile) => (profile.cookieCount ?? 0) > 0) ?? profiles[0];
+      setCookieProfileId(preferred.id);
+      setCookieScope(preview.host);
+      setCookiePreview({ ...preview, profiles });
+    } catch {
+      toast.error("Couldn't look for Chrome cookies.");
+    } finally {
+      setCookieBusy(false);
+    }
+  }, [conversationId]);
+
+  // Step 2: the user confirmed in the dialog — copy and reload so the site
+  // picks the session up immediately.
+  const handleImportChromeCookies = useCallback(async () => {
+    const bridge = getBridge();
+    const preview = cookiePreview;
+    if (!bridge?.browserChromeCookieImport || !preview?.host || !cookieProfileId) return;
+    const scope = cookieScopeOptions(preview, cookieProfileId).includes(cookieScope)
+      ? cookieScope
+      : preview.host;
+    setCookieBusy(true);
+    try {
+      const result = await bridge.browserChromeCookieImport(conversationId, {
+        profileId: cookieProfileId,
+        expectedHost: preview.host,
+        scope,
+      });
+      if (!result?.ok) {
+        // Declining the shell's own confirmation is not an error.
+        if (result?.cancelled) return;
+        toast.error(result?.error || "Couldn't import cookies from Chrome.");
+        return;
+      }
+      const imported = result.imported ?? 0;
+      const unusable = (result.skipped ?? 0) + (result.failed ?? 0);
+      if (imported === 0) {
+        // Keep the dialog open — another Chrome profile may hold the session.
+        toast.error(
+          (result.failed ?? 0) > 0
+            ? `Chrome's cookies for ${scope} couldn't be saved in this browser session.`
+            : `Chrome had no usable cookies for ${scope}.`,
+        );
+        return;
+      }
+      setCookiePreview(null);
+      const suffix = imported === 1 ? "cookie" : "cookies";
+      toast.success(
+        `Imported ${imported} ${suffix} from Chrome${unusable > 0 ? ` (${unusable} couldn't be used)` : ""}.`,
+      );
+      void bridge.browserReload?.(conversationId);
+    } catch {
+      toast.error("Couldn't import cookies from Chrome.");
+    } finally {
+      setCookieBusy(false);
+    }
+  }, [conversationId, cookiePreview, cookieProfileId, cookieScope]);
 
   // If the view goes away (closed) while design mode is on, drop the pressed
   // state so the button doesn't lie — the injected picker died with the view.
@@ -404,6 +553,15 @@ export function BrowserPane({
   //     canGoBack/canGoForward (both false with no view); reload + DevTools are
   //     explicitly disabled (nothing to reload / no devtools target yet). The
   //     URL bar stays editable so the user can open the first page.
+  const cookieProfiles = cookiePreview?.profiles ?? [];
+  const selectedCookieProfile =
+    cookieProfiles.find((profile) => profile.id === cookieProfileId) ?? cookieProfiles[0];
+  const cookieScopes = cookieScopeOptions(cookiePreview, cookieProfileId);
+  const activeCookieScope = cookieScope || cookieScopes[0] || "";
+  /** Cookies the selected profile holds for one scope. */
+  const countForScope = (scope: string) =>
+    selectedCookieProfile?.scopes?.find((entry) => entry.host === scope)?.cookieCount ??
+    (scope === cookiePreview?.host ? (selectedCookieProfile?.cookieCount ?? 0) : 0);
   return (
     <div
       className={cn("flex min-h-0 min-w-0 flex-col", className)}
@@ -474,6 +632,18 @@ export function BrowserPane({
         >
           <WrenchIcon className="size-4" />
         </button>
+        {cookieImportSupported && (
+          <button
+            type="button"
+            onClick={handlePreviewChromeCookies}
+            disabled={!hasView || cookieBusy}
+            aria-label="Import cookies from Chrome"
+            title="Import this site's cookies from Chrome so you're signed in here too"
+            className="flex size-6 items-center justify-center rounded text-foreground hover:bg-muted disabled:pointer-events-none disabled:opacity-40"
+          >
+            <CookieIcon className="size-4" />
+          </button>
+        )}
         <button
           type="button"
           onClick={handleToggleDesignMode}
@@ -516,6 +686,97 @@ export function BrowserPane({
           {agentBrowser ? " — the agent will open pages here too." : "."}
         </div>
       )}
+      {/* DialogContent mounts SuppressBrowserView, hiding the native view. */}
+      <Dialog
+        open={cookiePreview !== null}
+        onOpenChange={(open) => {
+          if (!open && !cookieBusy) setCookiePreview(null);
+        }}
+      >
+        <DialogContent className="sm:max-w-md">
+          <DialogHeader>
+            <DialogTitle>Import cookies from Chrome</DialogTitle>
+            <DialogDescription>
+              Copies {activeCookieScope}'s cookies into this conversation's browser, so the site
+              reuses the sign-in you already have in Chrome. Nothing is written back to Chrome, and
+              the copy disappears when Omnigent quits.
+            </DialogDescription>
+          </DialogHeader>
+          <div className="flex flex-col gap-3">
+            <div className="flex flex-col gap-1">
+              <span className="text-muted-foreground text-xs">Site</span>
+              {cookieScopes.length > 1 ? (
+                <Select value={activeCookieScope} onValueChange={setCookieScope}>
+                  <SelectTrigger aria-label="Site scope" className="w-full">
+                    <SelectValue>{activeCookieScope}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {cookieScopes.map((scope) => (
+                      <SelectItem key={scope} value={scope}>
+                        {scope} ({countForScope(scope)})
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <span className="break-all font-medium text-sm">{cookiePreview?.host}</span>
+              )}
+            </div>
+            <div className="flex flex-col gap-1">
+              <span className="text-muted-foreground text-xs">Chrome profile</span>
+              {cookieProfiles.length > 1 ? (
+                <Select value={cookieProfileId} onValueChange={setCookieProfileId}>
+                  <SelectTrigger aria-label="Chrome profile" className="w-full">
+                    <SelectValue>{selectedCookieProfile?.name}</SelectValue>
+                  </SelectTrigger>
+                  <SelectContent>
+                    {cookieProfiles.map((profile) => (
+                      <SelectItem key={profile.id} value={profile.id}>
+                        {profile.name} (
+                        {profile.scopes?.find((entry) => entry.host === activeCookieScope)
+                          ?.cookieCount ?? profile.cookieCount}
+                        )
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+              ) : (
+                <span className="font-medium text-sm">{selectedCookieProfile?.name}</span>
+              )}
+            </div>
+            <p className="text-muted-foreground text-xs">
+              {countForScope(activeCookieScope)}{" "}
+              {countForScope(activeCookieScope) === 1 ? "cookie" : "cookies"} for{" "}
+              {activeCookieScope} and its subdomains. Other sites' cookies stay out of Omnigent
+              entirely.
+            </p>
+            {activeCookieScope !== cookiePreview?.host && (
+              <p className="text-muted-foreground text-xs">
+                Cookies from other subdomains stay bound to their own host, so they only apply once
+                the tab visits them.
+              </p>
+            )}
+            <p className="text-muted-foreground text-xs">
+              macOS asks for permission to read Chrome's key from your login Keychain. Choose Allow,
+              not Always Allow: Always Allow lets any local process read the key.
+            </p>
+            <p className="text-destructive text-xs">
+              {/* Agent and user tabs share one jar per conversation: the agent can
+                  act as you on this site whether or not it drives this tab. */}
+              This conversation's tabs share one cookie jar, including any tab the agent controls,
+              so the agent can act as you on this site while these cookies are loaded.
+            </p>
+          </div>
+          <DialogFooter>
+            <Button variant="outline" onClick={() => setCookiePreview(null)} disabled={cookieBusy}>
+              Cancel
+            </Button>
+            <Button onClick={handleImportChromeCookies} disabled={cookieBusy}>
+              {cookieBusy ? "Importing…" : "Import cookies"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }

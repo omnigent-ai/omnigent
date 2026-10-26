@@ -20,6 +20,8 @@ import {
   computeShowsWorking,
   containsMarkdownTable,
   dispatchInitialPrompt,
+  failedSessionLastError,
+  isComposerReadOnly,
   isCostRoutingEligible,
   isSubagentRoutingEligible,
   isUnboundCodingFork,
@@ -52,7 +54,7 @@ import { nativeCodingAgentForHarness, WRAPPER_LABEL_KEY } from "@/lib/nativeCodi
 // or hide the share button from managers.
 
 function composerState(permissionLevel: number | null) {
-  const isReadOnly = permissionLevel === 1;
+  const isReadOnly = isComposerReadOnly(permissionLevel, null, null);
   const canType = !isReadOnly;
   const canSubmit = !isReadOnly;
   return { isReadOnly, canType, canSubmit };
@@ -89,6 +91,17 @@ describe("Composer permission gating", () => {
     const state = composerState(null);
     expect(state.isReadOnly).toBe(false);
     expect(state.canType).toBe(true);
+  });
+
+  it("a structural read-only reason locks the composer at any level", () => {
+    expect(isComposerReadOnly(4, "Mirrored transcript", null)).toBe(true);
+    expect(isComposerReadOnly(null, "Mirrored transcript", null)).toBe(true);
+  });
+
+  it("a temporary send block keeps the level-1 startup fallback editable", () => {
+    // A client-only conversation falls back to level 1 before its session
+    // exists; the send block, not read-only, is what holds submission.
+    expect(isComposerReadOnly(1, null, "Starting the session…")).toBe(false);
   });
 });
 
@@ -204,6 +217,23 @@ describe("Terminal-first surface selection", () => {
       }),
     ).toBe(false);
     expect(shouldMountTerminalSurface(null, null)).toBe(false);
+  });
+});
+
+describe("failedSessionLastError", () => {
+  const error = { code: "runner_failed_to_start", message: "host authentication failed" };
+
+  it("surfaces the error for a failed session", () => {
+    expect(failedSessionLastError({ status: "failed", lastTaskError: error })).toEqual(error);
+  });
+
+  it("hides a stale error on a session that is no longer failed", () => {
+    expect(failedSessionLastError({ status: "running", lastTaskError: error })).toBeNull();
+  });
+
+  it("returns null for a failed session with no error, or no session", () => {
+    expect(failedSessionLastError({ status: "failed" })).toBeNull();
+    expect(failedSessionLastError(null)).toBeNull();
   });
 });
 
@@ -1354,10 +1384,11 @@ describe("buildSlashCommandMap", () => {
   it("returns the built-ins unchanged when no skills are loaded", () => {
     const map = buildSlashCommandMap([], true, true);
     // Insertion-order: built-ins come from the static record verbatim.
-    // /btw (claude-native) and /side (codex-native) are gated off by default,
-    // so both are excluded here.
+    // Session- and harness-specific commands are gated off by default.
     expect(Object.keys(map)).toEqual(
-      Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      Object.keys(BUILTIN_SLASH_COMMANDS).filter(
+        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
+      ),
     );
     // Spot-check a built-in description survives the spread.
     expect(map["/help"]).toBe(BUILTIN_SLASH_COMMANDS["/help"]);
@@ -1373,6 +1404,13 @@ describe("buildSlashCommandMap", () => {
     );
   });
 
+  it("includes /clear only when showClear is true (native terminals)", () => {
+    expect(buildSlashCommandMap([], true, true)["/clear"]).toBeUndefined();
+    expect(
+      buildSlashCommandMap([], true, true, true, false, false, "/", false, false, true)["/clear"],
+    ).toBe(BUILTIN_SLASH_COMMANDS["/clear"]);
+  });
+
   it("includes /btw only when showBtw is true (claude-native)", () => {
     // Off by default and when explicitly false.
     expect(buildSlashCommandMap([], true, true)["/btw"]).toBeUndefined();
@@ -1380,6 +1418,13 @@ describe("buildSlashCommandMap", () => {
     // On when the session is claude-native.
     expect(buildSlashCommandMap([], true, true, true, true)["/btw"]).toBe(
       BUILTIN_SLASH_COMMANDS["/btw"],
+    );
+  });
+
+  it("includes /mcp only for a started session", () => {
+    expect(buildSlashCommandMap([], true, true)["/mcp"]).toBeUndefined();
+    expect(buildSlashCommandMap([], true, true, true, false, false, "/", false, true)["/mcp"]).toBe(
+      BUILTIN_SLASH_COMMANDS["/mcp"],
     );
   });
 
@@ -1430,9 +1475,11 @@ describe("buildSlashCommandMap", () => {
       true,
     );
     // Built-ins first, then skills in their input order — the menu
-    // surfaces built-ins above user skills. /btw and /side are gated off.
+    // surfaces built-ins above user skills. Session- and harness-specific commands are gated off.
     expect(Object.keys(map)).toEqual([
-      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter((name) => name !== "/btw" && name !== "/side"),
+      ...Object.keys(BUILTIN_SLASH_COMMANDS).filter(
+        (name) => !["/btw", "/side", "/mcp", "/clear"].includes(name),
+      ),
       "/triage-issues",
       "/mlflow-bug",
     ]);

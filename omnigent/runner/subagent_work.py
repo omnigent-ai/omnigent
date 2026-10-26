@@ -886,7 +886,7 @@ async def run_subagent_launch_reaper(
             reap_stalled_subagent_launches(mark_terminal=mark_terminal)
             if reconcile_pending is not None:
                 await reconcile_pending()
-        except Exception:  # noqa: BLE001 — the sweep is a backstop; never die.
+        except Exception:  # the sweep is a backstop; never die.
             _logger.warning("sub-agent launch reaper sweep failed", exc_info=True)
 
 

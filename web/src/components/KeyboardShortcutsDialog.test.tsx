@@ -134,6 +134,7 @@ describe("KeyboardShortcutsDialog", () => {
     expect(screen.getByText("Show keyboard shortcuts")).toBeTruthy();
     expect(screen.getByText("Send message")).toBeTruthy();
     expect(keysFor("Open model picker")).toEqual(["Ctrl", "⇧", "M"]);
+    expect(keysFor("Cycle permission mode (in session)")).toEqual(["⇧", "Tab"]);
     expect(screen.getByText("Recall previous prompt")).toBeTruthy();
     expect(screen.getByText("Previous session")).toBeTruthy();
     expect(keysFor("Previous session")).toEqual(["Ctrl", "["]);

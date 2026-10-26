@@ -128,7 +128,9 @@ def test_relay_process_failure_cleanup(tmp_path: Path, failure: str) -> None:
             "import os,signal,time; from pathlib import Path; "
             "signal.signal(signal.SIGHUP, lambda *_: "
             "(time.sleep(0.05), print('graceful-exit-tail', flush=True), exit(23))); "
-            f"Path({str(ready)!r}).write_text(str(os.getpid())); "
+            # Publish readiness only after the PID file is fully written and closed.
+            f"ready = Path({str(ready)!r}); pending = ready.with_suffix('.tmp'); "
+            "pending.write_text(str(os.getpid())); pending.replace(ready); "
             "time.sleep(30)",
         ]
         # Inject only the outer input failure; fork, inner PTY and child are real.

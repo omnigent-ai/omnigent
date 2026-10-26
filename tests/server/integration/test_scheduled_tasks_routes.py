@@ -20,7 +20,12 @@ from omnigent.db.utils import builtin_agent_id
 from omnigent.native.native_coding_agents import CLAUDE_NATIVE_AGENT_NAME
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
+from omnigent.server.feature_flags import resolve_feature_flags
 from omnigent.server.routes import scheduled_tasks as scheduled_tasks_routes
+from omnigent.server.scheduled.dispatch_scheduler import (
+    PersistentTaskScheduler,
+    ScheduledTaskDispatchHooks,
+)
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -55,10 +60,13 @@ def _stub_host_workspace_validation(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 @pytest.fixture()
-def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
+def auth_app(
+    runtime_init: None, db_uri: str, tmp_path: Path, request: pytest.FixtureRequest
+) -> FastAPI:
     from omnigent.server.auth import UnifiedAuthProvider
     from omnigent.stores.host_store import HostStore
 
+    persistent = getattr(request, "param", False)
     artifact_store = LocalArtifactStore(str(tmp_path / "artifacts"))
     app = create_app(
         agent_store=SqlAlchemyAgentStore(db_uri),
@@ -73,6 +81,15 @@ def auth_app(runtime_init: None, db_uri: str, tmp_path: Path) -> FastAPI:
         # ``app.state.host_store`` is None and the route skips the check.
         host_store=HostStore(db_uri),
         auth_provider=UnifiedAuthProvider(source="header"),
+        feature_flags=resolve_feature_flags(
+            {"OMNIGENT_FEATURES": "automations_v2" if persistent else "-automations_v2"}
+        ),
+        server_config={"scheduled_task_scheduler": {"startup_retry_seconds": 0.01}},
+        scheduled_task_dispatch=(
+            ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock(return_value=None))
+            if persistent
+            else None
+        ),
     )
     _make_user(db_uri)
     _register_host(app, "4b653f6031f35d168cc0b37caa1306d1", "alice@example.com")
@@ -943,18 +960,138 @@ async def test_update_rejects_invalid_reasoning_effort(
     assert bad.status_code == 400, bad.text
 
 
-async def test_delete_removes_task(auth_client: httpx.AsyncClient, db_uri: str) -> None:
+@pytest.mark.parametrize("claimed", [False, True])
+async def test_delete_removes_task(
+    auth_client: httpx.AsyncClient, db_uri: str, claimed: bool
+) -> None:
     _make_user(db_uri)
     created = (
         await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
     ).json()
     task_id = created["id"]
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    if claimed:
+        task = store.get(task_id)
+        from omnigent.server.scheduled.schedule import next_scheduled_time
+
+        assert store.initialize_next_run_at(task, next_scheduled_time(task, task.created_at))
+        task = store.get(task_id)
+        assert task is not None and task.next_run_at is not None
+        assert (
+            store.claim_scheduled_run(
+                task,
+                now=task.next_run_at,
+                next_run_at=task.next_run_at + 3600,
+                host_id=task.host_id,
+                lease_seconds=120,
+            )
+            is not None
+        )
 
     deleted = await auth_client.delete(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert deleted.status_code == 200, deleted.text
 
     got = await auth_client.get(f"/v1/scheduled-tasks/{task_id}", headers=_headers())
     assert got.status_code == 404
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert listed.json()["scheduled_tasks"] == []
+    if claimed:
+        assert store.get(task_id).state == "deleted"
+        assert len(store.list_runs(task_id)[0]) == 1
+        for method, suffix, body in [
+            ("get", "/runs", None),
+            ("post", "/run", None),
+            ("patch", "", {"state": "active"}),
+            ("delete", "", None),
+        ]:
+            response = await auth_client.request(
+                method,
+                f"/v1/scheduled-tasks/{task_id}{suffix}",
+                headers=_headers(),
+                json=body,
+            )
+            assert response.status_code == 404
+
+
+async def test_delete_cleanup_failure_still_returns_success_off_event_loop(
+    auth_client,
+    auth_app,
+    db_uri,
+    monkeypatch,
+):
+    import threading
+
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    request_thread = threading.get_ident()
+    cleanup_threads = []
+
+    def fail_cleanup(self, task_id, *, after=None):
+        cleanup_threads.append(threading.get_ident())
+        raise RuntimeError("cleanup interrupted")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SqlAlchemyScheduledTaskStore, "_purge_deleted_task_page", fail_cleanup)
+        response = await auth_client.delete(
+            f"/v1/scheduled-tasks/{created['id']}", headers=_headers()
+        )
+    assert response.status_code == 200, response.text
+    assert cleanup_threads and request_thread not in cleanup_threads
+    assert auth_app.state.scheduled_task_scheduler.job_count == 0
+    assert (
+        await auth_client.get(f"/v1/scheduled-tasks/{created['id']}", headers=_headers())
+    ).status_code == 404
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    assert store.get(created["id"]).state == "deleted"
+    store.purge_deleted_tasks()
+    assert store.get(created["id"]) is None
+
+
+@pytest.mark.parametrize("operation", ["create", "update"])
+async def test_schedule_search_failure_returns_400_and_rolls_back(
+    auth_client,
+    auth_app,
+    db_uri,
+    monkeypatch,
+    operation,
+):
+    from omnigent.server.scheduled.rrule import RRuleSearchError
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    store = auth_app.state.scheduled_task_scheduler._store
+    store.configure_dispatch(True)
+    existing = None
+    if operation == "update":
+        created = (
+            await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+        ).json()
+        existing = store.get(created["id"])
+
+    def fail_actual_schedule(*args):
+        raise RRuleSearchError("search budget exceeded")
+
+    monkeypatch.setattr(sqlalchemy_store, "next_scheduled_time", fail_actual_schedule)
+    if operation == "create":
+        response = await auth_client.post(
+            "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+        )
+    else:
+        response = await auth_client.patch(
+            f"/v1/scheduled-tasks/{existing.id}",
+            json={"rrule": "FREQ=DAILY;BYHOUR=12"},
+            headers=_headers(),
+        )
+    assert response.status_code == 400, response.text
+    assert "Could not calculate the next run time for this schedule." in response.text
+    expected_outcome = (
+        "The task was not created." if operation == "create" else "Your changes were not saved."
+    )
+    assert expected_outcome in response.text
+    if existing is None:
+        assert store.list() == []
+    else:
+        assert store.get(existing.id) == existing
 
 
 async def test_other_users_task_is_not_visible(
@@ -1794,3 +1931,132 @@ async def test_run_now_503_when_scheduler_not_running(
     auth_app.state.scheduled_task_run_now = None
     resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
     assert resp.status_code == 503, resp.text
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+@pytest.mark.parametrize("scheduler_available", [True, False])
+async def test_database_scheduler_crud_uses_persisted_next_run(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    scheduler_available: bool,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from datetime import datetime
+
+    # The opt-in scheduler has no per-task timers to update; each request persists
+    # its schedule and renders that same value without another scheduler lookup.
+    assert isinstance(auth_app.state.scheduled_task_scheduler, PersistentTaskScheduler)
+    assert auth_app.state.scheduled_task_scheduler.is_started
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    if not scheduler_available:
+        await auth_app.state.scheduled_task_scheduler.stop()
+        monkeypatch.setattr(auth_app.state, "scheduled_task_scheduler", None)
+    created = await auth_client.post(
+        "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+    )
+    assert created.status_code == 200, created.text
+    task = created.json()
+    assert (
+        datetime.fromisoformat(task["next_run_at"]).timestamp()
+        == store.get(task["id"]).next_run_at
+    )
+    url = f"/v1/scheduled-tasks/{task['id']}"
+    fetched = await auth_client.get(url, headers=_headers())
+    assert fetched.status_code == 200, fetched.text
+    assert fetched.json()["next_run_at"] == task["next_run_at"]
+    listed = await auth_client.get("/v1/scheduled-tasks", headers=_headers())
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["scheduled_tasks"][0]["next_run_at"] == task["next_run_at"]
+    for edit in ({"rrule": "FREQ=DAILY;BYHOUR=17"}, {"timezone": "Asia/Tokyo"}):
+        changed = await auth_client.patch(url, json=edit, headers=_headers())
+        assert changed.status_code == 200, changed.text
+        assert all(changed.json()[key] == value for key, value in edit.items())
+        assert changed.json()["next_run_at"] != fetched.json()["next_run_at"]
+        assert (
+            datetime.fromisoformat(changed.json()["next_run_at"]).timestamp()
+            == store.get(task["id"]).next_run_at
+        )
+        fetched = changed
+    paused = await auth_client.patch(url, json={"state": "paused"}, headers=_headers())
+    assert paused.status_code == 200, paused.text
+    assert paused.json()["next_run_at"] is None
+    resumed = await auth_client.patch(url, json={"state": "active"}, headers=_headers())
+    assert resumed.status_code == 200, resumed.text
+    assert resumed.json()["next_run_at"] is not None
+    deleted = await auth_client.delete(url, headers=_headers())
+    assert deleted.status_code == 200, deleted.text
+    assert store.get(task["id"]) is None
+
+
+@pytest.mark.parametrize("load_fails", [False, True])
+async def test_legacy_retry_keeps_tasks_created_and_edited_during_load(
+    auth_app, db_uri, monkeypatch, load_fails
+):
+    import asyncio
+    from threading import Event
+
+    from tests._helpers.polling import poll_until_async
+
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    existing = store.create(
+        "0123456789abcdef0123456789abcdef",
+        "existing",
+        "prompt",
+        "FREQ=DAILY;BYHOUR=9",
+        "alice@example.com",
+        builtin_agent_id(CLAUDE_NATIVE_AGENT_NAME),
+        "UTC",
+    )
+    entered, release = asyncio.Event(), Event()
+    loop = asyncio.get_running_loop()
+    load = SqlAlchemyScheduledTaskStore.list_active_all_workspaces
+    attempts = 0
+
+    def fail_then_snapshot(self):
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise RuntimeError("temporary database outage")
+        snapshot = load(self)
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10), "Startup snapshot was never released"
+        if load_fails and attempts == 2:
+            raise RuntimeError("database read failed after route mutations")
+        return snapshot
+
+    monkeypatch.setattr(
+        SqlAlchemyScheduledTaskStore, "list_active_all_workspaces", fail_then_snapshot
+    )
+    async with auth_app.router.lifespan_context(auth_app):
+        assert auth_app.state.scheduled_task_scheduler is None
+        try:
+            await asyncio.wait_for(entered.wait(), 10)
+            async with httpx.AsyncClient(
+                transport=httpx.ASGITransport(app=auth_app), base_url="http://test"
+            ) as client:
+                created = await client.post(
+                    "/v1/scheduled-tasks", json=_create_body(), headers=_headers()
+                )
+                assert created.status_code == 200, created.text
+                edited = await client.patch(
+                    f"/v1/scheduled-tasks/{existing.id}",
+                    json={"rrule": "FREQ=DAILY;BYHOUR=17", "timezone": "Asia/Tokyo"},
+                    headers=_headers(),
+                )
+                assert edited.status_code == 200, edited.text
+                assert created.json()["next_run_at"] is not None
+                assert edited.json()["next_run_at"] is not None
+        finally:
+            release.set()
+        await poll_until_async(
+            lambda: (
+                auth_app.state.scheduled_task_scheduler is not None
+                and auth_app.state.scheduled_task_scheduler.is_started
+            ),
+            timeout_s=10,
+        )
+        scheduler = auth_app.state.scheduled_task_scheduler
+        assert scheduler.job_count == 2
+        assert scheduler.next_run_at(created.json()["id"]) == created.json()["next_run_at"]
+        assert scheduler.next_run_at(existing.id) == edited.json()["next_run_at"]

@@ -1,4 +1,9 @@
-"""Notify the old conversation when a native harness rotates to its successor."""
+"""Tell a superseded native session that ``/clear`` moved its terminal.
+
+Native ``/clear`` (Claude Code's hook, Codex's new app-server thread) rotates
+the terminal onto a fresh Omnigent session. The old session never sees another
+turn, so its viewers need an explicit notice and redirect.
+"""
 
 from __future__ import annotations
 
@@ -10,17 +15,15 @@ import httpx
 _logger = logging.getLogger(__name__)
 
 
-async def post_supersession_notice(
+async def post_clear_supersession(
     client: httpx.AsyncClient,
     *,
     old_session_id: str,
     new_session_id: str,
     agent_name: str,
-    command: str,
-    old_session_resumable: bool,
 ) -> None:
     """
-    Notify the superseded session that a new-conversation command rotated it away.
+    Notify the superseded session that a ``/clear`` rotated it away.
 
     Posts three best-effort events to the OLD conversation, in order:
 
@@ -29,7 +32,7 @@ async def post_supersession_notice(
        so it will never receive the turn-end edge that would normally
        clear it.
     2. A persisted assistant ``message`` item linking to the new
-       conversation, so a later reload of the superseded conversation
+       conversation, so a later reload of the cleared conversation
        explains what happened and offers the continuation link. This is
        the durable record — it survives reconnects.
     3. A transient ``external_session_superseded`` event the server
@@ -37,31 +40,26 @@ async def post_supersession_notice(
        viewing the old conversation auto-redirects to the new one.
 
     Each failure is logged and swallowed: the rotation has already
-    completed, and a notification error must not disrupt the caller's
-    forward/read loop or stop the new session from forwarding.
+    completed and reset forwarder state, and a notification error must
+    not disrupt the poll loop or stop the new session from forwarding.
 
     :param client: Omnigent HTTP client (``base_url`` = AP server).
     :param old_session_id: Superseded conversation id, e.g. ``"conv_old"``.
     :param new_session_id: Rotated-to conversation id, e.g. ``"conv_new"``.
     :param agent_name: Agent name to stamp on the notice message — an
         assistant ``message`` item requires one.
-    :param command: Vendor command that rotated the session, e.g.
-        ``"/clear"`` or ``"/new"``. Named in the notice text.
-    :param old_session_resumable: Whether sending a message to the old
-        conversation resumes it. Claude keeps the old executor bound
-        (``True``); Codex and Antigravity transfer the bridge to the
-        replacement (``False``), so the notice omits the resume offer.
     :returns: None.
     """
     if old_session_id == new_session_id:
         # Defensive: never address the notice/redirect at the live session.
-        # If the caller's old id ever collapses to the new id, posting here
-        # would dump the supersession banner onto the active chat.
+        # The caller resolves the old id from the pre-rotation forwarder
+        # state, but if that ever collapses to the new id, posting here
+        # would dump the "you were cleared" banner onto the active chat.
         return
-    old_events_url = f"/v1/sessions/{urllib.parse.quote(old_session_id, safe='')}/events"
+    events_path = f"/v1/sessions/{urllib.parse.quote(old_session_id, safe='')}/events"
     try:
         status_resp = await client.post(
-            old_events_url,
+            events_path,
             json={
                 "type": "external_session_status",
                 "data": {"status": "idle"},
@@ -70,23 +68,20 @@ async def post_supersession_notice(
         status_resp.raise_for_status()
     except httpx.HTTPError:
         _logger.warning(
-            "Failed to post %s supersession idle status; old_session=%s new_session=%s",
-            command,
+            "Failed to post /clear supersession idle status; old_session=%s new_session=%s",
             old_session_id,
             new_session_id,
             exc_info=True,
             extra={"session_id": old_session_id},
         )
     notice = (
-        f"This conversation was ended by `{command}`. "
-        f"Continue in [the new chat](/c/{urllib.parse.quote(new_session_id, safe='')})."
+        "This conversation was ended by `/clear`. "
+        f"Continue in [the new chat](/c/{new_session_id}). "
+        "You can also send a message here to resume this conversation."
     )
-    if old_session_resumable:
-        # Only Claude keeps the old executor bound, so only it can resume in place.
-        notice += " You can also send a message here to resume this conversation."
     try:
         item_resp = await client.post(
-            old_events_url,
+            events_path,
             json={
                 "type": "external_conversation_item",
                 "data": {
@@ -102,8 +97,7 @@ async def post_supersession_notice(
         item_resp.raise_for_status()
     except httpx.HTTPError:
         _logger.warning(
-            "Failed to post %s supersession notice; old_session=%s new_session=%s",
-            command,
+            "Failed to post /clear supersession notice; old_session=%s new_session=%s",
             old_session_id,
             new_session_id,
             exc_info=True,
@@ -111,7 +105,7 @@ async def post_supersession_notice(
         )
     try:
         event_resp = await client.post(
-            old_events_url,
+            events_path,
             json={
                 "type": "external_session_superseded",
                 "data": {"target_conversation_id": new_session_id},
@@ -120,8 +114,7 @@ async def post_supersession_notice(
         event_resp.raise_for_status()
     except httpx.HTTPError:
         _logger.warning(
-            "Failed to post %s supersession redirect event; old_session=%s new_session=%s",
-            command,
+            "Failed to post /clear supersession redirect event; old_session=%s new_session=%s",
             old_session_id,
             new_session_id,
             exc_info=True,
