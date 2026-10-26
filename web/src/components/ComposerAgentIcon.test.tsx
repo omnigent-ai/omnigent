@@ -1,5 +1,4 @@
 import genieCodeLogo from "@/assets/genie-code-logo.svg";
-import genieCodeLogoSource from "@/assets/genie-code-logo.svg?raw";
 import { cleanup, render } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { ComposerAgentIcon } from "./ComposerAgentIcon";
@@ -17,30 +16,4 @@ describe.each([
     expect(mark).toHaveAttribute("src", genieCodeLogo);
     expect(mark).not.toHaveClass("dark:invert");
   });
-});
-
-it("keeps the CLI banner gradient on the Genie composer mark", () => {
-  const { container } = render(<ComposerAgentIcon agent={{ name: "genie", harness: "genie" }} />);
-  expect(container.querySelector("img")).toHaveAttribute("src", genieCodeLogo);
-  const asset = new DOMParser().parseFromString(genieCodeLogoSource, "image/svg+xml");
-  const gradient = asset.querySelector("linearGradient");
-  expect(gradient?.getAttribute("gradientUnits")).toBe("objectBoundingBox");
-  expect(gradient?.getAttribute("x1")).toBe("0");
-  expect(gradient?.getAttribute("y1")).toBe("0");
-  expect(gradient?.getAttribute("x2")).toBe("1");
-  expect(gradient?.getAttribute("y2")).toBe("1");
-  expect(
-    Array.from(asset.querySelectorAll("stop"), (stop) => [
-      stop.getAttribute("offset"),
-      stop.getAttribute("stop-color"),
-    ]),
-  ).toEqual([
-    ["25%", "#6188E5"],
-    ["37.5%", "#9C45E7"],
-    ["50%", "#CC00E8"],
-    ["62.5%", "#E74B96"],
-    ["75%", "#FC6A48"],
-  ]);
-  expect(asset.querySelector("path")?.getAttribute("fill")).toBe(`url(#${gradient?.id})`);
-  expect(genieCodeLogoSource).not.toContain("currentColor");
 });

@@ -1600,6 +1600,23 @@ def _build_codex_spawn_env(
     return env
 
 
+def _genie_codex_owned_selection(
+    spec: AgentSpec, provider: ProviderEntry | None
+) -> Literal["implicit", "explicit"] | None:
+    if (
+        provider is None
+        or provider.cli != "codex"
+        or provider.kind not in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND)
+    ):
+        return None
+    from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
+
+    binding = binding_for_harness(load_runtime_inference_config(load_config()), "genie")
+    if isinstance(spec.executor.auth, ProviderAuth) or binding is not None:
+        return "explicit"
+    return "implicit"
+
+
 def _build_genie_spawn_env(
     spec: AgentSpec,
     *,
@@ -1630,15 +1647,9 @@ def _build_genie_spawn_env(
     if model is not None:
         env["HARNESS_GENIE_MODEL"] = model
     provider = _resolve_provider_for_build(spec, harness_type="genie", for_launch=True)
-    if (
-        provider is not None
-        and provider.cli == "codex"
-        and provider.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND)
-    ):
-        from omnigent.inference_config import binding_for_harness, load_runtime_inference_config
-
-        binding = binding_for_harness(load_runtime_inference_config(load_config()), "genie")
-        if isinstance(spec.executor.auth, ProviderAuth) or binding is not None:
+    codex_owned_selection = _genie_codex_owned_selection(spec, provider)
+    if provider is not None and codex_owned_selection is not None:
+        if codex_owned_selection == "explicit":
             raise OmnigentError(
                 f"provider {provider.name!r} uses Codex-owned credentials, which Genie "
                 "cannot consume. Select a Databricks or OpenAI-compatible provider in "

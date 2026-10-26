@@ -868,7 +868,10 @@ def _genie_provider_availability() -> HarnessAvailability:
     :returns: ``True`` or ``"needs-auth"``.
     """
     try:
-        from omnigent.runtime.workflow import _resolve_provider_for_build
+        from omnigent.runtime.workflow import (
+            _genie_codex_owned_selection,
+            _resolve_provider_for_build,
+        )
         from omnigent.spec.types import AgentSpec, ExecutorSpec
 
         spec = AgentSpec(
@@ -878,23 +881,13 @@ def _genie_provider_availability() -> HarnessAvailability:
             executor=ExecutorSpec(type="omnigent", config={"harness": "genie"}),
         )
         provider = _resolve_provider_for_build(spec, harness_type="genie", for_launch=True)
-        if (
-            provider is not None
-            and provider.cli == "codex"
-            and provider.kind in (SUBSCRIPTION_KIND, CLI_CONFIG_KIND)
-        ):
-            from omnigent.inference_config import (
-                binding_for_harness,
-                load_runtime_inference_config,
-            )
+        codex_owned_selection = _genie_codex_owned_selection(spec, provider)
+        if codex_owned_selection == "explicit":
+            return HARNESS_NEEDS_AUTH
+        if codex_owned_selection == "implicit":
             from omnigent.inner.codex_executor import _codex_home_config_source_from_env
             from omnigent.inner.genie_executor import GENIE_HOME_DIR_NAME, GENIE_HOME_ENV_VAR
 
-            if (
-                binding_for_harness(load_runtime_inference_config(load_config()), "genie")
-                is not None
-            ):
-                return HARNESS_NEEDS_AUTH
             genie_home = _codex_home_config_source_from_env(
                 GENIE_HOME_ENV_VAR, GENIE_HOME_DIR_NAME
             )
