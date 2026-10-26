@@ -169,7 +169,9 @@ describe("side-chat working indicator", () => {
       }),
     );
 
-    expect(screen.getByTestId("working-indicator")).toHaveTextContent("Blocked on: tool approval");
+    expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+      "Waiting for you in the agent's terminal (tool approval).",
+    );
     expect(screen.getByRole("button", { name: "Interrupt side chat" })).toBeEnabled();
   });
 

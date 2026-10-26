@@ -3152,6 +3152,11 @@ describe("Sidebar view options", () => {
     "In the last 7 days",
     "In the last 30 days",
     "Earlier",
+    "acp:private",
+    "Claude Code",
+    "Claude SDK",
+    "Codex",
+    "Unknown harness",
   ]);
   const groupHeaders = () =>
     screen
@@ -3179,7 +3184,76 @@ describe("Sidebar view options", () => {
     );
     expect(screen.getByRole("menuitemradio", { name: "Created" })).toBeInTheDocument();
     expect(screen.getByRole("menuitemradio", { name: "Updated" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: "Harness" })).toBeInTheDocument();
   });
+
+  it.each(["created", "updated"])(
+    "groups by harness across agents, projects and sharing with %s ordering",
+    (ordering) => {
+      localStorage.setItem(
+        "omnigent:sidebar-view",
+        JSON.stringify({ grouping: "harness", ordering }),
+      );
+      projectsMock.push("Customer X");
+      seedPins(["conv_pinned"]);
+      mockConversations([
+        conv("conv_project_native", "project_builder", {
+          harness: "codex-native",
+          created_at: 1,
+          updated_at: 300,
+          labels: { omni_project: "Customer X" },
+        }),
+        conv("conv_shared_sdk", "shared_reviewer", {
+          harness: "codex",
+          created_at: 3,
+          updated_at: 100,
+          owner: "other@example.com",
+        }),
+        conv("conv_custom_sdk", "custom_builder", {
+          harness: "codex",
+          created_at: 2,
+          updated_at: 200,
+        }),
+        conv("conv_wrapper", "custom_name", {
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        }),
+        conv("conv_claude_sdk", "custom_claude", { harness: "claude-sdk" }),
+        conv("conv_raw", "custom_acp", { harness: "acp:private" }),
+        conv("conv_unknown", "named_without_harness"),
+        conv("conv_pinned", "pinned_agent", { harness: "pi-native" }),
+      ]);
+      renderGroupingSidebar();
+      selectSessionFilter("all");
+      expect(groupHeaders()).toEqual([
+        "acp:private",
+        "Claude Code",
+        "Claude SDK",
+        "Codex",
+        "Unknown harness",
+      ]);
+      expect(
+        within(groupSection("Codex"))
+          .getAllByRole("link", { name: /^conv_/ })
+          .map((link) => link.textContent),
+      ).toEqual(
+        ordering === "created"
+          ? ["conv_shared_sdk", "conv_custom_sdk", "conv_project_native"]
+          : ["conv_project_native", "conv_custom_sdk", "conv_shared_sdk"],
+      );
+      for (const [title, id] of [
+        ["Claude Code", "conv_wrapper"],
+        ["Claude SDK", "conv_claude_sdk"],
+        ["acp:private", "conv_raw"],
+        ["Unknown harness", "conv_unknown"],
+        ["Pinned", "conv_pinned"],
+      ]) {
+        expect(within(groupSection(title!)).getByText(id!)).toBeInTheDocument();
+      }
+      expect(screen.queryByRole("button", { name: "Projects" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Pi" })).toBeNull();
+    },
+  );
 
   it.each(["empty", "loading", "error"])("keeps Working visible while %s", (state) => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
@@ -3278,15 +3352,18 @@ describe("Sidebar view options", () => {
     expect(within(firstGroup).getByTestId("sessions-new-session")).toBeTruthy();
   });
 
-  it("keeps the filter reachable on the Sessions header when there's nothing to group", () => {
-    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "updated" }));
-    mockConversations([]);
-    renderGroupingSidebar();
+  it.each(["updated", "harness"])(
+    "keeps the filter reachable when %s has nothing to group",
+    (grouping) => {
+      localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping }));
+      mockConversations([]);
+      renderGroupingSidebar();
 
-    expect(screen.queryByText("Projects")).toBeNull();
-    const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
-    expect(within(sessions).getByTestId("session-filter")).toBeTruthy();
-  });
+      expect(screen.queryByText("Projects")).toBeNull();
+      const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+      expect(within(sessions).getByTestId("session-filter")).toBeTruthy();
+    },
+  );
 
   it("keeps Load more while any group is expanded", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "updated" }));
@@ -3737,7 +3814,7 @@ describe("sidebar_grouping_ui release flag", () => {
     }),
   ];
 
-  it.each(["status", "created"])(
+  it.each(["status", "created", "harness"])(
     "ignores saved %s grouping while the flag is off",
     async (grouping) => {
       localStorage.setItem(

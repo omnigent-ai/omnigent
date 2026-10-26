@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from pathlib import Path
@@ -122,6 +123,40 @@ class _RecordingClaudeRegistry:
             name="claude:main",
             metadata={"terminal_name": "claude", "session_key": "main", "running": True},
         )
+
+
+class _ResumeSnapshotServerClient(NullServerClient):
+    """Server client serving one session snapshot, empty labels and optional items."""
+
+    def __init__(
+        self,
+        session_url: str,
+        snapshot: dict[str, Any],
+        items: list[dict[str, Any]] | None = None,
+    ) -> None:
+        self._session_url = session_url
+        self._snapshot = snapshot
+        self._items = items
+
+    async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
+        """Return empty labels (so the bridge id is the session id), items or the snapshot."""
+        del kwargs
+        if url.endswith("/labels"):
+            payload: dict[str, Any] = {"labels": {}}
+        elif self._items is not None and url == f"{self._session_url}/items":
+            payload = {"data": self._items}
+        else:
+            assert url == self._session_url
+            payload = self._snapshot
+
+        class _Response(NullServerClient._Response):
+            """Canned JSON response."""
+
+            def json(self) -> dict[str, Any]:
+                """Return the canned payload."""
+                return payload
+
+        return _Response()
 
 
 def _load_claude_invocation_settings(args: list[str]) -> dict[str, Any]:
@@ -2998,8 +3033,10 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         external_session_id: str,
         workspace: Path,
         bridge_dir: Path,
+        resume_copy: bool = False,
     ) -> Path | None:
         """Record the resume id and optionally provide a transcript."""
+        assert not resume_copy
         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
@@ -3025,57 +3062,6 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     recorded_user_texts = [
         initial_prompt if initial_prompt_recorded else "An earlier instruction."
     ]
-
-    class _SnapshotServerClient(NullServerClient):
-        """Server client whose session snapshot carries the resume id."""
-
-        async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-            """Return the session snapshot, or labels for the cleared-bridge check."""
-            del kwargs
-
-            # auto-create reads the bridge_id label to honour a /clear "-cleared"
-            # re-key. Report none here so it falls back to session_id (no /clear).
-            if url.endswith("/labels"):
-
-                class _LabelsResponse(NullServerClient._Response):
-                    """Empty labels → bridge_id resolves to session_id."""
-
-                    def json(self) -> dict[str, Any]:
-                        """Return an empty labels payload."""
-                        return {"labels": {}}
-
-                return _LabelsResponse()
-
-            if url.endswith("/items"):
-
-                class _ItemsResponse(NullServerClient._Response):
-                    """Recorded user turns for the consumed-prompt check."""
-
-                    def json(self) -> dict[str, Any]:
-                        """Return the parametrized user messages."""
-                        return {
-                            "data": [
-                                {
-                                    "type": "message",
-                                    "role": "user",
-                                    "content": [{"type": "input_text", "text": text}],
-                                }
-                                for text in recorded_user_texts
-                            ]
-                        }
-
-                return _ItemsResponse()
-
-            assert url == "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2"
-
-            class _SnapResponse(NullServerClient._Response):
-                """Snapshot response carrying the parametrized resume id."""
-
-                def json(self) -> dict[str, Any]:
-                    """Return the session snapshot dict."""
-                    return snapshot
-
-            return _SnapResponse()
 
     launched_args: list[str] = []
 
@@ -3109,7 +3095,18 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         "5cdbea97a2fb0c659bc09605401e2bb2",
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
-        server_client=_SnapshotServerClient(),  # type: ignore[arg-type]
+        server_client=_ResumeSnapshotServerClient(  # type: ignore[arg-type]
+            "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2",
+            snapshot,
+            items=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                }
+                for text in recorded_user_texts
+            ],
+        ),
     )
 
     # The forwarder runs as a scheduled task; yield so the stub records its
@@ -3150,6 +3147,142 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
 
 
 @pytest.mark.asyncio
+async def test_auto_create_claude_terminal_resumes_a_copy_while_a_background_job_runs_it(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A cold resume of a session a background Claude job runs launches a copy.
+
+    Claude refuses ``claude --resume <id>`` while its own background job still
+    holds the session, so the Claude terminal would exit at startup. The
+    runner must rebuild the history under a fresh id and resume that instead.
+    """
+    session_external_id = "02857840-6362-408f-b41f-309e396ed7c6"
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    config_dir = tmp_path / "claude-config"
+    (config_dir / "sessions").mkdir(parents=True)
+    (config_dir / "sessions" / f"{os.getppid()}.json").write_text(
+        json.dumps({"sessionId": session_external_id, "kind": "bg", "jobId": "ab12cd34"}),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+    synth_calls: list[str] = []
+
+    async def _fake_synth(
+        client: Any,
+        *,
+        session_id: str,
+        external_session_id: str,
+        workspace: Path,
+        bridge_dir: Path,
+        resume_copy: bool,
+    ) -> Path:
+        """Record the id the transcript is rebuilt under."""
+        assert resume_copy
+        del client, session_id, workspace, bridge_dir
+        synth_calls.append(external_session_id)
+        return tmp_path / f"{external_session_id}.jsonl"
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
+        _fake_synth,
+    )
+
+    captured: dict[str, Any] = {}
+
+    await _auto_create_claude_terminal(
+        "5cdbea97a2fb0c659bc09605401e2bb2",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=_ResumeSnapshotServerClient(  # type: ignore[arg-type]
+            "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2",
+            {"external_session_id": session_external_id},
+        ),
+    )
+
+    launched_args = list(captured["spec"].args)
+    assert len(synth_calls) == 1
+    copy_session_id = synth_calls[0]
+    assert copy_session_id != session_external_id
+    resume_index = launched_args.index("--resume")
+    assert launched_args[resume_index + 1] == copy_session_id
+    assert session_external_id not in launched_args
+
+
+@pytest.mark.asyncio
+async def test_auto_create_claude_terminal_resumes_in_place_when_the_registry_check_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A registry probe that raises still resumes the session's own id, with its history."""
+    session_external_id = "02857840-6362-408f-b41f-309e396ed7c6"
+    monkeypatch.setattr(claude_native_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_native_bridge, "_BRIDGE_ROOT", tmp_path / "root")
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://127.0.0.1:8000")
+    monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
+    (tmp_path / "workspace").mkdir()
+    monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.forwarder.supervise_forwarder",
+        _no_op_forwarder,
+    )
+
+    def broken_registry(session_id: str, **kwargs: object) -> None:
+        raise RuntimeError("unreadable registry")
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main.find_background_holder", broken_registry
+    )
+    synth_calls: list[str] = []
+
+    async def _fake_synth(
+        client: Any,
+        *,
+        session_id: str,
+        external_session_id: str,
+        workspace: Path,
+        bridge_dir: Path,
+        resume_copy: bool,
+    ) -> Path:
+        """Record the id the transcript is rebuilt under."""
+        assert not resume_copy
+        del client, session_id, workspace, bridge_dir
+        synth_calls.append(external_session_id)
+        return tmp_path / f"{external_session_id}.jsonl"
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
+        _fake_synth,
+    )
+    captured: dict[str, Any] = {}
+
+    await _auto_create_claude_terminal(
+        "5cdbea97a2fb0c659bc09605401e2bb2",
+        _RecordingClaudeRegistry(captured),
+        lambda _sid, _evt: None,
+        server_client=_ResumeSnapshotServerClient(  # type: ignore[arg-type]
+            "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2",
+            {"external_session_id": session_external_id},
+        ),
+    )
+
+    launched_args = list(captured["spec"].args)
+    assert synth_calls == [session_external_id]
+    assert launched_args[launched_args.index("--resume") + 1] == session_external_id
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("source_transcript", ["missing", "unreadable", "available"])
 async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
     source_transcript: str,
@@ -3177,6 +3310,7 @@ async def test_auto_create_claude_fork_preserves_history_in_another_workspace(
         claude_native_bridge, "ensure_claude_workspace_trusted", lambda *a, **k: None
     )
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", tmp_path / "projects")
+    monkeypatch.delenv("CLAUDE_CONFIG_DIR", raising=False)
     monkeypatch.setattr(orchestration, "resolve_cli_binary", lambda _: None)
     monkeypatch.setattr("omnigent.config.load_effective_config", lambda **_: {})
     forwarder = AsyncMock()
@@ -3318,8 +3452,10 @@ async def test_auto_create_claude_terminal_cold_resume_fallback_uses_pre_wipe_br
         external_session_id: str,
         workspace: Path,
         bridge_dir: Path,
+        resume_copy: bool,
     ) -> Path:
         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
+        assert not resume_copy
         del client, session_id, workspace
         synth_calls.append(external_session_id)
         return tmp_path / f"{external_session_id}.jsonl"

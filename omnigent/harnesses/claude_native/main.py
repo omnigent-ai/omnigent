@@ -92,6 +92,7 @@ from omnigent.databricks_ai_gateway import (
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harnesses.claude_native.bridge import (
     BRIDGE_ID_LABEL_KEY,
+    RESUME_COPY_MARKER_SUFFIX,
     ClaudeNativeHookInterpreterMismatchError,
     augment_claude_args,
     bridge_dir_for_bridge_id,
@@ -109,6 +110,10 @@ from omnigent.harnesses.claude_native.state import (
     read_launch_state,
     redirect_launch_state,
     write_launch_state,
+)
+from omnigent.harnesses.claude_native.status_file import (
+    find_background_holder,
+    session_has_live_process,
 )
 from omnigent.host.daemon_launch import (
     daemon_poll_intervals,
@@ -2415,7 +2420,7 @@ def _redirect_claude_transcript_to_current_project(
     :param external_session_id: Claude session id / transcript stem,
         e.g. ``"02857840-6362-408f-b41f-309e396ed7c6"``.
     :param current: Current cwd, already resolved.
-    :returns: Path to the moved transcript.
+    :returns: Path to the moved transcript, or the original while a background job holds it.
     :raises click.ClickException: If the source transcript is missing
         or unsafe.
     """
@@ -2428,8 +2433,13 @@ def _redirect_claude_transcript_to_current_project(
     if source is None:
         raise click.ClickException(
             f"Claude transcript {external_session_id!r} was not found under "
-            f"{_CLAUDE_PROJECTS_DIR}."
+            f"{_claude_projects_dir()}."
         )
+    if find_background_holder(external_session_id) is not None:
+        # Cold resume will rebuild a copy in the requested workspace.
+        redirect_launch_state(session_id, str(current))
+        click.echo("Keeping the background job's transcript; resuming a copy here.", err=True)
+        return source
     target_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
     tmp = target.with_suffix(".jsonl.tmp")
     try:
@@ -2685,12 +2695,13 @@ def _find_claude_transcript(
     """
     if not _CLAUDE_SESSION_ID_RE.fullmatch(external_session_id):
         return None
-    if not _CLAUDE_PROJECTS_DIR.is_dir():
+    projects_dir = _claude_projects_dir()
+    if not projects_dir.is_dir():
         return None
     matches: list[Path] = []
     filename = f"{external_session_id}.jsonl"
     excluded = exclude.resolve() if exclude is not None else None
-    for project_dir in _CLAUDE_PROJECTS_DIR.iterdir():
+    for project_dir in projects_dir.iterdir():
         if not project_dir.is_dir():
             continue
         candidate = project_dir / filename
@@ -2702,18 +2713,31 @@ def _find_claude_transcript(
     return matches[0]
 
 
+def _claude_projects_dir() -> Path:
+    """
+    Return the directory Claude Code keeps its project transcripts in.
+
+    Mirrors Claude's own resolution: ``$CLAUDE_CONFIG_DIR/projects`` when set,
+    otherwise ``~/.claude/projects``.
+
+    :returns: The projects directory (not guaranteed to exist).
+    """
+    configured = os.environ.get("CLAUDE_CONFIG_DIR")
+    return Path(configured).expanduser() / "projects" if configured else _CLAUDE_PROJECTS_DIR
+
+
 def _claude_project_dir_for_cwd(cwd: Path) -> Path:
     """
     Return Claude's project transcript directory for *cwd*.
 
     Claude Code stores transcripts under
-    ``~/.claude/projects/<sanitized-cwd>/``. The observed sanitizer
-    replaces non-alphanumeric path characters with ``-``.
+    ``<projects dir>/<sanitized-cwd>/`` (see :func:`_claude_projects_dir`).
+    The observed sanitizer replaces non-alphanumeric path characters with ``-``.
 
     :param cwd: Absolute cwd, e.g. ``Path("/home/me/repo")``.
     :returns: Claude project transcript directory.
     """
-    return _CLAUDE_PROJECTS_DIR / _sanitize_claude_project_name(str(cwd))
+    return _claude_projects_dir() / _sanitize_claude_project_name(str(cwd))
 
 
 def _sanitize_claude_project_name(path: str) -> str:
@@ -5360,12 +5384,14 @@ async def _resolve_cold_resume_args(
         click.echo(f"warning: {message}", err=True)
         _logger.warning(message)
         return ()
+    resume_session_id = _claude_resume_session_id(external_session_id, session_id=session_id)
     transcript = await _ensure_local_claude_resume_transcript(
         client,
         session_id=session_id,
-        external_session_id=external_session_id,
+        external_session_id=resume_session_id,
         workspace=Path.cwd().resolve(),
         bridge_dir=bridge_dir_for_bridge_id(labels.get(BRIDGE_ID_LABEL_KEY) or session_id),
+        resume_copy=resume_session_id != external_session_id,
     )
     if transcript is None:
         # No resumable records: ``claude --resume`` against an empty (or
@@ -5378,7 +5404,65 @@ async def _resolve_cold_resume_args(
         click.echo(f"warning: {message}", err=True)
         _logger.warning(message)
         return ()
-    return ("--resume", external_session_id)
+    return ("--resume", resume_session_id)
+
+
+# Namespace for the stable id a held Claude session's resume copy gets.
+_CLAUDE_RESUME_COPY_NAMESPACE = uuid.UUID("6f2b0d5e-3c41-4a8e-9b7d-2e5f1a9c4d60")
+
+
+def _claude_resume_session_id(external_session_id: str, *, session_id: str) -> str:
+    """
+    Pick the Claude session id a cold resume passes to ``--resume``.
+
+    Claude Code refuses to resume a session one of its background jobs still
+    runs, and rebuilding that session's transcript would rewrite the file the
+    job appends to. Such a session resumes on a copy instead, rebuilt from the
+    same Omnigent history. The copy id is stable per Omnigent session, so
+    repeated resumes reuse one copy transcript, unless a live Claude still has
+    that copy open. The Omnigent session keeps its ``external_session_id``, so
+    a later resume checks the original again.
+
+    :param external_session_id: The session's Claude id, e.g.
+        ``"02857840-6362-408f-b41f-309e396ed7c6"``.
+    :param session_id: Omnigent conversation id the resume is for, e.g.
+        ``"conv_abc123"``.
+    :returns: *external_session_id*, or a copy id when a background job
+        holds it.
+    """
+    try:
+        holder = find_background_holder(external_session_id)
+    except Exception:  # A registry probe must not change how a resume launches.
+        _logger.warning(
+            "Could not check Claude's session registry for %s; resuming it in place",
+            external_session_id,
+            exc_info=True,
+            extra={"session_id": session_id},
+        )
+        return external_session_id
+    if holder is None:
+        return external_session_id
+    copy_session_id = str(
+        uuid.uuid5(_CLAUDE_RESUME_COPY_NAMESPACE, f"{session_id}:{external_session_id.lower()}")
+    )
+    try:
+        copy_in_use = session_has_live_process(copy_session_id)
+    except Exception:  # noqa: BLE001 — unknown means the copy may be live
+        copy_in_use = True
+    if copy_in_use:
+        # Rebuilding that transcript would swap the file under the live Claude.
+        copy_session_id = str(uuid.uuid4())
+    _logger.info(
+        "Claude session %s is running in a background job (pid=%s kind=%s job=%s); "
+        "resuming a copy as %s",
+        external_session_id,
+        holder.pid,
+        holder.kind,
+        holder.job_id,
+        copy_session_id,
+        extra={"session_id": session_id},
+    )
+    return copy_session_id
 
 
 async def _ensure_local_claude_resume_transcript(
@@ -5388,6 +5472,7 @@ async def _ensure_local_claude_resume_transcript(
     external_session_id: str,
     workspace: Path,
     bridge_dir: Path | None = None,
+    resume_copy: bool = False,
 ) -> Path | None:
     """
     Refresh Claude Code's local JSONL transcript for cold resume.
@@ -5414,6 +5499,7 @@ async def _ensure_local_claude_resume_transcript(
         what Claude computes.
     :param bridge_dir: Launch bridge path identifying the attachment cache.
         Defaults to the legacy session-id bridge when omitted.
+    :param resume_copy: Mark a temporary native copy so local import excludes it.
     :returns: Path to the local transcript that was written; ``None`` if
         *external_session_id* is not a safe transcript stem, or if the AP
         history yields no resumable records (an empty transcript would make
@@ -5442,6 +5528,8 @@ async def _ensure_local_claude_resume_transcript(
         # ClickException) still propagate: the server explicitly rejected
         # the conversation, so reviving local history is unsafe.
         if _is_resumable_claude_transcript(target):
+            if resume_copy:
+                target.with_suffix(RESUME_COPY_MARKER_SUFFIX).touch(mode=0o600)
             _logger.warning(
                 "Could not fetch server history for %r; resuming from the "
                 "existing local transcript %s",
@@ -5474,6 +5562,9 @@ async def _ensure_local_claude_resume_transcript(
         with tmp.open("w", encoding="utf-8") as handle:
             for record in records:
                 handle.write(json.dumps(record, separators=(",", ":")) + "\n")
+        if resume_copy:
+            # Publish the marker first so import never sees an unmarked copy.
+            target.with_suffix(RESUME_COPY_MARKER_SUFFIX).touch(mode=0o600)
         os.replace(tmp, target)
     except OSError as exc:
         raise click.ClickException(

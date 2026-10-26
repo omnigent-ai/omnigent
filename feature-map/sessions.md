@@ -121,7 +121,7 @@ the header menu), and each place is a separate entry point.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
-  (Default / Status / Created / Updated), Display (All / My / Shared / Archived), Ordering
+  (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
   (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
   arrive;
@@ -134,6 +134,9 @@ the header menu), and each place is a separate entry point.
   when empty. Starting or running sessions enter Working immediately; idle must
   last 10 seconds before they leave it. Errors and approvals bypass that delay.
   This only affects grouping, and existing hover/rename holds still apply.
+  Harness groups sessions under alphabetically ordered harness names (such as
+  Claude Code, Codex, and Pi), including custom agents using the same harness.
+  Sessions without harness information appear under Unknown harness; pins stay separate.
   Created and Updated group by their respective date, independently of ordering,
   with the Created/Updated prefix only on the first date section, followed by
   headings such as “Yesterday” and “Earlier”. Environment metadata shows an icon
@@ -241,7 +244,7 @@ menu, then filter by project.
 
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
 Projects header holds Grouping, Display, Ordering and Show. In
-Status, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
+Status, Harness, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
 project, Shared and Sessions rows together; the Sessions header keeps only New
 session. Hovering a row opens
@@ -792,6 +795,8 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary sessions still return to the new-session page in
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 - **`view-options`:**
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_harness_grouping_persists_across_reload`
+  (desktop and narrow-browser navigation),
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`

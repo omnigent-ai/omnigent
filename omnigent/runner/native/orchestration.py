@@ -8959,18 +8959,26 @@ async def _auto_create_claude_terminal(
     # ``stat`` taken later routinely skips the freshly-injected message.
     resume_prefix_bytes: int | None = None
     if server_client is not None and session_external_id is not None:
-        from omnigent.harnesses.claude_native.main import _ensure_local_claude_resume_transcript
+        from omnigent.harnesses.claude_native.main import (
+            _claude_resume_session_id,
+            _ensure_local_claude_resume_transcript,
+        )
 
         try:
+            # If a background Claude job still holds this session, resume a copy under a fresh id.
+            resume_session_id = _claude_resume_session_id(
+                session_external_id, session_id=session_id
+            )
             _transcript = await _ensure_local_claude_resume_transcript(
                 server_client,
                 session_id=session_id,
-                external_session_id=session_external_id,
+                external_session_id=resume_session_id,
                 workspace=Path(workspace).resolve(),
                 bridge_dir=bridge_dir,
+                resume_copy=resume_session_id != session_external_id,
             )
             if _transcript is not None:
-                resume_external_session_id = session_external_id
+                resume_external_session_id = resume_session_id
                 resume_prefix_bytes = _measured_prefix_bytes(_transcript)
         except Exception:  # best-effort; launch fresh on failure
             _logger.warning(

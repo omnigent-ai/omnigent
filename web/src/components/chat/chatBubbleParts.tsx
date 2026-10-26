@@ -55,10 +55,11 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
-import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
+import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
+  hasPendingOwnElicitation,
   imagePreview,
   isTextBlock,
   keyedAttachments,
@@ -78,6 +79,7 @@ import { useStickToBottomContext } from "use-stick-to-bottom";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
+import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
@@ -413,19 +415,36 @@ function useAgentTurnActive(): boolean {
   return computeIsTurnActive(sessionStatus, localSending);
 }
 
+/** Whether any elicitation card is still awaiting the user's answer. */
+function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
+  return blocks.some((b) => b.type === "elicitation" && b.status === "pending");
+}
+
 /**
  * The label shown next to the working shimmer. When the agent is parked on a
  * dialog (`blockedOn`) it says so; otherwise it rotates through
  * `WORKING_MESSAGES` by wall-clock `tick`.
+ *
+ * @param options.answerableInChat - A pending chat card can answer the block.
+ * @param options.terminalView - The Chat/Terminal toggle reaches the agent's terminal.
  */
-export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
+export function workingIndicatorLabel(
+  tick = 0,
+  blockedOn: string | null = null,
+  { answerableInChat = false, terminalView = false } = {},
+): string {
   if (blockedOn) {
     // A "dialog open" block lives only in the terminal tab, so point the user
     // there to respond rather than leaving the session looking hung.
     if (blockedOn === "dialog open") {
       return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
     }
-    return `Blocked on: ${blockedOn}`;
+    if (answerableInChat) return `Blocked on: ${blockedOn}`;
+    const waiting =
+      blockedOn === "permission prompt"
+        ? "Waiting for your approval in the agent's terminal."
+        : `Waiting for you in the agent's terminal (${blockedOn}).`;
+    return terminalView ? `${waiting} Open the Terminal view to respond.` : waiting;
   }
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
@@ -435,9 +454,16 @@ export function WorkingIndicator() {
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
+  const rootHasOwnPendingElicitation = useChatStore((s) =>
+    hasPendingOwnElicitation(s.blocks, s.conversationId),
+  );
   const rootAgentWorking = useAgentTurnActive();
+  const terminalFirst = useTerminalFirst();
   const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
   const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
+  const hasOwnPendingElicitation = scopedConversationId
+    ? hasPendingOwnElicitation(scopedState.blocks, scopedConversationId)
+    : rootHasOwnPendingElicitation;
   const agentWorking = scopedConversationId
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
@@ -446,15 +472,17 @@ export function WorkingIndicator() {
   // the state and the shimmer stays off (it would misread as the agent still
   // thinking). While the turn is active the shimmer shows, with the pill beside it.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
-  const label = workingIndicatorLabel(tick, blockedOn);
+  const label = workingIndicatorLabel(tick, blockedOn, {
+    answerableInChat: hasOwnPendingElicitation,
+    // The toggle switches to the root session's terminal, not a side chat's.
+    terminalView: !scopedConversationId && (terminalFirst?.isTerminalFirst ?? false),
+  });
   return (
     <>
-      {/* Sole aria-live region for the working state. A stable "Working…" (not
-          the rotating label) so screen readers announce the turn once, without
-          re-announcing every few seconds; the visible shimmer below stays
-          aria-hidden. */}
+      {/* Sole aria-live region: a stable "Working…" or block reason, so the rotating
+          label isn't re-announced. The visible shimmer below stays aria-hidden. */}
       <span role="status" aria-live="polite" className="sr-only">
-        Working…
+        {blockedOn ? label : "Working…"}
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>
@@ -984,14 +1012,12 @@ function AssistantBubble({
   const activeConversationId = useChatStore((s) => s.conversationId);
   const conversationId = scopedConversationId ?? activeConversationId;
   const rootSessionStatus = useChatStore((s) => s.sessionStatus);
-  const rootHasPendingElicitation = useChatStore((s) =>
-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
-  );
+  const rootHasPendingElicitation = useChatStore((s) => hasPendingElicitationBlock(s.blocks));
   const sessionStatus = scopedConversationId ? scopedState.sessionStatus : rootSessionStatus;
   // A pending elicitation means the turn is parked awaiting the user — still in
   // flight even when its lifecycle or the session status reads settled.
   const hasPendingElicitation = scopedConversationId
-    ? scopedState.blocks.some((b) => b.type === "elicitation" && b.status === "pending")
+    ? hasPendingElicitationBlock(scopedState.blocks)
     : rootHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
   const { isCopied, handleCopy } = useCopyMessage(

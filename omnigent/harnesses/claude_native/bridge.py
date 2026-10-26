@@ -119,6 +119,7 @@ _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
 BRIDGE_DIR_ENV_VAR = "HARNESS_CLAUDE_NATIVE_BRIDGE_DIR"
 REQUEST_SESSION_ID_ENV_VAR = "HARNESS_CLAUDE_NATIVE_REQUEST_SESSION_ID"
 BRIDGE_ID_LABEL_KEY = "omnigent.claude_native.bridge_id"
+RESUME_COPY_MARKER_SUFFIX = ".omnigent-resume-copy"
 
 
 def _bridge_injection_lock(bridge_dir: Path) -> threading.Lock:
