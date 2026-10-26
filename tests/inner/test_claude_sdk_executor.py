@@ -120,13 +120,14 @@ class TestPromptExtraction(unittest.TestCase):
             {"role": "tool_result", "content": "SF: 61F"},
             {"role": "assistant", "content": "61F."},
             {"role": "user", "content": "Warmer than NYC?"},
-            # Recovery history can end in a tool item after the latest user message.
             {"role": "tool_call", "content": {"tool": "weather", "args": {"city": "NYC"}}},
         ]
         self.assertTrue(executor.replays_tool_history())
-        fresh = executor._build_prompt(messages[:-1], resume_session=False)
+        fresh = executor._build_prompt(messages, resume_session=False)
         self.assertIn('tool call: {"tool": "weather", "args": {"city": "SF"}}', fresh)
         self.assertIn("tool result: SF: 61F", fresh)
+        self.assertIn('tool call: {"tool": "weather", "args": {"city": "NYC"}}', fresh)
+        self.assertEqual(fresh.count("Warmer than NYC?"), 1)
         self.assertEqual(executor._build_prompt(messages, resume_session=True), "Warmer than NYC?")
 
     def test_resumed_session_includes_all_trailing_user_messages(self):

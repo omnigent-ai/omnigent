@@ -3089,7 +3089,7 @@ class ClaudeSDKExecutor(Executor):
         notice_messages = messages
         if resume_session:
             notice_messages = []
-            for message in reversed(messages):
+            for message in reversed(without_tool_history(messages)):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
@@ -3618,7 +3618,8 @@ class ClaudeSDKExecutor(Executor):
         # latest message's content blocks for native multimodal
         # delivery to the Anthropic API.
         latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
-        prior = messages[:-1] if messages else []
+        latest_index = max(i for i, msg in enumerate(messages) if msg.get("role") == "user")
+        prior = messages[:latest_index] + messages[latest_index + 1 :]
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         for msg in prior:

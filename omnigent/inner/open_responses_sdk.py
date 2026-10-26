@@ -234,13 +234,10 @@ def _convert_messages_to_responses(
     # A recorded call is emitted once, with its output right behind it: live
     # history repeats a call per status, and the API rejects a call without output.
     outputs_by_id: dict[str, Message] = {}
-    call_ids: set[str] = set()
     for message in messages:
         recorded = _recorded_call_id(message)
         if recorded is not None and message.get("role") == "tool_result":
             outputs_by_id.setdefault(recorded, message)
-        elif recorded is not None and message.get("role") == "tool_call":
-            call_ids.add(recorded)
     emitted_ids: set[str] = set()
 
     i = 0
@@ -329,7 +326,7 @@ def _convert_messages_to_responses(
 
         elif role == "tool_result":
             # A recorded output already went out with its call.
-            if _recorded_call_id(msg) not in call_ids:
+            if _recorded_call_id(msg) not in emitted_ids:
                 result.append(
                     {
                         "type": "message",
