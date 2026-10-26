@@ -10130,11 +10130,17 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: crash_pane,
     )
+    # The pane is alive, so the wait runs out its budget rather than seeing it gone.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
+            extend_for_slow_boot=False,
         )
     message = str(excinfo.value)
     assert "did not become ready" in message
@@ -10161,11 +10167,16 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: "",
     )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
+            extend_for_slow_boot=False,
         )
     message = str(excinfo.value)
     assert "did not become ready" in message
