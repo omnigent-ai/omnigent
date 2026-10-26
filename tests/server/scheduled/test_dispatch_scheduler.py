@@ -1847,3 +1847,76 @@ async def test_recovery_failure_after_stop_is_still_logged(store, monkeypatch, c
     finally:
         release.set()
         await scheduler.stop()
+
+
+async def test_failing_claim_log_still_starts_the_claimed_run(store, monkeypatch, caplog):
+    from omnigent.server.scheduled import dispatch_scheduler
+
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    original_info = dispatch_scheduler._logger.info
+
+    def broken_info(message, *args, **kwargs):
+        if kwargs.get("extra", {}).get("event_name") == "scheduled_run_claimed":
+            raise RuntimeError("debug-log sink unavailable")
+        return original_info(message, *args, **kwargs)
+
+    monkeypatch.setattr(dispatch_scheduler._logger, "info", broken_info)
+
+    async def fire(task, lease):
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        assert store.list_runs(task.id)[0][0].status == "running"
+        assert "Could not log a scheduler event" in caplog.text
+        assert "Could not prepare a scheduled run" not in caplog.text
+    finally:
+        await scheduler.stop()
+
+
+async def test_event_records_keep_their_call_site(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+
+    async def fire(task, lease):
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now)
+    try:
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+    [claimed] = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "scheduled_run_claimed"
+    ]
+    # Dashboards group by function name, so the guard must not replace the caller.
+    assert claimed.funcName == "_claim_due"
+
+
+async def test_changed_session_is_logged_again(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    first, second = uuid.uuid4().hex, uuid.uuid4().hex
+    await lease.attach_session(first)
+    await lease.attach_session(first)
+    await lease.attach_session(second)
+    sessions = [event["session_id"] for event in _events(caplog, "scheduled_run_session_attached")]
+    assert sessions == [first, second]
+    assert store.list_runs(task.id)[0][0].conversation_id == second
