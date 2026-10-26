@@ -771,6 +771,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // step — the snapshot re-seeds the indicator on the next load.
     if (
       stage !== "provisioning" &&
+      stage !== "action_required" &&
       stage !== "cloning" &&
       stage !== "starting" &&
       stage !== "connecting" &&
@@ -785,6 +786,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
       stage,
       error: typeof data.error === "string" ? data.error : null,
       provider: typeof data.provider === "string" ? data.provider : undefined,
+      details: typeof data.details === "string" ? data.details : null,
     } satisfies SessionSandboxStatusEvent;
   }
   if (eventType === "session.mcp_startup") {
@@ -984,6 +986,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     } satisfies SessionPresenceEvent;
   }
 
+  if (eventType === "ui.open_file") {
+    if (typeof data.path !== "string" || !data.path) return null;
+    return { type: "ui_open_file", path: data.path };
+  }
+
   // Embedded-browser action request: asks the desktop relay to run the agent's
   // browser_* action against the view. Ignored by non-Electron renderers.
   if (eventType === "browser.action_request") {
@@ -1034,6 +1041,13 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     // session to acceptEdits mode on accept).
     const allowAllEdits = p.allow_all_edits === true;
     const allowAutoMode = p.allow_auto_mode === true;
+    const permissionDirectories =
+      Array.isArray(p.permission_directories) &&
+      p.permission_directories.every(
+        (directory): directory is string => typeof directory === "string" && directory.length > 0,
+      )
+        ? p.permission_directories
+        : undefined;
     // claude-native non-edit tool prompts stamp this so the ApprovalCard
     // offers the persistent "don't ask again" button (installs a
     // session-scoped allow rule on accept). `tool` is the gated tool;
@@ -1131,6 +1145,7 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
           : null,
       allowAllEdits,
       allowAutoMode,
+      permissionDirectories,
       rememberScope,
       codexPersistModes,
       agyPermission,

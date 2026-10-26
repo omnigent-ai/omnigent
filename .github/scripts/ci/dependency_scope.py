@@ -7,9 +7,8 @@ import json
 import os
 import re
 import subprocess
-from pathlib import Path
-
 import tomllib
+from pathlib import Path
 
 DEPENDENCY_SCOPES = {
     "dev/omnidev/Cargo.lock": "omnidev",

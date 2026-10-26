@@ -372,7 +372,7 @@ class _SignerRelay(EgressProxy):
                 ),
                 timeout=30,
             )
-        except (asyncio.TimeoutError, OSError):
+        except (TimeoutError, OSError):
             await self._send_bad_gateway(client_writer, "")
             return False
 
@@ -430,9 +430,9 @@ class _SignerRelay(EgressProxy):
                 ):
                     raise ValueError("unsupported upstream interim response")
         except (
+            TimeoutError,
             asyncio.IncompleteReadError,
             asyncio.LimitOverrunError,
-            asyncio.TimeoutError,
             OSError,
             SigningRejected,
             ValueError,
@@ -478,7 +478,7 @@ class _SignerRelay(EgressProxy):
                     client_writer,
                     started=started,
                 )
-        except (asyncio.IncompleteReadError, asyncio.TimeoutError, OSError, ValueError):
+        except (TimeoutError, asyncio.IncompleteReadError, OSError, ValueError):
             return bytes_relayed, response.status, False
         return bytes_relayed + body_bytes, response.status, keep_alive
 
@@ -493,7 +493,7 @@ class _SignerRelay(EgressProxy):
             close = getattr(awaitable, "close", None)
             if close is not None:
                 close()
-            raise asyncio.TimeoutError
+            raise TimeoutError
         return await asyncio.wait_for(
             awaitable,
             timeout=min(_RESPONSE_IDLE_TIMEOUT_SECONDS, remaining),
@@ -692,9 +692,9 @@ async def _fake_provider(
         )
         await writer.drain()
     except (
+        TimeoutError,
         asyncio.IncompleteReadError,
         asyncio.LimitOverrunError,
-        asyncio.TimeoutError,
         OSError,
         ValueError,
     ):

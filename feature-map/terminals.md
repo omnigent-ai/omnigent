@@ -27,6 +27,8 @@ reattach when the session moves to another host.
   chat or composer.
 - `dialog-routing`: when the harness is waiting on a dialog in its terminal, chat
   says so and routes the user to the terminal.
+- `split-panes`: behind `splittable_terminal_view_ui`, split the Terminal view
+  into shell panes, resize them (each side stays within 25–75%), and close them.
 
 ## How to get to it (user POV)
 
@@ -43,6 +45,12 @@ with their own terminal retain the switcher.
 - Choose Resume when the terminal shows as stopped.
 - On desktop with `grid_sessions_display_ui` enabled, use each grid cell's header switch.
   The shortcut targets the active cell; shells remain in the shared Workspace.
+- On desktop with `splittable_terminal_view_ui` enabled, use the header's "Split
+  right" / "Split down" buttons in Terminal view and pick a shell type. Drag a
+  divider (or focus it and use the arrow keys along its axis) to resize. "Close
+  pane" asks for confirmation, then kills the focused shell; the agent pane
+  cannot be closed. Panes are saved per session in this browser and show only
+  for desktop owners outside grid cells.
 
 **User shells:**
 

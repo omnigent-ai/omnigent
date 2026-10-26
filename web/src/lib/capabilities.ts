@@ -66,7 +66,9 @@ export type FeatureKey =
   | "custom_agents_settings_ui"
   | "sidebar_grouping_ui"
   | "workspace_content_search"
-  | "grid_sessions_display_ui";
+  | "grid_sessions_display_ui"
+  | "automations_v2"
+  | "splittable_terminal_view_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -216,6 +218,12 @@ export interface ServerInfo {
    */
   archive_worktree_cleanup?: boolean;
   /**
+   * True when ``GET /v1/sessions`` accepts ``search_scope``. Older servers
+   * ignore it, so the palette lists one mixed search group there. Fails to
+   * ``false``.
+   */
+  session_search_scope?: boolean;
+  /**
    * True when a managed create accepts ``host_id`` naming its new sandbox
    * host. Older servers reject it, so the create omits it there. Fails to
    * ``false``.
@@ -314,6 +322,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   installable_harnesses: [],
   dictation_available: false,
   archive_worktree_cleanup: false,
+  session_search_scope: false,
   request_managed_sandbox_host_id: false,
   branding: null,
 };
@@ -427,6 +436,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          session_search_scope: data.session_search_scope === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,

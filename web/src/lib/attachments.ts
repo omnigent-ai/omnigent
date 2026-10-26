@@ -42,6 +42,16 @@ const UNCOMPRESSED_IMAGE_LIMIT_MB = 5;
 
 export type AttachmentCategory = keyof typeof ATTACHMENT_SIZE_LIMITS_MB;
 
+export function clipboardFiles(data: DataTransfer | null | undefined): File[] {
+  const files: File[] = [];
+  for (const item of data?.items ?? []) {
+    if (item.kind !== "file") continue;
+    const file = item.getAsFile();
+    if (file !== null) files.push(file);
+  }
+  return files;
+}
+
 /** Keep unnamed clipboard images consistent before and after upload. */
 export function attachmentFilename(file: File): string {
   return file.name || "image.png";
@@ -78,6 +88,7 @@ const TEXT_CODE_EXTENSIONS = new Set([
   ".md",
   ".markdown",
   ".csv",
+  ".tsv",
   ".json",
   ".jsonl",
   ".ndjson",
@@ -153,6 +164,11 @@ const DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
   ".sqlite3",
 ]);
 
+// Text/code extensions a browser may not map to a `text/*` type, which then
+// greys the file out in the OS picker. `.csv` rides `text/*` everywhere; `.tsv`
+// does not, so the filter has to name it.
+const UNMAPPED_TEXT_EXTENSIONS = [".tsv"];
+
 /**
  * The attach button's file-picker filter for *policy*, or `undefined` to
  * offer every file when the server delivers all types as files.
@@ -160,7 +176,14 @@ const DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS = new Set([
 export function attachmentAccept(policy?: FilesystemAttachmentsInfo | null): string | undefined {
   if (policy?.all_types) return undefined;
   const extensions = policy ? policy.extensions : [...DEFAULT_FILESYSTEM_ATTACHMENT_EXTENSIONS];
-  return ["image/*", "application/pdf", "text/*", "application/json", ...extensions].join(",");
+  return [
+    "image/*",
+    "application/pdf",
+    "text/*",
+    "application/json",
+    ...UNMAPPED_TEXT_EXTENSIONS,
+    ...extensions,
+  ].join(",");
 }
 
 function extensionOf(filename: string): string {

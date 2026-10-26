@@ -55,6 +55,7 @@ describe("classifyAttachment", () => {
     expect(classifyAttachment(makeFile("a.ts", "video/mp2t"))).toBe("text");
     expect(classifyAttachment(makeFile("main.rs", ""))).toBe("text");
     expect(classifyAttachment(makeFile("notebook.ipynb", ""))).toBe("text");
+    expect(classifyAttachment(makeFile("data.tsv", ""))).toBe("text");
     // Windows/Excel tags .csv as application/vnd.ms-excel — extension wins.
     expect(classifyAttachment(makeFile("data.csv", "application/vnd.ms-excel"))).toBe("text");
   });
@@ -106,12 +107,21 @@ describe("classifyAttachment", () => {
 describe("attachmentAccept", () => {
   it("lists inline types plus the policy's filesystem extensions", () => {
     expect(attachmentAccept()).toBe(
-      "image/*,application/pdf,text/*,application/json,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3",
+      "image/*,application/pdf,text/*,application/json,.tsv,.zip,.docx,.xlsx,.pptx,.db,.sqlite,.sqlite3",
     );
     expect(attachmentAccept({ extensions: [".gz"], all_types: false })).toBe(
-      "image/*,application/pdf,text/*,application/json,.gz",
+      "image/*,application/pdf,text/*,application/json,.tsv,.gz",
     );
     expect(attachmentAccept({ extensions: [".zip"], all_types: true })).toBeUndefined();
+  });
+
+  it("names .tsv, which the text/* wildcard does not cover in every browser", () => {
+    // A browser that maps .tsv to no MIME greys it out in the OS picker, so
+    // the filter must name it even though .csv needs no entry.
+    expect(attachmentAccept()?.split(",")).toContain(".tsv");
+    expect(attachmentAccept({ extensions: [".gz"], all_types: false })?.split(",")).toContain(
+      ".tsv",
+    );
   });
 });
 

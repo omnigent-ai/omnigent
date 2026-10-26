@@ -1022,6 +1022,54 @@ def test_threaded_idle_watcher_fires_on_tick_each_poll(tmp_path: Path) -> None:
     assert count["n"] >= 3
 
 
+def test_threaded_idle_watcher_records_when_output_changed_the_screen(tmp_path: Path) -> None:
+    """``screen_changed_within`` reports the watcher's screen diff, or ``None``
+    when the watcher has not watched for the whole window or has gone stale.
+
+    :param tmp_path: Temporary directory used for placeholder tmux paths.
+    """
+    instance = TerminalInstance(
+        name="codex",
+        session_key="main",
+        socket_path=tmp_path / "tmux.sock",
+        private_dir=tmp_path,
+        running=True,
+    )
+    frames = iter(["booting", "working 1", "working 2"])
+    current = {"frame": "booting"}
+
+    def _capture() -> str:
+        current["frame"] = next(frames, current["frame"])
+        return current["frame"]
+
+    instance._capture_pane_for_idle_or_none = _capture  # type: ignore[method-assign]
+    instance._pane_is_dead = lambda: False  # type: ignore[method-assign]
+    ticks = threading.Event()
+    count = {"n": 0}
+
+    def _on_tick() -> None:
+        count["n"] += 1
+        if count["n"] >= 5:
+            ticks.set()
+
+    assert instance.screen_changed_within(60.0) is None
+    instance.start_idle_watcher_thread(on_tick=_on_tick, poll_interval_s=0.01)
+    assert ticks.wait(timeout=1.0)
+    try:
+        assert instance.screen_changed_within(60.0) is None, "watched for less than the window"
+        assert instance._screen_watch_started_at is not None
+        instance._screen_watch_started_at -= 120.0
+        assert instance.screen_changed_within(60.0) is True
+        assert instance._screen_changed_at is not None
+        instance._screen_changed_at -= 120.0
+        assert instance.screen_changed_within(60.0) is False
+    finally:
+        instance._stop_idle_watcher_thread()
+    assert instance._screen_watched_at is not None
+    instance._screen_watched_at -= 60.0
+    assert instance.screen_changed_within(60.0) is None, "a stale capture says nothing"
+
+
 def test_pane_pid_sync_returns_pane_process_pid(tmp_path: Path) -> None:
     """``pane_pid_sync`` parses the tmux ``#{pane_pid}`` value.
 

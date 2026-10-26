@@ -581,7 +581,7 @@ class SessionsChat:
                     asyncio.shield(first_event_task),
                     timeout=_STREAM_READY_TIMEOUT_S,
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 first_event = None
             except StopAsyncIteration:
                 return
@@ -1250,7 +1250,7 @@ class SessionsChat:
         try:
             async with asyncio.timeout(timeout):
                 await _collect()
-        except asyncio.TimeoutError:
+        except TimeoutError:
             # Timeout is expected when the session completes before the deadline
             # or the race window is missed; return whatever text was collected so
             # far per the method contract (empty QueryResult is valid).

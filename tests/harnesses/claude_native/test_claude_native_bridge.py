@@ -20,6 +20,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -4449,6 +4450,10 @@ def test_inject_user_message_pastes_content_then_submits(
         ("/exit", " /exit"),
         ("/quit now", " /quit now"),
         ("  /help", "   /help"),
+        # Panels that write no transcript record, so their delivery is never confirmed.
+        ("/export", " /export"),
+        ("/rewind", " /rewind"),
+        ("/usage", " /usage"),
         ("/clear", "/clear"),
         ("/compact", "/compact"),
         ("/model sonnet-4", "/model sonnet-4"),
@@ -5019,22 +5024,20 @@ def test_inject_user_message_ignores_prompt_glyph_in_scrollback(
         inject_user_message(bridge_dir, content="hi", timeout_s=0.3)
 
 
-def test_inject_user_message_resends_enter_when_first_submit_swallowed(
+@pytest.mark.parametrize("submit_capture", ["ready", "empty", "whitespace", "failed"])
+@pytest.mark.parametrize("accept_first", [False, True], ids=["swallowed", "accepted"])
+def test_inject_user_message_verifies_submit_after_transient_capture_loss(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    submit_capture: str,
+    accept_first: bool,
 ) -> None:
     """
-    A submit Enter swallowed by the TUI's paste burst is retried.
+    Capture loss cannot confirm a submit or cause a blind retry.
 
-    Claude Code coalesces rapid stdin bursts into a paste; an Enter
-    that lands inside that window becomes a newline in the draft
-    instead of a submit, and the message sits unsent — the "typed but
-    never sent" bug. The helper must observe (via capture-pane) that
-    the draft is still in the input box after Enter and re-send Enter
-    until it clears. Here the fake TUI swallows the first Enter
-    (draft stays put) and submits on the second; a regression to
-    fire-and-forget Enter would send exactly one and return "success"
-    with the message undelivered.
+    If the first Enter is swallowed by Claude's paste burst, a readable
+    draft must return before another Enter. If it was accepted, capture
+    recovery shows the empty input box and no second Enter is sent.
     """
     monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
     # Shrink the polling cadence so the retry happens in milliseconds —
@@ -5052,14 +5055,12 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
     )
 
     enters: list[list[str]] = []
-    # Input-box state machine: the paste deposits the draft; the FIRST
-    # Enter is swallowed (folded into the paste burst — draft stays);
-    # the second Enter submits and clears the box.
-    tui = {"pane": _composer_pane(), "swallowed_enters": 0}
+    # The first Enter may be swallowed; a later Enter clears the draft.
+    tui = {"pane": _composer_pane(), "missing_captures": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
-        Simulate a TUI that swallows the first submit Enter.
+        Simulate capture loss after a submit that may have been swallowed.
 
         :param cmd: Argv list passed to subprocess.run.
         :param kwargs: Subprocess kwargs (ignored).
@@ -5068,31 +5069,295 @@ def test_inject_user_message_resends_enter_when_first_submit_swallowed(
         """
         del kwargs
         if "capture-pane" in cmd:
+            if len(enters) == 1 and tui["missing_captures"] < 3:
+                tui["missing_captures"] += 1
+                if submit_capture != "ready":
+                    assert len(enters) == 1, "an unreadable pane must not draw another Enter"
+                    return SimpleNamespace(
+                        returncode=1 if submit_capture == "failed" else 0,
+                        stdout="  \n" if submit_capture == "whitespace" else "",
+                        stderr="capture unavailable" if submit_capture == "failed" else "",
+                    )
             return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
         if "paste-buffer" in cmd:
             tui["pane"] = _composer_pane("fix the flaky test")
         if cmd[-1] == "Enter":
             enters.append(cmd)
-            if tui["swallowed_enters"] == 0:
-                tui["swallowed_enters"] = 1  # folded into the paste — draft stays
-            else:
+            if accept_first or len(enters) > 1:
                 tui["pane"] = _composer_pane()  # submitted — input box clears
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
     inject_user_message(bridge_dir, content="fix the flaky test")
 
-    # Exactly two Enters: the swallowed one plus one retry. One means
-    # the verify-retry loop regressed to fire-and-forget (the bug);
-    # three+ means retries keep firing after the draft cleared.
-    assert len(enters) == 2, (
-        f"Expected the swallowed Enter to be retried exactly once, got {len(enters)} Enter(s)."
+    assert len(enters) == (1 if accept_first else 2)
+
+
+@pytest.mark.parametrize(
+    "draft_rows",
+    [
+        pytest.param("  [Pasted text #1 +7 lines]\n", id="collapsed-placeholder"),
+        pytest.param("  Task: ship the paste\n  submit fix and verify\n", id="wrapped-literal"),
+        pytest.param("  Task: ship the pa\n  ste submit fix\n", id="wrapped-mid-word"),
+    ],
+)
+def test_inject_user_message_retries_enter_for_a_draft_below_the_prompt_row(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    draft_rows: str,
+) -> None:
+    """
+    A draft rendered under a blank ``❯`` is still verified and resubmitted.
+
+    Claude Code can leave the prompt row blank and render the paste on the
+    rows below it in the framed input box — collapsed to ``[Pasted text #1
+    +N lines]`` or as literal text wrapped at the pane width, which can
+    split the needle across rows. Reading only the ``❯`` row never sees
+    that draft, so delivery sent one blind Enter and reported success; when
+    the TUI swallowed it the first prompt of a sub-agent dispatch sat unsent
+    until someone pressed Enter.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
     )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    pasted_pane = _composer_pane().replace("❯ \n", "❯\n" + draft_rows)
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that renders the paste below ``❯`` and swallows the first Enter.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = pasted_pane
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
+            if tui["enters"] > 1:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
+
+    assert tui["pane"] == _composer_pane(), "The draft was left unsent in the input box."
+    assert tui["enters"] == 2
 
 
+_SUBMITTED_ECHO = """\
+❯ Task: ship the paste submit fix and verify
+  Task: ship the paste submit fix and verify
+"""
+
+
+@pytest.mark.parametrize(
+    "after_submit",
+    [
+        pytest.param(
+            lambda: (
+                _SUBMITTED_ECHO
+                + _composer_pane().replace(
+                    "? for shortcuts", "⏵⏵ auto mode on (shift+tab to cycle)"
+                )
+            ),
+            id="empty-box-under-echo",
+        ),
+        # Lazy: the dialog pane is defined further down this module.
+        pytest.param(lambda: _SUBMITTED_ECHO + _PERMISSION_PROMPT_PANE, id="permission-dialog"),
+    ],
+)
+def test_inject_user_message_sends_no_extra_enter_after_an_accepted_submit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    after_submit: Callable[[], str],
+) -> None:
+    """
+    Once the draft leaves the input box, no retry Enter follows.
+
+    Reading the whole framed box must not pick up the submitted message's
+    transcript echo above the frame, the mode footer below it, or a boxed
+    dialog the started turn opens. Any of those read as a still-pending
+    draft would send a retry Enter into the running turn, and on a
+    permission dialog that Enter approves the tool.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that accepts the first Enter.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane().replace(
+                "❯ \n", "❯\n  Task: ship the paste\n  submit fix and verify\n"
+            )
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
+            tui["pane"] = after_submit()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="Task: ship the paste submit fix and verify\n" * 8)
+
+    assert tui["enters"] == 1, f"Expected one submit Enter, got {tui['enters']}."
+
+
+def test_inject_user_message_retries_enter_for_a_draft_with_invisible_characters(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A draft holding U+FEFF is still recognised, so its swallowed Enter is retried.
+
+    Claude Code keeps Unicode format characters in the draft but never
+    renders them, and its first Enter only strips them ("Removed 2
+    invisible characters · review and press Enter to send"). A needle that
+    kept them never matched the pane, so delivery treated the message as
+    sent after that one Enter and it sat unsent.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_COMMIT_TIMEOUT_S", 0.2)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that hides U+FEFF and spends the first Enter stripping it.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("Task: ship the fix")
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
+            if tui["enters"] == 1:
+                tui["pane"] = _composer_pane("Task: ship the fix").replace(
+                    "? for shortcuts",
+                    "Removed 2 invisible characters · review and press Enter to send",
+                )
+            else:
+                tui["pane"] = _composer_pane()
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="\ufeff\ufeffTask: ship the fix")
+
+    assert tui["pane"] == _composer_pane(), "The draft was left unsent in the input box."
+    assert tui["enters"] == 2
+
+
+def test_inject_user_message_ignores_rows_below_an_unclosed_input_box(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    With no closing rule under the prompt row, the rows below are not read as the draft.
+
+    Here the started turn's pane shows the empty ``❯`` row directly under
+    the last rule, with the mode footer and a status line carrying the
+    session title (the prompt's first words) below it. Counting those rows
+    as the input box would read the title as a still-pending draft and
+    send retry Enters into the running turn.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._CLAUDE_READY_POLL_INTERVAL_S", 0.01
+    )
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_RETRY_INTERVAL_S", 0.02)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._SUBMIT_VERIFY_TIMEOUT_S", 0.5)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._PASTE_SETTLE_S", 0.0)
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._TRUSTED_PARENT", tmp_path)
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=Path("/tmp/example/tmux.sock"),
+        tmux_target="claude:0.0",
+    )
+    unclosed_after_submit = """\
+❯ Task: ship the paste submit fix
+──────────────────────────────
+❯
+  ⏵⏵ auto mode on (shift+tab to cycle)
+  Task: ship the paste submit fix · Opus
+"""
+    tui = {"pane": _composer_pane(), "enters": 0}
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        """
+        Simulate a TUI that accepts the first Enter and leaves the box unclosed.
+
+        :param cmd: Argv list passed to subprocess.run.
+        :param kwargs: Subprocess kwargs (ignored).
+        :returns: Fake CompletedProcess; capture-pane returns the simulated pane.
+        """
+        del kwargs
+        if "capture-pane" in cmd:
+            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+        if "paste-buffer" in cmd:
+            tui["pane"] = _composer_pane("Task: ship the paste submit fix")
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
+            tui["pane"] = unclosed_after_submit
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    inject_user_message(bridge_dir, content="Task: ship the paste submit fix")
+
+    assert tui["enters"] == 1, f"Expected one submit Enter, got {tui['enters']}."
+
+
+@pytest.mark.parametrize("capture_lost", [False, True], ids=["draft-remains", "capture-lost"])
 def test_inject_user_message_raises_when_draft_never_submits(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    capture_lost: bool,
 ) -> None:
     """
     Injection fails loud when the draft never leaves the input box.
@@ -5116,7 +5381,7 @@ def test_inject_user_message_raises_when_draft_never_submits(
         tmux_target="claude:0.0",
     )
 
-    tui = {"pane": _composer_pane()}
+    tui = {"pane": _composer_pane(), "enters": 0}
 
     def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
         """
@@ -5132,15 +5397,23 @@ def test_inject_user_message_raises_when_draft_never_submits(
         """
         del kwargs
         if "capture-pane" in cmd:
-            return SimpleNamespace(returncode=0, stdout=tui["pane"], stderr="")
+            pane = "" if capture_lost and tui["enters"] else tui["pane"]
+            return SimpleNamespace(returncode=0, stdout=pane, stderr="")
         if "paste-buffer" in cmd:
             tui["pane"] = _composer_pane("fix the flaky test")
+        if cmd[-1] == "Enter":
+            tui["enters"] += 1
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
-    with pytest.raises(RuntimeError, match="message was not delivered") as caught:
+    error_message = "could not be confirmed" if capture_lost else "message was not delivered"
+    with pytest.raises(RuntimeError, match=error_message) as caught:
         inject_user_message(bridge_dir, content="fix the flaky test")
-    assert isinstance(caught.value, claude_native_bridge.ClaudeMessageNotAccepted)
+    assert (
+        isinstance(caught.value, claude_native_bridge.ClaudeMessageNotAccepted) is not capture_lost
+    )
+    if capture_lost:
+        assert tui["enters"] == 1
 
 
 def test_inject_user_message_backs_off_enter_retries_on_stalled_tui(
@@ -5526,6 +5799,10 @@ def test_kill_session_raises_when_tmux_target_never_published(
     [
         "no server running on /tmp/example/tmux.sock",
         "can't find session: main",
+        pytest.param(
+            "error connecting to /tmp/example/tmux.sock (No such file or directory)",
+            id="socket-removed-after-idle-cleanup",
+        ),
     ],
 )
 def test_kill_session_is_idempotent_when_tmux_is_absent(
@@ -7837,6 +8114,46 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
     assert claude_native_bridge.read_user_effort_level() is None
 
 
+@pytest.mark.parametrize(
+    ("claude_args", "expected"),
+    [
+        (("--effort", "xhigh"), "xhigh"),
+        (("--effort=max",), "max"),
+        (("--effort", "low", "--model", "opus", "--effort", "xhigh"), "xhigh"),
+        (("--model", "opus"), "high"),
+        (("--effort", "ultra"), "high"),
+        (("--effort", "xhigh", "--effort", "ultra"), "high"),
+        (("--effort", "low", "--effort="), "low"),
+        (("--effort", "low", "--effort", "--verbose"), "low"),
+        (("--effort", "XHIGH"), "xhigh"),
+        (("--effort", "LOW", "--effort="), "low"),
+        (("--effort", " max\n"), "max"),
+        (("--effort", "low", "--effort", " "), "high"),
+    ],
+)
+def test_resolve_launch_effort_level_prefers_passed_effort(
+    claude_args: tuple[str, ...],
+    expected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A valid pass-through ``--effort`` wins over settings.json's ``effortLevel``.
+
+    Claude falls back to the wrapper's invocation ``effortLevel`` when the last
+    ``--effort`` is malformed, so it must carry exactly the effort read from the args.
+    """
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    assert claude_native_bridge.resolve_launch_effort_level(claude_args) == expected
+    invocation = _load_invocation_settings(augment_claude_args(claude_args, bridge_dir=tmp_path))
+    settings.unlink()
+    passed_effort = claude_native_bridge.resolve_launch_effort_level(claude_args)
+    assert passed_effort in (None, expected)
+    assert invocation.get("effortLevel") == passed_effort
+
+
 # ---------------------------------------------------------------------------
 # launch_model storage and retrieval
 # ---------------------------------------------------------------------------
@@ -8507,9 +8824,39 @@ def test_ensure_trusted_creates_config_when_missing(
     # Global onboarding gate — without this Claude shows the theme/login
     # flow on a never-onboarded machine.
     assert data["hasCompletedOnboarding"] is True
+    # Declined auto-mode default question — without this Claude asks "Make
+    # auto mode your default permission mode?" when settings pin another mode.
+    assert data["hasSeenAutoDefaultNudge"] is True
     # Per-directory trust gate, keyed by the RESOLVED absolute path —
     # without this Claude shows "Do you trust the files in this folder?".
     assert data["projects"][str(workspace.resolve())]["hasTrustDialogAccepted"] is True
+
+
+def test_ensure_trusted_declines_auto_default_question_for_onboarded_user(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    An onboarded, trusted config gains only the auto-mode default answer.
+
+    Claude Code asks "Make auto mode your default permission mode?" at
+    startup until this key is set, and its pre-selected "Yes" rewrites the
+    user's default mode. Declining it writes only ``hasSeenAutoDefaultNudge``,
+    so seeding must leave every other key, including the user's mode, alone.
+    """
+    config_path = _redirect_home(monkeypatch, tmp_path / "home")
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    existing = {
+        "oauthAccount": {"emailAddress": "user@example.com"},
+        "hasCompletedOnboarding": True,
+        "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
+    }
+    config_path.write_text(json.dumps(existing))
+
+    ensure_claude_workspace_trusted(workspace)
+
+    assert json.loads(config_path.read_text()) == {**existing, "hasSeenAutoDefaultNudge": True}
 
 
 def test_ensure_trusted_preserves_existing_state(
@@ -8517,7 +8864,7 @@ def test_ensure_trusted_preserves_existing_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    Seeding adds only the two gates; all other config is preserved.
+    Seeding adds only the gates; all other config is preserved.
 
     The file holds the user's OAuth account, MCP config, and per-project
     history. Clobbering any of it would be a regression, so this asserts
@@ -8561,7 +8908,7 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
-    When both gates are already set, the file is left byte-for-byte alone.
+    When every gate is already set, the file is left byte-for-byte alone.
 
     The seed file is written in compact form; the helper's writer uses
     two-space indentation. So if the ``if not changed: return`` short-
@@ -8574,6 +8921,7 @@ def test_ensure_trusted_idempotent_does_not_rewrite(
     workspace.mkdir(parents=True)
     already = {
         "hasCompletedOnboarding": True,
+        "hasSeenAutoDefaultNudge": True,
         "projects": {str(workspace.resolve()): {"hasTrustDialogAccepted": True}},
     }
     # Compact, no indentation — distinct from the helper's indent=2 output.
@@ -9822,11 +10170,17 @@ def test_wait_for_claude_prompt_ready_surfaces_terminal_output_on_timeout(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: crash_pane,
     )
+    # The pane is alive, so the wait runs out its budget rather than seeing it gone.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
+            extend_for_slow_boot=False,
         )
     message = str(excinfo.value)
     assert "did not become ready" in message
@@ -9853,11 +10207,16 @@ def test_wait_for_claude_prompt_ready_reports_empty_capture_count(
         "omnigent.harnesses.claude_native.bridge._capture_pane",
         lambda socket_path, tmux_target: "",
     )
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
     with pytest.raises(RuntimeError) as excinfo:
         claude_native_bridge._wait_for_claude_prompt_ready(
             "/tmp/example/tmux.sock",
             "claude:0.0",
             timeout_s=0.0,
+            extend_for_slow_boot=False,
         )
     message = str(excinfo.value)
     assert "did not become ready" in message
@@ -10019,6 +10378,38 @@ def test_wait_for_claude_prompt_ready_reports_a_sign_in_running_elsewhere(
     assert raised.value.code == "databricks_sign_in_pending"
     assert raised.value.remediation.startswith("Finish the sign-in that another session opened")
     assert not isinstance(raised.value, claude_native_bridge.ClaudePromptTimeout)
+
+
+def test_wait_for_claude_prompt_ready_reports_a_launcher_password_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A launcher waiting for a password fails delivery as a terminal dialog within
+    two polls, instead of waiting out the budget and reaping the pane that holds
+    the prompt the person must answer.
+    """
+    captures: list[int] = []
+
+    def _capture(socket_path: str, tmux_target: str, *, join_wrapped: bool = False) -> str:
+        captures.append(1)
+        return "Installing launcher...\nEnter password to configure settings.\nPassword:\n"
+
+    monkeypatch.setattr("omnigent.harnesses.claude_native.bridge._capture_pane", _capture)
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._claude_pane_state",
+        lambda socket_path, tmux_target: claude_native_bridge._ClaudePaneState(True),
+    )
+    with pytest.raises(claude_native_bridge.ClaudeTerminalDialog) as raised:
+        claude_native_bridge._wait_for_claude_prompt_ready(
+            "/tmp/example/tmux.sock",
+            "claude:0.0",
+            timeout_s=30.0,
+        )
+    assert str(raised.value).startswith(
+        "Claude Code's launch command is waiting for a password in its terminal"
+    )
+    assert "Password:" in str(raised.value)
+    assert len(captures) == 2
 
 
 def test_wait_for_claude_prompt_ready_prefers_a_rendered_prompt_over_a_link(
@@ -10817,6 +11208,7 @@ class _EditableComposer:
         *,
         cursor: int,
         visible_rows: int | None = None,
+        pane_rows: int | None = None,
         unavailable_clear_captures: int = 0,
     ) -> None:
         """
@@ -10827,12 +11219,16 @@ class _EditableComposer:
             the closing rule shows framed; a taller one is cut off at the
             bottom of the pane without it (the ``_SLIVER_MULTILINE_DRAFT_PANE``
             geometry). ``None`` shows the whole box.
+        :param pane_rows: When set, the pane has this many lines and keeps the
+            bottom of the screen in view, as Claude Code 2.1.309 does: a draft
+            too tall for it scrolls the opening rule and glyph row off the top.
         :param unavailable_clear_captures: Captures that fail after clearing
             starts; readiness captures remain readable.
         """
         self.text = draft
         self.cursor = cursor
         self._visible_rows = visible_rows
+        self._pane_rows = pane_rows
         self._unavailable_clear_captures = unavailable_clear_captures
         self._clearing_started = False
         self.submitted: list[str] = []
@@ -10882,7 +11278,10 @@ class _EditableComposer:
             # The rows take every line the pane has: no closing rule.
             clipped = "\n".join(rows[: self._visible_rows])
             return f"⏺ done\n{self._RULE}\n{clipped}\n"
-        return f"{self._RULE}\n" + "\n".join(rows) + f"\n{self._RULE}\n  ? for shortcuts\n"
+        screen = ["⏺ done", self._RULE, *rows, self._RULE, "  ? for shortcuts"]
+        if self._pane_rows is not None:
+            screen = screen[-self._pane_rows :]
+        return "\n".join(screen[1:] if self._pane_rows is None else screen) + "\n"
 
     def _insert(self, text: str) -> None:
         self.text = self.text[: self.cursor] + text + self.text[self.cursor :]
@@ -10928,11 +11327,17 @@ _BOX_GEOMETRIES = pytest.mark.parametrize(
 
 @_BOX_GEOMETRIES
 @_STALE_DRAFT_CURSORS
+@pytest.mark.parametrize(
+    "draft",
+    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
+    ids=["plain-draft", "draft-with-rule"],
+)
 def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
     visible_rows: int | None,
+    draft: str,
 ) -> None:
     """
     A multi-line draft left in the box is not submitted with the message.
@@ -10944,7 +11349,7 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
     clearing burst would likewise leave the hidden lines to be submitted.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=cursor, visible_rows=visible_rows)
+    composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
 
     inject_user_message(bridge_dir, content="hello from the web")
@@ -10954,11 +11359,17 @@ def test_inject_user_message_clears_every_line_of_a_leftover_draft(
 
 @_BOX_GEOMETRIES
 @_STALE_DRAFT_CURSORS
+@pytest.mark.parametrize(
+    "draft",
+    [_STALE_MULTILINE_DRAFT, _STALE_MULTILINE_DRAFT.replace("STALE TWO", "─────────")],
+    ids=["plain-draft", "draft-with-rule"],
+)
 def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     cursor: int,
     visible_rows: int | None,
+    draft: str,
 ) -> None:
     """
     A multi-line draft left in the box is not submitted with a slash command.
@@ -10969,7 +11380,7 @@ def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
     as for a message.
     """
     bridge_dir = _picker_bridge_dir(tmp_path)
-    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=cursor, visible_rows=visible_rows)
+    composer = _EditableComposer(draft, cursor=cursor, visible_rows=visible_rows)
     composer.install(monkeypatch)
 
     claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
@@ -11060,6 +11471,197 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         assert [text.strip() for text in composer.submitted] == [expected]
 
 
+_TALL_DRAFT = "\n".join(f"STALE {idx}" for idx in range(30))
+
+
+@pytest.mark.parametrize("cursor", [0, len(_TALL_DRAFT)], ids=["cursor-at-start", "cursor-at-end"])
+@pytest.mark.parametrize(
+    ("inject", "expected"),
+    [
+        (
+            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+            "hello from the web",
+        ),
+        (
+            lambda bridge_dir: claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high"
+            ),
+            "/effort high",
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cursor: int,
+    inject: Callable[[Path], None],
+    expected: str,
+) -> None:
+    """
+    A draft too tall for the pane is cleared, not waited on as an overlay.
+
+    Claude Code keeps the bottom of its screen in view, so the draft scrolls
+    the box's opening rule and ``❯`` row off the top. Read as "no input box",
+    the readiness gate waited out its budget and the turn failed as a
+    terminal that never became ready.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(_TALL_DRAFT, cursor=cursor, pane_rows=10)
+    composer.install(monkeypatch)
+
+    inject(bridge_dir)
+
+    assert [text.strip() for text in composer.submitted] == [expected]
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("cursor", [0, 8, 18], ids=["start", "middle", "end"])
+@pytest.mark.parametrize("draft", ["", "ONE\nTWO\nTHREE\nFOUR"], ids=["empty", "hidden-draft"])
+def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slash: bool, cursor: int, draft: str
+) -> None:
+    """A tiny pane can hide the closing rule even after every draft line was cleared."""
+    composer = _EditableComposer(draft, cursor=min(cursor, len(draft)), visible_rows=1)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="120 6 latest\n", stderr=""),
+    )
+    sizes: list[str] = []
+
+    def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
+        if args[0] == "resize-window":
+            height = args[args.index("-y") + 1]
+            sizes.append(height)
+            composer._visible_rows = None if int(height) >= 24 else 1
+        else:
+            composer._run_tmux(socket_path, *args)
+
+    verify = claude_native_bridge._verify_submit_accepted
+
+    def verify_at_usable_height(*args: Any, **kwargs: Any) -> bool:
+        assert composer._visible_rows is None
+        return verify(*args, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_verify_submit_accepted", verify_at_usable_height)
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    if slash:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+    else:
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == [
+        "/effort high" if slash else "hello from the web"
+    ]
+    assert sizes == ["24", "6"]
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize(
+    ("pane", "error"),
+    [
+        (_PERMISSION_PROMPT_PANE, claude_native_bridge.ClaudeUserPromptPending),
+        (_REVERSE_SEARCH_PANE, claude_native_bridge.ClaudePromptTimeout),
+        ("unrecognized screen\n", claude_native_bridge.ClaudePromptTimeout),
+    ],
+    ids=["approval", "history-search", "unrecognized"],
+)
+def test_composer_recovery_rechecks_the_surface_before_typing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    pane: str,
+    error: type[Exception],
+) -> None:
+    """A dialog exposed by resizing receives no clearing, paste or submit keystrokes."""
+    composer = _EditableComposer("", cursor=0, visible_rows=1)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="120 7 manual\nmanual\n", stderr=""
+        ),
+    )
+    resized = False
+    recovery_keys: list[str] = []
+
+    def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
+        nonlocal resized
+        if args[0] == "resize-window":
+            resized = args[args.index("-y") + 1] == "24"
+        elif resized:
+            assert args[0] == "send-keys" and args[-1] == "Escape"
+            recovery_keys.append(args[-1])
+        else:
+            composer._run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *args: pane if resized else composer._capture_pane(*args),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(alive=None),
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    with pytest.raises(error):
+        if slash:
+            claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high", ready_timeout_s=0.5
+            )
+        else:
+            inject_user_message(bridge_dir, content="hello from the web", timeout_s=0.5)
+
+    assert composer.submitted == []
+    assert not resized
+    if pane != _REVERSE_SEARCH_PANE:
+        assert recovery_keys == []
+
+
+def test_blank_rows_after_an_empty_glyph_row_count_as_a_cleared_box(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whole box holding only blank rows below ``❯`` is empty: nothing can join the paste."""
+    sends = _fake_tmux(monkeypatch, ["──────\n❯\n\n──────\n  ? for shortcuts\n"])
+
+    claude_native_bridge._clear_composer("/tmp/example/tmux.sock", "claude:0.0")
+
+    assert sum(1 for send in sends if "-l" in send) == 1
+
+
+def test_composer_box_reads_a_draft_scrolled_past_the_top_of_the_pane() -> None:
+    """Only the closing rule shows: the rows above it are the draft's, the glyph row is gone."""
+    pane = "  step 9\n  step 10\n\n  step 12\n──────\n  paste again to expand\n"
+
+    assert claude_native_bridge._composer_row(pane) is None
+    assert claude_native_bridge._composer_box(pane) == claude_native_bridge._ComposerBox(
+        ["  step 9", "  step 10", "", "  step 12"], framed=False
+    )
+    assert claude_native_bridge._occupying_surface(pane) == "a draft taller than the terminal"
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "● done\n  ⎿ output\n──────\n  ? for shortcuts\n",
+        "  tool output\n  more output\n──────\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n",
+        "\n".join(_REVERSE_SEARCH_PANE.splitlines()[:5]),
+    ],
+    ids=["transcript-row-above", "dialog-below-the-rule", "clipped-history-search"],
+)
+def test_composer_box_does_not_read_other_screens_as_a_scrolled_draft(pane: str) -> None:
+    """A screen with transcript rows or a dialog under its rule is not a draft."""
+    assert claude_native_bridge._composer_box(pane) is None
+    assert claude_native_bridge._occupying_surface(pane) == claude_native_bridge._OVERLAY_SURFACE
+
+
 @pytest.mark.parametrize(
     ("pane", "box"),
     [
@@ -11071,16 +11673,43 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
             "scrollback\n──────\n❯ one\n  two\n  three",
             claude_native_bridge._ComposerBox(["❯ one", "  two", "  three"], framed=False),
         ),
+        (
+            "──────\n❯ one\n  ──────\n  four\n──────\n  ? for shortcuts\n",
+            claude_native_bridge._ComposerBox(["❯ one", "  ──────", "  four"], framed=True),
+        ),
+        (
+            "──────\n❯ one\n  ──────",
+            claude_native_bridge._ComposerBox(["❯ one", "  ──────"], framed=False),
+        ),
+        (
+            "──────\nold output\n  ──────\n  ❯ one\n    ──────\n    four\n  ──────\n",
+            claude_native_bridge._ComposerBox(["  ❯ one", "    ──────", "    four"], framed=True),
+        ),
         ("──────\n  Change effort level?\n  ❯ 1. Yes, switch to low\n    2. No, go back\n", None),
         ("plain output, no box\n", None),
+        (
+            "──────\n\n❯ one\n──────\n  ? for shortcuts\n",
+            claude_native_bridge._ComposerBox(["❯ one"], framed=True),
+        ),
     ],
-    ids=["framed-with-blank-row", "closing-rule-off-screen", "dialog-selector", "no-box"],
+    ids=[
+        "framed-with-blank-row",
+        "closing-rule-off-screen",
+        "rule-inside-draft",
+        "rule-inside-clipped-draft",
+        "indented-frame-with-earlier-rule",
+        "dialog-selector",
+        "no-box",
+        "blank-row-under-the-opening-rule",
+    ],
 )
 def test_composer_box_reads_every_row_of_the_input_box(
     pane: str, box: claude_native_bridge._ComposerBox | None
 ) -> None:
     """Every row of the live box counts, and a box cut off by the pane says so."""
     assert claude_native_bridge._composer_box(pane) == box
+    if box is not None:
+        assert claude_native_bridge._composer_row(pane) == box.rows[0]
 
 
 def test_a_model_switch_types_the_argument_form_and_confirms(
@@ -12948,17 +13577,18 @@ class _ScriptedPolicyClient:
         self.steps = list(steps)
         self.calls = 0
         self.bodies: list[dict[str, object] | None] = []
+        self.urls: list[str] = []
 
     async def post(self, url: str, json: dict[str, object] | None = None) -> SimpleNamespace:
         """Replay the next step as a minimal httpx-Response-shaped namespace.
 
-        :param url: Evaluate path (ignored).
+        :param url: Forwarded session path, recorded for routing checks.
         :param json: Forwarded EvaluationRequest; recorded for identity checks.
         :returns: Response namespace, or raises the scripted failure.
         """
         import json as _json
 
-        del url
+        self.urls.append(url)
         self.bodies.append(json)
         step = self.steps[min(self.calls, len(self.steps) - 1)]
         self.calls += 1
@@ -13316,6 +13946,77 @@ async def test_curl_evaluate_policy_command_round_trips(
     output = json.loads(result.stdout)
     assert output["hookSpecificOutput"]["permissionDecision"] == "ask"
     assert output["hookSpecificOutput"]["permissionDecisionReason"]
+
+
+@pytest.mark.asyncio
+async def test_pi_extension_ui_relay_path_proxies_to_session_hook(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The tool relay forwards ``/hook/pi/extension-ui`` to the session hook."""
+
+    client = _ScriptedPolicyClient({"type": "extension_ui_response", "confirmed": True})
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, client)
+    try:
+        body = await asyncio.to_thread(
+            _relay_request_raw,
+            bridge_dir,
+            "/hook/pi/extension-ui",
+            {
+                "elicitation_id": "elicit_pi_" + "ab" * 16,
+                "request": {"method": "confirm", "title": "Clear?", "message": "Lost."},
+            },
+        )
+        assert json.loads(body) == {"type": "extension_ui_response", "confirmed": True}
+        assert client.urls == ["/v1/sessions/conv_hook_eval/hooks/pi-extension-ui"]
+        assert client.bodies[0]["elicitation_id"] == "elicit_pi_" + "ab" * 16
+    finally:
+        relay.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("extra_bytes", [False, True])
+async def test_pi_dialog_disconnect_cancels_upstream_wait(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, extra_bytes: bool
+) -> None:
+    """Client EOF or pipelined bytes release the upstream wait without spinning."""
+    started, cancelled = asyncio.Event(), asyncio.Event()
+
+    class WaitingClient:
+        async def post(self, url, json):
+            started.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+    relay, bridge_dir = _hook_relay(tmp_path, monkeypatch, WaitingClient())
+    info = json.loads((bridge_dir / claude_native_bridge._TOOL_RELAY_FILE).read_text())
+    from urllib.parse import urlsplit
+
+    url = urlsplit(info["url"])
+    _, writer = await asyncio.open_connection(url.hostname, url.port)
+    try:
+        body = json.dumps({"elicitation_id": "cancel-check", "request": {"method": "confirm"}})
+        writer.write(
+            (
+                "POST /hook/pi/extension-ui HTTP/1.1\r\n"
+                f"Host: {url.netloc}\r\nAuthorization: Bearer {info['token']}\r\n"
+                f"Content-Type: application/json\r\nContent-Length: {len(body)}\r\n\r\n{body}"
+            ).encode()
+        )
+        await writer.drain()
+        await asyncio.wait_for(started.wait(), timeout=5)
+        if extra_bytes:
+            writer.write(b"unexpected pipelined bytes")
+            await writer.drain()
+        else:
+            writer.close()
+        await asyncio.wait_for(cancelled.wait(), timeout=2)
+    finally:
+        writer.close()
+        with suppress(ConnectionResetError):
+            await writer.wait_closed()
+        relay.close()
 
 
 # ── owner-pid marker + orphan prune (bridge-dir reaping) ────────────────────
@@ -14063,3 +14764,101 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+@pytest.mark.parametrize(
+    ("policy", "local_override", "failure", "cleanup_fails"),
+    [
+        ("latest", False, None, False),
+        ("manual", True, RuntimeError("delivery failed"), False),
+        ("latest", True, claude_native_bridge.ClaudeInjectionCancelled("cancelled"), False),
+        ("latest", False, RuntimeError("delivery failed"), True),
+    ],
+)
+def test_usable_composer_height_restores_size_after_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    local_override: bool,
+    failure: RuntimeError | None,
+    cleanup_fails: bool,
+) -> None:
+    """Success, errors and cancellation release the temporary sizing override."""
+    metadata = f"120 7 {policy}\n" + (f"{policy}\n" if local_override else "")
+    run = Mock(
+        side_effect=[
+            subprocess.CompletedProcess([], 0, stdout=metadata),
+            subprocess.CompletedProcess([], 0),
+            OSError("restore failed") if cleanup_fails else subprocess.CompletedProcess([], 0),
+        ]
+    )
+    monkeypatch.setattr("subprocess.run", run)
+    cancelled = threading.Event()
+    with claude_native_bridge.cancellable_injection(cancelled):
+        try:
+            with claude_native_bridge._usable_composer_height("/tmp/sock", "main") as grew:
+                assert grew
+                if isinstance(failure, claude_native_bridge.ClaudeInjectionCancelled):
+                    cancelled.set()
+                if failure is not None:
+                    raise failure
+        except RuntimeError as actual:
+            assert actual is failure
+        else:
+            assert failure is None
+        assert claude_native_bridge._INJECTION_CANCEL_EVENT.get() is cancelled
+
+    assert run.call_args_list[1].args[0][3:] == ["resize-window", "-t", "main", "-y", "24"]
+    restore_policy = (
+        ["set-option", "-w", "-t", "main", "window-size", policy]
+        if local_override
+        else ["set-option", "-wu", "-t", "main", "window-size"]
+    )
+    assert run.call_args_list[2].args[0][3:] == [
+        "resize-window",
+        "-t",
+        "main",
+        "-x",
+        "120",
+        "-y",
+        "7",
+        ";",
+        *restore_policy,
+    ]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        subprocess.CompletedProcess([], 0, stdout="120 24 latest\n"),
+        subprocess.CompletedProcess([], 0, stdout="120 40 manual\nmanual\n"),
+        subprocess.CompletedProcess([], 0, stdout="\n"),
+        subprocess.CompletedProcess([], 1, stdout="120 7 latest\n"),
+        subprocess.TimeoutExpired("tmux", timeout=1),
+    ],
+)
+def test_usable_composer_height_leaves_normal_or_unknown_size_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: subprocess.CompletedProcess[str] | subprocess.TimeoutExpired,
+) -> None:
+    run = Mock(side_effect=[metadata])
+    monkeypatch.setattr("subprocess.run", run)
+    with claude_native_bridge._usable_composer_height("/tmp/sock", "main") as grew:
+        assert not grew
+    assert run.call_count == 1
+
+
+def test_usable_composer_height_does_not_deliver_after_resize_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = Mock(
+        side_effect=[
+            subprocess.CompletedProcess([], 0, stdout="120 7 latest\n"),
+            subprocess.TimeoutExpired("tmux", timeout=1),
+            subprocess.CompletedProcess([], 0),
+        ]
+    )
+    monkeypatch.setattr("subprocess.run", run)
+    with pytest.raises(RuntimeError, match="tmux command timed out"):
+        with claude_native_bridge._usable_composer_height("/tmp/sock", "main"):
+            pytest.fail("delivery continued after a failed resize")
+    assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"

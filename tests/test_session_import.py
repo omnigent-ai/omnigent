@@ -468,6 +468,25 @@ def test_load_claude_session_synthesizes_title_without_native(tmp_path: Path) ->
     assert imported.title == "inspect TODO.md"
 
 
+def test_load_claude_session_rejects_an_omnigent_resume_copy(tmp_path: Path) -> None:
+    """Copy provenance survives transcript rewrites without transient bridge state."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    _write_claude_transcript_with_titles(tmp_path, session_id, ai_title=None, custom_title=None)
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    assert load_claude_session(session_id, claude_home=tmp_path).title == "inspect TODO.md"
+    transcript.with_suffix(".omnigent-resume-copy").touch()
+
+    with pytest.raises(SessionImportNotFoundError, match="resume copy"):
+        load_claude_session(session_id, claude_home=tmp_path)
+
+    transcript.write_text(
+        json.dumps({"type": "user", "message": {"role": "user", "content": "Later turn"}}) + "\n",
+        encoding="utf-8",
+    )
+    with pytest.raises(SessionImportNotFoundError, match="resume copy"):
+        load_claude_session(session_id, claude_home=tmp_path)
+
+
 def test_load_claude_session_rejects_empty_history(tmp_path: Path) -> None:
     """An empty Claude transcript cannot create a claimed import."""
     session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
@@ -781,7 +800,7 @@ def test_list_recent_claude_sessions_orders_parents_and_applies_limit(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """Claude batch discovery returns only the newest parent transcripts."""
+    """Discovery skips subagents and resume copies before taking the newest parents."""
     monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(tmp_path))
     project = tmp_path / "projects" / "-repo"
     project.mkdir(parents=True)
@@ -797,6 +816,10 @@ def test_list_recent_claude_sessions_orders_parents_and_applies_limit(
     subagent.parent.mkdir()
     subagent.touch()
     os.utime(subagent, (4, 4))
+    resume_copy = project / "copy.jsonl"
+    resume_copy.touch()
+    os.utime(resume_copy, (5, 5))
+    resume_copy.with_suffix(".omnigent-resume-copy").touch()
 
     recent = list_recent_local_session_ids("claude", limit=2)
 

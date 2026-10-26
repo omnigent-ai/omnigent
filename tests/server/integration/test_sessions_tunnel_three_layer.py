@@ -991,7 +991,7 @@ async def test_on_runner_connect_restarts_relay_via_router(
 
         try:
             await asyncio.wait_for(_hook_did_its_job(), timeout=budget(5.0))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             registry_entry = ap_app.state.tunnel_registry.get(_RUNNER_ID)
             raise AssertionError(
                 "Reconnect did not drive the connect hook to completion within 5s.\n"
@@ -1169,7 +1169,7 @@ async def _reconnect_fires_connect_hook(
 
         try:
             await asyncio.wait_for(recovery_finished.wait(), timeout=budget(5.0))
-        except asyncio.TimeoutError:
+        except TimeoutError:
             raise AssertionError(
                 "Reconnect did not finish recovery of the connection containing "
                 f"{wait_for_recover!r} "
@@ -2540,6 +2540,9 @@ async def test_runner_disconnect_holds_turn_while_host_offline(
         error = await asyncio.wait_for(_failed(), timeout=budget(5.0))
         assert error["code"] == "runner_disconnected"
         assert ("did not come back within" in error["message"]) == (scenario == "expired")
+        assert ("came back without the runner" in error["message"]) == (
+            scenario == "host_back_without_runner"
+        )
     finally:
         if reconnect is not None:
             with contextlib.suppress(asyncio.CancelledError, Exception):

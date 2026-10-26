@@ -3851,11 +3851,13 @@ describe("chatStore — first message during native model startup", () => {
   let harness = "claude-native";
   let sandboxStage: string | null = null;
   let failedSnapshotReads = 0;
+  let snapshotModel: string | null = null;
 
   beforeEach(() => {
     harness = "claude-native";
     sandboxStage = null;
     failedSnapshotReads = 0;
+    snapshotModel = null;
     clearSessionDrafts();
     seedSession(sessionId);
     fetchMock.mockImplementation((input, init) => {
@@ -3874,7 +3876,7 @@ describe("chatStore — first message during native model startup", () => {
             "omnigent.wrapper":
               harness === "claude-native" ? "claude-code-native-ui" : "codex-native-ui",
           },
-          llm_model: null,
+          llm_model: snapshotModel,
           sandbox_status: sandboxStage === null ? null : { stage: sandboxStage, error: null },
         });
       }
@@ -3910,7 +3912,10 @@ describe("chatStore — first message during native model startup", () => {
     );
   }
 
-  function reportSandbox(stage: "ready" | "failed", error: string | null = null): void {
+  function reportSandbox(
+    stage: "provisioning" | "ready" | "failed",
+    error: string | null = null,
+  ): void {
     handleSessionEvent(
       { type: "session_sandbox_status", conversationId: sessionId, stage, error },
       sessionId,
@@ -4548,6 +4553,138 @@ describe("chatStore — first message during native model startup", () => {
       { conversationId: "conv_child", text: "child second" },
     ]);
     expect(conversationRegistry.peek("conv_child")?.getState().failedSendDraft).toBeNull();
+  });
+
+  it("sends the draft once a status snapshot carries the model report the stream missed", async () => {
+    vi.useFakeTimers();
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    snapshotModel = "haiku";
+    await vi.advanceTimersByTimeAsync(60_000);
+
+    expect(eventBodies()).toEqual([
+      {
+        type: "message",
+        data: expect.objectContaining({ content: [{ type: "input_text", text: original }] }),
+      },
+    ]);
+    expect(useChatStore.getState()).toMatchObject({ llmModel: "haiku", sessionModelSeeded: false });
+  });
+
+  /** Park matching requests until `release` answers them or their signal aborts. */
+  function parkRequests(matches: (url: string, init?: RequestInit) => boolean): {
+    release: () => void;
+  } {
+    const baseFetch = fetchMock.getMockImplementation()!;
+    const parked: (() => void)[] = [];
+    fetchMock.mockImplementation((input, init) =>
+      matches(String(input), init)
+        ? new Promise<Response>((resolve, reject) => {
+            init?.signal?.addEventListener("abort", () =>
+              reject(new DOMException("aborted", "AbortError")),
+            );
+            parked.push(() => resolve(baseFetch(input, init)));
+          })
+        : baseFetch(input, init),
+    );
+    return { release: () => parked.splice(0).forEach((answer) => answer()) };
+  }
+
+  /**
+   * Start the session, then switch away with its stream unopened, so only the
+   * model-wait deadline can read its snapshot.
+   */
+  async function beginInBackground(): Promise<void> {
+    vi.useFakeTimers();
+    parkRequests((url) => url === `/v1/sessions/${sessionId}/stream`);
+    begin();
+    await vi.advanceTimersByTimeAsync(0);
+    seedSession("conv_other");
+    const switching = useChatStore.getState().switchTo("conv_other");
+    await vi.advanceTimersByTimeAsync(0);
+    await switching;
+  }
+
+  const parkSnapshots = () =>
+    parkRequests(
+      (url, init) =>
+        url.split("?")[0] === `/v1/sessions/${sessionId}` && (init?.method ?? "GET") === "GET",
+    );
+
+  it("re-reads the snapshot at the model-wait deadline before failing the draft", async () => {
+    await beginInBackground();
+    snapshotModel = "haiku";
+    await vi.advanceTimersByTimeAsync(179_000);
+    expect(eventBodies()).toEqual([]);
+    await vi.advanceTimersByTimeAsync(1_000);
+
+    expect(eventBodies()).toHaveLength(1);
+    expect(conversationRegistry.peek(sessionId)?.getState()).toMatchObject({
+      llmModel: "haiku",
+      sessionModelSeeded: false,
+    });
+    expect(useChatStore.getState().failedSendDraft).toBeNull();
+  });
+
+  it("sends once when the live report lands during the deadline re-read", async () => {
+    await beginInBackground();
+    const snapshots = parkSnapshots();
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(eventBodies()).toEqual([]);
+
+    reportModel();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(eventBodies()).toHaveLength(1);
+    snapshotModel = "stale-model";
+    snapshots.release();
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(eventBodies()).toHaveLength(1);
+    expect(conversationRegistry.peek(sessionId)?.getState()).toMatchObject({
+      llmModel: "haiku",
+      failedSendDraft: null,
+    });
+  });
+
+  it("restores the draft when the deadline re-read times out", async () => {
+    await beginInBackground();
+    parkSnapshots();
+    await vi.advanceTimersByTimeAsync(180_000);
+    expect(conversationRegistry.peek(sessionId)?.getState().failedSendDraft).toBeNull();
+    await vi.advanceTimersByTimeAsync(15_000);
+
+    expect(eventBodies()).toEqual([]);
+    const state = conversationRegistry.peek(sessionId)?.getState();
+    expect(state).toMatchObject({
+      pendingUserMessages: [],
+      failedSendDraft: { conversationId: sessionId, text: original, files: [] },
+    });
+    expect(state?.blocks).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          type: "error",
+          message: expect.stringContaining("model did not finish starting"),
+        }),
+      ]),
+    );
+  });
+
+  it("gives the model a fresh deadline after a launch during the deadline re-read", async () => {
+    await beginInBackground();
+    const snapshots = parkSnapshots();
+    await vi.advanceTimersByTimeAsync(180_000);
+    reportSandbox("provisioning");
+    reportSandbox("ready");
+    snapshots.release();
+    await vi.advanceTimersByTimeAsync(179_000);
+
+    const state = conversationRegistry.peek(sessionId)?.getState();
+    expect(eventBodies()).toEqual([]);
+    expect(state?.failedSendDraft).toBeNull();
+    expect(state?.pendingUserMessages[0]?.initialDraft).toBeDefined();
+    reportModel();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(eventBodies()).toHaveLength(1);
   });
 
   it("abandons the waiting send when its conversation is disposed", async () => {
@@ -6115,7 +6252,10 @@ describe("chatStore — delivered-but-unacked send", () => {
   // A network failure on the send POST only proves the acknowledgement was lost;
   // the committed item arriving under the send's stable id proves delivery.
 
-  it("retracts the failed-send draft when its message commits under the send's stable id", async () => {
+  const errorCards = () =>
+    useChatStore.getState().blocks.filter((block): block is ErrorBlock => block.type === "error");
+
+  it("retracts the failed-send draft and card when its message commits under the send's stable id", async () => {
     useChatStore.setState({
       conversationId: "conv_existing",
       abortController: new AbortController(),
@@ -6131,6 +6271,9 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(draft).toMatchObject({ text: "summarize the deploy status", serverRefused: false });
     const stableId = draft?.stableId;
     expect(stableId).toBeTruthy();
+    expect(errorCards()).toEqual([
+      expect.objectContaining({ message: "Failed to fetch", unansweredSend: { stableId } }),
+    ]);
 
     handleSessionEvent({
       type: "session_input_consumed",
@@ -6143,9 +6286,74 @@ describe("chatStore — delivered-but-unacked send", () => {
     });
 
     expect(useChatStore.getState().failedSendDraft).toBeNull();
+    expect(errorCards()).toEqual([]);
     const last = useChatStore.getState().blocks.at(-1) as UserMessageBlock;
     expect(last.type).toBe("user_message");
     expect(last.ctx.itemId).toBe(stableId);
+  });
+
+  /** Fail every events POST for conv_existing as a dropped connection does. */
+  function dropEventPosts(): void {
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events") && init?.method === "POST") {
+        return Promise.reject(new TypeError("Load failed"));
+      }
+      return defaultFetchHandler(input, init);
+    });
+  }
+
+  /** Commit a native transcript mirror, which carries its own item id. */
+  function commitMirror(itemId: string, text: string): void {
+    handleSessionEvent({
+      type: "session_input_consumed",
+      itemId,
+      itemType: "message",
+      data: { role: "user", content: [{ type: "input_text", text }] },
+      createdBy: "user@example.com",
+    });
+  }
+
+  it("retracts a native send's failure card once its transcript mirror commits", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+    });
+    commitMirror("0".repeat(32), "file a single PR");
+    dropEventPosts();
+    await useChatStore.getState().send("file a single PR", "agent_xyz");
+    expect(errorCards()).toEqual([
+      expect.objectContaining({
+        message: "Load failed",
+        unansweredSend: { stableId: expect.any(String), text: "file a single PR" },
+      }),
+    ]);
+
+    // Only the send's own mirror counts: not other text, not text that merely
+    // ends the same way, and not a late copy of the earlier message.
+    commitMirror("1".repeat(32), "something else");
+    commitMirror("2".repeat(32), "please file a single PR");
+    commitMirror("0".repeat(32), "file a single PR");
+    expect(errorCards()).toHaveLength(1);
+    commitMirror("3".repeat(32), "[Attached: /tmp/notes.md]\n\nfile a single PR");
+    expect(errorCards()).toEqual([]);
+  });
+
+  it("lets one native mirror retract only one of two identical failure cards", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      abortController: new AbortController(),
+      isNativeTerminalSession: true,
+    });
+    dropEventPosts();
+    await useChatStore.getState().send("ship it", "agent_xyz");
+    await useChatStore.getState().send("ship it", "agent_xyz");
+    expect(errorCards()).toHaveLength(2);
+
+    commitMirror("1".repeat(32), "ship it");
+    expect(errorCards()).toHaveLength(1);
+    commitMirror("2".repeat(32), "ship it");
+    expect(errorCards()).toEqual([]);
   });
 
   it("flips a restored draft to delivered and stops the stable-id reuse", () => {
@@ -6173,7 +6381,7 @@ describe("chatStore — delivered-but-unacked send", () => {
     expect(useChatStore.getState().pendingRetryStableId).toBeNull();
   });
 
-  it("hands back no draft when the message committed before the send failure settled", async () => {
+  it("hands back no draft or card when the message committed before the send failure settled", async () => {
     const stableId = "b".repeat(32);
     useChatStore.setState({
       conversationId: "conv_existing",
@@ -6202,6 +6410,7 @@ describe("chatStore — delivered-but-unacked send", () => {
 
     expect(useChatStore.getState().failedSendDraft).toBeNull();
     expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    expect(errorCards()).toEqual([]);
   });
 
   it("marks the draft server-refused when the POST is answered with an Omnigent error", async () => {
@@ -6226,6 +6435,9 @@ describe("chatStore — delivered-but-unacked send", () => {
       text: "summarize the deploy status",
       serverRefused: true,
     });
+    // An answered refusal is a real failure: its card names no send to retract it.
+    expect(errorCards()).toHaveLength(1);
+    expect(errorCards()[0]).not.toHaveProperty("unansweredSend");
   });
 
   it("still hands back a server-refused draft whose persisted item is in the transcript", async () => {
@@ -7454,6 +7666,38 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       });
     });
 
+    it.each([
+      ["clears it when the launch moved on", "provisioning", null],
+      ["keeps it while the launch still asks", "action_required", "Sign in."],
+    ] as const)(
+      "a reloaded snapshot of a dismissed warning %s",
+      async (_label, stage, dismissed) => {
+        useChatStore.setState({
+          conversationId: "conv_abc",
+          sandboxStatus: { stage: "action_required", error: null, details: "Sign in." },
+          sandboxActionDismissed: "Sign in.",
+        });
+        fetchMock.mockImplementation(() =>
+          mockResponse({
+            id: "conv_abc",
+            agent_id: "agent_xyz",
+            status: "idle",
+            created_at: 0,
+            items: [],
+            labels: {},
+            sandbox_status: {
+              stage,
+              error: null,
+              details: stage === "action_required" ? "Sign in." : null,
+            },
+          }),
+        );
+        await useChatStore.getState().refreshSessionState("conv_abc");
+        expect(useChatStore.getState().sandboxStatus?.stage).toBe(stage);
+        expect(useChatStore.getState().sandboxActionDismissed).toBe(dismissed);
+      },
+    );
+
     it("advances the provisioning indicator through launch stages", () => {
       useChatStore.setState({
         sandboxStatus: { stage: "provisioning", error: null },
@@ -8162,6 +8406,31 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         error: {
           code: "model_change_not_applied",
           message: "The terminal was not switched to haiku.",
+        },
+      });
+      const state = useChatStore.getState();
+      expect(state.pendingModelChange).toBeNull();
+      expect(state.llmModel).toBe("claude-sonnet-5");
+    });
+
+    it("settles a pending switch on the not-applied info notice item", () => {
+      // A switch refused while the pane waits on the person arrives as a
+      // persisted info-level error item rather than a live response.error.
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        llmModel: "claude-sonnet-5",
+        pendingModelChange: "haiku",
+      });
+      handleSessionEvent({
+        type: "error",
+        source: "execution",
+        toolName: null,
+        itemId: "item_notice",
+        responseId: "task_notice",
+        error: {
+          code: "model_change_not_applied",
+          message: "The terminal was not switched to haiku.",
+          level: "info",
         },
       });
       const state = useChatStore.getState();
@@ -13405,6 +13674,66 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     }
   });
 
+  it.each([
+    ["moved on", { stage: "provisioning", error: null }, null],
+    ["settled", null, null],
+    ["still asks", { stage: "action_required", error: null, details: "Sign in." }, "Sign in."],
+  ] as const)(
+    "a reconnect that finds the launch %s updates a dismissed warning",
+    async (_label, snapshotStatus, dismissed) => {
+      seedSession("conv_dismissed", []);
+      const sinks = routeStreamOpens(["server-a", "server-b"]);
+      const normalFetch = fetchMock.getMockImplementation()!;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const url = typeof input === "string" ? input : input.toString();
+        const path = url.split("?")[0]!;
+        if (path === "/v1/sessions/conv_dismissed" && (init?.method ?? "GET") === "GET") {
+          return Promise.resolve(
+            mockResponse({
+              id: "conv_dismissed",
+              agent_id: "agent_xyz",
+              status: "idle",
+              created_at: 0,
+              items: [],
+              labels: {},
+              pending_elicitations: [],
+              pending_inputs: [],
+              mcp_startup: null,
+              terminal_pending: false,
+              sandbox_status: snapshotStatus,
+            }),
+          );
+        }
+        return normalFetch(input, init);
+      });
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: "conv_dismissed",
+        abortController: controller,
+        sandboxStatus: { stage: "action_required", error: null, details: "Sign in." },
+        sandboxActionDismissed: "Sign in.",
+      });
+      const loop = startStreamPump("conv_dismissed", controller, setState, getState);
+      try {
+        await vi.advanceTimersByTimeAsync(1);
+        sinks[0]!.error();
+        // The reconnect reads the snapshot the missed stream events would have updated.
+        await vi.advanceTimersByTimeAsync(50);
+        await drainAsync(2);
+        expect(useChatStore.getState().sandboxActionDismissed).toBe(dismissed);
+      } finally {
+        controller.abort();
+        const last = sinks[sinks.length - 1];
+        if (last) {
+          last.push("data: [DONE]\n\n");
+          last.close();
+        }
+        await vi.advanceTimersByTimeAsync(20);
+        await loop;
+      }
+    },
+  );
+
   it("suppresses delayed previews after snapshot-only completion recovery", async () => {
     seedSession("conv_native_tombstone", []);
     const sinks = routeStreamOpens();
@@ -13747,9 +14076,21 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await loop;
   });
 
+  /** The card a send leaves when its POST gets no answer. */
+  function unansweredSendCard(send: NonNullable<ErrorBlock["unansweredSend"]>): ErrorBlock {
+    return {
+      type: "error",
+      ctx: { agent: null, depth: 0, turn: 0, timestamp: 0, responseId: "", itemId: null },
+      message: "Load failed",
+      source: "",
+      code: "",
+      unansweredSend: send,
+    };
+  }
+
   // A restored failed-send draft reconciles against the snapshot too: its
   // `session_input_consumed` proof is never replayed after a reconnect.
-  it("retracts an ack-lost restored draft when the reconnect snapshot holds its item", async () => {
+  it("retracts an ack-lost restored draft and its card when the reconnect snapshot holds its item", async () => {
     const stableId = "c".repeat(32);
     const before = userMessage("draft_pre", "before the gap");
     seedSession("conv_draft_acklost", [before]);
@@ -13758,7 +14099,7 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     useChatStore.setState({
       conversationId: "conv_draft_acklost",
       abortController: controller,
-      blocks: itemsToBlocks([before]),
+      blocks: [...itemsToBlocks([before]), unansweredSendCard({ stableId })],
       // The POST got no answer at all; the composer restored the text.
       restoredSendDraft: {
         conversationId: "conv_draft_acklost",
@@ -13972,6 +14313,70 @@ describe("chatStore — startStreamPump reconnect loop", () => {
 
     expect(state.restoredSendDraft).toMatchObject({ stableId, delivered: true });
     expect(state.pendingRetryStableId).toBeNull();
+  });
+
+  it("retracts an unsettled send's card once a later snapshot holds its item", async () => {
+    const id = "conv_card_unsettled";
+    const stableId = "d".repeat(32);
+    // The item was already shown when the POST died and its verdict fetch failed.
+    const sent = { ...userMessage(`${id}_sent`, "resend me"), id: stableId };
+    seedSession(id, [sent]);
+    const sinks = routeStreamOpens();
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      blocks: [...itemsToBlocks([sent]), unansweredSendCard({ stableId })],
+    });
+
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    // The reconnect snapshot postdates the failure and records no rejection.
+    expect(useChatStore.getState().blocks.map((b) => b.ctx.itemId)).toEqual([stableId]);
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
+  });
+
+  it("keeps the failure card of a send the snapshot records the runner refusing", async () => {
+    const id = "conv_card_rejected";
+    const stableId = "e".repeat(32);
+    const before = userMessage(`${id}_pre`, "before the gap");
+    seedSession(id, [before]);
+    const sinks = routeStreamOpens();
+    serveRunnerRejectedSnapshot(id, stableId);
+    const controller = new AbortController();
+    useChatStore.setState({
+      conversationId: id,
+      abortController: controller,
+      blocks: [...itemsToBlocks([before]), unansweredSendCard({ stableId })],
+    });
+
+    const loop = startStreamPump(id, controller, setState, getState);
+    await drainAsync();
+    expect(sinks).toHaveLength(1);
+
+    // The server persisted the message before the runner refused it.
+    seedSessionItems(id, [before, { ...userMessage(`${id}_gap`, "resend me"), id: stableId }]);
+    sinks[0]!.error();
+    await drainAsync();
+    expect(sinks).toHaveLength(2);
+
+    expect(useChatStore.getState().blocks).toContainEqual(unansweredSendCard({ stableId }));
+
+    const last = sinks[1]!;
+    last.push("data: [DONE]\n\n");
+    last.close();
+    await drainAsync(2);
+    await loop;
   });
 
   it("keeps an attributed rejection in force after the session has moved on", async () => {
@@ -14751,6 +15156,60 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await drainAsync(2);
     await loop;
   });
+
+  it.each([
+    { path: "ordinary backfill", gapLength: 5 },
+    { path: "the fresh-window fallback", gapLength: 100 },
+  ])(
+    "retracts a native send's failure card when reconnect recovers its mirror through $path",
+    async ({ gapLength }) => {
+      const id = `conv_native_card_${gapLength}`;
+      const preGap = Array.from({ length: 30 }, (_, i) => gapUser("pre", i));
+      const windowItems = preGap.slice(-SESSION_HISTORY_PAGE_SIZE);
+      seedSession(id, preGap);
+      const sinks = routeStreamOpens();
+      const controller = new AbortController();
+      useChatStore.setState({
+        conversationId: id,
+        abortController: controller,
+        isNativeTerminalSession: true,
+        blocks: [
+          ...itemsToBlocks(windowItems),
+          unansweredSendCard({ stableId: "a".repeat(32), text: "ship it" }),
+          // Its text matches only a pre-gap message, so this card stays.
+          unansweredSendCard({ stableId: "b".repeat(32), text: "pre 25" }),
+        ],
+        hasMoreHistory: true,
+        oldestItemId: windowItems[0]!.id,
+      });
+
+      const loop = startStreamPump(id, controller, setState, getState);
+      await drainAsync();
+      expect(sinks).toHaveLength(1);
+
+      // The first send's mirror commits during the gap, under its own id.
+      const gap = Array.from({ length: gapLength - 1 }, (_, i) => gapUser("gap", i));
+      const mirror = {
+        ...userMessage("mirror", "[Attached: /tmp/notes.md]\n\nship it"),
+        id: "f".repeat(32),
+      };
+      seedSessionItems(id, [...preGap, ...gap, mirror]);
+      sinks[0]!.error();
+      await drainAsync();
+      expect(sinks).toHaveLength(2);
+
+      const cards = useChatStore
+        .getState()
+        .blocks.filter((block): block is ErrorBlock => block.type === "error");
+      expect(cards.map((card) => card.unansweredSend?.text)).toEqual(["pre 25"]);
+
+      const last = sinks[1]!;
+      last.push("data: [DONE]\n\n");
+      last.close();
+      await drainAsync(2);
+      await loop;
+    },
+  );
 
   it.each([
     { path: "ordinary backfill", gapLength: 5, refreshesWindow: false },

@@ -798,26 +798,21 @@ def _parse_harness_cli_version(text: str) -> str | None:
 _DEFAULT_CLI_PROBE_TIMEOUT_S = 30.0
 READINESS_CLI_PROBE_TIMEOUT_S = 10.0
 
-# Probe caches damping the ambient readiness storm: every readiness refresh
-# on every host daemon execs vendor CLIs (``--version`` / ``auth status``)
-# whose answers change only when the binary is swapped or a login flips —
-# with a few dozen idle hosts that compounds into a constant machine-wide
-# subprocess churn. ``--version`` output is a pure function of the binary
-# bytes, so successful parses are cached against the binary's
-# ``(path, mtime_ns, size)`` signature; login state can flip without the
-# binary changing, so only positive verdicts are cached and they expire
-# after a short TTL — a cached "not logged in" would blind the setup
-# wizard's confirmation right after a successful login.
-_VERSION_PROBE_CACHE: dict[tuple[str, int, int], str] = {}
+# Cache successful probes to limit subprocess churn during readiness checks.
+# Launchers can delegate to an updated executable without changing themselves.
+_VERSION_PROBE_CACHE: dict[tuple[str, int, int], tuple[str, float]] = {}
 _LOGIN_PROBE_CACHE: dict[tuple[str, str], float] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
+# ponytail: a 60s TTL bounds staleness without tracking launcher dependencies.
+_VERSION_PROBE_CACHE_TTL_S = 60.0
 _LOGIN_PROBE_CACHE_TTL_S = 120.0
 _PROBE_CACHE_MAX_ENTRIES = 64
 
 
-def invalidate_harness_login_probe_cache() -> None:
-    """Force the next harness login check to call the vendor CLI."""
+def invalidate_harness_probe_caches() -> None:
+    """Force fresh CLI version and login probes after refresh or installation."""
     with _PROBE_CACHE_LOCK:
+        _VERSION_PROBE_CACHE.clear()
         _LOGIN_PROBE_CACHE.clear()
 
 
@@ -1000,10 +995,9 @@ def _harness_cli_version_string(
 ) -> str | None:
     """Return the parsed, normalized version string from *binary* ``--version``.
 
-    Successful parses are cached against the binary's ``(path, mtime_ns,
-    size)`` signature — the output cannot change until the binary does.
-    Failed probes (missing/hung binary, unparseable output) are never
-    cached, so a flaky state keeps re-probing like before.
+    Successful parses are cached briefly against ``(path, mtime_ns, size)``.
+    Expiration catches updates behind an unchanged launcher. Failed probes
+    (missing/hung binary, unparseable output) are never cached.
 
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
@@ -1012,8 +1006,8 @@ def _harness_cli_version_string(
     if sig is not None:
         with _PROBE_CACHE_LOCK:
             cached = _VERSION_PROBE_CACHE.get(sig)
-        if cached is not None:
-            return cached
+        if cached is not None and time.monotonic() < cached[1]:
+            return cached[0]
     try:
         completed = subprocess.run(
             [binary, "--version"],
@@ -1035,7 +1029,7 @@ def _harness_cli_version_string(
         with _PROBE_CACHE_LOCK:
             if len(_VERSION_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
                 _VERSION_PROBE_CACHE.clear()
-            _VERSION_PROBE_CACHE[sig] = version
+            _VERSION_PROBE_CACHE[sig] = (version, time.monotonic() + _VERSION_PROBE_CACHE_TTL_S)
     return version
 
 
@@ -1127,6 +1121,7 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
         return HarnessInstallResult(False, "install timed out after 300s")
     except OSError as exc:
         return HarnessInstallResult(False, f"install command failed to run: {exc}")
+    invalidate_harness_probe_caches()
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None

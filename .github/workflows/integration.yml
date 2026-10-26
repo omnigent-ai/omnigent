@@ -92,10 +92,9 @@ jobs:
 
   integration:
     name: Integration (${{ matrix.name }})
-    # Draft PRs resolve to an EMPTY matrix in `setup`, so this job produces zero
-    # leg runs (and thus no skipped placeholder check). Fork PRs DO run (mock
-    # LLM, no secrets) -- same as ci.yml.
+    # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: setup
+    if: needs.setup.outputs.matrix != '{"include":[]}'
     runs-on: ubuntu-latest
     # Per-leg ceiling; inner test step caps at 25 min, rest covers install +
     # junit upload. Legs run in parallel; longest gates wall-time.
@@ -103,10 +102,7 @@ jobs:
     strategy:
       # Don't cancel sibling harnesses on failure; surface which is red.
       fail-fast: false
-      # Harness legs (per-leg model + worker pinning) come from `setup`; [] when
-      # skipped. The ``Integration (...)`` leg-name prefix is load-bearing --
-      # the notify job's jq keys on it. Pinning rationale + codex worker halving
-      # live in .github/scripts/ci/integration-matrix.sh.
+      # Harness/model/worker pins come from integration-matrix.sh.
       matrix: ${{ fromJSON(needs.setup.outputs.matrix) }}
 
     steps:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextlib
 import functools
 import mimetypes
@@ -18,6 +19,7 @@ from fastapi import (
     APIRouter,
     Depends,
     File,
+    Form,
     HTTPException,
     Query,
     Request,
@@ -137,9 +139,15 @@ class _RunnerStreamResponse(StreamingResponse):
             await self._upstream.aclose()
 
 
-# Runner wait for a PR label request, above the runner's 15-second budget for all of
-# its ``gh`` calls, so a slow edit that GitHub applied is not reported as failed.
-_LABEL_PROXY_TIMEOUT_S = 20.0
+# Runner wait for a PR label, reviewer, or merge request, above the runner's 15-second
+# budget for all of its ``gh`` calls, so a slow edit that GitHub applied is not
+# reported as failed.
+_PR_EDIT_PROXY_TIMEOUT_S = 20.0
+# Runner wait for a PR attachment upload, above the runner's 110-second budget for it.
+_PR_ATTACHMENT_PROXY_TIMEOUT_S = 120.0
+# The largest PR attachment, a video; the runner checks each type's limit. Both
+# the runner and host tunnels carry it base64-encoded (a third larger) in one frame.
+_MAX_PR_ATTACHMENT_BYTES = 70 * 1024 * 1024
 
 # Admission gate bounding how many image uploads hold their raw bytes in memory
 # and decode/re-encode at once. Created lazily on first use so it binds to the
@@ -400,7 +408,7 @@ def register_resources_routes(
         conversation: Conversation,
         runner_path: str,
     ) -> Response:
-        """Stream a file download from the runner without buffering it.
+        """Resume an idle runner if needed and stream a file without buffering it.
 
         The runner serves the bytes straight from disk; forwarding them
         chunk by chunk keeps the server's memory flat however large the
@@ -418,10 +426,29 @@ def register_resources_routes(
             predates downloads.
         :raises HTTPException: 502 when no runner can be reached.
         """
-        runner_client = await _get_runner_client_for_resource_access(
-            session_id,
-            conversation=conversation,
-        )
+        try:
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id,
+                conversation=conversation,
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            # Restarting a runner needs edit access, even when its files are
+            # shared with read-only viewers. Live downloads keep the read gate.
+            conversation = await _validate_session(session_id, request, LEVEL_EDIT)
+            _, conversation = await ensure_runner_connected(
+                session_id=session_id,
+                conv=conversation,
+                app_state=request.app.state,
+                conversation_store=conversation_store,
+                runner_router=runner_router or get_server_runner_router(),
+                raise_host_refusal=True,
+            )
+            runner_client = await _get_runner_client_for_resource_access(
+                session_id,
+                conversation=conversation,
+            )
         if runner_client is None:
             raise HTTPException(
                 status_code=502,
@@ -577,7 +604,7 @@ def register_resources_routes(
         :param op: Host-side op name — ``"list_or_read"`` / ``"changes"``
             / ``"diff"`` / ``"search"`` / ``"github_info"`` /
             ``"github_changes"`` / ``"github_diff"`` / ``"github_pr_diff"`` /
-            ``"github_labels"``.
+            ``"github_labels"`` / ``"github_merge_options"`` / ``"github_reviewers"``.
             The ``github_*`` ops serve every git provider; their names are
             stable wire ids.
         :param host_params: Op-specific args for the host reader.
@@ -983,6 +1010,8 @@ def register_resources_routes(
         conversation: Conversation,
         op: str,
         host_params: dict[str, Any],
+        timeout: float | None = None,
+        uncertain_failure_detail: str | None = None,
     ) -> dict[str, Any] | None:
         """Serve a workspace-mutating op over the session's host tunnel.
 
@@ -990,8 +1019,14 @@ def register_resources_routes(
         runner is offline but the host holding the workspace is connected.
 
         :param op: Host-side write op — ``"github_set_preference"``,
-            ``"github_prs_update"``, or ``"github_labels_update"``.
+            ``"github_prs_update"``, ``"github_labels_update"``,
+            ``"github_reviewers_update"``, ``"github_details_update"``,
+            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``, or
+            ``"github_disable_auto_merge"``.
         :param host_params: Op-specific args for the host writer.
+        :param timeout: Seconds to wait for the host; the tunnel's default when ``None``.
+        :param uncertain_failure_detail: Report a dispatched write's unavailable result
+            as 502 with this detail instead of treating it as an offline host.
         :returns: The refreshed payload, or ``None`` when no host is bound /
             connected / reachable (caller re-raises the runner-offline error).
         :raises HTTPException: On host-reported failures, reproducing the runner's
@@ -1018,13 +1053,55 @@ def register_resources_routes(
                 workspace=conversation.workspace,
                 session_id=session_id,
                 params=host_params,
+                **({"timeout": timeout} if timeout is not None else {}),
             )
-        except HostFsUnavailableError:
+        except HostFsUnavailableError as exc:
+            if uncertain_failure_detail is not None:
+                raise HTTPException(status_code=502, detail=uncertain_failure_detail) from exc
             return None
         except HostFsError as exc:
             if exc.status == 400:
                 raise HTTPException(status_code=400, detail=exc.message) from exc
             raise HTTPException(status_code=502, detail=exc.message) from exc
+
+    async def _post_pr_edit(
+        session_id: str,
+        conv: Conversation,
+        *,
+        runner_path: str,
+        host_op: str,
+        params: dict[str, Any],
+        failure_detail: str,
+        non_idempotent: bool = False,
+    ) -> dict[str, Any]:
+        """POST a PR edit to the runner, or to the host tunnel when the runner is offline.
+
+        :param host_op: Host-side write op, e.g. ``"github_merge"``.
+        :param failure_detail: Error detail when the runner's refusal carries none.
+        :param non_idempotent: Preserve uncertainty when the host loses a write result.
+        :returns: The runner's or host's result.
+        :raises HTTPException: With the runner's status and ``detail`` when it refuses.
+        """
+        try:
+            status, result = await _proxy_post_to_runner(
+                session_id, runner_path, params, conv, timeout=_PR_EDIT_PROXY_TIMEOUT_S
+            )
+        except OmnigentError as exc:
+            if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
+                raise
+            payload = await _write_workspace_via_host(
+                session_id,
+                conv,
+                op=host_op,
+                host_params=params,
+                uncertain_failure_detail=failure_detail if non_idempotent else None,
+            )
+            if payload is None:
+                raise
+            return payload
+        if status >= 400:
+            raise HTTPException(status_code=status, detail=result.get("detail", failure_detail))
+        return result
 
     async def _proxy_post_to_runner(
         session_id: str,
@@ -3268,7 +3345,7 @@ def register_resources_routes(
             host_params={"pr_url": pr_url},
             runner_params={"pr_url": pr_url},
             runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
-            runner_timeout=_LABEL_PROXY_TIMEOUT_S,
+            runner_timeout=_PR_EDIT_PROXY_TIMEOUT_S,
         )
 
     @router.post(
@@ -3290,33 +3367,317 @@ def register_resources_routes(
         body = await request.json()
         if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
             raise HTTPException(status_code=400, detail="Expected a pull request URL")
-        params = {
-            "pr_url": body["pr_url"],
-            "add": body.get("add", []),
-            "remove": body.get("remove", []),
-        }
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/labels",
+            host_op="github_labels_update",
+            params={
+                "pr_url": body["pr_url"],
+                "add": body.get("add", []),
+                "remove": body.get("remove", []),
+            },
+            failure_detail="Cannot update labels",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/merge-options",
+        response_model=None,
+    )
+    async def get_session_github_merge_options(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the merge methods the selected PR's repository allows, for the merge dialog.
+
+        Requires edit access, like the merge it feeds. Falls back to the host
+        tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A ``session.github.merge_options`` with ``methods`` and ``default``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_merge_options",
+            host_params={"pr_url": pr_url},
+            runner_params={"pr_url": pr_url},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge-options",
+            runner_timeout=_PR_EDIT_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/merge",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def merge_session_github_pr(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Merge the selected PR with the host's provider account.
+
+        The merge applies only while the PR's head is ``expected_head``. Served by
+        the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url``, ``merge_method`` (``merge``,
+            ``squash``, or ``rebase``), and ``expected_head``, a full commit SHA.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/merge",
+            host_op="github_merge",
+            params={
+                "pr_url": body["pr_url"],
+                "merge_method": body.get("merge_method"),
+                "expected_head": body.get("expected_head"),
+            },
+            failure_detail="Cannot merge the pull request",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/disable-auto-merge",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def disable_session_github_auto_merge(
+        request: Request, session_id: str
+    ) -> dict[str, Any]:
+        """
+        Turn off the selected PR's auto-merge with the host's provider account.
+
+        Served by the runner when it's online, else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url``.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_merge``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/disable-auto-merge",
+            host_op="github_disable_auto_merge",
+            params={"pr_url": body["pr_url"]},
+            failure_detail="Cannot disable auto-merge",
+        )
+
+    @router.get(
+        "/sessions/{session_id}/resources/github/reviewers",
+        response_model=None,
+    )
+    async def list_session_github_reviewers(
+        request: Request,
+        session_id: str,
+        pr_url: str,
+    ) -> dict[str, Any]:
+        """
+        List the users and teams a review of the selected PR can be requested from.
+
+        Requires edit access, like the reviewer edit it feeds. Falls back to the
+        host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :returns: A list of ``{login, kind, name}`` with ``has_more``.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        return await _fs_get_with_host_fallback(
+            session_id,
+            conv,
+            op="github_reviewers",
+            host_params={"pr_url": pr_url},
+            runner_params={"pr_url": pr_url},
+            runner_path=f"/v1/sessions/{session_id}/resources/github/reviewers",
+            runner_timeout=_PR_EDIT_PROXY_TIMEOUT_S,
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/reviewers",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def update_session_github_reviewers(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Request reviews on the selected PR and withdraw pending requests.
+
+        Uses the host's provider account; served by the runner when it's online,
+        else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url`` and ``add`` / ``remove`` lists
+            of ``{login, kind}``.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_reviewers`` with the PR's resulting reviewers.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/reviewers",
+            host_op="github_reviewers_update",
+            params={
+                "pr_url": body["pr_url"],
+                "add": body.get("add", []),
+                "remove": body.get("remove", []),
+            },
+            failure_detail="Cannot update reviewers",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/comments",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def create_session_github_comment(request: Request, session_id: str) -> dict[str, Any]:
+        """Post a top-level comment using the host's selected GitHub account."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/comments",
+            host_op="github_comment_create",
+            non_idempotent=True,
+            params={"pr_url": body["pr_url"], "body": body.get("body")},
+            failure_detail="Could not confirm comment posting. Check GitHub before retrying.",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/details",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def update_session_github_details(request: Request, session_id: str) -> dict[str, Any]:
+        """
+        Replace the selected PR's title and/or description.
+
+        Uses the host's provider account; served by the runner when it's online,
+        else by the host over its tunnel.
+
+        :param request: JSON body with ``pr_url`` and an optional ``title`` and ``body``;
+            an omitted or null field keeps its current value.
+        :param session_id: Session/conversation identifier.
+        :returns: A ``session.github.pr_details`` with the PR's resulting title and body.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/details",
+            host_op="github_details_update",
+            params={
+                "pr_url": body["pr_url"],
+                "title": body.get("title"),
+                "body": body.get("body"),
+            },
+            failure_detail="Cannot update the pull request",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/attachments",
+        response_model=None,
+        # Multipart is CORS-safelisted, so only the Origin check stops a
+        # cross-site page uploading under the PR account.
+        dependencies=[Depends(require_trusted_origin)],
+    )
+    async def upload_session_github_attachment(
+        request: Request,
+        session_id: str,
+        pr_url: Annotated[str, Form()],
+        file: Annotated[UploadFile, File(...)],
+    ) -> dict[str, Any]:
+        """
+        Upload an image or video to embed in the selected PR's description.
+
+        The file goes to the provider without being kept by Omnigent, and the PR
+        is unchanged until a description that links it is saved. Falls back to
+        the host tunnel when the runner is offline.
+
+        :param request: The incoming FastAPI request (for auth).
+        :param session_id: Session/conversation identifier.
+        :param pr_url: The selected PR, which must be tracked by the session.
+        :param file: The image or video.
+        :returns: A ``session.github.pr_attachment`` with the ``url`` to embed.
+        """
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        content = await _read_upload_capped(file, _MAX_PR_ATTACHMENT_BYTES)
+        name = file.filename or ""
         try:
-            status, result = await _proxy_post_to_runner(
-                session_id,
-                f"/v1/sessions/{session_id}/resources/github/labels",
-                params,
-                conv,
-                timeout=_LABEL_PROXY_TIMEOUT_S,
-            )
+            resp = await _post_attachment_to_runner(session_id, conv, pr_url, name, content)
         except OmnigentError as exc:
             if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
                 raise
             payload = await _write_workspace_via_host(
-                session_id, conv, op="github_labels_update", host_params=params
+                session_id,
+                conv,
+                op="github_attachment_upload",
+                host_params={
+                    "pr_url": pr_url,
+                    "name": name,
+                    "content_base64": base64.b64encode(content).decode("ascii"),
+                },
+                timeout=_PR_ATTACHMENT_PROXY_TIMEOUT_S,
             )
             if payload is None:
                 raise
             return payload
-        if status >= 400:
+        try:
+            result = resp.json()
+        except ValueError:
+            result = None
+        if resp.status_code >= 400 or not isinstance(result, dict):
+            detail = result.get("detail") if isinstance(result, dict) else None
             raise HTTPException(
-                status_code=status, detail=result.get("detail", "Cannot update labels")
+                status_code=resp.status_code if resp.status_code >= 400 else 502,
+                detail=detail or "Cannot upload the file",
             )
         return result
+
+    async def _post_attachment_to_runner(
+        session_id: str, conv: Conversation, pr_url: str, name: str, content: bytes
+    ) -> httpx.Response:
+        """Forward an attachment's raw bytes to the runner.
+
+        :raises OmnigentError: ``runner_unavailable`` when the runner is offline.
+        :raises HTTPException: 502 when the runner cannot be reached otherwise.
+        """
+        runner_client = await _get_runner_client_for_resource_access(session_id, conversation=conv)
+        if runner_client is None:
+            raise HTTPException(status_code=502, detail="no runner available for resource access")
+        try:
+            return await runner_client.post(
+                f"/v1/sessions/{session_id}/resources/github/attachments",
+                params={"pr_url": pr_url, "name": name},
+                content=content,
+                headers={"Content-Type": "application/octet-stream"},
+                timeout=_PR_ATTACHMENT_PROXY_TIMEOUT_S,
+            )
+        except (httpx.HTTPError, ConnectionError) as exc:
+            raise HTTPException(
+                status_code=502, detail="runner resource endpoint unavailable"
+            ) from exc
 
     # Generic single-resource lookup — registered AFTER typed
     # collections so "environments", "terminals", "files" are not

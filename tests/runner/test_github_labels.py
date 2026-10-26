@@ -277,7 +277,7 @@ def test_every_gh_call_of_a_label_edit_shares_one_deadline(
         "/workspace", PullRequestRef.from_url(PR_URL), add=["ready"], remove=["bug"]
     )
 
-    deadline = 100.0 + github._LABEL_REQUEST_SECONDS
+    deadline = 100.0 + github._PR_EDIT_REQUEST_SECONDS
     assert deadlines == [("token", deadline), ("--hostname", deadline), ("--hostname", deadline)]
     assert github._gh_deadline.get() is None
 
@@ -299,7 +299,7 @@ def test_a_label_edit_past_its_deadline_reports_an_unknown_outcome(
     def run(argv: list[str], *, cwd: str, timeout: float, env: object = None):
         del cwd, env
         commands.append(argv)
-        assert timeout <= github._LABEL_REQUEST_SECONDS
+        assert timeout <= github._PR_EDIT_REQUEST_SECONDS
         clock[0] += timeout
         return None, "", "timed out"
 

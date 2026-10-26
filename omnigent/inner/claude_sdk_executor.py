@@ -87,6 +87,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    without_tool_history,
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
@@ -115,6 +116,54 @@ _CLAUDE_CODE_MIN_THINKING_BUDGET_TOKENS = 1024
 # gateway env (not the generic-provider gateway env) must carry it.
 _ANTHROPIC_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
 _DATABRICKS_CODING_AGENT_HEADER = "x-databricks-use-coding-agent-mode: true"
+
+CLAUDE_AUTH_FAILED_CODE = "claude_sdk_auth_failed"
+CLAUDE_AUTH_FAILED_TITLE = "Claude Code could not authenticate"
+# Failed ResultMessages carry no structured auth signal (unlike api_retry's
+# status), so Claude Code's (2.1.x) failure wording is the only input. A bare
+# "Run /login" is insufficient: billing/device-enrollment errors suggest it too.
+_CLAUDE_AUTH_FAILURE_MARKERS = (
+    "failed to authenticate",
+    "authentication failed",
+    "authentication_error",
+    "not authenticated",
+    "not logged in",
+    "not signed in",
+    "login expired",
+    "please login again",
+    "run /login to sign in",
+    "run /login to authenticate",
+    "run /login and sign in",
+    "oauth session expired",
+    "oauth token revoked",
+    "credential is expired or revoked",
+    "invalid api key",
+    "disabled api key authentication",
+)
+
+# Claude Code ends its failure lines with "." or a " \u00b7 Run /login" clause.
+_TRAILING_PUNCTUATION = ".!: \u00b7"
+
+
+def is_claude_auth_failure_text(text: str) -> bool:
+    """Whether *text* is Claude Code reporting that it could not authenticate."""
+    normalized = " ".join(text.replace("`", "").lower().split())
+    return any(marker in normalized for marker in _CLAUDE_AUTH_FAILURE_MARKERS)
+
+
+def _claude_auth_remediation(*, databricks_profile: bool, gateway: bool) -> str:
+    """The next step for a Claude Code authentication failure in this transport mode."""
+    if databricks_profile:
+        return "Check your selected ~/.databrickscfg profile."
+    if gateway:
+        return (
+            "Check your provider's base URL and auth command (ANTHROPIC_BASE_URL / gateway auth)."
+        )
+    return (
+        "Sign in to Claude Code on the host that runs this agent (`claude auth login`), "
+        f"or run `{cli_invocation()} setup` there to give the agent a Claude API key or gateway."
+    )
+
 
 # ---------------------------------------------------------------------------
 # TypeAliases for Omnigent JSON-shaped boundary values. The SDK exchanges
@@ -879,6 +928,27 @@ def _ensure_sdk() -> ModuleType:
         ) from exc
 
 
+# Tools of the in-process ``omnigent`` MCP server; only these come back through
+# ``_stable_tool_executor``. Every other tool (Claude Code's ``Skill`` and
+# ``ToolSearch``, or a user-configured MCP server) runs inside the CLI.
+_OMNIGENT_MCP_PREFIX = "mcp__omnigent__"
+
+
+def _tool_call_metadata(tool_block: _ToolUseBlockObj) -> dict[str, object]:
+    """Metadata for a ``ToolCallRequest``: its ``call_id``, and whether the CLI runs it.
+
+    A call the CLI runs itself is marked ``internally_executed`` so the
+    executor adapter keeps its id out of the dispatch-correlation queue.
+    Otherwise the id is never consumed, and every later Omnigent tool
+    dispatch in the turn pairs with the previous call's id, which records
+    each call twice under mismatched ids.
+    """
+    return {
+        "call_id": tool_block.id,
+        "internally_executed": not tool_block.name.startswith(_OMNIGENT_MCP_PREFIX),
+    }
+
+
 def _build_mcp_tools(
     tool_schemas: list[ToolSpec],
     tool_executor: ToolExecutor | None,
@@ -1045,7 +1115,7 @@ def _resolve_databricks_claude_model(profile: str | None) -> str:
                     " > ".join(("opus", "sonnet", "haiku", "fable")),
                 )
                 return servable
-    except Exception:  # noqa: BLE001 — the bundled catalog is the last resort
+    except Exception:  # the bundled catalog is the last resort
         logger.warning(
             "claude-sdk: live Databricks model discovery failed for profile %r; "
             "falling back to the bundled catalog",
@@ -1117,7 +1187,7 @@ def _gateway_model_vocabulary(base_url: str, auth_command: str | None) -> _Gatew
     )
     try:
         listing = model_catalog.listing_for_provider(provider)
-    except Exception:  # noqa: BLE001 — best-effort; unpinned aliases are the safe default
+    except Exception:  # best-effort; unpinned aliases are the safe default
         logger.warning(
             "claude-sdk: could not list the gateway's models; leaving "
             "ANTHROPIC_DEFAULT_*_MODEL and modelOverrides unset",
@@ -1959,7 +2029,7 @@ class ClaudeSDKExecutor(Executor):
                             _unset_env_var("CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS")
                         )
                     await asyncio.wait_for(client.connect(), timeout=_CONNECT_TIMEOUT_SECONDS)
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 await self._force_close_client(client)
                 tail = "\n".join(line.rstrip() for line in connect_stderr[-40:])
                 detail = tail or "(no CLI stderr captured)"
@@ -2182,7 +2252,7 @@ class ClaudeSDKExecutor(Executor):
                     try:
                         with suppress(Exception):
                             await asyncio.wait_for(process.wait(), timeout=5)
-                    except asyncio.TimeoutError:
+                    except TimeoutError:
                         _kill_process_tree(process)
                         with suppress(Exception):
                             await process.wait()
@@ -2217,6 +2287,9 @@ class ClaudeSDKExecutor(Executor):
         return True
 
     def handles_tools_internally(self) -> bool:
+        return True
+
+    def replays_tool_history(self) -> bool:
         return True
 
     def supports_live_message_queue(self) -> bool:
@@ -2460,7 +2533,7 @@ class ClaudeSDKExecutor(Executor):
             return None
         # Omnigent's own tools are already TOOL_CALL-gated server-side via
         # the dispatch bridge / ProxyMcpManager — don't evaluate them twice.
-        if tool_name.startswith("mcp__omnigent__"):
+        if tool_name.startswith(_OMNIGENT_MCP_PREFIX):
             return None
         _verdict = await _policy_eval(
             "PHASE_TOOL_CALL",
@@ -2850,6 +2923,11 @@ class ClaudeSDKExecutor(Executor):
         observed_model: str | None = None
         system_diagnostics: list[str] = []
         terminal_error: str | None = None
+        terminal_auth_failure = False
+        auth_remediation = _claude_auth_remediation(
+            databricks_profile=self._gateway_uses_databricks_profile,
+            gateway=bool(self._gateway),
+        )
         compaction_occurred: bool = False
         claude_session_id: str | None = None
         compaction_transcript_path: pathlib.Path | None = None
@@ -2945,7 +3023,7 @@ class ClaudeSDKExecutor(Executor):
                     for message in messages
                     if isinstance(message.message, dict)
                 ]
-            except Exception:  # noqa: BLE001
+            except Exception:
                 logger.warning(
                     "Failed to read Claude post-compaction session messages "
                     "(session=%s); preserving full server history instead of "
@@ -3011,7 +3089,7 @@ class ClaudeSDKExecutor(Executor):
         notice_messages = messages
         if resume_session:
             notice_messages = []
-            for message in reversed(messages):
+            for message in reversed(without_tool_history(messages)):
                 if message.get("role") != "user":
                     break
                 notice_messages.insert(0, message)
@@ -3034,7 +3112,7 @@ class ClaudeSDKExecutor(Executor):
                     client.query(sdk_prompt, session_id=session_key),
                     timeout=_QUERY_START_TIMEOUT_SECONDS,
                 )
-            except asyncio.TimeoutError as exc:
+            except TimeoutError as exc:
                 raise TimeoutError(
                     f"Claude SDK query start timed out after {int(_QUERY_START_TIMEOUT_SECONDS)}s"
                 ) from exc
@@ -3173,7 +3251,7 @@ class ClaudeSDKExecutor(Executor):
                                         # with the matching
                                         # :class:`ToolCallComplete`
                                         # by call_id.
-                                        metadata={"call_id": tool_block.id},
+                                        metadata=_tool_call_metadata(tool_block),
                                     )
                         else:
                             # No streaming — emit events from the full message.
@@ -3204,7 +3282,7 @@ class ClaudeSDKExecutor(Executor):
                                     yield ToolCallRequest(
                                         name=tool_block.name,
                                         args=tool_block.input,
-                                        metadata={"call_id": tool_block.id},
+                                        metadata=_tool_call_metadata(tool_block),
                                     )
 
                     elif isinstance(message, sdk.UserMessage):
@@ -3261,7 +3339,14 @@ class ClaudeSDKExecutor(Executor):
                                 self._agent_name,
                                 failure_text,
                             )
-                            terminal_error = failure_text
+                            terminal_auth_failure = is_claude_auth_failure_text(failure_text)
+                            # Keep the next step in the message too: the REPL and
+                            # SDK stream render only code/message.
+                            terminal_error = (
+                                f"{failure_text.rstrip(_TRAILING_PUNCTUATION)}. {auth_remediation}"
+                                if terminal_auth_failure
+                                else failure_text
+                            )
                         elif not response_text and result_msg.result:
                             response_text = result_msg.result
                         raw_usage = getattr(result_msg, "usage", None)
@@ -3331,23 +3416,12 @@ class ClaudeSDKExecutor(Executor):
                                 error_status in {401, 403}
                                 or retry_error == "authentication_failed"
                             ):
-                                if self._gateway_uses_databricks_profile:
-                                    auth_hint = "Check your selected ~/.databrickscfg profile."
-                                elif self._gateway:
-                                    auth_hint = (
-                                        "Check your provider's base URL and auth command "
-                                        "(ANTHROPIC_BASE_URL / gateway auth)."
-                                    )
-                                else:
-                                    auth_hint = (
-                                        "Check your Claude CLI login status "
-                                        "(`claude /status`) or API key configuration."
-                                    )
                                 terminal_error = (
                                     "Claude SDK provider authentication failed"
                                     f" ({retry_error}, status={error_status}). "
-                                    f"{auth_hint}"
+                                    f"{auth_remediation}"
                                 )
+                                terminal_auth_failure = True
                                 break
 
                             if error_status == 404:
@@ -3363,6 +3437,7 @@ class ClaudeSDKExecutor(Executor):
                                     f"({retry_error}, status={error_status}). "
                                     f"{endpoint_hint}"
                                 )
+                                terminal_auth_failure = False
                                 break
                         elif getattr(system_msg, "hook_event_name", None) == "PreCompact":
                             compaction_occurred = True
@@ -3458,7 +3533,16 @@ class ClaudeSDKExecutor(Executor):
                 compaction_event = _build_compaction_complete_event()
                 if compaction_event is not None:
                     yield compaction_event
-            yield ExecutorError(message=terminal_error, usage=turn_usage)
+            if terminal_auth_failure:
+                yield ExecutorError(
+                    message=terminal_error,
+                    usage=turn_usage,
+                    code=CLAUDE_AUTH_FAILED_CODE,
+                    title=CLAUDE_AUTH_FAILED_TITLE,
+                    remediation=auth_remediation,
+                )
+            else:
+                yield ExecutorError(message=terminal_error, usage=turn_usage)
             return
 
         # ── LLM_RESPONSE policy evaluation ───────────────────────
@@ -3522,7 +3606,8 @@ class ClaudeSDKExecutor(Executor):
             present in the latest user message.
         """
         if resume_session:
-            return ClaudeSDKExecutor._extract_trailing_user_content(messages)
+            # The live session already holds its tool items; only a fresh one replays them.
+            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
 
         user_messages = [msg for msg in messages if msg.get("role") == "user"]
         if len(messages) <= 1 or len(user_messages) <= 1:
@@ -3533,7 +3618,8 @@ class ClaudeSDKExecutor(Executor):
         # latest message's content blocks for native multimodal
         # delivery to the Anthropic API.
         latest_content = ClaudeSDKExecutor._extract_latest_user_content(messages)
-        prior = messages[:-1] if messages else []
+        latest_index = max(i for i, msg in enumerate(messages) if msg.get("role") == "user")
+        prior = messages[:latest_index] + messages[latest_index + 1 :]
 
         prior_blocks: list[_JsonObject] = [_text_block("Conversation so far:")]
         for msg in prior:
