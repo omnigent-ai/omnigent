@@ -123,7 +123,9 @@ def parse_client_side_tool_spec(raw: dict[str, Any]) -> ClientSideToolSpec:
     :class:`ClientSideToolSpec` and the workflow's
     :func:`_handle_tool_calls` for routing.
 
-    :param raw: A dict in standard OpenAI function tool format, e.g.::
+    :param raw: A dict in standard OpenAI function tool format, e.g.:
+
+        .. code-block:: json
 
             {
                 "type": "function",

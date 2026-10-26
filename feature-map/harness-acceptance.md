@@ -16,6 +16,7 @@ record omissions rather than treating unselected checks as passed.
 | ID | Priority | Observable acceptance |
 | --- | --- | --- |
 | `launch-reply` | P0 | Launch through the supported entry point; streamed output and the final answer appear once. Usage is reported where supported. |
+| `working-status` | P0 | A demonstrably active turn stays working through quiet model/tool work. Supported blocked states explain what input is needed. Completion, interruption and process exit settle the indicator; the next turn works. Opening or closing a terminal viewer does not change the reported state. |
 | `tool-history` | P0 | A real tool returns a value; a later turn uses that value without repeating the tool. Tool events and results remain visible. |
 | `model-effort` | P0 | Pre-launch and in-session selections reach the intended model/request. Supported effort survives a tool round trip and a later change without losing history; rejected changes do not falsely appear applied. |
 | `interrupt-continue` | P0 | Interrupt a demonstrably active turn, then complete another turn in the same session without stale work or a stuck running state. |
@@ -78,7 +79,8 @@ no harness-specific tests exist. No passing per-harness results are implied.
 
 | Checklist ID | Bench dimensions | Existing automation / remaining gap |
 | --- | --- | --- |
-| `launch-reply` | `basic_turn`, `streaming`, `cost_tracking` | Server/runner observations; browser launch/rendering and exact-once presentation need the owning UI tests. |
+| `launch-reply` | `basic_turn`, `streaming`, `cost_tracking` | Also check authored instructions for custom agents via the [native instruction recipe](./native-harnesses.md#driving-it-with-the-repro-environment); bench replies alone do not prove delivery. Server/runner observations; browser launch/rendering and exact-once presentation need the owning UI tests. |
+| `working-status` | — | No shared status-continuity probe. Use the [native working-status recipe](./native-harnesses.md#driving-it-with-the-repro-environment) for Claude OSC/file fallback and UI status routing; SDK lifecycle and other natives need their own evidence. A completed basic turn does not prove quiet-work or blocked-state accuracy. |
 | `tool-history` | `tool_calling` | Tool round trip only. Later-turn recall is not a shared probe; reuse the Pi scenarios below and identify other harness coverage explicitly. |
 | `model-effort` | `model_override`, `reasoning` | Native-TUI model override is currently skipped; SDK routing/reasoning observations are narrower than selection persistence. Reasoning output does not prove outgoing effort, tool continuity, High→Low or UI state. |
 | `interrupt-continue` | `interrupt` | Cancellation signal/early termination; follow-up recovery needs a separate assertion in the same session. |
@@ -105,6 +107,29 @@ matrices at the lowest reliable layer; retain browser/process cases for distinct
 boundaries. Do not move or replace working regression coverage just to fit the
 checklist.
 
+### Pi SDK bundled resources (own environment)
+
+For `launch-reply`, launch an uploaded Pi agent bundle through the server/runner,
+then run `omnigent run <bundle>` from a sibling workspace under Linux Bubblewrap.
+Include an extension,
+a skill and bundle-root instructions; verify all reach the provider request and
+that tools still use the session workspace. Existing scenarios:
+`tests/e2e/omnigent/test_pi_bundle_extensions_cwd_e2e.py`,
+`tests/e2e/omnigent/test_pi_bundle_project_resources_e2e.py`, and
+`tests/e2e/omnigent/test_pi_managed_extensions_e2e.py`.
+The managed-extensions filename refers to extension provisioning, not Managed
+Omnigent. The uploaded-bundle and existing global-extension CLI scenarios cover
+unsandboxed startup;
+the separate CLI bundle case covers real Bubblewrap isolation; a macOS skip does not
+validate that boundary. Native Pi resource discovery is a separate path.
+
+Run the scoped `launch-reply` checks (own environments; real Pi, scripted provider):
+
+```sh
+uv run --no-sync pytest tests/e2e/omnigent/test_pi_bundle_extensions_cwd_e2e.py tests/e2e/omnigent/test_pi_bundle_project_resources_e2e.py tests/e2e/omnigent/test_pi_managed_extensions_e2e.py --reruns 0 -q
+```
+
+
 ### Deterministic checks versus live canaries
 
 | Lane | Use | What a pass does not prove |
@@ -116,6 +141,13 @@ The verification environment configures mock Claude/Codex, not every harness.
 Other harnesses use the owning scenario's isolated setup. A missing vendor CLI
 or credential must remain visible. Do not change global rollout settings or
 reuse a developer daemon to obtain a passing result.
+
+For mock journeys, verify that the test's unique user prompt reaches the mock
+under the intended model. A reply that echoes an expected token, or a nonzero
+background-request count, is insufficient. Native Claude mock sessions reject
+conflicting machine-managed routing before launch; isolated user directories
+do not override machine policy. Run on a clean container/CI host and record the
+blocked local attempt separately (see [native prerequisites](./native-harnesses.md#driving-it-with-the-repro-environment)).
 
 For an **authorized** live bench slice, use an explicit harness/model and require
 observations. This example runs SDK Pi; select `pi-native` separately for native:
@@ -170,6 +202,10 @@ exists. Add an owner/next step for unresolved rows.
   bench observations; it does not validate this entire checklist or browser UI.
 - Tool, reasoning and interrupt probes are independent checks, not a substitute
   for a single session surviving tools, effort changes and follow-ups.
+- For Pi gateway reasoning, include a model whose metadata exists only in its
+  vendor catalog (for example GPT), alongside a Databricks-catalog model (Gemini).
+  Observe outgoing effort through a tool result and follow-up; a pre-enriched
+  model fixture or a visible High label alone misses catalog fallback failures.
 - Browser reload is not runner restart; neither is credential renewal. Test
   the boundary affected by the change and name unrun boundaries explicitly.
 - Use the same baseline for all affected harnesses. Until a gap is covered,

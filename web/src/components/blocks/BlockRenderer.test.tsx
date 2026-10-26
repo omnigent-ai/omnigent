@@ -13,7 +13,7 @@ import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
 import { FileViewerContext } from "@/shell/FileViewerContext";
 import { normalizeExplicitMathDelimiters } from "@/components/ai-elements/mathMarkdown";
-import { BlockRenderer } from "./BlockRenderer";
+import { BlockRenderer, rendersOnlyWorkedFold } from "./BlockRenderer";
 
 afterEach(cleanup);
 
@@ -752,6 +752,230 @@ describe("BlockRenderer dispatch", () => {
       );
       expect(screen.getByTestId("turn-worked-fold-pin-line")).toBeDefined();
       expect(screen.getByText("Called 1 tool")).toBeDefined();
+    });
+
+    describe("with foldNarration", () => {
+      it("folds narration and work behind one row, leaving the last message", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "I'll write the placeholder first.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Encrypting it now.", final: true },
+          tool(2, "Bash"),
+          { kind: "reasoning", itemId: "r0", text: "Checking the output.", duration: 2 },
+          { kind: "text", itemId: "m2", text: "Lorem ipsum dolor sit amet.", final: true },
+          { kind: "reasoning", itemId: "r1", text: "Wrapping up.", duration: 1 },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" workedForS={24} foldNarration />);
+
+        const fold = screen.getByRole("button", { name: "Worked for 24s" });
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        const answer = screen.getByText("Lorem ipsum dolor sit amet.");
+        expect(
+          fold.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+        expect(screen.queryByText("I'll write the placeholder first.")).toBeNull();
+        expect(screen.queryByText("Encrypting it now.")).toBeNull();
+
+        fireEvent.click(fold);
+        const first = screen.getByText("I'll write the placeholder first.");
+        const second = screen.getByText("Encrypting it now.");
+        expect(
+          first.compareDocumentPosition(second) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+        expect(
+          second.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+      });
+
+      it("folds progress messages in a turn without tool calls", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "I'll show a few progress updates.", final: true },
+          { kind: "text", itemId: "m1", text: "Read the message.", final: true },
+          { kind: "text", itemId: "m2", text: "Final placeholder answer.", final: true },
+        ];
+        const view = render(<BlockRenderer items={items} sessionStatus="idle" />);
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(screen.getByText("Read the message.")).toBeDefined();
+
+        view.rerender(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        return waitFor(() => {
+          expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
+          expect(screen.queryByText("Read the message.")).toBeNull();
+          expect(screen.getByText("Final placeholder answer.")).toBeDefined();
+        });
+      });
+
+      it("merges trailing reasoning into the same fold in a turn without tool calls", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Gathering context.", final: true },
+          { kind: "text", itemId: "m1", text: "Final placeholder answer.", final: true },
+          { kind: "reasoning", itemId: "r0", text: "Wrapping up.", duration: 1 },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        const fold = screen.getByRole("button", { name: "Worked" });
+        const answer = screen.getByText("Final placeholder answer.");
+        expect(
+          fold.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+        expect(screen.queryByText("Gathering context.")).toBeNull();
+      });
+
+      it("leaves a single-message turn and a live turn unfolded until it settles", () => {
+        const answerOnly: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Just the answer.", final: true },
+        ];
+        const view = render(
+          <BlockRenderer items={answerOnly} sessionStatus="idle" foldNarration />,
+        );
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+
+        const live: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Starting.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Still going.", final: true },
+        ];
+        view.rerender(
+          <BlockRenderer
+            items={live}
+            sessionStatus="running"
+            turnLifecycle="streaming"
+            foldNarration
+          />,
+        );
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(screen.getByText("Starting.")).toBeDefined();
+
+        view.rerender(
+          <BlockRenderer
+            items={live}
+            sessionStatus="idle"
+            turnLifecycle="completed"
+            foldNarration
+          />,
+        );
+        return waitFor(() => {
+          expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
+          expect(screen.queryByText("Starting.")).toBeNull();
+          expect(screen.getByText("Still going.")).toBeDefined();
+        });
+      });
+
+      it("keeps a terminal error turn and pending approvals visible", () => {
+        const failed: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Trying the build.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Build output looked odd.", final: true },
+          { kind: "error", itemId: null, source: "", code: "server_error", message: "Failed." },
+        ];
+        const view = render(<BlockRenderer items={failed} sessionStatus="idle" foldNarration />);
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(screen.getByText("Trying the build.")).toBeDefined();
+        view.unmount();
+
+        const parked: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Need approval.", final: true },
+          tool(1, "Bash"),
+          elicitation("pending", null),
+          { kind: "text", itemId: "m1", text: "Waiting on you.", final: true },
+        ];
+        const parkedView = render(
+          <BlockRenderer items={parked} sessionStatus="idle" foldNarration />,
+        );
+        expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
+        expect(screen.queryByText("Need approval.")).toBeNull();
+        expect(screen.getByText("Waiting on you.")).toBeDefined();
+        expect(screen.getByText("Claude wants to call Bash", { exact: false })).toBeDefined();
+
+        // A fold that has shown stays latched, so mount the parked turn fresh.
+        parkedView.unmount();
+        render(
+          <BlockRenderer
+            items={parked}
+            sessionStatus="idle"
+            isLastAssistant
+            hasPendingElicitation
+            foldNarration
+          />,
+        );
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(screen.getByText("Need approval.")).toBeDefined();
+      });
+
+      it("keeps narration visible in a turn that failed or hit a denial", () => {
+        const denied: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Trying the deploy.", final: true },
+          tool(1, "Bash"),
+          { kind: "policy_denied", itemId: null, reason: "Blocked.", phase: "request" },
+          { kind: "text", itemId: "m1", text: "Deploy was blocked.", final: true },
+        ];
+        const view = render(<BlockRenderer items={denied} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.getByText("Trying the deploy.")).toBeDefined();
+        expect(screen.getByText("Deploy was blocked.")).toBeDefined();
+
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Starting the build.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "Partial output.", final: true },
+        ];
+        for (const turnLifecycle of ["failed", "cancelled", "incomplete"] as const) {
+          view.rerender(
+            <BlockRenderer
+              items={items}
+              sessionStatus="idle"
+              turnLifecycle={turnLifecycle}
+              foldNarration
+            />,
+          );
+          expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+          expect(screen.getByText("Starting the build.")).toBeDefined();
+        }
+      });
+
+      it("still folds narration after a retry that succeeded", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Calling the model.", final: true },
+          { kind: "retry", itemId: null, source: "", attempt: 1, maxAttempts: 3, delaySeconds: 1 },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "All done.", final: true },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.queryByText("Calling the model.")).toBeNull();
+        expect(screen.getByText("All done.")).toBeDefined();
+      });
+
+      it("keeps a continued bubble's last message visible", () => {
+        // A later bubble may answer a wake or a question card, not this turn.
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Dispatching sub-agents.", final: true },
+          tool(1, "Agent"),
+          { kind: "text", itemId: "m1", text: "Here is the answer.", final: true },
+        ];
+        const inputs = { items, sessionStatus: "idle" as const, continued: true };
+        expect(rendersOnlyWorkedFold({ ...inputs, foldNarration: true })).toBe(false);
+        render(<BlockRenderer {...inputs} foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.getByText("Here is the answer.")).toBeDefined();
+        expect(screen.queryByText("Dispatching sub-agents.")).toBeNull();
+
+        const textOnly = { ...inputs, items: [items[0]!, items[2]!] };
+        expect(rendersOnlyWorkedFold({ ...textOnly, foldNarration: true })).toBe(false);
+      });
+
+      it("keeps the last non-blank message as the answer", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Looking into it.", final: true },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "The real answer.", final: true },
+          { kind: "text", itemId: "m2", text: "  \n", final: true },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.getByText("The real answer.")).toBeDefined();
+        expect(screen.queryByText("Looking into it.")).toBeNull();
+      });
     });
 
     describe("expand scroll-into-view", () => {

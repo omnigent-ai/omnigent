@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import time
-from datetime import datetime, timedelta, timezone
+from datetime import UTC, datetime, timedelta
 
 import httpx
 import pytest
@@ -257,7 +257,7 @@ def test_custom_date_inputs_have_max_today(page: Page, live_server: str) -> None
 
     page.get_by_role("button", name="Custom").click()
 
-    today_str = datetime.now(tz=timezone.utc).date().isoformat()
+    today_str = datetime.now(tz=UTC).date().isoformat()
     start_input = page.locator('input[type="date"]').first
     end_input = page.locator('input[type="date"]').last
 
@@ -275,7 +275,7 @@ def test_custom_date_end_auto_adjusts_when_start_exceeds_end(page: Page, live_se
     start_input = page.locator('input[type="date"]').first
     end_input = page.locator('input[type="date"]').last
 
-    today = datetime.now(tz=timezone.utc).date()
+    today = datetime.now(tz=UTC).date()
     new_start = today.isoformat()
     yesterday = (today - timedelta(days=1)).isoformat()
 

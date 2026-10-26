@@ -723,10 +723,27 @@ async def test_native_transcript_preserves_browser_title_preference(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+@pytest.mark.parametrize(
+    "harness,message_text,rejected_auth,active_turn",
+    [
+        ("claude-native", "set up the worktree", False, False),
+        ("claude-native", "/login", True, False),
+        ("claude-native", "/logout", True, False),
+        ("claude-native", " \n/login workspace", True, False),
+        ("claude-native", "/login-help", False, False),
+        ("claude-native", "Explain /login", False, False),
+        ("codex-native", "/login", False, False),
+        ("claude-native", "/login", True, True),
+    ],
+)
 async def test_native_message_repeat_with_same_stable_id_forwards_once(
     client: httpx.AsyncClient,
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    message_text: str,
+    rejected_auth: bool,
+    active_turn: bool,
 ) -> None:
     """
     A resend that reuses the web client's stable message id is answered with
@@ -755,7 +772,7 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
         "type": "message",
         "data": {
             "role": "user",
-            "content": [{"type": "input_text", "text": "set up the worktree"}],
+            "content": [{"type": "input_text", "text": message_text}],
             "stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
         },
     }
@@ -767,25 +784,58 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
             "omnigent.server.routes._sessions.orchestration._get_runner_client",
             AsyncMock(return_value=runner),
         )
-        agent = await create_test_agent(client, name="claude-native-ui")
+        agent = await create_test_agent(
+            client,
+            name=f"{harness}-ui",
+            executor={"type": "omnigent", "config": {"harness": harness}},
+        )
         created = await client.post(
             "/v1/sessions",
             json={
                 "agent_id": agent["id"],
                 "labels": {
                     "omnigent.ui": "terminal",
-                    "omnigent.wrapper": "claude-code-native-ui",
+                    "omnigent.wrapper": (
+                        "claude-code-native-ui"
+                        if harness == "claude-native"
+                        else "codex-native-ui"
+                    ),
                 },
             },
         )
         assert created.status_code == 201, created.text
         session_id = created.json()["id"]
+        if active_turn:
+            sessions_module._publish_status(session_id, "running", response_id="response_active")
+        before = (await client.get(f"/v1/sessions/{session_id}")).json()
+        published: list[tuple[str, dict[str, Any]]] = []
+        _capture_published(monkeypatch, published)
         try:
 
             def message_forwards() -> int:
                 return sum(1 for r in forwarded if r.url.path.endswith("/events"))
 
             first = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            if rejected_auth:
+                assert first.status_code == 400, first.text
+                assert first.json()["error"]["code"] == "invalid_input"
+                assert "omni setup" in first.json()["error"]["message"]
+                assert message_forwards() == 0
+                assert pending_inputs.snapshot_for(session_id) == []
+                after = (await client.get(f"/v1/sessions/{session_id}")).json()
+                assert after["items"] == before["items"]
+                assert after["status"] == before["status"]
+                if active_turn:
+                    assert sessions_module._session_active_response_cache[session_id] == (
+                        "response_active"
+                    )
+                assert not any(
+                    event.get("type") in {"response.error", "response.failed"}
+                    or (event.get("type") == "session.status" and event.get("status") == "failed")
+                    for published_session, event in published
+                    if published_session == session_id
+                )
+                return
             assert first.status_code == 202, first.text
             assert message_forwards() == 1
             # The runner learns the message's id so a failed turn can name it.
@@ -5010,6 +5060,7 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
                     "native_error_category": "invalid_request",
                     "detail_source": "hook_last_assistant_message",
                     "failure_source": "claude_hook",
+                    "transcript_error_context_state": "hook_details_present",
                     "native_session_id": "native-session",
                     "failure_id": "native-failure-synthetic",
                     "http_status": 400,
@@ -5039,6 +5090,7 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
     assert attrs["native_error_category"] == "invalid_request"
     assert attrs["detail_source"] == "hook_last_assistant_message"
     assert attrs["failure_source"] == "claude_hook"
+    assert attrs["transcript_error_context_state"] == "hook_details_present"
     assert attrs["native_session_id"] == "native-session"
     assert attrs["failure_id"] == "native-failure-synthetic"
     assert attrs["http_status"] == "400"
@@ -5589,11 +5641,14 @@ async def test_post_external_session_status_failed_keeps_wire_output_and_harness
     assert snapshot_error["message"] == detail
 
 
-@pytest.mark.parametrize("wire_output", [False, True])
+@pytest.mark.parametrize(
+    ("wire_output", "partial_output"), [(False, False), (True, False), (False, True)]
+)
 async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     wire_output: bool,
+    partial_output: bool,
 ) -> None:
     """Native 429 reports retain a retryable code on the stream and snapshot."""
     detail = (
@@ -5631,6 +5686,9 @@ async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     data: dict[str, Any] = {"status": "failed", "response_id": response_id}
     if wire_output:
         data["output"] = detail
+    if partial_output:
+        data["output"] = "The earlier request returned HTTP 403; I am checking the result."
+        data["failure_detail"] = detail
     status_resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},
@@ -12660,6 +12718,97 @@ async def test_native_message_persisted_when_runner_offline(
     # what the web re-renders on reload via itemsToBlocks. (The separate
     # last_task_error snapshot field is the exit-report durability path,
     # which needs a bound runner_id — covered by the snapshot unit test.)
+    snap = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snap["status"] == "failed"
+
+
+async def _post_native_message(client: httpx.AsyncClient, sid: str) -> httpx.Response:
+    return await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+
+async def test_native_message_to_hostless_gone_runner_is_refused(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A message to a session whose host-less runner is gone is refused.
+
+    A runner bound without a host ran in a local terminal; once it's gone
+    nothing can relaunch it. The server refuses with a resume command and
+    records nothing, so the client keeps the message.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    sid = session["id"]
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(sid, "runner_local_terminal")
+
+    resp = await _post_native_message(client, sid)
+    assert resp.status_code == 503, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert f"claude --resume {sid}" in error["message"]
+
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    assert not [i for i in items if i["type"] in {"message", "error"}], items
+    snap = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snap["status"] == "idle"
+
+
+@pytest.mark.parametrize("case", ["side_chat", "sub_agent", "exit_report"])
+async def test_native_message_to_gone_runner_still_persisted_when_recoverable(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """
+    Side chats, sub-agents, and runners with an exit report keep the failed turn.
+
+    Their failure is recorded rather than refused: side chats and sub-agents
+    recover through their parent, and an exit report explains the failure.
+    """
+    from omnigent.server.host_registry import RunnerExitReports
+
+    agent = await create_test_agent(client)
+    labels = {"omnigent.wrapper": "claude-code-native-ui"}
+    store = SqlAlchemyConversationStore(db_uri)
+    if case == "sub_agent":
+        parent = await _create_session(client, agent["id"], labels=labels)
+        sid = store.create_conversation(
+            kind="sub_agent",
+            title="coder:child",
+            parent_conversation_id=parent["id"],
+            agent_id=agent["id"],
+            labels=labels,
+        ).id
+    else:
+        if case == "side_chat":
+            labels = {**labels, "omnigent.side_chat": "1"}
+        sid = (await _create_session(client, agent["id"], labels=labels))["id"]
+    assert store.set_runner_id(sid, "runner_local_terminal")
+    if case == "exit_report":
+        monkeypatch.setattr(
+            RunnerExitReports, "get", lambda self, runner_id: "runner process exited with code 1"
+        )
+
+    resp = await _post_native_message(client, sid)
+    assert "No host can restart" not in resp.text
+    # A sub-agent's send also tries to wake its runner-less parent, which answers 503.
+    assert resp.status_code == (503 if case == "sub_agent" else 202), resp.text
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    errors = [i for i in items if i["type"] == "error"]
+    assert len(errors) == 1, items
+    assert errors[0]["code"] == "runner_failed_to_start"
     snap = (await client.get(f"/v1/sessions/{sid}")).json()
     assert snap["status"] == "failed"
 

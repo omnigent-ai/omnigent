@@ -1,18 +1,6 @@
-// Editor for a project's stored default session settings (`config`), reached
-// from the project-folder kebab menu. Writing a project's config is what lets
-// the new-chat composer pre-fill host / working directory / agent and the
-// isolated-worktree default when starting a session in the project.
-//
-// Scope mirrors what the composer prefills today: host, workspace, agent,
-// whether new sessions start in a fresh git worktree, the base branch a
-// worktree forks from (which overrides the user-global default in Settings ›
-// Git), and — when the default agent is a native harness with a model choice
-// (Claude Code / Codex) — a default model for new sessions. Reasoning-effort /
-// harness stay per-agent run config, out of scope here. The host and agent
-// pickers reuse the composer's components; the working directory reuses its
-// filesystem browser (inline, so it scrolls inside the modal).
-// Fields are optional: an unset one stores no default (an absent key), and an
-// all-default dialog stores an empty config.
+// Project settings dialog: edits the stored defaults (`config`) the new-session
+// composer prefills (host, workspace, agent, worktree and base branch, and a model
+// and effort for native harnesses). An unset field stores no key.
 
 import { ChevronDownIcon } from "lucide-react";
 import { type FormEvent, useEffect, useMemo, useRef, useState } from "react";
@@ -33,6 +21,7 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { Switch } from "@/components/ui/switch";
+import { nativeEffortOptions } from "@/components/HarnessConfigControls";
 import { useProjectConfig, useUpdateProjectConfig } from "@/hooks/useConversations";
 import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
@@ -42,6 +31,8 @@ import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { readAlwaysUseWorktree } from "@/lib/worktreeDefaultPreferences";
 import { SANDBOX_HOST_CHOICE } from "@/lib/hostPreferences";
 import { CLAUDE_NATIVE_MODELS } from "@/lib/claudeNativeModels";
+import { findNativeModelOption } from "@/lib/codexNativeModels";
+import { normalizeEffortLabel } from "@/lib/composerModelLabel";
 import {
   isNativeCodingAgent,
   nativeAgentHasCapability,
@@ -140,6 +131,9 @@ export function ProjectSettingsDialog({
   // Default model for new sessions, only meaningful when the default agent is
   // a native harness with a model choice; NONE stores no default (unset key).
   const [model, setModel] = useState<string>(NONE);
+  // Default reasoning effort, offered alongside the model for harnesses with an
+  // effort ladder; NONE stores no default (unset key).
+  const [effort, setEffort] = useState<string>(NONE);
   const [workspaceOpen, setWorkspaceOpen] = useState(false);
 
   // The agent picker and the host Select portal their dropdowns OUTSIDE
@@ -190,6 +184,8 @@ export function ProjectSettingsDialog({
     setBaseBranch(c.base_branch ?? "");
     setAgentId(c.agent_id ?? null);
     setModel(c.model ?? NONE);
+    // The server stores config untyped, so ignore a malformed effort.
+    setEffort(typeof c.effort === "string" && c.effort ? c.effort : NONE);
     setWorkspaceOpen(false);
   }, [open, stored, loadFailed]);
 
@@ -232,6 +228,8 @@ export function ProjectSettingsDialog({
     const agentUnresolved = agentId != null && selectedAgent === null;
     if (supportsModelDefault && model !== NONE) config.model = model;
     else if (!agentUnresolved) delete config.model;
+    if (supportsEffortDefault && effortValue !== NONE) config.effort = effortValue;
+    else if (!agentUnresolved) delete config.effort;
 
     updateConfig.mutate(
       { id: projectId, name: projectName, config },
@@ -303,6 +301,41 @@ export function ProjectSettingsDialog({
   // Offer the control only for a model-taking harness; when it can only render
   // "No default" it stays visible but disabled with an explanatory hint.
   const supportsModelDefault = harnessTakesModel;
+  // Mirror the composer's effort ladder (Codex varies per model).
+  const effortLadder = (pinnedModel: string) =>
+    nativeEffortOptions(
+      selectedNativeSpec?.harness,
+      hostModelOptions ?? [],
+      pinnedModel === NONE ? null : pinnedModel,
+    );
+  // Codex ladders are known only once the catalog resolves the model; until then
+  // keep the stored level.
+  const effortLadderKnown = (pinnedModel: string) => {
+    if (selectedNativeSpec?.harness !== "codex-native") return true;
+    const options = hostModelOptions ?? [];
+    const target = pinnedModel === NONE ? options.find((m) => m.isDefault)?.id : pinnedModel;
+    return findNativeModelOption(options, target) !== null;
+  };
+  const effortOptions = supportsModelDefault ? effortLadder(model) : null;
+  const supportsEffortDefault = effortOptions !== null;
+  const effortInLadder = (options: typeof effortOptions, level: string) =>
+    (options ?? []).some((e) => e.value === level);
+  // A stored level a known ladder lacks would never apply, so show and save no default.
+  const effortValue =
+    effort !== NONE && effortLadderKnown(model) && !effortInLadder(effortOptions, effort)
+      ? NONE
+      : effort;
+  const effortDropped = effort !== NONE && effortValue === NONE;
+  const storedEffortMissing = effortValue !== NONE && !effortInLadder(effortOptions, effortValue);
+  const effortPickerEmpty = (effortOptions ?? []).length === 0 && effortValue === NONE;
+  const selectModel = (next: string) => {
+    setModel(next);
+    // Keep only the shown level, and only if the new model's ladder can run it.
+    const dropEffort =
+      effortValue === NONE ||
+      (effortLadderKnown(next) && !effortInLadder(effortLadder(next), effortValue));
+    if (dropEffort) setEffort(NONE);
+  };
   // The host the agent picker's readiness badges check against (its config
   // hints show whether a harness is set up there). Null when no concrete host.
   const warningHost = onlineHosts.find((h) => h.host_id === browsableHostId) ?? null;
@@ -468,7 +501,10 @@ export function ProjectSettingsDialog({
                 onSelectAgent={(a) => {
                   // A model default belongs to the picked harness's vocab —
                   // don't carry an alias onto a different agent.
-                  if (a.id !== agentId) setModel(NONE);
+                  if (a.id !== agentId) {
+                    setModel(NONE);
+                    setEffort(NONE);
+                  }
                   setAgentId(a.id);
                 }}
                 pendingAgent={null}
@@ -505,6 +541,7 @@ export function ProjectSettingsDialog({
                   onClick={() => {
                     setAgentId(null);
                     setModel(NONE);
+                    setEffort(NONE);
                   }}
                 >
                   Clear
@@ -524,7 +561,7 @@ export function ProjectSettingsDialog({
             >
               <Select
                 value={model}
-                onValueChange={setModel}
+                onValueChange={selectModel}
                 onOpenChange={onDropdownOpenChange}
                 disabled={isLoading || modelPickerEmpty}
               >
@@ -539,6 +576,41 @@ export function ProjectSettingsDialog({
                     </SelectItem>
                   ))}
                   {storedModelMissing && <SelectItem value={model}>{model}</SelectItem>}
+                </SelectContent>
+              </Select>
+            </Field>
+          )}
+
+          {supportsEffortDefault && (
+            <Field
+              label="Effort"
+              hint={
+                effortDropped
+                  ? `The saved effort (${normalizeEffortLabel(effort)}) isn't available for this model; saving clears it.`
+                  : effortPickerEmpty
+                    ? "Pick a model or connect a host to see effort levels."
+                    : "Default reasoning effort for new sessions with this agent"
+              }
+            >
+              <Select
+                value={effortValue}
+                onValueChange={setEffort}
+                onOpenChange={onDropdownOpenChange}
+                disabled={isLoading || effortPickerEmpty}
+              >
+                <SelectTrigger className="w-full" data-testid="project-settings-effort">
+                  <SelectValue placeholder="No default" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value={NONE}>No default</SelectItem>
+                  {(effortOptions ?? []).map((e) => (
+                    <SelectItem key={e.value} value={e.value}>
+                      {e.label}
+                    </SelectItem>
+                  ))}
+                  {storedEffortMissing && (
+                    <SelectItem value={effortValue}>{normalizeEffortLabel(effortValue)}</SelectItem>
+                  )}
                 </SelectContent>
               </Select>
             </Field>

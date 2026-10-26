@@ -23,6 +23,7 @@ import {
   Timer,
   Wrench,
 } from "lucide-react";
+import { isShellTool } from "@/lib/toolTitle";
 
 /**
  * @param name - the tool name as it arrives in the call (e.g.
@@ -36,7 +37,7 @@ export function iconForTool(name: string, nativeToolType?: string): LucideIcon {
   }
   // Order matters: more specific names (`sys_terminal_close`,
   // `sys_session_close`) must match before the broader category prefix.
-  if (name === "sys_os_shell") return Terminal;
+  if (isShellTool(name)) return Terminal;
   if (/^sys_os_(read|write|edit)$/.test(name)) return FileText;
   if (name === "sys_terminal_close") return Ban;
   if (name.startsWith("sys_terminal_")) return Terminal;

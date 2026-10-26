@@ -1,5 +1,6 @@
 package ai.omnigent.android
 
+import android.app.AlertDialog
 import android.content.Intent
 import android.os.Bundle
 import android.view.LayoutInflater
@@ -35,6 +36,19 @@ class ConnectActivity : ComponentActivity() {
             }
         }
         findViewById<Button>(R.id.connect).setOnClickListener { connect(field.text.toString()) }
+        findViewById<Button>(R.id.about).setOnClickListener {
+            AlertDialog
+                .Builder(this)
+                .setTitle(R.string.about_title)
+                .setMessage(
+                    getString(
+                        R.string.about_version,
+                        BuildConfig.VERSION_NAME,
+                        BuildConfig.VERSION_CODE,
+                    ),
+                ).setPositiveButton(android.R.string.ok, null)
+                .show()
+        }
         field.setOnEditorActionListener { _, actionId, _ ->
             if (actionId == EditorInfo.IME_ACTION_GO) {
                 connect(field.text.toString())

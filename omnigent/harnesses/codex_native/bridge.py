@@ -13,13 +13,12 @@ import stat
 import sys
 import tempfile
 import time
+import tomllib
 from collections.abc import Callable, Iterator, Mapping, MutableMapping
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
-
-import tomllib
 
 from omnigent.harnesses.codex_egress import CertificateFailure
 from omnigent.native import native_bridge_common
@@ -1689,7 +1688,7 @@ def clear_active_turn_id_if_matches(
             return
         try:
             on_cleared()
-        except Exception:  # noqa: BLE001 - the clear is written; a retry cannot re-run it.
+        except Exception:  # the clear is written; a retry cannot re-run it.
             _logger.warning(
                 "Codex-native cleared-turn callback raised for %s", bridge_dir, exc_info=True
             )

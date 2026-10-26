@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import shlex
 import shutil
+import subprocess
 import sys
 from pathlib import Path
 
@@ -18,19 +19,17 @@ from omnigent.inner.os_env import (
 )
 
 pytestmark = pytest.mark.posix_only
+requires_bwrap = pytest.mark.skipif(
+    sys.platform != "linux" or shutil.which("bwrap") is None,
+    reason="requires Linux and bwrap",
+)
 
 
 @pytest.mark.parametrize(
     "backend",
     [
         "none",
-        pytest.param(
-            "linux_bwrap",
-            marks=pytest.mark.skipif(
-                sys.platform != "linux" or shutil.which("bwrap") is None,
-                reason="requires Linux and bwrap",
-            ),
-        ),
+        pytest.param("linux_bwrap", marks=requires_bwrap),
         pytest.param(
             "darwin_seatbelt",
             marks=pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS"),
@@ -115,5 +114,32 @@ def test_tools_repair_broken_checkout_with_normal_shell_imports(
 
     try:
         asyncio.run(exercise())
+    finally:
+        env.close()
+
+
+@requires_bwrap
+def test_bwrap_helper_outlives_the_tool_call_thread(tmp_path: Path) -> None:
+    """Each tool call runs on a short-lived thread; the next call reuses the same helper."""
+    env = create_os_environment(
+        OSEnvSpec(
+            type="caller_process",
+            cwd=str(tmp_path.resolve()),
+            sandbox=OSEnvSandboxSpec(
+                type="linux_bwrap", read_paths=[str(_project_root() / "omnigent")]
+            ),
+        )
+    )
+    assert isinstance(env, CallerProcessOSEnvironment)
+    try:
+        first = asyncio.run(env.shell("echo first"))
+        assert first.get("stdout") == "first\n", first
+        helper = env._helper._proc
+        assert helper is not None
+        with pytest.raises(subprocess.TimeoutExpired):
+            helper.wait(timeout=1)
+        second = asyncio.run(env.shell("echo second"))
+        assert second.get("stdout") == "second\n", second
+        assert env._helper._proc is helper
     finally:
         env.close()

@@ -30,6 +30,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
 from omnigent.terminals import TerminalRegistry
+from tests.budgets import budget
 from tests.runner.conftest import (
     _build_app_for_spec,
     _drain_session_event_queue,
@@ -4400,8 +4401,11 @@ async def test_required_terminal_exit_publishes_deleted_and_failed(
         )
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
+        # The watcher marks a dead pane not running before reporting exit, so
+        # cleanup skips tmux kill-server for the stub's never-started server.
+        instance.running = False
         on_exit()
-        queued_events = await asyncio.wait_for(_collect_exit_events(), timeout=1.0)
+        queued_events = await asyncio.wait_for(_collect_exit_events(), timeout=budget(1.0))
         for _ in range(100):
             if pm.released:
                 break
@@ -4532,8 +4536,11 @@ async def test_required_terminal_exit_classifies_root_failure(tmp_path: Path) ->
         await resource_registry.observe_required_terminal(conv_id, "claude", "main", instance)
         on_exit = callbacks.get("on_exit")
         assert callable(on_exit)
+        # The watcher marks a dead pane not running before reporting exit, so
+        # cleanup skips tmux kill-server for the stub's never-started server.
+        instance.running = False
         on_exit()
-        failed = await asyncio.wait_for(_collect_failed(), timeout=1.0)
+        failed = await asyncio.wait_for(_collect_failed(), timeout=budget(1.0))
     finally:
         _session_event_queues_ref.pop(conv_id, None)
 
@@ -5141,6 +5148,7 @@ async def test_events_effort_change_on_native_session_types_slash_command(
         timeout_s: float,
         auto_confirm: bool = False,
         confirm_hint: str | None = None,
+        ready_timeout_s: float | None = None,
     ) -> None:
         """Record the call and return without touching tmux."""
         captured.append((bridge_dir, command, timeout_s, confirm_hint))

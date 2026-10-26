@@ -24,6 +24,7 @@ from omnigent.onboarding.sandboxes.microsandbox import (
     SANDBOX_ENV_PASSTHROUGH_ENV_VAR,
     MicrosandboxSandboxLauncher,
 )
+from tests._helpers.live_server import find_free_port
 
 # Fakes mirror the optional async SDK without requiring a virtualization host.
 # Explicit recorders catch invalid access, and sys.modules resolves local imports.
@@ -1113,13 +1114,6 @@ def test_attach_missing_sandbox_fails_with_create_hint(
 # ── forward_local_port ──────────────────────────────────────
 
 
-def _free_port() -> int:
-    """Grab an ephemeral local port."""
-    with socket.socket() as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
-
-
 def test_forward_local_port_bridges_host_connection_into_guest(
     fake_microsandbox: _FakeMicrosandboxState,
 ) -> None:
@@ -1133,7 +1127,7 @@ def test_forward_local_port_bridges_host_connection_into_guest(
     sandbox_id = _provisioned(fake_microsandbox, launcher)
     sandbox = fake_microsandbox.sandboxes[sandbox_id]
     sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    port = _free_port()
+    port = find_free_port()
 
     with launcher.forward_local_port(sandbox_id, port):
         with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:
@@ -1198,7 +1192,7 @@ def test_forward_local_port_teardown_kills_live_bridges(
     sandbox_id = _provisioned(fake_microsandbox, launcher)
     sandbox = fake_microsandbox.sandboxes[sandbox_id]
     sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    port = _free_port()
+    port = find_free_port()
 
     with launcher.forward_local_port(sandbox_id, port):
         conn = socket.create_connection(("127.0.0.1", port), timeout=10)
@@ -1229,7 +1223,7 @@ def test_forward_local_port_works_under_public_only(
     sandbox_id = _provisioned(fake_microsandbox, launcher)
     sandbox = fake_microsandbox.sandboxes[sandbox_id]
     sandbox.shell_queue.append((0, "", ""))  # command -v python3
-    port = _free_port()
+    port = find_free_port()
 
     with launcher.forward_local_port(sandbox_id, port):
         with socket.create_connection(("127.0.0.1", port), timeout=10) as conn:

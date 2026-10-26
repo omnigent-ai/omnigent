@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     CompactionData,
+    Conversation,
     ErrorData,
     FunctionCallData,
     FunctionCallOutputData,
@@ -1834,6 +1835,129 @@ def test_list_conversations_search_query_matches_content(
     assert conv_title.id in matched_ids, "title match should be included"
     assert conv_content.id in matched_ids, "content match should be included"
     assert conv_neither.id not in matched_ids, "non-matching conversation excluded"
+
+
+def test_list_conversations_search_scope_splits_title_and_content_matches(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``search_scope`` returns disjoint title and content groups of one search.
+
+    A session matching in both its title and content is a title match only,
+    and each group pages with the ordinary cursor.
+
+    :param conversation_store: The conversation store fixture.
+    """
+
+    def add_message(conversation_id: str, text: str) -> None:
+        conversation_store.append(
+            conversation_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_{conversation_id}",
+                    data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+                ),
+            ],
+        )
+
+    title_only = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_only.id, title="Kestrel plan")
+    title_and_content = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_and_content.id, title="kestrel notes")
+    add_message(title_and_content.id, "more kestrel detail")
+    content_ids = []
+    for index in range(3):
+        content_only = conversation_store.create_conversation()
+        conversation_store.update_conversation(content_only.id, title=f"Sync {index}")
+        add_message(content_only.id, "the kestrel checklist")
+        content_ids.append(content_only.id)
+    unrelated = conversation_store.create_conversation()
+    conversation_store.update_conversation(unrelated.id, title="Unrelated")
+
+    def page_through(scope: str) -> list[Conversation]:
+        """Read every match of ``scope`` two rows at a time."""
+        rows: list[Conversation] = []
+        after: str | None = None
+        while True:
+            page = conversation_store.list_conversations(
+                search_query="kestrel", search_scope=scope, limit=2, after=after
+            )
+            rows.extend(page.data)
+            if not page.has_more:
+                return rows
+            after = page.last_id
+
+    title_rows = page_through("title")
+    assert sorted(c.id for c in title_rows) == sorted([title_only.id, title_and_content.id])
+    # The title already shows the hit, so the title group skips snippets.
+    assert all(c.search_snippet is None for c in title_rows)
+
+    content_rows = page_through("content")
+    # Paging walks the same order as one unpaged read, with no repeats or gaps.
+    unpaged = conversation_store.list_conversations(search_query="kestrel", search_scope="content")
+    assert [c.id for c in content_rows] == [c.id for c in unpaged.data]
+    assert sorted(c.id for c in content_rows) == sorted(content_ids)
+    assert all(c.search_snippet for c in content_rows)
+
+    all_ids = {c.id for c in conversation_store.list_conversations(search_query="kestrel").data}
+    assert all_ids == {title_only.id, title_and_content.id, *content_ids}
+
+    with pytest.raises(ValueError, match="search_scope"):
+        conversation_store.list_conversations(search_query="kestrel", search_scope="body")
+
+
+@pytest.mark.parametrize("query", ["50%", "a_b", "x/y"])
+def test_list_conversations_search_matches_like_wildcards_literally(
+    conversation_store: SqlAlchemyConversationStore,
+    query: str,
+) -> None:
+    """
+    ``%``, ``_`` and the escape character in a search match only themselves,
+    in titles, content and the content snippet.
+
+    :param conversation_store: The conversation store fixture.
+    :param query: A search containing a LIKE wildcard or the escape character.
+    """
+    title_hit = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_hit.id, title=f"Plan {query} rollout")
+    content_hit = conversation_store.create_conversation()
+    conversation_store.update_conversation(content_hit.id, title="Notes")
+    conversation_store.append(
+        content_hit.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_wildcard_hit",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": f"ship {query} today"}]
+                ),
+            ),
+        ],
+    )
+    # Each would match if the query's wildcard or escape character were active.
+    near_miss = query.replace("%", "0").replace("_", "-").replace("/", "")
+    decoy = conversation_store.create_conversation()
+    conversation_store.update_conversation(decoy.id, title=f"Plan {near_miss} rollout")
+    conversation_store.append(
+        decoy.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_wildcard_decoy",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"ship {near_miss} today"}],
+                ),
+            ),
+        ],
+    )
+
+    by_id = {c.id: c for c in conversation_store.list_conversations(search_query=query).data}
+    assert set(by_id) == {title_hit.id, content_hit.id}
+    snippet = by_id[content_hit.id].search_snippet
+    assert snippet is not None
+    assert query in snippet
 
 
 def test_list_conversations_search_query_content_only(
