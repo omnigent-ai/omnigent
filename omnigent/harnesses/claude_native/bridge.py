@@ -4892,11 +4892,11 @@ def inject_slash_command(
         raise ClaudeUserPromptPending(
             "Answer the pending Claude question or permission request before changing settings."
         )
+    delivery_diagnostics.set_stage("clearing_composer")
     # Clear any draft the user is mid-typing; otherwise the command below
     # concatenates with their text and Enter submits
     # ``<their-draft>/effort high`` as a turn. Unlike Escape it does
     # not interrupt an in-flight generation.
-    delivery_diagnostics.set_stage("clearing_composer")
     _clear_composer(socket_path, tmux_target)
     # ``-l`` pastes ``/`` and spaces literally; trailing Enter submits.
     delivery_diagnostics.set_stage("typing_command")
