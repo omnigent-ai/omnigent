@@ -236,6 +236,7 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "currently experiencing high demand, which may cause temporary errors",
 )
 # 499 is the gateway reporting its own cancelled upstream call, which Claude Code never retries.
 _TRANSIENT_UPSTREAM_STATUSES = {"499", "500", "502", "503", "504", "529"}
@@ -288,6 +289,7 @@ def classify_native_turn_error(code: str, message: str) -> str:
         status in _TRANSIENT_UPSTREAM_STATUSES
         or _UPSTREAM_CANCELLED_ENVELOPE.search(message)
         or any(fragment in lowered for fragment in _TRANSIENT_UPSTREAM_FRAGMENTS)
+        or lowered.strip().removesuffix(".") == "request timed out"
     ):
         return "transient_upstream_error"
     return code

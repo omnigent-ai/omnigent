@@ -5778,6 +5778,30 @@ _CODEX_LOGIN_EXPIRED_DETAIL = (
     ("detail", "expected_code", "card", "wrapper", "reauth_required", "status_extra"),
     [
         (
+            "Request timed out",
+            "transient_upstream_error",
+            {},
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (
+            "We’re currently experiencing high demand, which may cause temporary errors.",
+            "transient_upstream_error",
+            {},
+            "codex-native-ui",
+            False,
+            {},
+        ),
+        (
+            "We’re currently experiencing high demand, which may cause temporary errors.",
+            "transient_upstream_error",
+            _CODEX_COMPACTION_RETRY_CARD,
+            "codex-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
+        (
             'API Error: 499 {"error_code":"CANCELLED","message":""}',
             "transient_upstream_error",
             {},
