@@ -2274,12 +2274,9 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       return;
     }
     if (s.status === "streaming") {
-      // A send owns the latch, so the queue waits for it — that is the
-      // one-message-per-turn contract. Unless the latch is stranded, in which
-      // case waiting is forever: clear it so the composer also stops queueing
-      // (`shouldQueueSend` reads the same flag) and drain below. Only queues
-      // drained here can wedge like this; `flushBackgroundQueues` drives the
-      // rest off the server's own status.
+      // The queue waits for a send's latch (one message per turn), but a stranded latch
+      // waits forever: clear it so the composer stops queueing too and drain below.
+      // `flushBackgroundQueues` drives queues not drained here off server status.
       if (!sendLatchIsStranded(s)) return;
       // The stranded send still holds this conversation's chain link, so the
       // drain below would park on it for another SEND_CHAIN_MAX_WAIT_MS. Same

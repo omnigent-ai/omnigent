@@ -859,7 +859,7 @@ function SideChatComposer({
       return;
     }
     if (slashCompletion.handleKey(event, intent)) return;
-    // Escape interrupts the running turn and keeps the draft, as in the main composer.
+    // A grid pane is a whole session, so only side chats let Escape stop the turn.
     if (event.key === "Escape" && queues && busy) {
       event.preventDefault();
       interruptSideChat();
