@@ -78,6 +78,39 @@ def test_classifies_rejected_arguments(command: str, exit_status: int, output: s
     assert diagnosis.category is ErrorCategory.CONFIG
 
 
+@pytest.mark.parametrize("exit_status", [0, 1, None])
+def test_classifies_background_session_refusal_even_when_wrapper_exits_zero(
+    exit_status: int | None,
+) -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=exit_status,
+        output=(
+            "That session is running in the\nbackground (abcd1234). "
+            "Run `claude attach abcd1234` to open it, or `claude stop abcd1234` "
+            "first to resume it here.\nAdd --fork-session to branch off a copy instead.\n"
+            "Claude Code exited with code 1\nPane is dead (status 0)"
+        ),
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude session is already running in the background"
+    assert diagnosis.remediation is not None
+    assert "claude attach <session-id>" in diagnosis.remediation
+    assert "claude stop <session-id>" in diagnosis.remediation
+    assert "abcd1234" not in str(diagnosis)
+
+
+@pytest.mark.parametrize(
+    "output",
+    [
+        "Background task running; use claude attach or claude stop to manage sessions.",
+        "That session is running in the background; waiting for tool results.",
+    ],
+)
+def test_background_work_alone_does_not_diagnose_a_resume_refusal(output: str) -> None:
+    assert classify_terminal_failure(command="claude", exit_status=None, output=output) is None
+
+
 @pytest.mark.parametrize(
     "output",
     [
