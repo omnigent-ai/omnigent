@@ -48,7 +48,10 @@ export function PullRequestCommentComposer({
         </TabsContent>
         <TabsContent value="preview" className="min-h-0 overflow-y-auto">
           {draft.body.trim() ? (
-            <MessageResponse components={PULL_REQUEST_MARKDOWN_COMPONENTS}>
+            <MessageResponse
+              allowGitHubAttachmentImages
+              components={PULL_REQUEST_MARKDOWN_COMPONENTS}
+            >
               {draft.body}
             </MessageResponse>
           ) : (

@@ -642,10 +642,12 @@ it("blocks blank and oversized comments and previews Markdown", async () => {
   fireEvent.change(screen.getByRole("textbox"), { target: { value: "x".repeat(65537) } });
   expect(await screen.findByRole("alert")).toHaveTextContent("65536");
   expect(screen.getByRole("button", { name: "Post comment" })).toBeDisabled();
-  fireEvent.change(screen.getByRole("textbox"), { target: { value: "**Ready for review**" } });
-  await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue("**Ready for review**"));
+  const draft = `**Ready for review**\n![Screenshot](${ASSET_URL})`;
+  fireEvent.change(screen.getByRole("textbox"), { target: { value: draft } });
+  await waitFor(() => expect(screen.getByRole("textbox")).toHaveValue(draft));
   fireEvent.mouseDown(screen.getByRole("tab", { name: "Preview" }), { button: 0, ctrlKey: false });
   expect(await screen.findByText("Ready for review")).toBeInTheDocument();
+  expect(await screen.findByRole("img", { name: "Screenshot" })).toHaveAttribute("src", ASSET_URL);
   expect(edits).toHaveLength(0);
 });
 
