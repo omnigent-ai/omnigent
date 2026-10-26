@@ -68,6 +68,7 @@ import {
   updateProjectConfig as apiUpdateProjectConfig,
 } from "@/lib/projectsApi";
 import { releaseConversation, useChatStore } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
 import type { Session } from "@/lib/types";
 import { useSessionUpdatesConnected } from "./useSessionUpdatesConnected";
 import { markConversationSeen } from "./useUnseenConversations";
@@ -1321,12 +1322,37 @@ export function useLeaveSession() {
  * header merges snapshot fields over the list row (snapshot winning),
  * so a snapshot left stale at the pre-stop state would clobber the
  * now-stopped state and the header's Stop gate would lag.
+ *
+ * Also drops the session's pending user bubbles: a delivered stop settles the
+ * web messages queued before it without a `session.input.consumed` receipt.
+ * Only the bubbles present when the stop began are dropped, so a message sent
+ * while the stop is in flight — which the server keeps live — keeps its bubble.
+ * A stop that reached no live runner (`stop_delivered: false`) settles nothing,
+ * so every bubble is kept for the relaunch.
  */
 export function useStopSession() {
   const queryClient = useQueryClient();
   return useMutation({
     mutationFn: (id: string) => stopSession(id),
-    onSuccess: (_data, id) => {
+    onMutate: (id: string) => {
+      // Snapshot only the posted bubbles present when Stop begins. An unposted
+      // in-flight send can land after the server's pre-stop snapshot and stay
+      // live, and a send during the stop is added later; both survive onSuccess.
+      const stoppedTempIds =
+        conversationRegistry
+          .peek(id)
+          ?.getState()
+          .pendingUserMessages.filter((p) => p.posted === true)
+          .map((p) => p.tempId) ?? [];
+      return { stoppedTempIds };
+    },
+    onSuccess: (data, id, context) => {
+      // Only a delivered stop settled the queued messages server-side. When it
+      // reached no live runner (``stop_delivered: false``) they stay live for
+      // the relaunch, so keep their optimistic bubbles rather than dropping.
+      if (data?.stopDelivered !== false) {
+        useChatStore.getState().dropPendingUserMessages(id, context?.stoppedTempIds ?? []);
+      }
       void queryClient.invalidateQueries({ queryKey: ["conversations"] });
       void queryClient.invalidateQueries({ queryKey: ["session", id] });
     },

@@ -80,6 +80,14 @@ export interface PostEventResponse {
   recovered?: boolean;
   /** Machine-readable recovery outcome for retry_session control events. */
   recovery?: "already_connected" | "native_terminal_ready" | "runner_relaunched";
+  /**
+   * Present and `false` only when a stop_session reached no live runner, so
+   * the server left the session's pending inputs live for the next relaunch
+   * rather than settling them. Absent when the stop was delivered (the
+   * pending inputs were interrupted server-side). The stop UI keeps its
+   * optimistic bubbles whenever this is `false`.
+   */
+  stopDelivered?: boolean;
 }
 
 /**
@@ -452,6 +460,7 @@ function postEventResponseFromWire(wire: {
   pending_id?: string;
   recovered?: boolean;
   recovery?: PostEventResponse["recovery"];
+  stop_delivered?: boolean;
 }): PostEventResponse {
   return {
     queued: wire.queued,
@@ -460,6 +469,7 @@ function postEventResponseFromWire(wire: {
     pendingId: wire.pending_id,
     recovered: wire.recovered,
     recovery: wire.recovery,
+    stopDelivered: wire.stop_delivered,
   };
 }
 
@@ -1418,6 +1428,7 @@ export async function postEvent(
       pending_id?: string;
       recovered?: boolean;
       recovery?: PostEventResponse["recovery"];
+      stop_delivered?: boolean;
     },
   );
 }
