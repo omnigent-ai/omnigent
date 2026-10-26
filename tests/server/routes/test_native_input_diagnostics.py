@@ -215,6 +215,26 @@ async def test_lifecycle_without_a_native_record_has_a_stable_cause_class(
     assert saved[record.attributes["error_item_id"]].data.code == "native_prompt_not_recorded"
 
 
+@pytest.mark.parametrize("invalid_key", ["input_stable_id", "pending_id", "delivery_attempt_id"])
+def test_malformed_lifecycle_identity_does_not_fall_back_to_another_identifier(
+    invalid_key: str,
+) -> None:
+    session_id = "conv_malformed_lifecycle_identity"
+    pending_id = pending_inputs.record(session_id, [], stable_id="a" * 32)
+    original = pending_inputs.delivery_attributes_for(session_id, pending_id)
+    try:
+        _record_native_input_lifecycle(
+            session_id,
+            {**original, "type": "response.completed", invalid_key: "invalid identity"},
+        )
+        assert (
+            pending_inputs.delivery_attributes_for(session_id, pending_id)["last_delivery_stage"]
+            == "server_queued"
+        )
+    finally:
+        pending_inputs.resolve(session_id, pending_id)
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize("interrupted", [False, True])
 async def test_uncertain_or_interrupted_input_does_not_report_missing_message(

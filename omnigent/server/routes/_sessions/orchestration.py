@@ -3410,6 +3410,11 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
     event_type = event.get("type")
     stage = _NATIVE_INPUT_LIFECYCLE_STAGES.get(event_type) if isinstance(event_type, str) else None
     identity = input_attributes(event)
+    if any(
+        key in event and key not in identity
+        for key in ("input_stable_id", "pending_id", "delivery_attempt_id")
+    ):
+        return
     stable_id = identity.get("input_stable_id")
     pending_id = identity.get("pending_id")
     delivery_attempt_id = identity.get("delivery_attempt_id")
