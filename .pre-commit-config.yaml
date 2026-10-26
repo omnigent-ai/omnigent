@@ -4,6 +4,11 @@
 # A built web-UI bundle may be committed at this path (vendored, minified
 # JS/CSS) — never lint or "fix" it.
 exclude: ^omnigent/server/static/web-ui/
+# `pre-commit install` (run by `just ensure`) wires both stages: the hooks run on
+# each commit, and again on push over the commits being pushed, so a commit made
+# with --no-verify or before the hooks were installed still cannot leave the
+# machine unchecked.
+default_install_hook_types: [pre-commit, pre-push]
 repos:
   - repo: local
     hooks:

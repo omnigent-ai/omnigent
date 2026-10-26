@@ -949,7 +949,7 @@ def _ensure_default_agents(
     """
     Register all built-in agents that should always be available.
 
-    Called on every server lifespan startup. Each helper is
+    Called during server startup. Each helper is
     content-aware via :func:`_ensure_builtin_agent`: it creates the
     agent if missing and refreshes it in place when the packaged
     bundle changed, so a redeploy picks up a new spec instead of
@@ -1387,6 +1387,7 @@ def create_app(
     base_path: str | None = None,
     host_sharded: bool = False,
     *,
+    default_agents_seeded: bool = False,
     preference_store: PreferenceStore | None = None,
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
@@ -1407,6 +1408,8 @@ def create_app(
         file content).
     :param agent_cache: Cache for loaded agent specs and working
         directories.
+    :param default_agents_seeded: The CLI already refreshed built-ins before
+        registering explicit agent bundles; skip a second refresh at startup.
     :param runner_tunnel_tokens: Optional allow-list of binding
         tokens accepted by the runner WebSocket tunnel route, e.g.
         ``frozenset({"uA6Zz..."})``. ``None`` accepts any
@@ -1793,7 +1796,8 @@ def create_app(
         # SessionFilesystemRegistry moved to the runner. Both
         # warmup blocks deleted here.
 
-        _ensure_default_agents(agent_store, artifact_store, agent_cache)
+        if not default_agents_seeded:
+            _ensure_default_agents(agent_store, artifact_store, agent_cache)
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.
