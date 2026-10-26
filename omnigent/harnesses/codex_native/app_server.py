@@ -72,6 +72,12 @@ from omnigent.harnesses.codex_native.process_registry import (
     register_codex_native_process,
     unregister_codex_native_process,
 )
+from omnigent.harnesses.codex_native.provider_auth import (
+    ProviderAuthHelper,
+    databricks_cli_selector,
+    is_static_key_command,
+    wrap_provider_auth_command,
+)
 from omnigent.harnesses.codex_native.stderr_diagnostics import (
     MAX_STDERR_RECORD_BYTES,
     CodexStderrDiagnostics,
@@ -81,6 +87,7 @@ from omnigent.harnesses.codex_native.stderr_diagnostics import (
 from omnigent.inner import _proc
 from omnigent.inner.codex_executor import (
     _CODEX_ROUTER_HOOK_MODULE,
+    _GATEWAY_AUTH_TIMEOUT_MS,
     _clean_codex_env,
     _codex_cli_version,
     _codex_home_config_source_from_env,
@@ -3401,6 +3408,15 @@ def _databricks_launch_materialization(
     host = host.rstrip("/")
     resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
     base_url, auth_command, auth_refresh_interval_ms = _databricks_codex_gateway(host, profile)
+    # ucode owns its login command and profile; record the profile-derived fallback.
+    if auth_command == _databricks_codex_auth_command(host, profile):
+        auth_command = wrap_provider_auth_command(
+            auth_command,
+            ProviderAuthHelper(
+                provider="Databricks", databricks_profile=profile, databricks_host=host
+            ),
+            timeout_ms=_GATEWAY_AUTH_TIMEOUT_MS,
+        )
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
             model=resolved_model,
@@ -3960,8 +3976,21 @@ def _codex_provider_launch(entry: ProviderEntry, model: str | None) -> NativeCod
         return None
     if family is None:
         return None
-    if family.auth_command:
+    if family.auth_command and is_static_key_command(family.auth_command):
         auth_command = family.auth_command
+    elif family.auth_command:
+        # Record failed mints so the turn error can name this provider and
+        # keep the helper's output, which Codex discards.
+        databricks_profile, databricks_host = databricks_cli_selector(family.auth_command)
+        auth_command = wrap_provider_auth_command(
+            family.auth_command,
+            ProviderAuthHelper(
+                provider=entry.name,
+                databricks_profile=databricks_profile,
+                databricks_host=databricks_host,
+            ),
+            timeout_ms=_GATEWAY_AUTH_TIMEOUT_MS,
+        )
     elif family.api_key:
         auth_command = f"printf %s {shlex.quote(family.api_key)}"
     else:
@@ -4361,6 +4390,8 @@ def resolve_native_codex_launch(
                 "native-codex routing: managed connect host — Databricks Unity Gateway "
                 "via the credential broker (host-only [omnigent] profile + sidecar).",
             )
+            # The broker-minted helper stays unwrapped: a failed mint here means
+            # the managed host lost its connection, which no profile login fixes.
             return NativeCodexLaunch(
                 config_overrides=_databricks_codex_config_overrides(
                     model=resolved_model,

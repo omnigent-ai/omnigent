@@ -34,11 +34,18 @@ def _publish_native_status(
     *,
     response_id: str,
     output: str | None = None,
+    error_detail: dict[str, str] | None = None,
 ) -> None:
-    """Publish the status payload used by native harness forwarders."""
+    """Publish the status payload used by native harness forwarders.
+
+    :param error_detail: The ``error_*`` card fields a forwarder attaches when it
+        diagnosed the failure itself.
+    """
     data: dict[str, object] = {"status": status, "response_id": response_id}
     if output is not None:
         data["output"] = output
+    if error_detail:
+        data.update(error_detail)
     response = httpx.post(
         f"{base_url}/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},
@@ -374,44 +381,133 @@ def test_databricks_rate_limit_is_retryable_live_and_after_reload(
     ).to_have_count(1)
 
 
-def test_codex_model_rejection_shows_recovery_hint_live_and_after_reload(
-    page: Page,
+_CODEX_MODEL_REJECTION = (
+    "The 'system.ai.gpt-6-1-sol' model is not supported when using Codex with a ChatGPT account."
+)
+
+
+def _provider_auth_failure_edge() -> tuple[str, dict[str, str]]:
+    """The output and card fields the forwarder posts for a recorded ``oss`` helper failure."""
+    from omnigent.harnesses.codex_native.provider_auth import (
+        OUTCOME_EXITED,
+        ProviderAuthFailure,
+        ProviderAuthHelper,
+        diagnose_provider_auth_failure,
+    )
+    from omnigent.runner.launch_failure import CODEX_PROVIDER_AUTH_FAILED_CODE
+
+    codex_message = "provider auth command `sh` exited with status exit status: 1"
+    diagnosis = diagnose_provider_auth_failure(
+        codex_message,
+        ProviderAuthFailure(
+            helper=ProviderAuthHelper(provider="DatabricksOSS", databricks_profile="oss"),
+            outcome=OUTCOME_EXITED,
+            exit_status=1,
+            stdout="null",
+            stderr="",
+        ),
+    )
+    return diagnosis.message(codex_message), {
+        "error_code": CODEX_PROVIDER_AUTH_FAILED_CODE,
+        "error_title": diagnosis.title,
+        "error_cause": diagnosis.cause,
+        "error_remediation": diagnosis.remediation,
+    }
+
+
+@pytest.mark.parametrize(
+    ("case", "headline", "visible", "absent"),
+    [
+        pytest.param(
+            "model-rejection",
+            "Model unavailable with ChatGPT login",
+            (
+                "model picker or /model",
+                "another provider, configure it for Codex",
+                "on the host, then start a new session",
+                _CODEX_MODEL_REJECTION,
+            ),
+            (),
+            id="model-rejection",
+        ),
+        pytest.param(
+            "provider-auth",
+            "Codex could not get a Databricks token",
+            (
+                "provider 'DatabricksOSS' (Databricks profile 'oss') exited with status 1",
+                "printed `null` instead of a token",
+                "Try this: On the host that runs this agent, run "
+                "`databricks auth token --profile oss --output json`",
+                "`databricks auth login --profile oss`",
+            ),
+            ("codex login", "Codex ran into an error during this turn."),
+            id="provider-auth",
+        ),
+    ],
+)
+def test_codex_turn_failure_shows_recovery_hint_live_and_after_reload(
+    request: pytest.FixtureRequest,
     live_server: str,
+    case: str,
+    headline: str,
+    visible: tuple[str, ...],
+    absent: tuple[str, ...],
 ) -> None:
-    """Raw Codex failure flows through the real API, stream, saved state, and card."""
+    """A Codex failure flows through the real API, stream, saved state and card with its next step.
+
+    The model-rejection case posts Codex's raw text and the server diagnoses it;
+    the provider-auth case posts the card fields the forwarder diagnosed from a
+    recorded Databricks helper failure. The page is created after the session
+    exists so a recording starts at the first navigation.
+    """
+    if case == "model-rejection":
+        output, error_detail = _CODEX_MODEL_REJECTION, None
+    else:
+        output, error_detail = _provider_auth_failure_edge()
     created = create_native_session(httpx, live_server, harness="codex")
     session_id = created["session_id"]
     try:
-        message = (
-            "The 'system.ai.gpt-6-1-sol' model is not supported when using Codex "
-            "with a ChatGPT account."
-        )
+        page: Page = request.getfixturevalue("page")
         page.goto(f"{live_server}/c/{session_id}")
         expect(page.get_by_test_id("view-mode-chat")).to_be_visible(timeout=15_000)
         page.get_by_test_id("view-mode-chat").click()
         expect(page.get_by_role("textbox", name="Message the agent")).to_be_visible()
-        _publish_native_status(live_server, session_id, "running", response_id="rejected_model")
+        _publish_native_status(live_server, session_id, "running", response_id="codex_turn")
         _publish_native_status(
-            live_server, session_id, "failed", response_id="rejected_model", output=message
+            live_server,
+            session_id,
+            "failed",
+            response_id="codex_turn",
+            output=output,
+            error_detail=error_detail,
         )
 
         pill = page.get_by_test_id("error-pill")
-        headline = "Model unavailable with ChatGPT login"
         for reload in (False, True):
             if reload:
                 page.reload()
             expect(pill, f"reload={reload}").to_contain_text(headline, timeout=15_000)
+            expect(pill).to_be_visible()
             pill.locator('button[aria-expanded="false"]').click()
-            expect(pill).to_contain_text("model picker or /model")
-            expect(pill).to_contain_text("another provider, configure it for Codex")
-            expect(pill).to_contain_text("on the host, then start a new session")
-            expect(pill.get_by_test_id("error-message-content")).to_contain_text(message)
+            content = pill.get_by_test_id("error-message-content")
+            content.scroll_into_view_if_needed()
+            expect(content).to_be_visible()
+            expect(content).to_contain_text(visible[-1])
+            for text in visible:
+                expect(pill).to_contain_text(text)
+            for text in absent:
+                expect(pill).not_to_contain_text(text)
             expect(pill.get_by_role("button", name="Retry", exact=True)).to_have_count(0)
             expect(pill.get_by_role("button", name="Resume session", exact=True)).to_have_count(0)
+            if os.environ.get("OMNIGENT_E2E_RECORD_DIR") or (
+                request.config.getoption("--video", default="off") != "off"
+            ):
+                # Hold the expanded card so a recording shows it legibly.
+                page.wait_for_timeout(2_500)
 
         if screenshot_dir := os.environ.get("E2E_SCREENSHOT_DIR"):
             Path(screenshot_dir).mkdir(parents=True, exist_ok=True)
-            page.screenshot(path=str(Path(screenshot_dir) / "codex-model-rejection.png"))
+            page.screenshot(path=str(Path(screenshot_dir) / f"codex-{case}.png"))
     finally:
         httpx.delete(f"{live_server}/v1/sessions/{session_id}", timeout=10.0).raise_for_status()
 

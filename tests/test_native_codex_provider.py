@@ -253,6 +253,48 @@ def test_resolve_native_codex_launch_openrouter_coerces_chat_wire(_isolated: Pat
     assert launch.model == "qwen/q"
 
 
+def test_resolve_native_codex_launch_wraps_a_custom_auth_command(_isolated: Path) -> None:
+    """A provider's own bearer helper runs through the failure recorder, named for the card.
+
+    The recorder keeps what the helper printed when it fails (Codex discards it)
+    and knows the Databricks profile the helper mints with. A static key stays a
+    bare ``printf`` (see the inline-key tests above): it cannot fail.
+    """
+    helper = "databricks auth token --profile oss --output json | jq -er .access_token"
+    _seed(
+        _isolated,
+        {
+            "DatabricksOSS": {
+                "kind": "gateway",
+                "default": True,
+                "openai": {
+                    "base_url": "https://oss.example.com/ai-gateway/codex/v1",
+                    "auth_command": helper,
+                    "models": {"default": "databricks-gpt-5-5"},
+                },
+            }
+        },
+    )
+
+    launch = resolve_native_codex_launch(model=None)
+
+    config = tomllib.loads("\n".join(launch.config_overrides))
+    provider = config["model_providers"][config["model_provider"]]
+    assert provider["base_url"] == "https://oss.example.com/ai-gateway/codex/v1"
+    assert provider["auth"]["command"] == "sh"
+    words = shlex.split(provider["auth"]["args"][-1])
+    assert words[:4] == [
+        sys.executable,
+        "-I",
+        "-m",
+        "omnigent.harnesses.codex_native.provider_auth",
+    ]
+    assert words[words.index("--provider") + 1] == "DatabricksOSS"
+    assert words[words.index("--databricks-profile") + 1] == "oss"
+    assert words[words.index("--timeout-ms") + 1] == str(provider["auth"]["timeout_ms"])
+    assert words[-1] == helper
+
+
 def test_resolve_native_codex_launch_subscription_logged_in_uses_cli_login(
     _isolated: Path,
 ) -> None:

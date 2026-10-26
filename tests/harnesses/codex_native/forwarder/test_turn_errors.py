@@ -1,6 +1,7 @@
 """Turn errors for Codex forwarding.
 
-Failed turns surface their reason; authentication errors include a re-auth hint.
+Failed turns surface their reason; authentication errors include a re-auth hint,
+and a failed provider bearer helper is diagnosed from its recorded run instead.
 Resume uses the same verdict. Empty turns warn and stay idle, as do clean turns.
 """
 
@@ -19,11 +20,20 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
     read_certificate_failure,
     record_certificate_failure,
+    record_provider_auth_failure,
     write_bridge_state,
 )
+from omnigent.harnesses.codex_native.provider_auth import (
+    OUTCOME_EXITED,
+    ProviderAuthFailure,
+    ProviderAuthHelper,
+)
+from omnigent.runner.launch_failure import CODEX_PROVIDER_AUTH_FAILED_CODE
 from tests.harnesses.codex_native.forwarder._support import (
     _RecordingClient,
 )
+
+_PROVIDER_AUTH_EXIT_1 = "provider auth command `sh` exited with status exit status: 1"
 
 
 def _seed_active_turn(bridge_dir: Path, turn_id: str) -> None:
@@ -1350,3 +1360,143 @@ async def test_interrupted_turn_keeps_launcher_certificate_record(tmp_path: Path
     )
 
     assert read_certificate_failure(tmp_path) is not None
+
+
+def _record_oss_helper_failure(bridge_dir: Path) -> None:
+    """Record the reported helper run: ``jq -er .access_token`` left ``null`` and exit 1."""
+    record_provider_auth_failure(
+        bridge_dir,
+        ProviderAuthFailure(
+            helper=ProviderAuthHelper(provider="DatabricksOSS", databricks_profile="oss"),
+            outcome=OUTCOME_EXITED,
+            exit_status=1,
+            stdout="null",
+            stderr="",
+        ),
+    )
+
+
+def _provider_auth_turn_params(message: str) -> dict:
+    return {"turn": {"id": "turn_123", "status": "failed", "error": {"message": message}}}
+
+
+def test_classify_codex_error_provider_auth_is_its_own_kind() -> None:
+    """A failed bearer helper is not a Codex login problem, whatever its stderr says."""
+    provider_auth = fwd._CODEX_ERROR_KIND_PROVIDER_AUTH
+    assert fwd._classify_codex_error({}, _PROVIDER_AUTH_EXIT_1) == provider_auth
+    # Codex appends the helper's stderr; a "login" there must not earn the codex login hint.
+    assert (
+        fwd._classify_codex_error(
+            {"codexErrorInfo": {"httpStatusCode": 401}},
+            f"{_PROVIDER_AUTH_EXIT_1}: Error: not logged in, run databricks auth login",
+        )
+        == provider_auth
+    )
+
+
+def test_terminal_turn_status_edge_provider_auth_error_names_profile_and_recovery(
+    tmp_path: Path,
+) -> None:
+    """The reported failure (``null`` + exit 1 from the ``oss`` helper) names its provider,
+    profile and the Databricks sign-in instead of a bare ``sh`` exit status."""
+    _seed_active_turn(tmp_path, "turn_123")
+    _record_oss_helper_failure(tmp_path)
+
+    edge = fwd._terminal_turn_status_edge(
+        tmp_path, "turn/completed", _provider_auth_turn_params(_PROVIDER_AUTH_EXIT_1)
+    )
+
+    assert edge is not None
+    assert edge.status == "failed"
+    error = edge.error
+    assert error is not None
+    assert error.kind == fwd._CODEX_ERROR_KIND_PROVIDER_AUTH
+    assert error.is_auth is False
+    assert error.code == CODEX_PROVIDER_AUTH_FAILED_CODE
+    assert error.title == "Codex could not get a Databricks token"
+    assert error.cause is not None
+    assert "provider 'DatabricksOSS' (Databricks profile 'oss')" in error.cause
+    assert "exited with status 1" in error.cause
+    assert "printed `null` instead of a token" in error.cause
+    assert error.remediation is not None
+    assert "`databricks auth login --profile oss`" in error.remediation
+    assert error.message.endswith(f"Codex reported: {_PROVIDER_AUTH_EXIT_1}")
+    assert "codex login" not in error.message
+
+
+def test_terminal_turn_status_edge_provider_auth_error_without_record_still_explains(
+    tmp_path: Path,
+) -> None:
+    """Without a recorded run (an unwrapped helper) the card still avoids ``codex login``."""
+    _seed_active_turn(tmp_path, "turn_123")
+
+    edge = fwd._terminal_turn_status_edge(
+        tmp_path, "turn/completed", _provider_auth_turn_params(_PROVIDER_AUTH_EXIT_1)
+    )
+
+    assert edge is not None
+    assert edge.error is not None
+    assert edge.error.code == CODEX_PROVIDER_AUTH_FAILED_CODE
+    assert edge.error.title == "Codex could not get a provider token"
+    assert edge.error.cause is not None
+    assert _PROVIDER_AUTH_EXIT_1 in edge.error.cause
+    assert "codex login" not in edge.error.message
+
+
+def test_resume_terminal_status_edge_diagnoses_provider_auth_error(tmp_path: Path) -> None:
+    """The resume edge gets the same diagnosis as the live edge."""
+    _seed_active_turn(tmp_path, "turn_123")
+    _record_oss_helper_failure(tmp_path)
+    turns = [{"id": "turn_123", "status": "failed", "error": {"message": _PROVIDER_AUTH_EXIT_1}}]
+
+    edge = fwd._resume_terminal_status_edge_for_latest_turn(tmp_path, "thread_123", turns)
+
+    assert edge is not None
+    assert edge.error is not None
+    assert edge.error.code == CODEX_PROVIDER_AUTH_FAILED_CODE
+    assert edge.error.is_auth is False
+    assert edge.error.remediation is not None
+    assert "`databricks auth login --profile oss`" in edge.error.remediation
+
+
+@pytest.mark.asyncio
+async def test_handle_event_provider_auth_error_notification_posts_the_diagnosis(
+    tmp_path: Path,
+) -> None:
+    """The failed edge carries the card fields and no re-auth flag, so the server
+    never offers ``codex login`` for a Databricks profile."""
+    client = _RecordingClient()
+    _record_oss_helper_failure(tmp_path)
+
+    await fwd._handle_event(
+        client,  # type: ignore[arg-type]
+        session_id="conv_x",
+        bridge_dir=tmp_path,
+        event={
+            "method": "error",
+            "params": {
+                "threadId": "thread_123",
+                "turnId": "turn_123",
+                "willRetry": False,
+                "error": {"message": _PROVIDER_AUTH_EXIT_1},
+            },
+        },
+        usage_coalescer=fwd._SessionUsageCoalescer(client, "conv_x"),  # type: ignore[arg-type]
+        elicitation_tracker=fwd._CodexElicitationTaskTracker(),
+        expected_thread_id="thread_123",
+    )
+
+    assert len(client.posts) == 1
+    _url, body = client.posts[0]
+    assert body["type"] == "external_session_status"
+    data = body["data"]
+    assert data["status"] == "failed"
+    assert data["response_id"] == "codex_turn_123"
+    assert "reauth_required" not in data
+    assert data["error_code"] == CODEX_PROVIDER_AUTH_FAILED_CODE
+    assert data["error_title"] == "Codex could not get a Databricks token"
+    assert "Databricks profile 'oss'" in data["error_cause"]
+    assert "`databricks auth login --profile oss`" in data["error_remediation"]
+    assert data["output"].startswith(data["error_cause"])
+    assert f"Try this: {data['error_remediation']}" in data["output"]
+    assert "codex login" not in data["output"]

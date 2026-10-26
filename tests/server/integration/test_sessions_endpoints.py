@@ -5914,6 +5914,168 @@ async def test_native_failures_are_coded_live_and_after_reload(
     }
 
 
+_PROVIDER_AUTH_CARD = {
+    "title": "Codex could not get a Databricks token",
+    "cause": (
+        "The auth command for provider 'DatabricksOSS' (Databricks profile 'oss') exited with "
+        "status 1 and printed `null` instead of a token."
+    ),
+    "remediation": (
+        "On the host that runs this agent, run `databricks auth token --profile oss --output "
+        "json` to see the full error. If it asks you to sign in, run `databricks auth login "
+        "--profile oss`. Then send your message again."
+    ),
+}
+_PROVIDER_AUTH_OUTPUT = (
+    f"{_PROVIDER_AUTH_CARD['cause']}\n\nTry this: {_PROVIDER_AUTH_CARD['remediation']}\n\n"
+    "Codex reported: provider auth command `sh` exited with status exit status: 1"
+)
+_PROVIDER_AUTH_FORWARDED = {
+    "error_code": "codex_provider_auth_failed",
+    **{f"error_{key}": value for key, value in _PROVIDER_AUTH_CARD.items()},
+}
+
+
+@pytest.mark.parametrize(
+    ("wrapper", "forwarded", "output", "expected_code", "expected_card"),
+    [
+        (
+            "codex-native-ui",
+            _PROVIDER_AUTH_FORWARDED,
+            _PROVIDER_AUTH_OUTPUT,
+            "codex_provider_auth_failed",
+            _PROVIDER_AUTH_CARD,
+        ),
+        # A failed credential helper still needs reauthentication during compaction.
+        (
+            "codex-native-ui",
+            {**_PROVIDER_AUTH_FORWARDED, **_CODEX_COMPACTION_MODELS},
+            _PROVIDER_AUTH_OUTPUT,
+            "codex_provider_auth_failed",
+            _PROVIDER_AUTH_CARD,
+        ),
+        # Blank or non-string fields are an older runner's edge: the server classifies as before.
+        (
+            "codex-native-ui",
+            {"error_code": "", "error_title": None, "error_cause": 7},
+            _PROVIDER_AUTH_OUTPUT,
+            "codex_turn_error",
+            {},
+        ),
+        # A code the forwarders are not known to diagnose is ignored, card and all.
+        (
+            "codex-native-ui",
+            {**_PROVIDER_AUTH_FORWARDED, "error_code": "made_up_code"},
+            _PROVIDER_AUTH_OUTPUT,
+            "codex_turn_error",
+            {},
+        ),
+        # The forwarded card describes its own code; it is dropped when the
+        # server's classification moves the failure elsewhere.
+        (
+            "codex-native-ui",
+            _PROVIDER_AUTH_FORWARDED,
+            'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+            '"Budget \\"team\\" has reached its limit of $100."}',
+            "budget_exhausted",
+            {},
+        ),
+        # The Codex-specific code is not accepted from another native harness.
+        (
+            "claude-code-native-ui",
+            _PROVIDER_AUTH_FORWARDED,
+            _PROVIDER_AUTH_OUTPUT,
+            "native_turn_error",
+            {},
+        ),
+        # The live event keeps a long card in full; the reload labels keep a bounded prefix.
+        (
+            "codex-native-ui",
+            {**_PROVIDER_AUTH_FORWARDED, "error_cause": _PROVIDER_AUTH_CARD["cause"] + " x" * 200},
+            _PROVIDER_AUTH_OUTPUT,
+            "codex_provider_auth_failed",
+            {**_PROVIDER_AUTH_CARD, "cause": _PROVIDER_AUTH_CARD["cause"] + " x" * 200},
+        ),
+    ],
+    ids=[
+        "forwarder-diagnosed",
+        "during-compaction",
+        "ignored-blanks",
+        "unknown-code",
+        "reclassified",
+        "other-harness",
+        "long-cause",
+    ],
+)
+async def test_forwarder_diagnosed_native_failure_keeps_its_card(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    wrapper: str,
+    forwarded: dict[str, Any],
+    output: str,
+    expected_code: str,
+    expected_card: dict[str, str],
+) -> None:
+    """A forwarder that diagnosed the failure names the code and card the error carries."""
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    harness = "codex-native" if wrapper == "codex-native-ui" else "claude-native"
+    agent = await create_test_agent(
+        client, executor={"type": "omnigent", "config": {"harness": harness}}
+    )
+    session = await _create_session(client, agent["id"], labels={"omnigent.wrapper": wrapper})
+    session_id = session["id"]
+    item_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {
+                "item_type": "message",
+                "response_id": "resp_provider_auth",
+                "source_id": "src_provider_auth",
+                "item_data": {
+                    "role": "assistant",
+                    "agent": wrapper,
+                    "content": [{"type": "output_text", "text": output}],
+                },
+            },
+        },
+    )
+    assert item_resp.status_code == 202, item_resp.text
+    status_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {
+                "status": "failed",
+                "response_id": "resp_provider_auth",
+                "output": output,
+                **forwarded,
+            },
+        },
+    )
+    assert status_resp.status_code == 202, status_resp.text
+    failed_events = [event for event in published if event.get("status") == "failed"]
+    assert len(failed_events) == 1
+    error = failed_events[0]["error"]
+    assert error["code"] == expected_code
+    assert error["message"] == output
+    for field in ("title", "cause", "remediation"):
+        assert error[field] == expected_card.get(field)
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    last_task_error = snapshot_resp.json()["last_task_error"]
+    # The persisted labels keep a bounded prefix of each long field.
+    assert output.startswith(last_task_error.pop("message").rstrip("…"))
+    for field, expected in expected_card.items():
+        assert expected.startswith(last_task_error.pop(field).rstrip("…"))
+    assert last_task_error == {"code": expected_code, "agent_name": wrapper}
+
+
 async def test_post_external_session_status_propagates_runner_delivery_failure(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,

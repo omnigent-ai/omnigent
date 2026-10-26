@@ -59,6 +59,8 @@ from omnigent.native.input_diagnostics import input_attributes
 from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
 from omnigent.runner.launch_failure import (
     CODEX_COMPACTION_MODEL_FAILED,
+    CODEX_PROVIDER_AUTH_FAILED_CODE,
+    FORWARDED_TURN_ERROR_CODES,
     classify_native_turn_error,
     diagnose_client_update_required,
     diagnose_codex_compaction_model_failure,
@@ -354,6 +356,22 @@ _METADATA_OBSERVATION_EVENT_TYPES = frozenset(
         _SUBAGENT_STATUS_TYPE,
     }
 )
+
+
+def _forwarded_status_error(data: Mapping[str, object]) -> dict[str, str]:
+    """
+    Return the ``error_*`` card fields a forwarder attached to a failed edge.
+
+    :param data: The ``external_session_status`` event data.
+    :returns: Non-blank string fields keyed ``code`` / ``title`` / ``cause`` /
+        ``remediation``; an older runner's edge yields ``{}``.
+    """
+    forwarded: dict[str, str] = {}
+    for field in ("code", "title", "cause", "remediation"):
+        value = data.get(f"error_{field}")
+        if isinstance(value, str) and value.strip():
+            forwarded[field] = value.strip()
+    return forwarded
 
 
 def _is_batchable_external_item(event: SessionEventInput) -> bool:
@@ -2258,15 +2276,28 @@ def register_events_routes(
                     agent_store=agent_store,
                     agent_cache=agent_cache,
                 )
-                # Native forwarders share the output and reauth fields.
-                # Codex-specific codes require a resolved Codex session.
-                if harness == "codex-native" and data.get("reauth_required") is True:
+                # A forwarder that diagnosed the failure itself names its code and
+                # card fields; otherwise the server classifies from the shared
+                # output/reauth fields.
+                forwarded = _forwarded_status_error(data)
+                forwarded_code = forwarded.get("code")
+                if forwarded_code not in FORWARDED_TURN_ERROR_CODES or harness != "codex-native":
+                    forwarded_code = None
+                if forwarded_code is not None:
+                    error_code = forwarded_code
+                elif harness == "codex-native" and data.get("reauth_required") is True:
                     error_code = "codex_reauth_required"
                 elif harness == "codex-native" and body.data.get("output"):
                     error_code = "codex_turn_error"
                 else:
                     error_code = "native_turn_error"
                 classified_code = classify_native_turn_error(error_code, output)
+                # The forwarded card describes the forwarded code only.
+                card = (
+                    forwarded
+                    if forwarded_code is not None and classified_code == forwarded_code
+                    else {}
+                )
                 # The old-CLI refusal carries the versions, so the card can name the fix.
                 diagnosis = (
                     diagnose_client_update_required(output)
@@ -2283,7 +2314,8 @@ def register_events_routes(
                 if (
                     harness == "codex-native"
                     # A fork doesn't renew an expired login, so keep its sign-in recovery.
-                    and classified_code != "codex_reauth_required"
+                    and classified_code
+                    not in {"codex_reauth_required", CODEX_PROVIDER_AUTH_FAILED_CODE}
                     and isinstance(compaction_model, str)
                     and compaction_model
                     and isinstance(selected_model, str)
@@ -2297,12 +2329,15 @@ def register_events_routes(
                     # A retry can clear a temporary failure, so keep its retryable code.
                     if classified_code not in {"rate_limit_exceeded", "transient_upstream_error"}:
                         classified_code = CODEX_COMPACTION_MODEL_FAILED
+                if any(card.get(field) for field in ("title", "cause", "remediation")):
+                    diagnosis = None
                 status_error = ErrorDetail(
                     code=classified_code,
                     message=output.strip(),
-                    title=diagnosis.title if diagnosis else None,
-                    cause=diagnosis.cause if diagnosis else None,
-                    remediation=diagnosis.remediation if diagnosis else None,
+                    title=card.get("title") or (diagnosis.title if diagnosis else None),
+                    cause=card.get("cause") or (diagnosis.cause if diagnosis else None),
+                    remediation=card.get("remediation")
+                    or (diagnosis.remediation if diagnosis else None),
                 )
             if status_error is not None:
                 failed_agent_name = await asyncio.to_thread(

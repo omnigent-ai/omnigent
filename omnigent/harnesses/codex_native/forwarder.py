@@ -12,7 +12,7 @@ import urllib.error
 import urllib.request
 from collections.abc import AsyncIterator, Callable
 from contextvars import ContextVar
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import httpx
@@ -51,6 +51,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_codex_config_effort,
     read_codex_config_model,
     read_mcp_startup,
+    read_provider_auth_failure,
     settle_pending_mcp_startup,
     update_active_turn_id,
     update_mcp_server_startup,
@@ -62,6 +63,10 @@ from omnigent.harnesses.codex_native.elicitation import (
 )
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
+)
+from omnigent.harnesses.codex_native.provider_auth import (
+    diagnose_provider_auth_failure,
+    is_provider_auth_error,
 )
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
@@ -76,6 +81,7 @@ from omnigent.native._native_post_delivery import (
     replay_dead_letters,
 )
 from omnigent.native._native_supersession import post_clear_supersession
+from omnigent.runner.launch_failure import CODEX_PROVIDER_AUTH_FAILED_CODE
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -282,6 +288,10 @@ _CODEX_AUTH_HTTP_STATUS_TOKEN = re.compile(r"(?<![\w-])40[13](?![\w-])")
 _CODEX_RATE_LIMIT_ERROR = re.compile(r"(?<![\w-])429(?![\w-])|too many requests|rate[ _-]limit")
 _CODEX_ERROR_KIND_AUTH = "auth"
 _CODEX_ERROR_KIND_GENERIC = "generic"
+# The provider's bearer helper failed: a provider/profile problem on the host,
+# not a Codex login, so it is diagnosed from the helper's recorded run instead
+# of getting the re-auth hint.
+_CODEX_ERROR_KIND_PROVIDER_AUTH = "provider_auth"
 _CODEX_REAUTH_HINT = "If this looks like an auth issue, running `codex login` may help."
 # Budget/quota exhaustion from the AI gateway: the gateway returns HTTP 403 +
 # PERMISSION_DENIED for these, which looks like auth to the generic checks —
@@ -1038,16 +1048,37 @@ class _CodexTerminalError:
 
     :param message: Human-readable error text, e.g.
         ``"401 Unauthorized: ChatGPT login expired"``.
-    :param kind: Classification, either ``"auth"`` or ``"generic"``.
+    :param kind: Classification: ``"auth"``, ``"provider_auth"`` or ``"generic"``.
+    :param code: Failure code the forwarder diagnosed for this error, e.g.
+        ``"codex_provider_auth_failed"``; ``None`` leaves classification to
+        the server.
+    :param title: Card headline paired with *code*, or ``None``.
+    :param cause: Plain-English explanation paired with *code*, or ``None``.
+    :param remediation: Concrete next step paired with *code*, or ``None``.
     """
 
     message: str
     kind: str
+    code: str | None = None
+    title: str | None = None
+    cause: str | None = None
+    remediation: str | None = None
 
     @property
     def is_auth(self) -> bool:
         """:returns: ``True`` when the error was classified as auth-related."""
         return self.kind == _CODEX_ERROR_KIND_AUTH
+
+    @property
+    def detail(self) -> dict[str, str]:
+        """:returns: The diagnosed ``error_*`` fields to carry on the status edge."""
+        fields = (
+            ("error_code", self.code),
+            ("error_title", self.title),
+            ("error_cause", self.cause),
+            ("error_remediation", self.remediation),
+        )
+        return {name: value for name, value in fields if value}
 
 
 def _classify_codex_error(error: _JsonObject, message: str) -> str:
@@ -1060,16 +1091,22 @@ def _classify_codex_error(error: _JsonObject, message: str) -> str:
     message for versions/shapes that omit it, unless the message is a 429.
 
     Budget/quota exhaustion is checked first: the AI gateway returns HTTP 403
-    for these, which the auth checks below would otherwise misclassify.
+    for these, which the auth checks below would otherwise misclassify. A
+    failed provider bearer helper is checked next: Codex appends the helper's
+    stderr to that message, which may mention a login the re-auth hint cannot
+    fix.
 
     :param error: The ``turn.error`` object.
     :param message: Its already-extracted message text.
-    :returns: :data:`_CODEX_ERROR_KIND_AUTH` or
+    :returns: :data:`_CODEX_ERROR_KIND_AUTH`,
+        :data:`_CODEX_ERROR_KIND_PROVIDER_AUTH` or
         :data:`_CODEX_ERROR_KIND_GENERIC`.
     """
     lowered = message.lower()
     if any(fragment in lowered for fragment in _CODEX_BUDGET_EXHAUSTED_FRAGMENTS):
         return _CODEX_ERROR_KIND_GENERIC
+    if is_provider_auth_error(message):
+        return _CODEX_ERROR_KIND_PROVIDER_AUTH
     info = error.get("codexErrorInfo")
     variant: str | None = None
     http_status: object = None
@@ -1200,6 +1237,40 @@ def _terminal_error_from_notification(params: _JsonObject) -> _CodexTerminalErro
         return None
     message = _error_payload_message(payload)
     return _CodexTerminalError(message=message, kind=_classify_codex_error(payload, message))
+
+
+def _describe_provider_auth_error(
+    error: _CodexTerminalError, bridge_dir: Path | None
+) -> _CodexTerminalError:
+    """
+    Replace a bare ``provider auth command`` failure with its diagnosis.
+
+    :param error: The classified terminal error.
+    :param bridge_dir: Native Codex bridge directory holding the helper's
+        recorded run, or ``None`` for a child thread (Codex's message alone).
+    :returns: *error* unchanged unless it is a provider-auth failure.
+    """
+    if error.kind != _CODEX_ERROR_KIND_PROVIDER_AUTH:
+        return error
+    failure = read_provider_auth_failure(bridge_dir) if bridge_dir is not None else None
+    diagnosis = diagnose_provider_auth_failure(error.message, failure)
+    used = failure if diagnosis.used_record else None
+    _logger.info(
+        "Codex forwarder diagnosed provider auth failure: "
+        "record_used=%s provider=%s outcome=%s login_required=%s",
+        diagnosis.used_record,
+        used.helper.provider if used is not None else None,
+        used.outcome if used is not None else None,
+        diagnosis.login_required,
+    )
+    return replace(
+        error,
+        message=diagnosis.message(error.message),
+        code=CODEX_PROVIDER_AUTH_FAILED_CODE,
+        title=diagnosis.title,
+        cause=diagnosis.cause,
+        remediation=diagnosis.remediation,
+    )
 
 
 @dataclass(frozen=True)
@@ -3001,6 +3072,8 @@ def _resume_terminal_status_edge_for_latest_turn(
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
         error = _terminal_error_from_turn({"turn": turn})
+        if error is not None:
+            error = _describe_provider_auth_error(error, bridge_dir)
         return _CodexTurnStatusEdge(
             status=status,
             turn_id=turn_id,
@@ -3847,7 +3920,7 @@ async def _maybe_handle_turn_event(
                     status="failed",
                     turn_id=turn_id,
                     source="error",
-                    error=error,
+                    error=_describe_provider_auth_error(error, bridge_dir),
                     compaction_model=compaction_model,
                     selected_model=selected_model if compaction_model else None,
                 ),
@@ -5152,7 +5225,7 @@ def _terminal_turn_status_edge(
             status="failed",
             turn_id=terminal_turn_id,
             source=f"{source}:turn-error",
-            error=error,
+            error=_describe_provider_auth_error(error, bridge_dir),
         )
     if _turn_status_is_failed(params):
         _logger.info(
@@ -6991,6 +7064,7 @@ async def _post_status(
     response_id: str | None = None,
     output: str | None = None,
     reauth_required: bool = False,
+    error_detail: dict[str, str] | None = None,
     compaction_model: str | None = None,
     selected_model: str | None = None,
 ) -> None:
@@ -7008,6 +7082,9 @@ async def _post_status(
     :param reauth_required: When ``True``, mark a ``failed`` edge as caused by
         an authentication error so the surface can prompt a re-auth.
         Surface-only: no automatic ``codex login`` is triggered.
+    :param error_detail: ``error_code`` / ``error_title`` / ``error_cause`` /
+        ``error_remediation`` fields for a ``failed`` edge the forwarder
+        diagnosed itself; the server carries them onto the turn's error.
     :param compaction_model: Previous model a failed pre-turn compaction ran
         on, so the server can explain that switching models won't help.
     :param selected_model: The thread's selected model for that failure.
@@ -7020,6 +7097,8 @@ async def _post_status(
         data["output"] = output
     if reauth_required:
         data["reauth_required"] = True
+    if error_detail:
+        data.update(error_detail)
     if compaction_model is not None and selected_model is not None:
         data["compaction_model"] = compaction_model
         data["selected_model"] = selected_model
@@ -7080,11 +7159,13 @@ async def _post_turn_status_edge(
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
     output: str | None = None
     reauth_required = False
+    error_detail: dict[str, str] | None = None
     if edge.error is not None:
         output = edge.error.message
         if edge.error.is_auth:
             reauth_required = True
             output = f"{output}\n\n{_CODEX_REAUTH_HINT}"
+        error_detail = edge.error.detail
     await _post_status(
         client,
         session_id,
@@ -7092,6 +7173,7 @@ async def _post_turn_status_edge(
         response_id=response_id,
         output=output,
         reauth_required=reauth_required,
+        error_detail=error_detail,
         compaction_model=edge.compaction_model,
         selected_model=edge.selected_model,
     )
