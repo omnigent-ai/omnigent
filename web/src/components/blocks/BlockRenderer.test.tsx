@@ -928,16 +928,22 @@ describe("BlockRenderer dispatch", () => {
               foldNarration
             />,
           );
+          expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
           expect(screen.getByText("Starting the build.")).toBeDefined();
-          expect(
-            rendersOnlyWorkedFold({
-              items,
-              sessionStatus: "idle",
-              turnLifecycle,
-              foldNarration: true,
-            }),
-          ).toBe(false);
         }
+      });
+
+      it("still folds narration after a retry that succeeded", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Calling the model.", final: true },
+          { kind: "retry", itemId: null, source: "", attempt: 1, maxAttempts: 3, delaySeconds: 1 },
+          tool(1, "Bash"),
+          { kind: "text", itemId: "m1", text: "All done.", final: true },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        expect(screen.queryByText("Calling the model.")).toBeNull();
+        expect(screen.getByText("All done.")).toBeDefined();
       });
 
       it("keeps a continued bubble's last message visible", () => {

@@ -164,7 +164,8 @@ function foldsNarration({
   return (
     foldNarration &&
     (turnLifecycle === undefined || turnLifecycle === "completed") &&
-    !items.some(isFailureItem)
+    // A retry that later succeeded stays in the transcript; a trailing one blocks any fold.
+    !items.some((item) => item.kind === "error" || item.kind === "policy_denied")
   );
 }
 
