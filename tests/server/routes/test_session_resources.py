@@ -4471,6 +4471,50 @@ async def test_shell_proxies_to_runner(
     assert published == []
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status", "response_body", "kind"),
+    [
+        (502, "", "empty"),
+        (503, "private-upstream-body", "invalid_json"),
+        (200, "[]", "non_object"),
+    ],
+    ids=["empty-gateway-error", "non-json-gateway-error", "non-object-success"],
+)
+async def test_shell_invalid_runner_response_is_diagnosed_without_replaying(
+    client: httpx.AsyncClient,
+    caplog: pytest.LogCaptureFixture,
+    status: int,
+    response_body: str,
+    kind: str,
+) -> None:
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/environments/default/shell"
+    fake_runner = _FakeRunnerClient(
+        text_responses={path: (status, response_body, {"content-type": "text/html"})}
+    )
+    set_runner_router(_FakeRunnerRouter(fake_runner))  # type: ignore[arg-type]
+
+    with caplog.at_level(logging.ERROR):
+        response = await client.post(path, json={"command": "private-shell-command"})
+
+    assert response.status_code == 502
+    assert "operation may have completed" in response.json()["detail"]
+    assert fake_runner.calls == [("POST", path)]
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "runner_resource_response_invalid"
+    ]
+    assert len(records) == 1
+    attrs = records[0].attributes
+    assert attrs["http_status"] == status
+    assert attrs["method"] == "POST"
+    assert attrs["response_kind"] == kind
+    assert attrs["response_bytes"] == len(response_body)
+    assert attrs["content_type"] == "text/html"
+    assert "private-" not in records[0].getMessage() + json.dumps(attrs)
+
+
 # ── Conversation deletion cleanup test ───────────────────────────
 
 

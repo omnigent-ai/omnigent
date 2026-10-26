@@ -8,6 +8,7 @@ import contextlib
 import functools
 import mimetypes
 import ntpath
+import re
 import urllib.parse
 import weakref
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
@@ -28,6 +29,7 @@ from fastapi import (
 from fastapi.responses import JSONResponse, Response, StreamingResponse
 from starlette.types import Receive, Scope, Send
 
+from omnigent.debug_logging import debug_event
 from omnigent.entities import (
     Conversation,
     StoredFile,
@@ -114,6 +116,43 @@ from omnigent.stores.permission_store import PermissionStore
 
 if TYPE_CHECKING:
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+
+
+def _runner_resource_write_payload(
+    response: httpx.Response, *, session_id: str, method: str
+) -> dict[str, Any]:
+    """Reject unreadable mutation replies without replaying an uncertain operation."""
+    try:
+        payload = response.json()
+    except (ValueError, RecursionError):
+        kind = "invalid_json" if response.content else "empty"
+    else:
+        if isinstance(payload, dict):
+            return payload
+        kind = "non_object"
+    content_type = response.headers.get("content-type", "").split(";", 1)[0].strip().lower()
+    if content_type not in {"application/json", "text/plain", "text/html", ""}:
+        content_type = "other"
+    request_id = response.headers.get("x-request-id", "")
+    _logger.error(
+        "Runner resource mutation returned an unreadable response",
+        extra=debug_event(
+            "runner_resource_response_invalid",
+            session_id=session_id,
+            method=method,
+            http_status=response.status_code,
+            response_kind=kind,
+            response_bytes=len(response.content),
+            content_type=content_type or "missing",
+            server_request_id=request_id
+            if re.fullmatch(r"[0-9a-fA-F-]{16,64}", request_id)
+            else None,
+        ),
+    )
+    raise HTTPException(
+        status_code=502,
+        detail="runner resource endpoint returned an invalid response; operation may have completed",
+    )
 
 
 class _RunnerStreamResponse(StreamingResponse):
@@ -1141,7 +1180,9 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
-        return resp.status_code, resp.json()
+        return resp.status_code, _runner_resource_write_payload(
+            resp, session_id=session_id, method="POST"
+        )
 
     async def _proxy_delete_to_runner(
         session_id: str,
@@ -1172,7 +1213,9 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
-        return resp.status_code, resp.json()
+        return resp.status_code, _runner_resource_write_payload(
+            resp, session_id=session_id, method="DELETE"
+        )
 
     async def _proxy_put_to_runner(
         session_id: str,
@@ -1209,7 +1252,9 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
-        return resp.status_code, resp.json()
+        return resp.status_code, _runner_resource_write_payload(
+            resp, session_id=session_id, method="PUT"
+        )
 
     async def _proxy_patch_to_runner(
         session_id: str,
@@ -1246,7 +1291,9 @@ def register_resources_routes(
                 status_code=502,
                 detail="runner resource endpoint unavailable",
             ) from exc
-        return resp.status_code, resp.json()
+        return resp.status_code, _runner_resource_write_payload(
+            resp, session_id=session_id, method="PATCH"
+        )
 
     # Typed collection routes registered BEFORE /{resource_id} so
     # "environments", "terminals", "files" are not captured as ids.
