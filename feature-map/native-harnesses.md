@@ -45,8 +45,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.
-- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups
-  stay in that thread, and closing it leaves the parent usable.
+- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
+  including those sent while it works, stay in that thread, and closing it
+  leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
 - `idle-reap`: a finished native pane left alone past the idle window closes

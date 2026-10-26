@@ -1,8 +1,10 @@
 """Exercise Polly's workflow cleanup and GitHub output handoff in a real shell."""
 
 import os
+import shutil
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 import pytest
@@ -176,7 +178,7 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
     assert not (destination / "polly-review.txt").exists()
 
 
-@pytest.mark.parametrize("failure_step", ["secret-scan", "posting", None])
+@pytest.mark.parametrize("failure_step", ["secret-scan", "posting", "timeout", None])
 @pytest.mark.parametrize(
     "scope_suffix",
     [
@@ -189,6 +191,10 @@ def test_failure_diagnostics_preserves_logs_without_gateway_secrets(
 def test_review_diagnostics_retain_raw_stdout(
     tmp_path: Path, failure_step: str | None, scope_suffix: str
 ) -> None:
+    timeout_command = shutil.which("timeout") or shutil.which("gtimeout")
+    if timeout_command is None:
+        pytest.skip("The Ubuntu workflow requires GNU timeout.")
+    (tmp_path / "timeout").symlink_to(timeout_command)
     workflow = yaml.safe_load(_WORKFLOW.read_text())
     steps = {step["name"]: step for step in workflow["jobs"]["review"]["steps"]}
     review = (
@@ -202,6 +208,10 @@ def test_review_diagnostics_retain_raw_stdout(
         "uv": 'cat "$POLLY_TEST_STDOUT"\necho "stderr: test-api-secret" >&2\n',
         "gh": 'echo "Forced posting failure" >&2\nexit 42\n' if failure_step else "exit 0\n",
     }
+    if failure_step == "timeout":
+        commands["uv"] += (
+            "trap 'echo cleaned > cleanup-marker; exit 130' INT\nwhile :; do sleep 1; done\n"
+        )
     for name, command in commands.items():
         executable = tmp_path / name
         executable.write_text("#!/bin/sh\n" + command)
@@ -209,6 +219,7 @@ def test_review_diagnostics_retain_raw_stdout(
     env = {
         "PATH": f"{tmp_path}{os.pathsep}{os.defpath}",
         "POLLY_TEST_STDOUT": str(tmp_path / "stdout.txt"),
+        "GITHUB_ENV": str(tmp_path / "github_env"),
         "GITHUB_OUTPUT": str(tmp_path / "github_output"),
         "OMNIGENT_POLLY_HARNESS": "unused",
         "OMNIGENT_POLLY_MODEL": "unused",
@@ -238,7 +249,24 @@ def test_review_diagnostics_retain_raw_stdout(
             check=False,
         )
 
+    assert run_step("Set review deadline").returncode == 0
+    env.update(line.split("=", 1) for line in (tmp_path / "github_env").read_text().splitlines())
+    remaining = int(env["POLLY_REVIEW_DEADLINE"]) - int(time.time())
+    assert 0 < remaining < workflow["jobs"]["review"]["timeout-minutes"] * 60
+    if failure_step == "timeout":
+        env["POLLY_REVIEW_DEADLINE"] = str(int(time.time()) + 2)
     result = run_step("Run Polly review")
+    if failure_step == "timeout":
+        assert result.returncode == 124, result.stdout + result.stderr
+        assert "no review was published" in result.stdout
+        assert (tmp_path / "cleanup-marker").exists()
+        assert not (tmp_path / "github_output").exists()
+        assert not (tmp_path / "polly_review.txt").exists()
+        assert run_step("Prepare Polly diagnostics").returncode == 0
+        diagnostics = tmp_path / "polly-diagnostics"
+        assert _REVIEW in (diagnostics / "polly-output.txt").read_text()
+        assert "timed out or was killed" in (diagnostics / "polly-stderr.log").read_text()
+        return
     assert result.returncode == 0, result.stdout + result.stderr
     header, payload = (tmp_path / "github_output").read_text().split("\n", 1)
     delimiter = header.removeprefix("review_text<<")

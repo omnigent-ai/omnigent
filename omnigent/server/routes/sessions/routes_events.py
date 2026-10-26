@@ -242,6 +242,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _cancel_runner_relays,
     _child_session_summaries_from_conversations,
     _codex_side_chat_fork_lost,
+    _codex_side_chat_thread_id,
     _dispatch_session_event_to_runner,
     _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready,
@@ -3232,11 +3233,16 @@ def register_events_routes(
                 )
         native_terminal_ready = False
         initializer = getattr(request.app.state, "runner_session_initializer", None)
-        if _runner_needs_session_init or (
-            conv.runner_id is not None
-            and _is_native_terminal_session(conv)
-            and initializer is not None
-            and not initializer.is_initialized(conv, runner_client)
+        # Codex child turns run on a thread in the parent's app-server, not their own session.
+        codex_child_turn = body.type == "message" and _codex_side_chat_thread_id(conv) is not None
+        if not codex_child_turn and (
+            _runner_needs_session_init
+            or (
+                conv.runner_id is not None
+                and _is_native_terminal_session(conv)
+                and initializer is not None
+                and not initializer.is_initialized(conv, runner_client)
+            )
         ):
             # Idle reconnects defer initialization until the next interaction.
             # The initializer coalesces completed handshakes for this generation.

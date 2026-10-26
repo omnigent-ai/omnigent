@@ -11208,6 +11208,7 @@ class _EditableComposer:
         *,
         cursor: int,
         visible_rows: int | None = None,
+        pane_rows: int | None = None,
         unavailable_clear_captures: int = 0,
     ) -> None:
         """
@@ -11218,12 +11219,16 @@ class _EditableComposer:
             the closing rule shows framed; a taller one is cut off at the
             bottom of the pane without it (the ``_SLIVER_MULTILINE_DRAFT_PANE``
             geometry). ``None`` shows the whole box.
+        :param pane_rows: When set, the pane has this many lines and keeps the
+            bottom of the screen in view, as Claude Code 2.1.309 does: a draft
+            too tall for it scrolls the opening rule and glyph row off the top.
         :param unavailable_clear_captures: Captures that fail after clearing
             starts; readiness captures remain readable.
         """
         self.text = draft
         self.cursor = cursor
         self._visible_rows = visible_rows
+        self._pane_rows = pane_rows
         self._unavailable_clear_captures = unavailable_clear_captures
         self._clearing_started = False
         self.submitted: list[str] = []
@@ -11273,7 +11278,10 @@ class _EditableComposer:
             # The rows take every line the pane has: no closing rule.
             clipped = "\n".join(rows[: self._visible_rows])
             return f"⏺ done\n{self._RULE}\n{clipped}\n"
-        return f"{self._RULE}\n" + "\n".join(rows) + f"\n{self._RULE}\n  ? for shortcuts\n"
+        screen = ["⏺ done", self._RULE, *rows, self._RULE, "  ? for shortcuts"]
+        if self._pane_rows is not None:
+            screen = screen[-self._pane_rows :]
+        return "\n".join(screen[1:] if self._pane_rows is None else screen) + "\n"
 
     def _insert(self, text: str) -> None:
         self.text = self.text[: self.cursor] + text + self.text[self.cursor :]
@@ -11463,6 +11471,197 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         assert [text.strip() for text in composer.submitted] == [expected]
 
 
+_TALL_DRAFT = "\n".join(f"STALE {idx}" for idx in range(30))
+
+
+@pytest.mark.parametrize("cursor", [0, len(_TALL_DRAFT)], ids=["cursor-at-start", "cursor-at-end"])
+@pytest.mark.parametrize(
+    ("inject", "expected"),
+    [
+        (
+            lambda bridge_dir: inject_user_message(bridge_dir, content="hello from the web"),
+            "hello from the web",
+        ),
+        (
+            lambda bridge_dir: claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high"
+            ),
+            "/effort high",
+        ),
+    ],
+    ids=["web-message", "slash-command"],
+)
+def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    cursor: int,
+    inject: Callable[[Path], None],
+    expected: str,
+) -> None:
+    """
+    A draft too tall for the pane is cleared, not waited on as an overlay.
+
+    Claude Code keeps the bottom of its screen in view, so the draft scrolls
+    the box's opening rule and ``❯`` row off the top. Read as "no input box",
+    the readiness gate waited out its budget and the turn failed as a
+    terminal that never became ready.
+    """
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    composer = _EditableComposer(_TALL_DRAFT, cursor=cursor, pane_rows=10)
+    composer.install(monkeypatch)
+
+    inject(bridge_dir)
+
+    assert [text.strip() for text in composer.submitted] == [expected]
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("cursor", [0, 8, 18], ids=["start", "middle", "end"])
+@pytest.mark.parametrize("draft", ["", "ONE\nTWO\nTHREE\nFOUR"], ids=["empty", "hidden-draft"])
+def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slash: bool, cursor: int, draft: str
+) -> None:
+    """A tiny pane can hide the closing rule even after every draft line was cleared."""
+    composer = _EditableComposer(draft, cursor=min(cursor, len(draft)), visible_rows=1)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="120 6 latest\n", stderr=""),
+    )
+    sizes: list[str] = []
+
+    def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
+        if args[0] == "resize-window":
+            height = args[args.index("-y") + 1]
+            sizes.append(height)
+            composer._visible_rows = None if int(height) >= 24 else 1
+        else:
+            composer._run_tmux(socket_path, *args)
+
+    verify = claude_native_bridge._verify_submit_accepted
+
+    def verify_at_usable_height(*args: Any, **kwargs: Any) -> bool:
+        assert composer._visible_rows is None
+        return verify(*args, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_verify_submit_accepted", verify_at_usable_height)
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    if slash:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+    else:
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == [
+        "/effort high" if slash else "hello from the web"
+    ]
+    assert sizes == ["24", "6"]
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize(
+    ("pane", "error"),
+    [
+        (_PERMISSION_PROMPT_PANE, claude_native_bridge.ClaudeUserPromptPending),
+        (_REVERSE_SEARCH_PANE, claude_native_bridge.ClaudePromptTimeout),
+        ("unrecognized screen\n", claude_native_bridge.ClaudePromptTimeout),
+    ],
+    ids=["approval", "history-search", "unrecognized"],
+)
+def test_composer_recovery_rechecks_the_surface_before_typing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    pane: str,
+    error: type[Exception],
+) -> None:
+    """A dialog exposed by resizing receives no clearing, paste or submit keystrokes."""
+    composer = _EditableComposer("", cursor=0, visible_rows=1)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            returncode=0, stdout="120 7 manual\nmanual\n", stderr=""
+        ),
+    )
+    resized = False
+    recovery_keys: list[str] = []
+
+    def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
+        nonlocal resized
+        if args[0] == "resize-window":
+            resized = args[args.index("-y") + 1] == "24"
+        elif resized:
+            assert args[0] == "send-keys" and args[-1] == "Escape"
+            recovery_keys.append(args[-1])
+        else:
+            composer._run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *args: pane if resized else composer._capture_pane(*args),
+    )
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_claude_pane_state",
+        lambda *_args: claude_native_bridge._ClaudePaneState(alive=None),
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    with pytest.raises(error):
+        if slash:
+            claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high", ready_timeout_s=0.5
+            )
+        else:
+            inject_user_message(bridge_dir, content="hello from the web", timeout_s=0.5)
+
+    assert composer.submitted == []
+    assert not resized
+    if pane != _REVERSE_SEARCH_PANE:
+        assert recovery_keys == []
+
+
+def test_blank_rows_after_an_empty_glyph_row_count_as_a_cleared_box(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A whole box holding only blank rows below ``❯`` is empty: nothing can join the paste."""
+    sends = _fake_tmux(monkeypatch, ["──────\n❯\n\n──────\n  ? for shortcuts\n"])
+
+    claude_native_bridge._clear_composer("/tmp/example/tmux.sock", "claude:0.0")
+
+    assert sum(1 for send in sends if "-l" in send) == 1
+
+
+def test_composer_box_reads_a_draft_scrolled_past_the_top_of_the_pane() -> None:
+    """Only the closing rule shows: the rows above it are the draft's, the glyph row is gone."""
+    pane = "  step 9\n  step 10\n\n  step 12\n──────\n  paste again to expand\n"
+
+    assert claude_native_bridge._composer_row(pane) is None
+    assert claude_native_bridge._composer_box(pane) == claude_native_bridge._ComposerBox(
+        ["  step 9", "  step 10", "", "  step 12"], framed=False
+    )
+    assert claude_native_bridge._occupying_surface(pane) == "a draft taller than the terminal"
+
+
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "● done\n  ⎿ output\n──────\n  ? for shortcuts\n",
+        "  tool output\n  more output\n──────\n  Do you want to proceed?\n  ❯ 1. Yes\n    2. No\n",
+        "\n".join(_REVERSE_SEARCH_PANE.splitlines()[:5]),
+    ],
+    ids=["transcript-row-above", "dialog-below-the-rule", "clipped-history-search"],
+)
+def test_composer_box_does_not_read_other_screens_as_a_scrolled_draft(pane: str) -> None:
+    """A screen with transcript rows or a dialog under its rule is not a draft."""
+    assert claude_native_bridge._composer_box(pane) is None
+    assert claude_native_bridge._occupying_surface(pane) == claude_native_bridge._OVERLAY_SURFACE
+
+
 @pytest.mark.parametrize(
     ("pane", "box"),
     [
@@ -11488,6 +11687,10 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         ),
         ("──────\n  Change effort level?\n  ❯ 1. Yes, switch to low\n    2. No, go back\n", None),
         ("plain output, no box\n", None),
+        (
+            "──────\n\n❯ one\n──────\n  ? for shortcuts\n",
+            claude_native_bridge._ComposerBox(["❯ one"], framed=True),
+        ),
     ],
     ids=[
         "framed-with-blank-row",
@@ -11497,6 +11700,7 @@ def test_unavailable_composer_capture_never_submits_the_leftover_draft(
         "indented-frame-with-earlier-rule",
         "dialog-selector",
         "no-box",
+        "blank-row-under-the-opening-rule",
     ],
 )
 def test_composer_box_reads_every_row_of_the_input_box(
@@ -14560,3 +14764,101 @@ def test_hold_approval_wait_marker_refreshes_until_released(
     settled = len(touches)
     time.sleep(0.1)
     assert len(touches) == settled, "the refresher must stop when the block exits"
+
+
+@pytest.mark.parametrize(
+    ("policy", "local_override", "failure", "cleanup_fails"),
+    [
+        ("latest", False, None, False),
+        ("manual", True, RuntimeError("delivery failed"), False),
+        ("latest", True, claude_native_bridge.ClaudeInjectionCancelled("cancelled"), False),
+        ("latest", False, RuntimeError("delivery failed"), True),
+    ],
+)
+def test_usable_composer_height_restores_size_after_delivery(
+    monkeypatch: pytest.MonkeyPatch,
+    policy: str,
+    local_override: bool,
+    failure: RuntimeError | None,
+    cleanup_fails: bool,
+) -> None:
+    """Success, errors and cancellation release the temporary sizing override."""
+    metadata = f"120 7 {policy}\n" + (f"{policy}\n" if local_override else "")
+    run = Mock(
+        side_effect=[
+            subprocess.CompletedProcess([], 0, stdout=metadata),
+            subprocess.CompletedProcess([], 0),
+            OSError("restore failed") if cleanup_fails else subprocess.CompletedProcess([], 0),
+        ]
+    )
+    monkeypatch.setattr("subprocess.run", run)
+    cancelled = threading.Event()
+    with claude_native_bridge.cancellable_injection(cancelled):
+        try:
+            with claude_native_bridge._usable_composer_height("/tmp/sock", "main") as grew:
+                assert grew
+                if isinstance(failure, claude_native_bridge.ClaudeInjectionCancelled):
+                    cancelled.set()
+                if failure is not None:
+                    raise failure
+        except RuntimeError as actual:
+            assert actual is failure
+        else:
+            assert failure is None
+        assert claude_native_bridge._INJECTION_CANCEL_EVENT.get() is cancelled
+
+    assert run.call_args_list[1].args[0][3:] == ["resize-window", "-t", "main", "-y", "24"]
+    restore_policy = (
+        ["set-option", "-w", "-t", "main", "window-size", policy]
+        if local_override
+        else ["set-option", "-wu", "-t", "main", "window-size"]
+    )
+    assert run.call_args_list[2].args[0][3:] == [
+        "resize-window",
+        "-t",
+        "main",
+        "-x",
+        "120",
+        "-y",
+        "7",
+        ";",
+        *restore_policy,
+    ]
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [
+        subprocess.CompletedProcess([], 0, stdout="120 24 latest\n"),
+        subprocess.CompletedProcess([], 0, stdout="120 40 manual\nmanual\n"),
+        subprocess.CompletedProcess([], 0, stdout="\n"),
+        subprocess.CompletedProcess([], 1, stdout="120 7 latest\n"),
+        subprocess.TimeoutExpired("tmux", timeout=1),
+    ],
+)
+def test_usable_composer_height_leaves_normal_or_unknown_size_untouched(
+    monkeypatch: pytest.MonkeyPatch,
+    metadata: subprocess.CompletedProcess[str] | subprocess.TimeoutExpired,
+) -> None:
+    run = Mock(side_effect=[metadata])
+    monkeypatch.setattr("subprocess.run", run)
+    with claude_native_bridge._usable_composer_height("/tmp/sock", "main") as grew:
+        assert not grew
+    assert run.call_count == 1
+
+
+def test_usable_composer_height_does_not_deliver_after_resize_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    run = Mock(
+        side_effect=[
+            subprocess.CompletedProcess([], 0, stdout="120 7 latest\n"),
+            subprocess.TimeoutExpired("tmux", timeout=1),
+            subprocess.CompletedProcess([], 0),
+        ]
+    )
+    monkeypatch.setattr("subprocess.run", run)
+    with pytest.raises(RuntimeError, match="tmux command timed out"):
+        with claude_native_bridge._usable_composer_height("/tmp/sock", "main"):
+            pytest.fail("delivery continued after a failed resize")
+    assert run.call_count == 3, "restore even if the timed-out resize may have taken effect"
