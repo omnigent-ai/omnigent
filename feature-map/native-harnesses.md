@@ -18,7 +18,9 @@ implements them separately, so a fix for one harness does not reach the others.
   repair conflicting defaults, and keep the connection across tool turns.
 - `needs-auth`: a harness without usable credentials is shown as needing
   sign-in, with a repair hint, instead of failing after launch. A harness the
-  host has not configured can be hidden from the picker.
+  host has not configured can be hidden from the picker. When harness repair is
+  enabled, Settings → Harnesses shows the missing credential as an actionable
+  card; its Reconfigure control and full-card click replace a separate banner action.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the
@@ -141,6 +143,10 @@ Probes run only on expansion.
 `/settings/harnesses` or its harness detail pages, or the import review modal
 shown for a newly connected or requested host → See more. The modal auto-opens
 only when the server enables the `import_review` release feature.
+
+**Harness credential repair:** Settings → Harnesses → a needs-auth harness →
+Settings. Activate either the credential card or its Reconfigure affordance;
+both open the same repair flow.
 
 **Idle reap:** finish a turn, then leave the session alone past the idle window:
 a web session with its Terminal view open but untouched or its tabs closed, a
@@ -358,6 +364,8 @@ Cross-harness journeys:
   `tests/server/integration/test_utility_endpoints.py::test_info_returns_expected_fields`.
 
 - **`needs-auth`:**
+  `web/src/pages/settings/SettingsHarnessesSection.test.tsx` covers the
+  flag-gated credential warning card, its Reconfigure affordance, and full-card click.
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
