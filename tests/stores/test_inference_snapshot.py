@@ -330,6 +330,25 @@ def test_fork_keeps_snapshot_even_when_resetting_model_choice(
         assert fetched.inference_snapshot == snapshot
 
 
+@pytest.mark.parametrize("clear_snapshot", [False, True])
+def test_fork_replaces_source_inference_identity(
+    store: SqlAlchemyConversationStore, clear_snapshot: bool
+) -> None:
+    source_snapshot = {**_snapshot(), "owner_id": "alice@example.test"}
+    target_snapshot = None if clear_snapshot else {**_snapshot(), "owner_id": "bob@example.test"}
+    source = store.create_conversation(inference_snapshot=source_snapshot)
+
+    fork = store.fork_conversation(
+        source.id,
+        override_inference_snapshot=target_snapshot,
+        override_inference_snapshot_set=True,
+    )
+
+    assert fork.inference_snapshot == target_snapshot
+    assert store.get_conversation(fork.id).inference_snapshot == target_snapshot
+    assert store.get_conversation(source.id).inference_snapshot == source_snapshot
+
+
 def test_model_edits_and_host_replacement_preserve_snapshot(
     store: SqlAlchemyConversationStore,
 ) -> None:

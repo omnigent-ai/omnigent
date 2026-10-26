@@ -204,7 +204,7 @@ from omnigent.onboarding.sandboxes.base import (
 # RepoWorkspace lives in the launcher's own package so a launcher can accept it
 # without importing omnigent.server; re-exported here (its parser is here) so
 # existing `from omnigent.server.managed_hosts import RepoWorkspace` keeps working.
-from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace
+from omnigent.onboarding.sandboxes.types import GitCloneOptions, RepoWorkspace, SandboxForkSource
 from omnigent.stores.host_store import Host, HostStore
 
 if TYPE_CHECKING:
@@ -939,7 +939,10 @@ class ManagedSandboxDeployment:
         for config in self.configs:
             if config.managed_launch_supported and config.provider is not None:
                 launcher = config.launcher_factory()
-                caps[config.provider] = {"multi_repo": launcher.capabilities.multi_repo}
+                caps[config.provider] = {
+                    "multi_repo": launcher.capabilities.multi_repo,
+                    "fork_sandbox": launcher.capabilities.fork_sandbox,
+                }
                 from omnigent.inference_config import parse_inference_config
                 from omnigent.server.inference_catalog import ambient_gateway_providers
 
@@ -3778,6 +3781,7 @@ async def launch_managed_host(
     agent_name: str | None = None,
     on_stage: SandboxStageObserver | None = None,
     host_id: str | None = None,
+    fork_source: SandboxForkSource | None = None,
 ) -> ManagedHostLaunch:
     """
     Provision a sandbox, start a host in it, and wait until it registers.
@@ -3823,6 +3827,8 @@ async def launch_managed_host(
     :param host_id: Id to register the host under — a create's
         ``host_id`` — or ``None`` to mint one. A requested id also makes the
         host route by it (see :func:`host_slice_key_enabled`).
+    :param fork_source: Server-authorized source generation to copy instead of
+        provisioning an empty sandbox. The caller selects the source's provider.
     :returns: The registered host id + in-sandbox workspace path
         (the cloned repository directory when *repo* is set).
     :raises HTTPException: 400 when *provider* is not configured or the
@@ -3831,14 +3837,37 @@ async def launch_managed_host(
     """
     entry = _select_provider_config(config, provider)
     launcher = build_owner_launcher(entry, config, owner)
-    repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
+    if fork_source is not None and not launcher.capabilities.fork_sandbox:
+        raise HTTPException(
+            status_code=400,
+            detail=f"sandbox provider '{launcher.provider}' does not support sandbox forking",
+        )
+    if fork_source is None:
+        repos = _apply_git_clone_options(launcher, repos, entry.git_clone)
     slice_key_enabled = host_id is not None
     host_id = host_id or uuid.uuid4().hex
     host_name = managed_host_name(host_id)
     try:
         await asyncio.to_thread(launcher.prepare_for_launch, agent_name=agent_name)
         await asyncio.to_thread(launcher.prepare)
-        sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+        if fork_source is None:
+            sandbox_id = await asyncio.to_thread(launcher.provision, host_name)
+        else:
+            sandbox_id = await asyncio.to_thread(
+                launcher.fork,
+                fork_source.sandbox_id,
+                host_name,
+                target_user_id=owner,
+                idempotency_key=host_id,
+                source_workspace=fork_source.workspace,
+            )
+            if (
+                not isinstance(sandbox_id, str)
+                or not sandbox_id
+                or sandbox_id == fork_source.sandbox_id
+            ):
+                # Never hand the source to startup's failure cleanup.
+                raise click.ClickException("sandbox fork did not return a new sandbox id")
     except OwnerCredentialMissingError as exc:
         # The user must act (connect the provider); not a backend failure.
         raise HTTPException(status_code=409, detail=exc.message) from exc

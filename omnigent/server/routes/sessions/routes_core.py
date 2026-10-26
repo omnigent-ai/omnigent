@@ -42,6 +42,7 @@ from omnigent.entities import (
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
 from omnigent.models.model_override import validate_model_override
+from omnigent.onboarding.sandboxes.types import SandboxForkSource
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
     RUNNER_TUNNEL_TOKEN_HEADER,
@@ -92,6 +93,7 @@ from omnigent.server.routes._auth_helpers import (
 from omnigent.server.routes._auth_helpers import (
     require_user as _require_user,
 )
+from omnigent.server.routes._auth_helpers import require_workspace_read_access
 from omnigent.server.routes._content_type import (
     require_json_content_type,
     require_json_or_multipart_content_type,
@@ -188,6 +190,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _validate_session_model_selection,
     ensure_runner_connected,
 )
+from omnigent.server.sandbox_forks import sandbox_fork_provider
 from omnigent.server.schemas import (
     AutomaticSessionRenameRequest,
     AutomaticSessionRenameResponse,
@@ -508,6 +511,7 @@ def register_core_routes(
         sandbox_provider: str | None,
         workspaces: list[str],
         requested_host_id: str | None = None,
+        fork_source: SandboxForkSource | None = None,
     ) -> None:
         """
         Provision a managed sandbox host for a just-created session.
@@ -575,7 +579,7 @@ def register_core_routes(
         # Reject several repos on a provider that clones only one, with a clear
         # 4xx (the web picker already caps this per provider; this guards direct
         # API callers). Resolve the provider the launch will actually use.
-        if len(workspaces) > 1:
+        if len(workspaces) > 1 and fork_source is None:
             resolved = sandbox_provider or sandbox_config.default.provider
             caps = sandbox_config.provider_ui_capabilities().get(resolved or "", {})
             if not caps.get("multi_repo", False):
@@ -636,6 +640,7 @@ def register_core_routes(
             agent_store=agent_store,
             agent_id=agent_id,
             host_id=requested_host_id,
+            fork_source=fork_source,
         )
         _start_managed_launch_task(
             session_id,
@@ -1632,13 +1637,26 @@ def register_core_routes(
         access = await _require_access_and_level(
             user_id, session_id, LEVEL_READ, permission_store, conversation_store
         )
+        conversation = access.conversation or await asyncio.to_thread(
+            conversation_store.get_conversation, session_id
+        )
+        workspace_readable = False
+        if conversation is not None and conversation.host_id is not None:
+            try:
+                await require_workspace_read_access(
+                    user_id, conversation, access.level, permission_store, conversation_store
+                )
+                workspace_readable = True
+            except OmnigentError as exc:
+                if exc.code not in (ErrorCode.FORBIDDEN, ErrorCode.NOT_FOUND):
+                    raise
         return await _get_session_snapshot(
             conversation_store,
             session_id,
             access.level,
             agent_store,
             agent_cache,
-            conversation=access.conversation,
+            conversation=conversation,
             liveness_lookup=liveness_lookup if include_liveness else None,
             include_items=include_items,
             include_live_status=include_live_status,
@@ -1649,6 +1667,7 @@ def register_core_routes(
             sandbox_config=getattr(request.app.state, "sandbox_config", None),
             viewer_id=user_id,
             request=request,
+            workspace_readable=workspace_readable,
         )
 
     @router.get(
@@ -3625,6 +3644,42 @@ def register_core_routes(
                 code=ErrorCode.INVALID_INPUT,
             )
 
+        fork_source = None
+        resolved_sandbox_provider = body.sandbox_provider
+        requested_host_id = body.host_id
+        if body.fork_sandbox:
+            await require_workspace_read_access(
+                user_id, source, access.level, permission_store, conversation_store
+            )
+            source_host_store = getattr(request.app.state, "host_store", None)
+            source_host = (
+                await asyncio.to_thread(source_host_store.get_host, source.host_id)
+                if source_host_store is not None and source.host_id is not None
+                else None
+            )
+            provider = sandbox_fork_provider(
+                source,
+                True,
+                source_host,
+                getattr(request.app.state, "sandbox_config", None),
+            )
+            if provider is None:
+                raise OmnigentError(
+                    "The source sandbox is unavailable or its provider does not support forking.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            if body.sandbox_provider is not None and body.sandbox_provider != provider:
+                raise OmnigentError(
+                    "A sandbox fork must use the source sandbox's provider.",
+                    code=ErrorCode.INVALID_INPUT,
+                )
+            assert source_host is not None and source_host.sandbox_id is not None
+            fork_source = SandboxForkSource(
+                sandbox_id=source_host.sandbox_id, workspace=source.workspace
+            )
+            resolved_sandbox_provider = provider
+            requested_host_id = requested_host_id or secrets.token_hex(16)
+
         from omnigent.server.routes.sandbox_inference import (
             actual_harness,
             configured_snapshot,
@@ -3632,11 +3687,15 @@ def register_core_routes(
         )
 
         source_configured = configured_snapshot(source.inference_snapshot)
+        foreign_inference_snapshot = False
         if source.inference_snapshot is not None:
             from omnigent.server.auth import RESERVED_USER_LOCAL
 
             assert source.inference_snapshot is not None
-            if source.inference_snapshot["owner_id"] != (user_id or RESERVED_USER_LOCAL):
+            foreign_inference_snapshot = source.inference_snapshot["owner_id"] != (
+                user_id or RESERVED_USER_LOCAL
+            )
+            if foreign_inference_snapshot and not body.fork_sandbox:
                 raise OmnigentError(
                     "This session's inference configuration belongs to another user. "
                     "Start a new session to use your own provider connection.",
@@ -3767,7 +3826,45 @@ def register_core_routes(
                 # aliases), so the fork falls back to the bound agent default.
                 clear_override_model = True
 
-        if source_configured:
+        inference_override: dict[str, Any] = {}
+        if foreign_inference_snapshot:
+            from omnigent.runtime import get_agent_cache
+            from omnigent.server.routes.sandbox_inference import prepare_create_inference
+
+            cache = agent_cache or get_agent_cache()
+            try:
+                target_spec = (
+                    await asyncio.to_thread(cache.load, base_agent.id, base_agent.bundle_location)
+                ).spec
+            except (KeyError, AttributeError, ValueError, ImportError, OSError) as exc:
+                raise OmnigentError(
+                    "Cannot load the target agent to prepare its inference configuration",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
+            selected_model = (
+                (None if clear_override_model else override_model)
+                if model_override_set
+                else source.model_override
+            )
+            target_snapshot, override_model = await prepare_create_inference(
+                request,
+                SessionCreateRequest(
+                    agent_id=base_agent.id,
+                    host_type="managed",
+                    sandbox_provider=resolved_sandbox_provider,
+                ),
+                target_spec,
+                user_id,
+                conversation_store,
+                model_override=selected_model,
+            )
+            inference_override = {
+                "override_inference_snapshot": target_snapshot,
+                "override_inference_snapshot_set": True,
+            }
+            clear_override_model = False
+            model_override_set = True
+        elif source_configured:
             selected_model = (
                 (None if clear_override_model else override_model)
                 if model_override_set
@@ -3853,10 +3950,10 @@ def register_core_routes(
         # A managed fork's chosen sandbox host id is born with the row, as on a
         # create: the caller routes the fork by it until its host binds, so no
         # read of the row may miss it. The source's own id was dropped above.
-        if body.host_type == "managed" and body.host_id is not None:
+        if body.host_type == "managed" and requested_host_id is not None:
             from omnigent.server.managed_hosts import REQUESTED_HOST_ID_LABEL_KEY
 
-            extra_labels[REQUESTED_HOST_ID_LABEL_KEY] = body.host_id
+            extra_labels[REQUESTED_HOST_ID_LABEL_KEY] = requested_host_id
 
         # When the fork binds a NATIVE target, the native CLI won't replay
         # the copied Omnigent transcript on its own — mark the fork so the
@@ -3999,8 +4096,8 @@ def register_core_routes(
                     sizes=[stored.bytes for stored in filesystem_sources],
                 )
 
-        if body.host_id is not None:
-            await _check_requested_host_id(request, body.host_id, user_id)
+        if requested_host_id is not None:
+            await _check_requested_host_id(request, requested_host_id, user_id)
 
         # Copied last, after every validation above; the copy row itself is
         # inserted inside fork_conversation's transaction.
@@ -4055,6 +4152,7 @@ def register_core_routes(
                 project_id=fork_project_id,
                 file_id_map=fork_file_id_map,
                 created_by=user_id,
+                **inference_override,
             )
         except LookupError as exc:
             await drop_unused_copy()
@@ -4146,9 +4244,10 @@ def register_core_routes(
                     session_id=new_conv.id,
                     agent_id=new_conv.agent_id,
                     user_id=user_id,
-                    sandbox_provider=body.sandbox_provider,
+                    sandbox_provider=resolved_sandbox_provider,
                     workspaces=fork_workspaces,
-                    requested_host_id=body.host_id,
+                    requested_host_id=requested_host_id,
+                    fork_source=fork_source,
                 )
         finally:
             # Push the forked session to this user's other open tabs — but NOT a

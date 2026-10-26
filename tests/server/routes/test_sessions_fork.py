@@ -7,6 +7,8 @@ shape using minimal real-type stubs — no MagicMock.
 
 from __future__ import annotations
 
+from dataclasses import replace
+from types import SimpleNamespace
 from typing import Any
 
 import httpx
@@ -25,6 +27,7 @@ from omnigent.entities import (
     StoredFile,
 )
 from omnigent.errors import SESSION_AGENT_BUNDLE_MISSING_MESSAGE, OmnigentError
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from omnigent.server.auth import AuthProvider, UnifiedAuthProvider
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -34,7 +37,9 @@ from omnigent.server.managed_hosts import (
     resolve_managed_agent_label,
 )
 from omnigent.server.routes import _session_create_validation as create_validation
+from omnigent.server.routes._auth_helpers import SessionAccess
 from omnigent.server.routes.sessions import create_sessions_router, routes_core
+from omnigent.server.sandbox_forks import sandbox_fork_provider
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     FORK_SOURCE_LABEL_KEY,
@@ -42,6 +47,9 @@ from omnigent.stores.conversation_store import (
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+from omnigent.stores.host_store import Host
+from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from tests.server.helpers import create_test_agent
 
 # ── Minimal store stubs ──────────────────────────────────────────
@@ -553,6 +561,7 @@ def _build_app(
     auth_provider: AuthProvider | None = None,
     file_store: _FileStore | None = None,
     artifact_store: _ArtifactStore | None = None,
+    permission_store: PermissionStore | None = None,
 ) -> FastAPI:
     """
     Build a FastAPI app with the sessions router and error handler.
@@ -589,6 +598,7 @@ def _build_app(
         auth_provider=auth_provider,
         file_store=file_store,  # type: ignore[arg-type]
         artifact_store=artifact_store,  # type: ignore[arg-type]
+        permission_store=permission_store,
     )
     app = FastAPI()
 
@@ -1939,6 +1949,190 @@ class _HostIdentityStore:
         """Record the lookup and report the configured answer."""
         self.lookups.append({"host_id": host_id, "user_id": user_id, "name": name})
         return self.taken
+
+
+class _ForkSourceHostStore(_HostIdentityStore):
+    """Resolve the source host without exposing it in the caller's host list."""
+
+    def __init__(self, source: Host) -> None:
+        super().__init__(taken=False)
+        self.source = source
+
+    def get_host(self, host_id: str) -> Host | None:
+        return self.source if host_id == self.source.host_id else None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("level", "share_files", "capable", "requested_provider", "expected"),
+    [
+        (1, False, True, None, 403),
+        (1, True, True, None, 201),
+        (2, False, True, None, 201),
+        (4, False, False, None, 400),
+        (4, False, True, "kubernetes", 400),
+    ],
+)
+async def test_fork_sandbox_authorizes_files_and_pins_source_generation(
+    monkeypatch: pytest.MonkeyPatch,
+    level: int,
+    share_files: bool,
+    capable: bool,
+    requested_provider: str | None,
+    expected: int,
+) -> None:
+    source = _make_conversation()
+    source.host_id = "source-host"
+    source.workspace = "/mnt/alice/repo"
+    source.share_workspace_files = share_files
+    store = _ConversationStore({source.id: source})
+    app = _build_app(store, auth_provider=UnifiedAuthProvider(source="header"))
+    launches = _arm_managed_app(app, monkeypatch)
+    source_host = Host(
+        host_id=source.host_id,
+        name="alice-sandbox",
+        user_id="alice@example.com",
+        status="offline",
+        created_at=1,
+        updated_at=1,
+        sandbox_provider="modal",
+        sandbox_id="source-generation-17",
+    )
+    app.state.host_store = _ForkSourceHostStore(source_host)
+    provider_config = app.state.sandbox_config.default
+
+    def unrelated_launcher() -> None:
+        raise AssertionError("Fork eligibility must not construct unrelated providers")
+
+    app.state.sandbox_config.configs = (
+        replace(
+            provider_config,
+            launcher_factory=lambda: SimpleNamespace(
+                provider="modal",
+                capabilities=SandboxCapabilities(managed_launch=True, fork_sandbox=capable),
+            ),
+        ),
+        replace(provider_config, provider="unrelated", launcher_factory=unrelated_launcher),
+    )
+
+    async def access(*_args: Any, **_kwargs: Any) -> SessionAccess:
+        return SessionAccess(level=level, conversation=source)
+
+    monkeypatch.setattr(routes_core, "_require_access_and_level", access)
+    assert sandbox_fork_provider(
+        source, level >= 2 or share_files, source_host, app.state.sandbox_config
+    ) == ("modal" if capable and (level >= 2 or share_files) else None)
+    response = TestClient(app).post(
+        f"/v1/sessions/{source.id}/fork",
+        json={
+            "host_type": "managed",
+            "fork_sandbox": True,
+            **({"sandbox_provider": requested_provider} if requested_provider else {}),
+        },
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert response.status_code == expected, response.text
+    if expected != 201:
+        assert store.fork_calls == []
+        assert launches == []
+        return
+    launch = launches[0]
+    assert launch["owner"] == "bob@example.com"
+    assert launch["provider"] == "modal"
+    assert launch["fork_source"].sandbox_id == "source-generation-17"
+    assert launch["fork_source"].workspace == "/mnt/alice/repo"
+    fork = store.get_conversation(response.json()["id"])
+    assert fork is not None
+    assert fork.labels[REQUESTED_HOST_ID_LABEL_KEY] == launch["host_id"]
+    assert store.fork_calls[0]["resume_source_native_session"] is False
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        {"fork_sandbox": True},
+        {"fork_sandbox": True, "host_type": "managed", "side_chat": True},
+        {"fork_sandbox": True, "host_type": "managed", "workspace": None},
+    ],
+)
+def test_fork_sandbox_rejects_conflicting_request_fields(body: dict[str, Any]) -> None:
+    source = _make_conversation()
+    store = _ConversationStore({source.id: source})
+    response = TestClient(_build_app(store)).post(f"/v1/sessions/{source.id}/fork", json=body)
+    assert response.status_code == 422, response.text
+    assert store.fork_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parent_level", [1, 2])
+async def test_sandbox_fork_checks_inherited_workspace_permission(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, parent_level: int
+) -> None:
+    from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
+
+    agents = SqlAlchemyAgentStore(db_uri)
+    agent = agents.create(
+        agent_id="087b7cb7ac30abf4debfaa578d052ec6",
+        name="test-agent",
+        bundle_location="fake-bundle",
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    parent = store.create_conversation(agent_id=agent.id)
+    source_host_id = "310dc384700d4f7d8fcb40ad8152a82f"
+    child = store.create_conversation(
+        kind="sub_agent",
+        parent_conversation_id=parent.id,
+        agent_id=agent.id,
+        host_id=source_host_id,
+        workspace="/workspace/repo",
+    )
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    permissions.ensure_user("bob@example.com")
+    permissions.grant("bob@example.com", parent.id, parent_level)
+    app = _build_app(
+        store,  # type: ignore[arg-type]
+        agent_store=agents,  # type: ignore[arg-type]
+        auth_provider=UnifiedAuthProvider(source="header"),
+        permission_store=permissions,
+    )
+    launches = _arm_managed_app(app, monkeypatch)
+    app.state.host_store = _ForkSourceHostStore(
+        Host(
+            host_id=source_host_id,
+            name="alice-sandbox",
+            user_id="alice@example.com",
+            status="offline",
+            created_at=1,
+            updated_at=1,
+            sandbox_provider="modal",
+            sandbox_id="source-generation",
+        )
+    )
+    app.state.sandbox_config.configs = (
+        replace(
+            app.state.sandbox_config.default,
+            launcher_factory=lambda: SimpleNamespace(
+                provider="modal",
+                capabilities=SandboxCapabilities(managed_launch=True, fork_sandbox=True),
+            ),
+        ),
+    )
+    client = TestClient(app)
+    headers = {"X-Forwarded-Email": "bob@example.com"}
+    snapshot = client.get(
+        f"/v1/sessions/{child.id}",
+        params={"include_items": False, "include_usage": False, "include_live_status": False},
+        headers=headers,
+    )
+    assert snapshot.status_code == 200, snapshot.text
+    assert snapshot.json()["sandbox_fork_provider"] == ("modal" if parent_level == 2 else None)
+    response = client.post(
+        f"/v1/sessions/{child.id}/fork",
+        json={"host_type": "managed", "fork_sandbox": True},
+        headers=headers,
+    )
+    assert response.status_code == (201 if parent_level == 2 else 403), response.text
+    assert len(launches) == (1 if parent_level == 2 else 0)
 
 
 @pytest.mark.asyncio

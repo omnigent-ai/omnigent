@@ -6618,6 +6618,12 @@
             "title": "Codex Bypass Sandbox",
             "type": "boolean"
           },
+          "fork_sandbox": {
+            "default": false,
+            "description": "Copy the source sandbox's current workspace through its provider. Requires a managed destination and does not rewind files to up_to_response_id.",
+            "title": "Fork Sandbox",
+            "type": "boolean"
+          },
           "host_id": {
             "anyOf": [
               {
@@ -8202,6 +8208,18 @@
             ],
             "description": "Strict runner liveness \u2014 `True` iff a runner tunnel is currently registered for this session. This is the sole reachability signal: `True` means the client can chat normally. It does **not** fold in host-relaunch optimism (a dead runner on a live host reads `False` here, not `True`) \u2014 the open-session view pairs it with `host_online` to decide what to show. `None` when the server has no runner liveness lookup wired.",
             "title": "Runner Online"
+          },
+          "sandbox_fork_provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Source sandbox provider supporting a copy for the current viewer.",
+            "title": "Sandbox Fork Provider"
           },
           "sandbox_status": {
             "anyOf": [

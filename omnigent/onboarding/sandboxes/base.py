@@ -575,6 +575,40 @@ class SandboxLifecycle(ABC):
         :raises click.ClickException: If provisioning fails.
         """
 
+    def fork(
+        self,
+        source_sandbox_id: str,
+        name: str,
+        *,
+        target_user_id: str,
+        idempotency_key: str,
+        source_workspace: str | None = None,
+    ) -> str:
+        """Copy a sandbox into independent storage and return its new id.
+
+        Optional capability, enabled by ``SandboxCapabilities.fork_sandbox``. The
+        provider authorizes copying from the source to ``target_user_id`` and
+        makes the copy writable by that user, without modifying the source.
+        Repeated calls with the same ``idempotency_key`` identify one copy.
+        Copying must finish before the destination host starts. The provider
+        cleans up partial copies when it fails before returning an id.
+
+        The copy must not start an inherited host or expose source credentials.
+        The subsequent ``start_host`` installs its fresh identity and credentials,
+        preserves copied files instead of recloning, and returns the destination
+        cwd corresponding to ``source_workspace``. Providers may reserve the
+        destination id here and finish copying during ``start_host``.
+
+        :param source_sandbox_id: Server-resolved source generation to copy.
+        :param name: Human-readable name for the new sandbox.
+        :param target_user_id: Authenticated owner of the new sandbox.
+        :param idempotency_key: Stable destination host id for deduplicating retries.
+        :param source_workspace: Source session cwd, or ``None`` for its default.
+        :returns: An opaque sandbox id distinct from ``source_sandbox_id``.
+        :raises SandboxCapabilityError: When sandbox forking is unsupported.
+        """
+        raise self._capability_error("fork a sandbox")
+
     def attach(self, sandbox_id: str) -> None:
         """
         Validate / refresh access to an existing sandbox so subsequent

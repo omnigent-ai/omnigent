@@ -524,6 +524,8 @@ export interface Session {
    * sees the current stage.
    */
   sandboxStatus?: SandboxStatus | null;
+  /** Provider able to copy this sandbox for the current user; null when unavailable. */
+  sandboxForkProvider?: string | null;
   /**
    * Per-MCP-server startup state for native harness sessions
    * (codex-native). Present while the harness boots its MCP servers or

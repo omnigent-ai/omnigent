@@ -28,6 +28,7 @@ from omnigent.entities import Conversation
 from omnigent.entities.agent import Agent
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.server.auth import (
+    LEVEL_EDIT,
     LEVEL_OWNER,
     RESERVED_USER_LOCAL,
     AuthProvider,
@@ -42,6 +43,28 @@ from omnigent.stores import ConversationStore
 from omnigent.stores.permission_store import PermissionStore
 
 _LEVEL_NAMES = {1: "read", 2: "edit", 3: "manage", 4: "owner"}
+
+
+async def require_workspace_read_access(
+    user_id: str | None,
+    conversation: Conversation,
+    permission_level: int | None,
+    permission_store: PermissionStore | None,
+    conversation_store: ConversationStore,
+) -> None:
+    """Authorize workspace bytes after session read access, resolving inherited grants."""
+    if conversation.share_workspace_files:
+        return
+    if conversation.parent_conversation_id is None and permission_level is not None:
+        if permission_level >= LEVEL_EDIT:
+            return
+        raise OmnigentError(
+            "Reading workspace files requires edit access or workspace file sharing.",
+            code=ErrorCode.FORBIDDEN,
+        )
+    await require_access(
+        user_id, conversation.id, LEVEL_EDIT, permission_store, conversation_store
+    )
 
 
 def get_user_id(

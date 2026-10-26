@@ -19,6 +19,7 @@ export interface SessionActionSource {
   hostId?: string | null;
   /** Sidebar ConversationSummary wire shape. */
   host_id?: string | null;
+  sandboxForkProvider?: string | null;
 }
 
 export function sessionActionRestrictions(
@@ -31,7 +32,8 @@ export function sessionActionRestrictions(
     session?.labels?.["omnigent.host_type"] === "managed" ||
     (host?.sandbox_provider != null && UNSUPPORTED_FORK_PROVIDERS.has(host.sandbox_provider));
   return {
-    forkDisabledReason: unsupportedSource ? SANDBOX_FORK_UNSUPPORTED : undefined,
+    forkDisabledReason:
+      unsupportedSource && !session?.sandboxForkProvider ? SANDBOX_FORK_UNSUPPORTED : undefined,
     switchHostDisabledReason:
       unsupportedSource || host?.sandbox_provider ? SANDBOX_SWITCH_HOST_UNSUPPORTED : undefined,
   };

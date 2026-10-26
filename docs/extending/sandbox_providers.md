@@ -286,6 +286,64 @@ Providers declare their feature set via a `capabilities` property returning
 | `file_copy` | Supports copying files into the sandbox |
 | `streaming_exec` | Supports streaming process execution |
 | `foreground_exec` | Supports a foreground exec with inherited stdio |
+| `fork_sandbox` | Copies a sandbox into independent storage owned by the requesting user |
+
+## Forking a session's sandbox
+
+Sandbox copying is opt-in. A provider enables it with
+`SandboxCapabilities(fork_sandbox=True, ...)` and implements this lifecycle hook:
+
+```python
+def fork(
+    self,
+    source_sandbox_id: str,
+    name: str,
+    *,
+    target_user_id: str,
+    idempotency_key: str,
+    source_workspace: str | None = None,
+) -> str:
+    # Delegate to your sandbox controller; return the new sandbox's opaque id.
+    ...
+```
+
+For an injected launcher, set `ManagedSandboxConfig.provider` to the launcher's
+provider name so capability discovery can find it. The adapter can call the
+controller's own HTTP API; Omnigent does not prescribe an endpoint or a storage
+copy mechanism.
+
+Clients request copying with `fork_sandbox: true` and `host_type: "managed"` on
+`POST /v1/sessions/{id}/fork`. Omnigent checks access to the source workspace,
+resolves its sandbox id and provider, and supplies the authenticated destination
+user. The idempotency key is the new managed host's stable id.
+
+The launch sequence is `prepare()` → `fork()` → register a fresh host and token
+→ `start_host()` → wait for the host to connect. The controller must:
+
+- Return a new sandbox id with independent writable storage and authorize
+  ownership for `target_user_id`. Files outside the shared workspace require
+  separate authorization or exclusion.
+- Deduplicate calls using `idempotency_key` and reject reuse with a different
+  source or owner. Clean up partial copies if the hook fails before returning an
+  id; after it returns, the existing startup-failure cleanup applies.
+- Remove inherited credentials and runtime identity before exposing the copy.
+  `start_host` receives the new host id, token, and configuration.
+- Preserve copied files during `start_host` instead of recloning repositories,
+  and return the destination cwd corresponding to `source_workspace`. The copy
+  must finish before the destination host starts.
+
+Storage copying, consistency, retention, and recovery remain the controller's
+responsibility under the existing sandbox lifecycle.
+
+Eligible sessions show **Fork sandbox as well**, checked by default. Unchecking
+it uses the existing destination picker. Forking from an earlier message copies
+current files; it does not restore historical filesystem state. Omitting the API
+flag preserves existing behavior. No built-in provider enables copying yet.
+
+To verify an integration, make an uncommitted change and an untracked file as A,
+share workspace access with B, and fork as B with the checkbox on. Confirm B owns
+an independent copy with both files, the corresponding cwd, and fresh credentials.
+Repeat unchecked and with a controller rejection.
 
 ## Network policy for harness bridge servers
 

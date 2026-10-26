@@ -6,11 +6,11 @@ import asyncio
 import copy
 import json
 from collections.abc import AsyncIterator, Iterator
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 import pytest_asyncio
@@ -19,6 +19,7 @@ from httpx import ASGITransport, AsyncClient, MockTransport, Request, Response
 
 from omnigent.db.utils import generate_agent_id
 from omnigent.models import model_catalog
+from omnigent.onboarding.sandboxes.types import SandboxCapabilities
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.managed_hosts import (
@@ -1017,6 +1018,85 @@ async def test_configured_fork_rejects_foreign_provider_owner(env: _Env, unbound
     assert response.status_code == 400, response.text
     assert "another user" in response.text
     assert env.persisted() == before
+
+
+@pytest.mark.parametrize(
+    "target_config", ["configured", "unconfigured", "unavailable_model", "missing_bundle"]
+)
+async def test_sandbox_copy_uses_target_users_inference(
+    env: _Env, monkeypatch: pytest.MonkeyPatch, target_config: str
+) -> None:
+    env.catalog.owner = "alice@example.test"
+    created = await _json_create(env, model_override="gateway/fast")
+    assert created.status_code == 201, created.text
+    source_id = created.json()["id"]
+    source_snapshot = env.store.get_conversation(source_id).inference_snapshot
+    env.app.state.sandbox_config = ManagedSandboxDeployment.single(
+        replace(
+            env.app.state.sandbox_config.default,
+            launcher_factory=lambda: SimpleNamespace(
+                capabilities=SandboxCapabilities(managed_launch=True, fork_sandbox=True)
+            ),
+        )
+    )
+    source_host = env.app.state.host_store.register_managed_host(
+        host_id="a" * 32,
+        name="source",
+        user_id="alice@example.test",
+        token="source-token",
+        provider="agent_sandbox",
+        sandbox_id="source-sandbox",
+        token_expires_at=2**31,
+    )
+    env.store.set_host_id(source_id, host_id=source_host.host_id, workspace="/workspace/project")
+    env.catalog.owner = "local"
+    env.catalog.revision = "revision-target"
+    if target_config == "unconfigured":
+        monkeypatch.setattr(env.catalog, "prepare", AsyncMock(return_value=None))
+    elif target_config == "unavailable_model":
+        monkeypatch.setattr(
+            env.catalog,
+            "catalog",
+            AsyncMock(
+                return_value={
+                    "status": "ready",
+                    "models": [{"id": "gateway/main"}],
+                    "default_model": "gateway/main",
+                }
+            ),
+        )
+    elif target_config == "missing_bundle":
+        monkeypatch.setattr(AgentCache, "load", Mock(side_effect=FileNotFoundError("bundle")))
+    before = env.persisted()
+    env.launch.reset_mock()
+
+    response = await env.client.post(
+        f"/v1/sessions/{source_id}/fork",
+        json={"host_type": "managed", "fork_sandbox": True},
+    )
+
+    if target_config in {"unavailable_model", "missing_bundle"}:
+        assert response.status_code == 400, response.text
+        assert (
+            "configured model list"
+            if target_config == "unavailable_model"
+            else "Cannot load the target agent"
+        ) in response.text
+        assert env.persisted() == before
+        env.launch.assert_not_called()
+    else:
+        assert response.status_code == 201, response.text
+        fork = env.store.get_conversation(response.json()["id"])
+        assert fork is not None
+        if target_config == "unconfigured":
+            assert fork.inference_snapshot is None
+        else:
+            assert fork.inference_snapshot["owner_id"] == "local"
+            assert fork.inference_snapshot["configuration_revision"] == "revision-target"
+            assert env.catalog.calls[-1] == ("agent_sandbox", "codex", None)
+        assert env.launch.call_args.kwargs["owner"] == "local"
+        assert env.launch.call_args.kwargs["fork_source"].sandbox_id == "source-sandbox"
+    assert env.store.get_conversation(source_id).inference_snapshot == source_snapshot
 
 
 @pytest.mark.parametrize(
