@@ -8,11 +8,16 @@ import logging
 import os
 import re
 import stat
+import sys
 import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
 from typing import cast
+
+if sys.platform == "win32":
+    import _winapi
+    import msvcrt
 
 from omnigent.debug_logging import debug_event
 from omnigent.harnesses.diagnostics import (
@@ -29,6 +34,12 @@ _CLOSE_READS = 4
 _MARKER_BYTES = 4096
 _LAUNCH_ID = re.compile(r"[0-9a-f]{32}\Z")
 _logger = logging.getLogger(__name__)
+# Windows has no ``dir_fd`` or ``O_NOFOLLOW``; there the bridge directory is
+# used by path and each entry is checked with ``lstat`` before it is opened.
+_DIR_FD_SUPPORTED = (
+    os.open in os.supports_dir_fd and hasattr(os, "O_NOFOLLOW") and hasattr(os, "O_DIRECTORY")
+)
+_FILE_SHARE_READ_WRITE_DELETE = 0x7
 
 
 @dataclass(frozen=True)
@@ -37,7 +48,12 @@ class _Capture:
     launch_id: str
 
 
-def _open_directory(path: Path) -> int:
+def _open_directory(path: Path) -> int | Path:
+    if not _DIR_FD_SUPPORTED:
+        info = os.lstat(path)
+        if _is_link(info) or not stat.S_ISDIR(info.st_mode):
+            raise OSError("Diagnostic directory is a link or not a directory")
+        return path
     fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
     info = os.fstat(fd)
     if info.st_uid != os.getuid() or stat.S_IMODE(info.st_mode) & 0o077:
@@ -46,18 +62,68 @@ def _open_directory(path: Path) -> int:
     return fd
 
 
-def _open_file(directory_fd: int, filename: str) -> int:
-    fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory_fd)
+def _close_directory(directory: int | Path) -> None:
+    if isinstance(directory, int):
+        os.close(directory)
+
+
+def _entry(directory: int | Path, filename: str) -> tuple[str, int | None]:
+    """Name *filename* relative to the directory descriptor, or by path without one."""
+    if isinstance(directory, int):
+        return filename, directory
+    return str(directory / filename), None
+
+
+def _is_link(info: os.stat_result) -> bool:
+    """Whether an ``lstat`` result is a symlink, junction or other reparse point."""
+    reparse = getattr(info, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT
+    return stat.S_ISLNK(info.st_mode) or bool(reparse)
+
+
+if sys.platform == "win32":
+
+    def _open_by_path(path: Path) -> int:
+        """Open for reading and still let Claude rotate the file by renaming it."""
+        handle = _winapi.CreateFile(
+            str(path),
+            _winapi.GENERIC_READ,
+            _FILE_SHARE_READ_WRITE_DELETE,
+            0,
+            _winapi.OPEN_EXISTING,
+            0,
+            0,
+        )
+        try:
+            return msvcrt.open_osfhandle(handle, os.O_RDONLY)
+        except BaseException:
+            _winapi.CloseHandle(handle)
+            raise
+
+else:
+
+    def _open_by_path(path: Path) -> int:
+        return os.open(path, os.O_RDONLY)
+
+
+def _open_file(directory: int | Path, filename: str) -> int:
+    if isinstance(directory, int):
+        fd = os.open(filename, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory)
+        owned = os.fstat(fd).st_uid == os.getuid()
+    else:
+        # The opened file must be the entry that lstat checked, not a link swapped in.
+        entry = os.lstat(directory / filename)
+        fd = _open_by_path(directory / filename)
+        owned = not _is_link(entry) and os.path.samestat(entry, os.fstat(fd))
     info = os.fstat(fd)
-    if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid() or info.st_nlink != 1:
+    if not stat.S_ISREG(info.st_mode) or not owned or info.st_nlink != 1:
         os.close(fd)
         raise OSError("Diagnostic input is not an owned regular file")
     return fd
 
 
-def _read_capture(directory_fd: int) -> _Capture | None:
+def _read_capture(directory: int | Path) -> _Capture | None:
     try:
-        fd = _open_file(directory_fd, CLAUDE_DEBUG_LOG_MARKER)
+        fd = _open_file(directory, CLAUDE_DEBUG_LOG_MARKER)
     except FileNotFoundError:
         return None
     try:
@@ -76,29 +142,31 @@ def _read_capture(directory_fd: int) -> _Capture | None:
     return _Capture(filename, launch_id) if payload.get("filename") == filename else None
 
 
-def _clear_capture(directory_fd: int) -> None:
+def _clear_capture(directory: int | Path) -> None:
     with contextlib.suppress(OSError, ValueError):
-        capture = _read_capture(directory_fd)
+        capture = _read_capture(directory)
         if capture is not None:
             for filename in (capture.filename, capture.filename + ".1"):
                 with contextlib.suppress(FileNotFoundError):
-                    os.unlink(filename, dir_fd=directory_fd)
+                    name, dir_fd = _entry(directory, filename)
+                    os.unlink(name, dir_fd=dir_fd)
     with contextlib.suppress(FileNotFoundError):
-        os.unlink(CLAUDE_DEBUG_LOG_MARKER, dir_fd=directory_fd)
+        name, dir_fd = _entry(directory, CLAUDE_DEBUG_LOG_MARKER)
+        os.unlink(name, dir_fd=dir_fd)
 
 
 def augment_claude_debug_args(args: list[str], bridge_dir: Path) -> list[str]:
     """Add a fresh owned debug file when opted in, preserving explicit user flags."""
     if not harness_stderr_capture_enabled():
         return args
-    directory_fd: int | None = None
+    directory: int | Path | None = None
     created: Path | None = None
     try:
         from omnigent.harnesses.claude_native.bridge import _ensure_secure_dir, _write_json_file
 
         _ensure_secure_dir(bridge_dir)
-        directory_fd = _open_directory(bridge_dir)
-        _clear_capture(directory_fd)
+        directory = _open_directory(bridge_dir)
+        _clear_capture(directory)
         separator = args.index("--") if "--" in args else len(args)
         if any(
             arg == "--debug-file" or arg.startswith("--debug-file=") for arg in args[:separator]
@@ -106,11 +174,12 @@ def augment_claude_debug_args(args: list[str], bridge_dir: Path) -> list[str]:
             return args
         launch_id = uuid.uuid4().hex
         filename = f"claude-debug-{launch_id}.log"
+        name, dir_fd = _entry(directory, filename)
         fd = os.open(
-            filename,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0),
             0o600,
-            dir_fd=directory_fd,
+            dir_fd=dir_fd,
         )
         os.close(fd)
         created = bridge_dir / filename
@@ -125,8 +194,8 @@ def augment_claude_debug_args(args: list[str], bridge_dir: Path) -> list[str]:
                 created.unlink()
         return args
     finally:
-        if directory_fd is not None:
-            os.close(directory_fd)
+        if directory is not None:
+            _close_directory(directory)
 
 
 class ClaudeDebugLogFollower:
@@ -196,17 +265,18 @@ class ClaudeDebugLogFollower:
 
     def _read(self) -> tuple[bytes, list[str], int]:
         """Read one chunk, draining a renamed inode before switching to its replacement."""
-        directory_fd = _open_directory(self._bridge_dir)
+        directory = _open_directory(self._bridge_dir)
         candidate: int | None = None
         omitted_bytes = 0
         try:
             try:
-                os.stat(CLAUDE_DEBUG_LOG_MARKER, dir_fd=directory_fd, follow_symlinks=False)
+                name, dir_fd = _entry(directory, CLAUDE_DEBUG_LOG_MARKER)
+                os.stat(name, dir_fd=dir_fd, follow_symlinks=False)
             except FileNotFoundError:
                 self._marker_present = False
             else:
                 self._marker_present = True
-            capture = _read_capture(directory_fd)
+            capture = _read_capture(directory)
             if capture != self._capture:
                 self._reset_file()
                 self._capture = capture
@@ -218,7 +288,7 @@ class ClaudeDebugLogFollower:
                 # later rotations are handled through the already-open inode.
                 if capture is not None:
                     with contextlib.suppress(OSError):
-                        predecessor = _open_file(directory_fd, capture.filename + ".1")
+                        predecessor = _open_file(directory, capture.filename + ".1")
                         try:
                             omitted_bytes = os.fstat(predecessor).st_size
                         finally:
@@ -226,7 +296,7 @@ class ClaudeDebugLogFollower:
             if capture is None:
                 return b"", [], omitted_bytes
             with contextlib.suppress(FileNotFoundError):
-                candidate = _open_file(directory_fd, capture.filename)
+                candidate = _open_file(directory, capture.filename)
             self._file_present = candidate is not None
             if self._fd is None:
                 self._fd, candidate = candidate, None
@@ -255,7 +325,7 @@ class ClaudeDebugLogFollower:
         finally:
             if candidate is not None:
                 os.close(candidate)
-            os.close(directory_fd)
+            _close_directory(directory)
 
     def _feed(self, raw: bytes) -> tuple[list[str], int, int]:
         records: list[str] = []
@@ -291,13 +361,13 @@ class ClaudeDebugLogFollower:
             return 0
         info = os.fstat(self._fd)
         remaining = max(0, info.st_size - self._offset)
-        directory_fd = _open_directory(self._bridge_dir)
+        directory = _open_directory(self._bridge_dir)
         candidate: int | None = None
         try:
-            if _read_capture(directory_fd) != self._capture:
+            if _read_capture(directory) != self._capture:
                 return remaining
             with contextlib.suppress(FileNotFoundError):
-                candidate = _open_file(directory_fd, self._capture.filename)
+                candidate = _open_file(directory, self._capture.filename)
             if candidate is None:
                 return remaining
             replacement = os.fstat(candidate)
@@ -315,7 +385,7 @@ class ClaudeDebugLogFollower:
         finally:
             if candidate is not None:
                 os.close(candidate)
-            os.close(directory_fd)
+            _close_directory(directory)
 
     def _emit(
         self,
