@@ -419,8 +419,11 @@ class ProxyMcpManager:
         async def _wait_to_reattach(
             request_generation: int,
             cause: BaseException | None = None,
+            *,
+            response: httpx.Response | None = None,
         ) -> None:
             started = monotonic()
+            trigger = type(cause).__name__ if cause is not None else "detached_response"
             registry = self._execution_registry
             if registry is None or not registry.has_operation(self._session_id, operation_id):
                 _record_failure(
@@ -428,6 +431,8 @@ class ProxyMcpManager:
                     phase="server_reattach",
                     request_generation=request_generation,
                     started=started,
+                    response=response,
+                    reattach_trigger=trigger,
                 )
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
@@ -445,9 +450,8 @@ class ProxyMcpManager:
                     phase="server_reattach",
                     request_generation=request_generation,
                     started=started,
-                    reattach_trigger=type(cause).__name__
-                    if cause is not None
-                    else "detached_response",
+                    response=response,
+                    reattach_trigger=trigger,
                 )
                 raise RuntimeError(
                     f"MCP proxy call for tool {tool_name!r} in session "
@@ -524,7 +528,7 @@ class ProxyMcpManager:
                 code = err.get("code")
                 msg = err.get("message", "")
                 if code == RUNNER_MCP_EXECUTION_DETACHED_CODE:
-                    await _wait_to_reattach(request_generation)
+                    await _wait_to_reattach(request_generation, response=resp)
                     request_id += 1
                     payload = cast("_JsonObject", {**payload, "id": request_id})
                     continue

@@ -711,23 +711,29 @@ async def test_call_tool_failed_diagnostics_preserves_original_error(
 
 
 @pytest.mark.asyncio
-async def test_call_tool_server_reattach_timeout_keeps_operation_evidence(
-    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+@pytest.mark.parametrize("retained", [True, False])
+async def test_call_tool_server_reattach_failure_keeps_operation_evidence(
+    monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture, retained: bool
 ) -> None:
     from omnigent.runner import proxy_mcp_manager
 
     monkeypatch.setattr(proxy_mcp_manager, "_SERVER_RECONNECT_WAIT_S", 0.0)
-    transport = _StubTransport(
-        [_json_resp({"error": {"code": RUNNER_MCP_EXECUTION_DETACHED_CODE}})]
-    )
-    registry = McpExecutionRegistry()
+    request_id = "00000000-0000-4000-8000-000000000001"
+    response = _json_resp({"error": {"code": RUNNER_MCP_EXECUTION_DETACHED_CODE}})
+    response.headers["x-request-id"] = request_id
+    transport = _StubTransport([response])
+    registry = McpExecutionRegistry() if retained else None
     pending_approvals.reset_for_tests()
-    async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
-        manager = ProxyMcpManager(
-            session_id="conv_test", ap_client=client, execution_registry=registry
-        )
-        with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match="no replacement"):
-            await manager.call_tool(None, "sys_os_write", {"content": "private-file-content"})
+    try:
+        async with httpx.AsyncClient(transport=transport, base_url="http://ap-server") as client:
+            manager = ProxyMcpManager(
+                session_id="conv_test", ap_client=client, execution_registry=registry
+            )
+            expected = "no replacement" if retained else "without a reserved"
+            with caplog.at_level(logging.WARNING), pytest.raises(RuntimeError, match=expected):
+                await manager.call_tool(None, "sys_os_write", {"content": "private-file-content"})
+    finally:
+        pending_approvals.reset_for_tests()
 
     assert len(transport.calls) == 1
     [record] = [
@@ -736,12 +742,16 @@ async def test_call_tool_server_reattach_timeout_keeps_operation_evidence(
     attrs = record.attributes
     assert attrs["operation_id"] == transport.calls[0].body["params"][MCP_OPERATION_ID_PARAM]
     assert attrs["failure_phase"] == "server_reattach"
-    assert attrs["exception_type"] == "TimeoutError"
-    assert attrs["operation_retained"] is True
+    assert attrs["exception_type"] == ("TimeoutError" if retained else "none")
+    assert attrs["reattach_trigger"] == "detached_response"
+    assert attrs["http_status"] == 200
+    assert attrs["upstream_request_id"] == request_id
+    assert attrs["operation_retained"] is retained
     assert attrs["server_generation"] == attrs["observed_server_generation"] == 0
     assert attrs["phase_elapsed_ms"] >= 0
     assert "private-" not in record.getMessage() + json.dumps(attrs)
-    assert not registry.has_operation("conv_test", attrs["operation_id"])
+    if registry is not None:
+        assert not registry.has_operation("conv_test", attrs["operation_id"])
 
 
 # ── dispatch timeout nesting ────────────────────────────────────────────────
