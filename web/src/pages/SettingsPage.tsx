@@ -196,7 +196,6 @@ import {
 import {
   DEFAULT_FOLD_ASSISTANT_NARRATION,
   FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
-  readFoldAssistantNarration,
   useFoldAssistantNarration,
   writeFoldAssistantNarration,
 } from "@/lib/foldNarrationPreferences";
@@ -933,7 +932,7 @@ function FoldAssistantNarrationControl() {
       <SettingsLabel
         label="Show only the final answer"
         labelId={labelId}
-        description="After a turn finishes, fold the agent's progress messages into the Worked row with its tool calls. The last message is treated as the answer; expand Worked to see the rest."
+        description="Once a turn finishes, fold its progress messages into the Worked row. The last message stays visible as the answer."
       />
       <Switch
         aria-labelledby={labelId}
@@ -1049,8 +1048,6 @@ function AppearanceSection() {
       applyUiFontFamily(readUiFontFamily());
       applyThemePalette(readThemePalette());
       applyCustomTheme(readCustomTheme());
-      // Notify open chats; the import wrote storage directly.
-      writeFoldAssistantNarration(readFoldAssistantNarration());
 
       setIsImportDialogOpen(false);
       setResetKey((k) => k + 1);

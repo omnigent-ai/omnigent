@@ -1034,12 +1034,7 @@ def test_final_answer_setting_folds_narration_with_tool_work(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
-    """Opting in folds a finished turn's progress messages into one Worked row.
-
-    By default every assistant message stays visible between separate work
-    disclosures. With "Show only the final answer" on, the narration and the
-    shell calls collapse behind a single row and only the last message stays
-    visible; expanding the row shows the narration in order.
+    """Opting in leaves only the final message outside one Worked fold.
 
     :param request: Pytest request, used to create the recorded page after seeding.
     :param seeded_session: ``(base_url, session_id)`` from the local server.
@@ -1116,11 +1111,7 @@ def test_final_answer_setting_folds_progress_messages_without_tools(
     request: pytest.FixtureRequest,
     seeded_session: tuple[str, str],
 ) -> None:
-    """A turn with only progress messages folds them once the user opts in.
-
-    Without tool calls there is normally no Worked row at all. With the
-    setting on, the earlier messages fold and the last one stays visible;
-    turning the setting off restores them.
+    """Opting in folds text-only progress messages and persists across reload.
 
     :param request: Pytest request, used to create the recorded page after seeding.
     :param seeded_session: ``(base_url, session_id)`` from the local server.

@@ -51,5 +51,21 @@ describe("foldNarrationPreferences", () => {
       );
     });
     expect(result.current).toBe(false);
+
+    act(() => {
+      localStorage.setItem(FOLD_ASSISTANT_NARRATION_STORAGE_KEY, "true");
+      window.dispatchEvent(
+        new StorageEvent("storage", {
+          key: FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+          storageArea: sessionStorage,
+        }),
+      );
+    });
+    expect(result.current).toBe(false);
+
+    act(() => {
+      window.dispatchEvent(new StorageEvent("storage", { key: null, storageArea: localStorage }));
+    });
+    expect(result.current).toBe(true);
   });
 });

@@ -13,10 +13,8 @@
 //    routing/fan-out cards never fold regardless of position.
 //
 // 2. Turn folding: once settled, each work run collapses behind a
-//    "Worked" row. Assistant messages remain visible in order;
-//    pending elicitations and routing cards stay visible too. With
-//    the opt-in `foldNarration`, earlier messages fold with the work
-//    and only the turn's last message stays visible.
+//    "Worked" row. Assistant messages (all but the last with the
+//    opt-in `foldNarration`), elicitations and routing cards stay visible.
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -153,11 +151,12 @@ function turnLiveness({
   return { isOwnTurnLive, possiblyLive, isTurnLive: isOwnTurnLive || possiblyLive };
 }
 
-/** Work folds after an assistant message or in a tool-bearing continuation. */
+/** Work folds after an assistant message, or in a continuation with tools or folded text. */
 function hasFoldableShape(
   items: RenderItem[],
   { segments }: TurnPartition,
   continued = false,
+  foldNarration = false,
 ): boolean {
   const lastItem = items.findLast((item) => !isTrailingWrapup(item));
   // A terminal failure or denial must stay visible beside the assistant text.
@@ -173,7 +172,13 @@ function hasFoldableShape(
     segments.some((segment) => segment.kind === "work") &&
     (segments.some((segment) => segment.kind === "text") ||
       (continued &&
-        segments.some((segment) => segment.kind === "work" && segment.items.some(isToolItem))))
+        segments.some(
+          (segment) =>
+            segment.kind === "work" &&
+            segment.items.some(
+              (item) => isToolItem(item) || (foldNarration && item.kind === "text"),
+            ),
+        )))
   );
 }
 
@@ -187,7 +192,7 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
     continued: inputs.continued,
   });
   return (
-    hasFoldableShape(inputs.items, partition, inputs.continued) &&
+    hasFoldableShape(inputs.items, partition, inputs.continued, inputs.foldNarration) &&
     partition.segments.every((segment) => segment.kind === "work")
   );
 }
@@ -243,7 +248,7 @@ export function BlockRenderer({
     // Never fold a possibly-live bubble whose fold hasn't shown yet:
     // the terminal status edge is what folds it (see possiblyLive).
     (!possiblyLive || foldLatchedRef.current) &&
-    hasFoldableShape(items, partition, continued);
+    hasFoldableShape(items, partition, continued, foldNarration);
 
   // Debounce fold APPEARANCE on a live bubble: transient settled reads —
   // a step-wise turn's idle edge between steps, a stray bare idle before
@@ -461,6 +466,9 @@ function partitionTurn(
     wrapup.unshift(items[end - 1]!);
     end -= 1;
   }
+  // A continued bubble's answer lands in a later bubble, so all of its text folds.
+  const answerIndex =
+    foldNarration && !continued ? items.findLastIndex((item) => item.kind === "text") : -1;
   const segments: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
     const item = items[i]!;
@@ -473,7 +481,7 @@ function partitionTurn(
       segments.push({ kind: "exempt", item, index: i });
       continue;
     }
-    const kind = item.kind === "text" ? "text" : "work";
+    const kind = item.kind === "text" && (!foldNarration || i === answerIndex) ? "text" : "work";
     const previous = segments[segments.length - 1];
     if (previous?.kind === kind) previous.items.push(item);
     else segments.push({ kind, items: [item], startIndex: i });
@@ -483,40 +491,7 @@ function partitionTurn(
     if (lastWork?.kind === "work") lastWork.items.push(...wrapup);
     else segments.push({ kind: "work", items: wrapup, startIndex: end });
   }
-  return { segments: foldNarration ? foldNarrationIntoWork(segments, continued) : segments };
-}
-
-/**
- * Fold every message but the turn's last into the adjacent work runs. A
- * continued bubble's answer lands in a later bubble, so all of it folds.
- */
-function foldNarrationIntoWork(segments: TurnSegment[], continued: boolean): TurnSegment[] {
-  const finalTextSegment = continued
-    ? -1
-    : segments.findLastIndex((segment) => segment.kind === "text");
-  const folded: TurnSegment[] = [];
-  const appendWork = (items: RenderItem[], startIndex: number) => {
-    if (items.length === 0) return;
-    const previous = folded[folded.length - 1];
-    if (previous?.kind === "work") previous.items.push(...items);
-    else folded.push({ kind: "work", items: [...items], startIndex });
-  };
-  segments.forEach((segment, position) => {
-    if (segment.kind === "exempt") {
-      folded.push(segment);
-    } else if (segment.kind === "work" || position !== finalTextSegment) {
-      appendWork(segment.items, segment.startIndex);
-    } else {
-      const finalIndex = segment.items.length - 1;
-      appendWork(segment.items.slice(0, finalIndex), segment.startIndex);
-      folded.push({
-        kind: "text",
-        items: [segment.items[finalIndex]!],
-        startIndex: segment.startIndex + finalIndex,
-      });
-    }
-  });
-  return folded;
+  return { segments };
 }
 
 function isPendingElicitation(item: RenderItem): boolean {

@@ -805,6 +805,22 @@ describe("BlockRenderer dispatch", () => {
         });
       });
 
+      it("merges trailing reasoning into the same fold in a turn without tool calls", () => {
+        const items: RenderItem[] = [
+          { kind: "text", itemId: "m0", text: "Gathering context.", final: true },
+          { kind: "text", itemId: "m1", text: "Final placeholder answer.", final: true },
+          { kind: "reasoning", itemId: "r0", text: "Wrapping up.", duration: 1 },
+        ];
+        render(<BlockRenderer items={items} sessionStatus="idle" foldNarration />);
+        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+        const fold = screen.getByRole("button", { name: "Worked" });
+        const answer = screen.getByText("Final placeholder answer.");
+        expect(
+          fold.compareDocumentPosition(answer) & Node.DOCUMENT_POSITION_FOLLOWING,
+        ).toBeTruthy();
+        expect(screen.queryByText("Gathering context.")).toBeNull();
+      });
+
       it("leaves a single-message turn and a live turn unfolded", () => {
         const answerOnly: RenderItem[] = [
           { kind: "text", itemId: "m0", text: "Just the answer.", final: true },
@@ -856,7 +872,7 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.getByText("Claude wants to call Bash", { exact: false })).toBeDefined();
       });
 
-      it("folds every message of a tool-bearing continued bubble", () => {
+      it("folds every message of a continued bubble", () => {
         const items: RenderItem[] = [
           { kind: "text", itemId: "m0", text: "Dispatching sub-agents.", final: true },
           tool(1, "Agent"),
@@ -868,6 +884,10 @@ describe("BlockRenderer dispatch", () => {
         render(<BlockRenderer {...inputs} foldNarration />);
         expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
         expect(screen.queryByText("Waiting for results.")).toBeNull();
+
+        const textOnly = { ...inputs, items: [items[0]!, items[2]!] };
+        expect(rendersOnlyWorkedFold(textOnly)).toBe(false);
+        expect(rendersOnlyWorkedFold({ ...textOnly, foldNarration: true })).toBe(true);
       });
     });
 

@@ -36,7 +36,13 @@ export function writeFoldAssistantNarration(enabled: boolean): void {
 
 function subscribe(listener: () => void): () => void {
   const onStorage = (event: StorageEvent) => {
-    if (event.key === null || event.key === FOLD_ASSISTANT_NARRATION_STORAGE_KEY) listener();
+    if (event.key !== null && event.key !== FOLD_ASSISTANT_NARRATION_STORAGE_KEY) return;
+    try {
+      if (event.storageArea !== null && event.storageArea !== window.localStorage) return;
+    } catch {
+      // Unreadable storage: re-read, which falls back to the default.
+    }
+    listener();
   };
   window.addEventListener(CHANGE_EVENT, listener);
   window.addEventListener("storage", onStorage);
