@@ -710,7 +710,7 @@ def pending_ids(conversation_id: str) -> list[str]:
         ]
 
 
-def mark_interrupted(conversation_id: str, ids: Iterable[str]) -> None:
+def mark_interrupted(conversation_id: str, ids: Iterable[str]) -> list[str]:
     """
     Flag entries the person cancelled by interrupting the session's turn.
 
@@ -724,13 +724,17 @@ def mark_interrupted(conversation_id: str, ids: Iterable[str]) -> None:
     :param conversation_id: Conversation/session id, e.g. ``"conv_abc123"``.
     :param ids: Ids read with :func:`pending_ids` before the interrupt was
         forwarded, e.g. ``["pending_a1b2c3"]``.
+    :returns: The ids flagged, in the order given, e.g. ``["pending_a1b2c3"]``.
     """
+    flagged: list[str] = []
     with _lock:
         entries = _pending.get(conversation_id, {})
         for pending_id in ids:
             entry = entries.get(pending_id)
             if entry is not None and not entry.held:
                 entry.interrupted = True
+                flagged.append(pending_id)
+    return flagged
 
 
 def restore(conversation_id: str, drained: DrainedInput) -> None:

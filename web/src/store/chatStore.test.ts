@@ -6864,6 +6864,145 @@ describe("chatStore — stop", () => {
     useChatStore.getState().stop();
     expect(fetchMock).not.toHaveBeenCalled();
   });
+
+  describe("dropPendingUserMessages", () => {
+    // A posted native send carries the server's id; its POST ack set it.
+    const posted = (tempId: string, pendingId: string): PendingUserMessage => ({
+      tempId,
+      content: [{ type: "input_text", text: `message ${tempId}` }],
+      posted: true,
+      pendingId,
+    });
+    // A bubble replayed from the snapshot carries the server's id as `tempId`.
+    const replayed = (pendingId: string): PendingUserMessage => ({
+      tempId: pendingId,
+      content: [{ type: "input_text", text: `message ${pendingId}` }],
+    });
+    // A send whose POST has not returned yet has no server id.
+    const inFlight = (tempId: string): PendingUserMessage => ({
+      tempId,
+      content: [{ type: "input_text", text: `message ${tempId}` }],
+    });
+    const idsOf = (id: string) =>
+      conversationRegistry
+        .peek(id)!
+        .getState()
+        .pendingUserMessages.map((p) => p.tempId);
+
+    it.each([
+      { which: "active", target: "conv_fg", other: "conv_bg" },
+      { which: "background", target: "conv_bg", other: "conv_fg" },
+    ])("drops only the named bubbles of the $which conversation", ({ target, other }) => {
+      const bubbles = (id: string) => [
+        posted(`${id}_posted`, `pending_${id}_posted`),
+        replayed(`pending_${id}_replayed`),
+        posted(`${id}_later`, `pending_${id}_later`),
+        inFlight(`${id}_in_flight`),
+      ];
+      // `conv_fg` is bound last, so it is the one on screen.
+      bindConversationForTest("conv_bg", { pendingUserMessages: bubbles("conv_bg") });
+      bindConversationForTest("conv_fg", { pendingUserMessages: bubbles("conv_fg") });
+
+      useChatStore
+        .getState()
+        .dropPendingUserMessages(target, [
+          `pending_${target}_posted`,
+          `pending_${target}_replayed`,
+        ]);
+
+      expect(idsOf(target)).toEqual([`${target}_later`, `${target}_in_flight`]);
+      expect(idsOf(other)).toEqual(bubbles(other).map((p) => p.tempId));
+      // The root store keeps projecting whichever entry is on screen.
+      expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual(
+        idsOf("conv_fg"),
+      );
+    });
+
+    it("leaves the send queue, a failed-send draft and the turn state alone", () => {
+      const queued = [{ queueId: "q_1", text: "later", conversationId: "conv_abc" }];
+      const failedSendDraft = { conversationId: "conv_abc", text: "retry me", files: [] };
+      bindConversationForTest("conv_abc", {
+        pendingUserMessages: [posted("pend_1", "pending_1")],
+        failedSendDraft,
+        status: "streaming",
+        sessionStatus: "running",
+      });
+      useChatStore.setState({ queuedMessages: queued });
+
+      useChatStore.getState().dropPendingUserMessages("conv_abc", ["pending_1"]);
+
+      const state = useChatStore.getState();
+      expect(state.pendingUserMessages).toEqual([]);
+      expect(state.queuedMessages).toEqual(queued);
+      expect(state.failedSendDraft).toEqual(failedSendDraft);
+      expect(state.status).toBe("streaming");
+      expect(state.sessionStatus).toBe("running");
+    });
+
+    it("does nothing for a conversation that is not live", () => {
+      bindConversationForTest("conv_abc", { pendingUserMessages: [posted("pend_1", "pending_1")] });
+
+      useChatStore.getState().dropPendingUserMessages("conv_gone", ["pending_1"]);
+
+      // No entry is created for it, and the live conversation keeps its bubble.
+      expect(conversationRegistry.has("conv_gone")).toBe(false);
+      expect(idsOf("conv_abc")).toEqual(["pend_1"]);
+    });
+
+    it("drops a send the stop settled before its POST returned", async () => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        abortController: new AbortController(),
+      });
+      let ackPost: (() => void) | null = null;
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        if (
+          String(input).endsWith("/v1/sessions/conv_existing/events") &&
+          init?.method === "POST"
+        ) {
+          return new Promise<Response>((resolve) => {
+            ackPost = () => resolve(mockResponse({ queued: true, pending_id: "pending_late" }));
+          });
+        }
+        return defaultFetchHandler(input, init);
+      });
+      const sending = useChatStore.getState().send("stop me", "agent_xyz");
+      await vi.waitFor(() => expect(ackPost).not.toBeNull());
+
+      // The stop's response names the send before the send's own response arrives.
+      useChatStore.getState().dropPendingUserMessages("conv_existing", ["pending_late"]);
+      expect(useChatStore.getState().pendingUserMessages).toHaveLength(1);
+      ackPost!();
+      await sending;
+
+      expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+    });
+
+    it("does not let a late receipt for a dropped bubble take another message's", () => {
+      bindConversationForTest("conv_abc", {
+        pendingUserMessages: [
+          posted("pend_stopped", "pending_stopped"),
+          posted("pend_next", "pending_next"),
+        ],
+      });
+      useChatStore.getState().dropPendingUserMessages("conv_abc", ["pending_stopped"]);
+
+      // The agent had recorded the stopped message, so its mirror still arrives.
+      handleSessionEvent({
+        type: "session_input_consumed",
+        itemId: "msg_stopped",
+        itemType: "message",
+        clearedPendingId: "pending_stopped",
+        data: { role: "user", content: [{ type: "input_text", text: "message pend_stopped" }] },
+      });
+
+      expect(idsOf("conv_abc")).toEqual(["pend_next"]);
+      const users = useChatStore
+        .getState()
+        .blocks.flatMap((b) => (b.type === "user_message" ? [b.ctx.itemId] : []));
+      expect(users).toEqual(["msg_stopped"]);
+    });
+  });
 });
 
 describe("chatStore — handleSessionEvent (session.* events)", () => {
