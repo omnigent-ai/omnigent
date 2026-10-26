@@ -53,6 +53,7 @@ from omnigent.native.input_diagnostics import (
 )
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
+from omnigent.runtime.prompt import dedupe_tool_output_images
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CreateResponseRequest,
@@ -1525,14 +1526,21 @@ def _extract_role_keyed_messages(
     non-history inputs.
     """
     messages: list[Message] = []
+    seen_call_ids: set[str] = set()
     for item in input_value:
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
         if include_tool_history and item_type == "function_call":
+            # Live history repeats a call once per status update; keep the first.
+            call_id = item.get("call_id")
+            if isinstance(call_id, str) and call_id in seen_call_ids:
+                continue
             tool_call = _tool_call_message(item)
             if tool_call is not None:
                 messages.append(tool_call)
+                if isinstance(call_id, str):
+                    seen_call_ids.add(call_id)
             continue
         if include_tool_history and item_type == "function_call_output":
             messages.append(_tool_result_message(item))
@@ -1545,6 +1553,11 @@ def _extract_role_keyed_messages(
             continue
         messages.append({"role": role, "content": content})
     return messages
+
+
+# Per-output budget for replayed tool history: a fresh session gets the gist of
+# each result without one large read crowding out the conversation.
+_REPLAYED_TOOL_OUTPUT_MAX_BYTES = 16 * 1024
 
 
 def _tool_call_message(item: dict[str, Any]) -> Message | None:
@@ -1569,9 +1582,17 @@ def _tool_call_message(item: dict[str, Any]) -> Message | None:
 
 
 def _tool_result_message(item: dict[str, Any]) -> Message:
-    """Translate a ``function_call_output`` input item into a ``tool_result`` message."""
+    """Translate a ``function_call_output`` input item into a ``tool_result`` message.
+
+    The output is image-stripped and capped: a fresh session replays every one.
+    """
     output = item.get("output")
-    message: Message = {"role": "tool_result", "content": output if output is not None else ""}
+    if not isinstance(output, str):
+        output = "" if output is None else json.dumps(output)
+    output = cap_tool_output(
+        dedupe_tool_output_images(output), max_bytes=_REPLAYED_TOOL_OUTPUT_MAX_BYTES
+    )
+    message: Message = {"role": "tool_result", "content": output}
     call_id = item.get("call_id")
     if isinstance(call_id, str) and call_id:
         message["metadata"] = {"call_id": call_id}

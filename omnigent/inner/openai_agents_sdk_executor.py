@@ -53,6 +53,7 @@ from .executor import (
     classify_tool_result,
     describe_exception,
     split_transient_tail,
+    without_tool_history,
 )
 from .open_responses_sdk import (
     _OPENAI_KEY_PLACEHOLDER,
@@ -754,12 +755,6 @@ class _AgentsSessionState:
     rollback_to_item_count: int | None = None
 
 
-def _without_tool_history(messages: list[Message]) -> list[Message]:
-    """Drop ``tool_call`` / ``tool_result`` items: a live SDK session holds its own,
-    and the history cursor counts only conversational messages."""
-    return [msg for msg in messages if msg.get("role") not in ("tool_call", "tool_result")]
-
-
 # ``_sanitize_replay_item`` walks replay values recursively. At the
 # boundary these are either SDK TypedDicts, pydantic models that have
 # already been ``model_dump``-ed to dicts, or primitive JSON values — so
@@ -1421,7 +1416,7 @@ class OpenAIAgentsSDKExecutor(Executor):
             await self._rewind_sdk_session(state, state.rollback_to_item_count)
             state.rollback_to_item_count = None
 
-        cursor_view = _without_tool_history(messages)
+        cursor_view = without_tool_history(messages)
         if (
             state.started
             and len(split_transient_tail(cursor_view).persisted) < state.history_cursor
@@ -1453,7 +1448,7 @@ class OpenAIAgentsSDKExecutor(Executor):
             # A fresh SDK session (fork, restart) has no tool state, so replay the tool history.
             return _normalize_responses_items_for_chat(_convert_messages_to_responses(messages))
 
-        split = split_transient_tail(_without_tool_history(messages))
+        split = split_transient_tail(without_tool_history(messages))
         delta_persisted = split.persisted[state.history_cursor :]
         delta_messages = list(delta_persisted) + list(split.transient)
         if not delta_messages:
@@ -1875,7 +1870,7 @@ class OpenAIAgentsSDKExecutor(Executor):
                     state.started = True
                     state.resume_state = result.to_state()
                     state.history_cursor = len(
-                        split_transient_tail(_without_tool_history(messages)).persisted
+                        split_transient_tail(without_tool_history(messages)).persisted
                     )
                     yield TurnComplete(continue_turn=True)
                     return
@@ -1996,7 +1991,7 @@ class OpenAIAgentsSDKExecutor(Executor):
         if not response_text and final_text:
             yield TextChunk(text=final_text)
         state.history_cursor = (
-            len(split_transient_tail(_without_tool_history(messages)).persisted) + 1
+            len(split_transient_tail(without_tool_history(messages)).persisted) + 1
         )
         # Aggregate usage across all raw responses for this turn. The SDK
         # accumulates per-request usage on RunResult.raw_responses.

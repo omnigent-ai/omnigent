@@ -87,6 +87,7 @@ from .executor import (
     TurnComplete,
     classify_tool_result,
     describe_exception,
+    without_tool_history,
 )
 from .native_attachments import framework_notices, unresolved_attachment_marker
 from .sandbox import (
@@ -2267,6 +2268,9 @@ class ClaudeSDKExecutor(Executor):
     def handles_tools_internally(self) -> bool:
         return True
 
+    def replays_tool_history(self) -> bool:
+        return True
+
     def supports_live_message_queue(self) -> bool:
         # The SDK has no API to inject into an active turn; claiming this
         # capability caused the one-turn-behind desync described in #3472.
@@ -3581,7 +3585,8 @@ class ClaudeSDKExecutor(Executor):
             present in the latest user message.
         """
         if resume_session:
-            return ClaudeSDKExecutor._extract_trailing_user_content(messages)
+            # The live session already holds its tool items; only a fresh one replays them.
+            return ClaudeSDKExecutor._extract_trailing_user_content(without_tool_history(messages))
 
         user_messages = [msg for msg in messages if msg.get("role") == "user"]
         if len(messages) <= 1 or len(user_messages) <= 1:
