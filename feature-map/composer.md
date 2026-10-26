@@ -30,7 +30,8 @@ and steers messages while the agent is busy.
   selected sandbox and connecting.
 - `model-picker`: lists the host's live model catalog, highlights the current
   model, and keeps the selection. Long catalogs scroll inside a compact menu
-  capped at 20rem or the available viewport height, whichever is smaller.
+  capped at 40% of viewport height, between 20rem and 36rem, and never taller
+  than the available space.
   Ctrl+Shift+M opens it in both composers.
   States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model),
