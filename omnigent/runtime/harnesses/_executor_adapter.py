@@ -241,7 +241,9 @@ class ExecutorAdapter(HarnessApp):
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
         executor = self._ensure_executor()
-        messages = _translate_input_to_messages(request.input)
+        messages = _translate_input_to_messages(
+            request.input, include_tool_history=executor.replays_tool_history()
+        )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
         for message in messages:
@@ -1488,16 +1490,21 @@ def _extract_user_text(
 
 def _translate_input_to_messages(
     input_value: str | list[dict[str, Any]],
+    *,
+    include_tool_history: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
-    Accepts conversation-history shape (role-keyed messages plus tool history) and
-    single-turn fallback shape (plain string or content blocks, collapsed to one user message).
+    Accepts conversation-history shape (role-keyed messages, plus tool history when
+    *include_tool_history*) and single-turn fallback shape (plain string or content
+    blocks, collapsed to one user message).
     """
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
 
-    history_messages = _extract_role_keyed_messages(input_value)
+    history_messages = _extract_role_keyed_messages(
+        input_value, include_tool_history=include_tool_history
+    )
     if history_messages:
         return history_messages
 
@@ -1507,25 +1514,27 @@ def _translate_input_to_messages(
 
 def _extract_role_keyed_messages(
     input_value: list[dict[str, Any]],
+    *,
+    include_tool_history: bool,
 ) -> list[Message]:
-    """Extract role-keyed messages and tool history from an Omnigent input list.
+    """Extract role-keyed messages from an Omnigent input list.
 
-    ``function_call`` / ``function_call_output`` items become ``tool_call`` /
-    ``tool_result`` messages, so an executor replaying full history into a fresh
-    inner session (a fork or restart) keeps the tool context. Returns an empty
-    list for non-history inputs.
+    With *include_tool_history*, ``function_call`` / ``function_call_output`` items
+    become ``tool_call`` / ``tool_result`` messages for an executor that replays them
+    into a fresh inner session (a fork or restart). Returns an empty list for
+    non-history inputs.
     """
     messages: list[Message] = []
     for item in input_value:
         if not isinstance(item, dict):
             continue
         item_type = item.get("type")
-        if item_type == "function_call":
+        if include_tool_history and item_type == "function_call":
             tool_call = _tool_call_message(item)
             if tool_call is not None:
                 messages.append(tool_call)
             continue
-        if item_type == "function_call_output":
+        if include_tool_history and item_type == "function_call_output":
             messages.append(_tool_result_message(item))
             continue
         if item_type != "message" or "role" not in item:

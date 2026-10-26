@@ -688,6 +688,14 @@ class Executor:
         """
         return False
 
+    def replays_tool_history(self) -> bool:
+        """Whether history handed to this executor keeps recorded tool calls and outputs.
+
+        Off by default: an executor that renders history as prompt text would
+        inline every tool output on each fresh session.
+        """
+        return False
+
     def max_context_tokens(self) -> int | None:
         return None
 

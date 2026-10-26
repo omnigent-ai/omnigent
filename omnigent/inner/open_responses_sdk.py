@@ -218,16 +218,30 @@ def _recorded_call_id(message: Message) -> str | None:
     return call_id if isinstance(call_id, str) and call_id else None
 
 
+def _tool_output_text(content: object) -> str:
+    """Render a recorded tool output as Responses ``output`` text, inline base64 redacted."""
+    if content is None:
+        return ""
+    redacted = _redact_inline_base64(content)
+    return redacted if isinstance(redacted, str) else json.dumps(redacted)
+
+
 def _convert_messages_to_responses(
     messages: list[Message],
 ) -> list[ResponsesItem]:
     """Convert internal history to Responses API input items for replay/reset."""
     result: list[ResponsesItem] = []
-    # The API rejects a call without its output, so a recorded id pairs only
-    # when both halves are present; anything else falls back to adjacency.
-    call_ids = {_recorded_call_id(m) for m in messages if m.get("role") == "tool_call"}
-    result_ids = {_recorded_call_id(m) for m in messages if m.get("role") == "tool_result"}
-    paired_ids = (call_ids & result_ids) - {None}
+    # A recorded call is emitted once, with its output right behind it: live
+    # history repeats a call per status, and the API rejects a call without output.
+    outputs_by_id: dict[str, Message] = {}
+    call_ids: set[str] = set()
+    for message in messages:
+        recorded = _recorded_call_id(message)
+        if recorded is not None and message.get("role") == "tool_result":
+            outputs_by_id.setdefault(recorded, message)
+        elif recorded is not None and message.get("role") == "tool_call":
+            call_ids.add(recorded)
+    emitted_ids: set[str] = set()
 
     i = 0
     while i < len(messages):
@@ -273,7 +287,9 @@ def _convert_messages_to_responses(
                 continue
             tool_args = parsed.get("args", {})
             recorded_id = _recorded_call_id(msg)
-            if recorded_id is not None and recorded_id not in paired_ids:
+            if recorded_id is not None and (
+                recorded_id in emitted_ids or recorded_id not in outputs_by_id
+            ):
                 i += 1
                 continue
             call_id = recorded_id or f"call_{i}"
@@ -288,46 +304,37 @@ def _convert_messages_to_responses(
                 }
             )
 
-            if (
-                recorded_id is None
-                and i + 1 < len(messages)
-                and messages[i + 1].get("role") == "tool_result"
-                and _recorded_call_id(messages[i + 1]) not in paired_ids
-            ):
-                i += 1
-                raw_tool_output = messages[i].get("content")
-                if raw_tool_output is None:
-                    output_str = ""
-                elif isinstance(raw_tool_output, str):
-                    output_str = _redact_inline_base64(raw_tool_output)
-                else:
-                    output_str = json.dumps(_redact_inline_base64(raw_tool_output))
+            if recorded_id is not None:
+                emitted_ids.add(recorded_id)
                 result.append(
                     {
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": output_str,
+                        "output": _tool_output_text(outputs_by_id[recorded_id].get("content")),
+                    }
+                )
+            elif (
+                i + 1 < len(messages)
+                and messages[i + 1].get("role") == "tool_result"
+                and _recorded_call_id(messages[i + 1]) is None
+            ):
+                i += 1
+                result.append(
+                    {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": _tool_output_text(messages[i].get("content")),
                     }
                 )
 
         elif role == "tool_result":
-            redacted_content = _redact_inline_base64(content)
-            tool_output = (
-                redacted_content
-                if isinstance(redacted_content, str)
-                else json.dumps(redacted_content)
-            )
-            recorded_id = _recorded_call_id(msg)
-            if recorded_id in paired_ids:
-                result.append(
-                    {"type": "function_call_output", "call_id": recorded_id, "output": tool_output}
-                )
-            else:
+            # A recorded output already went out with its call.
+            if _recorded_call_id(msg) not in call_ids:
                 result.append(
                     {
                         "type": "message",
                         "role": "user",
-                        "content": f"[tool result] {tool_output}",
+                        "content": f"[tool result] {_tool_output_text(content)}",
                     }
                 )
 

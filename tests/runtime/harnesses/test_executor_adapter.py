@@ -1335,8 +1335,9 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
 
 def test_translate_input_to_messages_carries_tool_history() -> None:
     """
-    Tool items become ``tool_call`` / ``tool_result`` messages, so a fresh inner
-    session can replay them; a nameless call is dropped and bad arguments become ``{}``.
+    Tool items are dropped unless the executor opts in; then they become
+    ``tool_call`` / ``tool_result`` messages, a nameless call is dropped and bad
+    arguments become ``{}``.
     """
     from omnigent.runtime.harnesses._executor_adapter import (
         _translate_input_to_messages,
@@ -1365,7 +1366,8 @@ def test_translate_input_to_messages_carries_tool_history() -> None:
         },
     ]
 
-    messages = _translate_input_to_messages(input_value)
+    assert [m["role"] for m in _translate_input_to_messages(input_value)] == ["user", "assistant"]
+    messages = _translate_input_to_messages(input_value, include_tool_history=True)
 
     assert [m["role"] for m in messages] == [
         "user",

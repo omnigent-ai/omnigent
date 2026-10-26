@@ -1064,8 +1064,8 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
         _run(_t())
 
     def test_forked_session_replays_tool_history_once(self):
-        """A fresh SDK session (fork, restart) replays recorded tool items paired by
-        call id; the next turn sends only the new message, since the session holds them."""
+        """A fresh SDK session (fork, restart) replays each recorded call once with its
+        output behind it; the next turn sends only the new message."""
 
         def msg(role: str, content: object, call_id: str | None = None) -> dict[str, object]:
             message: dict[str, object] = {"role": role, "content": content, "session_id": "s1"}
@@ -1073,15 +1073,19 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
                 message["metadata"] = {"call_id": call_id}
             return message
 
+        sf_call = msg("tool_call", {"tool": "weather", "args": {"city": "SF"}}, "call_sf")
+        # Live history repeats a call per status, interleaves steering, and keeps
+        # calls interrupted before they returned.
         history = [
             msg("user", "weather in SF and NYC"),
-            msg("tool_call", {"tool": "weather", "args": {"city": "SF"}}, "call_sf"),
+            sf_call,
             msg("tool_call", {"tool": "weather", "args": {"city": "NYC"}}, "call_nyc"),
-            # Interrupted before it returned: the API rejects a call without output.
             msg("tool_call", {"tool": "weather", "args": {"city": "LA"}}, "call_la"),
+            sf_call,
+            msg("user", "metric please"),
             msg("tool_result", "SF: 61F", "call_sf"),
             msg("tool_result", "NYC: 45F", "call_nyc"),
-            msg("assistant", "SF 61, NYC 45"),
+            msg("assistant", "SF 16C, NYC 7C"),
             msg("user", "Which was warmer?"),
         ]
 
@@ -1099,16 +1103,25 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
                 _ = [e async for e in executor.run_turn(follow_up, [], "")]
 
             replayed = _FakeRunner.last_calls[0]["input"]
-            calls = [i["call_id"] for i in replayed if i.get("type") == "function_call"]
-            outputs = {
-                i["call_id"]: i["output"]
+            tool_items = [
+                (i["type"], i["call_id"], i.get("output"))
                 for i in replayed
-                if i.get("type") == "function_call_output"
-            }
-            self.assertEqual(calls, ["call_sf", "call_nyc"])
-            self.assertEqual(outputs, {"call_sf": "SF: 61F", "call_nyc": "NYC: 45F"})
+                if i.get("type") in ("function_call", "function_call_output")
+            ]
+            self.assertEqual(
+                tool_items,
+                [
+                    ("function_call", "call_sf", None),
+                    ("function_call_output", "call_sf", "SF: 61F"),
+                    ("function_call", "call_nyc", None),
+                    ("function_call_output", "call_nyc", "NYC: 45F"),
+                ],
+            )
+            # Each output directly follows its call, so steering lands after the pairs.
+            self.assertEqual(replayed[5]["content"], "metric please")
             self.assertEqual(replayed[-1]["content"], "Which was warmer?")
             self.assertEqual(_FakeRunner.last_calls[1]["input"], "second")
+            self.assertTrue(executor.replays_tool_history())
 
         _run(_t())
 
