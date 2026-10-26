@@ -185,12 +185,15 @@ def test_function_call_becomes_assistant_toolcall() -> None:
 
 def test_function_output_becomes_toolresult() -> None:
     records = pi_session_records_from_session_items(
-        [_function_output_item(call_id="call_1", output="file listing")],
+        [
+            _function_call_item(name="bash", call_id="call_1", arguments="{}"),
+            _function_output_item(call_id="call_1", output="file listing"),
+        ],
         session_id="conv_abc",
         external_session_id=_EXTERNAL_ID,
         cwd=Path("/repo"),
     )
-    msg = records[1]["message"]
+    msg = records[2]["message"]
     assert msg["role"] == "toolResult"
     assert msg["toolCallId"] == "call_1"
     assert msg["content"] == [{"type": "text", "text": "file listing"}]
@@ -472,7 +475,7 @@ def test_pairing_keeps_first_of_duplicate_results() -> None:
     assert [r["content"][0]["text"] for r in results] == ["first"]
 
 
-def test_results_do_not_move_across_user_messages() -> None:
+def test_late_results_move_before_intervening_user_messages() -> None:
     messages = _rebuilt_messages(
         [
             _call("c1"),
@@ -481,17 +484,15 @@ def test_results_do_not_move_across_user_messages() -> None:
             _output("c1"),
         ]
     )
-    assert [m["role"] for m in messages] == ["assistant", "user", "assistant", "toolResult"]
+    _assert_results_follow_calls(messages)
+    assert [m["role"] for m in messages] == ["assistant", "toolResult", "user", "assistant"]
 
 
-def test_orphan_and_missing_results_are_left_alone() -> None:
+def test_orphan_results_are_omitted_and_missing_results_are_left_alone() -> None:
     messages = _rebuilt_messages(
         [_output("orphan"), _call("missing"), _assistant_item("Done.", response_id="")]
     )
-    assert [m["role"] for m in messages] == ["toolResult", "assistant", "assistant"]
-    assert messages[0]["toolCallId"] == "orphan"
-    # No call to name it after; the orphan is replayed as-is.
-    assert messages[0]["toolName"] == ""
+    assert [m["role"] for m in messages] == ["assistant", "assistant"]
 
 
 def test_empty_text_items_are_dropped() -> None:

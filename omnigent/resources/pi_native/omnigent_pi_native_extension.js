@@ -1906,25 +1906,22 @@ module.exports = function (pi) {
     const callId = String(toolCall.id || toolCall.toolCallId || "");
     const name = String(toolCall.name || toolCall.toolName || "");
     if (!callId || !name) return;
-    const key = `${responseId}:${callId}`;
-    toolCallsById.set(callId, { key, responseId, name });
+    const known = toolCallsById.get(callId);
+    const ownerResponseId = known ? known.responseId : responseId;
+    const key = known ? known.key : `${responseId}:${callId}`;
+    toolCallsById.set(callId, { key, responseId: ownerResponseId, name, toolCall });
     if (postedToolCalls.has(key)) return;
-    postedToolCalls.add(key);
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
-        response_id: responseId,
-        item_type: "function_call",
-        item_data: {
-          agent: "Pi",
-          name,
-          arguments: safeJsonStringify(
-            toolCall.arguments ?? toolCall.input ?? {},
-          ),
-          call_id: callId,
-        },
+    await postConversationItem(config, {
+      response_id: ownerResponseId,
+      item_type: "function_call",
+      item_data: {
+        agent: "Pi",
+        name,
+        arguments: safeJsonStringify(toolCall.arguments ?? toolCall.input ?? {}),
+        call_id: callId,
       },
-    });
+    }, `tool-call:${callId}`);
+    postedToolCalls.add(key);
   }
 
   async function postToolResult(event, responseId) {
@@ -1932,20 +1929,21 @@ module.exports = function (pi) {
     const callId = String(event.toolCallId || event.id || "");
     if (!callId) return;
     const known = toolCallsById.get(callId);
-    const key = known && known.key ? known.key : `${responseId}:${callId}`;
+    const key = known ? known.key : `${responseId}:${callId}`;
     if (postedToolResults.has(key)) return;
-    postedToolResults.add(key);
-    await postEvent(config, {
-      type: "external_conversation_item",
-      data: {
-        response_id: known && known.responseId ? known.responseId : responseId,
-        item_type: "function_call_output",
-        item_data: {
-          call_id: callId,
-          output: textFromToolResult(event),
-        },
+    // A failed call POST must recover before its result is committed.
+    if (known && !postedToolCalls.has(key)) {
+      await postToolCall(known.toolCall, known.responseId);
+    }
+    await postConversationItem(config, {
+      response_id: known ? known.responseId : responseId,
+      item_type: "function_call_output",
+      item_data: {
+        call_id: callId,
+        output: textFromToolResult(event),
       },
-    });
+    }, `tool-result:${callId}`);
+    postedToolResults.add(key);
   }
 
   async function postCompletedReasoning(text, responseId, keyHint, streamed) {

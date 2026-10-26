@@ -4144,3 +4144,63 @@ const originalError = "API key auth failed for provider omnigent: " +
 """
     )
     _run_extension_script(node, _extension_path(), script)
+
+
+@pytest.mark.parametrize("item_type", ["function_call", "function_call_output"])
+@pytest.mark.parametrize("reject_first", [False, True])
+def test_tool_items_retry_with_stable_source_ids(item_type: str, reject_first: bool) -> None:
+    node = shutil.which("node")
+    if node is None:
+        pytest.skip("node is required")
+    extension_path = (
+        Path(__file__).resolve().parents[3]
+        / "omnigent/resources/pi_native/omnigent_pi_native_extension.js"
+    )
+    script = (
+        _usage_test_preamble()
+        + "const rejectFirst = "
+        + json.dumps(reject_first)
+        + ";"
+        + "const failingType = "
+        + json.dumps(item_type)
+        + ";"
+        + r"""
+(async () => {
+  const attempts = [];
+  let failOnce = true;
+  const originalFetch = global.fetch;
+  global.fetch = async (url, request) => {
+    const body = JSON.parse(request.body);
+    if (body.data?.item_type === failingType) {
+      attempts.push(body.data.source_id);
+      if (failOnce) {
+        failOnce = false;
+        if (rejectFirst) return { ok: false, status: 400 };
+        throw new Error("connection reset");
+      }
+    }
+    return originalFetch(url, request);
+  };
+  const call = { id: "retry-call", name: "bash", arguments: {} };
+  const message = { role: "assistant", content: [{ type: "toolCall", ...call }] };
+  const deliverCall = () => handlers.message_end({ message }, ctx);
+  if (rejectFirst && failingType === "function_call") {
+    await assert.rejects(deliverCall(), /HTTP 400/);
+  }
+  if (!(rejectFirst && failingType === "function_call")) await deliverCall();
+  const result = { toolCallId: call.id, content: [{ type: "text", text: "ok" }] };
+  if (rejectFirst && failingType === "function_call_output") {
+    await assert.rejects(handlers.tool_result(result, ctx), /HTTP 400/);
+  }
+  await handlers.tool_result(result, ctx);
+  await handlers.message_end({ message }, ctx);
+  await handlers.tool_result(result, ctx);
+  assert.equal(attempts.length, 2);
+  assert.ok(attempts[0]);
+  assert.equal(attempts[0], attempts[1]);
+  const items = postedEvents.filter(e => e.type === "external_conversation_item");
+  assert.deepEqual(items.map(e => e.data.item_type), ["function_call", "function_call_output"]);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    _run_extension_script(node, extension_path, script)

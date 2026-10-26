@@ -249,12 +249,12 @@ def pi_session_records_from_session_items(
 
     Items can commit out of order, so a response's text may land between a call
     and its result, or between parallel results. Every result is moved directly
-    after the message holding its call (within the same user turn), whether or
+    after the message holding its call, including across late user items, whether or
     not the items carry response ids. Otherwise Pi answers the call with a
     synthetic result and strands the real one after the next message, which
     Anthropic rejects with ``unexpected tool_use_id``. Late text stays after the
     results: a shared ``response_id`` does not prove it preceded them. Missing
-    and orphan results are left unchanged.
+    results are left unchanged; orphan results are omitted.
 
     :param items: Flat Omnigent item dicts in chronological order, e.g.
         ``{"type": "message", "role": "user", "content": [...]}``.
@@ -360,8 +360,8 @@ def pi_session_records_from_session_items(
 def _pair_pi_tool_results(entries: list[_JsonObject]) -> list[_JsonObject]:
     """Move each tool result directly after the assistant entry holding its call.
 
-    Only results of calls earlier in the same user turn move, in their original
-    relative order. Orphan results stay where they are.
+    Only results of earlier calls move, in their original
+    relative order. Results without an earlier matching call are omitted.
 
     :param entries: Pi message entries in chronological order (no header).
     :returns: The same entries, reordered.
@@ -372,9 +372,7 @@ def _pair_pi_tool_results(entries: list[_JsonObject]) -> list[_JsonObject]:
     for index, entry in enumerate(entries):
         message = cast(_JsonObject, entry["message"])
         role = message["role"]
-        if role == "user":
-            owners.clear()
-        elif role == "assistant":
+        if role == "assistant":
             for block in cast(list[_JsonObject], message["content"]):
                 if block.get("type") == "toolCall":
                     owners[cast(str, block["id"])] = index
@@ -382,6 +380,9 @@ def _pair_pi_tool_results(entries: list[_JsonObject]) -> list[_JsonObject]:
             owner = owners.pop(cast(str, message["toolCallId"]), None)
             if owner is not None:
                 results.setdefault(owner, []).append(entry)
+                moved.add(index)
+            else:
+                # An omitted/interrupted call cannot own a replayed tool result.
                 moved.add(index)
     paired: list[_JsonObject] = []
     for index, entry in enumerate(entries):
