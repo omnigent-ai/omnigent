@@ -883,9 +883,9 @@ async function postEventChecked(config, body, signal) {
   return response;
 }
 
-async function postEvent(config, body) {
+async function postEvent(config, body, signal) {
   try {
-    await postEventChecked(config, body);
+    await postEventChecked(config, body, signal);
   } catch (_err) {
     // Keep Pi responsive even if Omnigent is temporarily unavailable.
   }
@@ -906,12 +906,8 @@ function assistantItemPostTimeoutMs(config) {
     : _ASSISTANT_ITEM_POST_TIMEOUT_MS;
 }
 
-// Persisted history survives transient failures with a stable deduplication key.
-async function postConversationItem(config, data, sourceId, signal) {
-  const body = {
-    type: "external_conversation_item",
-    data: { ...data, source_id: boundedSourceId(sourceId) },
-  };
+// History and completion delivery share bounded retries.
+async function postEventWithRetry(config, body, signal) {
   let backoff = _ASSISTANT_ITEM_INITIAL_BACKOFF_MS;
   let lastError;
   const deadline = Date.now() + _ASSISTANT_ITEM_RETRY_BUDGET_MS;
@@ -962,7 +958,10 @@ function createHistoryQueue(config) {
 
   async function deliver(item) {
     if (item.accepted) return;
-    await postConversationItem(config, item.data, item.sourceId, controller.signal);
+    await postEventWithRetry(config, {
+      type: "external_conversation_item",
+      data: { ...item.data, source_id: boundedSourceId(item.sourceId) },
+    }, controller.signal);
     item.accepted = true;
     item.onAccepted?.();
   }
@@ -1026,6 +1025,22 @@ function createHistoryQueue(config) {
       queuedBytes += bytes;
       if (!worker) start();
       return item;
+    },
+    async flush() {
+      let timeout;
+      try {
+        return await Promise.race([
+          (async () => {
+            while (worker) await worker;
+            return true;
+          })(),
+          new Promise(resolve => {
+            timeout = setTimeout(() => resolve(false), _ASSISTANT_ITEM_RETRY_BUDGET_MS);
+          }),
+        ]);
+      } finally {
+        clearTimeout(timeout);
+      }
     },
     async close() {
       closed = true;
@@ -1562,6 +1577,7 @@ module.exports = function (pi) {
   // Response id shared across a turn's ``running`` → ``idle`` status pair.
   // Kept separate from activeResponseId, which turn_start overwrites.
   let turnStatusResponseId = null;
+  let turnResult = null;
   // Dedicated loop-state flag, set on agent_start / cleared on agent_end. Used
   // as the no-isIdle() fallback for requestInterrupt instead of
   // !activeResponseId: agent_start resets activeResponseId to null and only
@@ -2229,8 +2245,8 @@ module.exports = function (pi) {
         } finally {
           if (!agentRunning) {
             await postEvent(config, {
-              type: "external_session_status",
-              data: { status: "idle", response_id: responseId },
+              type: "subagent.status",
+              data: { idle: true, response_id: responseId },
             });
           }
           compacting = false;
@@ -2313,6 +2329,7 @@ module.exports = function (pi) {
     // completes. See F18.
     clearPendingInterrupt();
     agentRunning = true;
+    turnResult = null;
     setOmnigentStatus(config, ctx, "running");
     activeResponseId = null;
     turnOrdinal = 0;
@@ -2360,12 +2377,36 @@ module.exports = function (pi) {
     const endResponseId =
       turnStatusResponseId ?? `pi-${Date.now()}-${++sequence}`;
     turnStatusResponseId = null;
-    // Manual compact aborts the turn first; its own completion publishes idle.
+    // Compaction interrupts a loop without completing its delegated task.
     if (compacting) return;
+    const result = turnResult;
+    const outcome = result?.outcome ?? "failed";
+    // Readiness is not a completed result. Older servers may ignore this observation.
     await postEvent(config, {
-      type: "external_session_status",
-      data: { status: "idle", response_id: endResponseId },
-    });
+      type: "subagent.status",
+      data: { idle: true, response_id: endResponseId },
+    }, AbortSignal.timeout(assistantItemPostTimeoutMs(config)));
+    const drained = await history.flush();
+    const deliveryFailed = !drained || (Boolean(result?.output) && !result.item?.accepted);
+    const status = deliveryFailed || outcome === "failed" ? "failed" : "idle";
+    const output = deliveryFailed
+      ? "Omnigent could not save the Pi turn output; see host logs."
+      : (result?.output ?? "Pi turn ended without a final response.");
+    try {
+      await postEventWithRetry(config, {
+        type: "external_session_status",
+        data: {
+          status, response_id: endResponseId,
+          turn_completed: !deliveryFailed && outcome === "completed",
+          turn_outcome: deliveryFailed ? "failed" : outcome,
+          output,
+          ...(status === "failed" ? { failure_detail: output } : {}),
+        },
+      });
+    } catch (error) {
+      console.error("[pi-native] Failed to deliver turn outcome:", error);
+      ctx?.ui?.notify?.("Omnigent could not deliver the Pi turn outcome; see host logs.", "error");
+    }
   });
 
   pi.on("turn_start", async (event, ctx) => {
@@ -2542,7 +2583,7 @@ module.exports = function (pi) {
         ? message.errorMessage
         : "";
     if (stopReason === "error" && errorMessage) {
-      history.enqueue(
+      const item = history.enqueue(
         {
           response_id: responseId,
           item_type: "error",
@@ -2554,16 +2595,22 @@ module.exports = function (pi) {
         },
         assistantMessageSourceId(message, responseId, errorMessage),
       );
+      turnResult = { item, outcome: "failed", output: `Pi model error: ${errorMessage}` };
       return;
     }
     const text = textFromMessage(message);
-    if (!text) return;
+    const outcome = stopReason === "aborted" ? "cancelled"
+      : stopReason === "toolUse" || stopReason === "error" ? "failed" : "completed";
+    if (!text) {
+      turnResult = { outcome, output: "", item: null };
+      return;
+    }
     const sourceId = assistantMessageSourceId(message, responseId, text);
     if (postedAssistantMessages.has(sourceId)) return;
     // The authoritative assistant item. The web UI retires + replaces the
     // oldest in-flight live preview in place with this (FIFO; one preview
     // per message), so the streamed partials never duplicate the final.
-    history.enqueue(
+    const item = history.enqueue(
       {
         response_id: responseId,
         item_type: "message",
@@ -2581,6 +2628,7 @@ module.exports = function (pi) {
         ),
       },
     );
+    turnResult = { item, outcome, output: item ? text : "History delivery rejected" };
   });
 
   pi.on("turn_end", async (event, ctx) => {

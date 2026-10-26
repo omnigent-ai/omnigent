@@ -792,25 +792,22 @@ Cross-harness journeys:
   derived skill/MCP plugin listing still works; a 502 shows an inventory error.
   Codex and Cursor keep their existing derived listings.
 
-**Pi persisted history:** for `chat-render` and `tool-history`, send a prompt
-from the native terminal and complete a tool turn, then reload Chat. Each prompt,
-call, result and final answer should appear once. Extension regressions in
-`tests/harnesses/pi_native/test_pi_native_extension.py` cover bounded retry,
-stable item identity, later-item delivery and policy evaluation after failure; server
-idempotency is covered by
-`tests/server/integration/test_sessions_external_item_idempotency.py`.
-History delivery runs in an ordered background queue: Pi's input/tool/message
-hooks do not await its retries. Retry delays are 1, 2, 4 and 8 seconds, with five
-attempts and a 30-second per-item budget. Verify policy ALLOW/DENY still runs
-while a history POST is stalled. After a call exhausts retries, its result must
-re-send and acknowledge that call first; otherwise withhold/log the result.
-Repeated callbacks coalesce while pending; accepted items are suppressed.
-The queue and retained call cache each cap at 256 items / 16 MiB; overflow is
-logged. Shutdown drains for at most five seconds, then aborts outstanding writes.
-This is memory-only delivery, not recovery after a process crash. Final-answer
-persistence failures notify the terminal user. Deduplication requires a server
-that supports `source_id`; streaming chunks are not replayed. Component checks
-do not establish desktop rendering parity.
+**Pi persisted history:** for `chat-render` and `tool-history`, complete a
+prompt and tool turn, then reload Chat: each persisted item appears once.
+Stall a history POST and confirm policy ALLOW/DENY still runs. A result must
+wait for its call to be accepted. Retries retain item IDs; repeated tool/message
+callbacks coalesce, while a repeated input callback is a separate prompt.
+For a Pi child, stall final-answer delivery: idle may update, but the parent
+must receive no completion until the answer is saved. Exhaust delivery and
+expect a failed result instead of an old answer. Compaction ending is only an
+idle observation, not task completion. Queue bounds, retry budgets and shutdown
+limits live in `createHistoryQueue`; delivery is memory-only. Older servers
+may omit the status-only observation and lack `source_id` deduplication.
+`tests/harnesses/pi_native/test_pi_native_extension.py` covers extension behavior;
+`tests/server/routes/test_subagent_status.py` covers status-only forwarding;
+`tests/server/routes/test_native_failure_output.py` covers result selection;
+`tests/server/integration/test_sessions_external_item_idempotency.py` covers
+persistence deduplication. These checks do not establish desktop rendering parity.
 
 **Pi rebuilt history:** converter pairing/name cases in
 `tests/harnesses/pi_native/test_pi_native_resume.py` cover matching, reordered

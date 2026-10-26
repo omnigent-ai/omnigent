@@ -1363,6 +1363,70 @@ def test_history_outage_does_not_delay_hooks_and_coalesces_callbacks(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
+@pytest.mark.parametrize(
+    "mode", ["saved", "rejected", "deadline", "aborted", "model-error", "empty", "no-response"]
+)
+def test_turn_outcome_waits_for_history_but_idle_does_not(tmp_path: Path, mode: str) -> None:
+    script = (
+        _ASSISTANT_DURABILITY_HARNESS
+        + r"""
+(async () => {
+  const mode = process.argv[3];
+  let release;
+  let completionAttempts = 0;
+  global.setTimeout = (callback, delay, ...args) =>
+    originalSetTimeout(callback, delay === 30000 ? 50 : delay, ...args);
+  global.fetch = async (_url, request) => {
+    const body = JSON.parse(request.body);
+    posted.push(body);
+    if (body.type === 'external_conversation_item') {
+      await new Promise(resolve => { release = resolve; });
+      return {ok: mode !== 'rejected', status: mode === 'rejected' ? 400 : 204};
+    }
+    if (body.type === 'external_session_status' && body.data.status !== 'running') {
+      completionAttempts++;
+    }
+    return {ok: true, status: 204};
+  };
+  await handlers.agent_start({}, ctx);
+  if (mode !== 'no-response') {
+    await handlers.message_end({message: {role: 'assistant', timestamp: 20,
+      stopReason: mode === 'aborted' ? 'aborted' : mode === 'model-error' ? 'error' : 'stop',
+      errorMessage: mode === 'model-error' ? 'Provider refused this turn' : undefined,
+      content: mode === 'empty' ? [] : [{type: 'text', text: 'current result'}],
+    }}, ctx);
+  }
+  const finished = handlers.agent_end({}, ctx);
+  await settleHistory();
+  if (!['empty', 'no-response'].includes(mode)) assert.equal(completionAttempts, 0);
+  assert.ok(posted.some(e => e.type === 'subagent.status' && e.data.idle === true));
+  if (mode === 'deadline') {
+    await finished;
+    release();
+  } else {
+    release?.();
+    await finished;
+  }
+  const terminal = posted.filter(e => e.type === 'external_session_status').at(-1).data;
+  const failed = ['rejected', 'deadline', 'model-error', 'no-response'].includes(mode);
+  assert.equal(terminal.status, failed ? 'failed' : 'idle');
+  assert.equal(terminal.turn_completed, !failed && mode !== 'aborted');
+  const expectedOutcome = failed ? 'failed' : mode === 'aborted' ? 'cancelled' : 'completed';
+  assert.equal(terminal.turn_outcome, expectedOutcome);
+  assert.equal(terminal.output, mode === 'empty' ? '' : mode === 'no-response'
+    ? 'Pi turn ended without a final response.' : mode === 'model-error'
+    ? 'Pi model error: Provider refused this turn' : failed
+    ? 'Omnigent could not save the Pi turn output; see host logs.' : 'current result');
+  if (failed) assert.equal(terminal.failure_detail, terminal.output);
+  assert.equal(completionAttempts, 1);
+  await handlers.session_shutdown();
+})().catch(error => { process.stderr.write(String(error)); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()), str(tmp_path), mode)
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
 @pytest.mark.parametrize("recover", [True, False])
 def test_result_retries_its_failed_call_before_delivery(tmp_path: Path, recover: bool) -> None:
     script = (
@@ -4349,7 +4413,7 @@ global.fetch = async (_url, request) => {
   if (request.body) {
     const event = JSON.parse(request.body);
     posted.push(event);
-    if (outcome === "complete" && event.data?.status === "idle") await idlePosted;
+    if (outcome === "complete" && event.type === "subagent.status") await idlePosted;
   }
   return { ok: true };
 };
@@ -4396,7 +4460,14 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
     assert.equal(statuses().at(-1).data.status, "running");
     await handlers.agent_end({}, ctx);
   }
-  assert.equal(statuses().at(-1).data.status, "idle");
+  if (outcome === "complete" || outcome === "error") {
+    assert.equal(statuses().at(-1).data.status, "running", "compaction is not task completion");
+    const idleObservations = posted.filter(e => e.type === "subagent.status" && e.data.idle === true);
+    assert.equal(idleObservations.length, 1);
+  } else {
+    assert.equal(statuses().at(-1).data.status, "failed");
+    assert.equal(statuses().at(-1).data.turn_completed, false);
+  }
   if (outcome === "complete") {
     await drain();
     assert.deepEqual(sends, [], "do not start a turn before idle is published");
