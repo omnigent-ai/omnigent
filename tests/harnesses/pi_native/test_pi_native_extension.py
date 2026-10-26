@@ -4462,7 +4462,9 @@ const statuses = () => posted.filter(e => e.type === "external_session_status");
   }
   if (outcome === "complete" || outcome === "error") {
     assert.equal(statuses().at(-1).data.status, "running", "compaction is not task completion");
-    const idleObservations = posted.filter(e => e.type === "subagent.status" && e.data.idle === true);
+    const idleObservations = posted.filter(
+      e => e.type === "subagent.status" && e.data.idle === true,
+    );
     assert.equal(idleObservations.length, 1);
   } else {
     assert.equal(statuses().at(-1).data.status, "failed");
