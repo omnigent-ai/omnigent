@@ -53,6 +53,7 @@ from .executor import (
     classify_tool_result,
     describe_exception,
     split_transient_tail,
+    without_tool_history,
 )
 from .open_responses_sdk import (
     _OPENAI_KEY_PLACEHOLDER,
@@ -1262,6 +1263,9 @@ class OpenAIAgentsSDKExecutor(Executor):
     def handles_tools_internally(self) -> bool:
         return True
 
+    def replays_tool_history(self) -> bool:
+        return True
+
     def supports_stepwise_internal_turns(self) -> bool:
         return True
 
@@ -1412,7 +1416,11 @@ class OpenAIAgentsSDKExecutor(Executor):
             await self._rewind_sdk_session(state, state.rollback_to_item_count)
             state.rollback_to_item_count = None
 
-        if state.started and len(split_transient_tail(messages).persisted) < state.history_cursor:
+        cursor_view = without_tool_history(messages)
+        if (
+            state.started
+            and len(split_transient_tail(cursor_view).persisted) < state.history_cursor
+        ):
             await self._rewind_sdk_session(state, 0)
             state.started = False
             state.resume_state = None
@@ -1437,9 +1445,10 @@ class OpenAIAgentsSDKExecutor(Executor):
             state.resume_state = None
 
         if not state.started:
+            # A fresh SDK session (fork, restart) has no tool state, so replay the tool history.
             return _normalize_responses_items_for_chat(_convert_messages_to_responses(messages))
 
-        split = split_transient_tail(messages)
+        split = split_transient_tail(without_tool_history(messages))
         delta_persisted = split.persisted[state.history_cursor :]
         delta_messages = list(delta_persisted) + list(split.transient)
         if not delta_messages:
@@ -1860,7 +1869,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if stepwise_internal_turns and saw_tool_activity and result is not None:
                     state.started = True
                     state.resume_state = result.to_state()
-                    state.history_cursor = len(split_transient_tail(messages).persisted)
+                    state.history_cursor = len(
+                        split_transient_tail(without_tool_history(messages)).persisted
+                    )
                     yield TurnComplete(continue_turn=True)
                     return
                 logger.error("OpenAIAgentsSDKExecutor: max turns exceeded")
@@ -1979,7 +1990,9 @@ class OpenAIAgentsSDKExecutor(Executor):
 
         if not response_text and final_text:
             yield TextChunk(text=final_text)
-        state.history_cursor = len(split_transient_tail(messages).persisted) + 1
+        state.history_cursor = (
+            len(split_transient_tail(without_tool_history(messages)).persisted) + 1
+        )
         # Aggregate usage across all raw responses for this turn. The SDK
         # accumulates per-request usage on RunResult.raw_responses.
         #

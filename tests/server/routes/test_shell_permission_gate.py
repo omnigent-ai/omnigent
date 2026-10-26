@@ -995,6 +995,7 @@ _MERGE_PATH = "/v1/sessions/conv_share/resources/github/merge"
 _MERGE_OPTIONS_PATH = "/v1/sessions/conv_share/resources/github/merge-options"
 _DISABLE_AUTO_MERGE_PATH = "/v1/sessions/conv_share/resources/github/disable-auto-merge"
 _MERGE_BODY = {"pr_url": _LABELS_PR_URL, "merge_method": "squash", "expected_head": "a" * 40}
+_COMMENTS_PATH = "/v1/sessions/conv_share/resources/github/comments"
 _DETAILS_PATH = "/v1/sessions/conv_share/resources/github/details"
 _ATTACHMENTS_PATH = "/v1/sessions/conv_share/resources/github/attachments"
 
@@ -1042,22 +1043,26 @@ async def test_pr_merge_routes_require_edit(
     [("owner@example.com", 200), ("viewer@example.com", 403)],
     ids=["edit-allowed", "read-denied"],
 )
+@pytest.mark.parametrize("comment", [False, True], ids=["details", "comment"])
 async def test_pr_details_route_requires_edit(
     client: httpx.AsyncClient,
     runner_client: _RecordingRunnerClient,
     caller: str,
     expected: int,
+    comment: bool,
 ) -> None:
-    """Editing the title or description acts as the host's account, so viewers are refused."""
+    """Writing PR text acts as the host's account, so viewers are refused."""
+    path = _COMMENTS_PATH if comment else _DETAILS_PATH
+    fields = {"body": "Hello"} if comment else {"title": "Renamed"}
     edited = await client.post(
-        _DETAILS_PATH,
-        json={"pr_url": _LABELS_PR_URL, "title": "Renamed", "session_id": "untrusted"},
+        path,
+        json={"pr_url": _LABELS_PR_URL, **fields, "session_id": "untrusted"},
         headers={"X-Forwarded-Email": caller},
     )
 
     assert edited.status_code == expected, edited.text
     expected_posts = [
-        (_DETAILS_PATH, {"pr_url": _LABELS_PR_URL, "title": "Renamed", "body": None})
+        (path, {"pr_url": _LABELS_PR_URL, **({"body": None} if not comment else {}), **fields})
     ]
     assert runner_client.posts == ([] if expected == 403 else expected_posts)
 
@@ -1085,10 +1090,11 @@ async def test_pr_attachment_upload_refuses_viewers_before_the_runner(
         (_LABELS_PATH, {"pr_url": _LABELS_PR_URL, "add": ["bug"]}),
         (_REVIEWERS_PATH, {"pr_url": _LABELS_PR_URL, "add": [_REVIEWER]}),
         (_DETAILS_PATH, {"pr_url": _LABELS_PR_URL, "title": "Renamed"}),
+        (_COMMENTS_PATH, {"pr_url": _LABELS_PR_URL, "body": "Hello"}),
         (_MERGE_PATH, _MERGE_BODY),
         (_DISABLE_AUTO_MERGE_PATH, {"pr_url": _LABELS_PR_URL}),
     ],
-    ids=["labels", "reviewers", "details", "merge", "disable-auto-merge"],
+    ids=["labels", "reviewers", "details", "comments", "merge", "disable-auto-merge"],
 )
 async def test_pr_edit_requires_a_json_body(
     client: httpx.AsyncClient,

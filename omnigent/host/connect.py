@@ -3870,6 +3870,13 @@ class HostProcess:
                 add=params.get("add", []),
                 remove=params.get("remove", []),
             )
+        if op == "github_comment_create":
+            return pr_resource.create_pr_comment(
+                workspace,
+                session_id=cast("str | None", params.get("session_id")),
+                pr_url=cast("str | None", params.get("pr_url")),
+                body=params.get("body"),
+            )
         if op == "github_details_update":
             return pr_resource.update_pr_details(
                 workspace,

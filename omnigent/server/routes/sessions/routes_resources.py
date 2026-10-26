@@ -1011,6 +1011,7 @@ def register_resources_routes(
         op: str,
         host_params: dict[str, Any],
         timeout: float | None = None,
+        uncertain_failure_detail: str | None = None,
     ) -> dict[str, Any] | None:
         """Serve a workspace-mutating op over the session's host tunnel.
 
@@ -1020,10 +1021,12 @@ def register_resources_routes(
         :param op: Host-side write op — ``"github_set_preference"``,
             ``"github_prs_update"``, ``"github_labels_update"``,
             ``"github_reviewers_update"``, ``"github_details_update"``,
-            ``"github_attachment_upload"``, ``"github_merge"``, or
+            ``"github_comment_create"``, ``"github_attachment_upload"``, ``"github_merge"``, or
             ``"github_disable_auto_merge"``.
         :param host_params: Op-specific args for the host writer.
         :param timeout: Seconds to wait for the host; the tunnel's default when ``None``.
+        :param uncertain_failure_detail: Report a dispatched write's unavailable result
+            as 502 with this detail instead of treating it as an offline host.
         :returns: The refreshed payload, or ``None`` when no host is bound /
             connected / reachable (caller re-raises the runner-offline error).
         :raises HTTPException: On host-reported failures, reproducing the runner's
@@ -1052,7 +1055,9 @@ def register_resources_routes(
                 params=host_params,
                 **({"timeout": timeout} if timeout is not None else {}),
             )
-        except HostFsUnavailableError:
+        except HostFsUnavailableError as exc:
+            if uncertain_failure_detail is not None:
+                raise HTTPException(status_code=502, detail=uncertain_failure_detail) from exc
             return None
         except HostFsError as exc:
             if exc.status == 400:
@@ -1067,11 +1072,13 @@ def register_resources_routes(
         host_op: str,
         params: dict[str, Any],
         failure_detail: str,
+        non_idempotent: bool = False,
     ) -> dict[str, Any]:
         """POST a PR edit to the runner, or to the host tunnel when the runner is offline.
 
         :param host_op: Host-side write op, e.g. ``"github_merge"``.
         :param failure_detail: Error detail when the runner's refusal carries none.
+        :param non_idempotent: Preserve uncertainty when the host loses a write result.
         :returns: The runner's or host's result.
         :raises HTTPException: With the runner's status and ``detail`` when it refuses.
         """
@@ -1083,7 +1090,11 @@ def register_resources_routes(
             if exc.code != ErrorCode.RUNNER_UNAVAILABLE:
                 raise
             payload = await _write_workspace_via_host(
-                session_id, conv, op=host_op, host_params=params
+                session_id,
+                conv,
+                op=host_op,
+                host_params=params,
+                uncertain_failure_detail=failure_detail if non_idempotent else None,
             )
             if payload is None:
                 raise
@@ -3527,6 +3538,27 @@ def register_resources_routes(
                 "remove": body.get("remove", []),
             },
             failure_detail="Cannot update reviewers",
+        )
+
+    @router.post(
+        "/sessions/{session_id}/resources/github/comments",
+        response_model=None,
+        dependencies=[Depends(require_json_content_type)],
+    )
+    async def create_session_github_comment(request: Request, session_id: str) -> dict[str, Any]:
+        """Post a top-level comment using the host's selected GitHub account."""
+        conv = await _validate_session(session_id, request, LEVEL_EDIT)
+        body = await request.json()
+        if not isinstance(body, dict) or not isinstance(body.get("pr_url"), str):
+            raise HTTPException(status_code=400, detail="Expected a pull request URL")
+        return await _post_pr_edit(
+            session_id,
+            conv,
+            runner_path=f"/v1/sessions/{session_id}/resources/github/comments",
+            host_op="github_comment_create",
+            non_idempotent=True,
+            params={"pr_url": body["pr_url"], "body": body.get("body")},
+            failure_detail="Could not confirm comment posting. Check GitHub before retrying.",
         )
 
     @router.post(

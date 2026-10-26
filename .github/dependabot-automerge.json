@@ -15,6 +15,20 @@
     ],
     "zero_minor": [
       "*"
+    ],
+    "beta": [
+      "opentelemetry-distro",
+      "opentelemetry-exporter-http-transport",
+      "opentelemetry-exporter-otlp-common",
+      "opentelemetry-instrumentation",
+      "opentelemetry-instrumentation-aiohttp-client",
+      "opentelemetry-instrumentation-asgi",
+      "opentelemetry-instrumentation-fastapi",
+      "opentelemetry-instrumentation-httpx",
+      "opentelemetry-instrumentation-sqlalchemy",
+      "opentelemetry-semantic-conventions",
+      "opentelemetry-util-genai",
+      "opentelemetry-util-http"
     ]
   },
   "npm": {
@@ -28,14 +42,74 @@
       "@cursor/*",
       "electron",
       "@electron/*",
+      "electron-builder*",
+      "electron-updater",
+      "electron-winstaller",
+      "electron-publish",
+      "dmg-builder",
+      "app-builder-*",
+      "builder-util*",
+      "@vscode/vsce*",
+      "wrangler",
       "@capacitor/*",
       "react-native",
       "react-pdf",
-      "pdfjs-dist"
+      "pdfjs-dist",
+      "katex",
+      "shiki",
+      "@shikijs/*",
+      "vite",
+      "tailwindcss",
+      "@tailwindcss/vite",
+      "@tailwindcss/node",
+      "@tailwindcss/postcss"
     ],
     "zero_minor": [
       "*"
-    ]
+    ],
+    "consumers": {
+      "web": [],
+      "web/electron": [
+        {
+          "workflow": "web-tests.yml",
+          "job": "web test",
+          "step": "Test and build workspace consumers"
+        }
+      ],
+      "editors/vscode": [
+        {
+          "workflow": "web-tests.yml",
+          "job": "web test",
+          "step": "Test and build workspace consumers"
+        }
+      ],
+      "sdks/web-extension": [
+        {
+          "workflow": "web-tests.yml",
+          "job": "web test",
+          "step": "Test and build workspace consumers"
+        }
+      ],
+      "examples/extensions/hello-page/web": [
+        {
+          "workflow": "web-tests.yml",
+          "job": "web test",
+          "step": "Test and build workspace consumers"
+        }
+      ],
+      "deploy/cloudflare": [
+        {
+          "workflow": "docker-build.yml",
+          "job": "Docker build",
+          "step": "Cloudflare Worker and container dry-run"
+        },
+        {
+          "workflow": "docker-build.yml",
+          "job": "Docker build",
+          "step": "Build and smoke-test the Cloudflare image"
+        }
+      ]
+    }
   },
   "actions": {
     "default": "minor",
@@ -45,7 +119,15 @@
       "release-drafter/release-drafter",
       "googleapis/release-please-action",
       "actions/attest*",
-      "actions/create-github-app-token"
+      "actions/create-github-app-token",
+      "docker/login-action",
+      "docker/build-push-action",
+      "aws-actions/configure-aws-credentials"
+    ],
+    "shared_evidence": [
+      "actions/checkout",
+      "actions/download-artifact",
+      "docker/setup-buildx-action"
     ],
     "zero_minor": [
       "*"
@@ -64,7 +146,8 @@
     ".github/actions/setup-uv/action.yml": "ci.yml",
     ".github/workflows/docker-build.yml": "docker-build.yml",
     ".github/workflows/trivy.yml": "trivy.yml",
-    ".github/workflows/windows.yml": "windows.yml"
+    ".github/workflows/windows.yml": "windows.yml",
+    ".github/workflows/android-bundle.yml": "android-bundle.yml"
   },
   "pre_commit": [
     "https://github.com/pre-commit/pre-commit-hooks"
@@ -165,6 +248,9 @@
     "docker-build.yml": [
       "Docker build",
       "Docker result"
+    ],
+    "android-bundle.yml": [
+      "Build unsigned AAB"
     ]
   }
 }

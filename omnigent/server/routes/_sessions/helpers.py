@@ -13,6 +13,7 @@ import json
 import math
 import re
 import secrets
+import threading
 import time
 import urllib.parse
 import weakref
@@ -1597,6 +1598,11 @@ def _ancestor_session_ids(
     return ancestors
 
 
+# Ancestor mirrors run on worker threads and can finish out of order; this
+# keeps a late mirror from overwriting a newer state of the same card.
+_ancestor_elicitation_mirror_lock = threading.Lock()
+
+
 def _publish_elicitation_request_to_ancestors(
     conv_store: ConversationStore,
     session_id: str,
@@ -1608,11 +1614,24 @@ def _publish_elicitation_request_to_ancestors(
     :param conv_store: Store used to discover ancestor sessions.
     :param session_id: Child session that owns the elicitation,
         e.g. ``"conv_child123"``.
-    :param event: Original ``response.elicitation_request`` event.
+    :param event: Event whose ``elicitation_id`` selects the child's current
+        entry; mirrored as-is only when it has no id.
     """
-    mirrored = _targeted_elicitation_event(event, target_session_id=session_id)
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        session_stream.publish(ancestor_id, mirrored)
+    ancestor_ids = _ancestor_session_ids(conv_store, session_id)
+    if not ancestor_ids:
+        return
+    elicitation_id = event.get("elicitation_id")
+    with _ancestor_elicitation_mirror_lock:
+        if isinstance(elicitation_id, str) and elicitation_id:
+            # Mirror the child's current entry: a newer delivery state or a
+            # resolution may have landed while this mirror waited for a thread.
+            current = pending_elicitations.lookup(elicitation_id, conversation_id=session_id)
+            if current is None:
+                return
+            event = current[1]
+        mirrored = _targeted_elicitation_event(event, target_session_id=session_id)
+        for ancestor_id in ancestor_ids:
+            session_stream.publish(ancestor_id, mirrored)
 
 
 def _publish_elicitation_resolved_to_ancestors(
@@ -1635,8 +1654,14 @@ def _publish_elicitation_resolved_to_ancestors(
     :param reason: Optional no-verdict reason carried through to the
         mirrors; see :func:`_publish_elicitation_resolved`.
     """
-    for ancestor_id in _ancestor_session_ids(conv_store, session_id):
-        _publish_elicitation_resolved(ancestor_id, elicitation_id, action=action, reason=reason)
+    ancestor_ids = _ancestor_session_ids(conv_store, session_id)
+    with _ancestor_elicitation_mirror_lock:
+        if pending_elicitations.lookup(elicitation_id, conversation_id=session_id) is not None:
+            return  # The child re-asked under this id; its request mirror owns the card.
+        for ancestor_id in ancestor_ids:
+            _publish_elicitation_resolved(
+                ancestor_id, elicitation_id, action=action, reason=reason
+            )
 
 
 @restart_on_stale_cursor
