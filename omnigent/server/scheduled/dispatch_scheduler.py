@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 from collections.abc import Awaitable, Callable
@@ -45,11 +46,20 @@ def _run_event(event_name: str, run: ScheduledTaskRun, **attributes: object) -> 
     )
 
 
+def _log_safely(log: Callable[[], None]) -> None:
+    """Run a deferred event log; a logging failure must never change scheduling."""
+    try:
+        log()
+    except Exception:
+        with contextlib.suppress(Exception):
+            _logger.exception("Could not log a scheduler event")
+
+
 def _log_recovery_result(
     run: ScheduledTaskRun, status: str, transition: asyncio.Future[ScheduledTaskRun | None]
 ) -> None:
     if transition.cancelled() or transition.exception() is not None:
-        # Failures are logged by the sweep, or by _log_late_recovery_failure after a timeout.
+        # The sweep logs failures it awaits; _log_late_recovery_failure covers the rest.
         return
     # None means the run was no longer the expired startup recovery inspected.
     outcome = status if transition.result() is not None else "superseded"
@@ -77,7 +87,7 @@ def _log_late_recovery_failure(
 
 def _seconds(value: float) -> float:
     # Clock skew between replicas must not produce a negative delay.
-    return round(max(0.0, value), 3)
+    return round(max(0.0, float(value)), 3)
 
 
 class StartupLeaseLost(RuntimeError):
@@ -115,12 +125,12 @@ class StartupLease:
 
     async def attach_session(self, conversation_id: str) -> None:
         """Persist the session before dispatch so crash recovery can inspect it."""
-        first_session = self.run.conversation_id is None
         # Measured at the call, so database time is not counted as fire delay.
         recorded_at = self._now()
 
-        def log_session() -> None:
-            if first_session:
+        def log_session(previous: ScheduledTaskRun) -> None:
+            # Checked under the lease lock, so concurrent calls log one session.
+            if previous.conversation_id is None:
                 _logger.info(
                     "Recorded session %s for scheduled run %s",
                     conversation_id,
@@ -153,7 +163,7 @@ class StartupLease:
 
         finished_at = self._now()
 
-        def log_outcome() -> None:
+        def log_outcome(_previous: ScheduledTaskRun) -> None:
             _logger.info(
                 "Scheduled run %s startup ended with status %s",
                 self.run.id,
@@ -178,14 +188,14 @@ class StartupLease:
             committed=log_outcome,
         )
 
-    def when_writes_settle(self, callback: Callable[[], None]) -> None:
+    def _when_writes_settle(self, callback: Callable[[], None]) -> None:
         """Run *callback* once in-flight lease writes finish, or now if there are none."""
         pending = list(self._writes)
         if not pending:
-            callback()
+            _log_safely(callback)
             return
         settled = asyncio.gather(*pending, return_exceptions=True)
-        settled.add_done_callback(lambda _: callback())
+        settled.add_done_callback(lambda _: _log_safely(callback))
 
     async def _transition(
         self,
@@ -194,7 +204,7 @@ class StartupLease:
         conversation_id: str | None = None,
         error: str | None = None,
         error_code: str | None = None,
-        committed: Callable[[], None] | None = None,
+        committed: Callable[[ScheduledTaskRun], None] | None = None,
     ) -> None:
         await self._write(
             lambda: self._store.transition_starting_run(
@@ -213,10 +223,11 @@ class StartupLease:
         operation: Callable[[], ScheduledTaskRun | None],
         *,
         renewing: bool = False,
-        committed: Callable[[], None] | None = None,
+        committed: Callable[[ScheduledTaskRun], None] | None = None,
     ) -> None:
         async def apply() -> None:
             try:
+                previous = self.run
                 with workspace_scope(self.run.workspace_id):
                     run = await asyncio.to_thread(operation)
                 if run is None or (
@@ -235,13 +246,7 @@ class StartupLease:
                 self.run = run
                 # Runs even if the caller was cancelled, so committed outcomes are logged.
                 if committed is not None:
-                    try:
-                        committed()
-                    except Exception:
-                        # The write already committed; logging must not fail the caller.
-                        _logger.exception(
-                            "Could not log the committed update for run %s", self.run.id
-                        )
+                    _log_safely(lambda: committed(previous))
             finally:
                 self._lock.release()
 
@@ -519,8 +524,8 @@ class PersistentTaskScheduler:
                                 )
                                 # Logged on completion, even if this sweep times out first.
                                 transition.add_done_callback(
-                                    lambda done, run=run, status=status: _log_recovery_result(
-                                        run, status, done
+                                    lambda done, run=run, status=status: _log_safely(
+                                        lambda: _log_recovery_result(run, status, done)
                                     )
                                 )
                                 await asyncio.shield(transition)
@@ -533,10 +538,12 @@ class PersistentTaskScheduler:
                     extra=_run_event("scheduled_run_recovered", run, outcome="timeout"),
                 )
                 if transition is not None:
-                    # Nothing awaits the update any more; report a late failure.
-                    transition.add_done_callback(
-                        lambda done, run=run: _log_late_recovery_failure(run, done)
-                    )
+                    self._report_late_recovery_failure(run, transition)
+            except asyncio.CancelledError:
+                # Stopping cancels the sweep; the shielded update may still fail later.
+                if transition is not None:
+                    self._report_late_recovery_failure(run, transition)
+                raise
             except Exception:
                 _logger.exception(
                     "Could not finish recovery for run %s after its startup lease expired; "
@@ -547,6 +554,15 @@ class PersistentTaskScheduler:
         if len(runs) < self._batch_size:
             self._recovery_cursor = None
             self._recovery_cutoff = None
+
+    @staticmethod
+    def _report_late_recovery_failure(
+        run: ScheduledTaskRun, transition: asyncio.Future[ScheduledTaskRun | None]
+    ) -> None:
+        # Nothing awaits the update any more, so its failure is logged here.
+        transition.add_done_callback(
+            lambda done: _log_safely(lambda: _log_late_recovery_failure(run, done))
+        )
 
     async def _claim_due(self) -> None:
         cutoff = int(self._now())
@@ -687,7 +703,7 @@ class PersistentTaskScheduler:
                         )
 
                 # A cancelled finish can still commit; log only if it did not.
-                lease.when_writes_settle(log_unfinished)
+                lease._when_writes_settle(log_unfinished)
 
     async def _fire(self, task: ScheduledTask, lease: StartupLease) -> None:
         await lease.check()

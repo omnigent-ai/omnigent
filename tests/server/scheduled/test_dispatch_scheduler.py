@@ -1562,7 +1562,7 @@ async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog
     assert ended["delivered"]["prompt_delay_seconds"] == 10
     assert ended["delivered"]["session_id"] == session_id
     assert ended["failed"]["error_code"] == "host_offline"
-    # Both interrupted startups are handed to recovery, which preserves delivered work.
+    # Both unresolved startups are handed to recovery.
     recovered = _events(caplog, "scheduled_run_recovered")
     assert sorted(names[event["task_id"]] for event in recovered) == ["interrupted", "unfinished"]
     assert {event["outcome"] for event in recovered} == {"running"}
@@ -1572,7 +1572,14 @@ async def test_debug_events_cover_fire_success_delays_and_recovery(store, caplog
 
 @pytest.mark.parametrize(
     "failure",
-    ["poll", "initialize_scan", "initialize_task", "claim", "lease_renewal", "recovery_callback"],
+    [
+        "poll",
+        "initialize_scan",
+        "initialize_task",
+        "claim",
+        "lease_renewal",
+        "recovery_inspection",
+    ],
 )
 async def test_failed_operations_log_debug_events(store, monkeypatch, caplog, failure):
     from sqlalchemy import update
@@ -1618,7 +1625,7 @@ async def test_failed_operations_log_debug_events(store, monkeypatch, caplog, fa
             return original_renew(*args, **kwargs)
 
         monkeypatch.setattr(store, "renew_starting_run", renew_failing_once)
-    elif failure == "recovery_callback":
+    elif failure == "recovery_inspection":
         store.claim_scheduled_run(
             task,
             now=task.next_run_at,
@@ -1639,7 +1646,10 @@ async def test_failed_operations_log_debug_events(store, monkeypatch, caplog, fa
             "scheduled_task_operation_failed",
             {"operation": "lease_renewal", "task_id": task.id},
         ),
-        "recovery_callback": ("scheduled_run_recovered", {"outcome": "error", "task_id": task.id}),
+        "recovery_inspection": (
+            "scheduled_run_recovered",
+            {"outcome": "error", "task_id": task.id},
+        ),
     }
     event_name, attributes = expected[failure]
 
@@ -1687,7 +1697,7 @@ async def test_failed_outcome_log_does_not_fail_committed_finish(store, monkeypa
     monkeypatch.setattr(dispatch_scheduler._logger, "info", broken_info)
     await lease.finish("running")
     assert lease.run.status == store.list_runs(task.id)[0][0].status == "running"
-    assert "Could not log the committed update" in caplog.text
+    assert "Could not log a scheduler event" in caplog.text
 
 
 async def test_recovery_failure_after_timeout_is_still_logged(store, monkeypatch, caplog):
@@ -1758,3 +1768,82 @@ async def test_logged_delays_exclude_database_write_time(store, monkeypatch, cap
     [ended] = _events(caplog, "scheduled_run_startup_ended")
     assert attached["session_delay_seconds"] == 4
     assert ended["prompt_delay_seconds"] == 34
+
+
+async def test_concurrent_session_attachment_logs_one_session(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    session_id = uuid.uuid4().hex
+    await asyncio.gather(lease.attach_session(session_id), lease.attach_session(session_id))
+    assert [
+        event["session_id"] for event in _events(caplog, "scheduled_run_session_attached")
+    ] == [session_id]
+
+
+async def test_failed_startup_error_text_is_not_logged_as_an_attribute(store, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    run = store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    lease = StartupLease(store, run, now=clock.now, lease_seconds=120)
+    secret = "token=sk-live-123 for alice@example.com"
+    await lease.finish("failed", error=secret, error_code="host_offline")
+    [ended] = _events(caplog, "scheduled_run_startup_ended")
+    assert ended["error_code"] == "host_offline"
+    assert all(secret not in str(value) for value in ended.values())
+    assert store.list_runs(task.id)[0][0].error == secret
+
+
+async def test_recovery_failure_after_stop_is_still_logged(store, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=_SCHEDULER_LOGGER)
+    task = _task(store)
+    clock = FakeClock(task.next_run_at)
+    store.claim_scheduled_run(
+        task,
+        now=task.next_run_at,
+        next_run_at=task.next_run_at + 3600,
+        host_id=None,
+        lease_seconds=120,
+    )
+    clock.advance(120)
+    entered = asyncio.Event()
+    release = threading.Event()
+    loop = asyncio.get_running_loop()
+
+    def failing_transition(*args, **kwargs):
+        loop.call_soon_threadsafe(entered.set)
+        assert release.wait(10)
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(store, "transition_starting_run", failing_transition)
+    scheduler = PersistentTaskScheduler(
+        store, AsyncMock(), AsyncMock(return_value="running"), now=clock.now
+    )
+    try:
+        await scheduler.poll_once()
+        await asyncio.wait_for(entered.wait(), 10)
+        # Stopping cancels the sweep while its shielded update is still running.
+        await asyncio.wait_for(scheduler.stop(), 10)
+        release.set()
+        await poll_until_async(lambda: _events(caplog, "scheduled_run_recovered"))
+        assert [event["outcome"] for event in _events(caplog, "scheduled_run_recovered")] == [
+            "error"
+        ]
+    finally:
+        release.set()
+        await scheduler.stop()
