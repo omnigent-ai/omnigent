@@ -363,6 +363,51 @@ async def test_parent_session_snapshot_replays_child_pending_elicitation(
     assert prompts[0]["params"]["target_session_id"] == child.id
 
 
+async def test_late_ancestor_mirror_keeps_child_current_elicitation(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """A mirror that ran late on its thread must not revert or revive the parent card."""
+    from omnigent.runtime import pending_elicitations
+
+    session = await _create_parent_session(client, agent_name="late-ancestor-mirror")
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    child = _seed_child(
+        conv_store=conv_store,
+        parent_id=session["id"],
+        title="kiro:approval",
+        agent_id=session["agent_id"],
+    )
+
+    def request(state: str) -> dict[str, Any]:
+        return {
+            "type": "response.elicitation_request",
+            "elicitation_id": "elicit_child_q1",
+            "params": {"mode": "form", "message": "Approve", "native_delivery": {"state": state}},
+        }
+
+    pending_elicitations.record_publish(child.id, request("ready"))
+    pending_elicitations.record_publish(child.id, request("sending"))
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("sending")
+    )
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    _, mirrored = pending_elicitations.lookup("elicit_child_q1", conversation_id=session["id"])
+    assert mirrored["params"]["native_delivery"] == {"state": "sending"}
+    assert mirrored["params"]["target_session_id"] == child.id
+
+    pending_elicitations.resolve(child.id, "elicit_child_q1")
+    sessions_module._publish_elicitation_resolved_to_ancestors(
+        conv_store, child.id, "elicit_child_q1"
+    )
+    sessions_module._publish_elicitation_request_to_ancestors(
+        conv_store, child.id, request("ready")
+    )
+    assert pending_elicitations.count_for(session["id"]) == 0
+
+
 async def test_child_sessions_zero_pending_when_index_empty(
     client: httpx.AsyncClient,
     db_uri: str,
