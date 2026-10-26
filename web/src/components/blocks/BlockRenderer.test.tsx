@@ -1429,6 +1429,12 @@ describe("BlockRenderer dispatch", () => {
             notice("n1", "delegated"),
             text("m1", "Waiting on Peirce."),
             notice("n2", "returned"),
+            {
+              kind: "reasoning",
+              itemId: null,
+              text: "Reading the result.",
+              duration: 2,
+            } satisfies RenderItem,
           ],
           labels: ["Started Peirce", "Completed Peirce"],
         },
@@ -1459,19 +1465,47 @@ describe("BlockRenderer dispatch", () => {
         expect(noticeLabels()).toEqual(["Completed Peirce"]);
       });
 
-      it.each([null, "err_1"])(
-        "keeps a terminal error (item id %s) unfolded when a notice lands after it",
-        (itemId) => {
-          renderTurn([
-            text("m0", "Trying the build."),
-            tool(1, "Bash"),
-            { kind: "error", itemId, source: "", code: "server_error", message: "Failed." },
-            notice("n1", "returned"),
-          ]);
-          expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
-          expect(noticeLabels()).toEqual(["Completed Peirce"]);
-        },
-      );
+      it("keeps a terminal error unfolded when a notice lands after it", () => {
+        renderTurn([
+          text("m0", "Trying the build."),
+          tool(1, "Bash"),
+          { kind: "error", itemId: "err_1", source: "", code: "server_error", message: "Failed." },
+          notice("n1", "returned"),
+        ]);
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
+      });
+
+      it("streams a woken lead's unnamed output after its settled fold", () => {
+        const settled = [tool(1, "spawn_agent"), text("m1", "Waiting on Peirce.")];
+        // A native bubble's lifecycle always reads completed; only the session status moves.
+        const view = (items: RenderItem[], sessionStatus: "idle" | "running") => (
+          <MemoryRouter>
+            <BlockRenderer
+              items={items}
+              sessionStatus={sessionStatus}
+              turnLifecycle="completed"
+              isLastAssistant
+            />
+          </MemoryRouter>
+        );
+        const { rerender } = render(view(settled, "idle"));
+        expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
+        // The result wakes the lead, whose first reasoning has no committed item yet.
+        const reasoning: RenderItem = {
+          kind: "reasoning",
+          itemId: null,
+          text: "Reading Peirce's result.",
+          duration: undefined,
+        };
+        rerender(view([...settled, notice("n1", "returned"), reasoning], "running"));
+        expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+          "aria-expanded",
+          "false",
+        );
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
+        expect(screen.getByText("Reading Peirce's result.")).toBeDefined();
+      });
     });
 
     it("never folds the last assistant bubble while the session is running", async () => {

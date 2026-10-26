@@ -357,6 +357,34 @@ describe("sub-agent timeline events", () => {
     ]);
   });
 
+  it("holds a woken lead's unnamed output with its notice until committed work names it", () => {
+    // Native reasoning deltas carry no response id, so they inherit the old turn's.
+    const thinking: AnyBlock = {
+      type: "reasoning_chunk",
+      ctx: ctx({ responseId: "parent_turn" }),
+      text: "Reading the result.",
+    };
+    const woken = [work, answer, notice("returned"), thinking];
+    expect(buildStreamed(woken)).toMatchObject([
+      {
+        responseId: "parent_turn",
+        items: [
+          { kind: "tool" },
+          { kind: "text" },
+          { kind: "subagent_activity" },
+          { kind: "reasoning" },
+        ],
+      },
+    ]);
+    expect(buildStreamed([...woken, text("wake_answer", "wake_turn", "Approved.")])).toMatchObject([
+      { responseId: "parent_turn", items: [{ kind: "tool" }, { kind: "text" }] },
+      {
+        responseId: "wake_turn",
+        items: [{ kind: "subagent_activity" }, { kind: "reasoning" }, { kind: "text" }],
+      },
+    ]);
+  });
+
   it("splits at a notice only where committed work changes response", () => {
     // A live delta carries the active response's id; server items decide, as on reload.
     const delta: AnyBlock = {

@@ -174,12 +174,12 @@ function foldsNarration({
 /** Work folds after an assistant message or in a tool-bearing continuation. */
 function hasFoldableShape(
   items: RenderItem[],
-  { segments }: TurnPartition,
+  { segments, latest }: TurnPartition,
   continued = false,
 ): boolean {
-  const lastItem = items.findLast(
-    (item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity",
-  );
+  const lastItem = items
+    .slice(0, latest?.startIndex)
+    .findLast((item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity");
   // A terminal failure or denial must stay visible beside the assistant text.
   if (isFailureItem(lastItem)) return false;
   return (
@@ -199,7 +199,8 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   const partition = partitionTurn(inputs.items, foldsNarration(inputs), inputs.continued);
   return (
     hasFoldableShape(inputs.items, partition, inputs.continued) &&
-    partition.segments.every((segment) => segment.kind === "work")
+    partition.segments.every((segment) => segment.kind === "work") &&
+    partition.latest === null
   );
 }
 
@@ -342,6 +343,18 @@ export function BlockRenderer({
         </TurnWorkedFold>,
       );
     }
+    // A woken lead's output streams here, after the fold that has shown,
+    // until committed work moves it into the new response's own bubble.
+    if (partition.latest) {
+      rendered.push(
+        ...renderSequence(partition.latest.items, {
+          liveEdge: isTurnLive,
+          suppressReasoningDuration: showsWorking,
+          indexBase: partition.latest.startIndex,
+          onRetryError,
+        }),
+      );
+    }
     return rendered;
   }
 
@@ -443,6 +456,8 @@ interface TurnSequenceOptions {
 
 interface TurnPartition {
   segments: TurnSegment[];
+  /** The turn's latest news, shown after the fold (see `latestNewsStart`). */
+  latest: { items: RenderItem[]; startIndex: number } | null;
 }
 
 type TurnSegment =
@@ -468,72 +483,88 @@ function partitionTurn(
   foldNarration = false,
   continued = false,
 ): TurnPartition {
-  let end = items.length;
+  const latestStart = continued ? items.length : latestNewsStart(items);
+  const settled = items.slice(0, latestStart);
+  let end = settled.length;
   const wrapup: RenderItem[] = [];
-  while (end > 0 && isTrailingWrapup(items[end - 1]!)) {
-    wrapup.unshift(items[end - 1]!);
+  while (end > 0 && isTrailingWrapup(settled[end - 1]!)) {
+    wrapup.unshift(settled[end - 1]!);
     end -= 1;
   }
   // Keep the last non-blank message visible, even in a continued bubble.
   const answerIndex = foldNarration
-    ? items.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
+    ? settled.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
     : -1;
-  // Sub-agent notices nothing has followed yet are the turn's latest news. They
-  // fold once committed output, here or in a later bubble, moves past them.
-  const latestNoticesStart = continued
-    ? end
-    : items.findLastIndex(
-        (item, i) =>
-          i < end &&
-          item.kind !== "subagent_activity" &&
-          (isFailureItem(item) || !isProvisionalItem(item)),
-      ) + 1;
-  const segments: TurnSegment[] = [];
+  const built: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
-    const item = items[i]!;
+    const item = settled[i]!;
     if (
       isPendingElicitation(item) ||
       isPersistentToolCard(item) ||
       isInProgressTool(item) ||
-      isSlashCommandCard(item) ||
-      (item.kind === "subagent_activity" && i >= latestNoticesStart)
+      isSlashCommandCard(item)
     ) {
-      segments.push({ kind: "exempt", item, index: i });
+      built.push({ kind: "exempt", item, index: i });
       continue;
     }
     // Blank text after the answer stays with it rather than opening a second fold.
     const kind = item.kind === "text" && (answerIndex < 0 || i >= answerIndex) ? "text" : "work";
-    const previous = segments[segments.length - 1];
+    const previous = built[built.length - 1];
     if (previous?.kind === kind) previous.items.push(item);
-    else segments.push({ kind, items: [item], startIndex: i });
+    else built.push({ kind, items: [item], startIndex: i });
   }
+  const segments = foldNoticeRuns(built);
   if (wrapup.length > 0) {
     const lastWork = segments.findLast((segment) => segment.kind === "work");
     if (lastWork?.kind === "work") lastWork.items.push(...wrapup);
     else segments.push({ kind: "work", items: wrapup, startIndex: end });
   }
-  // A run of only notices folds with the nearest work, earlier first, as trailing
-  // wrapup does. With no work in the turn there is no row to fold into.
+  const latest =
+    latestStart < items.length
+      ? { items: items.slice(latestStart), startIndex: latestStart }
+      : null;
+  return { segments, latest };
+}
+
+/**
+ * Where the turn's latest news starts: trailing sub-agent notices and the
+ * uncommitted output after them, which may belong to a response not named
+ * yet. It stays visible after the fold until committed output follows.
+ */
+function latestNewsStart(items: RenderItem[]): number {
+  let start = items.length;
+  while (start > 0 && isNoticeOrUncommitted(items[start - 1]!)) start -= 1;
+  const notice = items.findIndex((item, i) => i >= start && item.kind === "subagent_activity");
+  return notice < 0 ? items.length : notice;
+}
+
+function isNoticeOrUncommitted(item: RenderItem): boolean {
+  return item.kind === "subagent_activity" || (!isFailureItem(item) && isProvisionalItem(item));
+}
+
+/**
+ * A run of only notices folds with the nearest work, earlier first. With no
+ * work in the turn there is no row to fold into, so the notices stay visible.
+ */
+function foldNoticeRuns(segments: TurnSegment[]): TurnSegment[] {
   const isNoticeRun = (segment: TurnSegment): boolean =>
     segment.kind === "work" && segment.items.every((item) => item.kind === "subagent_activity");
   const workRuns = segments.filter((segment) => segment.kind === "work" && !isNoticeRun(segment));
-  return {
-    segments: segments.flatMap((segment, index): TurnSegment[] => {
-      if (segment.kind !== "work" || !isNoticeRun(segment)) return [segment];
-      const earlier = workRuns.findLast((run) => segments.indexOf(run) < index);
-      const target = earlier ?? workRuns[0];
-      if (target?.kind !== "work") {
-        return segment.items.map((item, k) => ({
-          kind: "exempt",
-          item,
-          index: segment.startIndex + k,
-        }));
-      }
-      if (earlier) target.items.push(...segment.items);
-      else target.items.unshift(...segment.items);
-      return [];
-    }),
-  };
+  return segments.flatMap((segment, index): TurnSegment[] => {
+    if (segment.kind !== "work" || !isNoticeRun(segment)) return [segment];
+    const earlier = workRuns.findLast((run) => segments.indexOf(run) < index);
+    const target = earlier ?? workRuns[0];
+    if (target?.kind !== "work") {
+      return segment.items.map((item, k) => ({
+        kind: "exempt",
+        item,
+        index: segment.startIndex + k,
+      }));
+    }
+    if (earlier) target.items.push(...segment.items);
+    else target.items.unshift(...segment.items);
+    return [];
+  });
 }
 
 function isPendingElicitation(item: RenderItem): boolean {
