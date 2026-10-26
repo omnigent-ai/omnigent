@@ -8413,6 +8413,31 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
       expect(state.llmModel).toBe("claude-sonnet-5");
     });
 
+    it("settles a pending switch on the not-applied info notice item", () => {
+      // A switch refused while the pane waits on the person arrives as a
+      // persisted info-level error item rather than a live response.error.
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        llmModel: "claude-sonnet-5",
+        pendingModelChange: "haiku",
+      });
+      handleSessionEvent({
+        type: "error",
+        source: "execution",
+        toolName: null,
+        itemId: "item_notice",
+        responseId: "task_notice",
+        error: {
+          code: "model_change_not_applied",
+          message: "The terminal was not switched to haiku.",
+          level: "info",
+        },
+      });
+      const state = useChatStore.getState();
+      expect(state.pendingModelChange).toBeNull();
+      expect(state.llmModel).toBe("claude-sonnet-5");
+    });
+
     it("leaves pending state alone for unrelated errors", () => {
       useChatStore.setState({
         conversationId: "conv_abc",

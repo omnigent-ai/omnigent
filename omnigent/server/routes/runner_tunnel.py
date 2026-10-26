@@ -47,7 +47,11 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     decode_frame,
     encode_frame,
 )
-from omnigent.runner.transports.ws_tunnel.registry import RunnerSession, TunnelRegistry
+from omnigent.runner.transports.ws_tunnel.registry import (
+    RunnerSession,
+    TunnelEnd,
+    TunnelRegistry,
+)
 from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
 from omnigent.server.auth import RESERVED_USER_LOCAL, AuthProvider
 from omnigent.server.host_registry import RunnerExitReports
@@ -483,6 +487,7 @@ def create_runner_tunnel_router(
         await ws.accept()
         session: RunnerSession | None = None
         ended_by: str | None = None
+        peer_close_code: int | None = None
         owned: list[asyncio.Task[None]] = []
 
         def _connection_attrs() -> _TunnelConnectionAttrs:
@@ -671,6 +676,7 @@ def create_runner_tunnel_router(
             if session is not None:
                 session.peer_close_reason = getattr(exc, "reason", None) or None
             close_code = getattr(exc, "code", None)
+            peer_close_code = close_code
             # A normal or going-away close (idle shutdown, host restart) is expected.
             _logger.log(
                 logging.INFO if close_code in _CLEAN_CLOSE_CODES else logging.WARNING,
@@ -693,10 +699,18 @@ def create_runner_tunnel_router(
                 extra=debug_event("runner_tunnel", phase="error", **_connection_attrs()),
             )
         finally:
+            ended_at = time.time()
             for task in owned:
                 task.cancel()
             await asyncio.gather(*owned, return_exceptions=True)
             if session is not None:
+                # Snapshot before deregister records its own cleanup close on the session.
+                session.ended = TunnelEnd(
+                    at=ended_at,
+                    peer_code=peer_close_code,
+                    peer_reason=session.peer_close_reason,
+                    server_code=session.close_code,
+                )
                 registry.deregister(runner_id, session, retire=False)
                 if on_runner_disconnect is not None:
                     try:

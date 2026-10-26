@@ -1631,9 +1631,14 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
     launch_kwargs: dict[str, Any] = {}
 
     async def _fake_create_session(
-        _client: object, _bundle: bytes, *, bridge_id: str, terminal_launch_args: object = None
+        _client: object,
+        _bundle: bytes,
+        *,
+        bridge_id: str,
+        claude_args: object = (),
+        terminal_launch_args: object = None,
     ) -> str:
-        del _client, _bundle, bridge_id, terminal_launch_args
+        del _client, _bundle, bridge_id, claude_args, terminal_launch_args
         return "conv_local_fresh_raw"
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
@@ -1999,6 +2004,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         bundle: bytes,
         *,
         bridge_id: str | None,
+        claude_args: tuple[str, ...] = (),
         terminal_launch_args: list[str] | None = None,
     ) -> str:
         """
@@ -2007,6 +2013,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         :param client: HTTP client created by the prepare helper.
         :param bundle: Bundled agent bytes.
         :param bridge_id: Bridge label requested by the caller.
+        :param claude_args: Launch args the effort stamp reads.
         :param terminal_launch_args: Claude launch args persisted on
             the session for the runner to apply.
         :returns: Fixed conversation id.
@@ -2014,6 +2021,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         del client
         assert bundle == b"bundle"
         assert bridge_id is None
+        assert claude_args == ("--print", "hi")
         assert terminal_launch_args == ["--print", "hi"]
         return "conv_daemon_progress"
 
@@ -2131,7 +2139,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         headers={},
         session_id=None,
         session_bundle=b"bundle",
-        claude_args=("--print", "hi"),
+        claude_args=("--resume", "abc", "--print", "hi"),
         host_id="host_progress",
         workspace="/workspace",
         startup_progress=progress,
@@ -6293,9 +6301,11 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         _bundle: bytes,
         *,
         bridge_id: str,
+        claude_args: tuple[str, ...] = (),
     ) -> str:
         """Return a freshly-minted conv id without HTTP."""
         del _client, _bundle, bridge_id
+        assert claude_args == ("--effort", "xhigh")
         return "conv_new"
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
@@ -6342,7 +6352,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
             session_id=None,
             runner_id="runner_xyz",
             session_bundle=b"fake-bundle",
-            claude_args=(),
+            claude_args=("--effort", "xhigh"),
             command="claude",
             append_system_prompt="Fresh session bridge instructions.",
         )

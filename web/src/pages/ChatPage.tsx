@@ -237,7 +237,11 @@ import {
 import { useHostModelOptions, useHosts } from "@/hooks/useHosts";
 import { useSandboxLaunchModelOptions } from "@/hooks/useSandboxModelOptions";
 import { nativeModelLabel } from "@/components/HarnessConfigControls";
-import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import {
+  ComposerConfigSections,
+  type ComposerConfigSection,
+} from "@/components/composer/ComposerConfigSections";
+import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 import { buildFusionSections } from "@/components/composer/fusionSections";
 import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import { ComposerWorkspaceStatus } from "@/components/composer/ComposerWorkspaceStatus";
@@ -4908,6 +4912,22 @@ function SessionHarnessPicker({
   const [menuOpen, setMenuOpen] = useState(false);
   const [configOpen, setConfigOpen] = useState(false);
   const [startingSession, setStartingSession] = useState(false);
+  const [cycleDraft, setCycleDraft] = useState<{
+    sessionId: string | null;
+    model?: { key: string; id: string | null };
+    effort?: string;
+  } | null>(null);
+  const cycleDraftRef = useRef(cycleDraft);
+  const cancelCycle = useCallback(() => {
+    cycleDraftRef.current = null;
+    setCycleDraft(null);
+  }, []);
+  useEffect(
+    () => () => {
+      cycleDraftRef.current = null;
+    },
+    [],
+  );
   const appliedOpenNonce = useRef(0);
   const conversationId = useChatStore((state) => state.conversationId);
   const sessionHarness = useChatStore((state) => state.sessionHarness);
@@ -4971,14 +4991,16 @@ function SessionHarnessPicker({
     if (!openNonce || openNonce === appliedOpenNonce.current) return;
     appliedOpenNonce.current = openNonce;
     if (!disabled && configurable) {
+      cancelCycle();
       setMenuOpen(true);
       setConfigOpen(true);
     }
-  }, [openNonce, disabled, configurable]);
+  }, [openNonce, disabled, configurable, cancelCycle]);
   useEffect(() => {
+    cancelCycle();
     setMenuOpen(false);
     setConfigOpen(false);
-  }, [conversationId]);
+  }, [conversationId, cancelCycle]);
   const apply = async (change: () => Promise<unknown>, wakesSession = false) => {
     if (disabled || busyRef.current || pendingModelChange !== null) return;
     busyRef.current = true;
@@ -4994,41 +5016,245 @@ function SessionHarnessPicker({
       setStartingSession(false);
     }
   };
-  const selectModel = (modelId: string | null) =>
-    void apply(async () => {
-      const store = useChatStore.getState();
-      const sourceSessionId = store.conversationId;
-      await store.setModel(modelId, {
-        expectConfirmation:
-          (modelPickerKind === "claude" || modelPickerKind === "codex") && !modelsFromLaunchPreview,
-      });
-      if (useChatStore.getState().conversationId !== sourceSessionId) return;
-      if (
-        modelPickerKind === "codex" &&
-        selectedEffort !== null &&
-        !codexEffortLevelsForModel(codexModelOptions, modelId).includes(selectedEffort)
-      )
-        await store.setEffort(null);
-      if (
-        costRoutingEligible &&
-        routingOn &&
-        useChatStore.getState().conversationId === sourceSessionId
-      )
-        await store.setCostControlMode("off");
-    }, modelPickWakesSession);
+  const changeModel = async (modelId: string | null, nextEffort?: string) => {
+    const store = useChatStore.getState();
+    const sourceSessionId = store.conversationId;
+    await store.setModel(modelId, {
+      expectConfirmation:
+        (modelPickerKind === "claude" || modelPickerKind === "codex") && !modelsFromLaunchPreview,
+    });
+    if (useChatStore.getState().conversationId !== sourceSessionId) return;
+    if (
+      selectedEffort !== null &&
+      (isFusionModelUid(modelId) ||
+        (nextEffort === undefined &&
+          modelPickerKind === "codex" &&
+          !codexEffortLevelsForModel(codexModelOptions, modelId).includes(selectedEffort)))
+    )
+      await store.setEffort(null);
+    if (
+      costRoutingEligible &&
+      routingOn &&
+      useChatStore.getState().conversationId === sourceSessionId
+    )
+      await store.setCostControlMode("off");
+  };
+  const selectModel = (modelId: string | null) => {
+    cancelCycle();
+    void apply(() => changeModel(modelId), modelPickWakesSession);
+  };
+  const selectEffort = (effort: string) => {
+    cancelCycle();
+    void apply(() => useChatStore.getState().setEffort(effort));
+  };
   // Devin Fusion: the composed `fusion-…` id is the model; the lead effort is
   // baked in, so it carries no separate reasoning effort.
   const composerFusionOption = fusionOption(modelOptions);
   const composerFusion = composerFusionOption?.fusion;
   const fusionSelected = composerFusion !== undefined && isFusionModelUid(pickerSelectedModel);
-  const selectFusionModel = (modelUid: string) =>
+  const modelValueForKey = (key: string): string | null => {
+    const option = modelOptions.find((model) => model.id === key);
+    if (composerFusion !== undefined && key === composerFusionOption?.id)
+      return composerFusion.default;
+    return key === "__default__" || (supportsModelReset && option?.isDefault) ? null : key;
+  };
+  const modelSection: ComposerConfigSection | undefined = showModels
+    ? {
+        testId: "composer-agent-models",
+        header: "Models",
+        leading:
+          (inferenceConfigured && inferenceError) || modelOptions.length === 0 ? (
+            <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
+              {inferenceError ?? "No usable models are available for this session."}
+            </div>
+          ) : undefined,
+        choices: [
+          ...(supportsModelReset &&
+          !inferenceConfigured &&
+          !modelOptions.some((model) => model.isDefault)
+            ? [
+                {
+                  key: "__default__",
+                  label: "Default",
+                  checked: !routingOn && pickerSelectedModel === null,
+                  disabled: busy || pendingModelChange !== null || !!inferenceError,
+                  onSelect: () => selectModel(null),
+                  testId: "composer-agent-model-default",
+                },
+              ]
+            : []),
+          ...modelOptions.map((model) => ({
+            key: model.id,
+            label: nativeModelLabel(model),
+            checked:
+              !routingOn &&
+              (composerFusion !== undefined && model.id === composerFusionOption?.id
+                ? isFusionModelUid(pickerSelectedModel)
+                : model.id === pickerSelectedModel),
+            disabled: busy || pendingModelChange !== null || !!inferenceError,
+            onSelect: () => selectModel(modelValueForKey(model.id)),
+            testId: `composer-agent-model-${model.id}`,
+            title: nativeModelTooltip(model),
+            className: "whitespace-normal break-words",
+            data: { "data-model-id": model.id },
+          })),
+          ...(pickerSelectedModel &&
+          !isFusionModelUid(pickerSelectedModel) &&
+          !modelOptions.some((model) => model.id === pickerSelectedModel)
+            ? [
+                {
+                  key: "__current__",
+                  label: `${modelSummary ?? "Default"} (current)`,
+                  checked: !routingOn,
+                  disabled: true,
+                  className: "whitespace-normal break-words",
+                  data: { "data-model-id": pickerSelectedModel },
+                },
+              ]
+            : []),
+        ],
+      }
+    : undefined;
+  const buildEffortSection = (
+    levels: readonly string[],
+    current: string | null,
+    routed: boolean,
+    onSelect: (effort: string) => void,
+  ): ComposerConfigSection => ({
+    testId: "composer-agent-efforts",
+    header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
+    choices: levels.map((effort) => ({
+      key: effort,
+      label: formatStatusEffortLabel(effort) ?? effort,
+      checked: !routed && effort === current,
+      disabled: routed || busy || pendingModelChange !== null,
+      onSelect: () => onSelect(effort),
+      testId: `composer-agent-effort-${effort}`,
+      data: { "data-effort-level": effort },
+    })),
+  });
+  const effortSection =
+    showEffort && availableEfforts.length > 0
+      ? buildEffortSection(availableEfforts, selectedEffort, routingOn, selectEffort)
+      : undefined;
+  const fusionSections: readonly ComposerConfigSection[] | undefined =
+    composerFusion !== undefined && fusionSelected && !routingOn
+      ? buildFusionSections({
+          descriptor: composerFusion,
+          modelUid: pickerSelectedModel ?? composerFusion.default,
+          testIdPrefix: "composer-agent",
+          onChange: selectModel,
+          disabled: busy || pendingModelChange !== null,
+        })
+      : undefined;
+  const staged = cycleDraft?.sessionId === conversationId ? cycleDraft : null;
+  const appliedModelKey = modelSection?.choices.find((choice) => choice.checked)?.key;
+  const appliedModelId =
+    composerFusion !== undefined && pickerSelectedModel === "fusion"
+      ? composerFusion.default
+      : pickerSelectedModel;
+  const cycleModel = staged?.model ? staged.model.id : pickerSelectedModel;
+  const cycleRoutingOn = routingOn && staged?.model === undefined;
+  const cycleEffortLevels =
+    modelPickerKind === "codex" || modelPickerKind === "devin"
+      ? codexEffortLevelsForModel(codexModelOptions, cycleModel)
+      : availableEfforts;
+  const stageModel = (
+    key: string,
+    id = key === appliedModelKey ? appliedModelId : modelValueForKey(key),
+  ) => {
+    const previous = cycleDraftRef.current;
+    const levels =
+      modelPickerKind === "codex" || modelPickerKind === "devin"
+        ? codexEffortLevelsForModel(codexModelOptions, id)
+        : availableEfforts;
+    const effort = previous?.sessionId === conversationId ? previous.effort : undefined;
+    const next = {
+      sessionId: conversationId,
+      model: { key, id },
+      effort: effort !== undefined && levels.includes(effort) ? effort : undefined,
+    };
+    cycleDraftRef.current = next;
+    setCycleDraft(next);
+  };
+  const stageEffort = (effort: string) => {
+    const previous = cycleDraftRef.current;
+    const next = {
+      ...(previous?.sessionId === conversationId ? previous : {}),
+      sessionId: conversationId,
+      effort,
+    };
+    cycleDraftRef.current = next;
+    setCycleDraft(next);
+  };
+  const cycleModelSection = modelSection && {
+    ...modelSection,
+    choices: modelSection.choices.map((choice) => ({
+      ...choice,
+      checked: staged?.model ? choice.key === staged.model.key : choice.checked,
+      onSelect: choice.onSelect ? () => stageModel(choice.key) : undefined,
+    })),
+  };
+  const cycleEffortSection: ComposerConfigSection | undefined =
+    composerFusion !== undefined && isFusionModelUid(cycleModel) && !cycleRoutingOn
+      ? buildFusionSections({
+          descriptor: composerFusion,
+          modelUid: cycleModel ?? composerFusion.default,
+          testIdPrefix: "composer-agent",
+          onChange: (modelUid) => stageModel(composerFusionOption!.id, modelUid),
+          disabled: busy || pendingModelChange !== null,
+        })[1]
+      : (showEffort || modelPickerKind === "codex" || modelPickerKind === "devin") &&
+          cycleEffortLevels.length > 0
+        ? buildEffortSection(
+            cycleEffortLevels,
+            staged?.effort ?? selectedEffort,
+            cycleRoutingOn,
+            stageEffort,
+          )
+        : undefined;
+  const applyCycle = () => {
+    const draft = cycleDraftRef.current;
+    if (!draft || disabled || draft.sessionId !== useChatStore.getState().conversationId) {
+      dismissPreview();
+      return;
+    }
+    if (busyRef.current || pendingModelChange !== null) return;
+    const modelChanged =
+      draft.model !== undefined &&
+      (draft.model.key !== appliedModelKey || draft.model.id !== appliedModelId);
+    const effort =
+      draft.effort !== undefined && cycleEffortLevels.includes(draft.effort)
+        ? draft.effort
+        : undefined;
+    const effortChanged = effort !== undefined && effort !== selectedEffort;
+    const modelChoice = modelSection?.choices.find((choice) => choice.key === draft.model?.key);
+    if (
+      (modelChanged && (!modelChoice?.onSelect || modelChoice.disabled)) ||
+      (effortChanged && cycleRoutingOn)
+    ) {
+      dismissPreview();
+      return;
+    }
+    if (!modelChanged && !effortChanged) {
+      dismissPreview();
+      return;
+    }
+    cancelCycle();
     void apply(async () => {
-      const store = useChatStore.getState();
-      const sourceSessionId = store.conversationId;
-      await store.setModel(modelUid, { expectConfirmation: false });
-      if (useChatStore.getState().conversationId !== sourceSessionId) return;
-      if (selectedEffort !== null) await store.setEffort(null);
-    }, modelPickWakesSession);
+      if (modelChanged) await changeModel(draft.model!.id, effort);
+      if (draft.sessionId !== useChatStore.getState().conversationId) return;
+      if (effortChanged) await useChatStore.getState().setEffort(effort);
+    }, modelChanged && modelPickWakesSession);
+  };
+  const { preview, dismissPreview } = useComposerConfigCycleHotkeys(
+    cycleModelSection?.choices,
+    cycleEffortSection?.choices.filter(({ key }) => key !== "__fast__"),
+    !disabled && !busy && pendingModelChange === null,
+    busy || pendingModelChange !== null,
+    staged ? { apply: applyCycle, cancel: cancelCycle } : undefined,
+  );
+  useEffect(() => dismissPreview(), [conversationId, disabled, dismissPreview]);
   const configContent = (
     <>
       {startingSession && (
@@ -5044,9 +5270,12 @@ function SessionHarnessPicker({
         <>
           <DropdownMenuItem
             disabled={busy || pendingModelChange !== null}
-            onSelect={() =>
-              void apply(() => useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"))
-            }
+            onSelect={() => {
+              cancelCycle();
+              void apply(() =>
+                useChatStore.getState().setCostControlMode(routingOn ? "off" : "on"),
+              );
+            }}
             data-active={routingOn ? "true" : undefined}
             className="items-center text-13 data-[active=true]:bg-muted data-[active=true]:text-foreground dark:data-[active=true]:bg-muted/50"
           >
@@ -5057,101 +5286,25 @@ function SessionHarnessPicker({
         </>
       )}
       <ComposerConfigSections
-        models={
-          showModels
-            ? {
-                testId: "composer-agent-models",
-                header: "Models",
-                leading:
-                  (inferenceConfigured && inferenceError) || modelOptions.length === 0 ? (
-                    <div className="px-2 py-1 text-xs text-muted-foreground" role="status">
-                      {inferenceError ?? "No usable models are available for this session."}
-                    </div>
-                  ) : undefined,
-                choices: [
-                  ...(supportsModelReset &&
-                  !inferenceConfigured &&
-                  !modelOptions.some((model) => model.isDefault)
-                    ? [
-                        {
-                          key: "__default__",
-                          label: "Default",
-                          checked: !routingOn && pickerSelectedModel === null,
-                          disabled: busy || pendingModelChange !== null || !!inferenceError,
-                          onSelect: () => selectModel(null),
-                          testId: "composer-agent-model-default",
-                        },
-                      ]
-                    : []),
-                  ...modelOptions.map((model) => ({
-                    key: model.id,
-                    label: nativeModelLabel(model),
-                    checked:
-                      !routingOn &&
-                      (composerFusion !== undefined && model.id === composerFusionOption?.id
-                        ? isFusionModelUid(pickerSelectedModel)
-                        : model.id === pickerSelectedModel),
-                    disabled: busy || pendingModelChange !== null || !!inferenceError,
-                    onSelect: () =>
-                      composerFusion !== undefined && model.id === composerFusionOption?.id
-                        ? selectFusionModel(composerFusion.default)
-                        : selectModel(supportsModelReset && model.isDefault ? null : model.id),
-                    testId: `composer-agent-model-${model.id}`,
-                    title: nativeModelTooltip(model),
-                    className: "whitespace-normal break-words",
-                    data: { "data-model-id": model.id },
-                  })),
-                  ...(pickerSelectedModel &&
-                  !isFusionModelUid(pickerSelectedModel) &&
-                  !modelOptions.some((model) => model.id === pickerSelectedModel)
-                    ? [
-                        {
-                          key: "__current__",
-                          label: `${modelSummary ?? "Default"} (current)`,
-                          checked: !routingOn,
-                          disabled: true,
-                          className: "whitespace-normal break-words",
-                          data: { "data-model-id": pickerSelectedModel },
-                        },
-                      ]
-                    : []),
-                ],
-              }
-            : undefined
-        }
-        efforts={
-          showEffort && availableEfforts.length > 0
-            ? {
-                testId: "composer-agent-efforts",
-                header: modelPickerKind === "pi" ? "Thinking level" : "Effort",
-                choices: availableEfforts.map((effort) => ({
-                  key: effort,
-                  label: formatStatusEffortLabel(effort) ?? effort,
-                  checked: !routingOn && effort === selectedEffort,
-                  disabled: routingOn || busy || pendingModelChange !== null,
-                  onSelect: () => void apply(() => useChatStore.getState().setEffort(effort)),
-                  testId: `composer-agent-effort-${effort}`,
-                  data: { "data-effort-level": effort },
-                })),
-              }
-            : undefined
-        }
-        extra={
-          composerFusion !== undefined && fusionSelected && !routingOn
-            ? buildFusionSections({
-                descriptor: composerFusion,
-                modelUid: pickerSelectedModel ?? composerFusion.default,
-                testIdPrefix: "composer-agent",
-                onChange: selectFusionModel,
-                disabled: busy || pendingModelChange !== null,
-              })
-            : undefined
-        }
+        models={modelSection}
+        efforts={effortSection}
+        extra={fusionSections}
       />
     </>
   );
   return (
     <HarnessPicker
+      cyclePreview={
+        preview === "models"
+          ? cycleModelSection
+          : preview === "efforts"
+            ? cycleEffortSection
+            : undefined
+      }
+      cyclePreviewHint={
+        staged ? "Applies after 2 seconds · Enter to apply · Esc to cancel" : undefined
+      }
+      onDismissCyclePreview={dismissPreview}
       open={menuOpen}
       onOpenChange={(next) => {
         if (!next || (!disabled && !busy && configurable)) setMenuOpen(next);

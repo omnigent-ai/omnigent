@@ -47,6 +47,16 @@ and steers messages while the agent is busy.
   effort the pinned model lacks (or, with no project model, the remembered
   model lacks), an explicit composer pick, remembered Smart Routing, another
   agent chosen.
+- `config-cycle-hotkeys`: Ctrl+Alt+M cycles models and Ctrl+Alt+E cycles effort
+  in both composers (Ctrl on every platform). The relevant menu briefly opens
+  with the selected choice highlighted, preserving draft and input focus. In an
+  existing session, cycling stages choices locally and applies only the final
+  choice after two seconds without another press. Enter applies immediately
+  without sending the draft; Escape cancels. Wrapping back to the applied choice
+  sends no change. Before launch, choices update the local launch configuration.
+  Choices follow menu order and wrap, skipping unavailable options.
+  States: default, model-specific effort, staged/pending/refused changes, read-only,
+  unreachable, smart-routing effort disabled, terminal/editor focus untouched.
 - `effort-terminal-mirror`: an effort change typed in the Codex terminal shows
   in the composer, and a composer pick is not reverted by later terminal turns.
 - `permission-mode`: the harness's native approval modes; the current mode is
@@ -173,6 +183,8 @@ and steers messages while the agent is busy.
   shows **Provisioning sandbox…**: it lists the provider's default catalog, the
   rows the new-session picker offered, until the session's host or its own
   catalog can answer. A pick is saved for the launch.
+- Press Ctrl+Alt+M or Ctrl+Alt+E to cycle models or effort; keep typing while
+  the temporary menu shows the selected choice.
 - For a Codex session, open the Terminal view and change effort there, then
   return to Chat.
 - Type `/` in the message box; attach files with the button, by paste, or by
@@ -233,6 +245,8 @@ and steers messages while the agent is busy.
 - Pick a harness, then open its configuration for model, effort (Codex, Claude,
   Pi, Devin), and permission mode before the session exists. Ctrl+Shift+M also
   opens the agent/model picker here.
+- Press Ctrl+Alt+M or Ctrl+Alt+E to cycle models or effort before launch.
+  The menu previews the choice briefly while focus stays in the message box.
 - With a managed sandbox selected and no connected host, the model picker lists
   the sandbox's default catalog when `/v1/info` advertises `default_models` (an
   unbound gateway with `sandbox.model_discovery`, or a provider hook): rows under
@@ -524,6 +538,19 @@ Other connection providers alone do not enable the managed MCP picker.
   session click the transcript, press Ctrl+Shift+L and expect the message box
   focused. In a session whose gear is disabled (read-only or unreachable),
   Ctrl+Shift+M does nothing.
+- **`config-cycle-hotkeys`, both composers:** component coverage in
+  `web/src/hooks/useComposerConfigCycleHotkeys.test.tsx`,
+  `web/src/pages/ChatPage.composer.test.tsx`, and
+  `web/src/shell/NewChatDialog.test.tsx`. Manually: enter a draft, press
+  Ctrl+Alt+M several times and observe the model preview advance and wrap;
+  press Ctrl+Alt+E and observe effort change. In a session, press either shortcut
+  three times quickly: no change request should occur during the burst, then
+  only the final choice applies two seconds after the last press. Repeat with
+  Enter to apply immediately, Escape to cancel, and a full wrap to send no change.
+  Verify model then effort cycling applies both final choices. Wait for the
+  preview to close without moving focus or changing the draft. Repeat before
+  launch; reload the session to check persistence. The fork dialog has no composer cycle shortcuts; mobile
+  without a physical keyboard continues to use the pickers.
 - **`queue-and-steer`:**
   `tests/e2e_ui/chat/test_queue_steer.py::test_steer_sends_queued_message_while_busy`,
   `tests/e2e_ui/chat/test_composer_bulk_steer.py::test_bulk_steer_retries_the_whole_queue`

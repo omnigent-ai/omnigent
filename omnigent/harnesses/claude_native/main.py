@@ -97,7 +97,7 @@ from omnigent.harnesses.claude_native.bridge import (
     bridge_dir_for_bridge_id,
     prepare_bridge_dir,
     read_active_session_id,
-    read_user_effort_level,
+    resolve_launch_effort_level,
     url_component,
     validate_claude_hook_interpreter_compatibility,
 )
@@ -4662,6 +4662,7 @@ async def _prepare_claude_terminal_via_daemon(
                     client,
                     session_bundle,
                     bridge_id=None,
+                    claude_args=tuple(persist_args),
                     terminal_launch_args=persist_args or None,
                 ),
                 wait_for_host_online(client, host_id, timeout_s=_DAEMON_HOST_ONLINE_TIMEOUT_S),
@@ -5128,6 +5129,7 @@ async def _prepare_claude_terminal(
                 client,
                 session_bundle,
                 bridge_id=bridge_id,
+                claude_args=claude_args,
             )
             _mark_startup_step(
                 startup_profiler,
@@ -6241,6 +6243,7 @@ async def _create_claude_session(
     bundle: bytes,
     *,
     bridge_id: str | None,
+    claude_args: tuple[str, ...] = (),
     terminal_launch_args: list[str] | None = None,
 ) -> str:
     """
@@ -6261,6 +6264,9 @@ async def _create_claude_session(
         convention the runner's own auto-create path uses, so a
         daemon-routed launch (where the runner brings the terminal up)
         stays consistent. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
+    :param claude_args: Pass-through ``claude`` CLI args, e.g.
+        ``("--effort", "xhigh")``; a valid ``--effort`` here is stamped as
+        the session's ``reasoning_effort`` over settings.json's default.
     :param terminal_launch_args: Pass-through ``claude`` CLI args to
         persist on the session, e.g.
         ``["--dangerously-skip-permissions"]``. The runner reads these
@@ -6276,8 +6282,8 @@ async def _create_claude_session(
     metadata: _JsonObject = {"labels": labels}
     if terminal_launch_args:
         metadata["terminal_launch_args"] = terminal_launch_args
-    # Stamp the wrapped claude's real effortLevel so the pill isn't a guess.
-    effort = read_user_effort_level()
+    # Stamp the wrapped claude's real effort so the pill isn't a guess.
+    effort = resolve_launch_effort_level(claude_args)
     if effort is not None:
         metadata["reasoning_effort"] = effort
     resp = await client.post(

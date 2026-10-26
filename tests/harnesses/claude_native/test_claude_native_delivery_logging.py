@@ -457,3 +457,68 @@ def test_unreadable_status_snapshot_omits_the_claude_version(
     if context is not None:
         (tmp_path / "context.json").write_text(context)
     assert delivery_diagnostics._claude_code_version(tmp_path) == {}
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (
+            "scrollback\n──────\n❯ private draft\n  private second row\n──────\n  footer\n",
+            {
+                "composer_box_rows": "2",
+                "composer_box_blank_rows": "0",
+                "composer_first_row_glyph_only": "False",
+                "composer_pane_rows": "6",
+                "composer_pane_max_columns": "20",
+            },
+        ),
+        (
+            "scrollback\n──────\n❯\n\n──────\n  footer\n",
+            {
+                "composer_box_rows": "2",
+                "composer_box_blank_rows": "1",
+                "composer_first_row_glyph_only": "True",
+                "composer_pane_rows": "6",
+                "composer_pane_max_columns": "10",
+            },
+        ),
+    ],
+    ids=["two-row-draft", "glyph-row-and-blank-row"],
+)
+def test_an_uncleared_composer_logs_its_shape_without_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pane: str,
+    expected: dict[str, str],
+) -> None:
+    """A refused clear records the box's shape, so the failing layout can be named later."""
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args, **_kwargs: pane)
+    monkeypatch.setattr(bridge, "_run_tmux", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _s: None)
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: "owned-session",
+        cancelled_error=bridge.ClaudeInjectionCancelled,
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> None:
+        delivery_diagnostics.start_attempt()
+        bridge._clear_composer("/tmp/sock", "main")
+
+    with caplog.at_level("INFO", logger=delivery_diagnostics.__name__):
+        with pytest.raises(bridge.ClaudeComposerNotCleared):
+            deliver(tmp_path, content="hello")
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+    ]
+    row = record_to_row(record, source="runner")
+    attrs = row["attributes"]
+    assert {key: attrs[key] for key in expected} == expected
+    assert attrs["composer_box_found"] == "True"
+    assert attrs["composer_box_framed"] == "True"
+    assert attrs["composer_capture_empty"] == "False"
+    assert attrs["composer_rule_rows"] == "2"
+    assert attrs["error_type"] == "ClaudeComposerNotCleared"
+    assert "private" not in json.dumps(row)

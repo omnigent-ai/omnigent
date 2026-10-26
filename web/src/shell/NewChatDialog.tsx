@@ -35,7 +35,11 @@ import {
   HarnessMenuNavigationLabel,
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
-import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import {
+  ComposerConfigSections,
+  type ComposerConfigSection,
+} from "@/components/composer/ComposerConfigSections";
+import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 import { buildFusionSections } from "@/components/composer/fusionSections";
 import {
   compactModelTriggerLabel,
@@ -1438,6 +1442,8 @@ export function AgentHarnessPicker({
   autoHarnessActive = false,
   onSelectAutoHarness,
   openNonce = 0,
+  cyclePreview,
+  onDismissCyclePreview,
   blockedReasons,
   onPrefetchEntries,
 }: {
@@ -1514,6 +1520,8 @@ export function AgentHarnessPicker({
   onSelectAutoHarness?: () => void;
   /** Bump to open the menu imperatively (the landing's model-picker hotkey). */
   openNonce?: number;
+  cyclePreview?: ComposerConfigSection;
+  onDismissCyclePreview?: () => void;
   /** Agent id → why the target can't run it; those rows render disabled. */
   blockedReasons?: ReadonlyMap<string, string>;
   /** Called with the ids of rows the menu is about to show. */
@@ -1865,6 +1873,8 @@ export function AgentHarnessPicker({
   return (
     <HarnessPicker
       modal={dropdownModal}
+      cyclePreview={cyclePreview}
+      onDismissCyclePreview={onDismissCyclePreview}
       open={open}
       onOpenChange={(next) => {
         if (!next) {
@@ -3930,6 +3940,128 @@ export function NewChatLandingScreen() {
     setCostControlMode(null);
     rememberPickerOptions(selectedNativeHarness, { model: modelUid, effort: "", routing: "off" });
   };
+  const modelSection: ComposerConfigSection | undefined =
+    sandboxHasModelCatalog ||
+    supportsModelPicker ||
+    supportsPermissionMode ||
+    supportsDevinMode ||
+    selectedNativeHarness === "codex-native"
+      ? {
+          testId: "new-chat-landing-agent-models",
+          header: "Models",
+          leading: (
+            <>
+              {sandboxHasModelCatalog &&
+                !sandboxSelectedUnsupported &&
+                sandboxModels.data?.provider_label && (
+                  <div
+                    className="px-2 py-1 text-xs text-muted-foreground"
+                    data-testid="sandbox-model-provider"
+                  >
+                    {sandboxModels.data.provider_label}
+                  </div>
+                )}
+              {selectedNativeHarness === "pi-native" && (
+                <Input
+                  aria-label="Search models"
+                  placeholder="Search models…"
+                  value={pickerModelSearch}
+                  onChange={(event) => setPickerModelSearch(event.target.value)}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  data-testid="new-chat-landing-agent-model-search"
+                />
+              )}
+              {pickerModelsLoading && pickerModelOptions.length === 0 && (
+                <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
+              )}
+              {!pickerModelsLoading && pickerModelOptions.length === 0 && (
+                <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
+                  {pickerModelsError?.message ?? "Models unavailable"}
+                </div>
+              )}
+            </>
+          ),
+          choices: [
+            // Default can't launch once the provider rules the harness out.
+            ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
+            (!sandboxInferenceConfigured &&
+              pickerModelOptions.length > 0 &&
+              !pickerModelOptions.some((option) => option.isDefault))
+              ? [
+                  {
+                    key: "__default__",
+                    label: "Default",
+                    checked: !routingOn && pickedModel === "",
+                    onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
+                    testId: "new-chat-landing-agent-model-default",
+                  },
+                ]
+              : []),
+            ...pickerModelOptions.map((option) => ({
+              key: option.id,
+              label: visibleModelLabel(nativeModelLabel(option)),
+              checked:
+                !routingOn &&
+                (option.fusion !== undefined
+                  ? isFusionModelUid(pickedModel) ||
+                    (pickedModel === "" && option.isDefault === true)
+                  : pickedModel === option.id || (pickedModel === "" && option.isDefault === true)),
+              // The Fusion row always opens its Lead/Sidekick selectors,
+              // even when Fusion is the catalog default (routing it
+              // through MODEL_SELECT_DEFAULT would hide them).
+              onSelect: option.fusion
+                ? () => selectFusionModel(option.fusion!.default)
+                : () => selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+              testId: `new-chat-landing-agent-model-${option.id}`,
+              title: nativeModelTooltip(option),
+              className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
+            })),
+          ],
+        }
+      : undefined;
+  const effortSection: ComposerConfigSection | undefined =
+    pickerEffortOptions.length > 0
+      ? {
+          testId: "new-chat-landing-agent-efforts",
+          header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
+          choices: [
+            {
+              key: "__default__",
+              label: "Default",
+              checked: !routingOn && pickedEffort === "",
+              disabled: routingOn,
+              onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
+              testId: "new-chat-landing-agent-effort-default",
+            },
+            ...pickerEffortOptions.map((option) => ({
+              key: option.value,
+              label: option.label,
+              checked: !routingOn && pickedEffort === option.value,
+              disabled: routingOn,
+              onSelect: () => selectPickerEffort(option.value),
+              testId: `new-chat-landing-agent-effort-${option.value}`,
+            })),
+          ],
+        }
+      : undefined;
+  const fusionSections: readonly ComposerConfigSection[] | undefined =
+    pickerFusion !== undefined && fusionSelected && !routingOn
+      ? buildFusionSections({
+          descriptor: pickerFusion,
+          modelUid: fusionModelUid,
+          testIdPrefix: "new-chat-landing-agent",
+          onChange: selectFusionModel,
+        })
+      : undefined;
+  const { preview, dismissPreview } = useComposerConfigCycleHotkeys(
+    modelSection?.choices,
+    effortSection?.choices ?? fusionSections?.[1]?.choices.filter(({ key }) => key !== "__fast__"),
+    !!selectedAgent &&
+      isEntryConfigurable(selectedAgent) &&
+      !noExecutionTargetSelected &&
+      !creating &&
+      (!pickerLoading || pickerInteractiveWhileLoading),
+  );
   const selectedConfigContent =
     selectedAgent && isEntryConfigurable(selectedAgent) ? (
       <>
@@ -3990,137 +4122,21 @@ export function NewChatLandingScreen() {
               : undefined
           }
           models={
-            sandboxHasModelCatalog ||
-            supportsModelPicker ||
-            supportsPermissionMode ||
-            supportsDevinMode ||
-            selectedNativeHarness === "codex-native"
-              ? {
-                  testId: "new-chat-landing-agent-models",
-                  header: "Models",
-                  leading: (
-                    <>
-                      {sandboxHasModelCatalog &&
-                        !sandboxSelectedUnsupported &&
-                        sandboxModels.data?.provider_label && (
-                          <div
-                            className="px-2 py-1 text-xs text-muted-foreground"
-                            data-testid="sandbox-model-provider"
-                          >
-                            {sandboxModels.data.provider_label}
-                          </div>
-                        )}
-                      {selectedNativeHarness === "pi-native" && (
-                        <Input
-                          aria-label="Search models"
-                          placeholder="Search models…"
-                          value={pickerModelSearch}
-                          onChange={(event) => setPickerModelSearch(event.target.value)}
-                          onKeyDown={(event) => event.stopPropagation()}
-                          data-testid="new-chat-landing-agent-model-search"
-                        />
-                      )}
-                      {pickerModelsLoading && pickerModelOptions.length === 0 && (
-                        <div className="px-2 py-1 text-xs text-muted-foreground">
-                          Loading models…
-                        </div>
-                      )}
-                      {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-                        <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
-                          {pickerModelsError?.message ?? "Models unavailable"}
-                        </div>
-                      )}
-                    </>
-                  ),
-                  choices: [
-                    // Default can't launch once the provider rules the harness out.
-                    ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
-                    (!sandboxInferenceConfigured &&
-                      pickerModelOptions.length > 0 &&
-                      !pickerModelOptions.some((option) => option.isDefault))
-                      ? [
-                          {
-                            key: "__default__",
-                            label: "Default",
-                            checked: !routingOn && pickedModel === "",
-                            onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
-                            testId: "new-chat-landing-agent-model-default",
-                          },
-                        ]
-                      : []),
-                    ...pickerModelOptions
-                      .filter((option) =>
-                        pickerModelSearch
-                          .toLowerCase()
-                          .trim()
-                          .split(/\s+/)
-                          .every((term) =>
-                            `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
-                          ),
-                      )
-                      .map((option) => ({
-                        key: option.id,
-                        label: visibleModelLabel(nativeModelLabel(option)),
-                        checked:
-                          !routingOn &&
-                          (option.fusion !== undefined
-                            ? isFusionModelUid(pickedModel) ||
-                              (pickedModel === "" && option.isDefault === true)
-                            : pickedModel === option.id ||
-                              (pickedModel === "" && option.isDefault === true)),
-                        // The Fusion row always opens its Lead/Sidekick selectors,
-                        // even when Fusion is the catalog default (routing it
-                        // through MODEL_SELECT_DEFAULT would hide them).
-                        onSelect: option.fusion
-                          ? () => selectFusionModel(option.fusion!.default)
-                          : () =>
-                              selectPickerModel(
-                                option.isDefault ? MODEL_SELECT_DEFAULT : option.id,
-                              ),
-                        testId: `new-chat-landing-agent-model-${option.id}`,
-                        title: nativeModelTooltip(option),
-                        className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
-                      })),
-                  ],
-                }
-              : undefined
+            modelSection && {
+              ...modelSection,
+              choices: modelSection.choices.filter(
+                (choice) =>
+                  choice.key === "__default__" ||
+                  pickerModelSearch
+                    .toLowerCase()
+                    .trim()
+                    .split(/\s+/)
+                    .every((term) => `${choice.key} ${choice.label}`.toLowerCase().includes(term)),
+              ),
+            }
           }
-          efforts={
-            pickerEffortOptions.length > 0
-              ? {
-                  testId: "new-chat-landing-agent-efforts",
-                  header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
-                  choices: [
-                    {
-                      key: "__default__",
-                      label: "Default",
-                      checked: !routingOn && pickedEffort === "",
-                      disabled: routingOn,
-                      onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
-                      testId: "new-chat-landing-agent-effort-default",
-                    },
-                    ...pickerEffortOptions.map((option) => ({
-                      key: option.value,
-                      label: option.label,
-                      checked: !routingOn && pickedEffort === option.value,
-                      disabled: routingOn,
-                      onSelect: () => selectPickerEffort(option.value),
-                      testId: `new-chat-landing-agent-effort-${option.value}`,
-                    })),
-                  ],
-                }
-              : undefined
-          }
-          extra={
-            pickerFusion !== undefined && fusionSelected && !routingOn
-              ? buildFusionSections({
-                  descriptor: pickerFusion,
-                  modelUid: fusionModelUid,
-                  testIdPrefix: "new-chat-landing-agent",
-                  onChange: selectFusionModel,
-                })
-              : undefined
-          }
+          efforts={effortSection}
+          extra={fusionSections}
         />
       </>
     ) : null;
@@ -7276,6 +7292,14 @@ export function NewChatLandingScreen() {
                     the selected entry's submenu owns run configuration. */}
                       <AgentHarnessPicker
                         openNonce={modelPickerOpenNonce}
+                        cyclePreview={
+                          preview === "models"
+                            ? modelSection
+                            : preview === "efforts"
+                              ? (effortSection ?? fusionSections?.[1])
+                              : undefined
+                        }
+                        onDismissCyclePreview={dismissPreview}
                         agentEntries={agentEntries}
                         harnessEntries={harnessEntries}
                         blockedReasons={sandboxSelected ? sandboxBlockedReasons : undefined}

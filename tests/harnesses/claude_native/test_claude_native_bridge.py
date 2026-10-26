@@ -8114,6 +8114,46 @@ def test_read_user_effort_level_returns_none_when_settings_missing(
     assert claude_native_bridge.read_user_effort_level() is None
 
 
+@pytest.mark.parametrize(
+    ("claude_args", "expected"),
+    [
+        (("--effort", "xhigh"), "xhigh"),
+        (("--effort=max",), "max"),
+        (("--effort", "low", "--model", "opus", "--effort", "xhigh"), "xhigh"),
+        (("--model", "opus"), "high"),
+        (("--effort", "ultra"), "high"),
+        (("--effort", "xhigh", "--effort", "ultra"), "high"),
+        (("--effort", "low", "--effort="), "low"),
+        (("--effort", "low", "--effort", "--verbose"), "low"),
+        (("--effort", "XHIGH"), "xhigh"),
+        (("--effort", "LOW", "--effort="), "low"),
+        (("--effort", " max\n"), "max"),
+        (("--effort", "low", "--effort", " "), "high"),
+    ],
+)
+def test_resolve_launch_effort_level_prefers_passed_effort(
+    claude_args: tuple[str, ...],
+    expected: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A valid pass-through ``--effort`` wins over settings.json's ``effortLevel``.
+
+    Claude falls back to the wrapper's invocation ``effortLevel`` when the last
+    ``--effort`` is malformed, so it must carry exactly the effort read from the args.
+    """
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    assert claude_native_bridge.resolve_launch_effort_level(claude_args) == expected
+    invocation = _load_invocation_settings(augment_claude_args(claude_args, bridge_dir=tmp_path))
+    settings.unlink()
+    passed_effort = claude_native_bridge.resolve_launch_effort_level(claude_args)
+    assert passed_effort in (None, expected)
+    assert invocation.get("effortLevel") == passed_effort
+
+
 # ---------------------------------------------------------------------------
 # launch_model storage and retrieval
 # ---------------------------------------------------------------------------

@@ -3291,10 +3291,11 @@ def register_core_routes(
                 forward_failed = (
                     unsupported is None
                     and not unconfirmed
-                    and _surface_model_change_forward_failure(
+                    and await _surface_model_change_forward_failure(
                         session_id,
                         updated.model_override,
                         _model_forward,
+                        conversation_store,
                     )
                 )
                 if conv is not None and (

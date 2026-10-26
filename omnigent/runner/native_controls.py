@@ -115,6 +115,17 @@ async def _drive_claude_pane(
         return await asyncio.to_thread(function, *args, **kwargs)
 
 
+def _claude_waits_on_person(exc: BaseException) -> bool:
+    """Whether the switch was refused only because the pane awaits the person's answer."""
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudeSignInPending,
+        ClaudeTerminalDialog,
+        ClaudeUserPromptPending,
+    )
+
+    return isinstance(exc, ClaudeSignInPending | ClaudeTerminalDialog | ClaudeUserPromptPending)
+
+
 def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
     """
     Return a model-switch next step when the terminal is waiting on the person, else ``None``.
@@ -1421,6 +1432,7 @@ def build_native_controls(
                 content={
                     "error": "claude_native_model_failed",
                     "detail": _claude_model_change_blocked_detail(exc) or safe_detail,
+                    **({"waiting_on_person": True} if _claude_waits_on_person(exc) else {}),
                 },
             )
 

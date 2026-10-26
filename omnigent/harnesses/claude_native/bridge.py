@@ -2817,7 +2817,7 @@ def augment_claude_args(
         launch_model=_arg_value(claude_args, "--model"),
         launch_permission_mode=_arg_value(claude_args, "--permission-mode"),
         launch_bypass_permissions=_args_request_bypass_permissions(claude_args),
-        launch_effort=_arg_value(claude_args, "--effort"),
+        launch_effort=_launch_effort_arg(claude_args),
         subagent_router_dir=subagent_router_dir,
         turn_routing=turn_routing,
     )
@@ -2877,6 +2877,12 @@ def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
             if candidate and not candidate.startswith("--"):
                 value = candidate
     return value
+
+
+def _launch_effort_arg(args: tuple[str, ...]) -> str | None:
+    """Return the valid ``--effort`` in ``args``, trimmed and lowercased as Claude does."""
+    effort = (_arg_value(args, "--effort") or "").strip().lower()
+    return effort if effort in CLAUDE_EFFORTS else None
 
 
 def _args_request_bypass_permissions(args: tuple[str, ...]) -> bool:
@@ -6257,9 +6263,16 @@ def _clear_composer(socket_path: str, tmux_target: str) -> None:
     # removes the space when the input box already held focus.
     _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
-        box = _composer_box(_capture_pane(socket_path, tmux_target))
+        pane = _capture_pane(socket_path, tmux_target)
+        box = _composer_box(pane)
         settled = box is not None and box.framed and len(box.rows) <= 1
         if not settled and round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+            delivery_diagnostics.record_composer_not_cleared(
+                pane=pane,
+                rows=None if box is None else box.rows,
+                framed=box is not None and box.framed,
+                rule_count=sum(1 for line in pane.splitlines() if _is_box_rule(line)),
+            )
             raise ClaudeComposerNotCleared(
                 "A draft left in Claude Code's input box could not be cleared, so nothing "
                 "was sent. Open the terminal, clear the input box, then retry."
@@ -8516,7 +8529,7 @@ def read_user_effort_level() -> str | None:
     Return the user's configured Claude Code effort level, if any.
 
     Read client-side from ``effortLevel`` in ``~/.claude/settings.json`` —
-    the level the wrapped ``claude`` actually runs at (we pass no ``--effort``).
+    the level the wrapped ``claude`` runs at when no ``--effort`` is passed.
 
     :returns: A recognized effort, e.g. ``"medium"``; ``None`` when unset,
         unreadable, or not a valid Claude effort (fail-soft, never blocks launch).
@@ -8535,6 +8548,23 @@ def read_user_effort_level() -> str | None:
     if isinstance(effort, str) and effort in CLAUDE_EFFORTS:
         return effort
     return None
+
+
+def resolve_launch_effort_level(claude_args: tuple[str, ...]) -> str | None:
+    """
+    Return the effort the wrapped ``claude`` will run at for ``claude_args``.
+
+    The last ``--effort`` with a value wins if it names a valid effort; after a
+    later empty or flag-like ``--effort``, Claude falls back to that same effort
+    via the invocation ``effortLevel`` from :func:`augment_claude_args`.
+    Otherwise fall back to :func:`read_user_effort_level`.
+
+    :param claude_args: Pass-through Claude CLI args, e.g.
+        ``("--effort", "xhigh")``.
+    :returns: A recognized effort, e.g. ``"xhigh"``; ``None`` when neither
+        the args nor ``~/.claude/settings.json`` carry a valid one.
+    """
+    return _launch_effort_arg(claude_args) or read_user_effort_level()
 
 
 def _usage_from_transcript_entry(entry: _JsonObject) -> dict[str, int] | None:

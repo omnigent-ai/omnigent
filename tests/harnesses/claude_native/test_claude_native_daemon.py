@@ -18,6 +18,7 @@ import click
 import httpx
 import pytest
 
+from omnigent.harnesses.claude_native import bridge as claude_native_bridge
 from omnigent.harnesses.claude_native import main as claude_native
 from omnigent.harnesses.claude_native.bridge import BRIDGE_ID_LABEL_KEY
 from omnigent.harnesses.codex_native import main as codex_native
@@ -221,6 +222,33 @@ async def test_create_claude_session_persists_terminal_launch_args() -> None:
     assert b"--dangerously-skip-permissions" in body
     # bridge_id=None → the bridge-id label must NOT be written.
     assert BRIDGE_ID_LABEL_KEY.encode() not in body
+
+
+async def test_create_claude_session_stamps_passed_effort_over_settings(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pass-through ``--effort`` is the effort Claude runs at, so it is stamped."""
+    settings = tmp_path / "settings.json"
+    settings.write_text(json.dumps({"effortLevel": "high"}), encoding="utf-8")
+    monkeypatch.setattr(claude_native_bridge, "_USER_CLAUDE_SETTINGS_PATH", settings)
+    captured: dict[str, bytes] = {}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """Capture the multipart create body."""
+        captured["body"] = request.content
+        return httpx.Response(201, json={"session_id": "conv_new"})
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="https://e.com"
+    ) as client:
+        await claude_native._create_claude_session(
+            client,
+            b"bundle",
+            bridge_id=None,
+            claude_args=("--model", "opus", "--effort", "xhigh"),
+        )
+
+    assert b'"reasoning_effort": "xhigh"' in captured["body"]
 
 
 def _install_daemon_seam_mocks(
