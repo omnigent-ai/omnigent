@@ -59,6 +59,7 @@ import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blo
 import {
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
+  hasPendingOwnElicitation,
   imagePreview,
   isTextBlock,
   keyedAttachments,
@@ -453,14 +454,16 @@ export function WorkingIndicator() {
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
-  const rootHasPendingElicitation = useChatStore((s) => hasPendingElicitationBlock(s.blocks));
+  const rootHasOwnPendingElicitation = useChatStore((s) =>
+    hasPendingOwnElicitation(s.blocks, s.conversationId),
+  );
   const rootAgentWorking = useAgentTurnActive();
   const terminalFirst = useTerminalFirst();
   const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
   const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
-  const hasPendingElicitation = scopedConversationId
-    ? hasPendingElicitationBlock(scopedState.blocks)
-    : rootHasPendingElicitation;
+  const hasOwnPendingElicitation = scopedConversationId
+    ? hasPendingOwnElicitation(scopedState.blocks, scopedConversationId)
+    : rootHasOwnPendingElicitation;
   const agentWorking = scopedConversationId
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
@@ -470,16 +473,14 @@ export function WorkingIndicator() {
   // thinking). While the turn is active the shimmer shows, with the pill beside it.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
   const label = workingIndicatorLabel(tick, blockedOn, {
-    answerableInChat: hasPendingElicitation,
+    answerableInChat: hasOwnPendingElicitation,
     // The toggle switches to the root session's terminal, not a side chat's.
     terminalView: !scopedConversationId && (terminalFirst?.isTerminalFirst ?? false),
   });
   return (
     <>
-      {/* Sole aria-live region for the working state. A stable "Working…" (not
-          the rotating label) so screen readers announce the turn once, without
-          re-announcing every few seconds; a block reason is announced instead.
-          The visible shimmer below stays aria-hidden. */}
+      {/* Sole aria-live region: a stable "Working…" or block reason, so the rotating
+          label isn't re-announced. The visible shimmer below stays aria-hidden. */}
       <span role="status" aria-live="polite" className="sr-only">
         {blockedOn ? label : "Working…"}
       </span>

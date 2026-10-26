@@ -752,6 +752,22 @@ export type AnyBlock =
   | ResponseEndBlock;
 
 /**
+ * Whether a pending elicitation card answers `sessionId`'s own prompt. Cards
+ * mirrored from a sub-agent target the child session, so they don't count.
+ */
+export function hasPendingOwnElicitation(
+  blocks: readonly AnyBlock[],
+  sessionId: string | null,
+): boolean {
+  return blocks.some(
+    (b) =>
+      b.type === "elicitation" &&
+      b.status === "pending" &&
+      (b.targetSessionId == null || b.targetSessionId === sessionId),
+  );
+}
+
+/**
  * Item-id prefix marking a provisional, in-flight assistant-text block —
  * a live-streaming preview that lives in `blocks` until its authoritative
  * `text_done` replaces it. Never a real server item id.

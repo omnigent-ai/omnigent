@@ -220,6 +220,7 @@ describe("WorkingIndicator", () => {
     afterEach(() => {
       cleanup();
       conversationRegistry.release(sideChatId);
+      useChatStore.setState({ conversationId: null });
     });
 
     function renderInTerminalFirstSession(scope: string | null = null) {
@@ -253,6 +254,42 @@ describe("WorkingIndicator", () => {
       expect(screen.getByTestId("working-indicator")).toHaveTextContent(
         "Blocked on: permission prompt",
       );
+    });
+
+    it("still points at the terminal when the only pending card is a sub-agent's", () => {
+      useChatStore.setState({
+        conversationId: "conv_root",
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [{ ...pendingApproval, targetSessionId: "conv_sub_agent" }],
+      });
+      renderInTerminalFirstSession();
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Waiting for your approval in the agent's terminal. Open the Terminal view to respond.",
+      );
+    });
+
+    it("keeps the block reason beside a side chat's own pending card", () => {
+      conversationRegistry.acquire(sideChatId).setState({
+        sessionStatus: "running",
+        blockedOn: "permission prompt",
+        blocks: [{ ...pendingApproval, targetSessionId: sideChatId }],
+      });
+      renderInTerminalFirstSession(sideChatId);
+
+      expect(screen.getByTestId("working-indicator")).toHaveTextContent(
+        "Blocked on: permission prompt",
+      );
+    });
+
+    it("leaves out the Terminal view hint outside a terminal-first session", () => {
+      useChatStore.setState({ sessionStatus: "running", blockedOn: "permission prompt" });
+      render(<WorkingIndicator />);
+
+      const indicator = screen.getByTestId("working-indicator");
+      expect(indicator).toHaveTextContent("Waiting for your approval in the agent's terminal.");
+      expect(indicator).not.toHaveTextContent("Open the Terminal view");
     });
 
     it("does not offer the root session's Terminal view from a side chat", () => {
