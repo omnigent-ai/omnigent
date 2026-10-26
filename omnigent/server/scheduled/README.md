@@ -138,8 +138,10 @@ Each key is the occurrence's host ID, or the workspace ID as a decimal string fo
 a task with no host. Host IDs are bare lowercase 32-character hex, the same string
 a host or sandbox sends as its routing key. The scheduler calls `owned_hosts` once
 per page of due tasks, of Run now requests, and of expired startups, with each key
-listed once. Keys it omits are skipped until a later poll. If the call raises, or exceeds
-`recovery_seconds` during recovery, the replica owns none of that page this pass.
+listed once. If the call raises, or exceeds `recovery_seconds` during recovery, the
+replica owns none of that page. Due tasks it skips are checked again on the next
+poll; skipped Run now requests and expired startups are checked again once their
+scan starts over.
 `owned_hosts` is awaited during due-task polling, so it must return promptly and
 respect cancellation.
 

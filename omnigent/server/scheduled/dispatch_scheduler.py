@@ -839,7 +839,7 @@ class PersistentTaskScheduler:
         except Exception:
             _logger.exception(
                 "Could not check which of %d hosts this server owns; "
-                "will check them again on the next poll",
+                "will check them again on a later poll",
                 len(requested),
                 extra=debug_event("scheduled_task_operation_failed", operation=operation),
             )

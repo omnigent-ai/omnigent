@@ -725,16 +725,17 @@ async def test_recovery_skips_unowned_hosts_and_ownership_errors(store) -> None:
     clock.advance(120)
     runs = store.list_expired_starting_runs(int(clock.now()))
     checked = []
+    failing = {runs[0].host_id}
+    owned_keys = {runs[-1].host_id}
 
     async def owned(keys):
         checked.extend(keys)
-        if keys == [runs[0].host_id]:
+        if set(keys) & failing:
             raise RuntimeError("ownership lookup unavailable")
-        return [key for key in keys if key == runs[-1].host_id]
+        return [key for key in keys if key in owned_keys]
 
     async def recover(run):
         assert current_workspace_id() == 42
-        assert run == runs[-1]
         return "running"
 
     recovery = AsyncMock(side_effect=recover)
@@ -752,6 +753,16 @@ async def test_recovery_skips_unowned_hosts_and_ownership_errors(store) -> None:
         assert store.list_expired_starting_runs(int(clock.now())) == runs[:2]
         with workspace_scope(42):
             assert store.list_runs(runs[-1].scheduled_task_id)[0][0].status == "running"
+
+        # A failed lookup's page is checked again only after the scan wraps.
+        failing.clear()
+        owned_keys.add(runs[0].host_id)
+        for _ in range(2):
+            await scheduler.poll_once()
+            await _drain(scheduler)
+        assert checked == [run.host_id for run in runs] + [runs[0].host_id]
+        assert recovery.await_args_list[-1].args == (runs[0],)
+        assert store.list_expired_starting_runs(int(clock.now())) == [runs[1]]
     finally:
         await scheduler.stop()
 
