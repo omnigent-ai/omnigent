@@ -6,9 +6,15 @@ import {
   type ImportedSessionRef,
   type LocalImportResult,
 } from "@/lib/sessionsApi";
+import type * as SessionsApiModule from "@/lib/sessionsApi";
 import { useSessionImportStore } from "./sessionImport";
 
-vi.mock("@/lib/sessionsApi", () => ({ importLocalSessions: vi.fn() }));
+// Only the network call is faked; ApiError / importErrorFromException stay real
+// so the store's mapping of a thrown error to an ImportErrorInfo is exercised.
+vi.mock("@/lib/sessionsApi", async (importOriginal) => ({
+  ...(await importOriginal<typeof SessionsApiModule>()),
+  importLocalSessions: vi.fn(),
+}));
 
 const importMock = vi.mocked(importLocalSessions);
 
@@ -18,6 +24,11 @@ const DONE: LocalImportResult = {
   failed: 0,
   sessions: [],
   failures: [],
+  skipped: 0,
+  skippedSessions: [],
+  total: null,
+  complete: true,
+  error: null,
 };
 
 /** A stream the test settles by hand, so the in-flight state can be inspected. */
@@ -45,6 +56,8 @@ beforeEach(() => {
   useSessionImportStore.setState({
     importing: false,
     importedCount: 0,
+    streamed: [],
+    progress: null,
     request: null,
     result: null,
     error: null,
@@ -56,7 +69,7 @@ afterEach(() => {
 });
 
 describe("useSessionImportStore", () => {
-  it("exposes the in-flight import and the imported count until the stream settles", async () => {
+  it("exposes the in-flight import and the imported sessions until the stream settles", async () => {
     const stream = pendingImport();
     const queryClient = new QueryClient();
     const invalidate = spyInvalidate(queryClient);
@@ -65,11 +78,22 @@ describe("useSessionImportStore", () => {
       .getState()
       .start({ hostId: "host_1", source: "claude", limit: 25 }, queryClient);
     expect(useSessionImportStore.getState().importing).toBe(true);
-    expect(importMock).toHaveBeenCalledWith("host_1", "claude", 25, expect.any(Function));
+    expect(importMock).toHaveBeenCalledWith(
+      "host_1",
+      "claude",
+      25,
+      expect.any(Function),
+      undefined,
+      { onProgress: expect.any(Function) },
+    );
 
     stream.session({ id: "c1", title: "One" });
     stream.session({ id: "c2", title: null });
     expect(useSessionImportStore.getState().importedCount).toBe(2);
+    expect(useSessionImportStore.getState().streamed).toEqual([
+      { id: "c1", title: "One" },
+      { id: "c2", title: null },
+    ]);
     expect(useSessionImportStore.getState().importing).toBe(true);
 
     stream.resolve(DONE);
@@ -83,7 +107,7 @@ describe("useSessionImportStore", () => {
     expect(invalidate).toHaveBeenCalledWith({ queryKey: ["conversations"] });
   });
 
-  it("keeps the imported count and records the message when the import fails", async () => {
+  it("keeps the imported count and records a classified error when the import fails", async () => {
     importMock.mockImplementation(async (_host, _source, _limit, onSession) => {
       onSession?.({ id: "c1", title: "One" });
       throw new Error("Host went offline");
@@ -95,7 +119,15 @@ describe("useSessionImportStore", () => {
 
     const state = useSessionImportStore.getState();
     expect(state.importing).toBe(false);
-    expect(state.error).toBe("Host went offline");
+    // A plain Error (no import code) keeps its message and is offered for retry.
+    expect(state.error).toEqual({
+      code: null,
+      message: "Host went offline",
+      retryable: true,
+      errorId: null,
+      fixCommands: [],
+      hostName: null,
+    });
     expect(state.result).toBeNull();
     expect(state.importedCount).toBe(1);
   });
@@ -119,6 +151,7 @@ describe("useSessionImportStore", () => {
       25,
       expect.any(Function),
       "thread-9",
+      { onProgress: expect.any(Function) },
     );
     stream.resolve(DONE);
     await first;

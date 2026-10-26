@@ -10,7 +10,7 @@ import re
 import tarfile
 import time
 import uuid
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping, Sequence
 from contextlib import asynccontextmanager, suppress
 from importlib import import_module
 from itertools import batched, groupby
@@ -561,6 +561,35 @@ def _session_id_from_request(request: Request) -> str | None:
     """
     match = _SESSION_PATH_RE.search(request.url.path)
     return match.group(1) if match else None
+
+
+# A 422 audit row names the rejected fields by schema path and pydantic's built-in error
+# type, never the rejected values; list indices become "*" and any part that isn't an
+# identifier "?".
+_VALIDATION_AUDIT_MAX_ERRORS = 8
+_VALIDATION_AUDIT_MAX_DEPTH = 12
+_VALIDATION_AUDIT_PART_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]{0,63}")
+
+
+def _validation_audit_part(part: object) -> str:
+    if isinstance(part, int):
+        return "*"
+    if isinstance(part, str) and _VALIDATION_AUDIT_PART_RE.fullmatch(part):
+        return part
+    return "?"
+
+
+def _validation_audit_errors(errors: Sequence[Any]) -> str:
+    """``loc.path:error_type`` for the first few validation errors, ``;``-joined."""
+    entries = []
+    for error in errors[:_VALIDATION_AUDIT_MAX_ERRORS]:
+        if not isinstance(error, Mapping):
+            continue
+        loc = error.get("loc")
+        parts = tuple(loc)[:_VALIDATION_AUDIT_MAX_DEPTH] if isinstance(loc, (list, tuple)) else ()
+        path = ".".join(_validation_audit_part(part) for part in parts) or "?"
+        entries.append(f"{path}:{_validation_audit_part(error.get('type'))}")
+    return ";".join(entries)
 
 
 def _error_audit_extra(
@@ -2523,6 +2552,12 @@ def create_app(
             error_impact=exc.impact.value,
             error_phase=exc.phase.value,
         )
+        # An import rejected before its stream starts (host offline, unreachable, ...)
+        # is a 4xx whose only specific signal is the import code in the body; record it
+        # too.
+        import_code = exc.details.get("import_code") if isinstance(exc.details, dict) else None
+        if isinstance(import_code, str):
+            add_audit_attrs(import_code=import_code)
         if exc.code == ErrorCode.RUNNER_UNAVAILABLE:
             # A session state, not a fault: the user's machine is asleep or
             # the host disconnected, and clients render it as a reconnect
@@ -2573,7 +2608,9 @@ def create_app(
             )
         return JSONResponse(
             status_code=exc.http_status,
-            content={"error": {"code": exc.code, "message": exc.message}},
+            # ``details`` only adds fields: ``code``/``message`` keep the shape
+            # every existing client parses.
+            content={"error": {**exc.details, "code": exc.code, "message": exc.message}},
         )
 
     @app.exception_handler(RequestValidationError)
@@ -2598,6 +2635,11 @@ def create_app(
             error_category=ErrorCategory.USER.value,
             error_impact=ErrorImpact.BENIGN.value,
             error_phase=ErrorPhase.REQUEST.value,
+        )
+        errors = exc.errors()
+        add_audit_attrs(
+            validation_error_count=str(len(errors)),
+            validation_errors=_validation_audit_errors(errors),
         )
         return await request_validation_exception_handler(request, exc)
 
