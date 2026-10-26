@@ -1251,6 +1251,7 @@ def test_workspace_url_with_path_probes_nothing(
 
 def test_workspace_url_expands_when_mount_hidden_from_anonymous_probe(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A mount invisible to anonymous probes expands via a cached bearer.
 
@@ -1302,6 +1303,9 @@ def test_workspace_url_expands_when_mount_hidden_from_anonymous_probe(
         f"{_WORKSPACE_API_URL}/v1/me",
     ]
     assert [r["authorization"] for r in fake.requests] == [None, None, "Bearer tok-ws"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "(Databricks workspace-hosted omnigent)." in captured.err
 
 
 def test_workspace_url_hints_when_mount_dark_and_no_cached_grant(
@@ -1336,10 +1340,12 @@ def test_workspace_url_hints_when_mount_dark_and_no_cached_grant(
     # anonymous probes ran. A third request here would mean a Bearer
     # header was fabricated from nothing.
     assert [r["authorization"] for r in fake.requests] == [None, None]
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    # Hints go to stderr so a command's JSON stdout stays parseable.
+    assert captured.out == ""
     # The hint must name the remedy, otherwise the user is back to
     # debugging an opaque host-tunnel 404 on the bare workspace URL.
-    assert f"databricks auth login --host {_WORKSPACE}" in out
+    assert f"databricks auth login --host {_WORKSPACE}" in captured.err
 
 
 def test_workspace_url_hints_when_authed_probe_also_misses(
@@ -1375,10 +1381,11 @@ def test_workspace_url_hints_when_authed_probe_also_misses(
     # The authed retry ran and presented the cached bearer; without it
     # this test would be identical to the no-grant case.
     assert [r["authorization"] for r in fake.requests] == [None, None, "Bearer tok-ws"]
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert captured.out == ""
     # The message must say credentials were already tried — pointing
     # the user at `auth login` alone would send them in a circle.
-    assert "even with the cached workspace credentials" in out
+    assert "even with the cached workspace credentials" in captured.err
 
 
 def test_workspace_url_skips_authed_probe_without_databricks_extra(
@@ -1585,12 +1592,15 @@ def test_resolve_server_url_works_without_writable_auth_state(
 
 def test_workspace_url_expands_web_ui_path_to_api_mount(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The guide's web-UI URL (``<ws>/omnigent``) expands to the API mount.
 
     The internal user guide hands out ``<ws>/omnigent`` for the browser;
     a user who pastes it into ``omnigent login`` must reach the API mount
-    (``/api/2.0/omnigent``), not 404 the UI path's own /v1/me probe.
+    (``/api/2.0/omnigent``), not 404 the UI path's own /v1/me probe. The
+    desktop passes this URL to ``host status --json`` and parses its
+    stdout, so the expansion notice must stay on stderr.
     """
 
     probed = _scripted_normalizer_httpx(
@@ -1606,6 +1616,9 @@ def test_workspace_url_expands_web_ui_path_to_api_mount(
     assert cli_mod._workspace_api_server_url(f"{_WORKSPACE}/omnigent") == _WORKSPACE_API_URL
     # The bare root and its API mount were probed — never the UI path itself.
     assert f"{_WORKSPACE}/omnigent/v1/me" not in probed
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "(Databricks workspace-hosted omnigent)." in captured.err
 
 
 def test_workspace_url_web_ui_path_left_alone_off_workspace(

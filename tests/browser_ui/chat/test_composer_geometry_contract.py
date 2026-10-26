@@ -263,10 +263,10 @@ def test_attachment_chips_follow_the_row_grid(
         if rail.is_visible():
             page.keyboard.press("Control+Alt+BracketRight")
             expect(rail).not_to_be_visible()
-    names = ["alpha.txt", "beta.txt", "gamma.txt"]
+    names = [f"notes-{index:02}.md" for index in range(37)]
     _attach(page, names)
     chips = [
-        box(page.get_by_role("button", name=f"Remove {name}").locator("..")) for name in names
+        box(page.get_by_role("button", name=f"Remove {name}").locator("..")) for name in names[:3]
     ]
     for chip in chips[1:]:
         assert chip["height"] == pytest.approx(chips[0]["height"], abs=TOLERANCE)
@@ -276,6 +276,24 @@ def test_attachment_chips_follow_the_row_grid(
     ]
     assert gaps[0] == pytest.approx(gaps[1], abs=TOLERANCE)
     assert chips[0]["x"] == pytest.approx(box(_input(page, surface))["x"], abs=TOLERANCE)
+    for control in (_input(page, surface), _submit(page, surface)):
+        bounds = box(control)
+        assert bounds["y"] >= -TOLERANCE, bounds
+        assert bounds["y"] + bounds["height"] <= DESKTOP["height"] + TOLERANCE, bounds
+    if surface == "live":
+        transcript = box(page.locator('[role="log"]'))
+        visible = min(transcript["y"] + transcript["height"], DESKTOP["height"]) - max(
+            transcript["y"], 0
+        )
+        assert visible >= DESKTOP["height"] / 4, transcript
+    first_remove = page.get_by_role("button", name=f"Remove {names[0]}")
+    expect(first_remove).to_be_in_viewport(ratio=1)
+    tray = first_remove.locator("../..")
+    last_remove = page.get_by_role("button", name=f"Remove {names[-1]}")
+    expect(last_remove).not_to_be_in_viewport()
+    tray.hover()
+    page.mouse.wheel(0, 1000)
+    expect(last_remove).to_be_in_viewport(ratio=1)
 
 
 def test_wrapped_attachment_rows_keep_the_grid(
