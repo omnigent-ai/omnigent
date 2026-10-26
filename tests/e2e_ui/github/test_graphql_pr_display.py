@@ -243,7 +243,9 @@ def test_pr_appears_in_composer_and_workspace(
     expect(rail.get_by_role("tab", name="Pull Requests")).to_have_attribute(
         "aria-selected", "true"
     )
-    expect(rail.get_by_role("combobox", name="Session pull request")).to_contain_text(_TITLE)
+    expect(
+        rail.get_by_role("group", name="Session pull requests").locator('[aria-current="true"]')
+    ).to_contain_text(_TITLE)
     expect(rail.get_by_role("link", name=f"{_TITLE} #42")).to_have_attribute("href", _URL)
     expect(rail.get_by_text("Created from the active session checkout.")).to_be_visible()
     page.screenshot(path=str(tmp_path / "pr-displayed.png"), animations="disabled")

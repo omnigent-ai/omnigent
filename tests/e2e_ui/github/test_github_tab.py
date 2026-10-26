@@ -267,14 +267,15 @@ def test_pr_diff_retry_keeps_associations(
         "tab", name="Changes", exact=True
     ).click()
     expect(panel.get_by_role("alert")).to_have_text("GitHub could not load the PR diff.")
-    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    strip = panel.get_by_role("group", name="Session pull requests")
+    expect(strip).to_be_visible()
     expect(panel.get_by_text("No changes vs base.")).to_have_count(0)
     page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-error.png"))
     failed = False
     panel.get_by_role("button", name="Refresh", exact=True).click()
     expect(panel.get_by_role("alert")).to_have_count(0)
     expect(panel.locator("diffs-container")).to_have_count(1)
-    expect(panel.get_by_role("combobox", name="Session pull request")).to_be_visible()
+    expect(strip).to_be_visible()
     page.screenshot(path=str(tmp_path / f"pr-retry-{entry}-recovered.png"))
 
 
@@ -414,7 +415,9 @@ def test_composer_pr_link_opens_github_tab(
             expect(panel.get_by_role("tab", name="Pull Requests")).to_have_attribute(
                 "aria-selected", "true"
             )
-        expect(panel.get_by_text("Add the GitHub tab", exact=True)).to_be_visible(timeout=30_000)
+        expect(
+            panel.get_by_role("link", name=f"Add the GitHub tab #{_PR_NUMBER}", exact=True)
+        ).to_be_visible(timeout=30_000)
         expect(panel.get_by_label("Pull request status: Open")).to_be_visible()
         expect(
             panel.get_by_role("tablist", name="Pull request").get_by_role(
@@ -422,9 +425,11 @@ def test_composer_pr_link_opens_github_tab(
             )
         ).to_be_visible()
         if pr_count > 1:
-            expect(panel.get_by_role("combobox", name="Session pull request")).to_have_text(
-                f"example.com/acme/app #{_PR_NUMBER}"
-            )
+            expect(
+                panel.get_by_role("group", name="Session pull requests").locator(
+                    '[aria-current="true"]'
+                )
+            ).to_have_accessible_name(f"example.com/acme/app #{_PR_NUMBER}")
     finally:
         page.screenshot(path=tmp_path / "composer-pr-link-after-click.png", animations="disabled")
 

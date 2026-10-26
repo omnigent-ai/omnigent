@@ -5,6 +5,8 @@
 //
 //   usePullRequestInfo           — GET /resources/github
 //                                  repo / branch / base ref / associated PR + CI summary.
+//   usePullRequestInfos          — GET /resources/github?pr_url=<url> per tracked PR
+//                                  each PR's state + CI summary for the multi-PR strip.
 //   usePullRequestChangedFiles   — GET /resources/github/changes
 //                                  the PR's changed files (sidebar list).
 //   usePullRequestDiff           — GET /resources/github/diff
@@ -34,7 +36,7 @@
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useMutation, useQueries, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -495,6 +497,30 @@ export function usePullRequestInfo(
   });
 }
 
+/**
+ * Every tracked PR's info, sharing {@link usePullRequestInfo}'s per-PR cache
+ * entries, for the panel's multi-PR strip. Not polled and no turn-end
+ * invalidate of its own: the panel's selected-PR query does both for the session.
+ */
+export function usePullRequestInfos(
+  rawConversationId: string | undefined,
+  prUrls: readonly string[],
+) {
+  const conversationId = isTempConvId(rawConversationId) ? undefined : rawConversationId;
+  const serveable = useWorkspaceServeable(conversationId);
+  const retry = useRunnerOfflineRetry(serveable !== false);
+  return useQueries({
+    queries: prUrls.map((prUrl) => ({
+      queryKey: ["github-info", conversationId, prUrl],
+      queryFn: () => fetchPullRequestInfo(conversationId!, prUrl),
+      enabled: !!conversationId && serveable !== false,
+      retry,
+      retryDelay: runnerOfflineRetryDelay,
+      staleTime: 30_000,
+    })),
+  });
+}
+
 /** The account (a gh login) and/or base repo (a git remote name or `owner/repo`)
  *  to pin for this session's workspace. Either may be omitted to leave it as-is;
  *  an empty `account` clears the per-repo preference. */
@@ -677,6 +703,13 @@ export function useUpdateSessionPr(conversationId: string) {
     },
     onSuccess: async (info, body) => {
       await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
+      // Every cached PR's info carries the session's PR list, so the strip updates at once.
+      if (info.prs) {
+        queryClient.setQueriesData<PullRequestInfo>(
+          { queryKey: ["github-info", conversationId] },
+          (cached) => cached && { ...cached, prs: info.prs },
+        );
+      }
       queryClient.setQueryData(["github-info", conversationId], info);
       if (info.selected_pr_url) {
         queryClient.setQueryData(["github-info", conversationId, info.selected_pr_url], info);

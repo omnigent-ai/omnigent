@@ -14,6 +14,9 @@ from tests.e2e_ui.conftest import open_right_rail
 HOST = "git.example.test:8443"
 URL = f"https://{HOST}/team/sub/project/-/merge_requests/7"
 SECOND = f"https://{HOST}/team/sub/other/-/merge_requests/12"
+# Each MR's card label; GitLab has no default host, so the label keeps it.
+URL_LABEL = f"{HOST}/team/sub/project !7 — Add the widget"
+SECOND_LABEL = f"{HOST}/team/sub/other !12 — Fix another project"
 DISPLAY = {
     "id": "gitlab",
     "display_name": "GitLab",
@@ -221,9 +224,13 @@ def test_gitlab_panel_summary_and_diff(
             if mobile
             else page.get_by_role("complementary", name="Workspace")
         )
-    expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
-    expect(panel.get_by_role("heading", name="GitLab", exact=True)).to_be_visible()
-    expect(panel.get_by_text("!7", exact=True)).to_be_visible()
+    expect(panel.get_by_role("link", name="Add the widget !7", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    # With tracked MRs the header reads "Pull Requests"; its description names the provider.
+    expect(
+        panel.get_by_role("heading", name="Pull Requests", description="GitLab", exact=True)
+    ).to_be_visible()
     expect(panel.get_by_text("A widget from a nested GitLab project.", exact=True)).to_be_visible()
     expect(panel.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
     expect(panel.get_by_text(re.compile(r"1\s*pending"))).to_be_visible()
@@ -259,16 +266,17 @@ def test_gitlab_link_select_unlink(
     panel.get_by_role("button", name="Link a PR", exact=True).click()
     panel.get_by_role("textbox", name="Pull request URL").fill(SECOND)
     panel.get_by_role("button", name="Link", exact=True).click()
-    picker = panel.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_contain_text("!12")
-    expect(panel.get_by_text("Fix another project", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="team/sub/project !7").click()
-    expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="team/sub/other !12").click()
-    panel.get_by_role("button", name="Unlink PR", exact=True).click()
-    expect(picker).to_contain_text("!7")
+    strip = panel.get_by_role("group", name="Session pull requests")
+    first = strip.get_by_role("button", name=URL_LABEL, exact=True)
+    second = strip.get_by_role("button", name=SECOND_LABEL, exact=True)
+    expect(second).to_have_attribute("aria-current", "true")
+    expect(panel.get_by_role("link", name="Fix another project !12", exact=True)).to_be_visible()
+    first.click()
+    expect(panel.get_by_role("link", name="Add the widget !7", exact=True)).to_be_visible()
+    second.click()
+    strip.get_by_role("button", name=f"Unlink {SECOND_LABEL}", exact=True).click()
+    expect(second).to_have_count(0)
+    expect(first).to_have_attribute("aria-current", "true")
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("!7")
     page.screenshot(path=str(tmp_path / "gitlab-selection.png"), animations="disabled")
 
@@ -294,10 +302,12 @@ def test_gitlab_unlink_last_mr_clears_selection(
             if mobile
             else page.get_by_role("complementary", name="Workspace")
         )
-    expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible(timeout=30_000)
-    panel.get_by_role("button", name="Unlink PR", exact=True).click()
+    expect(panel.get_by_role("link", name="Add the widget !7", exact=True)).to_be_visible(
+        timeout=30_000
+    )
+    panel.get_by_role("button", name=f"Unlink {URL_LABEL}", exact=True).click()
     expect(panel.get_by_role("button", name="Link a PR", exact=True)).to_be_visible()
-    expect(panel.get_by_role("button", name="Unlink PR", exact=True)).to_have_count(0)
+    expect(panel.get_by_role("group", name="Session pull requests")).to_have_count(0)
     expect(panel.get_by_role("link", name="Open the PR on GitLab")).to_have_count(0)
     expect(panel.get_by_text(re.compile("Couldn.t load pull request"))).to_have_count(0)
     expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)

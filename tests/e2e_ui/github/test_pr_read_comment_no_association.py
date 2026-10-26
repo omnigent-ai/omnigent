@@ -2,8 +2,8 @@
 
 Session PR tracking observes completed shell calls on the runner
 (``omnigent/runner/pr_observer.py``) and surfaces associated PRs in the
-web UI: the workspace rail's Pull Requests tab shows a "Session pull request"
-picker and the composer status line links the selected PR. Reported bug:
+web UI: the workspace rail's Pull Requests tab shows a card per session PR
+and the composer status line links the selected PR. Reported bug:
 tool completions that merely *read* a pull request (``gh pr view``, a
 ``gh api`` GET) or *comment* on one (``gh pr comment``) associate that PR
 with the session, so unrelated review activity pollutes the session's PR
@@ -15,7 +15,7 @@ gh's canonical output for each subcommand, so no GitHub access is needed;
 the observer only ever sees the command string and its output) — and
 assert the *correct* behavior: a session that only reads or comments on a
 PR has no PR associations afterwards. The three read/comment shapes fail
-on the affected build (the picker lists ``example/one #42``); the
+on the affected build (the PR tab lists ``example/one #42``); the
 ``gh pr create`` control passes, pinning that the fix must suppress
 reads/comments without also suppressing creation tracking.
 """
@@ -267,8 +267,8 @@ def test_read_or_comment_does_not_associate_pr(
 
     rail = _open_github_panel(page)
     # A read/comment must leave the session unassociated: no session-PR
-    # picker in the Pull Requests tab and no composer status-line PR link.
-    expect(rail.get_by_role("combobox", name="Session pull request")).to_have_count(0)
+    # cards in the Pull Requests tab and no composer status-line PR link.
+    expect(rail.get_by_role("group", name="Session pull requests")).to_have_count(0)
     expect(page.get_by_test_id("composer-pr-link")).to_have_count(0)
     # The registry itself must stay empty — a hidden association would still
     # resurface in pickers and defaults later.
@@ -301,6 +301,7 @@ def test_created_pr_remains_tracked(
     )
 
     rail = _open_github_panel(page)
-    picker = rail.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_have_text("example/one #42", timeout=30_000)
+    expect(
+        rail.get_by_role("group", name="Session pull requests").locator('[aria-current="true"]')
+    ).to_have_accessible_name("example/one #42", timeout=30_000)
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("#42")

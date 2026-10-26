@@ -233,7 +233,8 @@ def test_created_pr_is_tracked(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="Pull Requests").click()
     # The created PR must be associated with the session: the Pull Requests tab's
-    # session-PR picker names it, and the composer status line links it.
-    picker = rail.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_have_text("example/project #42", timeout=30_000)
+    # selected session-PR card names it, and the composer status line links it.
+    expect(
+        rail.get_by_role("group", name="Session pull requests").locator('[aria-current="true"]')
+    ).to_have_accessible_name("example/project #42", timeout=30_000)
     expect(page.get_by_test_id("composer-pr-link")).to_have_accessible_name("#42")

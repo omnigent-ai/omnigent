@@ -170,3 +170,39 @@ it("does not restore an unlinked GitLab MR from an older host's stale selection"
     selected_pr_url: undefined,
   });
 });
+
+it("shows the remaining PR list in every cached PR's info as soon as one is unlinked", async () => {
+  const [one, two, three] = [1, 2, 3].map((number) => ({
+    url: `https://github.com/example/one/pull/${number}`,
+    host: "github.com",
+    repository: "example/one",
+    number,
+    relationship: "created",
+  }));
+  const remaining = {
+    object: "session.github.info",
+    tracking_available: true,
+    selected_pr_url: one.url,
+    prs: [one, three],
+  };
+  vi.stubGlobal(
+    "fetch",
+    vi.fn().mockResolvedValue(new Response(JSON.stringify(remaining), { status: 200 })),
+  );
+  const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  // The panel views PR 3 while PR 2 is unlinked from its card.
+  client.setQueryData(["github-info", "conv", three.url], {
+    title: "Viewed PR",
+    prs: [one, two, three],
+  });
+  const { result } = renderHook(() => useUpdateSessionPr("conv"), {
+    wrapper: ({ children }) => (
+      <QueryClientProvider client={client}>{children}</QueryClientProvider>
+    ),
+  });
+  await act(() => result.current.mutateAsync({ url: two.url, action: "remove" }));
+  expect(client.getQueryData(["github-info", "conv", three.url])).toEqual({
+    title: "Viewed PR",
+    prs: [one, three],
+  });
+});

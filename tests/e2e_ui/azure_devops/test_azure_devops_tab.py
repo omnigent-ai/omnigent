@@ -17,6 +17,9 @@ from tests.e2e_ui.github.test_github_tab import _INFO, _stub_github
 
 _PR_URL = "https://dev.azure.com/contoso/web/_git/app/pullrequest/7"
 _SECOND_URL = "https://dev.azure.com/contoso/web/_git/other/pullrequest/12"
+# Each PR's card label; Azure DevOps has no default host, so the label keeps it.
+_PR_LABEL = "dev.azure.com/contoso/web/app !7 — Add the widget"
+_SECOND_LABEL = "dev.azure.com/contoso/web/other !12 — Another repository"
 _DISPLAY = {
     "id": "azure_devops",
     "display_name": "Azure DevOps",
@@ -159,10 +162,12 @@ def test_azure_devops_tab_shows_provider_repo_and_pull_request(
         else page.get_by_role("complementary", name="Workspace")
     )
 
-    expect(rail.get_by_role("heading", name="Azure DevOps")).to_be_visible(timeout=30_000)
+    # With tracked PRs the header reads "Pull Requests"; its description names the provider.
+    expect(
+        rail.get_by_role("heading", name="Pull Requests", description="Azure DevOps", exact=True)
+    ).to_be_visible(timeout=30_000)
     expect(rail.get_by_text("contoso/web/app", exact=False).first).to_be_visible()
-    expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
-    expect(rail.get_by_text("!7", exact=True)).to_be_visible()
+    expect(rail.get_by_role("link", name="Add the widget !7", exact=True)).to_be_visible()
     expect(rail.get_by_label("Pull request status: Open")).to_be_visible()
     expect(rail.get_by_role("heading", name="GitHub")).to_have_count(0)
     expect(rail.get_by_role("combobox", name="GitHub account")).to_have_count(0)
@@ -224,7 +229,7 @@ def test_azure_partial_results_keep_loaded_data_and_explain_unavailable_diff(
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name="Pull Requests").click()
 
-    expect(rail.get_by_text("Add the widget", exact=True)).to_be_visible()
+    expect(rail.get_by_role("link", name="Add the widget !7", exact=True)).to_be_visible()
     expect(rail.get_by_text(re.compile(r"1\s*passed"))).to_be_visible()
     page.screenshot(path=tmp_path / "azure-partial-summary.png", animations="disabled")
     pr_tabs = rail.get_by_role("tablist", name="Pull request")
@@ -327,9 +332,11 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
     panel.get_by_role("button", name="Link a PR", exact=True).click()
     panel.get_by_role("textbox", name="Pull request URL").fill(_SECOND_URL)
     panel.get_by_role("button", name="Link", exact=True).click()
-    picker = panel.get_by_role("combobox", name="Session pull request")
-    expect(picker).to_contain_text("!12")
-    expect(panel.get_by_text("Another repository", exact=True)).to_be_visible()
+    strip = panel.get_by_role("group", name="Session pull requests")
+    first = strip.get_by_role("button", name=_PR_LABEL, exact=True)
+    second = strip.get_by_role("button", name=_SECOND_LABEL, exact=True)
+    expect(second).to_have_attribute("aria-current", "true")
+    expect(panel.get_by_role("link", name="Another repository !12", exact=True)).to_be_visible()
     panel.get_by_role("tablist", name="Pull request").get_by_role("tab", name="Changes").click()
     expect(
         panel.get_by_text(
@@ -337,13 +344,12 @@ def test_azure_link_select_unlink_explains_outside_workspace_diff(
         )
     ).to_be_visible()
     page.screenshot(path=tmp_path / "azure-outside-workspace.png", animations="disabled")
-    picker.click()
-    page.get_by_role("option").filter(has_text="contoso/web/app !7").click()
-    expect(panel.get_by_text("Add the widget", exact=True)).to_be_visible()
-    picker.click()
-    page.get_by_role("option").filter(has_text="contoso/web/other !12").click()
-    panel.get_by_role("button", name="Unlink PR", exact=True).click()
-    expect(picker).to_contain_text("!7")
+    first.click()
+    expect(panel.get_by_role("link", name="Add the widget !7", exact=True)).to_be_visible()
+    second.click()
+    strip.get_by_role("button", name=f"Unlink {_SECOND_LABEL}", exact=True).click()
+    expect(second).to_have_count(0)
+    expect(first).to_have_attribute("aria-current", "true")
     expect(page.get_by_test_id("composer-pr-link")).to_have_text("!7")
     page.screenshot(path=tmp_path / "azure-selection.png", animations="disabled")
 
