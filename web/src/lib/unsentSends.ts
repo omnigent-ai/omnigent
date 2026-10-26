@@ -1,6 +1,6 @@
-// Sends this tab hasn't seen answered, per session, in sessionStorage. The server can
-// hold a message POST for minutes (a sandbox launch or wake) without persisting it,
-// so a reload in that window would otherwise lose the text.
+// Sends this tab hasn't seen delivered, per session, in sessionStorage. The server can
+// hold a message POST for minutes (a sandbox launch or wake) without persisting it, and
+// a send queued again after a failure lives only in memory, so a reload would lose it.
 import { readComposerDraft, type StoredReplyDraft } from "./replyDraft";
 
 export interface UnsentSend {
@@ -61,7 +61,7 @@ export function rememberUnsentSend(conversationId: string, send: UnsentSend): vo
   write({ ...read(), [conversationId]: send });
 }
 
-/** Drop a session's record once this tab has seen that send settle. */
+/** Drop a session's record once that send is delivered or no longer this tab's to retry. */
 export function forgetUnsentSend(conversationId: string, stableId: string): void {
   if (pageHiding) return;
   const sends = read();

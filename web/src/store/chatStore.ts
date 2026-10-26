@@ -2190,9 +2190,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   dequeueMessage: (queueId) => {
+    const removed = get().queuedMessages.find((m) => m.queueId === queueId);
     setActive((s) => ({
       queuedMessages: s.queuedMessages.filter((m) => m.queueId !== queueId),
     }));
+    if (removed?.stableId !== undefined) forgetUnsentSend(removed.conversationId, removed.stableId);
   },
 
   releaseHostHeldMessages: (conversationId) => {
@@ -2289,12 +2291,16 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   clearQueuedMessages: (conversationId) => {
+    const dropped = get().queuedMessages.filter((m) => m.conversationId === conversationId);
     setActive((s) => {
       if (!s.queuedMessages.some((m) => m.conversationId === conversationId)) return {};
       return {
         queuedMessages: s.queuedMessages.filter((m) => m.conversationId !== conversationId),
       };
     });
+    for (const message of dropped) {
+      if (message.stableId !== undefined) forgetUnsentSend(conversationId, message.stableId);
+    }
   },
 
   maybeFlushQueuedHead: () => {
@@ -2422,6 +2428,8 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // release in finally) serializes every POST to this conversation across
       // both paths through one ordering primitive.
       const { waitForPrior, releaseSend } = enterSendChain(conversationId);
+      // Off the queue, its record must still read as open (see `unsentSendToRestore`).
+      if (head.stableId !== undefined) inFlightSends.set(head.stableId, false);
       // Upload any attachments, then post the message referencing their
       // server-assigned file_ids — the same two-phase sequence send() runs
       // (no combined endpoint exists: /resources/files stores the blob and
@@ -2446,6 +2454,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           type: "message",
           data: { role: "user", content, stable_id: head.stableId },
         });
+        if (head.stableId !== undefined) forgetUnsentSend(conversationId, head.stableId);
       })()
         .catch(() => {
           backgroundFlushCooldownUntil.set(
@@ -2465,6 +2474,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
           });
         })
         .finally(() => {
+          if (head.stableId !== undefined) inFlightSends.delete(head.stableId);
           backgroundFlushInFlight.delete(conversationId);
           // Hand the chain to the next POST (foreground or background) so it
           // can start its own network work in submission order.
@@ -2733,7 +2743,14 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       // Only once identity names the sender: unlike `getCurrentAuthorId`, this id
       // tells the single-user `local` viewer apart from one not yet resolved.
       const senderId = getCurrentUserId();
-      if (!compacts && sentOnScreen && senderId !== null && text.trim()) {
+      if (
+        !compacts &&
+        sentOnScreen &&
+        senderId !== null &&
+        text.trim() &&
+        // A session keeps one record, and a message still queued here keeps it.
+        !recordsQueuedSend(sessionId)
+      ) {
         rememberUnsentSend(sessionId, {
           stableId,
           text,
@@ -3007,7 +3024,11 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
       }
     } finally {
       inFlightSends.delete(stableId);
-      if (postedSessionId !== null) forgetUnsentSend(postedSessionId, stableId);
+      // A failed send this tab queued again (e.g. held for an offline host) lives
+      // only in memory, so keep its record for a reload or re-login.
+      if (postedSessionId !== null && !queuesSend(stableId)) {
+        forgetUnsentSend(postedSessionId, stableId);
+      }
       // Release the next queued send regardless of success/failure so one
       // failed POST can't stall the chain forever.
       releaseSend();
@@ -3813,6 +3834,17 @@ function rejectBusyCompact(conversationId: string | null): boolean {
   if (state?.status !== "streaming" && state?.sessionStatus !== "running") return false;
   toast.error("Compact is disabled while a chat is in progress", { richColors: true });
   return true;
+}
+
+/** Whether this tab's queue still holds the message sent under `stableId`. */
+function queuesSend(stableId: string): boolean {
+  return useChatStore.getState().queuedMessages.some((m) => m.stableId === stableId);
+}
+
+/** Whether the session's unsent record belongs to a message this tab still queues. */
+function recordsQueuedSend(conversationId: string): boolean {
+  const unsent = peekUnsentSend(conversationId);
+  return unsent !== null && queuesSend(unsent.stableId);
 }
 
 /**
@@ -7309,12 +7341,14 @@ async function sendVerdictFromServer(
  * The send a previous page of this tab left unanswered, as a failed-send draft.
  *
  * `send` records each message's text before its POST and drops it once the
- * POST settles. A record found on a cold bind therefore comes from a page that
- * reloaded or closed mid-send, e.g. while the server held the POST for a
- * sandbox wake, which persists nothing until the wake ends. Only the sender
- * gets the text back, and only if the snapshot holds no item under its stable
- * id. Matching text is no proof: `pending_inputs` entries and native mirrors
- * carry no stable id, and another message can say the same thing.
+ * POST settles, unless the message went back to this tab's queue. A record
+ * found on a cold bind therefore comes from a page that reloaded or closed
+ * mid-send, e.g. while the server held the POST for a sandbox wake, which
+ * persists nothing until the wake ends, or while it waited for an offline host
+ * in the queue. Only the sender gets the text back, and only if the snapshot
+ * holds no item under its stable id. Matching text is no proof:
+ * `pending_inputs` entries and native mirrors carry no stable id, and another
+ * message can say the same thing.
  *
  * @param conversationId - The session being bound.
  * @param items - The snapshot's committed items.
@@ -7325,8 +7359,10 @@ function unsentSendToRestore(
   items: readonly { id: string }[],
 ): ConversationState["failedSendDraft"] {
   const unsent = peekUnsentSend(conversationId);
-  // A send still open in this tab settles on its own.
-  if (unsent === null || inFlightSends.has(unsent.stableId)) return null;
+  // A send still open or queued in this tab settles on its own.
+  if (unsent === null || inFlightSends.has(unsent.stableId) || queuesSend(unsent.stableId)) {
+    return null;
+  }
   const viewerId = getCurrentUserId();
   // The viewer can't be checked before identity resolves; try again once it does.
   if (viewerId === null) {
