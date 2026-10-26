@@ -9929,6 +9929,7 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
 @pytest.mark.parametrize(
     "resource,body,op,params",
     [
+        ("/comments", {"body": "Hello"}, "github_comment_create", {"body": "Hello"}),
         ("/labels", {"remove": ["bug"]}, "github_labels_update", {"add": [], "remove": ["bug"]}),
         (
             "/reviewers",
@@ -10526,3 +10527,30 @@ async def test_environment_id_is_one_runner_url_segment(
             == (base + quote(environment_id, safe="") + suffix).encode()
         )
         assert forwarded.fragment == ""
+
+
+@pytest.mark.asyncio
+async def test_comment_transport_timeout_does_not_retry_on_host(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    runner = _FakeRunnerClient()
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    posts = []
+
+    async def timeout(path: str, **kwargs: Any) -> httpx.Response:
+        posts.append(path)
+        raise httpx.ReadTimeout("Response lost after dispatch")
+
+    async def unexpected_fallback(**kwargs: Any) -> None:
+        pytest.fail("An uncertain POST must not be repeated on the host")
+
+    monkeypatch.setattr(runner, "post", timeout)
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", unexpected_fallback)
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/comments"
+    response = await client.post(
+        path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "body": "Hello"}
+    )
+    assert response.status_code == 502
+    assert posts == [path]
