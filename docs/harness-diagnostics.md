@@ -318,6 +318,11 @@ evidence of the cause. If the server fills in absent detail from stored assistan
 output, it records `detail_source=assistant_output_fallback`; if it finds no
 output, it records `detail_source=missing`.
 
+If Claude hook evidence collection raises, the failed status still carries the
+hook identity, category when present, and runner version. Its
+`failure_context_error_phase` and `failure_context_error_type` describe the
+diagnostic failure, not the native turn's cause; no exception text is added.
+
 | Attributes | Source and meaning |
 | --- | --- |
 | `failure_source`, `detail_source` | Distinguish Claude hooks, explicit transcript API errors, forwarder delivery failures, and legacy external status data |

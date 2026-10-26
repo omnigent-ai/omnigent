@@ -19,6 +19,8 @@ _TEXT_FIELDS = frozenset(
         "forwarder_rejection_reason",
         "detail_source",
         "failure_decision",
+        "failure_context_error_type",
+        "failure_context_error_phase",
         "suppression_reason",
         "native_error_category",
         "transcript_error_context_state",

@@ -4574,12 +4574,14 @@ async def _forward_available_status_events(
         failure_context: FailureContext | None = None
         transcript_context: FailureContext | None = None
         if status == "failed":
+            failure_context_phase = "transcript_lookup"
             try:
                 transcript_context_state = "hook_details_present"
                 if record.failure_message is None:
                     transcript_context, transcript_context_state = await asyncio.to_thread(
                         _transcript_api_error_for_hook, bridge_dir, record, response_id
                     )
+                failure_context_phase = "context_assembly"
                 failure_context = _stop_failure_context(
                     record,
                     session_id=session_id,
@@ -4589,6 +4591,32 @@ async def _forward_available_status_events(
                     transcript_context_state=transcript_context_state,
                 )
             except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
+                # Keep the hook's identity when richer evidence cannot be collected.
+                failure_context = normalize_failure_context(
+                    {
+                        "failure_id": native_failure_id(
+                            "claude_hook",
+                            session_id,
+                            record.claude_session_id,
+                            record.agent_id,
+                            record.event_cursor,
+                            record.byte_offset,
+                            record.recorded_at,
+                        ),
+                        "failure_source": "claude_hook",
+                        "native_harness": "claude-native",
+                        "native_error_category": record.failure_category,
+                        "native_session_id": record.claude_session_id,
+                        "native_agent_id": record.agent_id,
+                        "native_hook_event": record.event_name,
+                        "native_hook_cursor": record.event_cursor,
+                        "native_hook_offset": record.byte_offset,
+                        "native_hook_recorded_at": record.recorded_at,
+                        "runner_version": VERSION,
+                        "failure_context_error_type": type(exc).__name__,
+                        "failure_context_error_phase": failure_context_phase,
+                    }
+                )
                 _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
         try:
             await post_external_session_status(
