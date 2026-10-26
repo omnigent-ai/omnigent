@@ -4670,6 +4670,7 @@ class CodexExecutor(Executor):
     _brokered_version_banner = "codex-cli"
     _brokered_min_version = _BROKERED_CODEX_MIN_VERSION
     _brokered_catalog_probe = True
+    _check_own_config_version = False
 
     def __init__(
         self,
@@ -5143,7 +5144,7 @@ class CodexExecutor(Executor):
     ) -> AsyncIterator[ExecutorEvent]:
         cfg = config or ExecutorConfig()
         binary_identity = _codex_binary_identity(self._codex_path)
-        if self._signer_backed and (
+        if (self._signer_backed or (self._check_own_config_version and not self._gateway)) and (
             binary_identity is None or binary_identity != self._brokered_version_identity
         ):
             # This probe must precede app-session construction: the latter

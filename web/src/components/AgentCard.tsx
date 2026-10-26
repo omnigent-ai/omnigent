@@ -1,4 +1,5 @@
 import { BotIcon } from "lucide-react";
+import genieCodeLogo from "@/assets/genie-code-logo.svg";
 import { AntigravityIcon } from "@/components/icons/AntigravityIcon";
 import { ClaudeIcon } from "@/components/icons/ClaudeIcon";
 import { CodexIcon } from "@/components/icons/CodexIcon";
@@ -17,6 +18,14 @@ import { nativeCodingAgentForAvailableAgent } from "@/lib/nativeCodingAgents";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { AgentHoverCard } from "@/components/AgentHoverCard";
 
+function GenieIcon(props: SVGProps<SVGSVGElement>) {
+  return (
+    <svg viewBox="0 0 16 16" {...props}>
+      <image href={genieCodeLogo} width="16" height="16" />
+    </svg>
+  );
+}
+
 /**
  * Pick the glyph for a catalog agent.
  *
@@ -33,6 +42,7 @@ export function iconForAgent(
   agent: Pick<AvailableAgent, "name" | "harness">,
 ): ComponentType<SVGProps<SVGSVGElement>> {
   if (agent.name === "nessie") return NessieIcon;
+  if (agent.harness === "genie") return GenieIcon;
   const nativeAgent = nativeCodingAgentForAvailableAgent(agent);
   if (nativeAgent?.iconKind === "claude") return ClaudeIcon;
   if (nativeAgent?.iconKind === "codex") return CodexIcon;

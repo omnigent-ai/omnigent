@@ -1,3 +1,4 @@
+import genieCodeLogo from "@/assets/genie-code-logo.svg";
 import type { SVGProps } from "react";
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -46,6 +47,13 @@ function chosenIcon(a: AvailableAgent): string | null | undefined {
 afterEach(cleanup);
 
 describe("AgentCard icon selection", () => {
+  it.each(["genie", "custom-reviewer"])("shows the Genie Code mark for %s", (name) => {
+    const { container } = render(
+      <AgentCard agent={agent({ name, harness: "genie" })} selected={false} onSelect={() => {}} />,
+    );
+    expect(container.querySelector("image")).toHaveAttribute("href", genieCodeLogo);
+  });
+
   it.each([
     // The whole point of keying on harness: a custom reviewer named
     // "design-reviewer" must still read as Codex, not fall back to bot.

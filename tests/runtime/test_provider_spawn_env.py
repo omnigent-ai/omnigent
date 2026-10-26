@@ -2468,8 +2468,8 @@ def test_genie_databricks_provider_is_brokered_like_codex(
 
 @pytest.mark.parametrize(
     "providers",
-    [{}, {"sub": {"kind": "subscription", "cli": "codex", "default": True}}],
-    ids=["no-provider", "subscription"],
+    [{}],
+    ids=["no-provider"],
 )
 def test_genie_without_usable_provider_fails_loud(
     config_home: Path, providers: dict[str, object], tmp_path: Path
@@ -2487,3 +2487,90 @@ def test_genie_without_usable_provider_fails_loud(
         pytest.raises(OmnigentError, match="'genie' harness needs a Databricks workspace"),
     ):
         _build_genie_spawn_env(spec, cwd=tmp_path)
+
+
+@pytest.mark.parametrize("kind", ["subscription", "cli-config"])
+@pytest.mark.parametrize("selection", ["default", "family-default", "fallback"])
+def test_genie_implicit_codex_provider_uses_own_credentials(
+    config_home: Path,
+    kind: str,
+    selection: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Starting Genie with a Codex default keeps Genie's own CLI credentials."""
+    provider = {"kind": kind, "cli": "codex", "model_provider": "Databricks"}
+    if selection != "fallback":
+        provider["default"] = "true" if selection == "default" else "openai"
+    _write_config(config_home, {"providers": {"codex-owned": provider}})
+
+    env = _build_genie_spawn_env(_make_spec(harness="genie"), cwd=tmp_path)
+
+    assert env == {
+        "HARNESS_GENIE_GATEWAY": "0",
+        "HARNESS_GENIE_SKILLS_FILTER": '"all"',
+        "HARNESS_GENIE_AGENT_NAME": "test-genie",
+        "HARNESS_GENIE_CWD": str(tmp_path),
+    }
+    from omnigent.inner import genie_harness
+
+    with monkeypatch.context() as env_patch:
+        for name in tuple(os.environ):
+            env_patch.delenv(name)
+        for name, value in env.items():
+            env_patch.setenv(name, value)
+        with patch("omnigent.inner.genie_executor._find_genie_cli", return_value="/usr/bin/genie"):
+            executor = genie_harness._build_genie_executor()
+    assert executor._codex_config_overrides == []
+
+
+@pytest.mark.parametrize("kind", ["subscription", "cli-config"])
+@pytest.mark.parametrize("selection", ["spec", "binding"])
+def test_genie_rejects_codex_owned_credentials(
+    config_home: Path, kind: str, selection: str
+) -> None:
+    """An explicit Genie provider choice must not silently use different credentials."""
+    config: dict[str, object] = {
+        "providers": {
+            "codex-owned": {"kind": kind, "cli": "codex", "model_provider": "Databricks"}
+        }
+    }
+    if selection == "binding":
+        config["inference"] = {"harnesses": {"genie": {"provider": "codex-owned"}}}
+    _write_config(config_home, config)
+    spec = _make_spec(
+        harness="genie", auth=ProviderAuth(name="codex-owned") if selection == "spec" else None
+    )
+
+    with pytest.raises(
+        OmnigentError, match=r"codex-owned.*Codex.*Genie.*inference\.harnesses\.genie"
+    ):
+        _build_genie_spawn_env(spec)
+
+
+def test_genie_inference_binding_routes_gateway(config_home: Path) -> None:
+    """A saved Genie binding overrides the family default and applies its model policy."""
+    config = _cli_config_default_config()
+    config["providers"]["genie-gateway"] = {
+        "kind": "gateway",
+        "openai": _key_family("https://genie.example/v1", "test-key", "provider-default"),
+    }
+    config["inference"] = {
+        "harnesses": {
+            "genie": {
+                "provider": "genie-gateway",
+                "default_model": "bound-model",
+                "model_allowlist": ["bound-model"],
+            }
+        }
+    }
+    _write_config(config_home, config)
+
+    env = _build_genie_spawn_env(_make_spec(harness="genie"))
+
+    assert env["HARNESS_GENIE_GATEWAY"] == "true"
+    assert env["HARNESS_GENIE_GATEWAY_BASE_URL"] == "https://genie.example/v1"
+    assert env["HARNESS_GENIE_GATEWAY_AUTH_COMMAND"] == "printf %s test-key"
+    assert env["HARNESS_GENIE_MODEL"] == "bound-model"
+    with pytest.raises(OmnigentError, match="configured model list"):
+        _build_genie_spawn_env(_make_spec(harness="genie", model="other-model"))

@@ -813,8 +813,8 @@ def test_genie_picker_readiness_requires_a_provider_genie_can_use(
 ) -> None:
     """An installed genie reads ready only once a launch would get a provider.
 
-    Genie has no login of its own: with nothing configured the launch refuses,
-    and a ``~/.codex/config.toml`` pin or a CLI subscription is codex-only.
+    Without its own CLI config, Genie needs a compatible provider rather than
+    a ``~/.codex/config.toml`` pin or Codex subscription.
     """
     import yaml
 
@@ -827,6 +827,39 @@ def test_genie_picker_readiness_requires_a_provider_genie_can_use(
     (tmp_path / "config.yaml").write_text(yaml.safe_dump({"providers": providers}))
 
     assert configured_harness_map()["genie"] == expected
+
+
+@pytest.mark.parametrize("provider_kind", ["cli-config", "subscription"])
+@pytest.mark.parametrize("custom_home", [False, True])
+def test_genie_picker_accepts_own_config_for_implicit_codex_default(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    provider_kind: str,
+    custom_home: bool,
+) -> None:
+    from tests._helpers.providers import isolate_provider_resolution
+
+    isolate_provider_resolution(monkeypatch, tmp_path)
+    _all_clis_installed(monkeypatch)
+    genie_home = tmp_path / ("genie-home" if custom_home else ".genie")
+    genie_home.mkdir()
+    (genie_home / "config.toml").write_text('model_provider = "Databricks"\n')
+    if custom_home:
+        monkeypatch.setenv("GENIE_HOME", str(genie_home))
+    else:
+        monkeypatch.delenv("GENIE_HOME", raising=False)
+    provider: dict[str, object] = {"kind": provider_kind, "cli": "codex", "default": True}
+    if provider_kind == "cli-config":
+        provider["model_provider"] = "Databricks"
+    config: dict[str, object] = {"providers": {"codex-owned": provider}}
+    config_path = tmp_path / "config.yaml"
+    config_path.write_text(yaml.safe_dump(config))
+
+    assert configured_harness_map()["genie"] is True
+
+    config["inference"] = {"harnesses": {"genie": {"provider": "codex-owned"}}}
+    config_path.write_text(yaml.safe_dump(config))
+    assert configured_harness_map()["genie"] == "needs-auth"
 
 
 @pytest.mark.parametrize(("installed", "expected"), [(False, False), (True, True)])
