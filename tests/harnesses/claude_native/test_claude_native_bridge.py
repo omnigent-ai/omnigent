@@ -9862,37 +9862,47 @@ def test_compute_transcript_cumulative_cost_dedupes_inference_records(
     claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
     path = tmp_path / "transcript.jsonl"
     (first_message_id, first_request_id), (last_message_id, last_request_id) = identities
-    _write_transcript_jsonl(
-        path,
-        [
-            _assistant_entry(
-                model="m",
-                input_tokens=2,
-                output_tokens=1,
-                message_id=first_message_id,
-                request_id=first_request_id,
-            ),
-            _assistant_entry(
-                model="m", input_tokens=1, output_tokens=1, message_id="msg_B", request_id="req_B"
-            ),
-            _assistant_entry(
-                model="m",
-                input_tokens=2,
-                output_tokens=3,
-                message_id=last_message_id,
-                request_id=last_request_id,
-            ),
-            _assistant_entry(
-                model="unpriced",
-                input_tokens=99,
-                output_tokens=99,
-                message_id="msg_A",
-                request_id="req_A",
-            ),
-        ],
-    )
+    entries = [
+        _assistant_entry(
+            model="m",
+            input_tokens=2,
+            output_tokens=1,
+            message_id=first_message_id,
+            request_id=first_request_id,
+        ),
+        _assistant_entry(
+            model="m", input_tokens=1, output_tokens=1, message_id="msg_B", request_id="req_B"
+        ),
+        _assistant_entry(
+            model="m",
+            input_tokens=2,
+            output_tokens=3,
+            message_id=last_message_id,
+            request_id=last_request_id,
+        ),
+        _assistant_entry(
+            model="unpriced",
+            input_tokens=99,
+            output_tokens=99,
+            message_id="msg_A",
+            request_id="req_A",
+        ),
+    ]
+    _write_transcript_jsonl(path, entries)
     cost = claude_native_bridge.compute_transcript_cumulative_cost(path, include_sidechains=True)
     assert cost == pytest.approx(110.0)
+
+    # Tallying the same records half a line at a time dedupes identically.
+    incremental_path = tmp_path / "incremental.jsonl"
+    incremental_path.touch()
+    tally = claude_native_bridge.TranscriptCostTally(include_sidechains=True)
+    for entry in entries:
+        line = json.dumps(entry) + "\n"
+        for chunk in (line[: len(line) // 2], line[len(line) // 2 :]):
+            with incremental_path.open("a", encoding="utf-8") as handle:
+                handle.write(chunk)
+            incremental_cost = claude_native_bridge.tally_transcript_cost(incremental_path, tally)
+    assert incremental_cost == pytest.approx(cost)
 
 
 @pytest.mark.parametrize(
@@ -10066,6 +10076,49 @@ def test_compute_transcript_cumulative_cost_none_when_nothing_priceable(
         claude_native_bridge.compute_transcript_cumulative_cost(priced, include_sidechains=True)
         is None
     )
+
+
+def test_tally_transcript_cost_reprices_read_records_without_rereading_them(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Records already tallied are re-priced in memory when their model gains
+    pricing or the provider config changes; a shrunken file is tallied again
+    from byte 0."""
+    from omnigent.llms.context_window import ModelPricing
+
+    catalog: dict[str, ModelPricing] = {}
+    monkeypatch.setattr("omnigent.llms.context_window.fetch_model_pricing", catalog.get)
+    provider_config: dict[str, Any] = {"revision": 1}
+    monkeypatch.setattr(
+        "omnigent.onboarding.provider_config.load_config", lambda: dict(provider_config)
+    )
+    claude_native_bridge._TRANSCRIPT_PRICING_CACHE.clear()
+    read_offsets: list[int] = []
+    real_read = claude_native_bridge._read_complete_jsonl_records
+
+    def recording_read(path: Path, **kwargs: Any) -> Any:
+        read_offsets.append(kwargs["byte_offset"])
+        return real_read(path, **kwargs)
+
+    monkeypatch.setattr(claude_native_bridge, "_read_complete_jsonl_records", recording_read)
+    path = tmp_path / "transcript.jsonl"
+    _write_transcript_jsonl(
+        path, [_assistant_entry(model="m", input_tokens=2, output_tokens=1, message_id="msg_A")]
+    )
+    size = path.stat().st_size
+    tally = claude_native_bridge.TranscriptCostTally(include_sidechains=True)
+
+    assert claude_native_bridge.tally_transcript_cost(path, tally) is None
+    catalog["m"] = ModelPricing(input_per_token=10.0, output_per_token=20.0)
+    assert claude_native_bridge.tally_transcript_cost(path, tally) == pytest.approx(40.0)
+    catalog["m"] = ModelPricing(input_per_token=20.0, output_per_token=40.0)
+    provider_config["revision"] = 2
+    assert claude_native_bridge.tally_transcript_cost(path, tally) == pytest.approx(80.0)
+    assert read_offsets == [0, size, size]
+
+    _write_transcript_jsonl(path, [_assistant_entry(model="m", input_tokens=1, output_tokens=0)])
+    assert path.stat().st_size < size
+    assert claude_native_bridge.tally_transcript_cost(path, tally) == pytest.approx(20.0)
 
 
 def test_format_terminal_failure_tail_returns_empty_for_blank_pane() -> None:

@@ -37,13 +37,18 @@ design and why the transcript channel replaced it).
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import enum
 import hashlib
 import json
 import logging
 import re
-from dataclasses import dataclass
+import sqlite3
+import threading
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import quote
 
 import httpx
 
@@ -486,33 +491,21 @@ def _pending_started_ms(obj: dict[str, object]) -> int | None:
     return marker if isinstance(marker, int) else None
 
 
-def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCall]:
-    """Return the gated tool calls currently awaiting a human in *store_path*.
+@dataclass
+class _PendingToolCallFold:
+    """Tool-call classification folded over blobs in rowid order.
 
-    Scans every blob for embedded JSON messages and classifies each
-    ``toolCallId`` by how its ``tool-call`` part appears:
-
-    * **pending** — appears in an object WITH ``pendingToolCallStartedAtMs``
-      (cursor is blocking on it),
-    * **committed** — appears in an object WITHOUT the marker (cursor finalized
-      it to run: either auto-approved, or approved and now executing),
-    * **resolved** — has a ``tool-result``.
-
-    A call is *awaiting a human* exactly when it is pending and NOT (committed or
-    resolved). Empirically a call that's genuinely blocked on the human appears
-    ONLY with the marker (never committed) until answered, while an
-    auto-approved / committed call appears without it — so this excludes the
-    auto-approve flash structurally, with no timing heuristic. Pure / read-only,
-    so it is safe to run alongside the forwarder tailing the same store.
-
-    :param store_path: This session's cursor ``store.db``.
-    :returns: Active pending tool calls (cursor shows them one at a time, but the
-        list supports more than one defensively), in first-seen order.
+    :param pending: Calls seen with the pending marker and not yet finished, in
+        first-seen order.
+    :param finished: Calls seen committed (a ``tool-call`` without the marker) or
+        resolved (a ``tool-result``); they never become pending again.
     """
-    pending: dict[str, CursorPendingToolCall] = {}
-    committed: set[str] = set()
-    resolved: set[str] = set()
-    for _rowid, _blob_id, data in _read_blob_rows(store_path, 0):
+
+    pending: dict[str, CursorPendingToolCall] = field(default_factory=dict)
+    finished: set[str] = field(default_factory=set)
+
+    def add_blob(self, data: object) -> None:
+        """Classify every tool-call part embedded in one ``blobs.data`` value."""
         raw = bytes(data) if isinstance(data, (bytes, bytearray)) else str(data).encode("utf-8")
         for obj in _iter_embedded_json_objects(raw):
             content = obj.get("content")
@@ -526,22 +519,234 @@ def read_cursor_pending_tool_calls(store_path: Path) -> list[CursorPendingToolCa
                 tool_call_id = part.get("toolCallId")
                 if not isinstance(tool_call_id, str):
                     continue
-                if part_type == "tool-call":
-                    if marker is not None:
+                if part_type == "tool-call" and marker is not None:
+                    if tool_call_id not in self.finished:
                         tool_name = part.get("toolName")
                         args = part.get("args")
-                        pending[tool_call_id] = CursorPendingToolCall(
+                        self.pending[tool_call_id] = CursorPendingToolCall(
                             tool_call_id=tool_call_id,
                             tool_name=tool_name if isinstance(tool_name, str) else "tool",
                             args=args if isinstance(args, dict) else {},
                         )
-                    else:
-                        committed.add(tool_call_id)
-                elif part_type == "tool-result":
-                    resolved.add(tool_call_id)
-    return [
-        call for tcid, call in pending.items() if tcid not in committed and tcid not in resolved
-    ]
+                elif part_type in ("tool-call", "tool-result"):
+                    self.finished.add(tool_call_id)
+                    self.pending.pop(tool_call_id, None)
+
+    def awaiting(self) -> list[CursorPendingToolCall]:
+        """Return the calls still awaiting a human, in first-seen order."""
+        return list(self.pending.values())
+
+
+def _connect_store(store_path: Path) -> tuple[sqlite3.Connection, bool]:
+    """Open *store_path*, preferring ``mode=ro`` like :func:`_read_blob_rows`.
+
+    The ``mode=rw`` fallback covers a briefly absent ``-shm`` without creating a
+    missing store.
+
+    :returns: The connection and whether it is read-only.
+    :raises sqlite3.Error: When neither connection can read the ``blobs`` table.
+    """
+    last_error: sqlite3.Error = sqlite3.OperationalError(f"cannot read {store_path}")
+    uri_path = quote(str(store_path), safe="/:\\")
+    for mode in ("ro", "rw"):
+        try:
+            connection = sqlite3.connect(
+                f"file:{uri_path}?mode={mode}",
+                timeout=5.0,
+                uri=True,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+        except sqlite3.Error as exc:
+            last_error = exc
+            continue
+        try:
+            connection.execute("SELECT 1 FROM blobs LIMIT 1").fetchall()
+        except sqlite3.Error as exc:
+            connection.close()
+            last_error = exc
+            continue
+        return connection, mode == "ro"
+    raise last_error
+
+
+class CursorPendingToolCallScan:
+    """Incremental :func:`read_cursor_pending_tool_calls` state for one poller.
+
+    Keeps one connection open so ``PRAGMA data_version`` can report an unchanged
+    store without reading it, and folds only blobs past the last folded rowid.
+    Cursor never rewrites a blob under its content-addressed id, so the store is
+    refolded from the start only if earlier rows were deleted or replaced, or if
+    the path now names a different file. One thread reads at a time;
+    :meth:`close` may be called from another thread.
+    """
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._reading = False
+        self._closed = False
+        self._connection: sqlite3.Connection | None = None
+        self._connection_read_only = True
+        self._identity: tuple[str, int, int] | None = None
+        self._data_version: int | None = None
+        self._last_rowid = 0
+        self._last_blob_id: object = None
+        self._row_count = 0
+        self._fold = _PendingToolCallFold()
+
+    def read(self, store_path: Path) -> list[CursorPendingToolCall]:
+        """Return the calls awaiting a human in *store_path*, or ``[]`` if it is unreadable."""
+        with self._lock:
+            if self._closed:
+                return []
+            self._reading = True
+        try:
+            return self._read(store_path)
+        finally:
+            with self._lock:
+                self._reading = False
+                closed = self._closed
+            if closed:
+                self._reset(None)
+
+    def close(self) -> None:
+        """Close the connection now, or after the read in progress finishes."""
+        with self._lock:
+            self._closed = True
+            if self._reading:
+                return
+        self._reset(None)
+
+    def _reset(self, identity: tuple[str, int, int] | None) -> None:
+        if self._connection is not None:
+            self._connection.close()
+        self._connection = None
+        self._identity = identity
+        self._data_version = None
+        self._restart_fold()
+
+    def _restart_fold(self) -> None:
+        self._last_rowid = 0
+        self._last_blob_id = None
+        self._row_count = 0
+        self._fold = _PendingToolCallFold()
+
+    def _read(self, store_path: Path) -> list[CursorPendingToolCall]:
+        try:
+            stat = store_path.stat()
+        except OSError:
+            self._reset(None)
+            return []
+        identity = (str(store_path), stat.st_dev, stat.st_ino)
+        if identity != self._identity:
+            self._reset(identity)
+        reused_connection = self._connection is not None
+        try:
+            return self._read_changes(store_path)
+        except sqlite3.Error:
+            self._reset(identity)
+            if not reused_connection:
+                return []
+        # A long-lived connection can fail where a fresh one succeeds (for
+        # example while ``-shm`` is briefly absent), so reconnect once.
+        try:
+            return self._read_changes(store_path)
+        except sqlite3.Error:
+            self._reset(identity)
+            return []
+
+    def _read_changes(self, store_path: Path) -> list[CursorPendingToolCall]:
+        if self._connection is None:
+            self._connection, self._connection_read_only = _connect_store(store_path)
+        connection = self._connection
+        if _store_data_version(connection) == self._data_version:
+            return self._fold.awaiting()
+        connection.execute("BEGIN")
+        try:
+            rows, refold = self._changed_rows(connection)
+            data_version = _store_data_version(connection)
+        finally:
+            connection.rollback()
+        # Parse after the snapshot ends so it does not hold back Cursor's WAL checkpoints.
+        if refold:
+            self._restart_fold()
+        self._fold_rows(rows)
+        if self._connection_read_only:
+            self._data_version = data_version
+        else:
+            # A writable fallback serves one read; the next poll retries ``mode=ro``.
+            connection.close()
+            self._connection = None
+            self._data_version = None
+        return self._fold.awaiting()
+
+    def _changed_rows(
+        self, connection: sqlite3.Connection
+    ) -> tuple[list[tuple[int, object, object]], bool]:
+        """Return the rows to fold and whether they replace the current fold."""
+        if self._row_count:
+            new_rows = connection.execute(
+                "SELECT rowid, id, data FROM blobs WHERE rowid > ? ORDER BY rowid",
+                (self._last_rowid,),
+            ).fetchall()
+            (row_count,) = connection.execute("SELECT COUNT(*) FROM blobs").fetchone()
+            last_row = connection.execute(
+                "SELECT id FROM blobs WHERE rowid = ?", (self._last_rowid,)
+            ).fetchone()
+            if row_count == self._row_count + len(new_rows) and last_row == (self._last_blob_id,):
+                return new_rows, False
+        return connection.execute(
+            "SELECT rowid, id, data FROM blobs ORDER BY rowid"
+        ).fetchall(), True
+
+    def _fold_rows(self, rows: Iterable[tuple[int, object, object]]) -> None:
+        for rowid, blob_id, data in rows:
+            self._fold.add_blob(data)
+            self._last_rowid = rowid
+            self._last_blob_id = blob_id
+            self._row_count += 1
+
+
+def _store_data_version(connection: sqlite3.Connection) -> int:
+    (data_version,) = connection.execute("PRAGMA data_version").fetchone()
+    return int(data_version)
+
+
+def read_cursor_pending_tool_calls(
+    store_path: Path, scan: CursorPendingToolCallScan | None = None
+) -> list[CursorPendingToolCall]:
+    """Return the gated tool calls currently awaiting a human in *store_path*.
+
+    Scans the blobs in rowid order for embedded JSON messages and classifies
+    each ``toolCallId`` by how its ``tool-call`` part appears:
+
+    * **pending** — appears in an object WITH ``pendingToolCallStartedAtMs``
+      (cursor is blocking on it),
+    * **committed** — appears in an object WITHOUT the marker (cursor finalized
+      it to run: either auto-approved, or approved and now executing),
+    * **resolved** — has a ``tool-result``.
+
+    A call is *awaiting a human* exactly when it is pending and NOT (committed or
+    resolved). Empirically a call that's genuinely blocked on the human appears
+    ONLY with the marker (never committed) until answered, while an
+    auto-approved / committed call appears without it — so this excludes the
+    auto-approve flash structurally, with no timing heuristic. Read-only, so it
+    is safe to run alongside the forwarder tailing the same store; *scan* carries
+    state between calls.
+
+    :param store_path: This session's cursor ``store.db``.
+    :param scan: State kept between one poller's calls so a repeated read skips
+        an unchanged store and folds only appended blobs. Without it every blob
+        is read.
+    :returns: Active pending tool calls (cursor shows them one at a time, but the
+        list supports more than one defensively), in first-seen order.
+    """
+    if scan is not None:
+        return scan.read(store_path)
+    fold = _PendingToolCallFold()
+    for _rowid, _blob_id, data in _read_blob_rows(store_path, 0):
+        fold.add_blob(data)
+    return fold.awaiting()
 
 
 def _preview_for_args(args: dict[str, object]) -> str:
@@ -875,7 +1080,11 @@ async def supervise_cursor_transcript_elicitations(
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
     from omnigent.cli_auth import open_server_client
 
-    async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
+    async with contextlib.AsyncExitStack() as exit_stack:
+        client = await exit_stack.enter_async_context(
+            open_server_client(base_url, headers=headers, auth=auth, timeout=timeout)
+        )
+        pending_scan = exit_stack.enter_context(contextlib.closing(CursorPendingToolCallScan()))
         while True:
             try:
                 if store_path is None or not store_path.exists():
@@ -883,7 +1092,9 @@ async def supervise_cursor_transcript_elicitations(
                         _resolve_elicitation_store, bridge_dir, workspace, launch_epoch_ms
                     )
                 pending_calls = (
-                    await asyncio.to_thread(read_cursor_pending_tool_calls, store_path)
+                    await asyncio.to_thread(
+                        read_cursor_pending_tool_calls, store_path, pending_scan
+                    )
                     if store_path is not None
                     else []
                 )

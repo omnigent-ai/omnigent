@@ -56,7 +56,7 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
@@ -3582,6 +3582,57 @@ def _transcript_model_pricing(
     return pricing
 
 
+@dataclass(frozen=True)
+class _TranscriptUsageRecord:
+    """
+    Pricing inputs from one transcript record carrying assistant usage.
+
+    :param line_number: One-based transcript line, the dedupe key of a record
+        with neither response id.
+    :param model: API model id, e.g. ``"claude-opus-4-8"``.
+    :param message_id: ``message.id``, or ``None`` when absent.
+    :param request_id: ``requestId``, or ``None`` when absent.
+    :param usage: Token usage from :func:`_usage_from_transcript_entry`.
+    """
+
+    line_number: int
+    model: str
+    message_id: str | None
+    request_id: str | None
+    usage: dict[str, int]
+
+
+@dataclass
+class TranscriptCostTally:
+    """
+    Incremental state for :func:`tally_transcript_cost` over one transcript.
+
+    Holds the read cursor, the usage records read so far and the per-response
+    costs folded from them, so a grown transcript is read and priced from its
+    appended records only.
+
+    :param include_sidechains: See :func:`compute_transcript_cumulative_cost`.
+    """
+
+    include_sidechains: bool
+    byte_offset: int = 0
+    line_cursor: int = 0
+    usage_records: list[_TranscriptUsageRecord] = field(default_factory=list)
+    provider_config_fingerprint: bytes | None = None
+    folded_records: int = 0
+    unpriced_models: set[str] = field(default_factory=set)
+    cost_by_response: dict[tuple[str, str | int], float] = field(default_factory=dict)
+    message_keys_by_request: dict[str, tuple[str, str | int]] = field(default_factory=dict)
+
+
+def _clear_transcript_cost_fold(tally: TranscriptCostTally) -> None:
+    """Forget folded costs so the stored usage records are priced again."""
+    tally.folded_records = 0
+    tally.unpriced_models.clear()
+    tally.cost_by_response.clear()
+    tally.message_keys_by_request.clear()
+
+
 def compute_transcript_cumulative_cost(
     transcript_path: Path,
     *,
@@ -3624,20 +3675,36 @@ def compute_transcript_cumulative_cost(
         for every model present) — distinct from ``0.0``, which means
         priced messages summed to zero.
     """
+    return tally_transcript_cost(
+        transcript_path, TranscriptCostTally(include_sidechains=include_sidechains)
+    )
+
+
+def tally_transcript_cost(transcript_path: Path, tally: TranscriptCostTally) -> float | None:
+    """
+    Advance *tally* past appended transcript records and return the cost.
+
+    Equivalent to :func:`compute_transcript_cumulative_cost` over the whole
+    file, but reads only the bytes after ``tally.byte_offset``. Stored usage
+    records are re-priced without re-reading the file when the provider
+    configuration changes or a previously unpriced model gains pricing. The
+    caller must discard *tally* when bytes before its offset are rewritten.
+
+    :param transcript_path: Claude transcript JSONL, e.g.
+        ``".../subagents/agent-<id>.jsonl"``.
+    :param tally: State from earlier calls for this transcript; updated in place.
+    :returns: Same as :func:`compute_transcript_cumulative_cost`.
+    """
     read_result = _read_complete_jsonl_records(
         transcript_path,
-        byte_offset=0,
-        start_line=0,
+        byte_offset=tally.byte_offset,
+        start_line=tally.line_cursor,
     )
-    from omnigent.llms.context_window import compute_llm_cost
-    from omnigent.onboarding.provider_config import load_config
-
-    provider_config = load_config()
-    provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
-
-    cost_by_response: dict[tuple[str, str | int], float] = {}
-    message_keys_by_request: dict[str, tuple[str, str | int]] = {}
-    for index, record in enumerate(read_result.records):
+    if read_result.byte_offset < tally.byte_offset:
+        # The file shrank, so the reader restarted from byte 0.
+        tally.usage_records.clear()
+        _clear_transcript_cost_fold(tally)
+    for record in read_result.records:
         if record.text is None:
             continue
         try:
@@ -3646,7 +3713,7 @@ def compute_transcript_cumulative_cost(
             continue
         if not isinstance(entry, dict):
             continue
-        if not include_sidechains and entry.get("isSidechain") is True:
+        if not tally.include_sidechains and entry.get("isSidechain") is True:
             continue
         usage = _usage_from_transcript_entry(entry)
         if usage is None:
@@ -3654,22 +3721,52 @@ def compute_transcript_cumulative_cost(
         model = _model_from_transcript_entry(entry)
         if model is None:
             continue
-        pricing = _transcript_model_pricing(
+        message = entry.get("message")
+        message_id = message.get("id") if isinstance(message, dict) else None
+        request_id = entry.get("requestId")
+        tally.usage_records.append(
+            _TranscriptUsageRecord(
+                line_number=record.line_number,
+                model=model,
+                message_id=message_id if isinstance(message_id, str) and message_id else None,
+                request_id=request_id if isinstance(request_id, str) and request_id else None,
+                usage=usage,
+            )
+        )
+    tally.byte_offset = read_result.byte_offset
+    tally.line_cursor = read_result.line_cursor
+
+    from omnigent.llms.context_window import compute_llm_cost
+    from omnigent.onboarding.provider_config import load_config
+
+    provider_config = load_config()
+    provider_config_fingerprint = hashlib.sha256(repr(provider_config).encode("utf-8")).digest()
+
+    def pricing_for(model: str) -> ModelPricing | None:
+        return _transcript_model_pricing(
             model,
             provider_config=provider_config,
             provider_config_fingerprint=provider_config_fingerprint,
         )
+
+    if provider_config_fingerprint != tally.provider_config_fingerprint or any(
+        pricing_for(model) is not None for model in tally.unpriced_models
+    ):
+        _clear_transcript_cost_fold(tally)
+        tally.provider_config_fingerprint = provider_config_fingerprint
+    cost_by_response = tally.cost_by_response
+    message_keys_by_request = tally.message_keys_by_request
+    while tally.folded_records < len(tally.usage_records):
+        usage_record = tally.usage_records[tally.folded_records]
+        tally.folded_records += 1
+        pricing = pricing_for(usage_record.model)
         if pricing is None:
+            tally.unpriced_models.add(usage_record.model)
             continue
-        message = entry.get("message")
-        message_id = message.get("id") if isinstance(message, dict) else None
-        if not isinstance(message_id, str) or not message_id:
-            message_id = None
-        request_id = entry.get("requestId")
-        if not isinstance(request_id, str) or not request_id:
-            request_id = None
+        message_id = usage_record.message_id
+        request_id = usage_record.request_id
         if message_id is not None:
-            key = ("message", message_id)
+            key: tuple[str, str | int] = ("message", message_id)
             if request_id is not None:
                 # A later fragment can supply the identity missing from earlier ones.
                 cost_by_response.pop(("request", request_id), None)
@@ -3677,8 +3774,8 @@ def compute_transcript_cumulative_cost(
         elif request_id is not None:
             key = message_keys_by_request.get(request_id, ("request", request_id))
         else:
-            key = ("record", index)
-        cost_by_response[key] = compute_llm_cost(usage, pricing)
+            key = ("record", usage_record.line_number)
+        cost_by_response[key] = compute_llm_cost(usage_record.usage, pricing)
     if not cost_by_response:
         return None
     return sum(cost_by_response.values())

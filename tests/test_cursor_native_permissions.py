@@ -30,6 +30,7 @@ import sqlite3 as _sqlite3
 from collections.abc import Callable
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -42,6 +43,7 @@ from omnigent.harnesses.cursor_native.permissions import (
     cursor_tool_call_elicitation_id,
     read_cursor_pending_tool_calls,
 )
+from tests._helpers.process_io import process_bytes_read
 from tests.budgets import budget
 
 
@@ -349,6 +351,220 @@ def test_read_pending_detects_multiple_distinct_gated_calls(tmp_path: Path) -> N
     assert names == ["Delete", "Write"]
 
 
+def _append_blob(store: Path, blob_id: str, data: bytes) -> None:
+    con = _sqlite3.connect(str(store))
+    try:
+        con.execute("INSERT INTO blobs (id, data) VALUES (?, ?)", (blob_id, data))
+        con.commit()
+    finally:
+        con.close()
+
+
+def _count_parsed_blobs(monkeypatch: pytest.MonkeyPatch) -> list[bytes]:
+    """Record every blob the pending-call fold parses."""
+    parsed: list[bytes] = []
+    parse = cnp._iter_embedded_json_objects
+
+    def counting_parse(raw: bytes) -> list[dict[str, object]]:
+        parsed.append(raw)
+        return parse(raw)
+
+    monkeypatch.setattr(cnp, "_iter_embedded_json_objects", counting_parse)
+    return parsed
+
+
+def test_pending_scan_skips_unchanged_store_and_folds_only_appended_blobs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = tmp_path / "store.db"
+    pending_blob = _framed(_pending_tool_call_obj("call_s\nfc", "Shell", {"command": "ls"}))
+    _write_store(store, [b'{"role":"user","content":"hi"}', pending_blob])
+    parsed = _count_parsed_blobs(monkeypatch)
+    scan = cnp.CursorPendingToolCallScan()
+    try:
+        assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == [
+            "call_s\nfc"
+        ]
+        assert len(parsed) == 2
+        assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == [
+            "call_s\nfc"
+        ]
+        assert len(parsed) == 2
+
+        result_blob = _json.dumps(_tool_result_obj("call_s\nfc")).encode("utf-8")
+        _append_blob(store, "blob-result", result_blob)
+        assert read_cursor_pending_tool_calls(store, scan) == []
+        assert parsed[2:] == [result_blob]
+    finally:
+        scan.close()
+
+
+@pytest.mark.parametrize("rewrite", ["deleted_row", "replaced_last_row", "recreated_store"])
+def test_pending_scan_refolds_a_store_whose_earlier_rows_changed(
+    tmp_path: Path, rewrite: str
+) -> None:
+    """Deleted, replaced, or recreated rows are refolded instead of trusting the old fold."""
+    store = tmp_path / "store.db"
+    _write_store(
+        store,
+        [
+            _framed(_pending_tool_call_obj("call_a", "Write", {})),
+            _framed(_pending_tool_call_obj("call_b", "Delete", {})),
+        ],
+    )
+    scan = cnp.CursorPendingToolCallScan()
+    try:
+        assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == [
+            "call_a",
+            "call_b",
+        ]
+        new_blob = _framed(_pending_tool_call_obj("call_c", "Shell", {}))
+        if rewrite == "recreated_store":
+            replacement = tmp_path / "replacement.db"
+            _write_store(replacement, [new_blob])
+            replacement.replace(store)
+            expected = ["call_c"]
+        else:
+            deleted_rowid = 1 if rewrite == "deleted_row" else 2
+            con = _sqlite3.connect(str(store))
+            try:
+                con.execute("DELETE FROM blobs WHERE rowid = ?", (deleted_rowid,))
+                con.execute("INSERT INTO blobs (id, data) VALUES (?, ?)", ("blob-c", new_blob))
+                con.commit()
+            finally:
+                con.close()
+            expected = ["call_b", "call_c"] if rewrite == "deleted_row" else ["call_a", "call_c"]
+        assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == expected
+    finally:
+        scan.close()
+
+
+def test_pending_scan_close_during_a_read_closes_after_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    store = tmp_path / "store.db"
+    _write_store(store, [_framed(_pending_tool_call_obj("call_x", "Write", {}))])
+    scan = cnp.CursorPendingToolCallScan()
+    parse = cnp._iter_embedded_json_objects
+
+    def close_mid_read(raw: bytes) -> list[dict[str, object]]:
+        scan.close()
+        assert scan._connection is not None
+        return parse(raw)
+
+    monkeypatch.setattr(cnp, "_iter_embedded_json_objects", close_mid_read)
+    assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == ["call_x"]
+    assert scan._connection is None
+    assert read_cursor_pending_tool_calls(store, scan) == []
+
+
+def test_pending_scan_reports_no_calls_for_an_unreadable_store(tmp_path: Path) -> None:
+    store = tmp_path / "store.db"
+    scan = cnp.CursorPendingToolCallScan()
+    try:
+        assert read_cursor_pending_tool_calls(store, scan) == []
+        store.write_bytes(b"not a database")
+        assert read_cursor_pending_tool_calls(store, scan) == []
+        store.unlink()
+        _write_store(store, [_framed(_pending_tool_call_obj("call_late", "Write", {}))])
+        assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == [
+            "call_late"
+        ]
+    finally:
+        scan.close()
+
+
+def test_pending_scan_reads_a_store_whose_path_has_uri_characters(tmp_path: Path) -> None:
+    """A ``#`` or ``%`` in the store path must not cut off its ``mode=ro`` URI."""
+    chat_dir = tmp_path / "chat #1 %3F"
+    chat_dir.mkdir()
+    store = chat_dir / "store.db"
+    scan = cnp.CursorPendingToolCallScan()
+    try:
+        assert read_cursor_pending_tool_calls(store, scan) == []
+        _write_store(store, [_framed(_pending_tool_call_obj("call_q", "Write", {}))])
+        assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == ["call_q"]
+    finally:
+        scan.close()
+    assert [path.name for path in tmp_path.iterdir()] == [chat_dir.name]
+
+
+def test_pending_scan_reads_a_live_wal_store_without_holding_back_checkpoints(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Blobs appended to a WAL store held open by its writer are folded, and the
+    writer can truncate the WAL while the scan parses them."""
+    store = tmp_path / "store.db"
+    _write_store(store, [_framed(_pending_tool_call_obj("call_w", "Write", {}))])
+    writer = _sqlite3.connect(str(store), timeout=0)
+    checkpoint_busy: list[int] = []
+    parse = cnp._iter_embedded_json_objects
+
+    def checkpoint_mid_parse(raw: bytes) -> list[dict[str, object]]:
+        (busy, _log_frames, _checkpointed) = writer.execute(
+            "PRAGMA wal_checkpoint(TRUNCATE)"
+        ).fetchone()
+        checkpoint_busy.append(busy)
+        return parse(raw)
+
+    scan = cnp.CursorPendingToolCallScan()
+    try:
+        assert writer.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+        writer.execute(
+            "INSERT INTO blobs (id, data) VALUES (?, ?)",
+            ("blob-v", _framed(_pending_tool_call_obj("call_v", "Delete", {}))),
+        )
+        writer.commit()
+        monkeypatch.setattr(cnp, "_iter_embedded_json_objects", checkpoint_mid_parse)
+        assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == [
+            "call_w",
+            "call_v",
+        ]
+        writer.execute(
+            "INSERT INTO blobs (id, data) VALUES (?, ?)",
+            ("blob-result", _json.dumps(_tool_result_obj("call_w")).encode("utf-8")),
+        )
+        writer.commit()
+        assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == ["call_v"]
+    finally:
+        scan.close()
+        writer.close()
+    assert checkpoint_busy == [0, 0, 0]
+
+
+def test_pending_scan_retries_read_only_after_a_writable_fallback(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A ``mode=rw`` fallback connection serves one read, and the next read tries
+    ``mode=ro`` again; the fallback never creates a missing store."""
+    store = tmp_path / "store.db"
+    _write_store(store, [_framed(_pending_tool_call_obj("call_f", "Write", {}))])
+    real_connect = _sqlite3.connect
+    store_uris: list[str] = []
+
+    def connect(database: str, *args: Any, **kwargs: Any) -> _sqlite3.Connection:
+        if database.startswith("file:"):
+            store_uris.append(database.rsplit("?", 1)[1])
+            if store_uris == ["mode=ro"]:
+                raise _sqlite3.OperationalError("unable to open database file")
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(_sqlite3, "connect", connect)
+    scan = cnp.CursorPendingToolCallScan()
+    try:
+        assert [c.tool_call_id for c in read_cursor_pending_tool_calls(store, scan)] == ["call_f"]
+        _append_blob(store, "blob-result", _json.dumps(_tool_result_obj("call_f")).encode("utf-8"))
+        assert read_cursor_pending_tool_calls(store, scan) == []
+    finally:
+        scan.close()
+    assert store_uris == ["mode=ro", "mode=rw", "mode=ro"]
+
+    missing = tmp_path / "missing.db"
+    with pytest.raises(_sqlite3.Error):
+        cnp._connect_store(missing)
+    assert not missing.exists()
+
+
 def test_tool_call_elicitation_id_is_stable_and_scoped(tmp_path: Path) -> None:
     """The id is deterministic per (session, toolCallId) and embeds the session."""
     a = cursor_tool_call_elicitation_id("conv_x", "call_1\nfc")
@@ -370,7 +586,7 @@ async def test_supervise_transcript_parks_new_call_then_releases_on_resolve(
 
     monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
     (tmp_path / "store.db").write_bytes(b"")  # exists() check
-    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s, _scan: list(pending_now))
     # Keystroke + park boundaries faked.
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
 
@@ -508,7 +724,7 @@ async def test_supervise_transcript_debounces_autoapproved_call(
 
     monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
     (tmp_path / "store.db").write_bytes(b"")
-    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending_now))
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s, _scan: list(pending_now))
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", lambda *_a, **_k: None)
 
     class _Resp:
@@ -607,13 +823,14 @@ def _install_supervisor_fakes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     *,
-    pending: list[CursorPendingToolCall],
+    pending: list[CursorPendingToolCall] | None,
     pane: str | None,
     deliver_keys: bool = True,
 ) -> tuple[list[tuple[str, dict]], list[tuple[str, ...]]]:
     """Fake the store, pane and HTTP boundaries the supervisor talks to.
 
     :param pending: Live list of pending calls; mutate it to resolve a gate.
+        ``None`` keeps the real reader over ``tmp_path / "store.db"``.
     :param pane: Pane text ``capture_cursor_pane`` returns, or ``None`` for a
         dead / unadvertised pane.
     :param deliver_keys: Whether the keystroke send reports success (``False``
@@ -625,7 +842,8 @@ def _install_supervisor_fakes(
 
     monkeypatch.setattr(cnp, "_discover_store", lambda *_a, **_k: tmp_path / "store.db")
     (tmp_path / "store.db").write_bytes(b"")
-    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending))
+    if pending is not None:
+        monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s, _scan: list(pending))
     monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: pane)
 
     async def _fake_send(_bridge: Path, _session: str, *keys: str) -> bool:
@@ -651,7 +869,11 @@ def _install_supervisor_fakes(
 
 
 def _start_supervisor(
-    tmp_path: Path, *, session_id: str, auto_accept_approvals: bool
+    tmp_path: Path,
+    *,
+    session_id: str,
+    auto_accept_approvals: bool,
+    poll_interval_s: float = 0.01,
 ) -> asyncio.Task[None]:
     """Start the supervisor with a fast poll and no settle window."""
     return asyncio.create_task(
@@ -662,7 +884,7 @@ def _start_supervisor(
             bridge_dir=tmp_path,
             workspace="/ws",
             launch_epoch_ms=0,
-            poll_interval_s=0.01,
+            poll_interval_s=poll_interval_s,
             settle_s=0.0,
             auto_accept_approvals=auto_accept_approvals,
         )
@@ -689,6 +911,58 @@ async def _stop(task: asyncio.Task[None]) -> None:
 def _hook_posts(posts: list[tuple[str, dict]]) -> list[tuple[str, dict]]:
     """The parked approval-card POSTs among *posts*."""
     return [(u, j) for u, j in posts if "hooks/cursor-permission-request" in u]
+
+
+async def test_supervise_transcript_reads_only_new_blobs_from_the_store(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Polls over an unchanged chat store must not re-read every blob, and a
+    pending call appended later is still surfaced without a full re-read."""
+    posts, _keys = _install_supervisor_fakes(monkeypatch, tmp_path, pending=None, pane=None)
+    store = tmp_path / "store.db"
+    text_blob = _json.dumps(
+        {"role": "assistant", "content": [{"type": "text", "text": "x" * 20_000}]}
+    ).encode("utf-8")
+    _write_store(store, [text_blob] * 100)
+    store_size = store.stat().st_size
+    bytes_at_start = process_bytes_read()
+    task = _start_supervisor(
+        tmp_path, session_id="conv_store", auto_accept_approvals=False, poll_interval_s=0.1
+    )
+    try:
+        assert await _wait_for(
+            lambda: process_bytes_read() - bytes_at_start >= store_size * 9 // 10,
+            timeout_s=10.0,
+        ), "the supervisor never read the store"
+        unchanged_start = process_bytes_read()
+        await asyncio.sleep(1.5)
+        unchanged_read = process_bytes_read() - unchanged_start
+
+        con = _sqlite3.connect(str(store))
+        try:
+            con.execute(
+                "INSERT INTO blobs (id, data) VALUES (?, ?)",
+                (
+                    "blob-new",
+                    _framed(_pending_tool_call_obj("call_new\nfc", "Shell", {"command": "ls"})),
+                ),
+            )
+            con.commit()
+        finally:
+            con.close()
+        append_start = process_bytes_read()
+        surfaced = await _wait_for(lambda: bool(_hook_posts(posts)), timeout_s=5.0)
+        append_read = process_bytes_read() - append_start
+    finally:
+        await _stop(task)
+
+    assert unchanged_read < store_size // 2, (
+        f"1.5 s of polls over an unchanged {store_size}-byte store read {unchanged_read} bytes"
+    )
+    assert surfaced, "the appended pending call was never surfaced"
+    assert append_read < store_size // 2, (
+        f"surfacing one appended blob read {append_read} bytes of a {store_size}-byte store"
+    )
 
 
 async def test_supervise_transcript_yolo_auto_accepts_without_card(
@@ -732,7 +1006,7 @@ async def test_supervise_transcript_yolo_waits_through_stale_pending_burst(
     )
     polls = 0
 
-    def read_pending(_store: Path) -> list[CursorPendingToolCall]:
+    def read_pending(_store: Path, _scan: object) -> list[CursorPendingToolCall]:
         nonlocal polls
         polls += 1
         return pending if polls <= 6 else []
@@ -770,7 +1044,7 @@ async def test_supervise_transcript_yolo_times_out_then_surfaces_card(
     polls = 0
     sent_at: list[float] = []
 
-    def read_pending(_store: Path) -> list[CursorPendingToolCall]:
+    def read_pending(_store: Path, _scan: object) -> list[CursorPendingToolCall]:
         nonlocal polls
         polls += 1
         return pending_now
