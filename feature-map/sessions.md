@@ -64,9 +64,11 @@ the header menu), and each place is a separate entry point.
   fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
-- `unsupported-sandbox-actions`: Databricks Sandbox and Arclet fork and
-  host-switch controls stay visible but disabled, with hover and keyboard
-  explanations. Their forms cannot submit.
+- `unsupported-sandbox-actions`: Databricks Sandbox fork controls and
+  Databricks Sandbox and Arclet host-switch controls stay visible but disabled,
+  with hover and keyboard explanations. Their forms cannot submit.
+- `fork-arclet`: an Arclet session forks only onto a new Arclet, the dialog's
+  single host choice. Without one on the server, Fork stays disabled.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app reconnects a local host
@@ -323,13 +325,21 @@ than the main session.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
-**Databricks Sandbox and Arclet sessions:** Fork is disabled in the header,
-sidebar menus, and message actions. The composer's host menu shows a disabled
-**Switch host…** item when you have write access. Read-only viewers retain the
+**Arclet sessions:** Fork in the header, sidebar menus, or message actions opens
+the clone dialog with a new Arclet sandbox as its only host; connected hosts
+and other sandbox providers are not offered. The repository prefills from the
+source's. Fork stays disabled when the server offers no Arclet, and **Continue
+in another directory…** is disabled because the session can only be cloned onto
+a new sandbox.
+
+**Databricks Sandbox and Arclet sessions:** Fork is disabled for Databricks
+Sandbox sessions in the header, sidebar menus, and message actions. The
+composer's host menu shows a disabled **Switch host…** item for both when you
+have write access. Read-only viewers retain the
 existing host menu without switching controls. Hover or focus a disabled action
 to read why it is unsupported.
-The reconnect dialog also disables Clone and Switch host; directory selection
-cannot enable either action.
+The reconnect dialog also disables Switch host, and Clone wherever Fork is
+disabled; directory selection cannot enable either action.
 While support is being checked, actions stay disabled. If that check fails,
 the explanation asks you to reload. A missing source-host record keeps switching
 disabled while ordinary shared sessions remain forkable. Direct dialogs show a loading status without
@@ -573,6 +583,15 @@ plain `uv run pytest`, which starts a private server for the test.
   Supported host-switch UI coverage:
   `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
   checks the release/launch requests with stubbed host APIs.
+- **`fork-arclet`:**
+  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_arclet_session_forks_only_onto_a_new_arclet`
+  checks that the sidebar dropdown and message action are enabled, drives the
+  header Fork, and checks the dialog's single Arclet choice and the managed fork
+  request. The server advertises Arclet through a stubbed `/v1/info` and the fork
+  is forwarded without its managed fields, so no Arclet is provisioned. The
+  server-unavailable and recovery cases, plus repository prefill, are covered in
+  `web/src/shell/ForkSessionDialog.test.tsx` and
+  `web/src/hooks/useSessionActionRestrictions.test.tsx`.
 - **`reconnect`, spinner (own environment):**
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
   seeds an error item directly into the spawned server's database.
@@ -872,6 +891,9 @@ plain `uv run pytest`, which starts a private server for the test.
   shared sessions. Other sandbox providers support forking. Verify the supported
   path with
   `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
+- An Arclet source is recognized from its host's provider, so a shared managed
+  Arclet session whose host is not in your host list keeps Fork disabled.
+  Without the managed label, such a session forks like an ordinary one.
 - A custom agent outlives its sessions: forks of your own sessions share it,
   and forking someone else's session gives you your own copy. Appearing in the
   picker does not prove the fork API accepts it; check the bound agent after
