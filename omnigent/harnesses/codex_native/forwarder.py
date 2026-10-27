@@ -480,9 +480,10 @@ class _CodexForwarderState:
         assistant reply, the forwarder recovers and posts the turn's user
         message if the live stream missed it (see
         :func:`_ensure_user_message_posted`).
-    :param user_message_copy_balance: Unmatched user-message copies keyed by
-        (thread, turn, content): positive counts live copies and negative
-        counts resumed copies with positional ids such as ``item-1``.
+    :param user_message_copy_balance: Unmatched user-message copies of
+        unfinished turns keyed by (thread, turn, content digest): positive
+        counts live copies and negative counts resumed copies with positional
+        ids such as ``item-1``.
     :param resume_echo_thread_ids: Threads whose resume snapshot is being
         replayed on a connection that also received its live notifications.
     :param partial_text_by_turn: Visible assistant/plan text fragments keyed
@@ -798,7 +799,7 @@ class _CodexForwarderState:
         their thread, turn and content. A live copy matches a resumed copy
         only while that thread's echoing replay registered it.
 
-        :param key: ``(thread_id, turn_id, content)`` for the copy.
+        :param key: ``(thread_id, turn_id, content_digest)`` for the copy.
         :param resumed: Whether the copy came from a resume snapshot.
         :returns: ``True`` when the copy duplicates an unmatched copy.
         """
@@ -806,8 +807,24 @@ class _CodexForwarderState:
         step = -1 if resumed else 1
         duplicate = balance * step < 0
         if duplicate or not resumed or key[0] in self.resume_echo_thread_ids:
-            self.user_message_copy_balance[key] = balance + step
+            if balance + step:
+                self.user_message_copy_balance[key] = balance + step
+            else:
+                self.user_message_copy_balance.pop(key, None)
         return duplicate
+
+    def forget_user_message_copies(self, turn_id: str) -> None:
+        """
+        Drop unmatched user-message copies once their turn ends.
+
+        Resume snapshots give positional ids only to in-progress turns, so a
+        finished turn's copies can no longer pair.
+
+        :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+        :returns: None.
+        """
+        for key in [key for key in self.user_message_copy_balance if key[1] == turn_id]:
+            del self.user_message_copy_balance[key]
 
     def note_tool_call_posted(self, call_id: str) -> None:
         """Record that a command's live function-call item was posted."""
@@ -4196,6 +4213,9 @@ async def _handle_terminal_turn_boundary_inner(
         params=params,
         forwarder_state=forwarder_state,
     )
+    terminal_turn_id = _terminal_turn_id_from_params(params)
+    if forwarder_state is not None and terminal_turn_id is not None:
+        forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
     if terminal.edge is not None:
         await _post_turn_status_edge(client, session_id, terminal.edge)
@@ -5327,8 +5347,11 @@ def _claim_completed_item(
         forwarder_state.advance_anon_counter(thread_id, turn_id)
     elif item.get("type") == "userMessage" and isinstance(item.get("content"), list):
         content = json.dumps(item["content"], sort_keys=True)
+        content_digest = hashlib.sha256(content.encode()).hexdigest()
         resumed = _CODEX_RESUME_POSITION_ITEM_ID.fullmatch(str(item.get("id"))) is not None
-        if forwarder_state.pair_user_message_copy((thread_id, turn_id, content), resumed=resumed):
+        if forwarder_state.pair_user_message_copy(
+            (thread_id, turn_id, content_digest), resumed=resumed
+        ):
             _logger.info("Codex forwarder skipped duplicate user message: key=%s", item_key)
             return None
     return item_key

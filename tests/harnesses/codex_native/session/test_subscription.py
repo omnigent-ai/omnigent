@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -702,6 +703,48 @@ def test_late_resume_keeps_identical_live_user_input(
         "Run the tests again.",
         "Run the tests again.",
     ]
+
+
+def test_turn_completion_drops_unmatched_live_user_message_copy(tmp_path: Path) -> None:
+    """A live user input is retained by digest only until its turn ends."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    forwarder_state = codex_native_forwarder._CodexForwarderState(parent_session_id="conv_123")
+    text = "Run the tests again."
+    retained: list[dict[tuple[str, str, str], int]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client([]) as client:
+            for event in (
+                {
+                    "method": "item/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turnId": "turn_123",
+                        "item": _user_message_item("0b6f1c2e-live-user", text),
+                    },
+                },
+                {
+                    "method": "turn/completed",
+                    "params": {
+                        "threadId": "thread_123",
+                        "turn": {"id": "turn_123", "status": "completed"},
+                    },
+                },
+            ):
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, tmp_path),
+                    event=event,
+                    expected_thread_id="thread_123",
+                    forwarder_state=forwarder_state,
+                )
+                retained.append(dict(forwarder_state.user_message_copy_balance))
+
+    asyncio.run(run())
+
+    content = json.dumps([{"type": "text", "text": text}], sort_keys=True)
+    digest = hashlib.sha256(content.encode()).hexdigest()
+    assert retained == [{("thread_123", "turn_123", digest): 1}, {}]
 
 
 @pytest.mark.parametrize(

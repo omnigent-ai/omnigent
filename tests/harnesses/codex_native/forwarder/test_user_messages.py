@@ -123,3 +123,21 @@ def test_pair_user_message_copy_matches_each_resumed_input_once(
     duplicates = [state.pair_user_message_copy(key, resumed=copy == "resumed") for copy in copies]
 
     assert duplicates == expected_duplicates
+
+
+def test_user_message_copy_balance_keeps_unmatched_copies_until_turn_ends() -> None:
+    """Paired copies and a finished turn's copies are not retained."""
+    state = fwd._CodexForwarderState(parent_session_id="conv_123")
+    state.resume_echo_thread_ids.add("thread_123")
+    paired = ("thread_123", "turn_123", "digest_paired")
+    unmatched = ("thread_123", "turn_123", "digest_unmatched")
+    other_turn = ("thread_123", "turn_456", "digest_unmatched")
+
+    state.pair_user_message_copy(paired, resumed=True)
+    state.pair_user_message_copy(paired, resumed=False)
+    state.pair_user_message_copy(unmatched, resumed=False)
+    state.pair_user_message_copy(other_turn, resumed=False)
+    assert state.user_message_copy_balance == {unmatched: 1, other_turn: 1}
+
+    state.forget_user_message_copies("turn_123")
+    assert state.user_message_copy_balance == {other_turn: 1}
