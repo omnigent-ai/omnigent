@@ -1,4 +1,4 @@
-"""E2E: tool-call Output panels soft-wrap long lines instead of clipping.
+"""E2E: shell tool output renders terminal-style and soft-wraps long lines.
 
 The ToolCard expanded panel renders tool output through ``CodeBlock``
 (``web/src/components/ai-elements/code-block.tsx``). When its ``<pre>``
@@ -12,11 +12,16 @@ The journey drives the real user path: a deterministic agent turn (mock
 LLM) runs one ``sys_os_shell`` command that prints a single very long
 line, then the test expands the settled turn's Worked fold, the tool-run
 summary, and the tool row, and asserts on what the user sees in the
-Output panel:
+shell terminal panel:
 
+  - the panel shows ``$ <command>`` and the parsed ``exit 0`` status, not
+    the raw Parameters JSON (which stays behind the Raw toggle);
   - the long output line must FIT the panel (``scrollWidth`` no wider
     than ``clientWidth``), i.e. wrap instead of forcing a horizontal
-    scrollbar.
+    scrollbar;
+  - turning word wrap off switches the line to horizontal scrolling;
+  - with Settings > Terminal theme pinned to dark under a light app, the
+    reloaded panel renders in the dark terminal palette, selection included.
 
 On the buggy build the line overflows horizontally by hundreds of
 pixels, so the final assertion fails — that failure is the reproduction.
@@ -48,19 +53,19 @@ _COMPOSER = "Send a message…"
 _ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 _WORKING = '[data-testid="working-indicator"]'
 
-# The command itself stays short (so the Parameters panel is not the
-# thing that overflows); the LONG single line is produced at runtime.
+# The command itself stays short (so the command line is not the thing
+# that overflows); the LONG single line is produced at runtime.
 _PHRASE = "long tool output line "
 _COMMAND = f"python3 -c \"print('{_PHRASE}' * 40 + 'x' * 300)\""
 
-# The phrase appears once inside the command string (Parameters panel),
-# but only the tool OUTPUT contains it repeated back-to-back — use the
-# doubled phrase to key every locator to the Output panel's <pre>.
+# The phrase appears once inside the command string, but only the tool
+# OUTPUT contains it repeated back-to-back — use the doubled phrase to key
+# every locator to the output's <pre>.
 _DOUBLED = (_PHRASE * 2).strip()
 
 _REPLY = "Long command finished."
 
-# JS helpers: find the Output panel's <pre> (the one carrying the doubled
+# JS helpers: find the output's <pre> (the one carrying the doubled
 # phrase) and measure its horizontal overflow. ``scrollWidth`` vs
 # ``clientWidth`` ties the assertion to what the user sees — whether the
 # content fits the column or needs horizontal scrolling.
@@ -73,6 +78,9 @@ _FIND_PRE = (
 )
 _PRE_PRESENT = f"() => !!({_FIND_PRE})()"
 _FITS = f"() => {{ const p = ({_FIND_PRE})(); return !!p && p.scrollWidth - p.clientWidth <= 1; }}"
+_SCROLLS = (
+    f"() => {{ const p = ({_FIND_PRE})(); return !!p && p.scrollWidth - p.clientWidth > 1; }}"
+)
 _OVERFLOW_PX = (
     f"() => {{ const p = ({_FIND_PRE})(); return p ? p.scrollWidth - p.clientWidth : null; }}"
 )
@@ -150,7 +158,7 @@ def long_output_session(
     set_fallback_mock_llm(mock_llm_server_url, model, _REPLY)
 
     yaml_text = _AGENT_YAML.format(name=name, model=model, cwd=str(ws))
-    session_id = _create_bundled_session(live_server, runner_id, yaml_text)
+    session_id = _create_bundled_session(live_server, runner_id, yaml_text, operator_authored=True)
 
     try:
         yield (live_server, session_id)
@@ -168,7 +176,7 @@ def _send(page: Page, text: str) -> None:
 
 
 def _expand_tool_output(page: Page) -> None:
-    """Expand Worked fold → tool-run summary → tool row → Output panel."""
+    """Expand Worked fold → tool-run summary → tool row → terminal panel."""
     # The Worked row only forms once the wrap-up text lands and the turn
     # settles, so waiting for it covers the turn.
     worked = page.get_by_test_id("turn-worked-fold")
@@ -186,8 +194,8 @@ def _expand_tool_output(page: Page) -> None:
     expect(row).to_be_visible(timeout=15_000)
     row.click()
 
-    # The expanded panel carries the Output code block with the long line.
-    expect(page.get_by_text("Output", exact=True)).to_be_visible(timeout=15_000)
+    # The expanded shell panel carries the command and the long output line.
+    expect(page.get_by_test_id("shell-tool-terminal")).to_be_visible(timeout=15_000)
     page.wait_for_function(_PRE_PRESENT, timeout=15_000)
 
 
@@ -204,6 +212,14 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
     expect(page.locator(_ASSISTANT, has_text=_REPLY).first).to_be_visible(timeout=90_000)
 
     _expand_tool_output(page)
+
+    # The panel reads like a terminal: the command (its `$` prompt is CSS-only)
+    # and the exit status parsed from sys_os_shell's JSON result; the
+    # Parameters JSON stays behind Raw.
+    terminal = page.get_by_test_id("shell-tool-terminal")
+    expect(terminal).to_contain_text("python3 -c")
+    expect(terminal.get_by_text("exit 0", exact=True)).to_be_visible()
+    expect(page.get_by_text("Parameters", exact=True)).to_have_count(0)
 
     # Regression guard: the long output line fits the panel width — no
     # horizontal clipping/scrolling needed to read it.
@@ -223,3 +239,26 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
             "(scrollWidth > clientWidth), so it can only be read by "
             "scrolling sideways"
         )
+
+    # Column-aligned output reads better unwrapped: the toggle must switch the
+    # same line to horizontal scrolling instead of wrapping.
+    terminal.get_by_role("button", name="Disable word wrap").click()
+    page.wait_for_function(_SCROLLS, timeout=8_000)
+
+    # The terminal theme setting paints the shell panel too: pin a dark
+    # terminal under the light app, then reload the persisted turn.
+    page.evaluate(
+        "() => { localStorage.setItem('web-theme', 'light');"
+        " localStorage.setItem('omnigent:terminal-theme', 'dark'); }"
+    )
+    page.reload()
+    _expand_tool_output(page)
+    terminal = page.get_by_test_id("shell-tool-terminal")
+    expect(terminal).to_have_attribute("data-terminal-theme", "dark")
+    expect(terminal).to_have_css("background-color", "rgb(19, 21, 23)")
+    # Selected text stays light on the dark panel instead of taking the light
+    # app's dark selection text.
+    selected_text = terminal.evaluate(
+        "(el) => getComputedStyle(el.querySelector('pre code span'), '::selection').color"
+    )
+    assert selected_text == "rgb(228, 228, 231)"

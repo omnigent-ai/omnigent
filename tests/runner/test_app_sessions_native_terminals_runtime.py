@@ -12,6 +12,7 @@ import shutil
 import sys
 import threading
 import uuid
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
 from typing import Any, cast
@@ -47,6 +48,7 @@ from omnigent.runner.session_init_protocol import (
     RunnerSessionInitSnapshot,
 )
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from tests.budgets import budget
 from tests.runner.conftest import (
     _FakeProcessManager,
     _runner_client,
@@ -403,9 +405,11 @@ async def test_codex_native_launch_config_reads_the_bridge_id_label(
 
 
 @pytest.mark.asyncio
-async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_resolution(
+@pytest.mark.parametrize("dependency", ["launch-routing", "gateway-host"])
+async def test_auto_create_codex_terminal_keeps_loop_responsive_during_credential_resolution(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    dependency: str,
 ) -> None:
     """A blocking builder dependency must not stop the runner's event loop."""
     import omnigent.harnesses.codex_native.app_server as codex_app_mod
@@ -415,10 +419,25 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     lookup_release = threading.Event()
     loop_progressed: list[bool] = []
 
-    def resolve_host(profile: str | None) -> None:
-        assert profile == "test-profile"
+    def wait_for_loop() -> None:
         loop.call_soon_threadsafe(lookup_started.set)
         loop_progressed.append(lookup_release.wait(timeout=1.0))
+
+    def resolve_host(profile: str | None) -> None:
+        assert profile == "test-profile"
+        if dependency == "gateway-host":
+            wait_for_loop()
+
+    launch_resolutions = 0
+
+    def resolve_launch(
+        *, model: str | None, spec: Any = None, terminal_launch_args: Any = ()
+    ) -> codex_app_mod.NativeCodexLaunch:
+        nonlocal launch_resolutions
+        launch_resolutions += 1
+        if dependency == "launch-routing" and launch_resolutions == 1:
+            wait_for_loop()
+        return codex_app_mod.NativeCodexLaunch([], model, "test-profile")
 
     monkeypatch.setattr(codex_native_bridge, "_BRIDGE_ROOT", tmp_path / "codex-bridge")
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path))
@@ -436,13 +455,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
     monkeypatch.setattr(codex_app_mod, "_find_codex_cli", lambda: "codex")
     monkeypatch.setattr(codex_app_mod, "_clean_codex_env", dict)
     monkeypatch.setattr(codex_app_mod, "_databricks_gateway_host", resolve_host)
-    monkeypatch.setattr(
-        codex_app_mod,
-        "resolve_native_codex_launch",
-        lambda *, model, spec=None, terminal_launch_args=(): codex_app_mod.NativeCodexLaunch(
-            [], model, "test-profile"
-        ),
-    )
+    monkeypatch.setattr(codex_app_mod, "resolve_native_codex_launch", resolve_launch)
 
     task = asyncio.create_task(
         _auto_create_codex_terminal(
@@ -461,7 +474,7 @@ async def test_auto_create_codex_terminal_keeps_loop_responsive_during_profile_r
         lookup_release.set()
         await asyncio.gather(task, return_exceptions=True)
 
-    assert loop_progressed == [True], "profile resolution blocked the runner's event loop"
+    assert loop_progressed == [True], f"{dependency} resolution blocked the runner's event loop"
 
 
 @pytest.mark.asyncio
@@ -2468,6 +2481,7 @@ async def _run_antigravity_auto_create(
     pane_agy_found: bool = True,
     lsof_attributes_ports: bool = False,
     build_agy_launch_calls: list[dict[str, Any]] | None = None,
+    auth_token_factory: Callable[[], str | None] | None = None,
 ) -> tuple[Any, list[tuple[int, str]], list[dict[str, Any]], list[tuple[str, dict[str, Any]]]]:
     """
     Drive ``_auto_create_antigravity_terminal`` with every live collaborator faked.
@@ -2501,6 +2515,7 @@ async def _run_antigravity_auto_create(
         stubbed ``build_agy_launch`` is appended here so a test can assert what
         the auto-create path forwards (e.g. snapshot ``terminal_launch_args`` →
         ``extra_args``).
+    :param auth_token_factory: Optional runner credential source for the launch.
     :returns: ``(bridge_state_after, start_cascade_calls, reader_calls,
         external_session_id_patch_calls)``.
     """
@@ -2515,7 +2530,9 @@ async def _run_antigravity_auto_create(
     monkeypatch.setenv("OMNIGENT_RUNNER_WORKSPACE", str(tmp_path / "workspace"))
     (tmp_path / "workspace").mkdir(parents=True, exist_ok=True)
     monkeypatch.delenv("DATABRICKS_CONFIG_PROFILE", raising=False)
-    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory", lambda: auth_token_factory
+    )
 
     # No-op the launch builder + onboarding seed so nothing tries to find agy.
     def _fake_build_agy_launch(**kwargs: Any) -> tuple[tuple[str, ...], dict[str, str]]:
@@ -2649,9 +2666,11 @@ async def _run_antigravity_auto_create(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authenticated", [False, True])
 async def test_auto_create_antigravity_cold_starts_real_conversation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    authenticated: bool,
 ) -> None:
     """
     A fresh runner launch cold-starts the agy conversation over RPC.
@@ -2666,12 +2685,21 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     continues it.
     """
     session_id = "72a4f9222c7ac0f45ba2736b57b51f62"
+    token_calls: list[str] = []
+
+    def auth_token() -> str:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        token_calls.append("resolved")
+        return "mock-reader-token"
+
     state, start_cascade_calls, reader_calls, patch_calls = await _run_antigravity_auto_create(
         tmp_path,
         monkeypatch,
         session_id=session_id,
         snapshot={},  # fresh: no external_session_id
         candidate_ports=[52548],
+        auth_token_factory=auth_token if authenticated else None,
     )
     # start_cascade was called once, on the discovered port, with a real id.
     assert len(start_cascade_calls) == 1
@@ -2688,6 +2716,7 @@ async def test_auto_create_antigravity_cold_starts_real_conversation(
     assert patch_calls == []  # cold-start no longer records the phantom cascade (#2 data-loss)
     # The RPC reader spawns (it replaced the transcript forwarder).
     assert len(reader_calls) == 1
+    assert token_calls == (["resolved"] if authenticated else [])
 
 
 @pytest.mark.asyncio
@@ -2724,9 +2753,11 @@ async def test_auto_create_antigravity_forwards_launch_args_to_agy_argv(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("authenticated", [False, True])
 async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    authenticated: bool,
 ) -> None:
     """
     Snapshot ``terminal_launch_args`` reach the launched kimi argv.
@@ -2751,7 +2782,20 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
     workspace.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(kimi_bridge_mod, "_BRIDGE_ROOT", tmp_path / "kimi-native")
     monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
-    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", lambda: None)
+    loop = asyncio.get_running_loop()
+    auth_started = asyncio.Event()
+    auth_release = threading.Event()
+    loop_progressed: list[bool] = []
+
+    def auth_factory() -> str:
+        loop.call_soon_threadsafe(auth_started.set)
+        loop_progressed.append(auth_release.wait(timeout=1.0))
+        return "mock-hook-token"
+
+    monkeypatch.setattr(
+        "omnigent.runner._entry._make_auth_token_factory",
+        lambda: auth_factory if authenticated else None,
+    )
     monkeypatch.setattr(kimi_mod, "resolve_kimi_executable", lambda: "/fake/bin/kimi")
     # Keep the session-home build off the user's real kimi config.
     monkeypatch.setattr(
@@ -2802,17 +2846,32 @@ async def test_auto_create_kimi_forwards_launch_args_to_kimi_argv(
                 name="Kimi",
             )
 
-    try:
-        await _auto_create_kimi_terminal(
+    task = asyncio.create_task(
+        _auto_create_kimi_terminal(
             session_id,
             cast(SessionResourceRegistry, _FakeResourceRegistry()),
             lambda _sid, _event: None,
             server_client=cast(httpx.AsyncClient, _SnapshotServerClient()),
         )
+    )
+    try:
+        if authenticated:
+            await asyncio.wait_for(auth_started.wait(), timeout=2.0)
+        auth_release.set()
+        await task
         await asyncio.sleep(0)
     finally:
+        auth_release.set()
+        await asyncio.gather(task, return_exceptions=True)
         await runner_app_mod._cancel_auto_forwarder_task(session_id)
 
+    assert loop_progressed == ([True] if authenticated else [])
+    hook_config = kimi_bridge_mod.read_hook_config(
+        kimi_bridge_mod.bridge_dir_for_session_id(session_id)
+    )
+    headers = hook_config["ap_auth_headers"]
+    assert isinstance(headers, dict)
+    assert headers.get("Authorization") == ("Bearer mock-hook-token" if authenticated else None)
     assert len(launched_specs) == 1
     spec = launched_specs[0]
     # Bare ``kimi`` plus the persisted pass-through args, verbatim.
@@ -3812,6 +3871,111 @@ async def test_codex_known_thread_forwarder_closes_retained_subscription(
             await operation
     assert closed == ["client", "server"]
     assert session_id not in orchestration._AUTO_CODEX_APP_SERVERS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("forward_path", ["discovered", "resumed"])
+@pytest.mark.parametrize("dependency", ["construction", "refresh"])
+async def test_codex_forwarder_auth_keeps_tunnel_pings_responsive(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    forward_path: str,
+    dependency: str,
+) -> None:
+    from omnigent.harnesses.codex_native import forwarder
+    from omnigent.runner import _entry
+    from omnigent.runner.native import orchestration
+    from omnigent.runner.transports.ws_tunnel.frames import (
+        PingFrame,
+        PongFrame,
+        decode_frame,
+        encode_frame,
+    )
+    from omnigent.runner.transports.ws_tunnel.serve import _handle_tunnel_frame
+
+    loop = asyncio.get_running_loop()
+    auth_started = asyncio.Event()
+    auth_release = threading.Event()
+    ping_during_auth: list[bool] = []
+    forwarded: list[dict[str, Any]] = []
+    sent: list[str] = []
+
+    def wait_for_ping() -> None:
+        loop.call_soon_threadsafe(auth_started.set)
+        ping_during_auth.append(auth_release.wait(timeout=budget(2)))
+
+    def token() -> str:
+        if dependency == "refresh" and not ping_during_auth:
+            wait_for_ping()
+        return "mock-forwarder-token"
+
+    def make_factory() -> Any:
+        if dependency == "construction":
+            wait_for_ping()
+        return token
+
+    async def forward(**kwargs: Any) -> None:
+        forwarded.append(kwargs)
+
+    async def send_text(text: str) -> None:
+        sent.append(text)
+
+    class Client:
+        async def close(self) -> None:
+            pass
+
+    client = Client()
+    real_async_client = httpx.AsyncClient
+    monkeypatch.setattr(_entry, "_make_auth_token_factory", make_factory)
+    monkeypatch.setattr(forwarder, "supervise_forwarder", forward)
+    monkeypatch.setattr(
+        forwarder,
+        "wait_for_thread_started",
+        lambda *_a, **_k: asyncio.sleep(0, result="thread-test"),
+    )
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr(
+        httpx,
+        "AsyncClient",
+        lambda **kwargs: real_async_client(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(200)), **kwargs
+        ),
+    )
+    kwargs: dict[str, Any] = {
+        "session_id": "conv-forwarder-auth",
+        "bridge_dir": tmp_path,
+        "codex_ws_url": "ws://127.0.0.1:9876",
+    }
+    operation = (
+        orchestration._codex_discover_thread_and_forward(
+            **kwargs,
+            codex_home=tmp_path / "codex-home",
+            workspace=str(tmp_path),
+            event_client=client,
+            routing_summary="test",
+        )
+        if forward_path == "discovered"
+        else orchestration._codex_forward_known_thread(
+            **kwargs, thread_id="thread-test", client=client
+        )
+    )
+    task = asyncio.create_task(operation)
+    try:
+        await asyncio.wait_for(auth_started.wait(), timeout=budget(4))
+        await _handle_tunnel_frame(
+            cast(Any, None), encode_frame(PingFrame(ts=123)), send_text, {}, {}
+        )
+        auth_release.set()
+        await task
+    finally:
+        auth_release.set()
+        await asyncio.gather(task, return_exceptions=True)
+
+    assert ping_during_auth == [True], f"{dependency} blocked the runner event loop"
+    assert decode_frame(sent[0]) == PongFrame(ts=123)
+    assert forwarded[0]["headers"] == {"Authorization": "Bearer mock-forwarder-token"}
+    assert forwarded[0]["client"] is client
+    assert forwarded[0]["auth"]._factory is token
 
 
 class _CodexPaneRegistry:

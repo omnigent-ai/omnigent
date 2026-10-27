@@ -742,13 +742,15 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
       expect(
         screen.getByText(
-          "Choose an existing directory to continue this conversation in a new session. Files from the missing workspace won’t be restored.",
+          "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.",
         ),
       ).toBeVisible();
       expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
       expect(screen.getByTestId("workspace-path-input")).toBeVisible();
       expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
-      expect(screen.queryByTestId("fork-session-branch-input")).not.toBeInTheDocument();
+      // Offered up front, but never prefilled with the missing worktree's branch.
+      expect(screen.getByTestId("fork-session-branch-input")).toBeVisible();
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
       expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Continue" })).toHaveAttribute(
         "aria-disabled",
@@ -839,6 +841,52 @@ describe("ForkSessionDialog", () => {
         "/Users/a/git/omnigent",
         undefined,
       );
+    });
+
+    it("continues in a new git worktree of the chosen repository", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog(RECOVERY);
+
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/Users/a/repo" },
+      });
+      fireEvent.change(screen.getByTestId("fork-session-branch-input"), {
+        target: { value: "recovered" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(checkHostDirectoryMock).toHaveBeenCalledExactlyOnceWith("host_1", "/Users/a/repo");
+      // Even when the chosen repo is the one the missing worktree came from,
+      // the new branch is not based on the missing worktree's branch.
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/repo", {
+        branchName: "recovered",
+        baseBranch: undefined,
+      });
+      expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork");
+    });
+
+    it("points a directory conflict at the worktree field", () => {
+      useDirectorySessionsMock.mockReturnValue({
+        data: [{ id: "conv_other", host_id: "host_1", workspace: "/Users/a/repo" }],
+      } as unknown as ReturnType<typeof useDirectorySessions>);
+      useRunnerHealthMock.mockReturnValue(new Map([["conv_other", true]]));
+      renderDialog(RECOVERY);
+
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/Users/a/repo" },
+      });
+      expect(screen.getByTestId("fork-session-conflict-hint")).toHaveTextContent(
+        "1 other agent is working in this directory, so writes may conflict. Name a git branch to work in an isolated copy.",
+      );
+
+      fireEvent.change(screen.getByTestId("fork-session-branch-input"), {
+        target: { value: "recovered" },
+      });
+      expect(screen.queryByTestId("fork-session-conflict-hint")).not.toBeInTheDocument();
     });
 
     it("requires an online host instead of falling back to a fresh sandbox", () => {

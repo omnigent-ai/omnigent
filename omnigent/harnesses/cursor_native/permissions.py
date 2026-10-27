@@ -52,7 +52,11 @@ from omnigent.harnesses.cursor_native.bridge import capture_cursor_pane, send_cu
 # Reuse the forwarder's store discovery and WAL-aware blob reader so the
 # transcript-based detector binds to the SAME cursor chat the forwarder mirrors
 # (one chat per workspace) and reads the live ``-wal`` state correctly.
-from omnigent.harnesses.cursor_native.forwarder import _discover_store, _read_blob_rows
+from omnigent.harnesses.cursor_native.forwarder import (
+    _discover_store,
+    _read_blob_rows,
+    _read_state,
+)
 
 _logger = logging.getLogger(__name__)
 
@@ -791,6 +795,21 @@ async def _yolo_auto_accept(
     return _YoloAccept.SENT
 
 
+def _resolve_elicitation_store(
+    bridge_dir: Path, workspace: str, launch_epoch_ms: int
+) -> Path | None:
+    """Return the chat store to watch, preferring the forwarder's bound store.
+
+    On cold resume the chat predates this launch, so ``_discover_store``'s
+    launch-recency filter never matches it; the bridge state's pre-seeded (or
+    forwarder-bound) store path does.
+    """
+    persisted = _read_state(bridge_dir).store_path
+    if persisted and Path(persisted).exists():
+        return Path(persisted)
+    return _discover_store(workspace, launch_epoch_ms)
+
+
 async def supervise_cursor_transcript_elicitations(
     *,
     base_url: str,
@@ -861,7 +880,7 @@ async def supervise_cursor_transcript_elicitations(
             try:
                 if store_path is None or not store_path.exists():
                     store_path = await asyncio.to_thread(
-                        _discover_store, workspace, launch_epoch_ms
+                        _resolve_elicitation_store, bridge_dir, workspace, launch_epoch_ms
                     )
                 pending_calls = (
                     await asyncio.to_thread(read_cursor_pending_tool_calls, store_path)

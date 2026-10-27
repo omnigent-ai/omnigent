@@ -39,11 +39,12 @@ FAILS on the buggy build and passes once the verdict is carried through.
 from __future__ import annotations
 
 import threading
-import time
 
 import httpx
 import pytest
 from playwright.sync_api import Page, expect
+
+from tests._helpers.polling import poll_until
 
 _APPROVAL_CARD = '[data-testid="approval-card"]'
 _MOCK_ELICITATION_TIMEOUT_MS = 15_000
@@ -54,16 +55,6 @@ def _pending_elicitations(base_url: str, session_id: str) -> list[dict]:
     resp = httpx.get(f"{base_url}/v1/sessions/{session_id}", timeout=10.0)
     resp.raise_for_status()
     return resp.json().get("pending_elicitations") or []
-
-
-def _wait_for(predicate, *, timeout_s: float = 30.0, interval_s: float = 0.5) -> None:
-    """Poll *predicate* until truthy or the deadline passes."""
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if predicate():
-            return
-        time.sleep(interval_s)
-    raise AssertionError("condition not met within timeout")
 
 
 @pytest.mark.timeout(90)
@@ -125,7 +116,7 @@ def test_elsewhere_resolved_approval_shows_verdict_not_ambiguous(
     )
 
     # The parked prompt drains and the hook returns Claude's allow decision.
-    _wait_for(lambda: not _pending_elicitations(base_url, session_id))
+    poll_until(lambda: not _pending_elicitations(base_url, session_id))
 
     # Step 4: the watched card flips to its responded state.
     responded = page.locator(f'{_APPROVAL_CARD}[data-state="responded"]').first

@@ -19,7 +19,8 @@ import httpx
 import pytest
 from playwright.sync_api import Locator, Page, Response, expect
 
-from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
+from tests._helpers.session import bind_session_runner, bundle_files
 from tests.e2e_ui.conftest import _ensure_runner_online, _server_state, open_right_rail
 
 _OUTSIDE_FILE = "inside-outside.txt"
@@ -68,7 +69,7 @@ def symlinked_workspace_session(
     runner_id = str(_server_state["runner_id"])
     yaml_text = _PROJECT_AGENT_YAML.format(workspace=workspace)
     bundle = bundle_files({"symlinked_project.yaml": yaml_text.encode()})
-    create = post_session_bundle(httpx.post, f"{live_server}/v1/sessions", bundle, timeout=30.0)
+    create = post_operator_session(httpx.post, f"{live_server}/v1/sessions", bundle, timeout=30.0)
     create.raise_for_status()
     session_id = create.json()["session_id"]
     bind_session_runner(httpx.patch, live_server, session_id, runner_id, timeout=10.0)

@@ -1,4 +1,4 @@
-"""Owned static model tables for Smart Routing and background titles.
+"""Owned static model tables for routing, background titles and Pi compatibility.
 
 Pre-launch picker listings carry no static stand-ins anymore — the live
 harness probes (see ``omnigent.host.connect``) are their source of truth.
@@ -22,6 +22,45 @@ class StaticModelFallback:
     owner: str
     provenance: str
     discovery_gap: str
+
+
+# The gateway catalog does not yet describe whether thinking can be disabled.
+PI_ANTHROPIC_THINKING_REQUIRED = StaticModelFallback(
+    model_ids=("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Measured Databricks Anthropic endpoints rejecting thinking.type.disabled",
+    discovery_gap="model listings advertise reasoning but not the supported thinking levels",
+)
+
+
+# Custom providers do not inherit Pi's built-in per-model compatibility flags.
+# On Pi upgrades, refresh adaptive/budget entries from pi-ai/dist/providers/data/anthropic.json.
+# Keep the thinking-required list above limited to gateway-verified restrictions.
+PI_ANTHROPIC_ADAPTIVE_THINKING = StaticModelFallback(
+    model_ids=(
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
+        "claude-fable-5",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+    ),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Pi 1.0.4 Anthropic catalog forceAdaptiveThinking entries",
+    discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
+)
+
+
+PI_ANTHROPIC_BUDGET_THINKING = StaticModelFallback(
+    model_ids=("claude-haiku-4-5", "claude-opus-4-5", "claude-sonnet-4-5"),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Pi 1.0.4 Anthropic catalog reasoning entries without forceAdaptiveThinking",
+    discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
+)
 
 
 #: Curated preference ORDER for codex's current arms — a ranking hint only

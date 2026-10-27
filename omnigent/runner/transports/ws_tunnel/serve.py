@@ -79,6 +79,7 @@ from omnigent.util.suspend_watch import watch_for_resume
 from omnigent.util.tls import client_ssl_context
 from omnigent.util.tunnel_limits import (
     RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
+    RUNNER_TUNNEL_SILENCE_TIMEOUT_S,
     TUNNEL_KEEPALIVE_PING_INTERVAL_S,
     TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
 )
@@ -136,6 +137,11 @@ _TUNNEL_RECYCLE_HTTP_STATUSES = {502}
 _RECYCLE_RECONNECT_MIN_S = 0.5
 _RECYCLE_RECONNECT_MAX_S = 3.0
 _RUNNER_TUNNEL_CLOSE_TIMEOUT_S = 0.25
+_RUNNER_TUNNEL_OPEN_TIMEOUT_S = 10.0
+# In-flight requests can own inference; preserve their existing keepalive tolerance.
+_RUNNER_TUNNEL_REQUEST_SILENCE_TIMEOUT_S = (
+    TUNNEL_KEEPALIVE_PING_INTERVAL_S + TUNNEL_KEEPALIVE_PING_TIMEOUT_S
+)
 # Close timeout for a *graceful* (idle-reaper) shutdown. Larger than the
 # snappy reconnect close above because completing the WebSocket close
 # handshake is what confirms the server read our end-of-stream ([DONE])
@@ -618,7 +624,10 @@ async def serve_tunnel(
                         not ever_connected
                         and auth_token is None
                         and auth_token_factory is not None
-                        and not getattr(auth_token_factory, "declined", False)
+                        and (
+                            not getattr(auth_token_factory, "declined", False)
+                            or getattr(auth_token_factory, "declined_without_proxy_bearer", False)
+                        )
                         and http_auth_rejection_streak >= _HTTP_AUTH_REJECTION_FATAL_ATTEMPTS
                     ):
                         # Same streak as the rejection below: a transient mint
@@ -642,12 +651,8 @@ async def serve_tunnel(
                             f"{http_auth_rejection_streak} attempts); "
                             f"{_reauth_hint(server_url)}"
                         ) from exc
-                    # Invalidate the cached token so the loop-top _refresh_auth_token
-                    # fetches a fresh one on the next attempt. The loop-top call is
-                    # already guarded against transient factory errors (OSError etc.),
-                    # so we don't call the factory directly here. Also clear a
-                    # 5xx-latched mint decline: the rejection proves the server
-                    # requires auth, so the next refresh must re-mint.
+                    # The rejection proves the server requires auth: drop the cached token
+                    # and any recoverable mint decline so the guarded loop-top refresh re-mints.
                     await asyncio.to_thread(_prepare_auth_retry, auth_token_factory)
                     retry_reason = f"HTTP {http_status}; retrying with refreshed token"
                     if ever_connected:
@@ -846,7 +851,7 @@ async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
         return False
     try:
         return bool(await asyncio.to_thread(getattr, factory, "sign_in_pending", False))
-    except Exception:  # noqa: BLE001 - optional status cannot prevent a tunnel upgrade.
+    except Exception:  # optional status cannot prevent a tunnel upgrade.
         _logger.warning(
             "sign_in_pending read failed; continuing with the available credential",
             exc_info=True,
@@ -858,7 +863,7 @@ async def _sign_in_pending(factory: Callable[[], str | None] | None) -> bool:
 def _prepare_auth_retry(factory: Callable[[], str | None] | None) -> None:
     """Reset rejected credentials without making transient failures fatal."""
     try:
-        _reset_server_error_decline(factory)
+        _reset_recoverable_decline(factory)
         _invalidate_auth_token_factory(factory)
     except (ValueError, OSError, ImportError):
         _logger.warning(
@@ -880,22 +885,24 @@ def _invalidate_auth_token_factory(factory: Callable[[], str | None] | None) -> 
     return bool(invalidate())
 
 
-def _reset_server_error_decline(factory: Callable[[], str | None] | None) -> None:
-    """Clear a mint decline latched by an intermediary 5xx.
+def _reset_recoverable_decline(factory: Callable[[], str | None] | None) -> bool:
+    """Clear a 5xx or bearer-less 401/403 mint decline after a re-auth rejection.
 
-    The tunnel upgrade was rejected with a re-auth signal, so the server
-    DOES require auth and a decline latched while it was unreachable (a
-    5xx answered for the mint endpoint) is wrong. Clearing it lets the
-    loop-top refresh re-mint on the next attempt. A genuine no-auth
-    refusal (HTTP 400/404) stays latched.
+    Definitive 400/404 declines stay latched.
 
     :param factory: Runner token factory, or ``None``.
+    :returns: ``True`` when a decline was cleared.
     """
-    if not getattr(factory, "declined_by_server_error", False):
-        return
+    if not (
+        getattr(factory, "declined_by_server_error", False)
+        or getattr(factory, "declined_without_proxy_bearer", False)
+    ):
+        return False
     reset = getattr(factory, "reset_decline", None)
-    if callable(reset):
-        reset()
+    if not callable(reset):
+        return False
+    reset()
+    return True
 
 
 async def _refresh_auth_token(
@@ -1095,6 +1102,7 @@ async def _serve_tunnel_once(
     import websockets
 
     dispatch_tasks: dict[str, asyncio.Task[None]] = {}
+    passive_dispatch_tasks: set[asyncio.Task[None]] = set()
     ws_channels: dict[str, _RunnerWSChannel] = {}
     # Identify as a first-party client so the server's WebSocket origin
     # guard (CSWSH protection) allows the handshake — this runner is not a
@@ -1151,18 +1159,20 @@ async def _serve_tunnel_once(
         websockets.connect(
             tunnel_url,
             additional_headers=headers,
+            open_timeout=_RUNNER_TUNNEL_OPEN_TIMEOUT_S,
             close_timeout=close_timeout,
             max_size=RUNNER_TUNNEL_MAX_MESSAGE_BYTES,
             ssl=ssl_ctx,
             # Protocol keepalive aligned to the server's 90 s app-level budget (not the
             # 20 s library default that drops a busy-but-healthy tunnel — issue #1116).
-            # Also the runner's only liveness probe for a silently-dead server.
+            # Application silence below also detects proxies answering PINGs.
             ping_interval=TUNNEL_KEEPALIVE_PING_INTERVAL_S,
             ping_timeout=TUNNEL_KEEPALIVE_PING_TIMEOUT_S,
         ) as ws,
         diagnostics.monitoring(_report_diagnostics, connection_id=connection_id),
     ):
         diagnostics.settings.update(
+            app_silence_timeout_s=RUNNER_TUNNEL_SILENCE_TIMEOUT_S,
             protocol_ping_interval_s=getattr(ws, "ping_interval", None),
             protocol_ping_timeout_s=getattr(ws, "ping_timeout", None),
             protocol_keepalive_source="websockets_connection",
@@ -1170,6 +1180,76 @@ async def _serve_tunnel_once(
 
         async def send_text(data: str) -> None:
             await diagnostics.send(ws.send, data)
+
+        async def receive_and_handle_frame() -> None:
+            raw = await ws.recv()
+            if shutdown_event is not None and shutdown_event.is_set():
+                return
+            await _handle_tunnel_frame(
+                app,
+                raw,
+                send_text,
+                dispatch_tasks,
+                ws_channels,
+                on_activity=on_activity,
+                event_dispatcher=event_dispatcher,
+                diagnostics=diagnostics,
+                passive_dispatch_tasks=passive_dispatch_tasks,
+            )
+
+        async def receive_frame() -> None:
+            """Bound the read and inline pong with one elapsed ownership deadline."""
+            started = asyncio.get_running_loop().time()
+            silence_timeout = RUNNER_TUNNEL_SILENCE_TIMEOUT_S
+            operation = asyncio.create_task(receive_and_handle_frame())
+            try:
+                while True:
+                    diagnostics.settings["app_silence_timeout_s"] = silence_timeout
+                    done, _pending = await asyncio.wait(
+                        {operation},
+                        timeout=max(
+                            0.0, started + silence_timeout - asyncio.get_running_loop().time()
+                        ),
+                    )
+                    if done:
+                        operation.result()
+                        return
+                    # Only event subscriptions are known to detach safely;
+                    # extend the same operation without cancelling a pending pong.
+                    if silence_timeout < _RUNNER_TUNNEL_REQUEST_SILENCE_TIMEOUT_S and (
+                        any(
+                            not task.done() and task not in passive_dispatch_tasks
+                            for task in dispatch_tasks.values()
+                        )
+                        or any(
+                            channel.task is None or not channel.task.done()
+                            for channel in ws_channels.values()
+                        )
+                    ):
+                        silence_timeout = _RUNNER_TUNNEL_REQUEST_SILENCE_TIMEOUT_S
+                        continue
+                    if shutdown_event is None or not shutdown_event.is_set():
+                        _logger.warning(
+                            "Runner %s made no server-frame progress for %.0fs; reconnecting",
+                            runner_id,
+                            silence_timeout,
+                            extra=debug_event(
+                                "runner_server_silence_timeout",
+                                session_id=runner_primary_session_id(),
+                                runner_id=runner_id,
+                                connection_id=connection_id,
+                                silence_timeout_s=silence_timeout,
+                                **diagnostics.snapshot(),
+                            ),
+                        )
+                        transport = getattr(ws, "transport", None)
+                        if transport is not None:
+                            with contextlib.suppress(Exception):
+                                transport.abort()
+                    raise ConnectionError("server application ping timeout; reconnecting")
+            finally:
+                operation.cancel()
+                await asyncio.gather(operation, return_exceptions=True)
 
         if on_connected is not None:
             on_connected()
@@ -1237,7 +1317,7 @@ async def _serve_tunnel_once(
             if shutdown_event is None:
                 while True:
                     try:
-                        raw = await ws.recv()
+                        await receive_frame()
                     except ConnectionClosedOK as exc:
                         if _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES:
                             # A server recycle (e.g. 1001) must reach
@@ -1246,24 +1326,15 @@ async def _serve_tunnel_once(
                             # clean close.
                             raise
                         break
-                    await _handle_tunnel_frame(
-                        app,
-                        raw,
-                        send_text,
-                        dispatch_tasks,
-                        ws_channels,
-                        on_activity=on_activity,
-                        event_dispatcher=event_dispatcher,
-                        diagnostics=diagnostics,
-                    )
             else:
                 # Race reads against the shutdown signal. When it fires,
                 # gracefully drain in-flight streams and close the socket so
                 # the server sees a clean end-of-stream, not an abrupt drop.
                 shutdown_wait = asyncio.create_task(shutdown_event.wait())
+                recv_task: asyncio.Task[None] | None = None
                 try:
                     while True:
-                        recv_task = asyncio.create_task(ws.recv())
+                        recv_task = asyncio.create_task(receive_frame())
                         done, _pending = await asyncio.wait(
                             {recv_task, shutdown_wait},
                             return_when=asyncio.FIRST_COMPLETED,
@@ -1282,7 +1353,7 @@ async def _serve_tunnel_once(
                             except asyncio.CancelledError:
                                 # Normal: the pending read was cancelled.
                                 pass
-                            except WebSocketException:
+                            except (WebSocketException, ConnectionError):
                                 # recv() had already failed with a close on the
                                 # same tick as the shutdown signal. We still
                                 # drain + close (below) so the exit stays quiet,
@@ -1306,7 +1377,7 @@ async def _serve_tunnel_once(
                             await ws.close(code=1000, reason=RUNNER_IDLE_SHUTDOWN_CLOSE_REASON)
                             break
                         try:
-                            raw = recv_task.result()
+                            recv_task.result()
                         except ConnectionClosedOK as exc:
                             # Normal close (1000/1005) mirrors the plain
                             # ``ws.recv()`` loop above: ends silently unless
@@ -1315,17 +1386,10 @@ async def _serve_tunnel_once(
                             if _websocket_close_code(exc) in _TUNNEL_RECYCLE_CLOSE_CODES:
                                 raise
                             break
-                        await _handle_tunnel_frame(
-                            app,
-                            raw,
-                            send_text,
-                            dispatch_tasks,
-                            ws_channels,
-                            on_activity=on_activity,
-                            event_dispatcher=event_dispatcher,
-                            diagnostics=diagnostics,
-                        )
                 finally:
+                    if recv_task is not None:
+                        recv_task.cancel()
+                        await asyncio.gather(recv_task, return_exceptions=True)
                     shutdown_wait.cancel()
                     with contextlib.suppress(asyncio.CancelledError):
                         await shutdown_wait
@@ -1437,7 +1501,10 @@ async def _send_hello(
         pass
 
     from omnigent.host.frames import CAP_MCP_REGISTRY
-    from omnigent.inner.native_attachments import CAP_FILESYSTEM_ATTACHMENTS
+    from omnigent.inner.native_attachments import (
+        CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
+        CAP_FILESYSTEM_ATTACHMENTS,
+    )
 
     await send_text(
         encode_frame(
@@ -1446,6 +1513,7 @@ async def _send_hello(
                 frame_protocol_version=1,
                 capabilities=[
                     CAP_FILESYSTEM_ATTACHMENTS,
+                    CAP_FILESYSTEM_ATTACHMENT_DELIVERY,
                     CAP_MCP_REGISTRY,
                     *([EVENT_INGEST_CAPABILITY] if event_dispatcher is not None else []),
                 ],
@@ -1477,6 +1545,7 @@ async def _handle_tunnel_frame(
     on_activity: Callable[[], None] | None = None,
     event_dispatcher: RunnerEventDispatcher | None = None,
     diagnostics: TunnelDiagnostics | None = None,
+    passive_dispatch_tasks: set[asyncio.Task[None]] | None = None,
 ) -> None:
     """Handle one server-to-runner tunnel frame.
 
@@ -1492,6 +1561,7 @@ async def _handle_tunnel_frame(
     :param on_activity: Optional sync callback fired for non-ping
         frames that represent real runner work.
     :param diagnostics: Connection-local application frame and heartbeat observations.
+    :param passive_dispatch_tasks: Connection-owned subscriptions that can safely reconnect.
     :returns: None.
     """
     if diagnostics is not None:
@@ -1526,6 +1596,17 @@ async def _handle_tunnel_frame(
             name=f"ws-tunnel-dispatch:{frame.id}",
         )
         dispatch_tasks[frame.id] = task
+        path = frame.path.split("?", 1)[0].split("/")
+        if (
+            passive_dispatch_tasks is not None
+            and frame.method == "GET"
+            and len(path) == 5
+            and path[:3] == ["", "v1", "sessions"]
+            and path[3]
+            and path[4] == "stream"
+        ):
+            passive_dispatch_tasks.add(task)
+            task.add_done_callback(passive_dispatch_tasks.discard)
         task.add_done_callback(_forget_dispatch_task(dispatch_tasks, frame.id))
     elif isinstance(frame, RequestCancelFrame):
         if on_activity is not None:

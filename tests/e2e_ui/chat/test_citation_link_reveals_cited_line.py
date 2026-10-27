@@ -41,7 +41,7 @@ import httpx
 import pytest
 from playwright.sync_api import Page, expect
 
-from tests._helpers.session import post_session_bundle
+from tests._helpers.operator_agents import post_operator_session
 
 _AGENT_NAME = "cited_line_target_demo"
 _FILE_REL = "src/module.py"
@@ -132,7 +132,7 @@ def cited_line_session(
     (ws / "src").mkdir()
     (ws / _FILE_REL).write_text(_module_source())
 
-    create_resp = post_session_bundle(
+    create_resp = post_operator_session(
         httpx.post, f"{live_server}/v1/sessions", _agent_bundle(str(ws)), timeout=30.0
     )
     create_resp.raise_for_status()

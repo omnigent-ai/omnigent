@@ -23,7 +23,6 @@ cost-advisor and subagent-model tests can re-use them directly:
 
     from tests.e2e.test_polly_e2e import (
         _SERVER_BOOT_TIMEOUT_SEC,
-        _free_port,
         _wait_for_health,
         _mock_env,
         _mock_polly_spec_dir,
@@ -38,7 +37,6 @@ openai-agents auth paths::
 from __future__ import annotations
 
 import shutil
-import socket
 import subprocess
 import sys
 import tempfile
@@ -50,6 +48,8 @@ from pathlib import Path
 
 import pytest
 import yaml
+
+from tests._helpers.live_server import find_free_port
 
 # tests/e2e/test_polly_e2e.py -> repo root is 2 parents up.
 _REPO = Path(__file__).resolve().parents[2]
@@ -63,19 +63,6 @@ _MIN_REPLY_CHARS = 12
 # by the ``model`` field in the POST /v1/responses body, so the spec's executor
 # model must match the key used in configure_mock_llm.
 _MOCK_BRAIN_MODEL = "mock-polly-brain"
-
-
-def _free_port() -> int:
-    """
-    Reserve an ephemeral localhost port for the local server.
-
-    :returns: A port number the OS just confirmed is free. There is a small
-        window between close and the server re-binding it; acceptable for a
-        single-process opt-in smoke.
-    """
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return sock.getsockname()[1]
 
 
 def _wait_for_health(base_url: str, deadline: float) -> None:
@@ -287,7 +274,7 @@ def local_polly_server(tmp_path: Path) -> Iterator[str]:
     :param tmp_path: pytest-provided per-test temp dir for the DB + artifacts.
     :yields: The base URL of the running server, e.g. ``"http://127.0.0.1:8811"``.
     """
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     db_uri = f"sqlite:///{tmp_path / 'polly_e2e.db'}"
     artifacts = tmp_path / "artifacts"

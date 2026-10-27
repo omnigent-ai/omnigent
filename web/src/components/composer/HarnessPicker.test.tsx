@@ -124,6 +124,88 @@ function GraceAreaPicker() {
 }
 
 describe("HarnessPicker", () => {
+  it.each(["click", "Enter", " ", "ArrowDown"])(
+    "opens the full picker directly from a cycle preview with %s",
+    async (gesture) => {
+      function PreviewPicker() {
+        const [open, setOpen] = useState(false);
+        const [preview, setPreview] = useState(true);
+        return (
+          <HarnessPicker
+            open={open}
+            onOpenChange={setOpen}
+            trigger={{ label: "Harness", model: "Opus" }}
+            onDismissCyclePreview={() => setPreview(false)}
+            cyclePreview={
+              preview
+                ? {
+                    testId: "preview-models",
+                    header: "Models",
+                    choices: [{ key: "opus", label: "Opus", checked: true }],
+                  }
+                : undefined
+            }
+          >
+            <DropdownMenuItem data-active="true">Full configuration</DropdownMenuItem>
+          </HarnessPicker>
+        );
+      }
+      render(<PreviewPicker />);
+      const trigger = screen.getByRole("button", { name: "Harness" });
+      if (gesture === "click") fireEvent.pointerDown(trigger, { button: 0 });
+      else fireEvent.keyDown(trigger, { key: gesture });
+      await waitFor(() => expect(screen.getByText("Full configuration")).toHaveFocus());
+      expect(screen.queryByRole("menuitemcheckbox", { name: "Opus" })).toBeNull();
+    },
+  );
+
+  it.each(["preview choice", "outside input", "full menu"])(
+    "preserves the intended focus when leaving a cycle preview for %s",
+    async (destination) => {
+      const picker = (mode: "closed" | "preview" | "menu") => (
+        <>
+          <input aria-label="Draft" />
+          <input aria-label="Other input" />
+          <HarnessPicker
+            open={mode === "menu"}
+            onOpenChange={vi.fn()}
+            trigger={{ label: "Harness", model: "Opus" }}
+            cyclePreview={
+              mode === "preview"
+                ? {
+                    testId: "preview-models",
+                    header: "Models",
+                    choices: [{ key: "opus", label: "Opus", checked: true, onSelect: vi.fn() }],
+                  }
+                : undefined
+            }
+          >
+            <DropdownMenuItem data-active="true">Full configuration</DropdownMenuItem>
+          </HarnessPicker>
+        </>
+      );
+      const { rerender } = render(picker("closed"));
+      const draft = screen.getByRole("textbox", { name: "Draft" });
+      act(() => draft.focus());
+      rerender(picker("preview"));
+      const choice = await screen.findByRole("menuitemcheckbox", { name: "Opus" });
+      expect(draft).toHaveFocus();
+
+      if (destination === "full menu") {
+        rerender(picker("menu"));
+        await waitFor(() => expect(screen.getByText("Full configuration")).toHaveFocus());
+      } else {
+        const outside = screen.getByRole("textbox", { name: "Other input" });
+        act(() => (destination === "preview choice" ? choice : outside).focus());
+        rerender(picker("closed"));
+        await waitFor(() =>
+          expect(destination === "preview choice" ? draft : outside).toHaveFocus(),
+        );
+        expect(screen.queryByRole("menu")).toBeNull();
+      }
+    },
+  );
+
   it.each(["right", "left"])(
     "keeps a %s submenu open while crossing a harness row toward its lower items",
     (side) => {

@@ -1,13 +1,10 @@
 #!/usr/bin/env bash
 # Emits the integration-test harness matrix as `matrix=<json>` on $GITHUB_OUTPUT.
 #
-# Returns an EMPTY matrix ({"include":[]}) to skip: zero jobs, NO check-runs.
-# This is the whole reason for the indirection (mirrors e2e-shard-matrix.sh): a
-# job-level `if:` skip would instead leave one check-run with an unexpanded
-# `Integration (${{ matrix.name }})` name.
+# Returns {"include":[]} when skipped. The consuming job must guard this value
+# with a job-level `if:` before GitHub expands the matrix.
 #
-# Skips only draft PRs. Integration is mock-LLM (no secrets), so fork PRs run
-# directly, like CI -- no fork-e2e/** mirror needed.
+# Skips draft PRs and scopes without consumers in this suite.
 #
 # Single openai-agents leg: all tests now run against the mock LLM server.
 # claude-sdk and codex reject "mock-model" as an unknown model (they validate
@@ -15,20 +12,20 @@
 # only openai-agents works without real credentials. The model name is unused
 # in mock mode (model_name fixture returns "mock-model" regardless).
 #
-# Env in:  EVENT_NAME (github.event_name), IS_DRAFT.
+# Env in:  EVENT_NAME (github.event_name), IS_DRAFT, RUN_TESTS (defaults to true).
 # Out:     matrix={"include":[{"name":..,"harness":..,"model":..,"workers":..}, ...]}
 #          (or {"include":[]} when skipped).
 
 set -euo pipefail
 
 skip=false
-if [[ "${IS_DRAFT:-false}" == "true" ]]; then
+if [[ "${IS_DRAFT:-false}" == "true" || "${RUN_TESTS:-true}" == "false" ]]; then
   skip=true
 fi
 
 if [[ "$skip" == "true" ]]; then
   echo 'matrix={"include":[]}' >> "$GITHUB_OUTPUT"
-  echo "skip: empty matrix (event=$EVENT_NAME draft=${IS_DRAFT:-})"
+  echo "skip: empty matrix (event=$EVENT_NAME draft=${IS_DRAFT:-} run=${RUN_TESTS:-true})"
   exit 0
 fi
 

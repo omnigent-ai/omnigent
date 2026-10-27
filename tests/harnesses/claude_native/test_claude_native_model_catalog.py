@@ -13,6 +13,35 @@ import pytest
 from omnigent.harnesses.claude_native import main as claude_native
 
 
+@pytest.mark.parametrize("helper", [None, "", "printf test-token"])
+def test_model_probe_uses_configured_auth_helper(
+    monkeypatch: pytest.MonkeyPatch, helper: str | None
+) -> None:
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "CLAUDE_CODE_OAUTH_TOKEN"):
+        monkeypatch.setenv(name, "ambient-credential")
+    monkeypatch.setattr(
+        "omnigent.claude_launcher.resolve_claude_launch", lambda command, args: (command, args)
+    )
+    config = (
+        claude_native.ClaudeNativeUcodeConfig(
+            env={"CLAUDE_CODE_USE_GATEWAY": "1"}, api_key_helper=helper
+        )
+        if helper is not None
+        else None
+    )
+
+    _, args, env = claude_native._claude_model_probe_invocation(config)
+
+    for name in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"):
+        if helper:
+            assert name not in env
+        else:
+            assert env[name] == "ambient-credential"
+    assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "ambient-credential"
+    if helper:
+        assert json.loads(args[args.index("--settings") + 1])["apiKeyHelper"] == helper
+
+
 def _stub_picker(
     monkeypatch: pytest.MonkeyPatch,
     models: list[dict[str, Any]] | None,

@@ -23,6 +23,9 @@ comments). This file pins only the new BE-2 surface.
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+
 import httpx
 import pytest
 
@@ -88,6 +91,30 @@ async def test_list_sessions_search_query_filters_by_title(client: httpx.AsyncCl
     # appears the LIKE pattern wasn't applied. If conv_a is missing
     # the LIKE is case-sensitive (e.g. forgot func.lower()).
     assert ids == [conv_a], f"Expected only {conv_a!r} matching 'alpha', got {ids!r}"
+
+
+async def test_list_sessions_search_scope_selects_match_group(client: httpx.AsyncClient) -> None:
+    """``search_scope`` reaches the store and rejects unknown scopes.
+
+    :param client: HTTP client wired to the test app.
+    """
+    conv_id = await _create_session(client, name="scope-agent", title="Gamma Launch Plan")
+
+    title_resp = await client.get(
+        "/v1/sessions", params={"search_query": "gamma", "search_scope": "title"}
+    )
+    assert title_resp.status_code == 200
+    assert [c["id"] for c in title_resp.json()["data"]] == [conv_id]
+    # The content group leaves out sessions whose title already matches.
+    content_resp = await client.get(
+        "/v1/sessions", params={"search_query": "gamma", "search_scope": "content"}
+    )
+    assert content_resp.status_code == 200
+    assert content_resp.json()["data"] == []
+    invalid_resp = await client.get(
+        "/v1/sessions", params={"search_query": "gamma", "search_scope": "body"}
+    )
+    assert invalid_resp.status_code == 422
 
 
 async def test_list_sessions_search_query_empty_is_noop(client: httpx.AsyncClient) -> None:
@@ -263,3 +290,74 @@ async def test_delete_session_when_runner_offline(client: httpx.AsyncClient) -> 
 
     get_resp = await client.get(f"/v1/sessions/{conv_id}")
     assert get_resp.status_code == 404
+
+
+class _DroppedRunnerClient:
+    """Runner client whose stream fails as if its tunnel had just closed."""
+
+    def stream(self, method: str, path: str, *, timeout: object) -> object:
+        del method, path, timeout
+        raise ConnectionError("tunnel closed before request completed")
+
+
+async def test_delete_session_cancels_relays_waiting_out_runner_grace(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Deleting a session whose runner just dropped ends its relays' reconnect grace.
+
+    Otherwise the grace expiry would fail the deleted session's (and its
+    sub-agent's) turn with ``runner_disconnected``.
+    """
+    from omnigent.errors import ErrorCode, OmnigentError
+    from omnigent.runtime import _globals, set_runner_router
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import orchestration
+
+    monkeypatch.setattr(orchestration, "RUNNER_DISCONNECT_GRACE_S", 60.0)
+    monkeypatch.setattr(orchestration, "_RELAY_RETRY_INTERVAL_S", 0.01)
+    store = SqlAlchemyConversationStore(db_uri)
+    conv_id = (await create_test_session(client))["id"]
+    child_id = store.create_conversation(kind="sub_agent", parent_conversation_id=conv_id).id
+
+    class _OfflineRunnerRouter:
+        def client_for_session_resources(self, session_id: str) -> object:
+            del session_id
+            raise OmnigentError(
+                "runner 'runner_dropped' is offline",
+                code=ErrorCode.RUNNER_UNAVAILABLE,
+            )
+
+    handles = []
+    prior = _globals._runner_router
+    try:
+        for session_id in (conv_id, child_id):
+            sessions_module._session_status_cache[session_id] = "running"
+            handle = sessions_module._ensure_runner_relay(
+                session_id,
+                "runner_dropped",
+                _DroppedRunnerClient(),  # type: ignore[arg-type]
+                conversation_store=store,
+            )
+            assert handle is not None
+            handles.append(handle)
+        await asyncio.sleep(0.05)
+        assert not any(h.task.done() for h in handles), "relays should be inside the grace"
+
+        set_runner_router(_OfflineRunnerRouter())  # type: ignore[arg-type]
+        del_resp = await client.delete(f"/v1/sessions/{conv_id}")
+        assert del_resp.status_code == 200
+        for handle in handles:
+            with contextlib.suppress(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(handle.task), timeout=2.0)
+            assert handle.task.cancelled()
+        for session_id in (conv_id, child_id):
+            assert sessions_module._session_status_cache.get(session_id) != "failed"
+    finally:
+        set_runner_router(prior)
+        # A failed assertion must not leave relays retrying into later tests.
+        for handle in handles:
+            handle.task.cancel()
+        for session_id in (conv_id, child_id):
+            sessions_module._session_status_cache.pop(session_id, None)

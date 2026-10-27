@@ -20,6 +20,8 @@ _MODEL_SERVICE_PREFIX = "model-services/"
 _SYSTEM_MODEL_PREFIX = "system.ai."
 _MODEL_SERVICES_MAX_RESULTS = 1000
 _MODEL_SERVICES_PARENT = "schemas/system.ai"
+#: Wire API a model service must advertise for the codex Responses route to serve it.
+_CODEX_RESPONSES_API_TYPE = "codex/v1/responses"
 _PAGE_SIZE = 100
 _MAX_PAGES = 100
 _HTTP_TIMEOUT_S = 10.0
@@ -150,12 +152,33 @@ def preferred_served_claude_model(
     return _models_by_claude_family(claude_ids, marker="claude-").get(preferred_family)
 
 
+def _advertises_api_type(service: dict[str, object], api_type: str) -> bool:
+    """Whether *service* serves *api_type*, compared trimmed and case-insensitively.
+
+    A missing, ``null`` or empty ``supported_api_types`` counts as yes, matching
+    listings that predate the field; any other non-list value counts as no.
+    """
+    api_types = service.get("supported_api_types")
+    if api_types is None or api_types == []:
+        return True
+    if not isinstance(api_types, list):
+        return False
+    reported = {value.strip().lower() for value in api_types if isinstance(value, str)}
+    return api_type.lower() in reported
+
+
 def _list_model_service_ids(
     client: httpx.Client,
     workspace_url: str,
     headers: dict[str, str],
+    *,
+    api_type: str | None = None,
 ) -> list[str]:
-    """List Databricks-managed ``system.ai`` model-service identifiers."""
+    """List Databricks-managed ``system.ai`` model-service identifiers.
+
+    :param api_type: When set, keep only services that advertise it, e.g.
+        ``"codex/v1/responses"`` (see :func:`_advertises_api_type`).
+    """
     model_ids: list[str] = []
     page_token: str | None = None
     seen_tokens: set[str] = set()
@@ -180,6 +203,8 @@ def _list_model_service_ids(
             for service in services:
                 raw_name = service.get("name") if isinstance(service, dict) else None
                 if not isinstance(raw_name, str):
+                    continue
+                if api_type is not None and not _advertises_api_type(service, api_type):
                     continue
                 model_id = raw_name.strip()
                 if model_id.startswith(_MODEL_SERVICE_PREFIX):
@@ -363,7 +388,9 @@ def discover_databricks_codex_models(
     Unity Catalog model services is the only listing that reports what the
     codex Responses route will serve, so ids are ``system.ai.`` by
     construction — unlike the Claude catalog above, which also has a legacy
-    gateway listing to merge in.
+    gateway listing to merge in. A model must advertise the codex Responses API:
+    a GPT-named model such as ``gpt-oss-120b`` that serves only chat routes
+    cannot run a codex turn.
 
     :param workspace_url: Workspace origin, e.g. ``"https://example.com"``.
     :param token: Workspace bearer token.
@@ -378,9 +405,22 @@ def discover_databricks_codex_models(
 
     headers = {"Authorization": f"Bearer {token}"}
     with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
-        model_ids = _list_model_service_ids(client, workspace_url, headers)
+        model_ids = _list_model_service_ids(
+            client, workspace_url, headers, api_type=_CODEX_RESPONSES_API_TYPE
+        )
     codex_ids = [model_id for model_id in model_ids if is_codex_compatible_model(model_id)]
     return tuple(sorted(codex_ids, key=_codex_preference_rank, reverse=True))
+
+
+def discover_databricks_gemini_models(
+    workspace_url: str, token: str, *, transport: httpx.BaseTransport | None = None
+) -> tuple[str, ...]:
+    """List Gemini model services accepted by the native Gemini gateway route."""
+    with httpx.Client(transport=transport, timeout=_HTTP_TIMEOUT_S) as client:
+        models = _list_model_service_ids(
+            client, workspace_url, {"Authorization": f"Bearer {token}"}
+        )
+    return tuple(model for model in models if _bare_model_id(model).startswith("gemini-"))
 
 
 def _codex_preference_rank(model_id: str) -> tuple[int, int, int, int, str]:
