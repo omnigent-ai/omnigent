@@ -1881,13 +1881,15 @@ def test_create_worktree_frame_round_trip() -> None:
     """Verify HostCreateWorktreeFrame survives encode → decode.
 
     A garbled repo_path or branch_name would create the worktree in
-    the wrong place or with the wrong branch.
+    the wrong place or with the wrong branch; a lost timeout_s would cut
+    a large checkout short.
     """
     original = HostCreateWorktreeFrame(
         request_id="req_wt_1",
         repo_path="/Users/alice/myrepo",
         branch_name="feature/login",
         base_branch="main",
+        timeout_s=3600.0,
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostCreateWorktreeFrame)
@@ -1937,6 +1939,34 @@ def test_create_worktree_frame_existing_branch_absent_defaults_false() -> None:
     decoded = decode_host_frame(json.dumps(msg))
     assert isinstance(decoded, HostCreateWorktreeFrame)
     assert decoded.existing_branch is False
+
+
+def test_create_worktree_frame_timeout_absent_defaults_none() -> None:
+    """A frame from an older server, without ``timeout_s``, decodes as ``None``."""
+    import json
+
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_6", repo_path="/repo", branch_name="wip")
+    )
+    msg = json.loads(encoded)
+    msg.pop("timeout_s")
+    decoded = decode_host_frame(json.dumps(msg))
+    assert isinstance(decoded, HostCreateWorktreeFrame)
+    assert decoded.timeout_s is None
+
+
+@pytest.mark.parametrize(
+    "raw_timeout",
+    ["0", "-1", "true", '"60"', "Infinity", "NaN", "1" + "0" * 400],
+    ids=["zero", "negative", "bool", "string", "infinity", "nan", "overflow"],
+)
+def test_create_worktree_frame_timeout_rejects_unusable_values(raw_timeout: str) -> None:
+    """A budget the host cannot wait on is a malformed frame, not silently kept."""
+    encoded = encode_host_frame(
+        HostCreateWorktreeFrame(request_id="req_wt_7", repo_path="/repo", branch_name="wip")
+    )
+    with pytest.raises(ValueError, match="timeout_s"):
+        decode_host_frame(encoded.replace('"timeout_s": null', f'"timeout_s": {raw_timeout}'))
 
 
 def test_create_worktree_result_frame_round_trip() -> None:

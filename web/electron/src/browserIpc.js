@@ -558,10 +558,19 @@ function registerBrowserIpc({
     const { conversationId } = args ?? {};
     const entry = typeof conversationId === "string" ? g.registry.get(conversationId) : null;
     if (!entry) return { exists: false };
+    const webContents = entry.view.webContents;
+    const url = webContents.getURL();
+    // A new view has no committed URL while its first navigation is loading.
+    const pendingUrl =
+      (url === "" || url === "about:blank") &&
+      (webContents.isLoadingMainFrame?.() ?? webContents.isLoading?.() ?? false)
+        ? entry.lastRequestedUrl
+        : undefined;
     return {
       exists: true,
-      url: entry.view.webContents.getURL(),
-      ...readNavState(entry.view.webContents),
+      url,
+      ...(pendingUrl ? { pendingUrl } : {}),
+      ...readNavState(webContents),
     };
   });
 

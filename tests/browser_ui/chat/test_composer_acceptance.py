@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from itertools import pairwise
 from pathlib import Path
 
@@ -364,3 +365,63 @@ def test_long_model_and_permission_remain_single_row(
     page.get_by_test_id("composer-agent-edit").click()
     expect(page.get_by_role("menuitemcheckbox", name=display_name, exact=True)).to_be_visible()
     assert all(results.values()), results
+
+
+def test_prompt_history_preserves_drafts_during_real_arrow_navigation(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """Native caret movement stops at the draft's top; empty input can recall."""
+    chat = chat_session_contract
+    history = ["Explain the previous change.", "Summarize the latest change."]
+    history_key = f"omnigent:prompt-history:{chat.session_id}"
+    page.add_init_script(
+        f"localStorage.setItem({json.dumps(history_key)}, {json.dumps(json.dumps(history))})"
+    )
+    page.set_viewport_size({"width": 1100, "height": 900})
+    page.goto(chat.url)
+    composer = page.get_by_label("Message the agent")
+    expect(composer).to_be_visible()
+
+    draft = "Keep this unfinished thought while I move back through its wrapped lines. " * 8
+    composer.fill(draft)
+    positions = [composer.evaluate("element => element.selectionStart")]
+    for _ in range(30):
+        composer.press("ArrowUp")
+        expect(composer).to_have_value(draft)
+        positions.append(composer.evaluate("element => element.selectionStart"))
+        if positions[-1] == 0:
+            break
+    assert positions[-1] == 0, positions
+    assert len(set(positions)) >= 3, "The draft must wrap across multiple visual lines"
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(draft)
+    composer.press("X")
+    expect(composer).to_have_value(f"X{draft}")
+
+    composer.fill("")
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(history[-1])
+    assert composer.evaluate("element => element.selectionStart") == len(history[-1])
+    # The first Up traverses the recalled line; the next walks older history.
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(history[-1])
+    assert composer.evaluate("element => element.selectionStart") == 0
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(history[0])
+    composer.press("ArrowDown")
+    expect(composer).to_have_value(history[-1])
+    composer.press("ArrowDown")
+    expect(composer).to_have_value("")
+
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(history[-1])
+    composer.press("!")
+    edited = f"{history[-1]}!"
+    expect(composer).to_have_value(edited)
+    composer.press("ArrowDown")
+    expect(composer).to_have_value(edited)
+    composer.press("ArrowUp")
+    assert composer.evaluate("element => element.selectionStart") == 0
+    composer.press("ArrowUp")
+    expect(composer).to_have_value(edited)
+    assert chat.event_posts == []

@@ -20,6 +20,7 @@ see.
 from __future__ import annotations
 
 import json
+import math
 from collections.abc import Iterator
 from dataclasses import dataclass, field
 from enum import Enum
@@ -77,6 +78,8 @@ CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
 CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
+# The host bounds a whole worktree create by ``HostCreateWorktreeFrame.timeout_s``:
+CAP_WORKTREE_CREATE_BUDGET = "worktree_create_budget"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
 HOST_CAPABILITIES: list[str] = [
@@ -90,6 +93,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_MCP_INVENTORY,
     CAP_HARNESS_STARTUP,
     CAP_REFRESH_HARNESSES,
+    CAP_WORKTREE_CREATE_BUDGET,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
 ]
@@ -632,6 +636,9 @@ class HostCreateWorktreeFrame:
     :param existing_branch: When ``True``, check out the pre-existing
         ``branch_name`` into a fresh worktree (the deleted-worktree
         recreate path) instead of creating a new branch.
+    :param timeout_s: Seconds the host may spend on this create; the
+        server waits a margin longer. ``None`` on frames from an older
+        server, whose shorter deadline the host must then stay within.
     """
 
     request_id: str
@@ -639,6 +646,7 @@ class HostCreateWorktreeFrame:
     branch_name: str
     base_branch: str | None = None
     existing_branch: bool = False
+    timeout_s: float | None = None
 
 
 @dataclass
@@ -1696,6 +1704,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "branch_name": frame.branch_name,
                 "base_branch": frame.base_branch,
                 "existing_branch": frame.existing_branch,
+                "timeout_s": frame.timeout_s,
             }
         )
     if isinstance(frame, HostCreateWorktreeResultFrame):
@@ -2859,6 +2868,7 @@ def _decode_create_worktree(msg: _JsonObject) -> HostCreateWorktreeFrame:
         branch_name=_required_str(msg, "branch_name"),
         base_branch=_optional_nullable_str(msg, "base_branch"),
         existing_branch=existing_branch is True,
+        timeout_s=_optional_positive_float(msg, "timeout_s"),
     )
 
 
@@ -3588,3 +3598,26 @@ def _optional_nullable_str(msg: _JsonObject, key: str) -> str | None:
     if not isinstance(val, str):
         raise ValueError(f"frame field must be a string or null: {key!r}")
     return val
+
+
+def _optional_positive_float(msg: _JsonObject, key: str) -> float | None:
+    """Return an optional positive number field as a float.
+
+    :param msg: Decoded frame object.
+    :param key: Field name, e.g. ``"timeout_s"``.
+    :returns: The value as a float, or ``None`` when absent or null.
+    :raises ValueError: If the field is present but not a positive,
+        finite number.
+    """
+    val = msg.get(key)
+    if val is None:
+        return None
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"frame field must be a number: {key!r}")
+    try:
+        number = float(val)
+    except OverflowError:
+        number = math.inf
+    if not math.isfinite(number) or number <= 0:
+        raise ValueError(f"frame field must be positive and finite: {key!r}")
+    return number

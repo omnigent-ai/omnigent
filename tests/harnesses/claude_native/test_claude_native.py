@@ -267,6 +267,7 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "ENABLE_TOOL_SEARCH": "true",
         "CLAUDE_CODE_DISABLE_AGENT_VIEW": "1",
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
+        "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK": "1",
     }
     args = spec["args"]
     assert args[:11] == [

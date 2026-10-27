@@ -143,6 +143,10 @@ and steers messages while the agent is busy.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
 - `draft-persistence`: unsent text survives arriving messages and prompts.
+- `prompt-history`: Up starts history recall only from empty text in an existing
+  session. Up/Down at the text boundaries browse recalled messages; editing one
+  returns to normal caret navigation. Whitespace and queued messages recalled
+  for editing remain drafts.
 - `delivered-send-recovery`: a sent message stays out of the composer when its
   HTTP acknowledgement is lost. Delivery during draft restoration clears the
   untouched draft; user edits remain. The "Something went wrong" card from the
@@ -212,6 +216,8 @@ and steers messages while the agent is busy.
 - Click the microphone button, or press ⌘/Ctrl+Alt+V, to dictate into the
   message box; press Enter to keep the text or Escape to discard it.
 - Send while the agent is working to queue a message, then steer it.
+- With the in-session message box empty, press Up to recall a previous prompt
+  (or the last queued message). While writing a draft, Up stops at the top.
 - With a native session's host offline, send a message; it waits in the queue
   as "Waiting for host" until the host reconnects.
 - Type `/n`, press Tab to complete `/new`, then Enter to open the new-session
@@ -625,6 +631,12 @@ Other connection providers alone do not enable the managed MCP picker.
   once after compaction. Repeat the queued flow while viewing another session.
 - **`draft-persistence`:**
   `tests/e2e_ui/chat/test_draft_survives_incoming_messages.py::test_mid_typing_answer_survives_arriving_prompt`
+- **`prompt-history`, in-session composer with a keyboard:**
+  `tests/browser_ui/chat/test_composer_acceptance.py::test_prompt_history_preserves_drafts_during_real_arrow_navigation`
+  checks wrapped-text caret movement, empty-composer recall, and edited recall.
+  Multiline, whitespace, quotes, and queued drafts have component coverage in
+  `web/src/pages/ChatPage.composer.test.tsx`. The new-session and side-chat
+  composers have no prompt recall; the vendor terminal owns its own history.
 - **`delivered-send-recovery`, in-session composer (desktop and mobile):**
   `tests/e2e_ui/mobile/test_composer_after_unacked_send.py::test_composer_stays_empty_after_delivered_but_unacked_send`
   runs with a phone viewport. Run the same lost-ack journey at a desktop viewport

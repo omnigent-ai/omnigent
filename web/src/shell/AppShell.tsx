@@ -83,7 +83,7 @@ import {
 } from "@/hooks/useChildSessions";
 import { useDebugMode } from "@/hooks/useDebugMode";
 import { useBrowserAgentRelay } from "@/hooks/useBrowserAgentRelay";
-import { browserViewOwnerId, openAgentBrowserTab } from "@/hooks/useBrowserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewOwnerId, openBrowserTab } from "@/hooks/useBrowserTabs";
 import { resyncBrowserSuppression } from "@/hooks/useSuppressBrowserView";
 import {
   isAgentTerminalKey,
@@ -1867,10 +1867,10 @@ function AppShellImpl() {
   // Browser-capable shells only (neither source fires without the bridge).
   useEffect(() => {
     if (!supportsBrowser()) return;
-    const surfaceBrowserTab = (sourceConversationId: string) => {
+    const surfaceBrowserTab = (sourceConversationId: string, tabId: string) => {
       // The mounted WorkspacePanel hook owns the active session's tab state.
       // Persist here only for background sessions that have no mounted hook.
-      if (sourceConversationId !== conversationId) openAgentBrowserTab(sourceConversationId);
+      if (sourceConversationId !== conversationId) openBrowserTab(sourceConversationId, tabId);
       if (sourceConversationId === conversationId) {
         handleRightRailTabChange("browser");
         setRightPanelOpenAnimated(true);
@@ -1879,7 +1879,7 @@ function AppShellImpl() {
     const unsubscribeLink = onInAppLinkOpen(surfaceBrowserTab);
     const unsubscribeAction = onBrowserActionRequest((evt, sourceConversationId) => {
       if (evt.action !== "navigate" || !sourceConversationId) return;
-      surfaceBrowserTab(sourceConversationId);
+      surfaceBrowserTab(sourceConversationId, AGENT_BROWSER_TAB_ID);
     });
     return () => {
       unsubscribeLink();
