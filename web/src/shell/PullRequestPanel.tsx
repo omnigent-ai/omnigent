@@ -24,7 +24,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
-  ArrowLeftIcon,
   CopyIcon,
   EllipsisIcon,
   ChevronDownIcon,
@@ -1062,7 +1061,9 @@ function PullRequestListRow({
   onSelect,
   onUnlink,
   unlinkPending,
+  selected,
 }: {
+  selected: boolean;
   conversationId: string;
   association: PullRequestAssociation;
   onSelect: () => void;
@@ -1099,10 +1100,16 @@ function PullRequestListRow({
   );
   const href = parseHttpUrl(association.url)?.href;
   return (
-    <li className="flex min-w-0 items-center gap-2 rounded-md px-1.5 hover:bg-muted/50">
+    <li
+      className={cn(
+        "flex min-h-10 min-w-0 items-center gap-2 px-1.5 hover:bg-muted/50",
+        selected && "bg-muted/70",
+      )}
+    >
       <button
         type="button"
         onClick={onSelect}
+        aria-current={selected ? "true" : undefined}
         title={label}
         aria-label={label}
         className="flex min-w-0 flex-1 cursor-pointer items-center gap-2 py-2 text-left text-ui focus-visible:outline-ring"
@@ -1204,8 +1211,6 @@ function PullRequestListRow({
 
 export function PullRequestPanel({ conversationId }: { conversationId: string }) {
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
-  const [detailsSession, setDetailsSession] = useState<string>();
-  const showingDetails = detailsSession === conversationId;
   const [linking, setLinking] = useState(false);
   const [url, setUrl] = useState("");
   const selected = selection?.sessionId === conversationId ? selection.url : undefined;
@@ -1261,13 +1266,18 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     associations?.provider_display,
   );
   const update = useUpdateSessionPr(conversationId);
-  useEffect(() => {
-    if (!selected && info.data?.selected_pr_url) {
-      setSelection({ sessionId: conversationId, url: info.data.selected_pr_url });
-    }
-  }, [conversationId, selected, info.data?.selected_pr_url]);
-  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
   const prs = associations?.prs ?? [];
+  useEffect(() => {
+    if (!info.data) return;
+    const availablePrs = info.data.prs;
+    const next = availablePrs?.length
+      ? availablePrs.some((pr) => pr.url === selected)
+        ? selected
+        : availablePrs[0].url
+      : info.data.selected_pr_url;
+    if (next !== selected) setSelection({ sessionId: conversationId, url: next });
+  }, [conversationId, selected, info.data]);
+  const changeSelection = (next?: string) => setSelection({ sessionId: conversationId, url: next });
   const selectedPr = prs.find((pr) => pr.url === (selected ?? associations?.selected_pr_url));
   const linkInEmptyState = prs.length === 0 && panelState.kind === "no-pr";
   const linkControls = (
@@ -1344,13 +1354,8 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
     <div className="flex h-full min-h-0 flex-col">
       {showTrackingControls ? (
         <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle showTitle={!showingDetails} />
+          <PanelTitle showTitle />
           <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
-            {prs.length > 0 && showingDetails && (
-              <Button variant="ghost" size="sm" onClick={() => setDetailsSession(undefined)}>
-                <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
-              </Button>
-            )}
             <div className="ml-auto flex shrink-0 items-center gap-1">
               <TooltipProvider delayDuration={0}>
                 <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
@@ -1359,7 +1364,7 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
                 <IconButton label="Link a PR" onClick={() => setLinking(!linking)}>
                   <PlusIcon className="size-3.5" aria-hidden="true" />
                 </IconButton>
-                {selected && showingDetails && (
+                {selected && (
                   <IconButton
                     label="Unlink PR"
                     disabled={update.isPending}
@@ -1398,59 +1403,59 @@ export function PullRequestPanel({ conversationId }: { conversationId: string })
           {[...(info.data?.warnings ?? []), ...(info.data?.discovery_warnings ?? [])].join(" ")}
         </p>
       ) : null}
-      <div className="min-h-0 flex-1">
-        {prs.length > 0 && !showingDetails ? (
-          <ul aria-label="Pull requests" className="h-full overflow-y-auto">
-            {prs.map((pr) => (
-              <PullRequestListRow
-                key={pr.url}
-                conversationId={conversationId}
-                association={{
-                  ...pr,
-                  provider: pr.provider ?? associations?.provider ?? undefined,
-                  provider_display:
-                    pr.provider_display ?? associations?.provider_display ?? undefined,
-                }}
-                unlinkPending={update.isPending}
-                onUnlink={
-                  associations?.tracking_available
-                    ? () =>
-                        update.mutate(
-                          { url: pr.url, action: "remove" },
-                          {
-                            onSuccess: (data) => {
-                              if (pr.url === selected) changeSelection(data.selected_pr_url);
-                            },
+      {prs.length > 0 && (
+        <ul
+          aria-label="Pull requests"
+          className="max-h-[min(12.5rem,40%)] shrink-0 overflow-y-auto border-b border-border"
+        >
+          {prs.map((pr) => (
+            <PullRequestListRow
+              key={pr.url}
+              conversationId={conversationId}
+              association={{
+                ...pr,
+                provider: pr.provider ?? associations?.provider ?? undefined,
+                provider_display:
+                  pr.provider_display ?? associations?.provider_display ?? undefined,
+              }}
+              unlinkPending={update.isPending}
+              onUnlink={
+                associations?.tracking_available
+                  ? () =>
+                      update.mutate(
+                        { url: pr.url, action: "remove" },
+                        {
+                          onSuccess: (data) => {
+                            if (pr.url === selected) changeSelection(data.selected_pr_url);
                           },
-                        )
-                    : undefined
-                }
-                onSelect={() => {
-                  changeSelection(pr.url);
-                  setDetailsSession(conversationId);
-                }}
-              />
-            ))}
-          </ul>
-        ) : (
-          <PullRequestPanelDetails
-            key={`${conversationId}:${selected ?? ""}`}
-            conversationId={conversationId}
-            info={info}
-            showHeading={!showTrackingControls}
-            refreshButton={!showTrackingControls ? refreshButton : undefined}
-            emptyStateAction={
-              associations?.tracking_available && linkInEmptyState ? (
-                <div className="mt-2 w-full max-w-sm">
-                  <Button onClick={() => setLinking(!linking)}>Link a PR</Button>
-                  {linkControls}
-                </div>
-              ) : (
-                openPrFallback
-              )
-            }
-          />
-        )}
+                        },
+                      )
+                  : undefined
+              }
+              selected={pr.url === selected}
+              onSelect={() => changeSelection(pr.url)}
+            />
+          ))}
+        </ul>
+      )}
+      <div className="min-h-0 flex-1">
+        <PullRequestPanelDetails
+          key={`${conversationId}:${selected ?? ""}`}
+          conversationId={conversationId}
+          info={info}
+          showHeading={!showTrackingControls}
+          refreshButton={!showTrackingControls ? refreshButton : undefined}
+          emptyStateAction={
+            associations?.tracking_available && linkInEmptyState ? (
+              <div className="mt-2 w-full max-w-sm">
+                <Button onClick={() => setLinking(!linking)}>Link a PR</Button>
+                {linkControls}
+              </div>
+            ) : (
+              openPrFallback
+            )
+          }
+        />
       </div>
     </div>
   );

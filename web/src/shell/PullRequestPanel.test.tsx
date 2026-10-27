@@ -2128,7 +2128,7 @@ describe("session PR selection", () => {
       });
       renderPanel();
       expect(!!screen.queryByRole("button", { name: "Merge" })).toBe(expected);
-      expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+      expect(screen.getByRole("tab", { name: "Summary" })).toBeVisible();
     },
   );
 
@@ -2193,7 +2193,7 @@ describe("session PR selection", () => {
     },
   );
 
-  it("opens rows and returns to the list while details load or fail", async () => {
+  it("auto-selects the first row and keeps the list while details load or fail", async () => {
     const user = userEvent.setup();
     const one = "https://github.com/example/one/pull/42";
     const two = "https://github.com/example/two/pull/42";
@@ -2208,7 +2208,7 @@ describe("session PR selection", () => {
         gh_available: true,
         authenticated: true,
         tracking_available: true,
-        selected_pr_url: one,
+        selected_pr_url: two,
         pr: { ...state.info!.data!.pr!, url: one, number: 42, title: "First repository" },
         prs: [
           {
@@ -2242,11 +2242,19 @@ describe("session PR selection", () => {
       expect.any(Object),
     );
 
-    expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
+    expect(screen.getByRole("tab", { name: "Summary" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "example/one #42 — First repository" }),
+    ).toHaveAttribute("aria-current", "true");
     await user.click(screen.getByRole("button", { name: "example/two #42 — Second repository" }));
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
-    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
-    expect(screen.getByRole("button", { name: "All pull requests (2)" })).toBeVisible();
+    expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: true, prUrl: two });
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "example/two #42 — Second repository" }),
+    ).toHaveAttribute("aria-current", "true");
+    expect(
+      screen.getByRole("button", { name: "example/one #42 — First repository" }),
+    ).not.toHaveAttribute("aria-current");
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_1" />);
@@ -2260,14 +2268,13 @@ describe("session PR selection", () => {
       "href",
       two,
     );
-    await user.click(screen.getByRole("button", { name: "All pull requests (2)" }));
     expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
     await user.click(screen.getByRole("button", { name: "example/one #42 — First repository" }));
-    expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: one });
+    expect(usePullRequestInfo).toHaveBeenCalledWith("conv_1", { poll: true, prUrl: one });
 
     state.info = { isLoading: true, error: null, isFetching: true };
     rerender(<PullRequestPanel conversationId="conv_other" />);
-    expect(screen.queryByRole("button", { name: /All pull requests/ })).toBeNull();
+    expect(screen.queryByRole("list", { name: "Pull requests" })).toBeNull();
   });
 
   it.each([undefined, null, "", "   "])(
