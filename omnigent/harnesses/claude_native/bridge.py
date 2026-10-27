@@ -6344,8 +6344,13 @@ def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
     rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
     if len(rules) < 2:
         return rules
-    frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
-    return [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
+    indents = {idx: len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules}
+    for idx in rules:
+        if lines[idx].lstrip()[:1] not in _BOX_RULE_CHARS:
+            # A clipped title's leading space belongs to the label, not the frame.
+            indents[idx] -= 1
+    frame_indent = min(indents[idx] for idx in rules[-2:])
+    return [idx for idx in rules if indents[idx] == frame_indent]
 
 
 def _composer_box(pane: str) -> _ComposerBox | None:
@@ -6562,7 +6567,13 @@ def _is_box_rule(line: str) -> bool:
     are otherwise the same shape. The length of the leading run cannot draw
     it: Claude Code right-aligns the label, so that run shrinks to a single
     glyph once the title nears the pane width, and the pane is only as wide
-    as the person's browser terminal.
+    as the person's browser terminal. A title wider than the pane is cut
+    with ``…`` and leaves no leading run at all
+    (``" a very long title… ─"``), so a rule without one is accepted only
+    when its label ends in that mark plus one space and starts one space
+    into the row, where the rule's own edge would be. Draft and transcript
+    rows are indented further, so a line that merely trails off in ``… ─``
+    stays content.
 
     :param line: A single pane line, e.g. ``"──────────"`` or
         ``"──────── my session ─"``.
@@ -6575,11 +6586,14 @@ def _is_box_rule(line: str) -> bool:
         return True
     lead = len(stripped) - len(stripped.lstrip(_TITLED_RULE_EDGE_GLYPHS))
     trail = len(stripped) - len(stripped.rstrip(_TITLED_RULE_EDGE_GLYPHS))
-    if lead < 1 or trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
+    if trail < 1 or len(stripped) < _MIN_TITLED_RULE_WIDTH:
         return False
     label = stripped[lead : len(stripped) - trail]
     if any(ch in _BOX_RULE_CHARS for ch in label):
         return False
+    if lead < 1:
+        starts_at_edge = line.startswith(" ") and not line.startswith("  ")
+        return starts_at_edge and label.endswith("… ") and bool(label[:-2].strip())
     return label.startswith(" ") and label.endswith(" ") and bool(label.strip())
 
 

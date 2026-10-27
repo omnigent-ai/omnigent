@@ -9829,6 +9829,28 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
     assert _claude_prompt_rendered(pane) is True
 
 
+_CLIPPED_TITLE_RULE = (
+    " Retry failed billing webhook deliveries with exponential backoff and"
+    " jitter, capped at one hour(… ─"
+)
+
+
+@pytest.mark.parametrize(
+    "rows",
+    [["❯"], ["❯ first line", "  ──────", "  second line trails off… ─", "  last line"]],
+    ids=["empty", "multiline-draft"],
+)
+def test_composer_reads_the_whole_box_under_a_clipped_title(rows: list[str]) -> None:
+    """The space before a clipped label does not indent its frame past the closing rule."""
+    pane = "\n".join([_CLIPPED_TITLE_RULE, *rows, "─" * 103, "  ? for shortcuts"])
+
+    assert _claude_prompt_rendered(pane) is True
+    assert claude_native_bridge._composer_rows(pane) == rows
+    assert claude_native_bridge._composer_box(pane) == claude_native_bridge._ComposerBox(
+        rows, framed=True
+    )
+
+
 @pytest.mark.parametrize(
     "line",
     [
@@ -9843,6 +9865,7 @@ def test_claude_prompt_rendered_sees_prompt_under_pane_wide_label() -> None:
         # 46-char title on a browser terminal only 50 columns wide.
         "── " + "t" * 75 + " ─",
         "─ fix-the-billing-webhook-retry-backoff-path-now ─",
+        _CLIPPED_TITLE_RULE,
     ],
 )
 def test_is_box_rule_accepts_rules(line: str) -> None:
@@ -9867,6 +9890,10 @@ def test_is_box_rule_accepts_rules(line: str) -> None:
         "│   │   │",  # deeper nesting, same shape
         "│   ├── src",  # a ``tree`` row
         "─" * 40 + " a │ b ─",  # a rule glyph inside the label
+        "  " + _CLIPPED_TITLE_RULE.lstrip(),  # continuation draft row
+        _CLIPPED_TITLE_RULE.lstrip(),  # missing the label's reserved space
+        " a title without an ellipsis ─",
+        " a short title… ─",  # narrower than _MIN_TITLED_RULE_WIDTH
     ],
 )
 def test_is_box_rule_rejects_non_rules(line: str) -> None:
@@ -11534,6 +11561,33 @@ _STALE_DRAFT_CURSORS = pytest.mark.parametrize(
 _BOX_GEOMETRIES = pytest.mark.parametrize(
     "visible_rows", [None, 2], ids=["whole-box-on-screen", "sliver-pane"]
 )
+
+
+@_STALE_DRAFT_CURSORS
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+def test_delivery_clears_multiline_drafts_under_a_clipped_title(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cursor: int, slash: bool
+) -> None:
+    """A clipped title must allow delivery while retaining every stale draft row for clearing."""
+    composer = _EditableComposer(_STALE_MULTILINE_DRAFT, cursor=cursor)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *args: composer._capture_pane(*args).replace(
+            composer._RULE, _CLIPPED_TITLE_RULE, 1
+        ),
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    if slash:
+        claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+    else:
+        inject_user_message(bridge_dir, content="hello from the web")
+
+    assert [text.strip() for text in composer.submitted] == [
+        "/effort high" if slash else "hello from the web"
+    ]
 
 
 @_BOX_GEOMETRIES
