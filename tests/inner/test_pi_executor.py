@@ -1974,6 +1974,10 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         executor = PiExecutor(gateway=True)
         _run(executor._get_gateway_token())
 
+    # Use the actual spawn environment, not a later change to the parent process.
+    executor._env["PI_CODING_AGENT_DIR"] = "pi-agent"
+    executor._cwd = str(tmp_path)
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "wrong-root"))
     config = executor._build_env_and_dir(
         [], 12345, "bridge-token", _build_models_json("https://h.example.com", "tok")
     )

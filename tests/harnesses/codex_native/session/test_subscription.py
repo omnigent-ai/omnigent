@@ -414,13 +414,16 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
     Fresh TUI threads can reject ``thread/resume`` until the first
     rollout exists; the forwarder retries and backfills resume items.
     """
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
     fake_client = _FakeCodexAppServerClient(
         response={
             "result": {
                 "thread": {
+                    "id": "thread_123",
                     "turns": [
                         {
                             "id": "turn_123",
+                            "status": "inProgress",
                             "items": [
                                 {
                                     "type": "userMessage",
@@ -434,7 +437,7 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
                                 },
                             ],
                         }
-                    ]
+                    ],
                 }
             }
         },
@@ -480,10 +483,63 @@ def test_subscribe_until_ready_retries_no_rollout_and_replays_messages(
         ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
         ("thread/resume", {"threadId": "thread_123"}),
     ]
-    assert [payload["data"]["item_data"]["role"] for payload in posted] == [
+    assert [payload["data"]["item_data"]["role"] for payload in posted[:2]] == [
         "user",
         "assistant",
     ]
+
+    assert posted[2]["data"] == _expected_status_data("running", "turn_123")
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_123"
+
+
+@pytest.mark.parametrize(
+    ("thread_id", "active_turn_id", "turn", "expected_status", "expected_active"),
+    [
+        ("thread_123", None, {"id": "turn_123", "status": "inProgress"}, "running", "turn_123"),
+        (
+            "thread_123",
+            "turn_123",
+            {"id": "turn_123", "status": {"type": "inProgress"}},
+            "running",
+            "turn_123",
+        ),
+        ("thread_other", None, {"id": "turn_123", "status": "inProgress"}, None, None),
+        (
+            "thread_123",
+            "turn_newer",
+            {"id": "turn_123", "status": "inProgress"},
+            None,
+            "turn_newer",
+        ),
+        ("thread_123", None, {"id": "turn_123", "items": []}, None, None),
+        ("thread_123", None, {"id": "turn_123", "status": "unknown"}, None, None),
+        ("thread_123", None, {"status": "inProgress"}, None, None),
+        (
+            "thread_123",
+            None,
+            {"id": "turn_123", "status": "inProgress", "error": {"message": "request failed"}},
+            "failed",
+            None,
+        ),
+    ],
+)
+def test_resume_turn_status_requires_current_explicit_state(
+    tmp_path: Path,
+    thread_id: str,
+    active_turn_id: str | None,
+    turn: dict[str, Any],
+    expected_status: str | None,
+    expected_active: str | None,
+) -> None:
+    """Authoritative active state must not overwrite a different thread or newer turn."""
+    _write_forwarder_bridge(tmp_path, active_turn_id=active_turn_id)
+    edge = codex_native_forwarder._resume_turn_status_edge_for_latest_turn(
+        tmp_path, thread_id, [turn]
+    )
+    assert (edge.status if edge is not None else None) == expected_status
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == expected_active
 
 
 def test_subscribe_until_ready_replays_completed_turn_status(

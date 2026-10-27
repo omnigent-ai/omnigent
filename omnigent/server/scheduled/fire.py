@@ -1666,11 +1666,13 @@ class ClaimedRunExecutor:
         fire_identity: FireIdentity | None = None,
         launch_dispatch: LaunchDispatch | None = None,
         registration_timeout_s: float = SANDBOX_REGISTRATION_TIMEOUT_S,
+        now: Callable[[], float] = time.time,
     ) -> None:
         self._deps = deps
         self._fire_identity = fire_identity
         self._fire_dispatch = _build_fire_dispatch(deps, launch_dispatch)
         self._registration_timeout_s = registration_timeout_s
+        self._now = now
 
     async def fire(self, task: ScheduledTask, lease: StartupLease) -> None:
         """``on_fire``: start the claimed run and record its startup outcome."""
@@ -1797,7 +1799,9 @@ class ClaimedRunExecutor:
         from omnigent.server.startup_inputs import STARTUP_LABEL
 
         if conv.labels.get(STARTUP_LABEL) == "failed":
-            # The launch failure is already recorded on the session.
+            # The launch failure is already recorded on the session. A sandbox
+            # that bound anyway can never deliver the failed prompt.
+            await self._terminate_sandbox(run.host_id)
             return "failed"
         if conv.host_id is not None:
             # The prompt was saved before the launch began; the host's replica
@@ -1812,6 +1816,11 @@ class ClaimedRunExecutor:
         launch = tracker.get(conv.id) if tracker is not None else None
         if launch is not None and not launch.settled.is_set():
             # Still provisioning on this server; a later sweep sees the binding.
+            return None
+        # A replica shutting down stops renewing at once, but keeps finishing
+        # unbound launches for the deployment's shutdown drain.
+        drain = getattr(self._deps.sandbox_config, "shutdown_drain_s", 0.0) or 0.0
+        if run.lease_expires_at is not None and self._now() < run.lease_expires_at + drain:
             return None
         reason = (
             launch.error

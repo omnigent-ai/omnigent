@@ -130,6 +130,24 @@ uv run --no-sync pytest tests/e2e/omnigent/test_pi_bundle_extensions_cwd_e2e.py 
 ```
 
 
+### Pi user resources (own environments)
+
+For `launch-reply` and `reload-resume`, configure Pi skills/extensions in the
+user agent root, with relative local-package paths and disabled-resource patterns.
+`tests/e2e/omnigent/test_pi_managed_extensions_e2e.py` drives SDK CLI startup with
+default and relative custom roots; inspect provider requests for loaded skills,
+package markers, excluded extensions, and unchanged SDK tool restrictions.
+`tests/e2e/omnigent/test_pi_context_files_e2e.py` checks that context/prompt controls
+and `skills: none` still apply. Native startup/resume is covered by
+`tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` through server/host/runner.
+A host custom root uses the existing explicit
+`OMNIGENT_RUNNER_ENV_PASSTHROUGH=PI_CODING_AGENT_DIR` setting.
+
+These scenarios use real Pi with scripted providers or prompt-observer extensions;
+they do not establish marketplace compatibility, browser rendering, live MCP OAuth,
+OS sandbox or Managed deployment acceptance. Linked resources are shared writable
+files; global instruction files, model credentials and session state stay separate.
+
 ### Deterministic checks versus live canaries
 
 | Lane | Use | What a pass does not prove |

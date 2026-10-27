@@ -3821,18 +3821,8 @@ function ComposerImpl(
       onStop();
       return;
     }
-    // ArrowUp/Down recall — only when the caret is already at the very
-    // start (ArrowUp) or end (ArrowDown) of the text.  Checking for the
-    // absence of "\n" before/after the cursor is not sufficient: long
-    // single-line text that wraps visually contains no newlines, so that
-    // check always fires and history recall intercepts cursor movement
-    // within the wrapped line.  Gating on position 0 / length ensures the
-    // browser gets to move the caret through wrapped lines first; only the
-    // final ArrowUp-at-start / ArrowDown-at-end triggers recall.
-    // Recall is for UNmodified arrows only. Cmd/Ctrl+↑/↓ (switch session) and
-    // Cmd/Alt+↑/↓ (jump between messages) are global window hotkeys meant to
-    // fire even mid-compose; without this guard the recall below intercepts
-    // them (replacing the draft) and the hotkeys appear broken in the composer.
+    // Recall starts from empty text; boundary checks preserve caret movement
+    // through wrapped recalled entries. Modified arrows belong to global hotkeys.
     if (
       (draft.quotes.length === 0 || recallingRef.current) &&
       (e.key === "ArrowUp" || e.key === "ArrowDown") &&
@@ -3843,7 +3833,7 @@ function ComposerImpl(
       const ta = e.currentTarget;
       if (e.key === "ArrowUp" && ta.selectionStart === 0) {
         // Empty-composer recall takes the last queued row before browsing history.
-        if (fullText.trim() === "" && files.length === 0 && mentionedItems.length === 0) {
+        if (fullText === "" && files.length === 0 && mentionedItems.length === 0) {
           const target = queuedMessages.findLast((m) => m.conversationId === conversationId);
           if (target !== undefined) {
             e.preventDefault();

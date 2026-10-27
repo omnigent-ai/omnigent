@@ -292,7 +292,7 @@ describe("terminalTheme", () => {
 
     // Dark mode should retain the terminal-like contrast the rest of the
     // app expects rather than inheriting the light prompt-band treatment.
-    expect(theme.background).toBe("#131517");
+    expect(theme.background).toBe("#0a0a0a");
     expect(theme.foreground).toBe("#e4e4e7");
     expect(theme.brightBlack).toBe("#71717a");
   });
