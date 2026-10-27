@@ -889,17 +889,6 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.getByText("Still checking.")).toBeDefined();
       });
 
-      it("decides per bubble, so a continued commentary-only bubble keeps its last message", () => {
-        const items: RenderItem[] = [
-          { kind: "text", itemId: "m0", text: "Checking.", final: true, phase: "commentary" },
-          tool(1, "Bash"),
-          { kind: "text", itemId: "m1", text: "Waiting on CI.", final: true, phase: "commentary" },
-        ];
-        render(<BlockRenderer items={items} sessionStatus="idle" continued foldNarration />);
-        expect(screen.queryByText("Checking.")).toBeNull();
-        expect(screen.getByText("Waiting on CI.")).toBeDefined();
-      });
-
       it("leaves a single-message turn and a live turn unfolded until it settles", () => {
         const answerOnly: RenderItem[] = [
           { kind: "text", itemId: "m0", text: "Just the answer.", final: true },
@@ -1025,23 +1014,27 @@ describe("BlockRenderer dispatch", () => {
         expect(screen.getByText("All done.")).toBeDefined();
       });
 
-      it("keeps a continued bubble's last message visible", () => {
-        // A later bubble may answer a wake or a question card, not this turn.
-        const items: RenderItem[] = [
-          { kind: "text", itemId: "m0", text: "Dispatching sub-agents.", final: true },
-          tool(1, "Agent"),
-          { kind: "text", itemId: "m1", text: "Here is the answer.", final: true },
-        ];
-        const inputs = { items, sessionStatus: "idle" as const, continued: true };
-        expect(rendersOnlyWorkedFold({ ...inputs, foldNarration: true })).toBe(false);
-        render(<BlockRenderer {...inputs} foldNarration />);
-        expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
-        expect(screen.getByText("Here is the answer.")).toBeDefined();
-        expect(screen.queryByText("Dispatching sub-agents.")).toBeNull();
+      // The rule is decided per bubble, so a commentary-only bubble falls back too.
+      it.each([undefined, "commentary" as const])(
+        "keeps a continued bubble's last message visible (phase: %s)",
+        (phase) => {
+          // A later bubble may answer a wake or a question card, not this turn.
+          const items: RenderItem[] = [
+            { kind: "text", itemId: "m0", text: "Dispatching sub-agents.", final: true, phase },
+            tool(1, "Agent"),
+            { kind: "text", itemId: "m1", text: "Here is the answer.", final: true, phase },
+          ];
+          const inputs = { items, sessionStatus: "idle" as const, continued: true };
+          expect(rendersOnlyWorkedFold({ ...inputs, foldNarration: true })).toBe(false);
+          render(<BlockRenderer {...inputs} foldNarration />);
+          expect(screen.getAllByTestId("turn-worked-fold")).toHaveLength(1);
+          expect(screen.getByText("Here is the answer.")).toBeDefined();
+          expect(screen.queryByText("Dispatching sub-agents.")).toBeNull();
 
-        const textOnly = { ...inputs, items: [items[0]!, items[2]!] };
-        expect(rendersOnlyWorkedFold({ ...textOnly, foldNarration: true })).toBe(false);
-      });
+          const textOnly = { ...inputs, items: [items[0]!, items[2]!] };
+          expect(rendersOnlyWorkedFold({ ...textOnly, foldNarration: true })).toBe(false);
+        },
+      );
 
       it("keeps the last non-blank message as the answer", () => {
         const items: RenderItem[] = [

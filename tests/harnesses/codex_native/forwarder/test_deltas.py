@@ -572,4 +572,8 @@ async def test_agent_message_forwards_codex_phase(
 
     assert posted is True
     [(_url, body)] = client.posts
-    assert body["data"]["item_data"].get("phase") == expected_phase
+    item_data = body["data"]["item_data"]
+    if expected_phase is None:
+        assert "phase" not in item_data
+    else:
+        assert item_data["phase"] == expected_phase
