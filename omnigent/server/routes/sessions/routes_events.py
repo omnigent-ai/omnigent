@@ -193,6 +193,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_devin_native_subagent,
     _launch_runner_on_host,
     _native_coding_agent_for_session,
+    _owns_host_runner,
     _parse_background_tasks,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
@@ -1804,10 +1805,15 @@ def register_events_routes(
                         "Couldn't release the side chat's resources. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     ) from exc
-            # Only the host-bound parent owns the shared runner. Stopping
-            # that process disconnects all its chats; child bindings keep it alive.
+            # Only the runner's owner stops it: the process serves every chat
+            # bound to it, so a sub-agent riding an ancestor's runner leaves it up.
             stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
+            if (
+                stop_conv is not None
+                and stop_conv.host_id
+                and stop_conv.runner_id
+                and await _owns_host_runner(stop_conv, conversation_store)
+            ):
                 stop_host_registry = getattr(request.app.state, "host_registry", None)
                 host_stopped = await _stop_host_runner_intentionally(
                     session_id,

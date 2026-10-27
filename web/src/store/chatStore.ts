@@ -143,7 +143,7 @@ import {
   resolveSessionHost,
   subscribeIdentity,
 } from "@/lib/identity";
-import { getOmnigentHostConfig, isDatabricksWorkspace } from "@/lib/host";
+import { isDatabricksWorkspace, isHostRoutingEnabled } from "@/lib/host";
 // Routing-free emit primitive (not "@/lib/analytics", which pulls in useLocation
 // and would form a routing↔store import cycle).
 import { emitInteractionPhase, startTimedInteraction } from "@/lib/analyticsEmit";
@@ -4791,12 +4791,13 @@ async function bindStream(
   // replica — NOT the one holding this session's runner tunnel. The live tail
   // then subscribes to the wrong replica's event bus and silently delivers
   // nothing (the server swallows the miss; there's no 503 to trigger the keyless
-  // retry). When sharded (a host fetcher is wired), resolve the session's host_id
-  // FIRST (one fast metadata GET that populates the map via sessionFromWire) so
-  // the stream keys correctly. Best-effort: a failed resolve falls through to the
+  // retry). The snapshot's launch stage also lives only on that replica. When
+  // requests route by host, resolve the session's host_id FIRST (one fast
+  // metadata GET that populates the map via sessionFromWire) so the stream and
+  // snapshot key correctly. Best-effort: a failed resolve falls through to the
   // unkeyed open (no worse than pre-fix). Re-apply after every resync, see
   // agentbricks/mas/.claude/skills/sync-omnigents/SKILL.md.
-  if (getOmnigentHostConfig().fetcher && getSessionHost(id) === null) {
+  if (isHostRoutingEnabled() && getSessionHost(id) === null) {
     try {
       // Prefer the registered resolver: it walks a hostless sub-agent child up
       // to its host-bound ancestor. Without one, the bare snapshot still seeds

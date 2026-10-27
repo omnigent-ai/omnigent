@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import logging
 
 import pytest
 
@@ -11,6 +12,7 @@ from omnigent.server.feature_flags import (
     FEATURES_ENV_VAR,
     Feature,
     FeatureFlags,
+    harness_install_enabled,
     resolve_feature_flags,
 )
 
@@ -131,6 +133,18 @@ def test_snapshot_is_immutable_and_does_not_follow_environment_mutation() -> Non
     assert not flags.enabled(Feature.HARNESS_INSTALL)
     with pytest.raises(dataclasses.FrozenInstanceError):
         flags.enabled_features = frozenset()  # type: ignore[misc]
+
+
+def test_harness_install_callable_failure_fails_closed(caplog: pytest.LogCaptureFixture) -> None:
+    """A broken deployment gate cannot expose setup routes or break requests."""
+
+    def broken_gate() -> bool:
+        raise RuntimeError("gate unavailable")
+
+    with caplog.at_level(logging.WARNING):
+        assert harness_install_enabled(broken_gate) is False
+
+    assert "harness_install gate failed" in caplog.text
 
 
 def test_release_flags_have_lifecycle_metadata_and_expected_defaults() -> None:

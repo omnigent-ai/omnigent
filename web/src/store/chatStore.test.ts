@@ -16372,6 +16372,45 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await teardown(controller, loop);
       setSessionHost(id, null);
     });
+
+    it("opens a host-bound session on its host's replica, where its launch stage lives", async () => {
+      workspaceMode();
+      const id = "conv_open_on_host";
+      seedSession(id, []);
+      const route = routeKeyedStreamOpens({
+        snapshotExtras: new Map([[id, { host_id: "host_b" }]]),
+      });
+      const routed = fetchMock.getMockImplementation()!;
+      // Only the replica running the sandbox wake holds its stage.
+      fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+        const path = (typeof input === "string" ? input : input.toString()).split("?")[0];
+        const onHostReplica = new Headers(init?.headers).get(SLICE_KEY) === "host_b";
+        if (path === `/v1/sessions/${id}` && onHostReplica && (init?.method ?? "GET") === "GET") {
+          return Promise.resolve(
+            mockResponse({
+              id,
+              agent_id: "agent_xyz",
+              status: "idle",
+              created_at: 0,
+              items: [],
+              labels: {},
+              pending_elicitations: [],
+              pending_inputs: [],
+              host_id: "host_b",
+              sandbox_status: { stage: "provisioning", error: null, provider: "arclet" },
+            }),
+          );
+        }
+        return routed(input, init);
+      });
+
+      await useChatStore.getState().switchTo(id);
+      await drainAsync();
+
+      expect(useChatStore.getState().sandboxStatus?.stage).toBe("provisioning");
+      expect(route.opens.map((open) => open.headers.get(SLICE_KEY))).toEqual(["host_b"]);
+      setSessionHost(id, null);
+    });
   });
 });
 

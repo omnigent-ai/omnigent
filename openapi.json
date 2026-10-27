@@ -11573,6 +11573,51 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/harnesses/accounts/refresh": {
+      "post": {
+        "description": "Probe non-secret harness accounts, using a recent connection result.",
+        "operationId": "refresh_host_harness_accounts_v1_hosts__host_id__harnesses_accounts_refresh_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Refresh Host Harness Accounts V1 Hosts  Host Id  Harnesses Accounts Refresh Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Host Harness Accounts",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/harnesses/refresh": {
       "post": {
         "description": "Force an immediate full harness-readiness probe on a host.",

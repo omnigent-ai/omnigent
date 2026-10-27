@@ -21,6 +21,20 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker. When harness repair is
   enabled, Settings → Harnesses shows the missing credential as an actionable
   card; its Reconfigure control and full-card click replace a separate banner action.
+- `account-management`: Settings harness cards show the non-secret account label
+  reported by the connected host (email, plan, organization, or provider names).
+  An expired account is shown as needing reconfiguration and the repair dialog
+  presents the existing copyable CLI sign-in command. The server owns
+  `/v1/hosts/{host}/harnesses/accounts/refresh`. Hosts never probe accounts on
+  their own: an enabled server requests one probe after connection, and Settings
+  requests one when Harnesses opens or its selected host changes. The server
+  reuses a successful result for 60 seconds. Account metadata and the refresh
+  route are available only while harness repair is enabled and the connected
+  host advertises support; older hosts receive no probe, and older servers or
+  flag-off servers never cause a new host to spawn one.
+- `isaac-credential-detection`: harness setup offers Isaac when host-side
+  Databricks detection finds a matching credential, and fails open for older
+  hosts or servers that cannot report detection results.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the
@@ -151,6 +165,10 @@ only when the server enables the `import_review` release feature.
 **Harness credential repair:** Settings → Harnesses → a needs-auth harness →
 Settings. Activate either the credential card or its Reconfigure affordance;
 both open the same repair flow.
+
+**Harness account repair:** Settings → Harnesses → a harness with an expired
+account → Settings → Reconfigure. Choose the personal credential and copy the
+CLI sign-in command, then use **Check again** after completing it on the host.
 
 **Idle reap:** finish a turn, then leave the session alone past the idle window:
 a web session with its Terminal view open but untouched or its tabs closed, a

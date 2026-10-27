@@ -6111,6 +6111,69 @@ _RELAUNCH_MEMO_MAX = 512
 _detached_supersede_stops: set[asyncio.Task[None]] = set()
 
 
+# Ancestor rows read per ownership check; deeper chains leave the runner up.
+_OWNERSHIP_ANCESTOR_LOOKUP_LIMIT = 16
+
+
+async def _owns_host_runner(conv: Conversation, conversation_store: ConversationStore) -> bool:
+    """
+    Whether ``conv`` owns the host runner it is bound to.
+
+    A sub-agent created with ``parent_session_id`` keeps its ``host_id`` but
+    inherits its parent's ``runner_id`` (a stale binding is healed back to the
+    nearest live ancestor's), so it rides a runner an ancestor owns, and
+    stopping that runner would take the parent and every sibling down. A
+    sub-agent owns its runner only when a bounded walk reads every ancestor row
+    and none is bound to the same runner or left unbound on the same host; an
+    unverifiable chain fails closed.
+
+    :param conv: Session row whose ``host_id``/``runner_id`` binding is being
+        torn down.
+    :param conversation_store: Store used to read the ancestor rows.
+    :returns: ``True`` when stopping the runner on this session's behalf is safe.
+    """
+    if not conv.host_id or not conv.runner_id:
+        return False
+    visited = {conv.id}
+    ancestor_id = conv.parent_conversation_id
+    for _ in range(_OWNERSHIP_ANCESTOR_LOOKUP_LIMIT):
+        if ancestor_id is None:
+            return True
+        if ancestor_id in visited:
+            break
+        visited.add(ancestor_id)
+        try:
+            ancestor = await asyncio.to_thread(conversation_store.get_conversation, ancestor_id)
+        except Exception:  # noqa: BLE001
+            _logger.warning(
+                "Runner ownership check for %s could not read ancestor %s; leaving the runner up",
+                conv.id,
+                ancestor_id,
+                exc_info=True,
+                extra={"session_id": conv.id},
+            )
+            return False
+        # A missing or unbound ancestor row could hide the owner, so leave the runner up.
+        if (
+            ancestor is None
+            or ancestor.runner_id == conv.runner_id
+            or (ancestor.runner_id is None and ancestor.host_id == conv.host_id)
+        ):
+            return False
+        ancestor_id = ancestor.parent_conversation_id
+    if ancestor_id is None:
+        return True
+    _logger.warning(
+        "Runner ownership check for %s stopped at ancestor %s (cycle or more than %d "
+        "ancestors); leaving the runner up",
+        conv.id,
+        ancestor_id,
+        _OWNERSHIP_ANCESTOR_LOOKUP_LIMIT,
+        extra={"session_id": conv.id},
+    )
+    return False
+
+
 def _spawn_superseded_runner_stop(
     session_id: str,
     host_id: str,
@@ -6239,6 +6302,7 @@ async def _launch_runner_on_host_locked(
 
     await host_registry.admit_launch(host_conn, conv.id)
     superseded_runner_id = conv.runner_id
+    reap_superseded = await _owns_host_runner(conv, conversation_store)
     binding_token = secrets.token_urlsafe(32)
     new_runner_id = token_bound_runner_id(binding_token)
 
@@ -6262,10 +6326,10 @@ async def _launch_runner_on_host_locked(
         ),
     )
     with runner_log_scope(conv.id, new_runner_id):
-        if superseded_runner_id and conv.host_id is not None:
+        if reap_superseded and superseded_runner_id and conv.host_id is not None:
             # The old runner is unbound as of the replace above; reap it so it
-            # doesn't idle on the host forever (tunnel still authenticating,
-            # forwarder still tailing this session).
+            # doesn't idle on the host. A sub-agent's inherited runner stays up
+            # for the ancestor that owns it.
             _spawn_superseded_runner_stop(
                 conv.id, conv.host_id, superseded_runner_id, host_registry
             )

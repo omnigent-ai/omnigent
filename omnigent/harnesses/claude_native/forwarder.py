@@ -6541,6 +6541,23 @@ async def _post_external_compaction_status(
     resp.raise_for_status()
 
 
+def _compaction_snapshot_message(
+    role: object, message: dict[object, object], content: object
+) -> dict[str, object]:
+    """
+    Build one snapshot entry from a Claude transcript record.
+
+    Claude Code writes one record per content block and rejoins records that
+    share ``message.id`` into one API message on resume, so that id travels
+    with the snapshot as ``message_id``.
+    """
+    snapshot: dict[str, object] = {"type": "message", "role": role, "content": content}
+    message_id = message.get("id")
+    if isinstance(message_id, str) and message_id:
+        snapshot["message_id"] = message_id
+    return snapshot
+
+
 def _compaction_summary_boundary(
     records: Mapping[str, dict[str, object]], summary: Mapping[str, object]
 ) -> dict[str, object] | None:
@@ -6726,7 +6743,7 @@ def _restore_preserved_compaction_messages(
         if not content:
             _logger.warning("Skipping empty Claude retained message")
             continue
-        snapshot.append((uid, {"type": "message", "role": role, "content": content}))
+        snapshot.append((uid, _compaction_snapshot_message(role, message, content)))
 
     # The SDK may have followed either the summary or the retained tail.
     # Replace that prefix while preserving turns that followed compaction.
@@ -6836,14 +6853,11 @@ async def _persist_native_compaction_item(
             content = raw_message.get("content")
             if not isinstance(content, (str, list)):
                 continue
-            message_id = getattr(message, "uuid", None)
-            if not isinstance(message_id, str) or not message_id:
-                message_id = f"native-message-{index}"
+            record_uuid = getattr(message, "uuid", None)
+            if not isinstance(record_uuid, str) or not record_uuid:
+                record_uuid = f"native-message-{index}"
             native_messages.append(
-                (
-                    message_id,
-                    {"type": "message", "role": role, "content": content},
-                )
+                (record_uuid, _compaction_snapshot_message(role, raw_message, content))
             )
         if not native_messages:
             raise ValueError("Claude session reader returned no usable messages")
@@ -6881,11 +6895,11 @@ async def _persist_native_compaction_item(
     compacted_messages: list[dict[str, object]] | None = None
     if native_messages is not None:
         compacted_messages = []
-        for message_id, message in native_messages:
+        for record_uuid, message in native_messages:
             snapshot_message = dict(message)
             try:
                 _, forwarded_items = _transcript_items_from_entry(
-                    {"type": message["role"], "uuid": message_id, "message": message},
+                    {"type": message["role"], "uuid": record_uuid, "message": message},
                     line_number=0,
                     record_offset=None,
                     agent_name="claude-native",
