@@ -4758,13 +4758,15 @@ class HostProcess:
                                 "reconnecting on slow backoff until it responds.",
                                 cause,
                             )
-                            print(
-                                f"⚠ {cause} The server may be unhealthy. "
-                                "Retrying on a slower cadence — this recovers "
-                                "automatically once the server responds.",
-                                file=sys.stderr,
-                                flush=True,
-                            )
+                            # A detached console must not stop tunnel recovery.
+                            with contextlib.suppress(OSError, ValueError):
+                                print(
+                                    f"⚠ {cause} The server may be unhealthy. "
+                                    "Retrying on a slower cadence — this recovers "
+                                    "automatically once the server responds.",
+                                    file=sys.stderr,
+                                    flush=True,
+                                )
                     else:
                         self._silent_connect_streak = 0
                     # Classify the disconnect to choose a reconnect cadence.
@@ -5329,12 +5331,14 @@ class HostProcess:
                 await self._report_runner_exit(
                     runner_id, report.error, had_connected=report.had_connected
                 )
-            print(
-                f"✓ Connected as {self._identity.name!r} "
-                f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
-                "Listening for sessions — Ctrl-C to disconnect.",
-                flush=True,
-            )
+            # Registration remains usable after the console reader exits.
+            with contextlib.suppress(OSError, ValueError):
+                print(
+                    f"✓ Connected as {self._identity.name!r} "
+                    f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
+                    "Listening for sessions — Ctrl-C to disconnect.",
+                    flush=True,
+                )
 
             # Readiness refresh runs in its own task, never on this receive loop:
             # a harness probe that blocks (a hung CLI ``--version`` / ``auth

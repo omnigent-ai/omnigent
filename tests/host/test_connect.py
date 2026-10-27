@@ -2357,10 +2357,13 @@ async def test_connect_watchdog_silent_on_intentional_stop(
 
 @pytest.mark.parametrize("had_connected", [None, False, True])
 @pytest.mark.parametrize("send_fails", [False, True])
+@pytest.mark.parametrize("console_error", [None, BrokenPipeError, ValueError])
 async def test_unreported_exit_flushes_after_reconnect(
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
     had_connected: bool | None,
     send_fails: bool,
+    console_error: type[Exception] | None,
 ) -> None:
     """An exit report that raced a disconnect is sent after the next hello.
 
@@ -2379,6 +2382,10 @@ async def test_unreported_exit_flushes_after_reconnect(
     )
     assert "runner_parked" in host._unreported_exits
     tunnel = _FakeTunnel()
+    if console_error is not None:
+        monkeypatch.setattr(
+            "omnigent.host.connect.print", Mock(side_effect=console_error), raising=False
+        )
 
     # _serve_frames sends hello, flushes parked reports, then hits the
     # fake recv's immediate disconnect.
@@ -7859,10 +7866,12 @@ async def test_sustained_recycle_failures_fall_back_to_backoff(
     assert prompt == [0, 1, 2], f"prompt cadence must stop after the streak cap: {prompt}"
 
 
+@pytest.mark.parametrize("console_error", [None, BrokenPipeError, ValueError])
 async def test_silent_connect_streak_escalates_and_slows_reconnects(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
+    console_error: type[Exception] | None,
 ) -> None:
     """Repeated accepted-but-silent connections escalate to slow backoff."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
@@ -7873,6 +7882,10 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     spy = _ConnectSpy([None, None, None, None, None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
     host = _host()
+    if console_error is not None:
+        monkeypatch.setattr(
+            "omnigent.host.connect.print", Mock(side_effect=console_error), raising=False
+        )
 
     with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
         await host.run()
@@ -7880,7 +7893,9 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     errors = [record for record in caplog.records if record.levelno == logging.ERROR]
     assert len(errors) == 1
     assert "3 consecutive connections but never responded" in errors[0].message
-    assert capsys.readouterr().err.count("never responded") == 1
+    if console_error is None:
+        assert capsys.readouterr().err.count("never responded") == 1
+    assert spy.call_count == 6
     reconnects = [
         record.message for record in caplog.records if "Reconnecting in" in record.message
     ]
