@@ -153,6 +153,16 @@ class OmnigentAcpMcp:
         """Tear down the relay HTTP server and remove the bridge dir."""
         self._cleanup()
 
+    def write_settings_file(self) -> Path:
+        """Export this session's relay for agents that read MCP settings files."""
+        if self._bridge_dir is None or not self._acp_servers:
+            raise RuntimeError("The Omnigent MCP relay is unavailable for this session")
+        from omnigent.harnesses.claude_native.bridge import _write_json_file, build_mcp_config
+
+        path = self._bridge_dir / "mcp-settings.json"
+        _write_json_file(path, build_mcp_config(self._bridge_dir))
+        return path
+
     def _cleanup(self) -> None:
         if self._relay is not None:
             with contextlib.suppress(Exception):

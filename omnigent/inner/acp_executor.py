@@ -191,6 +191,8 @@ class AcpAgentConfig:
     :param command: The command to launch, e.g. ``"gemini --experimental-acp"``.
         Split with :func:`shlex.split` into an argv and exec'd directly (never
         via a shell), so quoting works but ``$VAR`` / pipes / redirects do not.
+        ``{omnigent_mcp_config}`` expands to this session's private MCP settings
+        file before spawn; using it requires an enabled, available relay.
     :param name: Human label for logs / elicitation cards (e.g. ``"Gemini CLI"``).
     :param model: Optional model id, applied to the live session when a turn
         carries no per-turn pick — via ``session/set_model`` for agents that
@@ -605,8 +607,18 @@ class AcpExecutor(Executor):
         ``sandbox: none`` (the default) for now; per-agent write roots is a
         documented follow-up.
         """
-        binary = self._argv[0]
-        rest = self._argv[1:]
+        argv = self._argv
+        marker = "{omnigent_mcp_config}"
+        if any(marker in arg for arg in argv):
+            if not self._session_mcp_servers():
+                raise RuntimeError(
+                    "The command requires {omnigent_mcp_config}, "
+                    "but the Omnigent MCP relay is unavailable"
+                )
+            settings_path = str(self._mcp.write_settings_file())
+            argv = [arg.replace(marker, settings_path) for arg in argv]
+        binary = argv[0]
+        rest = argv[1:]
         os_env = self._os_env
         if os_env is None:
             return binary, rest
