@@ -16,6 +16,7 @@ from httpx import ASGITransport, AsyncClient
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
+    CAP_FILESYSTEM_ROOTS,
     CAP_HARNESS_ACCOUNTS,
     CAP_HARNESS_LOGIN,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
@@ -64,6 +65,7 @@ def _make_hello(
     :param gateway_inference: Per-harness AI-Gateway-backed inference map to
         report, e.g. ``{"claude-native": True}``; ``None`` mimics a host that
         doesn't report it.
+    :param filesystem_roots: Whether the Host supports root enumeration.
     :returns: JSON-encoded hello frame.
     """
     return encode_host_frame(
@@ -163,6 +165,7 @@ async def _connect_host(
         e.g. ``{"codex": False}``; ``None`` mimics an older host.
     :param gateway_inference: Gateway-inference map for the hello frame,
         e.g. ``{"codex": True}``; ``None`` mimics a host that doesn't report it.
+    :param filesystem_roots: Whether the Host supports root enumeration.
     :returns: Connected ASGI communicator.
     """
     path = f"/v1/hosts/{host_id}/tunnel"
@@ -427,6 +430,36 @@ async def test_connect_requests_accounts_only_when_enabled_and_supported(
         output = await comm.receive_output(timeout=1)
         assert output["type"] == "websocket.send"
         assert isinstance(decode_host_frame(output["text"]), HostProbeAccountsFrame)
+
+
+async def test_hosts_api_gates_filesystem_roots_on_host_capability(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """Only a Host advertising root enumeration exposes the capability."""
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry, capabilities=[CAP_FILESYSTEM_ROOTS])
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.json()["hosts"][0]["filesystem_roots"] is True
+    assert single.json()["filesystem_roots"] is True
+
+
+async def test_hosts_api_hides_filesystem_roots_for_older_host(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+) -> None:
+    """An older Host keeps the legacy picker flow."""
+    app, registry, _hs, _cs = host_api_app
+    _comm = await _connect_host(app, registry)
+
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        listing = await client.get("/v1/hosts")
+        single = await client.get(f"/v1/hosts/{_HOST_ID}")
+
+    assert listing.json()["hosts"][0]["filesystem_roots"] is False
+    assert single.json()["filesystem_roots"] is False
 
 
 async def test_hosts_api_surfaces_gateway_inference(
