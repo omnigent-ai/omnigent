@@ -11770,7 +11770,84 @@ def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
     assert sizes == ["24", "6"]
 
 
+_IDLE_COMPACT_NOTICE_PANE = """\
+──────────────────────────────
+❯ [idle-compact] 00000000-0000-0000-0000-000000000001: idle 60m with 900000 ctx tok
+ens (example-model) -> sent /compact. Use /rewind if you need to return to a spec
+ific earlier point.
+  ▸▸ auto mode on (shift+tab to cycle)
+"""
+
+
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("scenario", ["printed", "hidden-draft", "unresponsive", "scrollback"])
+def test_idle_compact_notice_redraw_preserves_delivery_checks(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slash: bool, scenario: str
+) -> None:
+    """Printed terminal output clears on redraw; real drafts still need clearing."""
+    draft = _TALL_DRAFT if scenario == "hidden-draft" else ""
+    composer = _EditableComposer(draft, cursor=0)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="120 40 latest\n", stderr=""),
+    )
+    overlay = _IDLE_COMPACT_NOTICE_PANE
+    if scenario == "hidden-draft":
+        overlay = overlay.replace("❯ [idle-compact]", "❯ STALE 0\n  [idle-compact]")
+    elif scenario == "scrollback":
+        overlay += _composer_pane("stale\n  still unreadable after clearing")
+    notice_visible = True
+    operations: list[tuple[str, ...]] = []
+
+    def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
+        nonlocal notice_visible, overlay
+        operations.append(args)
+        if args[0] == "send-keys" and args[-1] == "C-l":
+            if scenario == "hidden-draft":
+                assert "STALE" in composer.text, "Hidden draft lines must remain before redraw."
+            if scenario != "unresponsive":
+                notice_visible = False
+        else:
+            if args[-1] == "Space" and scenario in {"printed", "hidden-draft"}:
+                # An incremental repaint erases the marker but leaves the wrapped output.
+                overlay = "\n".join(
+                    row.partition("[idle-compact]")[0] for row in overlay.splitlines()
+                )
+            composer._run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(
+        claude_native_bridge,
+        "_capture_pane",
+        lambda *args: overlay if notice_visible else composer._capture_pane(*args),
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+
+    def inject() -> None:
+        if slash:
+            claude_native_bridge.inject_slash_command(bridge_dir, command="/effort high")
+        else:
+            inject_user_message(bridge_dir, content="hello from the web")
+
+    if scenario in {"unresponsive", "scrollback"}:
+        with pytest.raises(
+            claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
+        ):
+            inject()
+        assert composer.submitted == []
+        assert not any(args[0] in {"load-buffer", "paste-buffer"} for args in operations)
+    else:
+        inject()
+        assert [text.strip() for text in composer.submitted] == [
+            "/effort high" if slash else "hello from the web"
+        ]
+    assert sum(args[-1] == "C-l" for args in operations) == (scenario != "scrollback")
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("recovery", ["resize", "notice-redraw"])
 @pytest.mark.parametrize(
     ("pane", "error"),
     [
@@ -11784,27 +11861,33 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     slash: bool,
+    recovery: str,
     pane: str,
     error: type[Exception],
 ) -> None:
-    """A dialog exposed by resizing receives no clearing, paste or submit keystrokes."""
-    composer = _EditableComposer("", cursor=0, visible_rows=1)
+    """A dialog exposed by recovery receives no clearing, paste or submit keystrokes."""
+    composer = _EditableComposer("", cursor=0, visible_rows=1 if recovery == "resize" else None)
     composer.install(monkeypatch)
     monkeypatch.setattr(
         subprocess,
         "run",
         lambda *args, **kwargs: SimpleNamespace(
-            returncode=0, stdout="120 7 manual\nmanual\n", stderr=""
+            returncode=0,
+            stdout=f"120 {7 if recovery == 'resize' else 40} manual\nmanual\n",
+            stderr="",
         ),
     )
     resized = False
+    redrawn = False
     recovery_keys: list[str] = []
 
     def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
-        nonlocal resized
+        nonlocal resized, redrawn
         if args[0] == "resize-window":
             resized = args[args.index("-y") + 1] == "24"
-        elif resized:
+        elif args[0] == "send-keys" and args[-1] == "C-l":
+            redrawn = True
+        elif resized or redrawn:
             assert args[0] == "send-keys" and args[-1] == "Escape"
             recovery_keys.append(args[-1])
         else:
@@ -11814,7 +11897,13 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     monkeypatch.setattr(
         claude_native_bridge,
         "_capture_pane",
-        lambda *args: pane if resized else composer._capture_pane(*args),
+        lambda *args: (
+            pane
+            if resized or redrawn
+            else _IDLE_COMPACT_NOTICE_PANE
+            if recovery == "notice-redraw"
+            else composer._capture_pane(*args)
+        ),
     )
     monkeypatch.setattr(
         claude_native_bridge,
@@ -11832,6 +11921,7 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
 
     assert composer.submitted == []
     assert not resized
+    assert redrawn == (recovery == "notice-redraw")
     if pane != _REVERSE_SEARCH_PANE:
         assert recovery_keys == []
 

@@ -11,6 +11,7 @@ import type { SessionLiveness } from "@/hooks/useSessionLiveness";
 import type * as UseTerminalsModule from "@/hooks/useTerminals";
 import { useCreateTerminal, useTerminals } from "@/hooks/useTerminals";
 import { writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
+import { browserViewId } from "@/lib/browserTabs";
 import type { ChangedSort } from "./FlatFileList";
 import type { RightRailTab } from "./railTabs";
 import {
@@ -1150,6 +1151,42 @@ describe("WorkspacePanel tab-strip layout (regression)", () => {
 });
 
 describe("WorkspacePanel browser tab", () => {
+  it("uses page labels in tabs, close controls, and the panel picker", async () => {
+    const title = "Documentation: a complete guide to configuring your workspace and browser";
+    const firstView = browserViewId("conv_ws", "docs");
+    const browserClose = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserClose,
+        browserHasView: vi.fn(async (viewId: string) => ({
+          exists: true,
+          url:
+            viewId === firstView ? "https://docs.example.com/guide" : "https://status.example.com/",
+          title: viewId === firstView ? title : "",
+        })),
+      },
+    });
+    writeSessionWorkspaceState("conv_ws", {
+      openBrowsers: ["docs", "status"],
+      selectedBrowserId: "docs",
+    });
+    renderWorkspace({ showBrowserTab: true, rightRailTab: "browser" });
+    const tab = await screen.findByRole("tab", { name: title });
+    expect(tab).toHaveAttribute("title", title);
+    expect(tab).toHaveAttribute("aria-selected", "true");
+    expect(screen.getByRole("tab", { name: "status.example.com" })).toBeInTheDocument();
+    fireEvent.pointerDown(screen.getByRole("button", { name: "Select panel" }), { button: 0 });
+    fireEvent.click(screen.getByRole("menuitem", { name: title }));
+    await waitFor(() => expect(screen.queryByRole("menu")).not.toBeInTheDocument());
+    fireEvent.click(screen.getByRole("button", { name: `Close ${title}` }));
+    await waitFor(() => expect(screen.queryByRole("tab", { name: title })).not.toBeInTheDocument());
+    expect(browserClose).toHaveBeenCalledWith(firstView);
+    expect(screen.getByRole("tab", { name: "status.example.com" })).toHaveAttribute(
+      "aria-selected",
+      "true",
+    );
+  });
+
   it("opens a browser tab with Ctrl+Alt+B", () => {
     const { onRightRailTabChange, onReveal } = renderWorkspace({
       showBrowserTab: true,

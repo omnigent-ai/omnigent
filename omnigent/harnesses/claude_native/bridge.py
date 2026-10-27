@@ -6095,6 +6095,10 @@ def _restore_occupied_input(
     startup dialogs whose Escape quits Claude Code instead of closing them
     (:func:`_escape_quits_claude`): they are left for the person to answer.
 
+    Isaac's idle-compaction log can overwrite the rendered input box. Redraw
+    it once with Ctrl+L before any edit keys can erase its identifying prefix,
+    then check the actual composer and pending prompts again.
+
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. A screen with no input box counts only when it
@@ -6128,6 +6132,7 @@ def _restore_occupied_input(
     last_escape: float | None = None
     confirmed = False
     unclearable_seen = False
+    notice_redrawn = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -6144,6 +6149,17 @@ def _restore_occupied_input(
             return None
         surface = _occupying_surface(pane)
         delivery_diagnostics.record_restore_observation(pane=pane, surface=surface)
+        box = _composer_box(pane)
+        if (
+            not notice_redrawn
+            and box is not None
+            and any("[idle-compact]" in row for row in box.rows)
+        ):
+            _logger.info("claude-native: redrawing an idle-compaction notice over the input box")
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-l")
+            notice_redrawn = True
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            continue
         if surface is None:
             return None
         now = time.monotonic()
