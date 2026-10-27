@@ -1957,6 +1957,7 @@ def _resolve_harness_impl(
     *,
     agent_store: AgentStore | None = None,
     agent_cache: AgentCache | None = None,
+    agents_by_id: Mapping[str, Agent] | None = None,
 ) -> str | None:
     """
     Resolve the canonical harness for a conversation's bound agent.
@@ -1973,6 +1974,7 @@ def _resolve_harness_impl(
     :param conv: The conversation entity, or ``None``.
     :param agent_store: Optional store for resolving the bound agent.
     :param agent_cache: Optional cache for loading the bound agent spec.
+    :param agents_by_id: Optional preloaded agents, avoiding per-session store reads.
     :returns: The canonical harness (e.g. ``"openai-agents"`` or
         ``"claude-sdk"``), or ``None`` when unavailable.
     """
@@ -1989,17 +1991,20 @@ def _resolve_harness_impl(
         from omnigent.harness_aliases import canonicalize_harness
         from omnigent.runtime import get_agent_cache
 
-        if agent_store is None:
-            from omnigent.runtime._globals import _agent_store
+        if agents_by_id is not None:
+            agent = agents_by_id.get(conv.agent_id)
+        else:
+            if agent_store is None:
+                from omnigent.runtime._globals import _agent_store
 
-            agent_store = _agent_store
-        if agent_store is None:
+                agent_store = _agent_store
+            if agent_store is None:
+                return None
+            agent = agent_store.get(conv.agent_id)
+        if agent is None:
             return None
         if agent_cache is None:
             agent_cache = get_agent_cache()
-        agent = agent_store.get(conv.agent_id)
-        if agent is None:
-            return None
         loaded = agent_cache.load(
             agent.id, agent.bundle_location, expand_env=agent.operator_authored
         )
@@ -3793,7 +3798,7 @@ async def _persist_external_subagent_start(
     Mint a child :class:`Conversation` row for a claude-native
     sub-agent and emit the parent's ``session.created`` SSE event.
 
-    Claude Code spawns sub-agents internally via its Task tool and
+    Claude Code spawns sub-agents internally via tools or forked skills and
     never POSTs to Omnigent to register them. The forwarder watches the
     parent's on-disk ``subagents/`` directory and calls this handler
     when a new ``.meta.json`` appears. We reuse the parent's
@@ -3817,8 +3822,8 @@ async def _persist_external_subagent_start(
     :param body: The POST event body. Required ``data`` keys:
         ``subagent_id`` (Claude-side id, e.g. ``"a5c7eff..."``),
         ``agent_type`` (e.g. ``"Explore"``), ``description``
-        (free-form, used in the title), ``tool_use_id``
-        (e.g. ``"toolu_..."``).
+        (free-form display label). Optional ``tool_use_id`` links a
+        tool-spawned child to its call; forked skills have no tool call.
     :param conversation_store: Store used to read existing children
         (for idempotency) and create the new row.
     :returns: The child conversation id, e.g. ``"conv_child456"``.
@@ -3846,9 +3851,9 @@ async def _persist_external_subagent_start(
             "external_subagent_start requires data.description (string)",
             code=ErrorCode.INVALID_INPUT,
         )
-    if not isinstance(tool_use_id, str) or not tool_use_id:
+    if "tool_use_id" in body.data and (not isinstance(tool_use_id, str) or not tool_use_id):
         raise OmnigentError(
-            "external_subagent_start requires non-empty data.tool_use_id",
+            "external_subagent_start requires non-empty data.tool_use_id when provided",
             code=ErrorCode.INVALID_INPUT,
         )
     if parent_conv.agent_id is None:
@@ -3900,9 +3905,10 @@ async def _persist_external_subagent_start(
     labels = {
         _CLAUDE_NATIVE_WRAPPER_LABEL_KEY: _CLAUDE_NATIVE_SUBAGENT_WRAPPER_LABEL_VALUE,
         _CLAUDE_NATIVE_SUBAGENT_ID_LABEL_KEY: subagent_id,
-        _CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY: tool_use_id,
         _CLAUDE_NATIVE_DESCRIPTION_LABEL_KEY: description,
     }
+    if tool_use_id is not None:
+        labels[_CLAUDE_NATIVE_TOOL_USE_ID_LABEL_KEY] = tool_use_id
 
     try:
         child = await asyncio.to_thread(
@@ -4962,6 +4968,7 @@ def _publish_status(
     scheduled_run_outcome: Literal["auto", "failed"] = "auto",
     failure_origin: str | None = None,
     failure_context: object = None,
+    disconnect_evidence: Mapping[str, str] | None = None,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -4996,6 +5003,8 @@ def _publish_status(
         undifferentiated signature. Ignored for non-failed edges.
     :param failure_context: Untrusted optional native evidence, normalized at
         the failure-log boundary. Malformed values cannot reject the status edge.
+    :param disconnect_evidence: Flat string attributes describing the runner
+        drop that caused a ``"failed"`` edge, logged on the failure row only.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -5072,6 +5081,7 @@ def _publish_status(
                 response_id=response_id,
                 cached_background_task_count=_session_background_task_count_cache.get(session_id),
                 **failure_log_attributes(failure_context),
+                **(disconnect_evidence or {}),
             ),
         )
         session_live_state.persist_scheduled_run_completion(
@@ -6917,7 +6927,10 @@ def _native_terminal_failure_from_runner_response(
                 f"Native {display_name} terminal ensure failed with malformed "
                 f"runner response (HTTP {resp.status_code})."
             ),
-        )
+        ),
+        failure_context=normalize_failure_context(body.get("failure_context"))
+        if isinstance(body, dict)
+        else None,
     )
 
 
@@ -7018,10 +7031,11 @@ def _publish_error_event(session_id: str, error: ErrorData) -> None:
 _MODEL_CHANGE_NOT_APPLIED_CODE = "model_change_not_applied"
 
 
-def _surface_model_change_forward_failure(
+async def _surface_model_change_forward_failure(
     session_id: str,
     model: str | None,
     runner_result: _RunnerForwardResult | None,
+    conversation_store: ConversationStore,
 ) -> bool:
     """
     Publish a visible notice when a native pane never took a model change.
@@ -7041,10 +7055,15 @@ def _surface_model_change_forward_failure(
     diverged — the notice is for a session whose runner IS reachable and still
     did not switch the pane.
 
+    A refusal the runner marks ``waiting_on_person`` (an open dialog, question
+    or sign-in in the pane) is a persisted ``info`` notice rather than an
+    error: the session keeps running and only needs the person's answer.
+
     :param session_id: Session/conversation identifier, e.g. ``"conv_abc123"``.
     :param model: The model that was persisted, or ``None`` when cleared.
     :param runner_result: HTTP result from the forward, or ``None`` when no
         runner was reachable.
+    :param conversation_store: Store that persists a waiting-on-person notice.
     :returns: ``True`` when the runner rejected the change; ``False`` when it
         accepted the change or no runner answered.
     """
@@ -7060,6 +7079,7 @@ def _surface_model_change_forward_failure(
     if 200 <= runner_result.status_code < 300:
         return False
     reason = f"the runner returned status {runner_result.status_code}"
+    waiting_on_person = False
     # The runner's own detail names the concrete cause (e.g. "a dialog may
     # be open in the pane"); carry it into the visible notice when present.
     with contextlib.suppress(ValueError, TypeError):
@@ -7067,6 +7087,9 @@ def _surface_model_change_forward_failure(
         detail = parsed_body.get("detail") if isinstance(parsed_body, dict) else None
         if isinstance(detail, str) and detail.strip():
             reason = f"{reason} ({detail.strip()})"
+        waiting_on_person = (
+            isinstance(parsed_body, dict) and parsed_body.get("waiting_on_person") is True
+        )
     _logger.warning(
         "Model change not applied to the terminal for session=%s model=%r: %s (body=%s)",
         session_id,
@@ -7076,17 +7099,34 @@ def _surface_model_change_forward_failure(
         extra={"session_id": session_id},
     )
     target = model or "its default model"
-    _publish_error_event(
-        session_id,
-        ErrorData(
-            source="execution",
-            code=_MODEL_CHANGE_NOT_APPLIED_CODE,
-            message=(
-                f"The terminal was not switched to {target}: {reason}. "
-                "It is still running on its previous model."
-            ),
+    error = ErrorData(
+        source="execution",
+        code=_MODEL_CHANGE_NOT_APPLIED_CODE,
+        message=(
+            f"The terminal was not switched to {target}: {reason}. "
+            "It is still running on its previous model."
         ),
     )
+    if waiting_on_person:
+        notice = NewConversationItem(
+            type="error",
+            response_id=generate_task_id(),
+            data=error.model_copy(update={"level": "info"}),
+        )
+        try:
+            persisted = await asyncio.to_thread(conversation_store.append, session_id, [notice])
+        except Exception:  # noqa: BLE001 - fall back to the live error so the picker settles.
+            _logger.warning(
+                "Failed to persist model-change notice for session %s",
+                session_id,
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+        else:
+            if persisted:
+                _publish_external_conversation_item(session_id, persisted[0])
+                return True
+    _publish_error_event(session_id, error)
     return True
 
 

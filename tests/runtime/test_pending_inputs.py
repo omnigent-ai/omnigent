@@ -151,6 +151,35 @@ def test_cancelled_lifecycle_is_drained_as_interrupted_not_missing() -> None:
     assert interrupted.reason_code == "response_cancelled"
 
 
+@pytest.mark.parametrize("mismatch", [None, "session", "pending", "attempt", "stable", "missing"])
+def test_lifecycle_without_client_id_requires_its_exact_delivery_attempt(
+    mismatch: str | None,
+) -> None:
+    first = pending_inputs.record("conv", [_text_block("first")])
+    second = pending_inputs.record("conv", [_text_block("second")])
+    identity = pending_inputs.delivery_attributes_for("conv", first)
+    attempt = str(identity["delivery_attempt_id"])
+
+    matched = pending_inputs.mark_lifecycle(
+        "other" if mismatch == "session" else "conv",
+        "a" * 32 if mismatch == "stable" else None,
+        pending_id=second if mismatch == "pending" else first,
+        delivery_attempt_id=(
+            "b" * 32 if mismatch == "attempt" else None if mismatch == "missing" else attempt
+        ),
+        stage="native_turn_completed",
+    )
+
+    assert matched == (first if mismatch is None else None)
+    assert pending_inputs.delivery_attributes_for("conv", first)["last_delivery_stage"] == (
+        "native_turn_completed" if mismatch is None else "server_queued"
+    )
+    assert (
+        pending_inputs.delivery_attributes_for("conv", second)["last_delivery_stage"]
+        == "server_queued"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _clean_pending_inputs_index() -> Iterator[None]:
     """

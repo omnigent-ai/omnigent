@@ -22,8 +22,9 @@ _REPO = Path(__file__).resolve().parents[2]
 
 @pytest.mark.timeout(300)
 @pytest.mark.parametrize("harness", ["openai-agents", "codex-native"])
+@pytest.mark.parametrize("orchestration_enabled", [True, False], ids=["default", "kill-switch"])
 def test_private_manager_launch_send_read_and_sharing(
-    tmp_path, isolated_mock_llm_server_url, harness
+    tmp_path, isolated_mock_llm_server_url, harness, orchestration_enabled
 ):
     if harness == "codex-native" and any(shutil.which(cmd) is None for cmd in ("codex", "tmux")):
         pytest.skip("requires Codex and tmux")
@@ -33,7 +34,7 @@ def test_private_manager_launch_send_read_and_sharing(
     base_env = {k: v for k, v in os.environ.items() if k in {"PATH", "LANG", "TMPDIR"}}
     with tempfile.TemporaryDirectory(prefix="orch-native-", dir="/tmp") as native_state:
         env = {
-            "OMNIGENT_FEATURES": "session_orchestration",
+            "OMNIGENT_FEATURES": None,
             "OMNIGENT_CONFIG_HOME": str(config),
             "OMNIGENT_CODEX_NATIVE_STATE_DIR": native_state,
             "OMNIGENT_DISABLE_CATALOG_LOOKUP": "1",
@@ -44,7 +45,9 @@ def test_private_manager_launch_send_read_and_sharing(
         with server_runner(
             tmp_path / "stack", server_cwd=_REPO, server_env=env, base_env=base_env
         ) as stack:
-            stack.start_host(env=env, cwd=_REPO)
+            # The server's kill switch must work even when the runner opts in.
+            host_features = None if orchestration_enabled else "session_orchestration"
+            stack.start_host(env={**env, "OMNIGENT_FEATURES": host_features}, cwd=_REPO)
             with httpx.Client(base_url=stack.base_url, timeout=60, trust_env=False) as client:
                 poll_until(
                     lambda: [
@@ -82,6 +85,24 @@ def test_private_manager_launch_send_read_and_sharing(
                     if harness == "codex-native":
                         result["namespace"] = "mcp__omnigent"
                     return result
+
+                def tool_results(call_id):
+                    return [
+                        entry
+                        for request in get_mock_requests(mock)
+                        for entry in request.get("input", request.get("messages", []))
+                        if isinstance(entry, dict)
+                        and (
+                            (
+                                entry.get("type") == "function_call_output"
+                                and entry.get("call_id") == call_id
+                            )
+                            or (
+                                entry.get("role") == "tool"
+                                and entry.get("tool_call_id") == call_id
+                            )
+                        )
+                    ]
 
                 def items(session):
                     response = client.get(f"/v1/sessions/{session}/items", params={"limit": 100})
@@ -145,6 +166,70 @@ def test_private_manager_launch_send_read_and_sharing(
                         created = response.json()
                     sessions.append(created["session_id"])
                 manager, worker = sessions
+                if not orchestration_enabled:
+                    configure("BEFORE_SWITCH_TASK", [{"text": "BEFORE_SWITCH_RESULT"}])
+                    configure(
+                        "MANAGER_BEFORE_SWITCH",
+                        [
+                            {
+                                "tool_calls": [
+                                    tool(
+                                        "sys_session_message",
+                                        {"session_id": worker, "message": "BEFORE_SWITCH_TASK"},
+                                        "before-switch",
+                                    )
+                                ]
+                            },
+                            {"text": "BEFORE_SWITCH_SENT"},
+                        ],
+                    )
+                    send(manager, "MANAGER_BEFORE_SWITCH")
+                    wait_text(manager, "BEFORE_SWITCH_SENT")
+                    wait_text(worker, "BEFORE_SWITCH_RESULT")
+                    manager_runner = client.get(f"/v1/sessions/{manager}").json()["runner_id"]
+                    stack.restart_server(env={"OMNIGENT_FEATURES": "-session_orchestration"})
+                    poll_until(
+                        lambda: (
+                            client.get(f"/v1/runners/{manager_runner}/status").json().get("online")
+                        ),
+                        timeout_s=45,
+                    )
+                    agent = client.get(f"/v1/sessions/{worker}").json()["agent_id"]
+                    calls = [
+                        tool(
+                            "sys_session_message",
+                            {"session_id": worker, "message": "MUST_NOT_DELIVER"},
+                            "disabled-message",
+                        ),
+                        tool(
+                            "sys_session_create",
+                            {"agent_id": agent, "placement": "same_host"},
+                            "disabled-same-host",
+                        ),
+                        tool(
+                            "sys_session_create",
+                            {"agent_id": agent, "placement": "managed"},
+                            "disabled-managed",
+                        ),
+                        tool("sys_session_get_info", {"session_id": worker}, "allowed-read"),
+                    ]
+                    configure(
+                        "MANAGER_BEFORE_SWITCH_KILL_SWITCH",
+                        [{"tool_calls": [call]} for call in calls]
+                        + [{"text": "KILL_SWITCH_CHECKED"}],
+                    )
+                    send(manager, "MANAGER_BEFORE_SWITCH_KILL_SWITCH")
+                    wait_text(manager, "KILL_SWITCH_CHECKED")
+                    for call_id in ("disabled-message", "disabled-same-host", "disabled-managed"):
+                        assert "Session orchestration is disabled" in json.dumps(
+                            tool_results(call_id)
+                        )
+                    read = json.dumps(tool_results("allowed-read"))
+                    assert worker in read and "session_id" in read
+                    assert "MUST_NOT_DELIVER" not in json.dumps(items(worker))
+                    rows = client.get("/v1/sessions", params={"visibility": "mine"}).json()["data"]
+                    assert {row["id"] for row in rows} == {manager, worker}
+                    return
                 shared = client.put(
                     f"/v1/sessions/{worker}/permissions",
                     json={"user_id": "__public__", "level": 1},
@@ -382,20 +467,5 @@ def test_private_manager_launch_send_read_and_sharing(
                 wait_text(side_chat, "SIDE_CHAT_BLOCKED")
                 assert "SIDE_CHAT_MUST_NOT_DELIVER" not in json.dumps(items(worker))
                 # Native tool results reach the model without entering the UI transcript.
-                side_chat_results = [
-                    entry
-                    for request in get_mock_requests(mock)
-                    for entry in request.get("input", request.get("messages", []))
-                    if isinstance(entry, dict)
-                    and (
-                        (
-                            entry.get("type") == "function_call_output"
-                            and entry.get("call_id") == "side-chat-message"
-                        )
-                        or (
-                            entry.get("role") == "tool"
-                            and entry.get("tool_call_id") == "side-chat-message"
-                        )
-                    )
-                ]
+                side_chat_results = tool_results("side-chat-message")
                 assert "Shared sessions cannot" in json.dumps(side_chat_results)

@@ -3199,6 +3199,118 @@ describe("chatStore — send (first-send ordering)", () => {
     expect(useChatStore.getState().queuedMessages).toEqual([]);
   });
 
+  // waitingForHost must also bypass enqueueMessage's startupPending direct send.
+  it.each([false, true])(
+    "doesn't post anything when queueing a message for an offline host (startupPending: %s)",
+    (startupPending) => {
+      useChatStore.setState({
+        conversationId: "conv_existing",
+        boundAgentId: "agent_xyz",
+        abortController: new AbortController(),
+        status: "idle",
+        sessionStatus: "idle",
+        startupPending,
+        blocks: [],
+        pendingUserMessages: [],
+        // Queued mid-turn before the host dropped; the composer holds it while unreachable.
+        queuedMessages: [
+          { queueId: "q_earlier", text: "earlier", conversationId: "conv_existing" },
+        ],
+      });
+      const posts: string[] = [];
+      fetchMock.mockImplementation((input, init) => {
+        if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+          posts.push(String(init?.body));
+          return mockResponse({ queued: true, item_id: "item_1" });
+        }
+        return defaultFetchHandler(input, init);
+      });
+
+      useChatStore
+        .getState()
+        .enqueueMessage("hi", undefined, undefined, undefined, { waitingForHost: true });
+
+      // "earlier" waits too: refused while offline, it would be re-held behind "hi".
+      useChatStore.getState().maybeFlushQueuedHead();
+
+      expect(posts).toEqual([]);
+      expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["earlier", "hi"]);
+    },
+  );
+
+  it("sends nothing early while a conversation has a message waiting for its host", () => {
+    const sendSpy = vi.fn().mockResolvedValue(undefined);
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      boundAgentId: "agent_xyz",
+      status: "idle",
+      sessionStatus: "idle",
+      send: sendSpy,
+      queuedMessages: [
+        { queueId: "q_before", text: "before", conversationId: "conv_existing" },
+        {
+          queueId: "q_held",
+          text: "held",
+          conversationId: "conv_existing",
+          waitingForHost: true,
+        },
+        { queueId: "q_after", text: "after", conversationId: "conv_existing" },
+      ],
+    });
+
+    // "before" too: refused while offline, it would be re-held behind "held".
+    for (const queueId of ["q_before", "q_held", "q_after"]) {
+      useChatStore.getState().steerMessage(queueId);
+    }
+    useChatStore.getState().steerAllQueuedMessages("conv_existing");
+    useChatStore.getState().maybeFlushQueuedHead();
+
+    expect(sendSpy).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "before",
+      "held",
+      "after",
+    ]);
+  });
+
+  it("queues a message for an offline host without posting it until released", async () => {
+    useChatStore.setState({
+      conversationId: "conv_existing",
+      boundAgentId: "agent_xyz",
+      abortController: new AbortController(),
+      status: "idle",
+      sessionStatus: "idle",
+      blocks: [],
+      pendingUserMessages: [],
+      queuedMessages: [],
+    });
+    const posts: string[] = [];
+    fetchMock.mockImplementation((input, init) => {
+      if (String(input).endsWith("/v1/sessions/conv_existing/events")) {
+        posts.push(String(init?.body));
+        return mockResponse({ queued: true, item_id: "item_1" });
+      }
+      return defaultFetchHandler(input, init);
+    });
+
+    useChatStore
+      .getState()
+      .enqueueMessage("hi", undefined, undefined, undefined, { waitingForHost: true });
+    useChatStore.getState().maybeFlushQueuedHead();
+
+    expect(posts).toEqual([]);
+    expect(useChatStore.getState().queuedMessages).toMatchObject([
+      { text: "hi", conversationId: "conv_existing", waitingForHost: true },
+    ]);
+    expect(useChatStore.getState().blocks).toEqual([]);
+
+    useChatStore.getState().releaseHostHeldMessages("conv_existing");
+    useChatStore.getState().maybeFlushQueuedHead();
+    await vi.waitFor(() => expect(posts).toHaveLength(1));
+    expect(JSON.parse(posts[0])).toMatchObject({ type: "message" });
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
   it("surfaces the server's runner-unavailable cause verbatim when it names one", async () => {
     // Preserve the server's phase-specific detail in the error block.
     const causefulDetail =
@@ -8406,6 +8518,31 @@ describe("chatStore — handleSessionEvent (session.* events)", () => {
         error: {
           code: "model_change_not_applied",
           message: "The terminal was not switched to haiku.",
+        },
+      });
+      const state = useChatStore.getState();
+      expect(state.pendingModelChange).toBeNull();
+      expect(state.llmModel).toBe("claude-sonnet-5");
+    });
+
+    it("settles a pending switch on the not-applied info notice item", () => {
+      // A switch refused while the pane waits on the person arrives as a
+      // persisted info-level error item rather than a live response.error.
+      useChatStore.setState({
+        conversationId: "conv_abc",
+        llmModel: "claude-sonnet-5",
+        pendingModelChange: "haiku",
+      });
+      handleSessionEvent({
+        type: "error",
+        source: "execution",
+        toolName: null,
+        itemId: "item_notice",
+        responseId: "task_notice",
+        error: {
+          code: "model_change_not_applied",
+          message: "The terminal was not switched to haiku.",
+          level: "info",
         },
       });
       const state = useChatStore.getState();
@@ -17962,6 +18099,100 @@ describe("chatStore — client-side message queue", () => {
     },
   );
 
+  it("queues a side chat's follow-up on its own entry and drains it when that turn ends", async () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main", sessionStatus: "running" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+    seedConversationsCache([conv("conv_main", "running"), conv("conv_side", "idle")]);
+    const posts = (id: string) =>
+      fetchMock.mock.calls
+        .filter(
+          ([u, init]) =>
+            u === `/v1/sessions/${id}/events` && (init as RequestInit)?.method === "POST",
+        )
+        .map(([, init]) => JSON.parse((init as RequestInit).body as string));
+
+    useChatStore.getState().enqueueMessage("side follow-up", undefined, undefined, "conv_side");
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({
+        text: "side follow-up",
+        conversationId: "conv_side",
+        agentId: "agent_side",
+      }),
+    ]);
+    // The side chat's entry owns this queue, not the sidebar-driven background flush.
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+    expect(posts("conv_side")).toEqual([]);
+
+    side.setState({ sessionStatus: "idle" });
+    await tick();
+    expect(posts("conv_side")).toEqual([
+      expect.objectContaining({
+        type: "message",
+        data: expect.objectContaining({
+          content: [{ type: "input_text", text: "side follow-up" }],
+        }),
+      }),
+    ]);
+    expect(posts("conv_main")).toEqual([]);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+    expect(useChatStore.getState().pendingUserMessages).toEqual([]);
+  });
+
+  it("drains an idle side chat's queue when a held head is released", async () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+    useChatStore.getState().enqueueMessage("held follow-up", undefined, undefined, "conv_side");
+    useChatStore.setState((s) => ({
+      queuedMessages: s.queuedMessages.map((m) => ({ ...m, waitingForHost: true })),
+    }));
+    side.setState({ sessionStatus: "idle" });
+    await tick();
+    const sidePosts = () =>
+      fetchMock.mock.calls.filter(
+        ([u, init]) =>
+          u === "/v1/sessions/conv_side/events" && (init as RequestInit)?.method === "POST",
+      );
+    expect(sidePosts()).toEqual([]);
+
+    // The release only edits the app-global queue, never the side chat's entry.
+    useChatStore.getState().releaseHostHeldMessages("conv_side");
+    await tick();
+    expect(sidePosts()).toHaveLength(1);
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("restores a taken side-chat queue ahead of newer follow-ups and drains it", async () => {
+    bindConversationForTest("conv_main", { boundAgentId: "agent_main" });
+    const side = conversationRegistry.acquire("conv_side");
+    side.setState({ boundAgentId: "agent_side", sessionStatus: "running" });
+    useChatStore.getState().enqueueMessage("first follow-up", undefined, undefined, "conv_side");
+    const taken = useChatStore.getState().clearQueuedMessages("conv_side");
+    await tick();
+    useChatStore.setState((s) => ({
+      queuedMessages: [
+        ...s.queuedMessages,
+        { queueId: "q_newer", text: "newer follow-up", conversationId: "conv_side" },
+      ],
+    }));
+
+    useChatStore.getState().restoreQueuedMessages(taken);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "first follow-up",
+      "newer follow-up",
+    ]);
+    side.setState({ sessionStatus: "idle" });
+    await tick();
+    const sidePosts = fetchMock.mock.calls.filter(
+      ([u, init]) =>
+        u === "/v1/sessions/conv_side/events" && (init as RequestInit)?.method === "POST",
+    );
+    expect(sidePosts).toHaveLength(1);
+    expect(String((sidePosts[0][1] as RequestInit).body)).toContain("first follow-up");
+  });
+
   it.each(
     ["compaction_completed", "compaction_failed", "pi_compact_unavailable"].flatMap((terminal) =>
       [false, true].map((background) => [terminal, background] as const),
@@ -18936,6 +19167,28 @@ describe("chatStore — background cross-session flush", () => {
     // One POST to conv_bg (FIFO head only); its head left the queue, tail stays.
     expect(eventPosts()).toEqual([{ id: "conv_bg", text: "bg-first" }]);
     expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual(["bg-second"]);
+  });
+
+  it("does not flush a non-active conversation while one of its messages waits for the host", async () => {
+    seedConversationsCache([conv("conv_active", "running"), conv("conv_bg", "idle")]);
+    useChatStore.setState({
+      conversationId: "conv_active",
+      queuedMessages: [
+        { queueId: "q_1", text: "before", conversationId: "conv_bg" },
+        { queueId: "q_2", text: "held", conversationId: "conv_bg", waitingForHost: true },
+        { queueId: "q_3", text: "after", conversationId: "conv_bg" },
+      ],
+    });
+
+    useChatStore.getState().flushBackgroundQueues();
+    await tick();
+
+    expect(eventPosts()).toEqual([]);
+    expect(useChatStore.getState().queuedMessages.map((m) => m.text)).toEqual([
+      "before",
+      "held",
+      "after",
+    ]);
   });
 
   it("does not flush a non-active conversation whose first message is still held", async () => {

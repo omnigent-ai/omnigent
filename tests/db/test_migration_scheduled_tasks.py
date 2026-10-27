@@ -33,6 +33,7 @@ from omnigent.db.utils import (
 _PREVIOUS_HEAD = "9d820f91deef"
 _DISPATCH_PREVIOUS = "nf12ab34cd56"
 _DISPATCH_REVISION = "c8e4f2a6b901"
+_COMPLETED_STATE_REVISION = "9e82957bd115"
 _SCHEMA_PATHS = [
     "migration",
     "metadata",
@@ -311,7 +312,7 @@ def test_state_check_rejects_bad_code(db_engine: Engine) -> None:
     """The ``scheduled_tasks.state`` CHECK rejects codes outside the closed set.
 
     State is stored as a stable int code (see enum_codecs SCHEDULED_TASK_STATE,
-    codes 1-3); a code outside that range must fail the CHECK.
+    codes 1-4); a code outside that range must fail the CHECK.
     """
     with pytest.raises(IntegrityError):
         with db_engine.begin() as conn:
@@ -324,6 +325,26 @@ def test_state_check_rejects_bad_code(db_engine: Engine) -> None:
                     "'FREQ=DAILY;BYHOUR=9;BYMINUTE=0', 'u', 'ag', 'UTC', 99, 1)"
                 )
             )
+
+
+@pytest.mark.parametrize("db_engine", _SCHEMA_PATHS, indirect=True)
+def test_state_check_accepts_completed(db_engine: Engine) -> None:
+    """Migrated and model-built schemas both accept the completed state."""
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=db_engine)
+    with db_engine.begin() as conn:
+        conn.execute(
+            tasks.insert().values(
+                id=b"d" * 16,
+                name="ended",
+                prompt=b"p",
+                rrule="FREQ=DAILY;COUNT=2",
+                agent_id=b"g" * 16,
+                timezone="UTC",
+                state=4,
+                created_at=1,
+            )
+        )
+        assert conn.execute(sa.select(tasks.c.state)).scalar_one() == 4
 
 
 def test_scheduled_task_runs_status_check_rejects_bad_code(db_engine: Engine) -> None:
@@ -718,3 +739,58 @@ def test_downgrade_drops_both_tables(tmp_path: Path) -> None:
 
     engine.dispose()
     clear_engine_cache()
+
+
+def test_completed_state_downgrade_requires_live_connection() -> None:
+    config = _build_alembic_config("postgresql://")
+    config.output_buffer = StringIO()
+    with pytest.raises(RuntimeError, match="Downgrade requires a live connection"):
+        command.downgrade(config, f"{_COMPLETED_STATE_REVISION}:{_DISPATCH_REVISION}", sql=True)
+    assert "ALTER TABLE" not in config.output_buffer.getvalue()
+
+
+def test_completed_state_migration_round_trips(dispatch_migration_engine: Engine) -> None:
+    engine = dispatch_migration_engine
+    config = _build_alembic_config(engine.url.render_as_string(hide_password=False))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _COMPLETED_STATE_REVISION)
+    tasks = sa.Table("scheduled_tasks", sa.MetaData(), autoload_with=engine)
+    values = {
+        "name": "ended",
+        "prompt": b"p",
+        "rrule": "FREQ=DAILY;COUNT=2",
+        "agent_id": b"g" * 16,
+        "timezone": "UTC",
+        "created_at": 1,
+    }
+    with engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"a" * 16, state=4, **values))
+        conn.execute(tasks.insert().values(id=b"b" * 16, state=2, **values))
+    with pytest.raises(RuntimeError, match="Reconcile completed"), engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _DISPATCH_REVISION)
+    with engine.connect() as conn:
+        assert (
+            conn.execute(sa.text("SELECT version_num FROM alembic_version")).scalar_one()
+            == _COMPLETED_STATE_REVISION
+        )
+    # After reconciling, the downgrade restores the narrower check.
+    with engine.begin() as conn:
+        conn.execute(tasks.update().where(tasks.c.state == 4).values(state=1, next_run_at=None))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.downgrade(config, _DISPATCH_REVISION)
+    with engine.begin() as conn:
+        assert conn.execute(sa.select(tasks.c.state).order_by(tasks.c.id)).scalars().all() == [
+            1,
+            2,
+        ]
+    # MySQL reports CHECK violations as OperationalError (3819).
+    with pytest.raises((IntegrityError, sa.exc.OperationalError)), engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"c" * 16, state=4, **values))
+    with engine.begin() as conn:
+        config.attributes["connection"] = conn
+        command.upgrade(config, _COMPLETED_STATE_REVISION)
+    with engine.begin() as conn:
+        conn.execute(tasks.insert().values(id=b"c" * 16, state=4, **values))

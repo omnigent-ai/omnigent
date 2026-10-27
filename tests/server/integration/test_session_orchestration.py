@@ -8,7 +8,7 @@ import pytest
 from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER, RUNNER_TUNNEL_TOKEN_HEADER
 from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
-from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.feature_flags import FeatureFlags
 from omnigent.stores.conversation_store import (
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -29,13 +29,22 @@ from tests.server.integration.test_sessions_subagent_context import (
 pytestmark = pytest.mark.asyncio
 
 
+@pytest.fixture(autouse=True)
+def orchestration_environment(monkeypatch, request):
+    features = getattr(request, "param", None)
+    if features is None:
+        monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
+    else:
+        monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    return features
+
+
 @pytest.fixture
 async def peers(auth_client, auth_app, db_uri, monkeypatch):
     source = await _create_session_as(auth_client, "", "alice")
     target = await _create_session_as(auth_client, "", "alice")
     headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, source["id"])}
     auth_client.headers.update(headers)
-    auth_app.state.feature_flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
     captured = _stub_late_runner_bind(monkeypatch)
     return source, target, captured
 
@@ -52,8 +61,13 @@ async def _send(client, source, target, message="Please inspect the PR"):
 
 
 @pytest.mark.parametrize("policy_denied", [False, True])
+@pytest.mark.parametrize(
+    "orchestration_environment",
+    [None, "", "usage_page", "-session_orchestration"],
+    indirect=True,
+)
 async def test_private_sender_can_message_shared_receiver(
-    auth_client, peers, db_uri, monkeypatch, policy_denied
+    auth_client, peers, db_uri, monkeypatch, policy_denied, orchestration_environment
 ):
     from omnigent.server.routes.sessions import routes_events
 
@@ -68,6 +82,10 @@ async def test_private_sender_can_message_shared_receiver(
 
         monkeypatch.setattr(routes_events, "_evaluate_input_policy", deny_task)
     result = await _send(auth_client, source, target)
+    if orchestration_environment == "-session_orchestration":
+        assert "Session orchestration is disabled" in result["detail"]
+        assert not captured.get("posts")
+        return
     if policy_denied:
         assert "Task needs approval" in result["error"]
         assert result["denied"] is True and result["queued"] is False
@@ -408,7 +426,11 @@ async def test_scheduled_origin_blocks_new_controls_but_preserves_children_and_r
 
 
 @pytest.mark.parametrize("placement", ["same_host", "managed"])
-@pytest.mark.parametrize("condition", ["flag_off", "shared", "binding"])
+@pytest.mark.parametrize(
+    "condition,orchestration_environment",
+    [("flag_off", "-session_orchestration"), ("shared", None), ("binding", None)],
+    indirect=["orchestration_environment"],
+)
 async def test_creation_refuses_before_launch(
     auth_client, auth_app, peers, db_uri, placement, condition
 ):
@@ -419,13 +441,11 @@ async def test_creation_refuses_before_launch(
     _register_online_host(auth_app, host_id, "alice")
     SqlAlchemyConversationStore(db_uri).set_host_id(source["id"], host_id, workspace="/tmp")
     assert auth_app.state.sandbox_config.managed_launch_supported
-    if condition == "flag_off":
-        auth_app.state.feature_flags = FeatureFlags()
-    elif condition == "shared":
+    if condition == "shared":
         permissions = SqlAlchemyPermissionStore(db_uri)
         permissions.ensure_user("bob")
         permissions.grant("bob", source["id"], LEVEL_READ)
-    else:
+    elif condition == "binding":
         auth_client.headers[RUNNER_TUNNEL_TOKEN_HEADER] = "wrong"
     store = SqlAlchemyConversationStore(db_uri)
     permissions = SqlAlchemyPermissionStore(db_uri)
@@ -445,6 +465,16 @@ async def test_creation_refuses_before_launch(
         "binding": "requires the sender's bound runner",
     }[condition]
     assert expected in result["detail"], result
+    if condition == "flag_off":
+        response = await auth_client.post(
+            "/v1/sessions",
+            headers={ORCHESTRATION_SOURCE_HEADER: source["id"]},
+            json={
+                "agent_id": source["agent_id"],
+                "host_type": "managed" if placement == "managed" else "external",
+            },
+        )
+        assert response.status_code == 403 and expected in response.text
     assert not captured.get("posts")
     assert auth_app.state.host_registry.get(host_id).outbound_queue.empty()
     assert {s.id for s in store.list_conversations().data} == before_sessions
@@ -811,9 +841,6 @@ async def test_peer_message_readdresses_across_replicas(
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
     stack = two_replica_stack
-    flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
-    for app in (stack.keyless_replica, stack.tunnel_replica):
-        app.state.feature_flags = flags
     source = await _create_session_as(stack.keyless_client, "", "alice")
     target = await _create_session_as(stack.tunnel_client, "", "alice")
     source_headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, source["id"])}
@@ -894,9 +921,6 @@ async def test_managed_create_is_addressed_before_provisioning(
     from omnigent.server.routes.sessions import routes_core
 
     stack = two_replica_stack
-    flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
-    for app in (stack.keyless_replica, stack.tunnel_replica):
-        app.state.feature_flags = flags
     source = await _create_session_as(stack.keyless_client, "", "alice")
     headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, source["id"])}
     monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1")
@@ -973,8 +997,6 @@ async def test_same_host_creation_across_replicas(
     from tests.server.integration.test_sessions_permissions import _register_online_host
 
     stack = two_replica_stack
-    for app in (stack.keyless_replica, stack.tunnel_replica):
-        app.state.feature_flags = FeatureFlags(frozenset({Feature.SESSION_ORCHESTRATION}))
     source = await _create_session_as(stack.tunnel_client, "", "alice")
     headers = {"X-Forwarded-Email": "alice", **_bind_runner(db_uri, source["id"])}
     host_id = uuid4().hex
