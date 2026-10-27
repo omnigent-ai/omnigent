@@ -82,7 +82,8 @@ jobs:
     name: Pytest (${{ matrix.group }})
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
-    runs-on: ubuntu-latest
+    # Native process tests depend on the GNU env and timeout behavior of this image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
