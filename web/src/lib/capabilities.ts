@@ -218,6 +218,12 @@ export interface ServerInfo {
    */
   archive_worktree_cleanup?: boolean;
   /**
+   * True when ``GET /v1/sessions`` accepts ``search_scope``. Older servers
+   * ignore it, so the palette lists one mixed search group there. Fails to
+   * ``false``.
+   */
+  session_search_scope?: boolean;
+  /**
    * True when a managed create accepts ``host_id`` naming its new sandbox
    * host. Older servers reject it, so the create omits it there. Fails to
    * ``false``.
@@ -233,6 +239,8 @@ export interface ServerInfo {
   agent_detail?: boolean;
   /** Owner-only configuration reads and conditional PATCH updates. */
   agent_config_edit?: boolean;
+  /** Types the session events route accepts; empty on older servers. */
+  session_event_types?: readonly string[];
   /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
@@ -316,6 +324,7 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   installable_harnesses: [],
   dictation_available: false,
   archive_worktree_cleanup: false,
+  session_search_scope: false,
   request_managed_sandbox_host_id: false,
   branding: null,
 };
@@ -429,10 +438,14 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          session_search_scope: data.session_search_scope === true,
           request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
           agent_config_edit: data.agent_config_edit === true,
+          session_event_types: Array.isArray(data.session_event_types)
+            ? data.session_event_types.filter((t): t is string => typeof t === "string")
+            : [],
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           branding: parseBranding(data.branding),
         };

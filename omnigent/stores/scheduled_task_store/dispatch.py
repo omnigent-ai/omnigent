@@ -27,7 +27,7 @@ class ScheduledTaskDispatchStore(Protocol):
         ...
 
     def reset_dispatch_cursors(self) -> None:
-        """Clear all persisted cursors before starting legacy timers after a rollback."""
+        """Clear all persisted cursors and skip pending runs before starting legacy timers."""
         ...
 
     def list_uninitialized_tasks(
@@ -48,6 +48,10 @@ class ScheduledTaskDispatchStore(Protocol):
         """Pause only if the active task still matches the rejected snapshot."""
         ...
 
+    def complete_schedule(self, task: ScheduledTask) -> bool:
+        """Mark an active schedule with no remaining occurrence completed, if unchanged."""
+        ...
+
     def list_due_tasks(
         self, now: int, *, after: DispatchCursor | None = None, limit: int = 100
     ) -> list[ScheduledTask]: ...
@@ -63,8 +67,36 @@ class ScheduledTaskDispatchStore(Protocol):
     ) -> ScheduledTaskRun | None:
         """Advance an unchanged task and insert its unique starting run atomically.
 
+        A ``None`` next run marks the task completed.
+
         An already-recorded occurrence advances the cursor but returns None,
         as does a changed task. Neither case starts another run.
+        """
+        ...
+
+    def request_manual_run(
+        self, task: ScheduledTask, *, now: int, trigger_key: str, host_id: str | None
+    ) -> ScheduledTaskRun | None:
+        """Record a Run now request as a pending ``scheduled`` run, for any undeleted task.
+
+        Returns None if the task no longer exists or was deleted.
+        """
+        ...
+
+    def list_pending_runs(
+        self, *, after: TaskCursor | None = None, limit: int = 100
+    ) -> list[ScheduledTaskRun]:
+        """Pending runs across workspaces, keyset-paged by ``(workspace_id, id)``."""
+        ...
+
+    def claim_pending_run(
+        self, run: ScheduledTaskRun, *, now: int, lease_seconds: int
+    ) -> tuple[ScheduledTask, ScheduledTaskRun] | None:
+        """Start a pending run under a lease, returning the task snapshot to fire.
+
+        Returns None if another replica already claimed it. A run whose task was
+        deleted is recorded as ``skipped`` instead. A run whose host changed with
+        the task's target gets the new host and stays pending. Both return None.
         """
         ...
 
@@ -97,7 +129,8 @@ class ScheduledTaskDispatchStore(Protocol):
 
         Executors use an unexpired lease. Reconcilers use ``expired=True`` only
         after checking whether the prompt was sent: preserve a started run,
-        otherwise fail it. Never infer prompt delivery solely from lease expiry.
+        record ``succeeded`` if its session already finished, otherwise fail it.
+        Never infer prompt delivery solely from lease expiry.
 
         Deleting a task prevents future claims; it does not cancel an existing
         claim. Startup and recovery may still record progress for that run.

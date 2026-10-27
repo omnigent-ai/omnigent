@@ -1,18 +1,9 @@
-// Per-tool display title formatter for the tool-call trigger row.
-//
-// The transcript was full of titles like `sys_os_shell({"command":"ls
-// -la"})` — accurate but visually noisy. This module rewrites the
-// common built-in tool calls into short, plain-English phrases that
-// match how a human would describe the action ("ls -la", "Read
-// foo.py", "Start child session: 'researcher - auth'").
-//
-// The result is split into a `verb` (rendered bold by the trigger row
-// so the action stands out) and a `body` (the dynamic, less-important
-// payload — paths, queries, commands). Unknown tools fall back to the
-// pre-existing `name(argsSummary)` shape with no bolded verb so we
-// never lose information for tools we haven't taught this module about.
+// Titles for tool-call rows: a bold `verb` plus a dynamic `body` ("Read foo.py").
+// Tools without a formatter get a humanized name and key argument values, with
+// the MCP server as a tag and the raw name in the tooltip.
 
 import type { ShellOutputFormat } from "@/lib/shellToolOutput";
+import { identifierWords, ownValue, sentenceCase } from "@/lib/toolValue";
 
 /**
  * Structured title for a tool call.
@@ -26,12 +17,18 @@ import type { ShellOutputFormat } from "@/lib/shellToolOutput";
  *   passed it (relative or absolute); the trigger row links it.
  * - `isShellCommand`: set when `body` is a shell command line; the
  *   trigger row renders it terminal-style (`$ cmd`, monospace).
+ * - `server`: the MCP server that owns the tool (e.g. "linear"); the
+ *   trigger row shows it as a tag.
+ * - `toolName`: the raw tool name, set when the title was derived from it
+ *   so the row's tooltip can still show the exact name.
  */
 export interface ToolTitle {
   verb: string | null;
   body: string;
   filePath?: string;
   isShellCommand?: boolean;
+  server?: string;
+  toolName?: string;
 }
 
 type ArgFormatter = (args: Record<string, unknown>) => ToolTitle | null;
@@ -204,30 +201,187 @@ const FORMATTERS: Record<string, ArgFormatter> = {
     if (url !== null) return { verb: "Web fetch:", body: url };
     return null;
   },
+  web_read: (args) => {
+    const url = asString(args.url);
+    return url === null ? null : { verb: "Web read:", body: url };
+  },
 };
 
 /**
- * Compute the title shown in a tool-call trigger row. Tries the
- * per-tool formatter first; otherwise falls back to `name(argsSummary)`
- * (or just `name` when the summary is empty) with no verb emphasis.
+ * Compute the title shown in a tool-call trigger row. Tries the per-tool
+ * formatter first; otherwise humanizes the tool name and lists its key
+ * argument values, with no tool-specific knowledge.
  */
-export function formatToolTitle(
-  name: string,
-  args: Record<string, unknown>,
-  argsSummary?: string,
-): ToolTitle {
-  // Prefixed omnigent shell tools get the same `$ command` row as their panel.
-  const formatter =
-    FORMATTERS[name] ?? (isShellTool(name) ? FORMATTERS[stripOmnigentPrefix(name)] : undefined);
+export function formatToolTitle(name: string, args: Record<string, unknown>): ToolTitle {
+  const { server, tool } = splitToolName(name);
+  const formatter = server === undefined ? ownValue(FORMATTERS, tool) : undefined;
   if (formatter !== undefined) {
     const title = formatter(args);
     if (title !== null && (title.verb !== null || title.body.length > 0)) {
       return title;
     }
   }
-  const fallback =
-    argsSummary !== undefined && argsSummary.length > 0 ? `${name}(${argsSummary})` : name;
-  return { verb: null, body: fallback };
+  return {
+    verb: humanizeToolName(tool, server),
+    body: summarizeArgs(args),
+    toolName: name,
+    ...(server === undefined ? {} : { server }),
+  };
+}
+
+// `server__tool`, as Claude Code names MCP tools after an `mcp__` prefix and
+// SDK harnesses name a spec-declared MCP server's tools without one.
+const SERVER_TOOL_RE = /^([A-Za-z0-9](?:[\w-]*?[A-Za-z0-9])?)__([A-Za-z0-9][\s\S]*)$/;
+
+/**
+ * Split an MCP tool name into its server and tool: `mcp__linear__get_issue`
+ * and `linear__get_issue` -> `{ server: "linear", tool: "get_issue" }`.
+ * Omnigent's MCP server carries the built-in tools and proxies spec-declared
+ * servers, so `mcp__omnigent__x` resolves as `x`.
+ */
+export function splitToolName(name: string): { server?: string; tool: string } {
+  const bare = name.startsWith("mcp__") ? name.slice("mcp__".length) : name;
+  const match = SERVER_TOOL_RE.exec(bare);
+  if (match === null) return { tool: name };
+  const [, server, tool] = match;
+  if (server === "omnigent") return splitToolName(tool!);
+  return { server: server!, tool: tool! };
+}
+
+// Verbs a tool name may end with (`sys_scheduled_task_create`); moved to the
+// front so the label reads as an action ("Create scheduled task"). Words like
+// "list" and "search" are left out: at the end of a name they are nouns.
+const TRAILING_VERBS = new Set([
+  "add",
+  "cancel",
+  "close",
+  "create",
+  "delete",
+  "get",
+  "launch",
+  "read",
+  "remove",
+  "rename",
+  "send",
+  "set",
+  "start",
+  "stop",
+  "update",
+  "write",
+]);
+// A name that already starts with one of these reads as an action as-is.
+const LEADING_VERBS = new Set([
+  ...TRAILING_VERBS,
+  "apply",
+  "check",
+  "edit",
+  "execute",
+  "fetch",
+  "find",
+  "list",
+  "load",
+  "manage",
+  "merge",
+  "open",
+  "poll",
+  "post",
+  "query",
+  "reply",
+  "resolve",
+  "run",
+  "search",
+  "submit",
+]);
+
+/**
+ * A tool name as a sentence-case action label: `manage_todo_list` -> "Manage
+ * todo list". Drops Omnigent's `sys_` prefix and a repeat of the server name
+ * (`slack_read_api_call` on the slack server -> "Read API call").
+ */
+export function humanizeToolName(tool: string, server?: string): string {
+  let words = identifierWords(tool);
+  if (words.length > 1 && words[0] === "sys") words = words.slice(1);
+  const serverWords = server === undefined ? [] : identifierWords(server);
+  let shared = 0;
+  while (shared < serverWords.length && shared < words.length - 1) {
+    if (words[shared] !== serverWords[shared]) break;
+    shared += 1;
+  }
+  words = words.slice(shared);
+  const last = words[words.length - 1];
+  if (
+    words.length > 1 &&
+    last !== undefined &&
+    TRAILING_VERBS.has(last) &&
+    !LEADING_VERBS.has(words[0]!)
+  ) {
+    words = [last, ...words.slice(0, -1)];
+  }
+  const label = sentenceCase(words);
+  return label.length > 0 ? label : tool;
+}
+
+const ARG_SUMMARY_PARTS = 3;
+const ARG_STRING_MAX_CHARS = 200;
+const ARG_LIST_MAX_ITEMS = 3;
+const ARG_LIST_ITEM_MAX_CHARS = 40;
+// Numbers only identify something under id-like keys; a bare `20` from
+// `limit` or `max_results` means nothing in a one-line summary.
+const ID_LIKE_KEY_WORDS = new Set(["id", "number", "num", "pid", "port"]);
+// Words that mark an argument as a credential; matched per word so `author` passes.
+const SECRET_KEY_WORDS = new Set([
+  "apikey",
+  "auth",
+  "authorization",
+  "bearer",
+  "cookie",
+  "credential",
+  "credentials",
+  "key",
+  "passphrase",
+  "passwd",
+  "password",
+  "pat",
+  "private",
+  "secret",
+  "signature",
+  "token",
+]);
+
+/**
+ * Key argument values for a collapsed row, joined with " · "; skips long,
+ * multi-line, nested and secret-looking values.
+ */
+export function summarizeArgs(args: Record<string, unknown>): string {
+  const parts: string[] = [];
+  for (const [key, value] of Object.entries(args)) {
+    if (parts.length >= ARG_SUMMARY_PARTS) break;
+    if (identifierWords(key).some((word) => SECRET_KEY_WORDS.has(word))) continue;
+    const part = argSummaryPart(key, value);
+    if (part !== null) parts.push(part);
+  }
+  return parts.join(" · ");
+}
+
+function argSummaryPart(key: string, value: unknown): string | null {
+  if (typeof value === "string") {
+    const text = value.trim();
+    if (text.length === 0 || text.length > ARG_STRING_MAX_CHARS || text.includes("\n")) return null;
+    return text;
+  }
+  if (typeof value === "number") {
+    const lastWord = identifierWords(key).at(-1);
+    return lastWord !== undefined && ID_LIKE_KEY_WORDS.has(lastWord) ? String(value) : null;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return null;
+    const shortStrings =
+      value.length <= ARG_LIST_MAX_ITEMS &&
+      value.every((item) => typeof item === "string" && item.length <= ARG_LIST_ITEM_MAX_CHARS);
+    if (shortStrings) return value.join(", ");
+    return `${value.length} ${value.length === 1 ? "item" : "items"}`;
+  }
+  return null;
 }
 
 /**
@@ -237,7 +391,7 @@ export function formatToolTitle(
  * command is a bare `ls` re-categorize as directory listings, matching
  * the Claude Code TUI's step summaries.
  */
-type RunCategory = "shell" | "list" | "read" | "edit" | "search";
+export type RunCategory = "shell" | "list" | "read" | "edit" | "search";
 
 /** One tool call in a folded run: its name plus (optional) arguments. */
 export interface ToolRunCall {
@@ -331,7 +485,7 @@ function decodeShellWord(text: string): string | null {
 
 /** Whether `name` is a shell-command tool in any harness (Bash, shell, sys_os_shell...). */
 export function isShellTool(name: string): boolean {
-  return RUN_CATEGORIES[stripOmnigentPrefix(name)] === "shell";
+  return ownValue(RUN_CATEGORIES, stripOmnigentPrefix(name)) === "shell";
 }
 
 /** A shell tool call: the command line it ran and how its output is shaped. */
@@ -357,7 +511,7 @@ export function shellToolCall(name: string, args: Record<string, unknown>): Shel
   const bareName = stripOmnigentPrefix(name);
   return {
     command: bareName === "shell" ? unwrapShellCommand(command) : command,
-    outputFormat: SHELL_OUTPUT_FORMATS[bareName] ?? "plain",
+    outputFormat: ownValue(SHELL_OUTPUT_FORMATS, bareName) ?? "plain",
   };
 }
 
@@ -383,9 +537,24 @@ export function splitEnvPrefix(command: string): { env: string; rest: string } {
   return { env: match[0], rest };
 }
 
-function categorizeCall(call: ToolRunCall): RunCategory | "other" {
+/**
+ * A script's first line for a collapsed row, and how many more non-blank lines
+ * follow it. Leading comment lines are skipped: the first line is always top
+ * level, so a `#` there starts a comment.
+ */
+export function shellCommandPreview(script: string): { firstLine: string; moreLines: number } {
+  const lines = script
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  const shown = lines.find((line) => !line.startsWith("#")) ?? lines[0] ?? "";
+  return { firstLine: shown.replace(/\s*\\$/, ""), moreLines: Math.max(0, lines.length - 1) };
+}
+
+/** The action category of a tool call, e.g. `Bash("ls")` -> "list". */
+export function toolCallCategory(call: ToolRunCall): RunCategory | "other" {
   const name = stripOmnigentPrefix(call.name);
-  const category = RUN_CATEGORIES[name] ?? "other";
+  const category = ownValue(RUN_CATEGORIES, name) ?? "other";
   if (category === "shell") {
     const raw = typeof call.args?.command === "string" ? call.args.command : "";
     const command = unwrapShellCommand(raw);
@@ -404,7 +573,7 @@ function categorizeCall(call: ToolRunCall): RunCategory | "other" {
 export function formatToolRunLabel(calls: ToolRunCall[]): string {
   const counts = new Map<RunCategory | "other", number>();
   for (const call of calls) {
-    const category = categorizeCall(call);
+    const category = toolCallCategory(call);
     counts.set(category, (counts.get(category) ?? 0) + 1);
   }
 
@@ -445,8 +614,9 @@ function withPath(verb: string, raw: unknown): ToolTitle | null {
 }
 
 function sessionTitle(verb: string, args: Record<string, unknown>): ToolTitle | null {
-  const tool = asString(args.tool);
-  const session = asString(args.session);
+  // The named spawn schema (omnigent/tools/builtins/spawn.py) sends `agent`/`title`.
+  const tool = asString(args.tool) ?? asString(args.agent);
+  const session = asString(args.session) ?? asString(args.title);
   if (tool === null || session === null) return null;
   return { verb, body: `'${tool} - ${session}'` };
 }

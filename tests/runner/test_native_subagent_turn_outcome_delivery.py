@@ -104,21 +104,20 @@ class _Rig:
 
 
 @pytest.mark.asyncio
-async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing() -> None:
-    """A bare idle edge must not report an unfinished claude-native turn completed.
-
-    The claude forwarder stamps ``turn_completed`` on its ``Stop``-hook edge, so
-    an idle without it (a quiescence observation, a /clear supersession notice)
-    proves nothing about the turn's outcome and must not wake the parent with a
-    fabricated ``completed``.
-    """
-    rig = _Rig("claude-native")
+@pytest.mark.parametrize("harness", ["claude-native", "pi-native"])
+async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing(
+    harness: str,
+) -> None:
+    """Quiescence or compaction clears runner activity without completing the dispatch."""
+    rig = _Rig(harness)
     try:
         async with _runner_client(rig.app) as client:
             await rig.create_child_session(client)
             for data in ({"status": "running"}, {"status": "idle", "output": "partial text"}):
                 resp = await rig.post_status(client, data)
                 assert resp.status_code == 204, resp.text
+                assert rig.app.state.native_pane_status[rig.child_id] == data["status"]
+                assert rig.app.state.has_active_work() == (data["status"] == "running")
         assert rig.drained() == [], "a bare quiescence idle must not deliver a terminal status"
         entry = subagent_work.get_subagent_work(rig.child_id)
         assert entry is not None and entry.status not in ("completed", "cancelled", "failed")
@@ -127,16 +126,18 @@ async def test_quiescence_idle_for_outcome_confirming_harness_delivers_nothing()
 
 
 @pytest.mark.asyncio
-async def test_turn_completed_idle_delivers_completed_result() -> None:
+@pytest.mark.parametrize("harness", ["claude-native", "pi-native"])
+async def test_turn_completed_idle_delivers_completed_result(harness: str) -> None:
     """The forwarder's confirmed turn-end edge still completes the dispatch."""
-    rig = _Rig("claude-native")
+    rig = _Rig(harness)
     try:
         async with _runner_client(rig.app) as client:
             await rig.create_child_session(client)
-            resp = await rig.post_status(
-                client, {"status": "idle", "turn_completed": True, "output": "the verdict"}
-            )
-            assert resp.status_code == 204, resp.text
+            for _ in range(2):  # A lost acknowledgment retries the same completed result.
+                resp = await rig.post_status(
+                    client, {"status": "idle", "turn_completed": True, "output": "the verdict"}
+                )
+                assert resp.status_code == 204, resp.text
         delivered = rig.drained()
         assert [(item["status"], item["output"]) for item in delivered] == [
             ("completed", "the verdict")

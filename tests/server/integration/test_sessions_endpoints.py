@@ -723,10 +723,27 @@ async def test_native_transcript_preserves_browser_title_preference(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+@pytest.mark.parametrize(
+    "harness,message_text,rejected_auth,active_turn",
+    [
+        ("claude-native", "set up the worktree", False, False),
+        ("claude-native", "/login", True, False),
+        ("claude-native", "/logout", True, False),
+        ("claude-native", " \n/login workspace", True, False),
+        ("claude-native", "/login-help", False, False),
+        ("claude-native", "Explain /login", False, False),
+        ("codex-native", "/login", False, False),
+        ("claude-native", "/login", True, True),
+    ],
+)
 async def test_native_message_repeat_with_same_stable_id_forwards_once(
     client: httpx.AsyncClient,
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    message_text: str,
+    rejected_auth: bool,
+    active_turn: bool,
 ) -> None:
     """
     A resend that reuses the web client's stable message id is answered with
@@ -755,7 +772,7 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
         "type": "message",
         "data": {
             "role": "user",
-            "content": [{"type": "input_text", "text": "set up the worktree"}],
+            "content": [{"type": "input_text", "text": message_text}],
             "stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
         },
     }
@@ -767,25 +784,58 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
             "omnigent.server.routes._sessions.orchestration._get_runner_client",
             AsyncMock(return_value=runner),
         )
-        agent = await create_test_agent(client, name="claude-native-ui")
+        agent = await create_test_agent(
+            client,
+            name=f"{harness}-ui",
+            executor={"type": "omnigent", "config": {"harness": harness}},
+        )
         created = await client.post(
             "/v1/sessions",
             json={
                 "agent_id": agent["id"],
                 "labels": {
                     "omnigent.ui": "terminal",
-                    "omnigent.wrapper": "claude-code-native-ui",
+                    "omnigent.wrapper": (
+                        "claude-code-native-ui"
+                        if harness == "claude-native"
+                        else "codex-native-ui"
+                    ),
                 },
             },
         )
         assert created.status_code == 201, created.text
         session_id = created.json()["id"]
+        if active_turn:
+            sessions_module._publish_status(session_id, "running", response_id="response_active")
+        before = (await client.get(f"/v1/sessions/{session_id}")).json()
+        published: list[tuple[str, dict[str, Any]]] = []
+        _capture_published(monkeypatch, published)
         try:
 
             def message_forwards() -> int:
                 return sum(1 for r in forwarded if r.url.path.endswith("/events"))
 
             first = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            if rejected_auth:
+                assert first.status_code == 400, first.text
+                assert first.json()["error"]["code"] == "invalid_input"
+                assert "omni setup" in first.json()["error"]["message"]
+                assert message_forwards() == 0
+                assert pending_inputs.snapshot_for(session_id) == []
+                after = (await client.get(f"/v1/sessions/{session_id}")).json()
+                assert after["items"] == before["items"]
+                assert after["status"] == before["status"]
+                if active_turn:
+                    assert sessions_module._session_active_response_cache[session_id] == (
+                        "response_active"
+                    )
+                assert not any(
+                    event.get("type") in {"response.error", "response.failed"}
+                    or (event.get("type") == "session.status" and event.get("status") == "failed")
+                    for published_session, event in published
+                    if published_session == session_id
+                )
+                return
             assert first.status_code == 202, first.text
             assert message_forwards() == 1
             # The runner learns the message's id so a failed turn can name it.
@@ -1378,8 +1428,10 @@ async def test_external_session_superseded_leaves_interrupted_entries_hidden(
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
+@pytest.mark.parametrize("tool_use_id", ["toolu_016PwCnwmHv8h7kVpWLVd9YX", None])
 async def test_external_subagent_start_mints_child_session(
     client: httpx.AsyncClient,
+    tool_use_id: str | None,
 ) -> None:
     """
     Posting ``external_subagent_start`` to a claude-native parent
@@ -1406,7 +1458,7 @@ async def test_external_subagent_start_mints_child_session(
                 "subagent_id": "a5c7effac5a9a35ab",
                 "agent_type": "Explore",
                 "description": "Trace the auth flow",
-                "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
+                **({"tool_use_id": tool_use_id} if tool_use_id is not None else {}),
             },
         },
     )
@@ -1436,6 +1488,7 @@ async def test_external_subagent_start_mints_child_session(
     # Description is preserved on the row's labels for surfaces that
     # want it; the rail's row UI ignores ``session_name``.
     assert child["labels"]["omnigent.claude_native.description"] == "Trace the auth flow"
+    assert child["labels"].get("omnigent.claude_native.tool_use_id") == tool_use_id
 
 
 async def test_session_event_batch_is_ordered_and_idempotent(
@@ -2149,8 +2202,10 @@ async def test_external_subagent_start_falls_back_to_the_bare_agent_type(
     assert child["session_name"] == "a361e6a6aa05689cb"
 
 
+@pytest.mark.parametrize("tool_use_id", ["toolu_016PwCnwmHv8h7kVpWLVd9YX", None])
 async def test_external_subagent_start_is_idempotent_on_subagent_id(
     client: httpx.AsyncClient,
+    tool_use_id: str | None,
 ) -> None:
     """
     Two POSTs carrying the same ``subagent_id`` resolve to the same
@@ -2170,7 +2225,7 @@ async def test_external_subagent_start_is_idempotent_on_subagent_id(
             "subagent_id": "a5c7effac5a9a35ab",
             "agent_type": "Explore",
             "description": "Trace the auth flow",
-            "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
+            **({"tool_use_id": tool_use_id} if tool_use_id is not None else {}),
         },
     }
 
@@ -2323,31 +2378,38 @@ async def test_external_subagent_start_idempotency_pages_beyond_first_100(
 
 
 @pytest.mark.parametrize(
-    "missing_key",
-    ["subagent_id", "agent_type", "description", "tool_use_id"],
+    ("invalid_key", "invalid_value"),
+    [
+        ("subagent_id", None),
+        ("agent_type", None),
+        ("description", None),
+        ("tool_use_id", None),
+        ("tool_use_id", ""),
+        ("tool_use_id", 123),
+    ],
 )
-async def test_external_subagent_start_rejects_missing_required_keys(
+async def test_external_subagent_start_rejects_invalid_fields(
     client: httpx.AsyncClient,
-    missing_key: str,
+    invalid_key: str,
+    invalid_value: object,
 ) -> None:
-    """
-    A POST missing any of the four required ``data`` keys returns
-    400 — payload validation is at the route boundary so the handler
-    body always sees a complete record.
-    """
+    """Missing required fields and malformed optional tool IDs return 400."""
     agent = await create_test_agent(client)
     parent = await _create_session(
         client,
         agent["id"],
         labels={"omnigent.wrapper": "claude-code-native-ui"},
     )
-    data = {
+    data: dict[str, object] = {
         "subagent_id": "a5c7effac5a9a35ab",
         "agent_type": "Explore",
         "description": "Trace the auth flow",
         "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
     }
-    data.pop(missing_key)
+    if invalid_key == "tool_use_id":
+        data[invalid_key] = invalid_value
+    else:
+        data.pop(invalid_key)
     resp = await client.post(
         f"/v1/sessions/{parent['id']}/events",
         json={"type": "external_subagent_start", "data": data},
@@ -2355,7 +2417,7 @@ async def test_external_subagent_start_rejects_missing_required_keys(
     assert resp.status_code == 400
     # Error message must name the missing field so the forwarder's
     # logs point at the bug rather than reading "Invalid payload".
-    assert missing_key in resp.text
+    assert invalid_key in resp.text
 
 
 # ── POST /v1/sessions/{id}/events skill slash_command ─────
@@ -5727,6 +5789,30 @@ _CODEX_LOGIN_EXPIRED_DETAIL = (
 @pytest.mark.parametrize(
     ("detail", "expected_code", "card", "wrapper", "reauth_required", "status_extra"),
     [
+        (
+            "Request timed out",
+            "transient_upstream_error",
+            {},
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (
+            "We’re currently experiencing high demand, which may cause temporary errors.",
+            "transient_upstream_error",
+            {},
+            "codex-native-ui",
+            False,
+            {},
+        ),
+        (
+            "We’re currently experiencing high demand, which may cause temporary errors.",
+            "transient_upstream_error",
+            _CODEX_COMPACTION_RETRY_CARD,
+            "codex-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
         (
             'API Error: 499 {"error_code":"CANCELLED","message":""}',
             "transient_upstream_error",
@@ -10454,6 +10540,61 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
         _interrupt_fenced_sessions.discard(child_id)
         _session_active_response_cache.pop(child_id, None)
         _session_status_cache.pop(child_id, None)
+
+
+async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A side-chat follow-up must not start a runner session (and terminal) for the child."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    child_response = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert child_response.status_code == 202, child_response.text
+    child_id = child_response.json()["child_session_id"]
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(child_id, "native-runner")
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(202)
+
+    initialize = AsyncMock(return_value=True)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+    content = [{"type": "input_text", "text": "and why?"}]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner))
+        response = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={"type": "message", "data": {"role": "user", "content": content}},
+        )
+
+    assert response.status_code == 202, response.text
+    initialize.assert_not_awaited()
+    assert forwarded == [
+        (
+            f"/v1/sessions/{parent['id']}/events",
+            {"type": "message", "content": content, "codex_side_thread_id": "thread_side"},
+        )
+    ]
 
 
 async def test_interrupt_forward_success_keeps_stop_fence(

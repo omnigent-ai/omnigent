@@ -17,16 +17,12 @@ import "@xterm/xterm/css/xterm.css";
 import { withBasePath } from "@/lib/basePath";
 import { type CodeFont, codeFontFamilyForEditor, readCodeFont } from "@/lib/codeFontPreferences";
 import { parseHttpUrl } from "@/lib/openLinkInApp";
+import { terminalSurfaceColors } from "@/lib/terminalPalette";
 import { splitWorkspaceFileCitation } from "@/components/ai-elements/streamdown-security";
 import { resolveChatFilePath } from "@/hooks/useWorkspaceChangedFiles";
 import { CodexTerminalPalette, codexTerminalTheme } from "./CodexTerminalPalette";
 import { TerminalLinkProvider } from "./TerminalLinkProvider";
 
-// Card background colors derived from the app's CSS palette.
-// Light: --card: oklch(1.000 0 0) = pure white.
-// Dark:  --card: oklch(0.195 0.004 240) ≈ rgb(19, 21, 23) via OKLab → sRGB.
-const CARD_LIGHT = "#ffffff";
-const CARD_DARK = "#131517";
 const TERMINAL_BOLD_WEIGHT_OFFSET = 300;
 
 function terminalFontOptions({ sizePx, family, weight }: CodeFont) {
@@ -48,23 +44,23 @@ export const WS_CLOSE_WRONG_REPLICA = 4400;
  * Return an xterm `ITheme` object matched to the app's light or dark palette.
  */
 export function terminalTheme(isDark: boolean): ITheme {
-  const bg = isDark ? CARD_DARK : CARD_LIGHT;
+  const { background: bg, foreground, selection } = terminalSurfaceColors(isDark);
   return isDark
     ? {
         background: bg,
-        foreground: "#e4e4e7",
+        foreground,
         cursor: "#22d3ee",
         cursorAccent: bg,
-        selectionBackground: "#22d3ee33",
+        selectionBackground: selection,
         black: "#09090b",
         brightBlack: "#71717a",
       }
     : {
         background: bg,
-        foreground: "#18181b",
+        foreground,
         cursor: "#0891b2",
         cursorAccent: bg,
-        selectionBackground: "#0891b233",
+        selectionBackground: selection,
         black: "#18181b",
         brightBlack: "#e4e4e7",
         // CLIs that assume a dark terminal paint primary text with ANSI

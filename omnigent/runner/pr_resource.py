@@ -803,6 +803,30 @@ def update_pr_reviewers(
     return facet.edit_reviewers(root, reference, add=add_refs, remove=remove_refs)
 
 
+def create_pr_comment(
+    root: str,
+    *,
+    session_id: str | None = None,
+    pr_url: str | None = None,
+    body: object = None,
+) -> dict[str, Any]:
+    """Post a non-empty Markdown comment to the selected tracked PR."""
+    if not isinstance(body, str):
+        raise ValueError("Expected body to be a string")
+    if not body.strip():
+        raise ValueError("A comment cannot be empty")
+    if len(body) > _MAX_BODY_CHARS:
+        raise ValueError(f"A comment can be at most {_MAX_BODY_CHARS} characters")
+    facet, reference = _capable_target(
+        session_id,
+        pr_url,
+        capable=lambda capabilities: capabilities.comment_posting,
+        unselected="Select a pull request to post a comment",
+        unsupported="Posting comments on {kind} is not supported",
+    )
+    return facet.create_comment(root, reference, body=body)
+
+
 def _details_target(
     session_id: str | None, pr_url: str | None
 ) -> tuple[PullRequestFacet, SessionPullRequest]:

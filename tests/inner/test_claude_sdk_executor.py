@@ -112,6 +112,24 @@ class TestPromptExtraction(unittest.TestCase):
             "Second question",
         )
 
+    def test_tool_history_replays_only_into_a_fresh_session(self):
+        executor = self._make_executor()
+        messages = [
+            {"role": "user", "content": "Weather in SF?"},
+            {"role": "tool_call", "content": {"tool": "weather", "args": {"city": "SF"}}},
+            {"role": "tool_result", "content": "SF: 61F"},
+            {"role": "assistant", "content": "61F."},
+            {"role": "user", "content": "Warmer than NYC?"},
+            {"role": "tool_call", "content": {"tool": "weather", "args": {"city": "NYC"}}},
+        ]
+        self.assertTrue(executor.replays_tool_history())
+        fresh = executor._build_prompt(messages, resume_session=False)
+        self.assertIn('tool call: {"tool": "weather", "args": {"city": "SF"}}', fresh)
+        self.assertIn("tool result: SF: 61F", fresh)
+        self.assertIn('tool call: {"tool": "weather", "args": {"city": "NYC"}}', fresh)
+        self.assertEqual(fresh.count("Warmer than NYC?"), 1)
+        self.assertEqual(executor._build_prompt(messages, resume_session=True), "Warmer than NYC?")
+
     def test_resumed_session_includes_all_trailing_user_messages(self):
         """Batched buffered steers: all trailing user messages must reach the SDK.
 
@@ -1272,7 +1290,7 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
 
-        async def _t():
+        async def _t(model):
             with patch(
                 "omnigent.inner.databricks_executor._read_databrickscfg",
                 return_value=DatabricksCredentials(
@@ -1280,7 +1298,7 @@ class TestConstructor(unittest.TestCase):
                     token="dapi_test_token",
                 ),
             ):
-                executor = ClaudeSDKExecutor(gateway=True, model="databricks-claude-opus-4-7")
+                executor = ClaudeSDKExecutor(gateway=True, model=model)
 
             captured: dict[str, object] = {}
 
@@ -1299,7 +1317,10 @@ class TestConstructor(unittest.TestCase):
 
             self.assertEqual(captured["thinking"], {"type": "adaptive", "display": "summarized"})
 
-        _run(_t())
+        # Legacy serving-endpoint and Unity Catalog spellings of the same tier.
+        for model in ("databricks-claude-opus-4-7", "system.ai.claude-opus-4-7"):
+            with self.subTest(model=model):
+                _run(_t(model))
 
     def test_databricks_fable_pins_thinking_to_adaptive(self):
         """gateway=True + fable sets ``thinking={"type": "adaptive", "display": "summarized"}``.
@@ -1312,7 +1333,7 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
 
-        async def _t():
+        async def _t(model):
             with patch(
                 "omnigent.inner.databricks_executor._read_databrickscfg",
                 return_value=DatabricksCredentials(
@@ -1320,7 +1341,7 @@ class TestConstructor(unittest.TestCase):
                     token="dapi_test_token",
                 ),
             ):
-                executor = ClaudeSDKExecutor(gateway=True, model="databricks-claude-fable-5")
+                executor = ClaudeSDKExecutor(gateway=True, model=model)
 
             captured: dict[str, object] = {}
 
@@ -1339,7 +1360,10 @@ class TestConstructor(unittest.TestCase):
 
             self.assertEqual(captured["thinking"], {"type": "adaptive", "display": "summarized"})
 
-        _run(_t())
+        # Legacy serving-endpoint and Unity Catalog spellings of the same tier.
+        for model in ("databricks-claude-fable-5", "system.ai.claude-fable-5"):
+            with self.subTest(model=model):
+                _run(_t(model))
 
     def test_databricks_sonnet_leaves_thinking_unset(self):
         """gateway=True + non-adaptive-tier model preserves CLI default thinking."""
@@ -2394,6 +2418,10 @@ def _databricks_opus_executor():
     return _databricks_gateway_executor(model="databricks-claude-opus-4-7")
 
 
+def _databricks_uc_opus_executor():
+    return _databricks_gateway_executor(model="system.ai.claude-opus-4-7")
+
+
 @pytest.mark.parametrize(
     ("settings_text", "expected"),
     [
@@ -2485,6 +2513,7 @@ async def test_hermetic_turn_reads_relative_config_dir_from_cli_cwd(
         (_default_executor, 1024, {"type": "disabled"}),
         (_default_executor, 1025, None),
         (_databricks_opus_executor, 32000, {"type": "adaptive", "display": "summarized"}),
+        (_databricks_uc_opus_executor, 32000, {"type": "adaptive", "display": "summarized"}),
     ],
     ids=[
         "title-cap",
@@ -2492,6 +2521,7 @@ async def test_hermetic_turn_reads_relative_config_dir_from_cli_cwd(
         "largest-cap-without-room",
         "smallest-cap-with-room",
         "large-cap-adaptive-model",
+        "large-cap-uc-adaptive-model",
     ],
 )
 async def test_output_token_cap_reaches_cli_and_keeps_thinking_when_a_budget_fits(
@@ -6146,3 +6176,23 @@ async def test_effort_changes_rebuild_client_with_history(initial_effort, compac
 
     assert len(fake_sdk.created_clients) == 3
     assert [call.args[0] for call in close.await_args_list] == fake_sdk.created_clients[:2]
+
+
+def test_tool_call_metadata_marks_only_omnigent_mcp_tools_as_dispatched() -> None:
+    """Only the in-process ``omnigent`` MCP server's tools come back for dispatch.
+
+    Claude Code's own tools and other MCP servers' tools run inside the CLI, so
+    they are ``internally_executed`` and stay out of dispatch correlation.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.inner.claude_sdk_executor import _tool_call_metadata
+
+    for name, internal in (
+        ("mcp__omnigent__sys_os_shell", False),
+        ("Skill", True),
+        ("ToolSearch", True),
+        ("mcp__github__create_issue", True),
+    ):
+        metadata = _tool_call_metadata(SimpleNamespace(id="toolu_1", name=name))  # type: ignore[arg-type]
+        assert metadata == {"call_id": "toolu_1", "internally_executed": internal}, name

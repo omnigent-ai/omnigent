@@ -49,11 +49,11 @@ class HostFsError(Exception):
 
 
 class HostFsUnavailableError(Exception):
-    """The host could not be reached for a filesystem read.
+    """A host filesystem operation lost its connection or result.
 
     Connection loss or no reply within the timeout — an infrastructure
     condition. Callers treat it like a runner-offline result (fall
-    through to the next resolver link / 502).
+    through to the next resolver link / 502). A write may already have applied.
     """
 
 
@@ -151,16 +151,17 @@ async def write_workspace_from_host(
     The write counterpart of :func:`read_workspace_from_host` — for the small set
     of host-servable writes (currently ``"github_set_preference"``,
     ``"github_prs_update"``, ``"github_labels_update"``, ``"github_reviewers_update"``,
-    ``"github_details_update"``, ``"github_attachment_upload"``, ``"github_merge"``,
+    ``"github_details_update"``, ``"github_comment_create"``,
+    ``"github_attachment_upload"``, ``"github_merge"``,
     and ``"github_disable_auto_merge"``) so a preference change, a PR attach/remove,
-    a label, reviewer, title, or description edit, an attachment upload, or a merge
+    a label, reviewer, title, or description edit, a comment, an attachment upload, or a merge
     works when the session's runner is offline.
     Shares the result frame, the ``pending_fs_requests`` correlation map, and the
     error mapping with reads.
 
     :param op: Write op name — currently ``"github_set_preference"``,
         ``"github_prs_update"``, ``"github_labels_update"``,
-        ``"github_reviewers_update"``, ``"github_details_update"``,
+        ``"github_reviewers_update"``, ``"github_details_update"``, ``"github_comment_create"``,
         ``"github_attachment_upload"``, ``"github_merge"``, or
         ``"github_disable_auto_merge"``.
     :param params: Operation-specific arguments, e.g. ``{"account": ...}``.

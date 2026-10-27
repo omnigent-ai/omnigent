@@ -113,6 +113,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 
 ## Features
 
+- [Session orchestration](./session-orchestration.md) covers private-owner
+  messaging, top-level worker creation, polling results and sharing restrictions.
+
 - [Workspace content search](./workspace-content-search.md) covers runner-backed
   text search, result navigation and its release flag.
 
@@ -148,6 +151,8 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
   custom-agent targets, fork access checks, archive, reconnect, and resume.
 - [Video recordings](./video-rendering.md) covers inline chat playback, remote
   recording links, file previews, and download fallbacks.
+- [Tool calls in chat](./tool-calls.md) covers tool-call rows, their result
+  lines, the expanded field and Raw views, and tool-run folding.
 
 - [GitLab merge requests](./gitlab.md) covers the shared MR panel, composer,
   Canvas links, and native tracking.
@@ -173,8 +178,8 @@ map an area, remove it here in the same change.
 **Web and apps** (UI test areas):
 
 - Chat transcript, errors, and MCP status: `tests/e2e_ui/chat/` (only the
-  composer, side-chat, model-picker, harness-visibility, reconnect, and
-  terminal journeys are mapped)
+  composer, side-chat, model-picker, harness-visibility, reconnect, terminal,
+  and tool-call journeys are mapped)
 - Approvals, permission cards, and the inbox: `tests/e2e_ui/approvals/` (only
   native edit-tool approvals are mapped)
 - Sub-agents and the agent info popover: `tests/e2e_ui/agents/` (only Claude-native
@@ -191,7 +196,8 @@ map an area, remove it here in the same change.
 - Branding and base-path deploys: `tests/e2e_ui/branding/`, `tests/e2e_ui/base_path/`
 - Hotkeys: `tests/e2e_ui/hotkeys/`
 - Message rendering: `tests/e2e_ui/messages/` (only per-harness render parity,
-  Claude shell-command settlement, and refused-delivery persistence are mapped)
+  Claude shell-command settlement, refused-delivery persistence, and tool-run
+  folding are mapped)
 - Mobile layout: `tests/e2e_ui/mobile/` (only composer labels, the composer
   after an unacknowledged send, sidebar rename under the keyboard, and
   terminal touch scroll are mapped)

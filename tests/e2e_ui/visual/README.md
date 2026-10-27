@@ -45,8 +45,8 @@ renders in it, and you can reproduce that exact render locally with Docker — s
 [Updating the baseline](#updating-the-baseline). Because the renderer is the
 image, your host OS doesn't matter; you just need Docker (or let CI do it).
 
-The test is marked `@pytest.mark.visual`; the main e2e-ui suite (unpinned
-`ubuntu-latest`) excludes it via `-m "not visual"`. Only `ui-snapshot.yml` runs
+The test is marked `@pytest.mark.visual`; the main e2e-ui suite (standard
+runner image) excludes it via `-m "not visual"`. Only `ui-snapshot.yml` runs
 it.
 
 ## Is this check merge-blocking?

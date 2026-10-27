@@ -5204,6 +5204,7 @@ async def test_relay_dedupes_duplicate_error_persistence_but_forwards_live_frame
                 "exception_cause_type": "FileNotFoundError",
                 "native_launch_os_errno": 2,
                 "native_launch_os_errno_name": "ENOENT",
+                "native_launch_code_origin": "omnigent.runner.native.orchestration.launch:42",
                 "origin": "forged",
                 "exception_message": "private launch path",
             },
@@ -5289,6 +5290,7 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
         assert record.attributes["exception_cause_type"] == "FileNotFoundError"
         assert record.attributes["native_launch_os_errno"] == "2"
         assert record.attributes["native_launch_os_errno_name"] == "ENOENT"
+        assert record.attributes["native_launch_code_origin"].endswith(".launch:42")
         assert "private launch path" not in str(record.attributes)
     else:
         assert "failure_id" not in record.attributes
@@ -6742,7 +6744,10 @@ async def test_claude_native_reformatted_mirror_never_brands_later_messages_unde
 
 
 @pytest.mark.asyncio
-async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
+@pytest.mark.parametrize("with_context", [False, True])
+async def test_native_dispatch_reports_malformed_runner_error_body(
+    caplog: pytest.LogCaptureFixture, with_context: bool
+) -> None:
     """Opaque framework 500 bodies become explicit ensure errors.
 
     If the runner/tunnel returns a plain ``Internal Server Error`` body
@@ -6756,11 +6761,25 @@ async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
     store = _ConversationStore()
     conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
     assert conv is not None
+    response_text = "Internal Server Error"
+    if with_context:
+        response_text = json.dumps(
+            {
+                "error": "runner_request_failed",
+                "failure_context": {
+                    "failure_id": "err_opaque_startup",
+                    "failure_source": "runner_request",
+                    "exception_type": "RuntimeError",
+                    "native_launch_code_origin": "omnigent.runner.native.orchestration.launch:42",
+                    "origin": "forged",
+                },
+            }
+        )
     client = _FakeRunnerClient(
         text_responses={
             "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals": (
                 500,
-                "Internal Server Error",
+                response_text,
                 {"content-type": "text/plain"},
             )
         }
@@ -6793,6 +6812,15 @@ async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
         errors[0].data.message
         == "Native Claude terminal ensure failed with malformed runner response (HTTP 500)."
     )
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.attributes["origin"] == "native_terminal_boot_failed"
+    if with_context:
+        assert record.attributes["failure_id"] == "err_opaque_startup"
+        assert record.attributes["native_launch_code_origin"].endswith(".launch:42")
+    else:
+        assert "failure_id" not in record.attributes
 
 
 @pytest.mark.asyncio
@@ -9929,6 +9957,7 @@ async def test_pr_attachment_uses_bound_session_when_runner_offline(
 @pytest.mark.parametrize(
     "resource,body,op,params",
     [
+        ("/comments", {"body": "Hello"}, "github_comment_create", {"body": "Hello"}),
         ("/labels", {"remove": ["bug"]}, "github_labels_update", {"add": [], "remove": ["bug"]}),
         (
             "/reviewers",
@@ -10526,3 +10555,74 @@ async def test_environment_id_is_one_runner_url_segment(
             == (base + quote(environment_id, safe="") + suffix).encode()
         )
         assert forwarded.fragment == ""
+
+
+@pytest.mark.asyncio
+async def test_comment_transport_timeout_does_not_retry_on_host(
+    client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.server.routes import _host_filesystem
+
+    runner = _FakeRunnerClient()
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    posts = []
+
+    async def timeout(path: str, **kwargs: Any) -> httpx.Response:
+        posts.append(path)
+        raise httpx.ReadTimeout("Response lost after dispatch")
+
+    async def unexpected_fallback(**kwargs: Any) -> None:
+        pytest.fail("An uncertain POST must not be repeated on the host")
+
+    monkeypatch.setattr(runner, "post", timeout)
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", unexpected_fallback)
+    path = "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github/comments"
+    response = await client.post(
+        path, json={"pr_url": "https://github.com/acme/widgets/pull/17", "body": "Hello"}
+    )
+    assert response.status_code == 502
+    assert posts == [path]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("resource,expected", [("comments", 502), ("details", 503)])
+async def test_host_write_timeout_preserves_comment_uncertainty(
+    offline_env_client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    resource: str,
+    expected: int,
+) -> None:
+    from types import SimpleNamespace
+
+    from omnigent.server.routes import _host_filesystem
+
+    sent: list[str] = []
+    connection = SimpleNamespace(host_id="test-host", pending_fs_requests={})
+    registry = SimpleNamespace(send_text=lambda _connection, frame: sent.append(frame))
+    real_write = _host_filesystem.write_workspace_from_host
+
+    async def write_without_reply(**kwargs: Any) -> dict[str, Any]:
+        return await real_write(
+            **{
+                **kwargs,
+                "host_registry": registry,
+                "host_conn": connection,
+                "timeout": 0.001,
+            }
+        )
+
+    monkeypatch.setattr(_host_filesystem, "write_workspace_from_host", write_without_reply)
+    response = await offline_env_client.post(
+        f"/v1/sessions/{_OFFLINE_SESSION}/resources/github/{resource}",
+        json={"pr_url": "https://github.com/acme/widgets/pull/17", "body": "Hello"},
+    )
+    assert response.status_code == expected, response.text
+    assert len(sent) == 1
+    assert connection.pending_fs_requests == {}
+    if resource == "comments":
+        assert (
+            response.json()["detail"]
+            == "Could not confirm comment posting. Check GitHub before retrying."
+        )
+    else:
+        assert response.json()["error"]["code"] == "runner_unavailable"

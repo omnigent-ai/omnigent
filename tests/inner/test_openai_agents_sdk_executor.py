@@ -1063,6 +1063,71 @@ class TestOpenAIAgentsSDKExecutor(unittest.TestCase):
 
         _run(_t())
 
+    def test_forked_session_replays_tool_history_once(self):
+        """A fresh SDK session (fork, restart) replays each recorded call once with its
+        output behind it; the next turn sends only the new message."""
+
+        def msg(role: str, content: object, call_id: str | None = None) -> dict[str, object]:
+            message: dict[str, object] = {"role": role, "content": content, "session_id": "s1"}
+            if call_id is not None:
+                message["metadata"] = {"call_id": call_id}
+            return message
+
+        sf_call = msg("tool_call", {"tool": "weather", "args": {"city": "SF"}}, "call_sf")
+        # Live history repeats a call per status, interleaves steering, and keeps
+        # calls interrupted before they returned; a direct caller may omit a name.
+        history = [
+            msg("user", "weather in SF and NYC"),
+            sf_call,
+            msg("tool_call", {"tool": "weather", "args": {"city": "NYC"}}, "call_nyc"),
+            msg("tool_call", {"tool": "weather", "args": {"city": "LA"}}, "call_la"),
+            sf_call,
+            msg("user", "metric please"),
+            msg("tool_result", "SF: 61F", "call_sf"),
+            msg("tool_result", "NYC: 45F", "call_nyc"),
+            msg("assistant", "SF 16C, NYC 7C"),
+            msg("tool_call", {"args": {}}, "call_unnamed"),
+            msg("tool_result", "unnamed output", "call_unnamed"),
+            msg("user", "Which was warmer?"),
+        ]
+
+        async def _t():
+            _FakeRunner.last_calls = []
+            executor = OpenAIAgentsSDKExecutor(client=object())
+            with patch(
+                "omnigent.inner.openai_agents_sdk_executor._ensure_agents_sdk",
+                return_value=_fake_agents_sdk(),
+            ):
+                _FakeRunner.next_result = _FakeResult(events=[], final_output="SF")
+                _ = [e async for e in executor.run_turn(history, [], "")]
+                _FakeRunner.next_result = _FakeResult(events=[], final_output="ok")
+                follow_up = [*history, msg("assistant", "SF"), msg("user", "second")]
+                _ = [e async for e in executor.run_turn(follow_up, [], "")]
+
+            replayed = _FakeRunner.last_calls[0]["input"]
+            tool_items = [
+                (i["type"], i["call_id"], i.get("output"))
+                for i in replayed
+                if i.get("type") in ("function_call", "function_call_output")
+            ]
+            self.assertEqual(
+                tool_items,
+                [
+                    ("function_call", "call_sf", None),
+                    ("function_call_output", "call_sf", "SF: 61F"),
+                    ("function_call", "call_nyc", None),
+                    ("function_call_output", "call_nyc", "NYC: 45F"),
+                ],
+            )
+            # Each output directly follows its call, so steering lands after the pairs.
+            self.assertEqual(replayed[5]["content"], "metric please")
+            self.assertEqual(replayed[-2]["content"], "[tool result] unnamed output")
+            self.assertEqual(replayed[-1]["content"], "Which was warmer?")
+            self.assertEqual(_FakeRunner.last_calls[1]["input"], "second")
+            self.assertTrue(executor.replays_tool_history())
+
+        _run(_t())
+
     def test_started_session_preserves_structured_user_content(self):
         """Regression: fast path must not json.dumps a structured content list.
 

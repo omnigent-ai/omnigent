@@ -215,10 +215,30 @@ async def test_run_turn_rejects_stale_session_after_clear(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("command", ["/login", "/logout"])
-async def test_run_turn_points_auth_commands_at_omni_setup(
+@pytest.mark.parametrize(
+    ("in_managed_sandbox", "required_phrases", "unreachable_remedy"),
+    [
+        (False, ("omni setup",), "new session"),
+        (
+            True,
+            (
+                "credentials at launch",
+                "new session",
+                "if sign-in still fails",
+                "sandbox administrator",
+                "refresh its credentials",
+            ),
+            "omni setup",
+        ),
+    ],
+)
+async def test_run_turn_points_auth_commands_at_a_remedy_reachable_from_the_host(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     command: str,
+    in_managed_sandbox: bool,
+    required_phrases: tuple[str, ...],
+    unreachable_remedy: str,
 ) -> None:
     """
     ``/login`` must not be typed into the pane as a prompt.
@@ -228,8 +248,14 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
     the CLI answers it as an ordinary message. On an expired login that
     answer is "Login expired · Please run /login" — the instruction the
     user just followed, so the turn is wasted and the session is stuck.
-    Fail the turn with the host command that does re-authenticate.
+    Fail the turn with a remedy the user can perform: ``omni setup`` on
+    their own host, or a new session (then the sandbox administrator) on a
+    managed sandbox (``IS_SANDBOX=1``), which cannot run it.
     """
+    if in_managed_sandbox:
+        monkeypatch.setenv("IS_SANDBOX", "1")
+    else:
+        monkeypatch.delenv("IS_SANDBOX", raising=False)
 
     def fail_inject_user_message(
         bridge_dir_arg: Path,
@@ -266,7 +292,9 @@ async def test_run_turn_points_auth_commands_at_omni_setup(
 
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
-    assert "omni setup" in events[0].message
+    for phrase in required_phrases:
+        assert phrase in events[0].message
+    assert unreachable_remedy not in events[0].message
     assert events[0].undelivered is True
 
 

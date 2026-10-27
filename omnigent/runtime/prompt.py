@@ -306,7 +306,7 @@ _IMAGE_SOURCE_RE = re.compile(
 )
 
 
-def _dedupe_tool_output_images(output: str) -> str:
+def dedupe_tool_output_images(output: str) -> str:
     """Strip inline base64 image data from a persisted tool-result string.
 
     Older stored ``function_call_output`` items (and any harness ingest that
@@ -335,7 +335,7 @@ def _dedupe_tool_output_images(output: str) -> str:
     except (ValueError, TypeError):
         normalized = strip_unparseable_image_output(output)
         if normalized != output:
-            return _dedupe_tool_output_images(normalized)
+            return dedupe_tool_output_images(normalized)
 
         # Truncated/invalid JSON (e.g. clipped at the store byte cap): fall back
         # to an in-place regex rewrite of any image source block.
@@ -402,7 +402,7 @@ def history_to_input_items(
                     # Strip inline base64 image data on the way into the
                     # prompt so already-stored large-image sessions resume
                     # without overflowing the context window.
-                    "output": _dedupe_tool_output_images(item.data.output),
+                    "output": dedupe_tool_output_images(item.data.output),
                 }
             )
 

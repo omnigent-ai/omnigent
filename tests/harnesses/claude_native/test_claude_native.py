@@ -15,6 +15,7 @@ import queue
 import re
 import shlex
 import ssl
+import subprocess
 import threading
 from collections.abc import Iterator
 from dataclasses import dataclass, field
@@ -268,9 +269,11 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     }
     args = spec["args"]
-    assert args[:9] == [
+    assert args[:11] == [
         "-u",
         "ANTHROPIC_API_KEY",
+        "-u",
+        "ANTHROPIC_AUTH_TOKEN",
         "-u",
         "CLAUDECODE",
         "claude",
@@ -284,6 +287,28 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert "hooks" in settings
     assert "modelOverrides" not in settings
+
+
+def test_claude_terminal_request_without_helper_preserves_credentials(
+    tmp_path, monkeypatch
+) -> None:
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "CLAUDE_CODE_USE_GATEWAY": "1",
+            "ANTHROPIC_AUTH_TOKEN": "test-token",
+            "ANTHROPIC_API_KEY": "test-key",
+        },
+    )
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=config,
+    )
+
+    assert body["spec"]["args"][:3] == ["-u", "CLAUDECODE", "claude"]
+    assert body["spec"]["env"]["ANTHROPIC_AUTH_TOKEN"] == "test-token"
+    assert body["spec"]["env"]["ANTHROPIC_API_KEY"] == "test-key"
 
 
 def test_native_config_does_not_infer_overrides_from_routable_models() -> None:
@@ -374,9 +399,11 @@ def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch)
     )
 
     args = body["spec"]["args"]
-    assert args[:9] == [
+    assert args[:11] == [
         "-u",
         "ANTHROPIC_API_KEY",
+        "-u",
+        "ANTHROPIC_AUTH_TOKEN",
         "-u",
         "CLAUDECODE",
         "claude",
@@ -1631,9 +1658,14 @@ def test_run_with_local_server_threads_raw_instructions_to_prepare_terminal_fres
     launch_kwargs: dict[str, Any] = {}
 
     async def _fake_create_session(
-        _client: object, _bundle: bytes, *, bridge_id: str, terminal_launch_args: object = None
+        _client: object,
+        _bundle: bytes,
+        *,
+        bridge_id: str,
+        claude_args: object = (),
+        terminal_launch_args: object = None,
     ) -> str:
-        del _client, _bundle, bridge_id, terminal_launch_args
+        del _client, _bundle, bridge_id, claude_args, terminal_launch_args
         return "conv_local_fresh_raw"
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
@@ -1999,6 +2031,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         bundle: bytes,
         *,
         bridge_id: str | None,
+        claude_args: tuple[str, ...] = (),
         terminal_launch_args: list[str] | None = None,
     ) -> str:
         """
@@ -2007,6 +2040,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         :param client: HTTP client created by the prepare helper.
         :param bundle: Bundled agent bytes.
         :param bridge_id: Bridge label requested by the caller.
+        :param claude_args: Launch args the effort stamp reads.
         :param terminal_launch_args: Claude launch args persisted on
             the session for the runner to apply.
         :returns: Fixed conversation id.
@@ -2014,6 +2048,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         del client
         assert bundle == b"bundle"
         assert bridge_id is None
+        assert claude_args == ("--print", "hi")
         assert terminal_launch_args == ["--print", "hi"]
         return "conv_daemon_progress"
 
@@ -2131,7 +2166,7 @@ async def test_prepare_daemon_terminal_reports_progress_steps(
         headers={},
         session_id=None,
         session_bundle=b"bundle",
-        claude_args=("--print", "hi"),
+        claude_args=("--resume", "abc", "--print", "hi"),
         host_id="host_progress",
         workspace="/workspace",
         startup_progress=progress,
@@ -3290,10 +3325,12 @@ async def test_fetch_resume_items_raises_when_5xx_persists_at_floor() -> None:
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("status_code", [500, 429])
+@pytest.mark.parametrize("resume_copy", [False, True])
 async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     status_code: int,
+    resume_copy: bool,
 ) -> None:
     """
     Server history unreachable + intact local transcript → resume from it.
@@ -3327,9 +3364,11 @@ async def test_resume_transcript_falls_back_to_local_file_when_history_unfetchab
             session_id="conv_abc",
             external_session_id="sid123",
             workspace=workspace,
+            resume_copy=resume_copy,
         )
 
     assert written == local
+    assert local.with_suffix(".omnigent-resume-copy").exists() == resume_copy
     # The untouched local transcript is used as-is, never overwritten with
     # partial server state.
     assert local.read_text(encoding="utf-8") == '{"type":"user"}\n'
@@ -5118,6 +5157,61 @@ async def test_attach_exits_on_real_websocket_close_with_4404(
 
 
 @pytest.mark.asyncio
+async def test_read_fd_removes_reader_when_cancelled() -> None:
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    read_task = asyncio.create_task(claude_native._read_fd_with_reader(loop, read_fd))
+    try:
+        await asyncio.sleep(0)
+        assert not read_task.done()
+        read_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read_task
+
+        assert not loop.remove_reader(read_fd), "cancelled read left a selector callback"
+        os.write(write_fd, b"reconnected")
+        assert (
+            await asyncio.wait_for(
+                claude_native._read_fd_with_reader(loop, read_fd), timeout=budget(1.0)
+            )
+            == b"reconnected"
+        )
+        assert not loop.remove_reader(read_fd)
+    finally:
+        read_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await read_task
+        loop.remove_reader(read_fd)
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [b"input", b""], ids=["data", "eof"])
+async def test_read_fd_removes_reader_after_reading(data: bytes) -> None:
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    try:
+        if data:
+            os.write(write_fd, data)
+        os.close(write_fd)
+        write_fd = -1
+
+        assert (
+            await asyncio.wait_for(
+                claude_native._read_fd_with_reader(loop, read_fd), timeout=budget(1.0)
+            )
+            == data
+        )
+        assert not loop.remove_reader(read_fd)
+    finally:
+        loop.remove_reader(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
 async def test_websocket_to_stdout_does_not_block_event_loop() -> None:
     """
     ``_websocket_to_stdout`` offloads the blocking ``os.write`` to a
@@ -5896,6 +5990,242 @@ async def test_resolve_cold_resume_args_replaces_existing_local_claude_transcrip
 
 
 @pytest.mark.asyncio
+async def test_resolve_cold_resume_args_resumes_a_copy_while_a_background_job_runs_it(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """
+    A session a background Claude job still runs resumes on a rebuilt copy.
+
+    Claude refuses ``--resume`` for that session ("That session is running in
+    the background"), and the job keeps appending to the original transcript,
+    so the resume must leave that file alone and launch a copy under a new id.
+    A later resume while the job still runs reuses that copy and rebuilds it.
+    Both live in ``$CLAUDE_CONFIG_DIR/projects``, where that Claude reads them.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_dir = tmp_path / "claude-config"
+    projects = config_dir / "projects"
+    project_dir = projects / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+    live_transcript = project_dir / "claude-uuid-abc.jsonl"
+    project_dir.mkdir(mode=0o700, parents=True)
+    live_line = json.dumps({"type": "user", "sessionId": "claude-uuid-abc"}) + "\n"
+    live_transcript.write_text(live_line, encoding="utf-8")
+    (config_dir / "sessions").mkdir(parents=True)
+    (config_dir / "sessions" / f"{os.getppid()}.json").write_text(
+        json.dumps({"sessionId": "claude-uuid-abc", "kind": "bg", "jobId": "ab12cd34"}),
+        encoding="utf-8",
+    )
+    item_from_ap = {
+        "id": "msg_user_1",
+        "response_id": "resp_1",
+        "type": "message",
+        "status": "completed",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "fresh Omnigent text"}],
+    }
+    items_from_ap = [item_from_ap]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve the session snapshot and its item page.
+
+        :param request: Incoming mock HTTP request.
+        :returns: Mock Omnigent response.
+        """
+        if request.url.path == "/v1/sessions/conv_abc":
+            return httpx.Response(
+                200,
+                json=_conversation_response_body(
+                    labels={"omnigent.wrapper": "claude-code-native-ui"},
+                    external_session_id="claude-uuid-abc",
+                ),
+            )
+        if request.url.path == "/v1/sessions/conv_abc/items":
+            return httpx.Response(200, json=_items_response_body(items_from_ap))
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    monkeypatch.chdir(workspace)
+    # Claude keeps transcripts in its config dir, never in the home default.
+    default_projects = tmp_path / "home-claude-projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", default_projects)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+        items_from_ap.append(
+            {
+                **item_from_ap,
+                "id": "msg_user_2",
+                "response_id": "resp_2",
+                "content": [{"type": "input_text", "text": "later Omnigent text"}],
+            }
+        )
+        later_args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert args[0] == "--resume"
+    copy_session_id = args[1]
+    assert copy_session_id != "claude-uuid-abc"
+    assert later_args == args
+    assert live_transcript.read_text(encoding="utf-8") == live_line
+    copy_transcript = project_dir / f"{copy_session_id}.jsonl"
+    marker = copy_transcript.with_suffix(".omnigent-resume-copy")
+    assert marker.is_file()
+    assert not live_transcript.with_suffix(".omnigent-resume-copy").exists()
+    records = [
+        json.loads(line)
+        for line in copy_transcript.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    assert [record["message"]["content"] for record in records] == [
+        "fresh Omnigent text",
+        "later Omnigent text",
+    ]
+    assert {record["sessionId"] for record in records} == {copy_session_id}
+    assert sorted(path.name for path in project_dir.iterdir()) == sorted(
+        [live_transcript.name, copy_transcript.name, marker.name]
+    )
+    assert not default_projects.exists()
+
+
+def test_resume_copy_id_is_fresh_while_a_live_claude_has_the_copy_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A stable copy another live Claude still has open is not rebuilt under it."""
+    config_dir = tmp_path / "claude-config"
+    sessions = config_dir / "sessions"
+    sessions.mkdir(parents=True)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    (sessions / f"{os.getppid()}.json").write_text(
+        json.dumps({"sessionId": "claude-uuid-abc", "kind": "bg"}), encoding="utf-8"
+    )
+    stable_copy = claude_native._claude_resume_session_id("claude-uuid-abc", session_id="conv_abc")
+    assert stable_copy != "claude-uuid-abc"
+    assert claude_native._claude_resume_session_id("claude-uuid-abc", session_id="conv_abc") == (
+        stable_copy
+    )
+
+    # The previous launch's Claude still runs on the copy, e.g. a CLI-attached pane.
+    holder = subprocess.Popen(["sleep", "30"])
+    try:
+        (sessions / f"{holder.pid}.json").write_text(
+            json.dumps({"sessionId": stable_copy, "kind": "interactive"}), encoding="utf-8"
+        )
+        fresh_copy = claude_native._claude_resume_session_id(
+            "claude-uuid-abc", session_id="conv_abc"
+        )
+    finally:
+        holder.kill()
+        holder.wait()
+
+    assert fresh_copy not in {stable_copy, "claude-uuid-abc"}
+
+
+@pytest.mark.asyncio
+async def test_resolve_cold_resume_args_resumes_in_place_when_the_registry_check_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A registry probe that raises leaves the resume exactly as it was before the check."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    projects = tmp_path / "claude-projects"
+    item_from_ap = {
+        "id": "msg_user_1",
+        "response_id": "resp_1",
+        "type": "message",
+        "status": "completed",
+        "role": "user",
+        "content": [{"type": "input_text", "text": "fresh Omnigent text"}],
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve the session snapshot and its item page.
+
+        :param request: Incoming mock HTTP request.
+        :returns: Mock Omnigent response.
+        """
+        if request.url.path == "/v1/sessions/conv_abc":
+            return httpx.Response(
+                200,
+                json=_conversation_response_body(
+                    labels={"omnigent.wrapper": "claude-code-native-ui"},
+                    external_session_id="claude-uuid-abc",
+                ),
+            )
+        if request.url.path == "/v1/sessions/conv_abc/items":
+            return httpx.Response(200, json=_items_response_body([item_from_ap]))
+        raise AssertionError(f"unexpected request {request.method} {request.url}")
+
+    def broken_registry(session_id: str, **kwargs: object) -> None:
+        raise RuntimeError("unreadable registry")
+
+    monkeypatch.chdir(workspace)
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects)
+    monkeypatch.setattr(claude_native, "find_background_holder", broken_registry)
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        args = await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert args == ("--resume", "claude-uuid-abc")
+
+
+@pytest.mark.asyncio
+async def test_resolve_cold_resume_args_keeps_a_held_transcript_when_history_is_unavailable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Unreachable history while a job holds the session fails, never resuming the original."""
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    config_dir = tmp_path / "claude-config"
+    projects = config_dir / "projects"
+    project_dir = projects / claude_native._sanitize_claude_project_name(str(workspace.resolve()))
+    project_dir.mkdir(mode=0o700, parents=True)
+    live_transcript = project_dir / "claude-uuid-abc.jsonl"
+    live_line = json.dumps({"type": "user", "sessionId": "claude-uuid-abc"}) + "\n"
+    live_transcript.write_text(live_line, encoding="utf-8")
+    (config_dir / "sessions").mkdir(parents=True)
+    (config_dir / "sessions" / f"{os.getppid()}.json").write_text(
+        json.dumps({"sessionId": "claude-uuid-abc", "kind": "bg"}), encoding="utf-8"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        """
+        Serve the session snapshot; every item page fails.
+
+        :param request: Incoming mock HTTP request.
+        :returns: Mock Omnigent response.
+        """
+        if request.url.path == "/v1/sessions/conv_abc":
+            return httpx.Response(
+                200,
+                json=_conversation_response_body(
+                    labels={"omnigent.wrapper": "claude-code-native-ui"},
+                    external_session_id="claude-uuid-abc",
+                ),
+            )
+        return httpx.Response(500, json={"error": {"code": "internal_error"}})
+
+    monkeypatch.chdir(workspace)
+    # Claude keeps transcripts in its config dir, never in the home default.
+    default_projects = tmp_path / "home-claude-projects"
+    monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", default_projects)
+    monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(config_dir))
+    transport = httpx.MockTransport(handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+        with pytest.raises(click.ClickException):
+            await claude_native._resolve_cold_resume_args(client, "conv_abc")
+
+    assert live_transcript.read_text(encoding="utf-8") == live_line
+    assert [path.name for path in project_dir.iterdir()] == [live_transcript.name]
+    assert not default_projects.exists()
+
+
+@pytest.mark.asyncio
 async def test_ensure_local_claude_resume_transcript_repairs_stale_duplicated_image(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -6293,9 +6623,11 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
         _bundle: bytes,
         *,
         bridge_id: str,
+        claude_args: tuple[str, ...] = (),
     ) -> str:
         """Return a freshly-minted conv id without HTTP."""
         del _client, _bundle, bridge_id
+        assert claude_args == ("--effort", "xhigh")
         return "conv_new"
 
     async def _fake_bind_session_runner(*args: object, **kwargs: object) -> None:
@@ -6342,7 +6674,7 @@ async def test_prepare_claude_terminal_fresh_session_is_not_cold_resumed(
             session_id=None,
             runner_id="runner_xyz",
             session_bundle=b"fake-bundle",
-            claude_args=(),
+            claude_args=("--effort", "xhigh"),
             command="claude",
             append_system_prompt="Fresh session bridge instructions.",
         )
@@ -7285,9 +7617,11 @@ def test_align_working_directory_raises_when_recorded_path_missing(
     )
 
 
+@pytest.mark.parametrize("background", [False, True])
 def test_align_working_directory_redirect_moves_transcript_and_updates_state(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    background: bool,
 ) -> None:
     """
     User-approved redirect moves Claude's transcript into the current cwd.
@@ -7324,6 +7658,13 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         "",
     ]
     source.write_text("\n".join(original_lines) + "\n", encoding="utf-8")
+    if background:
+        sessions = projects_dir.parent / "sessions"
+        sessions.mkdir()
+        (sessions / f"{os.getppid()}.json").write_text(
+            json.dumps({"sessionId": external_session_id, "kind": "bg"})
+        )
+        monkeypatch.setenv("CLAUDE_CONFIG_DIR", str(projects_dir.parent))
     monkeypatch.setattr(claude_native, "_CLAUDE_PROJECTS_DIR", projects_dir)
     monkeypatch.setattr(
         claude_native,
@@ -7345,6 +7686,13 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         / claude_native._sanitize_claude_project_name(str(current_workspace.resolve()))
         / f"{external_session_id}.jsonl"
     )
+    state = read_launch_state("conv_redirect")
+    assert state is not None
+    assert state.working_directory == str(current_workspace.resolve())
+    if background:
+        assert source.read_text(encoding="utf-8") == "\n".join(original_lines) + "\n"
+        assert not target.exists()
+        return
     assert target.is_file(), f"redirect target {target} was not created"
     copied_payloads = [
         json.loads(line)
@@ -7361,9 +7709,6 @@ def test_align_working_directory_redirect_moves_transcript_and_updates_state(
         "sessionId": external_session_id,
     }, "records without top-level cwd must be preserved aside from compact JSON formatting"
     assert not source.exists(), f"source transcript {source} should be removed after move"
-    state = read_launch_state("conv_redirect")
-    assert state is not None
-    assert state.working_directory == str(current_workspace.resolve())
 
 
 def test_align_working_directory_redirect_replaces_stale_target(

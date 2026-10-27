@@ -1463,6 +1463,77 @@ function remountLanding(infoOverrides: Partial<ServerInfo> = {}): void {
 describe("model picker hotkey", () => {
   beforeEach(setupLandingMocks);
 
+  it("cycles the full Pi catalog after searching the model menu", () => {
+    mockAgents([testAgent("a_pi", "pi-native-ui", { display_name: "Pi", harness: "pi-native" })]);
+    mockModelQueries(() => ({
+      ...SUCCESS_QUERY_STATE,
+      data: [
+        { id: "model-a", model: "model-a", displayName: "Model A", isDefault: true },
+        { id: "model-b", model: "model-b", displayName: "Model B" },
+        { id: "model-c", model: "model-c", displayName: "Model C" },
+      ],
+    }));
+    renderLanding();
+    fireEvent.keyDown(window, { code: "KeyM", ctrlKey: true, shiftKey: true });
+    fireEvent.change(screen.getByRole("textbox", { name: "Search models" }), {
+      target: { value: "model-a" },
+    });
+    expect(screen.queryByRole("menuitemcheckbox", { name: "Model B" })).toBeNull();
+    closeMenu();
+    const input = screen.getByTestId("new-chat-landing-input");
+    act(() => input.focus());
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(screen.getByRole("menuitemcheckbox", { name: "Model B" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(screen.getByRole("menuitemcheckbox", { name: "Model C" })).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+  });
+
+  it("previews the cycled launch model and its effort ladder with the draft focused", async () => {
+    authenticatedFetchMock.mockResolvedValue({
+      ok: true,
+      json: async () => ({ id: "conv_new" }),
+    } as unknown as Response);
+    renderLanding();
+    selectAgent("a2");
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "unfinished task" } });
+    act(() => input.focus());
+
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("GPT-5.6");
+    expect(
+      await screen.findByTestId("new-chat-landing-agent-model-databricks-gpt-5-6"),
+    ).toHaveAttribute("aria-checked", "true");
+    for (const effort of ["Medium", "High", "xHigh"]) {
+      fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+      expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent(effort);
+    }
+    fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+    expect(screen.queryByTestId("new-chat-landing-agent-effort-value")).toBeNull();
+    fireEvent.keyDown(input, { code: "KeyE", ctrlKey: true, altKey: true });
+    expect(screen.getByTestId("new-chat-landing-agent-effort-value")).toHaveTextContent("Medium");
+    expect(await screen.findByTestId("new-chat-landing-agent-effort-medium")).toHaveAttribute(
+      "aria-checked",
+      "true",
+    );
+    expect(input).toHaveFocus();
+    expect(input).toHaveValue("unfinished task");
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+
+    await act(async () => fireEvent.submit(screen.getByTestId("new-chat-landing-composer")));
+    expect((await readCreateBody()).body).toMatchObject({
+      agent_id: "a2",
+      model_override: "databricks-gpt-5-6",
+      reasoning_effort: "medium",
+    });
+  });
+
   it("drills into the selected harness's model submenu on Ctrl+Shift+M and focuses its model", async () => {
     const user = userEvent.setup();
     mockAgents(DEFAULT_LANDING_AGENTS);
@@ -11828,6 +11899,39 @@ describe("managed sandbox gateway preview", () => {
       sandbox_provider_capabilities: { arclet: { default_models: true } },
     });
   }
+
+  it.each([
+    ["high", "high"],
+    ["xhigh", undefined],
+  ])(
+    "seeds project effort %s against the gateway model's ladder",
+    async (projectEffort, sentEffort) => {
+      preview();
+      authenticatedFetchMock.mockResolvedValue({
+        ok: true,
+        json: async () => ({ id: "conv_new" }),
+      } as Response);
+      useProjectsMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: [{ id: "proj_alpha", name: "Alpha" }],
+      });
+      useProjectConfigMock.mockReturnValue({
+        ...SUCCESS_QUERY_STATE,
+        data: { agent_id: "a2", model: astra.id, effort: projectEffort },
+      });
+      renderLanding(
+        {
+          managed_sandboxes_enabled: true,
+          sandbox_provider: "arclet",
+          sandbox_provider_capabilities: { arclet: { default_models: true } },
+        },
+        "/?project=Alpha",
+      );
+      const { body } = await submitAndReadBody();
+      expect(body.model_override).toBe(astra.id);
+      expect(body.reasoning_effort).toBe(sentEffort);
+    },
+  );
 
   it("offers gateway models without a host and carries Codex model and effort into create", async () => {
     preview();
