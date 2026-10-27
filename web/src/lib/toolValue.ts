@@ -305,6 +305,12 @@ const MARKUP_TAG = /<\/?[A-Za-z][\w-]*(?:\s[^<>]*)?\/?>/;
 const CONTAINER_PREFIX = /^(?:[ \t>]|(?:[-*+]|\d{1,9}[.)])[ \t])*/;
 // A fence indented at most three spaces; a deeper one is code or nested in a list.
 const PLAIN_FENCE = /^( {0,3})(`{3,}|~{3,})(.*)$/;
+// A link reference definition such as `[//]: # (note)`, which renders as nothing; its label
+// may escape brackets and run over lines, up to markdown's 999 characters.
+const REFERENCE_DEFINITION = new RegExp(
+  String.raw`${CONTAINER_PREFIX.source}\[(?:[^\\\]]|\\[\s\S]){0,999}\]:`,
+  "m",
+);
 
 // Drops closed fences, and code spans outside HTML blocks; from an unclear fence, keeps the rest.
 function withoutCode(text: string): string {
@@ -361,16 +367,26 @@ function withoutCode(text: string): string {
   return kept.join("\n");
 }
 
-// `line` without its code spans, read left to right as markdown does. From an HTML tag or a
-// backtick run with no partner on the line, the rest stays and `clear` is false.
+// `line` without its code spans, read left to right as markdown does. From an HTML tag, a link
+// target that may hold a backtick or tag, or a backtick run with no partner on the line, the
+// rest stays and `clear` is false.
 function withoutCodeSpans(line: string): { text: string; clear: boolean } {
-  const special = /\\|<[A-Za-z/!?]|`+/g;
+  const special = /\\|<[A-Za-z/!?]|\]\(|`+/g;
   let text = "";
   let position = 0;
   for (let match = special.exec(line); match !== null; match = special.exec(line)) {
     if (match[0] === "\\") {
       special.lastIndex = match.index + 2;
       continue;
+    }
+    if (match[0] === "](") {
+      // Markdown takes a link's destination and title whole, backticks included, even over lines.
+      const target = /(\S*)(\s+["'(])?/y;
+      target.lastIndex = special.lastIndex;
+      const [, destination = "", title] = target.exec(line) ?? [];
+      const closed = destination.includes(")") && title === undefined;
+      if (closed && !/[`<]/.test(destination)) continue;
+      return { text: text + line.slice(position), clear: false };
     }
     const runs = /`+/g;
     runs.lastIndex = special.lastIndex;
@@ -437,9 +453,8 @@ export function isProseText(text: string, key?: string): boolean {
   if (MARKUP_TAG.test(markup) || /<[?!]/.test(markup) || hidesInHtmlBlock(outsideCode)) {
     return false;
   }
+  if (REFERENCE_DEFINITION.test(outsideCode)) return false;
   const lines = outsideCode.split("\n").filter((line) => line.trim().length > 0);
-  // A link reference definition such as `[//]: # (note)` renders as nothing.
-  if (lines.some((line) => /^\[[^\]]+\]:/.test(line.replace(CONTAINER_PREFIX, "")))) return false;
   const codeLike = lines.filter(
     (line) => !/^\s+(?:[-*+]|\d+\.) /.test(line) && /^(?:\t| {4})|[;{}]\s*$/.test(line),
   ).length;

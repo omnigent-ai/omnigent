@@ -129,6 +129,8 @@ describe("ToolValueView", () => {
   it.each([
     // Unpaired backtick runs are plain text in markdown, so the tag would be hidden markup.
     "Fences use ``` and <instructions> is the tag; inline code uses ` too.\nThanks",
+    // Markdown reads the first backtick as part of the link, leaving the tag outside code.
+    "See [a](/u`v) <instructions> `w)\nok",
     // An unfinished HTML block opener would swallow the rest of the text.
     "Summary\n<pre\nHidden rest\n\nmore text",
     "Intro\n<?php\nEverything after this is hidden",

@@ -161,6 +161,9 @@ describe("isProseText", () => {
     expect(isProseText("[1] See the RFC.\n\nMore notes", "summary")).toBe(true);
     expect(isProseText("- [x] Done: tests\n- [ ] Ship", "summary")).toBe(true);
     expect(isProseText("When a <b, swap them\nThanks", "notes")).toBe(true);
+    expect(isProseText("See [docs](https://x/docs) and use `<T>` here\nThanks", "notes")).toBe(
+      true,
+    );
     expect(isProseText("Steps\n\n    run();\n- Build\n- Ship", "notes")).toBe(true);
     const withSample =
       "Steps:\n\n- Build\n    - web\n    - server\n- Ship\n\n```ts\nconst a = 1;\nif (a) {\n  run();\n}\n```\n";
@@ -216,6 +219,11 @@ describe("isProseText", () => {
       "<details\nHidden rest",
       "<details>\nWhen a<b swap them\n</details>",
       "<details>\nSee <https://x/docs>\n</details>",
+      'Intro\n\n[hidden\nlabel]: https://x "retain this note"\n\nMore',
+      'Intro\n\n[a\\]b]: https://x "retain this note"\n\nMore',
+      "See [a](/u`v) <instructions> `w)\nok",
+      'See [a](/u "t`x") <instructions> `w`\nok',
+      'See [a](/u\n"t`x") <instructions> `w`\nok',
     ]) {
       expect(isProseText(hiddenMarkup, "description")).toBe(false);
     }
@@ -248,10 +256,11 @@ describe("isProseText", () => {
     expect(isProseText(prose + "x".repeat(5_001), "description")).toBe(false);
   });
 
-  it("classifies unclosed fences, tags and comments in linear time", () => {
-    // The loose bound only catches super-linear scans on unclosed fences, tags and comments.
+  it("classifies unclosed fences, tags, comments and labels in linear time", () => {
+    // The loose bound only catches super-linear scans of these unclosed constructs.
     const started = performance.now();
     expect(isProseText("```a\n".repeat(9_000), "description")).toBe(true);
+    expect(isProseText("[a\n".repeat(9_000), "description")).toBe(true);
     expect(isProseText("a <b ".repeat(9_000), "description")).toBe(true);
     expect(isProseText("<!--a\n".repeat(8_000), "description")).toBe(false);
     expect(performance.now() - started).toBeLessThan(2_000);
