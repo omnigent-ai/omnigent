@@ -9206,67 +9206,76 @@ async def test_sys_session_send_failed_continuation_receipts_its_dispatch(
 
 
 @pytest.mark.asyncio
-async def test_sys_session_send_session_id_posts_to_direct_child(
+@pytest.mark.parametrize("tool_name", ["sys_session_send", "sys_session_message"])
+async def test_session_tools_direct_child_completion(
     monkeypatch: pytest.MonkeyPatch,
+    tool_name: str,
 ) -> None:
-    """
-    ``sys_session_send`` in by-session-id mode verifies the target is a
-    direct child of the caller, posts the message, and returns a running
-    handle. Proves the unified session_id mode: the message reaches the
-    existing child and the handle carries its id with ``status:running``
-    (the result is delivered asynchronously via ``sys_read_inbox``).
-
-    :param monkeypatch: Stubs the runner-local child registration so the
-        dispatch runs without a live runner.
-    """
+    """Only canonical send tracks child completion; compatibility delivery does not."""
+    from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
     from omnigent.runner.tool_dispatch import execute_tool
 
     monkeypatch.setattr(subagent_work, "register_child_session", lambda *a, **k: None)
     session_inbox: asyncio.Queue[dict[str, Any]] = asyncio.Queue()
-
+    parent_id = "a" * 32
+    child_id = "b" * 32
     event_posts: list[dict[str, Any]] = []
 
     async def _server_handler(request: httpx.Request) -> httpx.Response:
-        if request.method == "GET" and request.url.path == "/v1/sessions/conv_child":
-            # Target IS a direct child of the caller.
+        if request.method == "GET" and request.url.path == f"/v1/sessions/{child_id}":
             return httpx.Response(
                 200,
                 json={
-                    "id": "conv_child",
-                    "parent_session_id": "conv_caller",
+                    "id": child_id,
+                    "parent_session_id": parent_id,
                     "title": "researcher:auth",
                 },
             )
-        if request.method == "PATCH" and request.url.path == "/v1/sessions/conv_child":
+        if request.method == "PATCH" and request.url.path == f"/v1/sessions/{child_id}":
             return httpx.Response(200, json={"ok": True})
-        if request.method == "POST" and request.url.path == "/v1/sessions/conv_child/events":
+        if request.method == "POST" and request.url.path == f"/v1/sessions/{child_id}/events":
+            if tool_name == "sys_session_message":
+                assert request.headers[ORCHESTRATION_SOURCE_HEADER] == parent_id
             event_posts.append(json.loads(request.content))
-            return httpx.Response(200, json={"ok": True})
+            return httpx.Response(202, json={"queued": True})
         return httpx.Response(404, json={"error": str(request.url)})
 
+    text_arg = "args" if tool_name == "sys_session_send" else "message"
     async with httpx.AsyncClient(
         transport=httpx.MockTransport(_server_handler),
         base_url="http://server",
     ) as server_client:
         try:
             output = await execute_tool(
-                tool_name="sys_session_send",
-                arguments=json.dumps({"session_id": "conv_child", "args": "continue please"}),
+                tool_name=tool_name,
+                arguments=json.dumps({"session_id": child_id, text_arg: "continue please"}),
                 server_client=server_client,
-                conversation_id="conv_caller",
+                conversation_id=parent_id,
                 agent_spec=SimpleNamespace(sub_agents=[SimpleNamespace(name="researcher")]),
                 session_inbox=session_inbox,
             )
+            result = json.loads(output)
+            assert len(event_posts) == 1
+            if tool_name == "sys_session_message":
+                assert event_posts == [
+                    {"type": "session_message", "data": {"message": "continue please"}}
+                ]
+                assert result == {"queued": True}
+                assert subagent_work.get_subagent_work(child_id) is None
+                assert parent_id not in subagent_work._session_inboxes_ref
+            else:
+                assert event_posts[0]["type"] == "message"
+                assert event_posts[0]["data"]["content"][0]["text"] == "continue please"
+                assert result["conversation_id"] == child_id
+                assert result["task_id"] == child_id
+                assert result["kind"] == "sub_agent"
+                assert result["status"] == "launching"
+                assert "reply_mode" not in result
+                assert subagent_work.get_subagent_work(child_id) is not None
+                assert subagent_work._session_inboxes_ref[parent_id] is session_inbox
         finally:
-            subagent_work.unregister_subagent_work("conv_child")
-            subagent_work._session_inboxes_ref.pop("conv_caller", None)
-
-    # Message reached the existing child; handle carries its id + running status.
-    assert event_posts[0]["data"]["content"][0]["text"] == "continue please"
-    handle = json.loads(output)
-    assert handle["conversation_id"] == "conv_child"
-    assert handle["status"] == "launching"
-    assert "reply_mode" not in handle
+            subagent_work.unregister_subagent_work(child_id)
+            subagent_work._session_inboxes_ref.pop(parent_id, None)
 
 
 @pytest.mark.asyncio

@@ -115,8 +115,8 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
 - Existing child replies: `uv run --no-sync pytest
   tests/e2e/test_subagent_autowake_e2e.py
   tests/e2e/test_subagent_restart_recovery_e2e.py --reruns 0` checks named and
-  by-ID child sends through real SDK processes, automatic wake-up, and inbox
-  recovery after a runner restart, using a scripted provider.
+  by-ID child sends with automatic wake-up, plus named-send inbox recovery
+  after a runner restart, through real SDK processes with a scripted provider.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
 
@@ -188,6 +188,9 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   `created_by_session_id` records origin; it does not select child semantics.
   Policies keyed to `sys_session_send` (such as dispatch-purpose requirements
   and per-turn dispatch limits) also apply to its peer sends.
+  A custom policy matching only `sys_session_message` does not cover
+  `sys_session_send`. To restrict peer messaging across both interfaces, match
+  both tool names; the server's ownership and privacy checks apply to both.
 - The server enforces the flag even though tool schemas are discoverable while
   it is disabled. Peer messaging has no additional per-agent opt-in; creation
   retains its existing `spawn` advertisement gate. No schema migration or
