@@ -65,18 +65,26 @@ def test_usage_page_route_and_navigation_are_available_when_feature_is_on(
             "total_cost_usd": 0.0,
             "daily_costs": [],
             "sessions": [],
+            "sessions_has_more": False,
+            "sessions_last_id": None,
+            "harness_breakdown": {},
+            "model_breakdown": {},
         }
     )
 
     def handle_usage(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=report)
 
-    page.route("**/v1/usage", handle_usage)
+    page.route("**/v1/usage*", handle_usage)
     page.goto(f"{live_server}/usage")
 
     expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
     expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible()
-    expect(page.get_by_text("$0.00", exact=True)).to_be_visible()
+    # Scope the $0.00 amount to the Total cost card so the breakdown charts'
+    # axis ticks cannot satisfy the assertion.
+    total_cost_card = page.get_by_text("Total cost").locator("xpath=..")
+    expect(total_cost_card.get_by_text("$0.00")).to_be_visible()
+    expect(total_cost_card.get_by_text("0 sessions")).to_be_visible()
 
 
 def test_session_table_shows_other_harnesses_badge(
@@ -107,13 +115,17 @@ def test_session_table_shows_other_harnesses_badge(
                     "agent_name": None,
                 },
             ],
+            "sessions_has_more": False,
+            "sessions_last_id": "conv_abc",
+            "harness_breakdown": {"claude-sdk": 1.50},
+            "model_breakdown": {"claude-opus-4-8": 1.50},
         }
     )
 
     def handle_usage(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=report)
 
-    page.route("**/v1/usage", handle_usage)
+    page.route("**/v1/usage*", handle_usage)
     page.goto(f"{live_server}/usage")
 
     expect(page.get_by_test_id("usage-nav")).to_be_visible(timeout=30_000)
@@ -166,7 +178,7 @@ def test_usage_report_link_and_chat_reload_keep_complete_subtree_usage(
     usage_read = _session_read_matcher(session_url, include_usage=True)
     try:
         # Seeded storage has no usage SSE events: chat must hydrate over HTTP.
-        with page.expect_response(f"{base_url}/v1/usage") as report_response:
+        with page.expect_response(f"{base_url}/v1/usage*") as report_response:
             page.goto(f"{base_url}/usage")
         assert report_response.value.ok
         report = report_response.value.json()
@@ -240,13 +252,17 @@ def _setup_usage_page(page: Page, live_server: str) -> None:
             "total_cost_usd": 0.0,
             "daily_costs": [],
             "sessions": [],
+            "sessions_has_more": False,
+            "sessions_last_id": None,
+            "harness_breakdown": {},
+            "model_breakdown": {},
         }
     )
 
     def handle_usage(route: Route) -> None:
         route.fulfill(status=200, content_type="application/json", body=report)
 
-    page.route("**/v1/usage", handle_usage)
+    page.route("**/v1/usage*", handle_usage)
     page.goto(f"{live_server}/usage")
     expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible(timeout=30_000)
 
@@ -283,3 +299,110 @@ def test_custom_date_end_auto_adjusts_when_start_exceeds_end(page: Page, live_se
     start_input.fill(new_start)
 
     expect(end_input).to_have_value(new_start)
+
+
+def test_pagination_load_more_button_appears_and_loads_next_page(
+    page: Page,
+    live_server: str,
+) -> None:
+    """Load More button appears when sessions_has_more is true and fetches next page."""
+    _stub_server_info(page, usage_page=True)
+    now = int(time.time())
+    today_iso = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    first_page = json.dumps(
+        {
+            "cost_today": 2.50,
+            "cost_last_7d": 2.50,
+            "cost_last_30d": 2.50,
+            "total_cost_usd": 2.50,
+            "daily_costs": [{"day": today_iso, "cost_usd": 2.50}],
+            "sessions": [
+                {
+                    "id": "conv_page1",
+                    "created_at": now - 3600,
+                    "updated_at": now,
+                    "title": "Session from page 1",
+                    "cost_usd": 1.25,
+                    "models": {"claude-opus-4-8": 1.25},
+                    "harness": "claude-sdk",
+                    "other_harnesses": None,
+                    "llm_model": "claude-opus-4-8",
+                    "agent_name": None,
+                },
+            ],
+            "sessions_has_more": True,
+            "sessions_last_id": "conv_page1",
+            "harness_breakdown": {"claude-sdk": 2.50},
+            "model_breakdown": {"claude-opus-4-8": 2.50},
+        }
+    )
+
+    second_page = json.dumps(
+        {
+            "cost_today": 2.50,
+            "cost_last_7d": 2.50,
+            "cost_last_30d": 2.50,
+            "total_cost_usd": 2.50,
+            "daily_costs": [{"day": today_iso, "cost_usd": 2.50}],
+            "sessions": [
+                {
+                    "id": "conv_page2",
+                    "created_at": now - 7200,
+                    "updated_at": now - 100,
+                    "title": "Session from page 2",
+                    "cost_usd": 1.25,
+                    "models": {"claude-opus-4-8": 1.25},
+                    "harness": "claude-sdk",
+                    "other_harnesses": None,
+                    "llm_model": "claude-opus-4-8",
+                    "agent_name": None,
+                },
+            ],
+            "sessions_has_more": False,
+            "sessions_last_id": "conv_page2",
+            "harness_breakdown": {},
+            "model_breakdown": {},
+        }
+    )
+
+    requests: list[str] = []
+
+    def handle_usage(route: Route) -> None:
+        requests.append(route.request.url)
+        url = route.request.url
+        if "after=" in url:
+            route.fulfill(status=200, content_type="application/json", body=second_page)
+        else:
+            route.fulfill(status=200, content_type="application/json", body=first_page)
+
+    page.route("**/v1/usage*", handle_usage)
+    page.goto(f"{live_server}/usage")
+
+    expect(page.get_by_role("heading", name="Usage", exact=True)).to_be_visible(timeout=30_000)
+    expect(page.get_by_text("Session from page 1")).to_be_visible()
+
+    # exact=True: the sidebar's conversation list has its own "Load more"
+    # button when the server carries enough sessions; match only the usage
+    # table's pagination button.
+    load_more_button = page.get_by_role("button", name="Load More", exact=True)
+    expect(load_more_button).to_be_visible()
+
+    # The window total comes from the authoritative daily rollup, not the
+    # loaded session rows, so appending another page must not change it.
+    total_value = page.get_by_text("Total cost", exact=True).locator(
+        "xpath=following-sibling::p[1]"
+    )
+    expect(total_value).to_have_text("$2.50")
+
+    load_more_button.click()
+    expect(page.get_by_text("Session from page 2")).to_be_visible(timeout=10_000)
+    expect(load_more_button).not_to_be_visible()
+    expect(total_value).to_have_text("$2.50")
+
+    # Exactly two fetches: the initial page without a cursor, then one Load More
+    # carrying the first page's last id. A third request would mean the hook
+    # refetched on its own.
+    assert len(requests) == 2
+    assert "after=" not in requests[0]
+    assert "after=conv_page1" in requests[1]

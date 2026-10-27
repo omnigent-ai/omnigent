@@ -10249,6 +10249,24 @@
             "title": "Daily Costs",
             "type": "array"
           },
+          "harness_breakdown": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "Cost aggregated by harness over the sessions in the selected `since`/`until` range (server-computed on the first page), for the breakdown chart. Keys are harness names (e.g. `\"claude-sdk\"`); values are total USD cost. Sessions without a resolved harness are bucketed under `\"Unknown\"` so their spend still appears.",
+            "title": "Harness Breakdown",
+            "type": "object"
+          },
+          "model_breakdown": {
+            "additionalProperties": {
+              "format": "double",
+              "type": "number"
+            },
+            "description": "Cost aggregated by model over the sessions in the selected `since`/`until` range (server-computed on the first page), for the breakdown chart. Keys are model IDs (e.g. `\"claude-opus-4-8\"`); values are total USD cost.",
+            "title": "Model Breakdown",
+            "type": "object"
+          },
           "object": {
             "const": "usage_report",
             "default": "usage_report",
@@ -10256,12 +10274,30 @@
             "type": "string"
           },
           "sessions": {
-            "description": "Per-session detail, newest activity first.",
+            "description": "Per-session detail, newest activity first. **Pagination caveat:** sessions are sorted by `updated_at` (mutable), so if a session's `updated_at` changes between page fetches (e.g., a new turn updates an older session), it may skip forward past the cursor and be omitted from later pages. This is inherent to paginating on a mutable sort key; ID-based de-duplication on the client mitigates duplicates but cannot recover skipped rows.",
             "items": {
               "$ref": "#/components/schemas/SessionUsage"
             },
             "title": "Sessions",
             "type": "array"
+          },
+          "sessions_has_more": {
+            "default": false,
+            "description": "Whether more sessions exist beyond this page.",
+            "title": "Sessions Has More",
+            "type": "boolean"
+          },
+          "sessions_last_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "ID of the last session in the page, for cursor pagination. `None` if the page is empty.",
+            "title": "Sessions Last Id"
           },
           "total_cost_usd": {
             "default": 0.0,
@@ -18426,6 +18462,76 @@
       "get": {
         "description": "Aggregate the calling user's LLM spend across their sessions.\n\nrequire_user, not get_user_id: the aggregation scopes to the caller,\nso a request slipping through as `None` in multi-user mode would\nread another scope. Fail closed with 401 instead (`user_id` is\n`None` only when auth is disabled \u2014 the single-user / local case).",
         "operationId": "get_usage_v1_usage_get",
+        "parameters": [
+          {
+            "description": "Sessions per page, clamped to `[1, MAX_SESSION_PAGE_SIZE]`. Omit for the unbounded legacy response; the web page requests one bounded page at a time.",
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "integer"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Limit"
+            }
+          },
+          {
+            "description": "Cursor: the previous page's `sessions_last_id`.",
+            "in": "query",
+            "name": "after",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "After"
+            }
+          },
+          {
+            "description": "Only sessions last active on or after this UTC day (`YYYY-MM-DD`).",
+            "in": "query",
+            "name": "since",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Since"
+            }
+          },
+          {
+            "description": "Only sessions last active on or before this UTC day (`YYYY-MM-DD`).",
+            "in": "query",
+            "name": "until",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Until"
+            }
+          }
+        ],
         "responses": {
           "200": {
             "content": {
@@ -18436,6 +18542,26 @@
               }
             },
             "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "The `after`/`before` cursor names an item that no longer exists (it was deleted, or archived out of the filtered set) so the keyset bound cannot be resolved. The `error.code` is `stale_cursor`. Enumeration cannot continue from this cursor: restart from the first page, without a cursor."
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
           }
         },
         "summary": "Get Usage",
