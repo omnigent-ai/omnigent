@@ -83,10 +83,12 @@ test("opens remote files and folders with the same SSH authority as Arca Compani
   assert.equal(await openRemote(remotePath), true);
   assert.equal(await openRemote("/home/user/my repo", "cursor", "arclet-work.ssh", true), true);
   assert.deepEqual(calls, [
+    ["/usr/bin/open", ["-a", path.join(directory, "Cursor.app")]],
     [
       path.join(directory, "Cursor.app/Contents/Resources/app/bin/cursor"),
       ["--remote", "ssh-remote+arca.ssh", "--goto", "--", remotePath],
     ],
+    ["/usr/bin/open", ["-a", path.join(directory, "Cursor.app")]],
     [
       path.join(directory, "Cursor.app/Contents/Resources/app/bin/cursor"),
       ["--remote", "ssh-remote+arclet-work.ssh", "--", "/home/user/my repo"],
@@ -111,7 +113,8 @@ test("does not inherit another editor's IPC connection and reports CLI errors", 
     else process.env.VSCODE_IPC_HOOK_CLI = previousIpcHook;
   });
   const { directory, openRemote } = setup(t, "darwin", {
-    run: async (_command, _args, options) => {
+    run: async (command, _args, options) => {
+      if (command === "/usr/bin/open") return { stdout: "" };
       assert.equal(options.env.VSCODE_IPC_HOOK_CLI, undefined);
       assert.equal(options.env.CURSOR_CLI_BLOCK_CURSOR_AGENT, "true");
       throw new Error("Editor unavailable");
@@ -119,6 +122,48 @@ test("does not inherit another editor's IPC connection and reports CLI errors", 
   });
   fs.mkdirSync(path.join(directory, "Cursor.app"));
   assert.equal(await openRemote("/remote/repo"), false);
+});
+
+test("foregrounds the editor while its remote CLI is still starting", async (t) => {
+  const calls = [];
+  let finishCli;
+  let cliStarted;
+  const started = new Promise((resolve) => {
+    cliStarted = resolve;
+  });
+  const { directory, openRemote } = setup(t, "darwin", {
+    run: async (command) => {
+      calls.push(command);
+      if (command === "/usr/bin/open") return { stdout: "" };
+      cliStarted();
+      return new Promise((resolve) => {
+        finishCli = resolve;
+      });
+    },
+  });
+  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  const opening = openRemote("/remote/workspace");
+  await started;
+  assert.deepEqual(calls, [
+    "/usr/bin/open",
+    path.join(directory, "Cursor.app/Contents/Resources/app/bin/cursor"),
+  ]);
+  finishCli({ stdout: "" });
+  assert.equal(await opening, true);
+});
+
+test("still hands off the remote path if foregrounding fails", async (t) => {
+  let cliLaunched = false;
+  const { directory, openRemote } = setup(t, "darwin", {
+    run: async (command) => {
+      if (command === "/usr/bin/open") throw new Error("activation unavailable");
+      cliLaunched = true;
+      return { stdout: "" };
+    },
+  });
+  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  assert.equal(await openRemote("/remote/workspace"), true);
+  assert.equal(cliLaunched, true);
 });
 
 test("rejects invalid SSH destinations, local-only apps, and local hosts on the remote route", async (t) => {

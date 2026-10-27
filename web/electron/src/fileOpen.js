@@ -157,6 +157,8 @@ function registerFileOpen({
         const env = { ...process.env, CURSOR_CLI_BLOCK_CURSOR_AGENT: "true" };
         // A shell-launched desktop must not reuse an inherited editor's IPC connection.
         delete env.VSCODE_IPC_HOOK_CLI;
+        // Foreground the app before its CLI initializes and hands off the SSH workspace.
+        await run("/usr/bin/open", ["-a", appPath], { timeout: 5000 }).catch(() => {});
         await run(
           executable,
           ["--remote", `ssh-remote+${sshHost}`, ...(directory ? [] : ["--goto"]), "--", remotePath],
