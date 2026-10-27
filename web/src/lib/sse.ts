@@ -9,6 +9,7 @@ import { parseNativePermissionDelivery } from "./nativePermissionDelivery";
 // reducer never seeing certain events, which the reducer's tests can't
 // catch — please add an SSE-parser test when you touch this.
 
+import { assistantMessagePhase } from "./conversationItems";
 import { readSubagentActivity } from "./subagentActivity";
 import type {
   BrowserActionRequestEvent,
@@ -986,6 +987,11 @@ export function parseEvent(rawType: string, data: Record<string, unknown>): Stre
     } satisfies SessionPresenceEvent;
   }
 
+  if (eventType === "ui.open_file") {
+    if (typeof data.path !== "string" || !data.path) return null;
+    return { type: "ui_open_file", path: data.path };
+  }
+
   // Embedded-browser action request: asks the desktop relay to run the agent's
   // browser_* action against the view. Ignored by non-Electron renderers.
   if (eventType === "browser.action_request") {
@@ -1243,12 +1249,14 @@ function parseOutputItem(data: Record<string, unknown>): StreamEvent | null {
   if (itemType === "message") {
     if (rec.is_meta === true) return null;
     const content = rec.content;
+    const phase = assistantMessagePhase(rec.phase);
     return {
       type: "message_done",
       content: Array.isArray(content) ? (content as Record<string, unknown>[]) : [],
       itemId,
       responseId,
       ...(messageId !== undefined ? { messageId } : {}),
+      ...(phase !== undefined ? { phase } : {}),
     } satisfies MessageDone;
   }
 

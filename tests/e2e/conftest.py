@@ -362,6 +362,7 @@ def configure_mock_llm(
     *,
     key: str = "default",
     match: str | None = None,
+    required_tools: list[str] | None = None,
 ) -> None:
     """
     Configure a keyed response queue on the mock LLM server.
@@ -397,6 +398,8 @@ def configure_mock_llm(
     :param key: Queue key — typically the model name baked into the
         agent spec. Defaults to ``"default"`` (matches any model
         not assigned to a more specific queue).
+    :param required_tools: Advertised tools required to consume this queue,
+        isolating agent turns from background generation and review.
     :param match: Optional content-routing token. When set, the queue is
         selected if this token appears in the request's user input,
         regardless of ``model``. Use a deliberately-unique token (the
@@ -411,6 +414,8 @@ def configure_mock_llm(
     }
     if match is not None:
         payload["match"] = match
+    if required_tools is not None:
+        payload["required_tools"] = required_tools
     resp = httpx.post(
         f"{mock_llm_server_url}/mock/configure",
         json=payload,

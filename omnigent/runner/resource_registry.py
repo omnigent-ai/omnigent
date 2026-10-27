@@ -183,6 +183,9 @@ class TerminalExitEvent:
         ``idle`` at exit. ``True`` marks a clean shutdown after the turn
         finished; ``False`` (the default — last seen ``running``, or never
         observed) keeps a mid-turn crash or boot failure a failure.
+    :param expected_close: ``True`` when Omnigent killed the pane itself to
+        fail the turn (a delivery timeout). That turn reports its own error,
+        so the exit is not a second failure.
     :param terminal_instance_id: Identity of the observed terminal instance.
     :param lifecycle_context: Content-free evidence captured before exit cleanup.
     """
@@ -198,6 +201,7 @@ class TerminalExitEvent:
     last_output: str | None = None
     exit_status: int | None = None
     session_was_idle: bool = False
+    expected_close: bool = False
     terminal_instance_id: str | None = None
     lifecycle_context: dict[str, str] = field(default_factory=dict)
 
@@ -280,6 +284,13 @@ def trim_terminal_output(text: str | None) -> str | None:
     if len(body) < len(full):
         return f"... omitted {len(full) - len(body)} earlier character(s) ...\n{body}"
     return body
+
+
+def _pane_closed_by_omnigent(private_dir: Path) -> bool:
+    """Whether Omnigent killed the Claude pane in *private_dir* to fail its turn."""
+    from omnigent.harnesses.claude_native.bridge import pane_closed_by_omnigent
+
+    return pane_closed_by_omnigent(private_dir)
 
 
 def _terminal_exit_diagnostics(
@@ -1793,6 +1804,11 @@ class SessionResourceRegistry:
         ).lower()
         lifecycle_context["session_activity_epoch"] = str(self.session_activity_epoch(session_id))
         command, args_count, cwd, last_output, exit_status = _terminal_exit_diagnostics(instance)
+        expected_close = (
+            instance is not None
+            and resource_role == CLAUDE_NATIVE_TERMINAL_ROLE
+            and _pane_closed_by_omnigent(instance.private_dir)
+        )
 
         superseded_by: TerminalInstance | None = None
         if self._terminal_registry is not None:
@@ -1891,6 +1907,7 @@ class SessionResourceRegistry:
                     last_output=last_output,
                     exit_status=exit_status,
                     session_was_idle=session_was_idle,
+                    expected_close=expected_close,
                     terminal_instance_id=instance.diagnostic_id if instance is not None else None,
                     lifecycle_context=lifecycle_context,
                 )

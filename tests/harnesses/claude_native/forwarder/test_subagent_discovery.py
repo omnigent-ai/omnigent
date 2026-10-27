@@ -187,8 +187,14 @@ async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
         server.server_close()
 
 
+@pytest.mark.parametrize(
+    ("parent_spawn", "server_requires_tool_id"),
+    [("tool", False), ("slash_command", False), ("slash_command", True)],
+)
 async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
     tmp_path: Path,
+    parent_spawn: str,
+    server_requires_tool_id: bool,
 ) -> None:
     """Nested Claude agents register under their immediate Omnigent parent."""
     bridge_dir = tmp_path / "bridge"
@@ -240,6 +246,20 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
             )
             + "\n"
         )
+    if parent_spawn == "slash_command":
+        # Forked slash commands have no tool call; native metadata identifies
+        # their children even before the corresponding spawn record is flushed.
+        transcript_path.write_text("", encoding="utf-8")
+        parent_transcript.write_text("", encoding="utf-8")
+        parent_meta_path = parent_transcript.with_suffix(".meta.json")
+        parent_meta = json.loads(parent_meta_path.read_text(encoding="utf-8"))
+        parent_meta.pop("toolUseId")
+        parent_meta.update(description="/code-review example", spawnDepth=1)
+        parent_meta_path.write_text(json.dumps(parent_meta), encoding="utf-8")
+        child_meta_path = child_transcript.with_suffix(".meta.json")
+        child_meta = json.loads(child_meta_path.read_text(encoding="utf-8"))
+        child_meta.update(parentAgentId="z-parent", spawnDepth=2)
+        child_meta_path.write_text(json.dumps(child_meta), encoding="utf-8")
     start_paths: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -247,6 +267,15 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
         if body.get("type") != "external_subagent_start":
             return httpx.Response(202, json={})
         subagent_id = body["data"]["subagent_id"]
+        if parent_spawn == "slash_command" and subagent_id == "z-parent":
+            assert "tool_use_id" not in body["data"]
+            if server_requires_tool_id:
+                return httpx.Response(
+                    400,
+                    json={
+                        "message": "external_subagent_start requires non-empty data.tool_use_id"
+                    },
+                )
         start_paths[subagent_id] = request.url.path
         return httpx.Response(
             202,
@@ -257,12 +286,30 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
         transport=httpx.MockTransport(handler),
         base_url="http://ap",
     ) as client:
+        if server_requires_tool_id:
+            rejected = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_root",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=forwarder.SubagentForwardState(subagents={}),
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(
+                    base_delay_s=0.0, max_permanent_attempts=1
+                ),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            )
+            assert rejected.subagents == {}
+            assert forwarder._read_subagent_forward_state(bridge_dir) == rejected
+            assert not (bridge_dir / "dead_letter.jsonl").exists()
+            server_requires_tool_id = False
         state = await forwarder._forward_available_subagents(
             client=client,
             parent_session_id="conv_root",
             bridge_dir=bridge_dir,
             transcript_path=transcript_path,
-            state=forwarder.SubagentForwardState(subagents={}),
+            state=forwarder._read_subagent_forward_state(bridge_dir),
             agent_name="claude-native-ui",
             start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
@@ -301,6 +348,35 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
 
     assert start_paths["b-grandchild"] == "/v1/sessions/conv_a-child/events"
     assert restarted.subagents["b-grandchild"].parent_subagent_id == "a-child"
+
+
+@pytest.mark.parametrize(
+    ("lineage", "accepted"),
+    [
+        ({"spawnDepth": 1}, True),
+        ({"parentAgentId": "parent", "spawnDepth": 2}, True),
+        ({"parentAgentId": "parent"}, True),
+        ({"toolUseId": "toolu_spawn"}, True),
+        ({}, False),
+        ({"spawnDepth": 2}, False),
+        ({"spawnDepth": True}, False),
+        ({"spawnDepth": 1, "toolUseId": None}, False),
+        ({"spawnDepth": 1, "toolUseId": ""}, False),
+        ({"parentAgentId": ""}, False),
+        ({"parentAgentId": "worker"}, False),
+        ({"parentAgentId": "parent", "spawnDepth": 1}, False),
+    ],
+)
+def test_subagent_metadata_requires_a_spawn_call_or_explicit_lineage(
+    tmp_path: Path, lineage: dict[str, Any], accepted: bool
+) -> None:
+    """A missing tool call is valid only when native metadata proves the parent."""
+    meta_path = tmp_path / "agent-worker.meta.json"
+    meta_path.write_text(
+        json.dumps({"agentType": "general-purpose", "description": "/code-review", **lineage}),
+        encoding="utf-8",
+    )
+    assert (forwarder._read_subagent_meta(meta_path) is not None) is accepted
 
 
 async def test_subagent_watcher_parks_child_of_a_parked_parent(

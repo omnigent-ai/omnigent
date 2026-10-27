@@ -89,9 +89,13 @@ TIER_ENV = {
     "haiku": "ANTHROPIC_DEFAULT_HAIKU_MODEL",
 }
 GATEWAY_LABELS = {
-    "databricks-claude-opus-5": "Opus 5",
-    "databricks-claude-sonnet-5": "Sonnet 5",
-    "databricks-claude-haiku-5": "Haiku 5",
+    prefix + model_id: label
+    for model_id, label in (
+        ("claude-opus-5", "Opus 5"),
+        ("claude-sonnet-5", "Sonnet 5"),
+        ("claude-haiku-5", "Haiku 5"),
+    )
+    for prefix in ("system.ai.", "databricks-")
 }
 
 if os.environ.get("ANTHROPIC_BASE_URL"):
@@ -263,7 +267,7 @@ def _start_fake_workspace(bare_model_ids: tuple[str, ...]) -> tuple[str, Callabl
                     ]
                 }
             elif path == "/ai-gateway/anthropic/v1/models":
-                body = {"data": [{"id": f"databricks-{model_id}"} for model_id in bare_model_ids]}
+                body = {"data": [{"id": f"system.ai.{model_id}"} for model_id in bare_model_ids]}
             else:
                 self.send_response(404)
                 self.end_headers()

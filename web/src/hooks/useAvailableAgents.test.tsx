@@ -422,6 +422,119 @@ describe("useAvailableAgents", () => {
     ]);
   });
 
+  it("keeps custom agents on a native harness as their own rows, named by their own name", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_native", name: "claude-native-ui", harness: "claude-native", builtin: true },
+          { id: "ag_kiro", name: "kiro-native-ui", harness: "kiro-native", builtin: true },
+          // Seeded via OMNIGENT_BUILTIN_AGENT_DIRS: a built-in, but not the stock wrapper.
+          { id: "ag_teamresearch", name: "teamresearch", harness: "claude-native", builtin: true },
+          // Registered with `omnigent server --agent` (builtin: false).
+          {
+            id: "ag_autoresearch",
+            name: "autoresearch",
+            harness: "claude-native",
+            builtin: false,
+            created_at: 2,
+          },
+          {
+            id: "ag_fieldnotes",
+            name: "fieldnotes",
+            harness: "kiro-native",
+            builtin: false,
+            created_at: 1,
+          },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: EMPTY_MINE,
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    // Only the stock wrappers carry the vendor label; a custom agent on the same
+    // native harness keeps its own name and its own row, never folded away.
+    expect((result.current.data ?? []).map((a) => [a.id, a.display_name])).toEqual([
+      ["ag_native", "Claude Code"],
+      ["ag_kiro", "Kiro"],
+      ["ag_teamresearch", "Teamresearch"],
+      ["ag_autoresearch", "Autoresearch"],
+      ["ag_fieldnotes", "Fieldnotes"],
+    ]);
+  });
+
+  it("a seeded built-in custom Kiro agent does not shadow legacy Kiro rows", async () => {
+    routeFetch({
+      [BUILTINS_URL]: mockResponse({
+        object: "list",
+        data: [
+          { id: "ag_native", name: "claude-native-ui", harness: "claude-native", builtin: true },
+          // Seeded on kiro-native under its own name, not the stock
+          // kiro-native-ui wrapper, so it is not the Kiro built-in.
+          { id: "ag_teamkiro", name: "teamkiro", harness: "kiro-native", builtin: true },
+        ],
+        has_more: false,
+      }),
+      [MINE_URL]: sessionResponse({
+        object: "list",
+        // A legacy plain-"kiro" row is hidden only when the stock Kiro wrapper
+        // exists; with no wrapper seeded it keeps its own session row.
+        data: [{ id: "ag_legacy_kiro", name: "kiro" }],
+        has_more: false,
+      }),
+    });
+
+    const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+    await waitFor(() => {
+      expect(result.current.isSuccess).toBe(true);
+      expect(result.current.isPlaceholderData).toBe(false);
+    });
+
+    const rows = (result.current.data ?? []).map((a) => [a.id, a.display_name]);
+    expect(rows).toContainEqual(["ag_teamkiro", "Teamkiro"]);
+    expect(rows).toContainEqual(["ag_legacy_kiro", "Kiro"]);
+  });
+
+  it.each([true, false])(
+    "folds a builtin=%s stock wrapper clone into the single vendor row",
+    async (builtin) => {
+      routeFetch({
+        [BUILTINS_URL]: mockResponse({
+          object: "list",
+          data: [
+            { id: "ag_native", name: "claude-native-ui", harness: "claude-native", builtin: true },
+            // A fork clone carries the stock wrapper's name, so it folds into the
+            // vendor row even when flagged: stock-name recognition wins over the exemption.
+            {
+              id: "ag_clone",
+              name: "claude-native-ui (fork conv_7)",
+              harness: "claude-native",
+              builtin,
+            },
+          ],
+          has_more: false,
+        }),
+        [MINE_URL]: EMPTY_MINE,
+      });
+
+      const { result } = renderHook(() => ({ ...useAvailableAgents() }), { wrapper });
+      await waitFor(() => {
+        expect(result.current.isSuccess).toBe(true);
+        expect(result.current.isPlaceholderData).toBe(false);
+      });
+
+      expect((result.current.data ?? []).map((a) => [a.id, a.display_name])).toEqual([
+        ["ag_native", "Claude Code"],
+      ]);
+    },
+  );
+
   it("defaults a missing harness to null", async () => {
     routeFetch({
       [BUILTINS_URL]: mockResponse({
@@ -1001,6 +1114,49 @@ describe("prefetchAvailableAgentDetails", () => {
 
     // Shadow removed; only the seeded built-in remains.
     expect(queryClient.getQueryData(["available-agents"])).toEqual([kiroBuiltin]);
+  });
+
+  it("keeps a session agent when its only native peer is an explicitly flagged custom agent", async () => {
+    // The sole kiro peer is a user-flagged custom agent, not the stock
+    // wrapper, so enrichment must not fold the session row into it. Both keep
+    // their own rows.
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    const customKiro = testAgent("ag_teamkiro", "teamkiro", {
+      display_name: "Teamkiro",
+      harness: "kiro-native",
+      builtin: true,
+    });
+    const sessionKiro = testAgent("ag_session_kiro", "kiro-naitive", {
+      display_name: "Kiro-naitive",
+      harness: null,
+      sessionId: "conv_kiro",
+    });
+    queryClient.setQueryData(["available-agents"], [customKiro, sessionKiro]);
+
+    fetchMock.mockResolvedValueOnce(
+      mockResponse({
+        id: "ag_session_kiro",
+        object: "agent",
+        name: "kiro-naitive",
+        harness: "kiro-native",
+        skills: [],
+      }),
+    );
+
+    await prefetchAvailableAgentDetails(sessionKiro, queryClient);
+
+    expect(queryClient.getQueryData(["available-agents"])).toEqual([
+      customKiro,
+      {
+        id: "ag_session_kiro",
+        name: "kiro-naitive",
+        display_name: "Kiro-naitive",
+        description: null,
+        harness: "kiro-native",
+        skills: [],
+        sessionId: "conv_kiro",
+      },
+    ]);
   });
 });
 

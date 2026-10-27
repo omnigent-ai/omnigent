@@ -40,6 +40,18 @@ export interface MessageItem extends BaseItem {
   interrupted?: boolean;
   /** Native live-preview stream finalized by this persisted assistant message. */
   stream_message_id?: string;
+  /** Assistant-only harness label as stored, e.g. Codex `commentary`; may be newer than this client. */
+  phase?: string;
+}
+
+/** Codex `MessagePhase`: progress narration vs. (partial or final) answer text. */
+export type AssistantMessagePhase = "commentary" | "partial_answer" | "final_answer";
+
+/** Narrow an untrusted wire value to a known phase. */
+export function assistantMessagePhase(value: unknown): AssistantMessagePhase | undefined {
+  return value === "commentary" || value === "partial_answer" || value === "final_answer"
+    ? value
+    : undefined;
 }
 
 export interface FunctionCallItem extends BaseItem {

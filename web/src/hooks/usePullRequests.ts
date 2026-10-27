@@ -26,11 +26,15 @@
 //                                  the users and teams a review can be requested from.
 //   useUpdatePullRequestReviewers — POST /resources/github/reviewers
 //                                  request reviews / withdraw pending requests.
+//   useUpdatePullRequestDetails  — POST /resources/github/details
+//                                  replace the selected PR's title and/or description.
+//   uploadPullRequestAttachment  — POST /resources/github/attachments
+//                                  upload an image or video to embed in the description.
 //
 // Runner-offline (503 runner_unavailable) and no-os_env (404) are handled the
 // same way as the workspace filesystem hooks — reusing their helpers.
 
-import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { skipToken, useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import type { GitProviderDisplay } from "@/lib/gitProviders";
 import { authenticatedFetch } from "@/lib/identity";
 import { isTempConvId } from "@/lib/tempConversationId";
@@ -183,8 +187,14 @@ export interface PullRequestCapabilities {
   label_editing?: boolean;
   /** The PR can be merged from the panel; absent from older hosts. */
   merging?: boolean;
+  /** Top-level comments can be posted; absent from older hosts. */
+  comment_posting?: boolean;
   /** Reviews can be requested and pending requests withdrawn; absent from older hosts. */
   reviewer_editing?: boolean;
+  /** The PR's title and description can be edited; absent from older hosts. */
+  details_editing?: boolean;
+  /** Images and videos can be uploaded into the description; absent from older hosts. */
+  attachment_uploads?: boolean;
 }
 
 /** Why the panel can't show pull request content.
@@ -324,6 +334,15 @@ export interface PullRequestFileDiffResponse {
   after: string | null;
 }
 
+class PullRequestApiError extends Error {
+  readonly status: number;
+
+  constructor(message: string, status: number) {
+    super(message);
+    this.status = status;
+  }
+}
+
 /** Surface the server's error message (e.g. a git failure) rather than a bare
  *  status code, mirroring the workspace hooks. */
 async function errorFromResponse(res: Response): Promise<Error> {
@@ -335,7 +354,7 @@ async function errorFromResponse(res: Response): Promise<Error> {
   } catch {
     // Non-JSON body (gateway/front-door error) — keep the status line.
   }
-  return new Error(message);
+  return new PullRequestApiError(message, res.status);
 }
 
 /** Classify a 404 body from the GitHub resource endpoint.
@@ -696,18 +715,31 @@ export interface PullRequestRepoLabels {
 /** GET or POST one of the selected PR's editable resources, e.g. `labels`. */
 async function fetchPullRequestEditResource<T>(
   conversationId: string,
-  resource: "labels" | "reviewers" | "merge-options" | "merge" | "disable-auto-merge",
-  request: { prUrl: string } | { body: unknown },
+  resource:
+    | "labels"
+    | "reviewers"
+    | "comments"
+    | "details"
+    | "attachments"
+    | "merge-options"
+    | "merge"
+    | "disable-auto-merge",
+  request: { prUrl: string } | { body: unknown } | { form: FormData },
 ): Promise<T> {
   const path = `/v1/sessions/${encodeURIComponent(conversationId)}/resources/github/${resource}`;
   const response =
     "prUrl" in request
       ? await authenticatedFetch(`${path}${prQuery(request.prUrl)}`)
-      : await authenticatedFetch(path, {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify(request.body),
-        });
+      : await authenticatedFetch(
+          path,
+          "form" in request
+            ? { method: "POST", body: request.form }
+            : {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify(request.body),
+              },
+        );
   if (response.status === 503 && (await isRunnerUnavailable503(response))) {
     throw new RunnerOfflineError();
   }
@@ -969,4 +1001,164 @@ export function useUpdatePullRequestReviewers(conversationId: string) {
     },
     onError: () => queryClient.invalidateQueries({ queryKey: infoKey }),
   });
+}
+
+/** A title and/or description edit; an omitted field keeps its current value. */
+export interface PullRequestDetailsChange {
+  prUrl: string;
+  title?: string;
+  body?: string;
+}
+
+interface PullRequestDetails {
+  object: "session.github.pr_details";
+  title: string;
+  body: string;
+}
+
+/**
+ * Replace the selected PR's title and/or description through the runner or host
+ * fallback. A success writes GitHub's resulting title and body into the info cache.
+ */
+export function useUpdatePullRequestDetails(conversationId: string) {
+  const queryClient = useQueryClient();
+  const infoKey = ["github-info", conversationId];
+  return useMutation({
+    mutationKey: ["github-details-update", conversationId],
+    scope: { id: `github-details-${conversationId}` },
+    mutationFn: (change: PullRequestDetailsChange) =>
+      fetchPullRequestEditResource<PullRequestDetails>(conversationId, "details", {
+        body: { pr_url: change.prUrl, title: change.title, body: change.body },
+      }),
+    onSuccess: async ({ title, body }, change) => {
+      // A poll that started before the edit landed would bring the old text back.
+      await queryClient.cancelQueries({ queryKey: infoKey });
+      queryClient.setQueriesData<NormalizedPullRequestInfo>({ queryKey: infoKey }, (info) =>
+        info?.pr && info.selected_pr_url === change.prUrl
+          ? { ...info, pr: { ...info.pr, title, body } }
+          : info,
+      );
+    },
+  });
+}
+
+/** An uploaded description attachment. */
+export interface PullRequestAttachment {
+  object: "session.github.pr_attachment";
+  /** The URL to embed in the description. */
+  url: string;
+  /** The file name the provider stored, with an extension matching its type. */
+  name: string;
+  content_type: string;
+}
+
+/** Upload an image or video for the selected PR's description; the PR itself is unchanged. */
+export function uploadPullRequestAttachment(
+  conversationId: string,
+  prUrl: string,
+  file: File,
+): Promise<PullRequestAttachment> {
+  const form = new FormData();
+  form.append("pr_url", prUrl);
+  form.append("file", file, file.name || "attachment");
+  return fetchPullRequestEditResource<PullRequestAttachment>(conversationId, "attachments", {
+    form,
+  });
+}
+
+export const MAX_PULL_REQUEST_COMMENT_CHARACTERS = 65536;
+
+/** Match Python's Unicode code-point length, including astral characters. */
+export function pullRequestCommentTooLong(body: string): boolean {
+  return [...body].length > MAX_PULL_REQUEST_COMMENT_CHARACTERS;
+}
+
+function commentPostingError(error: Error): string {
+  const uncertain =
+    !(error instanceof RunnerOfflineError) &&
+    (!(error instanceof PullRequestApiError) || error.status >= 500);
+  return uncertain && !/check github before retrying/i.test(error.message)
+    ? `${error.message} Check GitHub before retrying if the comment may have been sent.`
+    : error.message;
+}
+
+interface PullRequestCommentDraft {
+  body: string;
+  pending: boolean;
+  error: string | null;
+}
+
+function commentDraftKey(conversationId: string, prUrl: string) {
+  return ["github-comment-draft", conversationId, prUrl] as const;
+}
+
+function mergePostedComments(comments: PullRequestComment[], posted: PullRequestComment[]) {
+  const urls = new Set(comments.map((comment) => comment.url));
+  return [...comments, ...posted.filter((comment) => !urls.has(comment.url))].sort((left, right) =>
+    (left.created_at ?? "").localeCompare(right.created_at ?? ""),
+  );
+}
+
+/** A PR-scoped draft survives tab/session switches and settles even after unmount. */
+export function usePullRequestCommentComposer(conversationId: string, prUrl: string) {
+  const queryClient = useQueryClient();
+  const key = commentDraftKey(conversationId, prUrl);
+  const initialDraft: PullRequestCommentDraft = { body: "", pending: false, error: null };
+  const { data: draft = initialDraft } = useQuery<PullRequestCommentDraft>({
+    queryKey: key,
+    queryFn: skipToken,
+    initialData: initialDraft,
+    enabled: false,
+    gcTime: 24 * 60 * 60 * 1000,
+  });
+  const updateDraft = (update: Partial<PullRequestCommentDraft>) =>
+    queryClient.setQueryData<PullRequestCommentDraft>(key, (current) =>
+      current ? { ...current, ...update } : current,
+    );
+  const mutation = useMutation({
+    mutationKey: ["github-comment-create", conversationId, prUrl],
+    retry: false,
+    mutationFn: (body: string) =>
+      fetchPullRequestEditResource<{ comment: PullRequestComment }>(conversationId, "comments", {
+        body: { pr_url: prUrl, body },
+      }),
+    onSuccess: async ({ comment }) => {
+      await queryClient.cancelQueries({ queryKey: ["github-info", conversationId] });
+      updateDraft({ body: "", pending: false, error: null });
+      queryClient.setQueriesData<PullRequestInfo>(
+        { queryKey: ["github-info", conversationId] },
+        (info) =>
+          info?.pr && info.selected_pr_url === prUrl
+            ? {
+                ...info,
+                pr: {
+                  ...info.pr,
+                  comments: mergePostedComments(info.pr.comments ?? [], [comment]),
+                },
+              }
+            : info,
+      );
+    },
+    onError: (error: Error) =>
+      updateDraft({
+        pending: false,
+        error: commentPostingError(error),
+      }),
+  });
+  return {
+    draft,
+    setBody: (body: string) => updateDraft({ body, error: null }),
+    post: () => {
+      const current = queryClient.getQueryData<PullRequestCommentDraft>(key);
+      if (
+        !current ||
+        current.pending ||
+        !current.body.trim() ||
+        pullRequestCommentTooLong(current.body)
+      )
+        return;
+      updateDraft({ pending: true, error: null });
+      mutation.mutate(current.body);
+    },
+  };
 }

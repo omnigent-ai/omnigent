@@ -177,7 +177,7 @@ async def test_claude_program_status_real_launch_and_fallback(
                 while len(statuses) == before:
                     await asyncio.sleep(0.02)
             assert statuses[-1] == ("running", "permission prompt")
-        for key, state in (("d", "idle"), ("w", "running"), ("i", "idle"), ("e", "failed")):
+        for key, state in (("d", "idle"), ("w", "running"), ("i", "idle")):
             await instance.send(keys=key)
             await wait_status(state)
         for key in ("c", "u"):
@@ -185,6 +185,13 @@ async def test_claude_program_status_real_launch_and_fallback(
             await wait_status("idle")  # Falls back to the still-unchanged status file.
             await instance.send(keys="w")
             await wait_status("running")
+        # An error report publishes nothing; the StopFailure hook owns the failed edge.
+        await instance.send(keys="e")
+        async with asyncio.timeout(5):
+            while reader.status is None or reader.status.state != "error":
+                await asyncio.sleep(0.02)
+        await asyncio.sleep(0.3)  # Longer than a poll, so a published failure would show here.
+        assert statuses[-1] == ("running", None)
         reader.path.unlink()
         reader.path.mkdir()  # Make snapshot replacement fail while the command keeps running.
         await instance.send(keys="b")
@@ -1170,6 +1177,62 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     assert record.session_id == "conv_idle"
     assert record.attributes["terminal_lifecycle"] == "required"
     assert record.attributes["session_status_before_exit"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_exit_after_omnigent_reap_is_expected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pane Omnigent killed to fail its turn exits as an expected close.
+
+    The delivery-timeout reap ends the pane while its turn is still running,
+    so the exit would otherwise look like a crash and fail the turn a second
+    time. The reap leaves a marker in the pane's private dir before the kill;
+    the exit event must carry it so the runner does not report the exit.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :param monkeypatch: Pytest fixture that stubs the tmux subprocess.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.private_dir.mkdir(parents=True)
+    bridge_dir = tmp_path / "bridge"
+    claude_bridge.write_tmux_target(
+        bridge_dir, socket_path=instance.private_dir / "tmux.sock", tmux_target="main"
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    terminal_registry._by_conversation.setdefault("conv_reap", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_reap"
+    )
+    on_activity = callbacks["on_activity"]
+    on_exit = callbacks["on_exit"]
+    assert callable(on_activity) and callable(on_exit)
+    on_activity()
+    claude_bridge.kill_session(bridge_dir, expected_close=True)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
+    assert exits[0].session_was_idle is False
+    assert exits[0].expected_close is True
 
 
 @pytest.mark.asyncio

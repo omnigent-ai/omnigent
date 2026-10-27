@@ -1,5 +1,12 @@
 import { useEffect, useRef } from "react";
-import { CommandIcon, LoaderCircleIcon, PlugIcon, WandSparklesIcon } from "lucide-react";
+import {
+  CircleAlertIcon,
+  CommandIcon,
+  LoaderCircleIcon,
+  PlugIcon,
+  TriangleAlertIcon,
+  WandSparklesIcon,
+} from "lucide-react";
 import type { SkillsStatus } from "@/lib/types";
 import { Link } from "@/lib/routing";
 import { cn } from "@/lib/utils";
@@ -146,11 +153,36 @@ export function rankedSlashCommandNames(
     .sort((a, b) => rank(a) - rank(b));
 }
 
-/** One row of the read-only `/mcp` inventory. */
-interface McpServerRow {
+/** Registry connection state for a `/mcp` row; host and custom rows have none. */
+export type McpServerConnection = "connected" | "sign-in-required" | "unavailable";
+
+/** One row of the `/mcp` inventory. */
+export interface McpServerRow {
   name: string;
   description?: string | null;
+  connection?: McpServerConnection;
+  /** How a `sign-in-required` row signs in; absent rows offer no action. */
+  signIn?: McpSignIn;
 }
+
+/**
+ * Where a row's sign-in happens: in the panel (the registry popup), on a page the
+ * host named, or in Settings when a token or workspace URL has to be typed.
+ */
+export type McpSignIn =
+  { kind: "inline" } | { kind: "url"; url: string } | { kind: "settings"; href: string };
+
+/** A sign-in that failed for one `/mcp` row. */
+export interface McpSignInError {
+  name: string;
+  message: string;
+}
+
+const MCP_CONNECTION_LABEL: Record<McpServerConnection, string> = {
+  connected: "Connected",
+  "sign-in-required": "Sign-in required",
+  unavailable: "Not available to your account",
+};
 
 interface SlashCommandMenuProps {
   /** The text typed after the leading ``/``, used to filter suggestions. */
@@ -181,15 +213,103 @@ interface SlashCommandMenuProps {
   mcpServers?: readonly McpServerRow[];
   mcpServersStatus?: string;
   mcpSettingsHref?: string;
+  /** Start the in-place sign-in for a `sign-in-required` row, by row name. */
+  onMcpSignIn?: (name: string) => void;
+  /** Row whose sign-in popup is open, if any. */
+  mcpAuthorizingName?: string | null;
+  mcpSignInError?: McpSignInError | null;
+}
+
+function McpConnectionIcon({ connection }: { connection?: McpServerConnection }) {
+  if (connection === "sign-in-required")
+    return (
+      <TriangleAlertIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-amber-500" />
+    );
+  if (connection === "unavailable")
+    return (
+      <CircleAlertIcon
+        aria-hidden="true"
+        className="mt-0.5 size-3.5 shrink-0 text-muted-foreground"
+      />
+    );
+  return (
+    <PlugIcon
+      aria-hidden="true"
+      className={cn(
+        "mt-0.5 size-3.5 shrink-0",
+        connection === "connected" ? "text-emerald-500" : "text-muted-foreground",
+      )}
+    />
+  );
+}
+
+function McpSignInAction({
+  server,
+  signingIn,
+  disabled,
+  onSignIn,
+}: {
+  server: McpServerRow;
+  /** This row's sign-in is the one running. */
+  signingIn: boolean;
+  /** Any row's sign-in is running: a second popup would silently cancel the first. */
+  disabled: boolean;
+  onSignIn?: (name: string) => void;
+}) {
+  const signIn = server.signIn;
+  if (signIn === undefined) return null;
+  if (signIn.kind === "url")
+    return (
+      <a
+        href={signIn.url}
+        target="_blank"
+        rel="noopener noreferrer"
+        data-testid={`mcp-sign-in-url-${server.name}`}
+        className="flex shrink-0 items-center rounded-md border border-border px-2 py-0.5 text-xs text-foreground hover:bg-muted dark:hover:bg-muted/50"
+      >
+        Sign in
+      </a>
+    );
+  if (signIn.kind === "settings")
+    return (
+      <Link
+        className="shrink-0 text-xs underline hover:text-foreground"
+        to={signIn.href}
+        data-testid={`mcp-sign-in-link-${server.name}`}
+      >
+        Sign in from Settings
+      </Link>
+    );
+  if (!onSignIn) return null;
+  return (
+    <button
+      type="button"
+      data-testid={`mcp-sign-in-${server.name}`}
+      disabled={disabled}
+      className="flex shrink-0 items-center gap-1 rounded-md border border-border px-2 py-0.5 text-xs text-foreground hover:bg-muted disabled:opacity-60 dark:hover:bg-muted/50"
+      onClick={() => onSignIn(server.name)}
+    >
+      {signingIn && <LoaderCircleIcon aria-hidden="true" className="size-3 animate-spin" />}
+      {signingIn ? "Signing in…" : "Sign in"}
+    </button>
+  );
+}
+
+interface McpServerRowsProps {
+  servers?: readonly McpServerRow[];
+  status?: string;
+  onSignIn?: (name: string) => void;
+  authorizingName?: string | null;
+  signInError?: McpSignInError | null;
 }
 
 function McpServerRows({
   servers,
   status,
-}: {
-  servers?: readonly McpServerRow[];
-  status?: string;
-}) {
+  onSignIn,
+  authorizingName,
+  signInError,
+}: McpServerRowsProps) {
   if (!servers?.length && !status) {
     return (
       <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
@@ -199,19 +319,51 @@ function McpServerRows({
   }
   return (
     <>
-      {servers?.map((server) => (
-        <div key={server.name} className="flex items-start gap-2 rounded-md px-2 py-1.5">
-          <PlugIcon aria-hidden="true" className="mt-0.5 size-3.5 shrink-0 text-emerald-500" />
-          <div className="min-w-0">
-            <div className="text-ui text-foreground">{server.name}</div>
-            {server.description && (
-              <div className="truncate text-xs leading-4 text-muted-foreground">
-                {server.description}
+      {servers?.map((server) => {
+        const needsSignIn = server.connection === "sign-in-required";
+        return (
+          <div
+            key={server.name}
+            data-testid={`mcp-server-row-${server.name}`}
+            className="rounded-md px-2 py-1.5"
+          >
+            <div className="flex items-start gap-2">
+              <McpConnectionIcon connection={server.connection} />
+              <div className="min-w-0 flex-1">
+                <div className="text-ui text-foreground">{server.name}</div>
+                {server.description && (
+                  <div className="truncate text-xs leading-4 text-muted-foreground">
+                    {server.description}
+                  </div>
+                )}
+                {server.connection && (
+                  <div
+                    className={cn(
+                      "text-xs leading-4",
+                      needsSignIn ? "text-amber-600 dark:text-amber-500" : "text-muted-foreground",
+                    )}
+                  >
+                    {MCP_CONNECTION_LABEL[server.connection]}
+                  </div>
+                )}
+              </div>
+              {needsSignIn && (
+                <McpSignInAction
+                  server={server}
+                  signingIn={authorizingName === server.name}
+                  disabled={authorizingName != null}
+                  onSignIn={onSignIn}
+                />
+              )}
+            </div>
+            {signInError?.name === server.name && (
+              <div role="alert" className="mt-1 pl-5 text-xs leading-4 text-destructive">
+                {signInError.message}
               </div>
             )}
           </div>
-        </div>
-      ))}
+        );
+      })}
       {status && (
         <div role="status" className="px-2 py-2 text-ui text-muted-foreground">
           {status}
@@ -222,14 +374,9 @@ function McpServerRows({
 }
 
 function McpServerMenu({
-  servers,
-  status,
   settingsHref = "/settings/harnesses",
-}: {
-  servers?: readonly McpServerRow[];
-  status?: string;
-  settingsHref?: string;
-}) {
+  ...rowProps
+}: McpServerRowsProps & { settingsHref?: string }) {
   return (
     <div
       data-testid="mcp-server-menu"
@@ -241,7 +388,7 @@ function McpServerMenu({
         <div className="text-xs leading-4 text-muted-foreground">Enabled for this session</div>
       </div>
       <div className="max-h-64 overflow-y-auto">
-        <McpServerRows servers={servers} status={status} />
+        <McpServerRows {...rowProps} />
       </div>
       <div className="mt-1 border-border border-t px-2 pt-2 text-xs text-muted-foreground">
         <Link className="underline hover:text-foreground" to={settingsHref}>
@@ -339,6 +486,9 @@ export function SlashCommandMenu({
   mcpServers,
   mcpServersStatus,
   mcpSettingsHref,
+  onMcpSignIn,
+  mcpAuthorizingName,
+  mcpSignInError,
 }: SlashCommandMenuProps) {
   const matchedNames = rankedSlashCommandNames(commands, query, builtinNames, labels);
   const listRef = useRef<HTMLDivElement>(null);
@@ -356,6 +506,9 @@ export function SlashCommandMenu({
         servers={mcpServers}
         status={mcpServersStatus}
         settingsHref={mcpSettingsHref}
+        onSignIn={onMcpSignIn}
+        authorizingName={mcpAuthorizingName}
+        signInError={mcpSignInError}
       />
     );
   if (matchedNames.length === 0 && skillsStatus == null) return null;

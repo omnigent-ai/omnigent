@@ -32,6 +32,7 @@ from omnigent._platform import IS_WINDOWS
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.models import model_catalog
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.process_logging import redact_log_text
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -53,6 +54,7 @@ from .executor import (
     classify_tool_result,
     describe_exception,
     split_transient_tail,
+    without_tool_history,
 )
 from .open_responses_sdk import (
     _OPENAI_KEY_PLACEHOLDER,
@@ -551,7 +553,7 @@ def _get_openai_async_client(
     # Treating it as Databricks-hosted sent credential-less OpenAI agents into
     # ambient Databricks auth, surfacing an "install databricks-sdk" error at
     # users who never configured Databricks.
-    allow_ambient_databricks = model is not None and model.startswith("databricks-")
+    allow_ambient_databricks = model is not None and is_databricks_model_id(model)
 
     # An explicit Databricks profile is authoritative; model-service names
     # are opaque Unity Catalog identifiers such as catalog.schema.service.
@@ -600,15 +602,15 @@ def _get_openai_async_client(
     if api_key:
         return AsyncOpenAI(api_key=api_key, **retry_kwargs)
 
-    # Without an explicit profile, only legacy Databricks model names opt in
-    # to ambient Databricks credentials.
+    # Without an explicit profile, only Databricks model names opt in to
+    # ambient Databricks credentials.
     if not profile and not allow_ambient_databricks:
         target = f"for model {model!r}" if model is not None else "and no model is pinned"
         raise ValueError(
             f"No provider credentials were configured {target}. "
             "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL), configure a "
-            "Databricks profile, or use a 'databricks-' prefixed model name "
-            "for legacy automatic Databricks routing."
+            "Databricks profile, or use a Databricks model name (system.ai.* or "
+            "databricks-*) for automatic Databricks routing."
         )
 
     # No env client: use the explicit profile or legacy ambient Databricks auth.
@@ -1262,6 +1264,9 @@ class OpenAIAgentsSDKExecutor(Executor):
     def handles_tools_internally(self) -> bool:
         return True
 
+    def replays_tool_history(self) -> bool:
+        return True
+
     def supports_stepwise_internal_turns(self) -> bool:
         return True
 
@@ -1412,7 +1417,11 @@ class OpenAIAgentsSDKExecutor(Executor):
             await self._rewind_sdk_session(state, state.rollback_to_item_count)
             state.rollback_to_item_count = None
 
-        if state.started and len(split_transient_tail(messages).persisted) < state.history_cursor:
+        cursor_view = without_tool_history(messages)
+        if (
+            state.started
+            and len(split_transient_tail(cursor_view).persisted) < state.history_cursor
+        ):
             await self._rewind_sdk_session(state, 0)
             state.started = False
             state.resume_state = None
@@ -1437,9 +1446,10 @@ class OpenAIAgentsSDKExecutor(Executor):
             state.resume_state = None
 
         if not state.started:
+            # A fresh SDK session (fork, restart) has no tool state, so replay the tool history.
             return _normalize_responses_items_for_chat(_convert_messages_to_responses(messages))
 
-        split = split_transient_tail(messages)
+        split = split_transient_tail(without_tool_history(messages))
         delta_persisted = split.persisted[state.history_cursor :]
         delta_messages = list(delta_persisted) + list(split.transient)
         if not delta_messages:
@@ -1860,7 +1870,9 @@ class OpenAIAgentsSDKExecutor(Executor):
                 if stepwise_internal_turns and saw_tool_activity and result is not None:
                     state.started = True
                     state.resume_state = result.to_state()
-                    state.history_cursor = len(split_transient_tail(messages).persisted)
+                    state.history_cursor = len(
+                        split_transient_tail(without_tool_history(messages)).persisted
+                    )
                     yield TurnComplete(continue_turn=True)
                     return
                 logger.error("OpenAIAgentsSDKExecutor: max turns exceeded")
@@ -1979,7 +1991,9 @@ class OpenAIAgentsSDKExecutor(Executor):
 
         if not response_text and final_text:
             yield TextChunk(text=final_text)
-        state.history_cursor = len(split_transient_tail(messages).persisted) + 1
+        state.history_cursor = (
+            len(split_transient_tail(without_tool_history(messages)).persisted) + 1
+        )
         # Aggregate usage across all raw responses for this turn. The SDK
         # accumulates per-request usage on RunResult.raw_responses.
         #

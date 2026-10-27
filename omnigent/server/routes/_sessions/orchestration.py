@@ -149,6 +149,7 @@ from omnigent.server.bundles import (
     validate_agent_bundle,
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.failed_status_diagnostics import failed_status_intake_attributes
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -305,6 +306,7 @@ from omnigent.server.routes._sessions.helpers import (
     _native_terminal_name_for_harness,
     _NativeTerminalEnsureOutcome,
     _owner_from_grants,
+    _owns_host_runner,
     _parse_external_conversation_item,
     _pending_elicitation_snapshot_for_session,
     _permission_level_from_grants,
@@ -379,6 +381,7 @@ from omnigent.server.schemas import (
     SessionEventInput,
     SessionListItem,
     SessionModelEvent,
+    SessionPullRequestSummary,
     SessionResponse,
     SessionStatusEvent,
     SessionUsageEvent,
@@ -402,6 +405,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
@@ -998,13 +1002,15 @@ async def _archive_stop(
     await _facade._best_effort_stop(session_id, conversation_store, runner_router)
     if conv.host_id and conv.runner_id:
         try:
-            await _stop_host_runner_intentionally(
-                session_id,
-                conv.host_id,
-                conv.runner_id,
-                host_registry,
-                conversation_store,
-            )
+            # A sub-agent riding an ancestor's runner leaves it up for the owner.
+            if await _owns_host_runner(conv, conversation_store):
+                await _stop_host_runner_intentionally(
+                    session_id,
+                    conv.host_id,
+                    conv.runner_id,
+                    host_registry,
+                    conversation_store,
+                )
         except Exception:  # noqa: BLE001
             _logger.debug(
                 "Archive host-runner teardown failed for %s",
@@ -1178,6 +1184,9 @@ def _build_session_list_item(
     pending_count: int,
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
+    harness: str | None = None,
+    pull_request: SessionPullRequestSummary | None = None,
+    pull_requests_synced: bool | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -1219,6 +1228,11 @@ def _build_session_list_item(
         wired — emitted as ``comments_count=0`` /
         ``comments_updated_at=None`` so the two states look identical
         on the wire.
+    :param harness: Resolved session harness from the batch's cached agent specs.
+    :param pull_request: The conversation's first linked pull request,
+        from the server's PR store; ``None`` when it has none.
+    :param pull_requests_synced: Whether the server has imported the
+        conversation's PRs, or ``None`` without PR storage.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -1234,6 +1248,7 @@ def _build_session_list_item(
         id=conv.id,
         agent_id=conv.agent_id,
         agent_name=agent_names_by_id.get(conv.agent_id),
+        harness=harness,
         status=_list_status_with_starting(
             _session_status_with_child_rollup(conv.id, child_session_ids, conv.live_status),
             conv.id,
@@ -1279,6 +1294,8 @@ def _build_session_list_item(
         search_snippet=conv.search_snippet,
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
+        pull_request=pull_request,
+        pull_requests_synced=pull_requests_synced,
     )
 
 
@@ -1457,6 +1474,9 @@ def _build_session_response(
             cumulative_input_tokens=int(own_usage.get("input_tokens", 0) or 0) + cached,
             cumulative_output_tokens=int(own_usage.get("output_tokens", 0) or 0),
             cumulative_cache_read_input_tokens=cached,
+            cumulative_cost_usd=own_usage.get("total_cost_usd")
+            if own_usage.get("native_cost_complete") is True
+            else None,
         )
     # Collapse per-user pin keys to the canonical bare key for this viewer, so
     # the snapshot never carries another user's pin key (see _labels_for_viewer).
@@ -1813,6 +1833,9 @@ def _persist_native_cumulative_usage(
       (exact billing; used directly). Stored in ``total_cost_usd``, which
       drives the badge and the per-user daily rollup, so the badge matches
       ``/cost`` in the Claude TUI.
+    - ``cost_complete`` — whether the reporter priced all accumulated usage.
+      Native Pi uses this to distinguish a resumable cost baseline from a
+      display subtotal that excludes unpriced turns.
     - ``policy_cost_usd`` — total session cost for ENFORCEMENT (the
       cost-budget gate). claude-native forwards ``max(S, real-time
       transcript estimate)`` here so the gate reflects in-flight sub-agent
@@ -1877,6 +1900,12 @@ def _persist_native_cumulative_usage(
     # downward report a no-op, so the worst a forged post can do is leave the
     # figure unchanged. (See also the runner-token guard on cost_control.*
     # label writes — usage was the missing half.)
+    if "cost_complete" in data:
+        if type(data["cost_complete"]) is not bool:
+            raise OmnigentError("cost_complete must be a bool", code=ErrorCode.INVALID_INPUT)
+        current["native_cost_complete"] = data["cost_complete"] and cost is not None
+    else:
+        current.pop("native_cost_complete", None)
     old_cost = float(current.get("total_cost_usd", 0.0) or 0.0)
     old_policy_cost = float(current.get("policy_cost_usd", 0.0) or 0.0)
     # Old cumulative token totals, captured before the overwrites below so
@@ -3409,8 +3438,16 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
     """Retain an identity-linked runner lifecycle edge on its queued web input."""
     event_type = event.get("type")
     stage = _NATIVE_INPUT_LIFECYCLE_STAGES.get(event_type) if isinstance(event_type, str) else None
-    stable_id = input_attributes(event).get("input_stable_id")
-    if stage is None or not isinstance(stable_id, str):
+    identity = input_attributes(event)
+    if any(
+        key in event and key not in identity
+        for key in ("input_stable_id", "pending_id", "delivery_attempt_id")
+    ):
+        return
+    stable_id = identity.get("input_stable_id")
+    pending_id = identity.get("pending_id")
+    delivery_attempt_id = identity.get("delivery_attempt_id")
+    if stage is None:
         return
     raw_response = event.get("response")
     response_id = raw_response.get("id") if isinstance(raw_response, dict) else None
@@ -3423,7 +3460,11 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         cause_class = "interrupted_or_lifecycle"
     pending_inputs.mark_lifecycle(
         session_id,
-        stable_id,
+        stable_id if isinstance(stable_id, str) else None,
+        pending_id=pending_id if isinstance(pending_id, str) else None,
+        delivery_attempt_id=(
+            delivery_attempt_id if isinstance(delivery_attempt_id, str) else None
+        ),
         stage=stage,
         cause_class=cause_class,
         reason_code=_native_input_reason_code(event),
@@ -3643,6 +3684,8 @@ async def _enrich_terminal_status_with_subagent_output(
     over the store for failures; fallback text must belong to the current
     response or follow the latest user message when no response id is present.
     A turn stopped before any output must not borrow an earlier turn's reply.
+    Explicit confirmed output, including an empty string, is authoritative
+    for native and ACP callers.
 
     :param data: The ``external_session_status`` ``data`` to enrich, e.g.
         ``{"status": "idle"}``.
@@ -3671,6 +3714,8 @@ async def _enrich_terminal_status_with_subagent_output(
         context.setdefault("detail_source", "external_status_failure_detail")
         return {**data, "output": failure_detail.strip()}
     existing = data.get("output")
+    if status == "idle" and data.get("turn_completed") is True and isinstance(existing, str):
+        return data
     if current_turn_only and isinstance(existing, str) and existing.strip():
         if status == "failed":
             context.setdefault("detail_source", "external_status_output")
@@ -3978,6 +4023,7 @@ async def _mark_runner_sessions_offline_impl(
     conversation_store: ConversationStore,
     *,
     fail_idle_top_level: bool = False,
+    disconnect_evidence: Mapping[str, str] | None = None,
 ) -> None:
     """
     Fail the sessions a departed runner actually interrupted, with the cause.
@@ -4020,7 +4066,11 @@ async def _mark_runner_sessions_offline_impl(
         if delay:
             await asyncio.sleep(delay)
         pending = await _mark_runner_sessions_offline_once(
-            pending, error, conversation_store, fail_idle_top_level=fail_idle_top_level
+            pending,
+            error,
+            conversation_store,
+            fail_idle_top_level=fail_idle_top_level,
+            disconnect_evidence=disconnect_evidence,
         )
         if not pending:
             return
@@ -4038,6 +4088,7 @@ async def _mark_runner_sessions_offline_once(
     conversation_store: ConversationStore,
     *,
     fail_idle_top_level: bool,
+    disconnect_evidence: Mapping[str, str] | None = None,
 ) -> list[Conversation]:
     """Reconcile each session once and return the ones blocked by metadata errors."""
     retry: list[Conversation] = []
@@ -4135,7 +4186,13 @@ async def _mark_runner_sessions_offline_once(
             continue
         if binding is None or binding[0] != conv.runner_id:
             continue
-        _publish_status(conv.id, "failed", error, failure_origin="runner_offline_sweep")
+        _publish_status(
+            conv.id,
+            "failed",
+            error,
+            failure_origin="runner_offline_sweep",
+            disconnect_evidence=disconnect_evidence,
+        )
         await record_subagent_activity(
             conv.id, "returned", conversation_store, turn_id=turn_id, status="failed"
         )
@@ -4535,6 +4592,8 @@ async def _bind_and_launch_managed_runner(
     # From here a shutdown may cancel the launch: the host's replica finishes it.
     if (launch_task := asyncio.current_task()) is not None:
         _unbound_managed_launch_tasks.discard(launch_task)
+    if (launch := tracker.get(session_id)) is not None:
+        launch.bound.set()
     if relaunch_host is not None:
         await _note_workspace_reset_on_recreate(session_id, conversation_store)
     # Host bound; what remains is launching the runner and waiting
@@ -7686,6 +7745,17 @@ async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
         return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
 
 
+def _codex_side_chat_thread_id(conv: Conversation) -> str | None:
+    """Return the parent app-server thread that runs a Codex child's turns, if forwardable."""
+    from omnigent.server.routes._sessions.common import (
+        _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
+    )
+
+    if not _is_codex_native_subagent(conv) or not conv.parent_conversation_id:
+        return None
+    return (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY) or None
+
+
 async def _forward_codex_side_chat_turn(
     conv: Conversation,
     body: SessionEventInput,
@@ -7859,7 +7929,7 @@ async def _dispatch_session_event_to_runner_impl(
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
-    if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
+    if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
         # the child thread echo, staying the single writer).
@@ -9166,6 +9236,18 @@ async def _relay_runner_stream_once(
                                     else None
                                 ),
                                 failure_origin="relayed_runner_status",
+                                failure_intake=(
+                                    failed_status_intake_attributes(
+                                        event,
+                                        runner_id=runner_id,
+                                        connection=getattr(resp, "extensions", {}).get(
+                                            "omnigent_runner_connection"
+                                        ),
+                                        source="relay_stream",
+                                    )
+                                    if status == "failed"
+                                    else None
+                                ),
                                 failure_context=event.get("failure_context"),
                                 blocked_on=(
                                     raw_blocked_on
@@ -11179,6 +11261,7 @@ async def _create_session_from_existing_agent(
     artifact_store: ArtifactStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     project_store: ProjectStore | None = None,
+    created_by_session_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -11208,6 +11291,7 @@ async def _create_session_from_existing_agent(
         ``file_id`` references in ``initial_items`` before forwarding
         to the runner.
     :param artifact_store: Optional binary content store for the same.
+    :param created_by_session_id: Server-authorized source of an independent worker.
     :returns: The newly created session snapshot and its conversation row.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -11748,6 +11832,8 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    if created_by_session_id is not None:
+        initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
     initial_labels.update(registry_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (

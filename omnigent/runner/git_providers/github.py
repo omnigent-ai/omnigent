@@ -32,6 +32,9 @@ _CAPABILITIES = ProviderCapabilities(
     label_editing=True,
     merging=True,
     reviewer_editing=True,
+    comment_posting=True,
+    details_editing=True,
+    attachment_uploads=True,
 )
 
 
@@ -210,6 +213,41 @@ class GitHubPullRequests:
         from omnigent.runner import github_resource
 
         return github_resource._edit_reviewers(root, reference, add=add, remove=remove)
+
+    def create_comment(self, root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+        """Post through GitHub's issue comments API as the selected account."""
+        from omnigent.runner import github_resource
+
+        return github_resource._create_comment(root, reference, body=body)
+
+    def edit_details(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        title: str | None,
+        body: str | None,
+    ) -> dict[str, Any]:
+        """Update the title and description through GitHub's pull requests API."""
+        from omnigent.runner import github_resource
+
+        return github_resource._edit_details(root, reference, title=title, body=body)
+
+    def upload_attachment(
+        self,
+        root: str,
+        reference: PullRequestRef,
+        *,
+        name: str,
+        content_type: str,
+        content: bytes,
+    ) -> dict[str, Any]:
+        """Upload through GitHub's user attachments endpoint, as ``gh --attach`` does."""
+        from omnigent.runner import github_resource
+
+        return github_resource._upload_attachment(
+            root, reference, name=name, content_type=content_type, content=content
+        )
 
     def shell_pr_operations(self, segments: Sequence[ShellSegment]) -> list[ShellPrOp]:
         """Return one op per ``gh pr`` or ``gh api`` segment."""

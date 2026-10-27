@@ -61,6 +61,7 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
         return "https://wkspc.example.com/"
 
     monkeypatch.setattr(databricks_executor, "_read_databrickscfg_host", _host)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -105,6 +106,7 @@ def test_databricks_unresolvable_credentials_sets_warning(
         raise OSError("refresh token is invalid")
 
     monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -112,6 +114,49 @@ def test_databricks_unresolvable_credentials_sets_warning(
     assert provider.credential_warning is not None
     assert "demo-staging" in provider.credential_warning
     assert "databricks auth login" in provider.credential_warning
+
+
+def test_databricks_sdk_probe_failure_with_working_auth_command_has_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK probe fails but Pi's apiKey command mints a token -> no false warning.
+
+    The SDK rejects a ``databricks`` wrapper shim on PATH that the apiKey
+    command runs fine, so the command decides whether the session works.
+    """
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    def _boom(profile: str | None):
+        raise OSError("databricks-sdk could not mint a token")
+
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+    commands: list[str] = []
+
+    def _auth(command: str) -> str:
+        commands.append(command)
+        return "cmd-tok"
+
+    monkeypatch.setattr(creds, "_run_auth_command", _auth)
+    fetched: list[tuple[str, str]] = []
+
+    def _fetch(host: str, token: str):
+        fetched.append((host, token))
+        return [], [], [], []
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _fetch)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is None
+    assert commands == [provider.api_key.removeprefix("!")]
+    assert fetched == [("https://wkspc.example.com", "cmd-tok")]
 
 
 def test_databricks_model_list_failure_has_no_warning(
@@ -963,7 +1008,13 @@ def test_to_models_config_shape() -> None:
     assert entry["api"] == "anthropic-messages"
     assert entry["apiKey"] == "!get-token"
     assert entry["authHeader"] is True
-    assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
+    assert entry["models"] == [
+        {
+            "id": "databricks-claude-sonnet-4-6",
+            "reasoning": True,
+            "compat": {"forceAdaptiveThinking": True},
+        }
+    ]
 
 
 def test_to_models_config_attributes_unity_gateway_providers() -> None:
@@ -2037,6 +2088,7 @@ def test_model_override_beats_databricks_default(monkeypatch: pytest.MonkeyPatch
         "_read_databrickscfg_host",
         lambda profile: "https://wkspc.example.com/",
     )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(
         model="databricks-claude-opus-4-7", config_loader=_databricks_config
@@ -3966,6 +4018,7 @@ def test_connect_broker_managed_host_resolves_without_configured_provider(
             agent=lambda name: SimpleNamespace(model="system.ai.claude-sonnet-4-6")
         ),
     )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}})
 
@@ -4101,9 +4154,10 @@ def test_provider_launch_scopes_picker_via_enabled_models(
     Provider-qualified refs distinguish managed models from built-in entries.
     Users can still toggle the picker back to the full catalog.
     """
-    monkeypatch.setattr(
-        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", tmp_path / "global-agent"
-    )
+    global_dir = tmp_path / "global-agent"
+    global_dir.mkdir()
+    (global_dir / "mcp.json").write_text('{"mcpServers": {"custom": {}}}', encoding="utf-8")
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(global_dir))
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://api.anthropic.com",
@@ -4124,6 +4178,7 @@ def test_provider_launch_scopes_picker_via_enabled_models(
         "omnigent/claude-sonnet-4-6",
     ]
     assert settings["defaultThinkingLevel"] is None
+    assert (agent_dir / "mcp.json").resolve() == (global_dir / "mcp.json").resolve()
 
 
 @pytest.mark.parametrize("kind", ["key", "gateway"])
@@ -4139,7 +4194,6 @@ def test_setup_single_model_preserves_picker_scope(
     prior_scope: list[str] | None,
 ) -> None:
     """Selecting a default in setup must not replace existing Pi picker preferences."""
-    from omnigent.inner import pi_settings
     from omnigent.onboarding.configure_models import (
         build_gateway_provider_entry,
         build_key_provider_entry,
@@ -4171,7 +4225,7 @@ def test_setup_single_model_preserves_picker_scope(
         global_settings["enabledModels"] = prior_scope
     global_file = global_dir / "settings.json"
     global_file.write_text(json.dumps(global_settings), encoding="utf-8")
-    monkeypatch.setattr(pi_settings, "DEFAULT_PI_AGENT_DIR", global_dir)
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(global_dir))
 
     provider = creds.resolve_pi_native_provider(model=override, config_loader=lambda: config)
     assert provider is not None
@@ -4203,7 +4257,7 @@ def test_provider_launch_without_curated_set_does_not_scope(
     global_settings = {"enabledModels": prior_scope} if prior_scope is not None else {}
     global_file = global_dir / "settings.json"
     global_file.write_text(json.dumps(global_settings), encoding="utf-8")
-    monkeypatch.setattr("omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR", global_dir)
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(global_dir))
     provider = creds.PiProviderConfig(
         provider_id="omnigent",
         base_url="https://gateway.example/anthropic",
@@ -4388,7 +4442,12 @@ def test_native_token_helper_reaps_its_process_group(
     if outcome in ("timeout", "shell_parent"):
         monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 2_000)
     pid_file = tmp_path / "descendant.pid"
-    helper = "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(30)"
+    # Publish only a complete PID before cancellation can terminate the helper.
+    helper = (
+        "import os,sys,time; from pathlib import Path; pid_file = Path(sys.argv[1]); "
+        "pending = pid_file.with_suffix('.pending'); "
+        "pending.write_text(str(os.getpid())); pending.replace(pid_file); time.sleep(30)"
+    )
     if outcome == "output_limit":
         helper = helper.replace(
             "time.sleep(30)",

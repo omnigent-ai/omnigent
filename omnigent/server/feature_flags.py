@@ -8,10 +8,13 @@ is built, giving each one an immutable snapshot.
 
 from __future__ import annotations
 
+import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+
+_logger = logging.getLogger(__name__)
 
 FEATURES_ENV_VAR = "OMNIGENT_FEATURES"
 _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
@@ -20,6 +23,7 @@ _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
 class Feature(StrEnum):
     """Canonical release-feature keys accepted by ``OMNIGENT_FEATURES``."""
 
+    SESSION_ORCHESTRATION = "session_orchestration"
     USAGE_PAGE = "usage_page"
     HARNESS_INSTALL = "harness_install"
     CANVAS = "canvas"
@@ -47,6 +51,14 @@ class FeatureDefinition:
 
 
 FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
+    FeatureDefinition(
+        feature=Feature.SESSION_ORCHESTRATION,
+        description="Private-owner session messaging and independent worker creation",
+        owner="server",
+        review_by_release="0.22.0",
+        frontend_visible=False,
+        default_enabled=True,
+    ),
     FeatureDefinition(
         feature=Feature.AUTOMATIONS_V2,
         description=(
@@ -148,6 +160,18 @@ class FeatureFlags:
     def enabled_names(self) -> tuple[str, ...]:
         """Return enabled canonical names in stable order."""
         return tuple(sorted(feature.value for feature in self.enabled_features))
+
+
+HarnessInstallGate = bool | Callable[[], bool]
+
+
+def harness_install_enabled(gate: HarnessInstallGate) -> bool:
+    """Resolve the harness-install gate for the current request."""
+    try:
+        return bool(gate() if callable(gate) else gate)
+    except Exception:  # deployment gates fail closed
+        _logger.warning("harness_install gate failed; disabling harness setup", exc_info=True)
+        return False
 
 
 def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFlags:

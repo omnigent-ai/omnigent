@@ -449,3 +449,95 @@ wheels = [
     assert process.returncode == 0, process.stderr
     merged = any(call[:2] == ["pr", "merge"] for call in calls)
     assert merged is (finding == "clean"), process.stdout
+
+
+@pytest.mark.parametrize(
+    "name,old,new,allowed",
+    [
+        ("opentelemetry-distro", "0.65b0", "0.66b1", True),
+        ("opentelemetry-instrumentation-fastapi", "0.66b0", "0.66b1", True),
+        ("opentelemetry-distro", "0.66.0", "0.67.0", True),
+        ("opentelemetry-distro", "0.66.0", "0.67b1", False),
+        ("opentelemetry-distro", "0.66b1", "0.67.0", False),
+        ("opentelemetry-distro", "0.66b1", "0.67.0b1", False),
+        ("opentelemetry-distro", "0.66b1", "0.67a1", False),
+        ("opentelemetry-distro", "0.66b1", "0.67b1.post1", False),
+        ("opentelemetry-distro", "0.66b1", "0.65b0", False),
+        ("opentelemetry-distro", "0.66b1", "0.66rc1", False),
+        ("opentelemetry-instrumentation-unlisted", "0.65b0", "0.66b1", False),
+        ("ordinary-library", "0.65b0", "0.66b1", False),
+        ("opentelemetry-distro", "0.66b1", "1.0b1", False),
+    ],
+)
+def test_explicit_otel_beta_families(policy_module, ordinary_policy, name, old, new, allowed):
+    if allowed:
+        policy_module.package_upgrade(name, old, new, ordinary_policy["python"])
+        requirement = f"{name}>={old}"
+        assert (
+            policy_module.python_requirement_upgrade(
+                requirement, f"{name}>={new}", ordinary_policy["python"]
+            )[0]
+            == name
+        )
+    else:
+        with pytest.raises(policy_module.NeedsReview):
+            policy_module.package_upgrade(name, old, new, ordinary_policy["python"])
+
+
+@pytest.mark.parametrize("previous", [None, "0.65b0"])
+def test_named_otel_beta_transitives_can_be_added_or_upgraded(
+    policy_module, ordinary_policy, previous
+):
+    name = "opentelemetry-instrumentation-fastapi"
+    before, after = (tomllib.loads(text) for text in (LOCK, LOCK.replace("0.15.1", "0.15.2")))
+    package = {
+        "name": name,
+        "version": "0.66b1",
+        "source": {"registry": "https://pypi.org/simple"},
+    }
+    if previous:
+        before["package"].append(dict(package, version=previous))
+        before["package"][0]["dependencies"] = [{"name": name}]
+    after["package"].append(package)
+    after["package"][0]["dependencies"] = [{"name": name}]
+    inventory = policy_module.lock_changes(before, after, ordinary_policy)
+    assert {(entry["name"], entry["version"]) for entry in inventory} == {
+        ("ruff", "0.15.2"),
+        (name, "0.66b1"),
+    }
+
+
+def test_beta_update_through_worker_still_requires_advisories(tmp_path, api):
+    name = "opentelemetry-distro"
+    old = LOCK.replace("ruff", name).replace("0.15.1", "0.65b0")
+    new = old.replace("0.65b0", "0.66b1")
+    manifest = f'[project]\ndependencies = ["{name}>=0.65b0"]\n'
+    set_changed_files(
+        api,
+        {
+            "uv.lock": (old, new),
+            "pyproject.toml": (manifest, manifest.replace("0.65b0", "0.66b1")),
+        },
+    )
+    metadata = copy.deepcopy(api["pypi"])
+    metadata["info"]["version"] = "0.66b1"
+    metadata["urls"][0]["url"] = f"https://files.pythonhosted.org/{name}.whl"
+    api["registry"] = {f"https://pypi.org/pypi/{name}/0.66b1/json": metadata}
+    report = api["report"]["Results"][0]
+    report["Packages"] = [{"Name": name, "Version": "0.66b1"}]
+    process, calls = run_cli(tmp_path, api, mode="merge", sweep=True)
+    assert process.returncode == 0, process.stderr
+    assert any(call[:2] == ["pr", "merge"] for call in calls), process.stdout
+    report["Vulnerabilities"].append(
+        {
+            "PkgName": name,
+            "InstalledVersion": "0.66b1",
+            "Severity": "HIGH",
+            "VulnerabilityID": "CVE-beta",
+        }
+    )
+    followup = tmp_path / "advisory"
+    followup.mkdir()
+    process, calls = run_cli(followup, api, mode="merge", sweep=True)
+    assert "CVE-beta" in process.stdout
+    assert not any(call[:2] == ["pr", "merge"] for call in calls)

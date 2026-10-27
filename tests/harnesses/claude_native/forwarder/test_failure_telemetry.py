@@ -30,11 +30,16 @@ from omnigent.native.failure_telemetry import FailureContext
         "unknown_response",
         "unmarked_prose",
         "explicit_hook_detail",
+        "missing_forward_state",
+        "malformed_forward_state",
+        "missing_native_session",
+        "missing_error_text",
+        "unmarked_retained_context",
     ],
 )
 @pytest.mark.asyncio
 async def test_category_only_failure_retains_current_api_error_after_restart(
-    tmp_path: Path, scenario: str
+    tmp_path: Path, scenario: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     bridge_dir = tmp_path / "bridge"
     transcript_path = tmp_path / "session.jsonl"
@@ -73,6 +78,8 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
     }
     if scenario == "explicit_hook_detail":
         hook["error_details"] = "API Error: 401 Invalid token"
+    if scenario == "missing_native_session":
+        hook.pop("session_id")
     bridge.record_hook_event(bridge_dir, hook)
     failures = []
 
@@ -141,6 +148,27 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
                 "later-record" if scenario == "failed_item_after_error" else "current-error"
             )
             assert all(failed_record not in source_id for source_id in persisted.seen_source_ids)
+        if scenario == "missing_forward_state":
+            (bridge_dir / forwarder._FORWARDER_STATE_FILE).unlink()
+        elif scenario == "malformed_forward_state":
+            (bridge_dir / forwarder._FORWARDER_STATE_FILE).write_text("{invalid")
+        elif scenario in {"missing_error_text", "unmarked_retained_context"}:
+            retained = dict(transcript_state.api_error_context or {})
+            if scenario == "missing_error_text":
+                retained.pop("native_error_message")
+            else:
+                retained["native_api_error_message"] = False
+            forwarder._write_forward_state(
+                bridge_dir, replace(transcript_state, api_error_context=retained)
+            )
+        checkpoint_reads: list[Path] = []
+        read_forward_state = forwarder._read_forward_state
+
+        def read_checkpoint(path: Path) -> forwarder.TranscriptForwardState | None:
+            checkpoint_reads.append(path)
+            return read_forward_state(path)
+
+        monkeypatch.setattr(forwarder, "_read_forward_state", read_checkpoint)
         for _ in range(1 if scenario in {"failed_item_after_error", "failed_error_item"} else 2):
             # Both retry attempts use fresh in-memory state; evidence must survive on disk.
             hook_state = await forwarder._forward_available_status_events(
@@ -164,6 +192,25 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
         assert failures[0] == failures[1]
     failure = failures[-1]
     context = failure["failure_context"]
+    expected_context_state = {
+        "explicit_hook_detail": "hook_details_present",
+        "missing_native_session": "native_session_unavailable",
+        "missing_forward_state": "forward_state_unavailable",
+        "malformed_forward_state": "forward_state_unavailable",
+        "different_response": "response_mismatch",
+        "unknown_response": "response_mismatch",
+        "foreign_session": "native_session_mismatch",
+        "subagent_error": "subagent_context",
+        "missing_error_text": "error_text_unavailable",
+        "unmarked_retained_context": "unmarked_error_context",
+        "recovered_turn": "no_api_error_context",
+        "failed_item_after_error": "no_api_error_context",
+        "unmarked_prose": "no_api_error_context",
+    }.get(scenario, "matched")
+    assert context["transcript_error_context_state"] == expected_context_state
+    assert len(checkpoint_reads) == (
+        0 if scenario in {"explicit_hook_detail", "missing_native_session"} else len(failures)
+    )
     assert failure["status"] == "failed"
     assert failure.get("response_id") == response_id
     assert context["failure_source"] == "claude_hook"
@@ -695,24 +742,36 @@ async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["transcript_lookup", "context_assembly"])
+@pytest.mark.parametrize("hook_category", [None, "server_error"])
 async def test_hook_telemetry_failure_does_not_block_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_phase: str,
+    hook_category: str | None,
 ) -> None:
     bridge_dir = tmp_path / "bridge"
+    hook = {"hook_event_name": "StopFailure", "session_id": "native-session"}
+    if hook_category is not None:
+        hook["error"] = hook_category
+    if failure_phase == "context_assembly":
+        hook["error_details"] = "Generation failed."
     bridge.record_hook_event(
         bridge_dir,
-        {
-            "hook_event_name": "StopFailure",
-            "session_id": "native-session",
-            "error": "server_error",
-            "error_details": "Generation failed.",
-        },
+        hook,
     )
 
     def fail(*args: object, **kwargs: object) -> None:
         raise TypeError("synthetic-private-telemetry-data")
 
-    monkeypatch.setattr(forwarder, "_stop_failure_context", fail)
+    monkeypatch.setattr(
+        forwarder,
+        "_stop_failure_context"
+        if failure_phase == "context_assembly"
+        else "_transcript_api_error_for_hook",
+        fail,
+    )
     caplog.set_level(logging.DEBUG, logger=forwarder.__name__)
     requests = []
 
@@ -739,16 +798,29 @@ async def test_hook_telemetry_failure_does_not_block_status(
             )
     assert state.event_cursor == 1
     assert state.byte_offset == (bridge_dir / "hooks.jsonl").stat().st_size
-    assert requests == [
-        {
-            "type": "external_session_status",
-            "data": {
-                "status": "failed",
-                "response_id": "resp_synthetic",
-                "failure_detail": "Generation failed.",
-            },
-        }
-    ]
+    assert len(requests) == 1
+    assert requests[0]["type"] == "external_session_status"
+    data = requests[0]["data"]
+    context = data.pop("failure_context")
+    expected = {"status": "failed", "response_id": "resp_synthetic"}
+    if failure_phase == "context_assembly":
+        expected["failure_detail"] = "Generation failed."
+    elif hook_category is not None:
+        expected["failure_detail"] = "Claude Code ended the turn with an API error (server_error)."
+    assert data == expected
+    assert context["failure_source"] == "claude_hook"
+    assert context["failure_context_error_type"] == "TypeError"
+    assert context["failure_context_error_phase"] == failure_phase
+    assert context["native_harness"] == "claude-native"
+    assert context["native_hook_event"] == "StopFailure"
+    assert context["native_hook_cursor"] == state.event_cursor
+    assert context["native_hook_offset"] == state.byte_offset
+    assert context["native_hook_recorded_at"] > 0
+    assert context["native_session_id"] == "native-session"
+    assert context.get("native_error_category") == hook_category
+    assert context["runner_version"] == forwarder.VERSION
+    assert context["failure_id"]
+    assert "synthetic-private-telemetry-data" not in json.dumps(context)
     assert "Claude hook failure telemetry failed: TypeError" in caplog.text
     assert "synthetic-private-telemetry-data" not in caplog.text
 

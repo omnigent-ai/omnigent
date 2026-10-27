@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import errno
 import json
 import logging
 from collections.abc import Callable
@@ -510,6 +511,32 @@ def test_draining_delivery_reconnects_and_accepts_input_once(
         "synthetic input" not in repr(getattr(record, "attributes", {}))
         for record in caplog.records
     )
+
+
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
+def test_accepted_steer_keeps_unchanged_state_when_disk_is_full(
+    draining_client, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, live_injection: bool
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_steered")
+    before = read_bridge_state(tmp_path)
+    draining_client.delivery_errors = []
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr("omnigent.harnesses.codex_native.bridge.tempfile.mkstemp", disk_full)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    if live_injection:
+        assert asyncio.run(executor.enqueue_session_message("main", "synthetic input"))
+    else:
+        assert [type(event) for event in _collect_turn_events(executor, "synthetic input")] == [
+            TurnComplete
+        ]
+
+    assert draining_client.accepted_inputs == [[{"type": "text", "text": "synthetic input"}]]
+    assert len(draining_client.requests) == 1
+    assert draining_client.requests[0][0] == "turn/steer"
+    assert read_bridge_state(tmp_path) == before
 
 
 @pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])

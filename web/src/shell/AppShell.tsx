@@ -94,6 +94,7 @@ import {
   useDeleteTerminal,
 } from "@/hooks/useTerminals";
 import { useWorkspaceResources } from "./useWorkspaceResources";
+import { useUiOpenFile } from "@/hooks/useUiOpenFile";
 import { citedFilePosition } from "./filePositionState";
 import { cn } from "@/lib/utils";
 import {
@@ -114,6 +115,7 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
+import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import {
   FileViewerContext,
@@ -131,6 +133,7 @@ import { useSettingsRoute } from "./settingsNav";
 import { SubagentsPanel } from "./SubagentsPanel";
 import { useRootSessionId, useSession } from "@/hooks/useSession";
 import { useSessionActionRestrictions } from "@/hooks/useSessionActionRestrictions";
+import { workspaceRecoveryDisabledReason } from "@/lib/sessionCapabilities";
 import {
   TerminalFirstContextProvider,
   type TerminalFirstContextValue,
@@ -796,7 +799,10 @@ function AppShellImpl() {
     !!conversationId &&
     (isKnownTopLevel || isChildSession) &&
     (permissionLevel === null || permissionLevel >= 1);
-  const { forkDisabledReason } = useSessionActionRestrictions(serverConversationId, activeConv);
+  const { forkDisabledReason, forkSandboxProvider } = useSessionActionRestrictions(
+    serverConversationId,
+    activeConv,
+  );
   // Agent tools/policies exist to show.
   const hasAgentInfo =
     serverConversationId != null && agentHasInfo(boundAgent, serverConversationId);
@@ -1442,6 +1448,8 @@ function AppShellImpl() {
     },
     [commitFileNavigation],
   );
+
+  useUiOpenFile(serverConversationId, showFilesPanel, openFileViewer);
 
   // Strip the file-viewer URL params (file/diff/comment). Memoized on
   // ``setSearchParams`` so it always closes over react-router's *current*
@@ -2325,6 +2333,7 @@ function AppShellImpl() {
       currentSessionId: serverConversationId ?? null,
       canFork: canClone,
       disabledReason: forkDisabledReason,
+      workspaceRecoveryDisabledReason: workspaceRecoveryDisabledReason(forkSandboxProvider),
       openForkDialog: (opts) => {
         const sourceSessionId =
           opts?.sourceSessionId && opts.sourceSessionId !== serverConversationId
@@ -2346,7 +2355,7 @@ function AppShellImpl() {
         setForkOpen(true);
       },
     }),
-    [canClone, forkDisabledReason, queryClient, serverConversationId],
+    [canClone, forkDisabledReason, forkSandboxProvider, queryClient, serverConversationId],
   );
   const workspacePanelVisible = Boolean(
     conversationId &&
@@ -2501,6 +2510,7 @@ function AppShellImpl() {
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
+                    createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}

@@ -17,7 +17,7 @@ import pytest
 from fastapi import FastAPI
 
 from omnigent.server.app import ServerInfoResponse
-from omnigent.server.feature_flags import Feature, FeatureFlags
+from omnigent.server.routes.sessions import CLIENT_SESSION_EVENT_TYPES
 from omnigent.stores.agent_store import AgentStore
 
 pytestmark = pytest.mark.asyncio
@@ -108,8 +108,16 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert data["installable_harnesses"] == []
     # Gates the web's archive worktree prompt; older servers omit it.
     assert data["archive_worktree_cleanup"] is True
+    # Gates the palette's grouped session search; older servers omit it.
+    assert data["session_search_scope"] is True
     assert data["agent_detail"] is True
     assert data["agent_config_edit"] is True
+    # Gates the web's /clear for native sessions; older servers reject it.
+    assert data["session_event_types"] == sorted(CLIENT_SESSION_EVENT_TYPES)
+    assert "clear" in data["session_event_types"]
+    # Browser-posted despite its prefix; runner-only events stay unadvertised.
+    assert "external_btw_dismiss" in data["session_event_types"]
+    assert "external_output_text_delta" not in data["session_event_types"]
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
@@ -120,6 +128,8 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     assert ServerInfoResponse.model_validate(data).agent_detail is False
     del data["agent_config_edit"]
     assert ServerInfoResponse.model_validate(data).agent_config_edit is False
+    del data["session_event_types"]
+    assert ServerInfoResponse.model_validate(data).session_event_types == []
 
 
 async def test_info_disables_config_edit_for_unsupported_store(
@@ -172,8 +182,7 @@ async def test_info_advertises_installable_harnesses_when_enabled(
     """
     from omnigent.onboarding.harness_install import ui_installable_harnesses
 
-    enabled = FeatureFlags(frozenset({Feature.HARNESS_INSTALL}))
-    monkeypatch.setattr(app.state, "feature_flags", enabled)
+    monkeypatch.setattr(app.state, "harness_install", True)
     resp = await client.get("/v1/info")
     assert resp.status_code == 200
     data = resp.json()

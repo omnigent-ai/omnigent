@@ -5,11 +5,12 @@ Claude Code takes its input box back from ``!`` shell mode on Escape only while
 the shell draft is empty; a typed command keeps the box in shell mode. The
 bridge clears such a command with Ctrl+U, which Claude Code applies to the line
 and then, at the start of the line, to the mode. The fake input box below
-reproduces that behaviour of Claude Code 2.1.299.
+reproduces that behaviour, including multi-line edits, of Claude Code 2.1.310.
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -24,6 +25,7 @@ from omnigent.harnesses.claude_native.bridge import (
 
 _RULE = "──────────────────────────────"
 _CTRL_U = "\x1b[117;5u"
+_CTRL_K = "\x1b[107;5u"
 
 
 class _InputBox:
@@ -31,37 +33,53 @@ class _InputBox:
     Claude Code's input box as far as shell mode is concerned.
 
     :param mode: ``"bash"`` for shell mode, ``"prompt"`` for chat input.
-    :param draft: Text in the box, with the cursor at its end.
+    :param draft: Text in the box.
+    :param cursor: Cursor offset; ``None`` places it at the end.
     """
 
-    def __init__(self, mode: str, draft: str) -> None:
+    def __init__(self, mode: str, draft: str, *, cursor: int | None = None) -> None:
         self.mode = mode
         self.draft = draft
+        self.cursor = len(draft) if cursor is None else cursor
         self.submitted: list[tuple[str, str]] = []
 
     def pane(self) -> str:
         glyph = "!" if self.mode == "bash" else "❯"
         footer = "  ! for shell mode" if self.mode == "bash" else "  ? for shortcuts"
-        return f"{_RULE}\n{glyph} {self.draft}\n{_RULE}\n{footer}\n"
+        first, *rest = self.draft.split("\n")
+        rows = [f"{glyph} {first}", *(f"  {row}" for row in rest)]
+        return "\n".join([_RULE, *rows, _RULE, footer]) + "\n"
 
     def key(self, key: str) -> None:
         if key in (_CTRL_U, "C-u"):
             # Clears the line; at the start of the line it leaves shell mode.
-            if self.draft:
-                self.draft = ""
-            else:
+            if self.cursor == 0:
                 self.mode = "prompt"
+            else:
+                start = self.draft.rfind("\n", 0, self.cursor) + 1
+                if start == self.cursor and self.cursor:
+                    start -= 1
+                self.draft = self.draft[:start] + self.draft[self.cursor :]
+                self.cursor = start
+        elif key == _CTRL_K:
+            end = self.draft.find("\n", self.cursor)
+            end = len(self.draft) if end == -1 else end
+            if end == self.cursor and end < len(self.draft):
+                end += 1
+            self.draft = self.draft[: self.cursor] + self.draft[end:]
         elif key == "Escape":
             # Shell mode ends only with the cursor at the start of an empty draft.
             if self.mode == "bash" and not self.draft:
                 self.mode = "prompt"
-        elif key in ("\x1b[97;5u", "\x1b[107;5u"):
-            self.draft = ""
+        elif key == "\x1b[97;5u":
+            self.cursor = self.draft.rfind("\n", 0, self.cursor) + 1
         elif key == "Space":
-            self.draft += " "
+            self.draft = self.draft[: self.cursor] + " " + self.draft[self.cursor :]
+            self.cursor += 1
         elif key == "Enter":
             self.submitted.append((self.mode, self.draft.strip()))
             self.draft = ""
+            self.cursor = 0
 
 
 def _patch_tmux(
@@ -90,11 +108,14 @@ def _patch_tmux(
         calls.append(cmd)
         if "paste-buffer" in cmd:
             box.draft = content
+            box.cursor = len(content)
         elif "send-keys" in cmd:
             if "-l" in cmd and cmd[-1].startswith("/"):
                 box.draft = cmd[-1]
+                box.cursor = len(box.draft)
             else:
-                box.key(cmd[-1])
+                for key in re.findall(r"\x1b\[\d+;5u|[^\x1b]+", cmd[-1]):
+                    box.key(key)
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr("subprocess.run", _fake_run)
@@ -120,7 +141,6 @@ def test_a_shell_mode_draft_is_cleared_and_the_message_delivered(
     inject_user_message(bridge_dir, content="hello from the web")
 
     keys = _keys(calls)
-    assert keys[:2] == [_CTRL_U, _CTRL_U], f"The shell draft must be cleared first; sent {keys}."
     assert "Escape" not in keys, f"Escape cannot clear a shell draft; sent {keys}."
     assert box.submitted == [("prompt", "hello from the web")]
 
@@ -140,17 +160,29 @@ def test_an_empty_shell_mode_box_is_still_escaped(
     assert box.submitted == [("prompt", "hi")]
 
 
+@pytest.mark.parametrize("draft", ["one\ntwo\nthree", "\none\ntwo"])
+@pytest.mark.parametrize("cursor", [0, 6, None], ids=["start", "middle", "end"])
+def test_a_multiline_shell_draft_is_cleared_before_web_input(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, draft: str, cursor: int | None
+) -> None:
+    """Line edits reclaim shell drafts without executing any leftover command."""
+    box = _InputBox("bash", draft, cursor=cursor)
+    bridge_dir, _calls = _patch_tmux(monkeypatch, tmp_path, box, content="hello from the web")
+
+    inject_user_message(bridge_dir, content="hello from the web")
+
+    assert box.submitted == [("prompt", "hello from the web")]
+
+
 def test_a_settings_command_clears_a_shell_mode_draft_too(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """The ``/model`` and ``/effort`` path shares the reclaim, so it is not refused either."""
     box = _InputBox("bash", "ls -la")
-    bridge_dir, calls = _patch_tmux(monkeypatch, tmp_path, box, content="")
+    bridge_dir, _calls = _patch_tmux(monkeypatch, tmp_path, box, content="")
 
     inject_slash_command(bridge_dir, command="/effort high")
 
-    keys = _keys(calls)
-    assert keys[:2] == [_CTRL_U, _CTRL_U], f"The shell draft must be cleared first; sent {keys}."
     assert box.submitted == [("prompt", "/effort high")]
 
 

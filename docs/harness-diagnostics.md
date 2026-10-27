@@ -203,6 +203,11 @@ classes. `native_launch_os_errno`, `native_launch_os_errno_name`, and
 chain. Missing fields mean unavailable evidence. These fields contain no raw
 exception messages, paths, arguments, or pane output.
 
+`native_launch_code_origin` identifies the last available Omnigent module,
+function, and line in the exception traceback, falling back to the available
+leaf when no framework frame exists. It names the launch operation without
+exporting its filesystem path; an exception without a traceback omits it.
+
 Older runners can omit the context; malformed and unknown fields are ignored.
 The context does not change error codes, display text, status handling, or
 retry policy, and does not add failure records.
@@ -318,11 +323,17 @@ evidence of the cause. If the server fills in absent detail from stored assistan
 output, it records `detail_source=assistant_output_fallback`; if it finds no
 output, it records `detail_source=missing`.
 
+If Claude hook evidence collection raises, the failed status still carries the
+hook identity, category when present, and runner version. Its
+`failure_context_error_phase` and `failure_context_error_type` describe the
+diagnostic failure, not the native turn's cause; no exception text is added.
+
 | Attributes | Source and meaning |
 | --- | --- |
 | `failure_source`, `detail_source` | Distinguish Claude hooks, explicit transcript API errors, forwarder delivery failures, and legacy external status data |
 | `failure_id` | Stable observation identity across forwarding retries; deduplicate observations by this ID |
 | `native_error_category` | Original hook category, retained even when last-assistant text is also present |
+| `transcript_error_context_state` | Why a failed parent hook reused or declined the retained transcript API error; `hook_details_present` means the hook supplied its own detail and no lookup ran |
 | `native_error_message` | Bounded, redacted text from an explicit API-error record or formatted API-error payload, before display rewriting |
 | `native_session_id`, `native_agent_id`, `native_agent_role` | Native actor identity when supplied or established by the existing hook suppression rules |
 | `native_hook_event`, `native_hook_cursor`, `native_hook_offset`, `native_hook_recorded_at` | Original hook position and timestamp; not the time of a retry |
@@ -338,6 +349,18 @@ The server also retains typed provider fields from explicit failed-status
 another JSON error. Parsing is limited to 16,384 characters and three envelopes; malformed
 or unmarked text adds no inferred facts. Stored assistant prose and idle or
 cancelled status edges are not parsed for provider facts.
+
+For category-only Claude hooks, `transcript_error_context_state` distinguishes
+`matched`, `forward_state_unavailable`, `native_session_unavailable`,
+`response_mismatch`, `no_api_error_context`, `unmarked_error_context`,
+`native_session_mismatch`, `subagent_context`, and `error_text_unavailable`.
+An unavailable forwarder checkpoint may be missing, unreadable or malformed;
+it does not establish that the transcript file is missing. No retained API-error
+context can mean it was never observed or was cleared by later output. These
+states explain the existing lookup decision without reading the transcript or
+diagnostic files again, exporting their paths, or inferring a provider cause.
+The runner and server both need the updated failure-context normalizer; older
+servers drop this field.
 
 `provider_error_type`, `provider_error_code`, `provider_error_param`, available
 HTTP status and explicitly named request IDs reach the existing failure record
@@ -556,3 +579,18 @@ the process and reader states with its tail. With the flag unset or `0`, confirm
 `stderr_reader_state = 'failed'` and `stderr_reader_error_type = 'ValueError'`
 distinguishes a failed drain from a live reader with an otherwise stalled
 startup. Use the return code and adjacent lifecycle events to interpret it.
+
+
+For failed status events, `session_turn_failed` also records the incoming error,
+code, message, output, detail, context, and response-ID field availability under
+`failure_wire_*`. These observations precede server detail enrichment and contain
+no event text. Existing normalized native hook metadata remains on the same row.
+`active_response_id_at_failure` names the server's cached response when available;
+it is an observation, not proof that a bare status belongs to that response.
+
+`failure_connection_source=relay_stream` identifies the connection retained by
+the stream response, with its advertised version, connection ID, and generation.
+A replacement tunnel does not change that snapshot. For external status posts,
+`bound_runner_at_intake` describes the currently bound local runner and does not
+claim it sent the event. An absent local connection is explicitly unavailable;
+it may be owned by another server replica. No version is inferred from the server.

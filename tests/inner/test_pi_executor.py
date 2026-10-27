@@ -1962,10 +1962,8 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         encoding="utf-8",
     )
     (global_agent / "npm").mkdir()
-    monkeypatch.setattr(
-        "omnigent.inner.pi_settings.DEFAULT_PI_AGENT_DIR",
-        global_agent,
-    )
+    (global_agent / "mcp.json").write_text('{"mcpServers": {"custom": {}}}', encoding="utf-8")
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(global_agent))
     with (
         patch("omnigent.inner.pi_executor._find_pi_cli", return_value="/usr/bin/pi"),
         patch(
@@ -1985,6 +1983,7 @@ def test_gateway_seeds_managed_settings_from_global_agent(
         assert settings["extensions"] == ["/ext/demo.ts"]
         assert settings["packages"] == ["npm:@x/y"]
         assert (managed_dir / "npm").is_symlink()
+        assert (managed_dir / "mcp.json").resolve() == (global_agent / "mcp.json").resolve()
     finally:
         shutil.rmtree(config.tmp_dir, ignore_errors=True)
 
