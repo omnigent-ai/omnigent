@@ -14,7 +14,7 @@ import socket
 import time
 import uuid
 from collections import Counter
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1936,9 +1936,12 @@ async def _ensure_local_codex_resume_rollout(
     has diverged. Before fetching that transcript, we best-effort replay any
     proven-undelivered dead letters so successful recovery is reflected in the
     same snapshot. If server history is temporarily unavailable, a valid local
-    rollout remains a best-effort fallback. A successful server fetch wins even
-    when its committed history is empty or shorter than the local file;
-    local-only records are intentionally discarded.
+    rollout remains a best-effort fallback. A successful server fetch wins over
+    divergent local-only records, even when its committed history is empty.
+    The one exception is a local rollout carrying assistant replies the server
+    transcript lacks: Omnigent never deletes committed items, so that gap means
+    the transcript forwarder failed to mirror completed turns, and rebuilding
+    would erase the native conversation. Such a rollout is kept as is.
 
     :param client: HTTP client pointed at the Omnigent server.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -1988,6 +1991,17 @@ async def _ensure_local_codex_resume_rollout(
             )
             return existing
         raise
+    existing = _find_codex_rollout(codex_home, external_session_id)
+    if existing is not None and _local_rollout_outruns_server_history(
+        existing, items, external_session_id=external_session_id
+    ):
+        _logger.warning(
+            "Server history for %r lacks assistant replies that the local Codex "
+            "rollout %s carries; keeping the local rollout instead of rebuilding it",
+            session_id,
+            existing,
+        )
+        return existing
     from omnigent.inner.native_attachments import resolve_session_item_file_references
 
     # History stores attachments as raw file_ids; restore the files so the
@@ -2100,6 +2114,81 @@ def _is_resumable_codex_rollout(path: Path, *, external_session_id: str) -> bool
     except (OSError, UnicodeDecodeError):
         return False
     return False
+
+
+def _assistant_reply_texts(payloads: Iterable[object]) -> Counter[str]:
+    """Count the non-empty assistant message texts among ``response_item`` payloads."""
+    replies: Counter[str] = Counter()
+    for payload in payloads:
+        if (
+            not isinstance(payload, dict)
+            or payload.get("type") != "message"
+            or payload.get("role") != "assistant"
+        ):
+            continue
+        content = payload.get("content")
+        blocks = content if isinstance(content, list) else []
+        text = "".join(
+            block["text"]
+            for block in blocks
+            if isinstance(block, dict) and isinstance(block.get("text"), str)
+        ).strip()
+        if text:
+            replies[text] += 1
+    return replies
+
+
+def _local_rollout_outruns_server_history(
+    rollout: Path,
+    items: list[_JsonObject],
+    *,
+    external_session_id: str,
+) -> bool:
+    """
+    Return whether a valid local rollout carries assistant replies the server lacks.
+
+    Only assistant replies are compared: Codex records its injected context
+    (``<environment_context>``, instructions) as user/developer messages with
+    no server counterpart. A server reply missing from the rollout is
+    divergent history, so the server still wins then.
+
+    :param rollout: Existing ``rollout-*.jsonl`` for the thread.
+    :param items: Committed Omnigent items fetched for the resume.
+    :param external_session_id: Codex thread id the rollout must belong to.
+    :returns: ``True`` when the rollout holds every server reply plus at least
+        one more; ``False`` for an unusable rollout.
+    """
+    if not _is_resumable_codex_rollout(rollout, external_session_id=external_session_id):
+        return False
+    local_payloads: list[object] = []
+    truncated = False
+    try:
+        with rollout.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                if not line.strip():
+                    continue
+                if truncated:
+                    # Malformed records before the end mean corruption, not a
+                    # crash mid-append.
+                    return False
+                try:
+                    record = json.loads(line)
+                except ValueError:
+                    truncated = True
+                    continue
+                if isinstance(record, dict) and record.get("type") == "response_item":
+                    local_payloads.append(record.get("payload"))
+    except (OSError, UnicodeDecodeError):
+        return False
+    local_replies = _assistant_reply_texts(local_payloads)
+    server_replies = _assistant_reply_texts(
+        _codex_response_item_from_session_item(item)
+        for item in items
+        if item.get("type") == "message" and not _is_interrupted_assistant_session_item(item)
+    )
+    if sum(local_replies.values()) <= sum(server_replies.values()):
+        return False
+    return not (server_replies - local_replies)
 
 
 class _CodexResumeHistoryUnavailableError(click.ClickException):

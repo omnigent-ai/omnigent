@@ -303,6 +303,9 @@ def _capture_handler(posted: list[dict[str, Any]]) -> Callable[[httpx.Request], 
         :param request: HTTP request sent by the forwarder.
         :returns: Accepted response.
         """
+        if request.method == "GET" and request.url.path.endswith("/items"):
+            # Committed-history reads before a refused-subscription replay.
+            return httpx.Response(200, json={"data": [], "has_more": False})
         posted.append(json.loads(request.content))
         return httpx.Response(202, json={"queued": False})
 
