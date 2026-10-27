@@ -187,18 +187,6 @@ describe("resolveServerInfo release features", () => {
   });
 });
 
-describe("resolveServerInfo Isaac credential mode", () => {
-  it.each(["auto", "on", "off"] as const)("preserves %s", async (mode) => {
-    const parsed = await probe({ isaac_credential: mode });
-    expect(parsed.isaac_credential).toBe(mode);
-  });
-
-  it.each([undefined, null, "invalid", true])("treats %s as missing", async (mode) => {
-    const parsed = await probe({ isaac_credential: mode });
-    expect(parsed.isaac_credential).toBeUndefined();
-  });
-});
-
 describe("resolveServerInfo session_search_scope", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ session_search_scope: true })).session_search_scope).toBe(true);

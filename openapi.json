@@ -5904,15 +5904,6 @@
             "title": "Installable Harnesses",
             "type": "array"
           },
-          "isaac_credential": {
-            "enum": [
-              "auto",
-              "on",
-              "off"
-            ],
-            "title": "Isaac Credential",
-            "type": "string"
-          },
           "login_url": {
             "anyOf": [
               {
@@ -6027,7 +6018,6 @@
           "smart_routing_sources",
           "features",
           "harness_install_enabled",
-          "isaac_credential",
           "installable_harnesses",
           "dictation_available",
           "branding"

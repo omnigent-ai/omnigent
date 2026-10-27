@@ -32,10 +32,9 @@ implements them separately, so a fix for one harness does not reach the others.
   route are available only while harness repair is enabled and the connected
   host advertises support; older hosts receive no probe, and older servers or
   flag-off servers never cause a new host to spawn one.
-- `isaac-credential-policy`: `/v1/info` exposes `isaac_credential` as `on`,
-  `off`, or `auto`. `on` always offers Isaac, `off` hides it, and `auto` uses
-  host-side Databricks credential detection while failing open for older hosts
-  or servers that cannot report detection results.
+- `isaac-credential-detection`: harness setup offers Isaac when host-side
+  Databricks detection finds a matching credential, and fails open for older
+  hosts or servers that cannot report detection results.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the

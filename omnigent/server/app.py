@@ -203,22 +203,6 @@ class FilesystemAttachmentsInfo(BaseModel):
     all_types: bool
 
 
-IsaacCredentialMode = Literal["auto", "on", "off"]
-
-
-def _coerce_isaac_credential(value: object) -> tuple[IsaacCredentialMode, bool]:
-    """Normalize one deployment-supplied Isaac visibility mode."""
-    if isinstance(value, str):
-        normalized = value.strip().lower()
-        if normalized == "on":
-            return "on", True
-        if normalized == "off":
-            return "off", True
-        if normalized == "auto":
-            return "auto", True
-    return "auto", False
-
-
 class ServerInfoResponse(BaseModel):
     accounts_enabled: bool
     single_user: bool
@@ -242,7 +226,6 @@ class ServerInfoResponse(BaseModel):
     smart_routing_sources: SmartRoutingSourcesInfo
     features: dict[str, bool]
     harness_install_enabled: bool
-    isaac_credential: IsaacCredentialMode
     installable_harnesses: list[str]
     dictation_available: bool
     # The archive PATCH accepts ``delete_worktree``; older servers reject it.
@@ -1403,7 +1386,6 @@ def create_app(
     filesystem_attachment_allowed_extensions: (
         str | list[str] | Callable[[], str | list[str] | None] | None
     ) = None,
-    isaac_credential: IsaacCredentialMode | Callable[[], str] | None = None,
     harness_install: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
@@ -1597,41 +1579,6 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
-    if callable(isaac_credential):
-        _isaac_credential_callable = isaac_credential
-        _isaac_warning_logged = False
-
-        def _warn_isaac_once(message: str, *, exc_info: bool = False) -> None:
-            nonlocal _isaac_warning_logged
-            if _isaac_warning_logged:
-                return
-            _isaac_warning_logged = True
-            _logger.warning(message, exc_info=exc_info)
-
-        def app_isaac_credential() -> IsaacCredentialMode:
-            try:
-                raw_value = _isaac_credential_callable()
-            except Exception:  # noqa: BLE001 — deployment gates fail open to auto
-                _warn_isaac_once("isaac_credential callable failed; using auto", exc_info=True)
-                return "auto"
-            mode, valid = _coerce_isaac_credential(raw_value)
-            if not valid:
-                _warn_isaac_once("invalid isaac_credential callable value; using auto")
-            return mode
-
-    else:
-        raw_value = (
-            os.environ.get("OMNIGENT_ISAAC_CREDENTIAL", "auto")
-            if isaac_credential is None
-            else isaac_credential
-        )
-        _isaac_credential_static, valid = _coerce_isaac_credential(raw_value)
-        if not valid:
-            _logger.warning("invalid isaac_credential value; using auto")
-
-        def app_isaac_credential() -> IsaacCredentialMode:
-            return _isaac_credential_static
-
     if harness_install is None:
         app_harness_install: bool | Callable[[], bool] = resolved_feature_flags.enabled(
             Feature.HARNESS_INSTALL
@@ -2147,7 +2094,6 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
-    app.state.isaac_credential = app_isaac_credential
     app.state.harness_install = app_harness_install
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
@@ -3379,7 +3325,6 @@ def create_app(
         current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
         frontend_features = app.state.feature_flags.frontend_dict()
         frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
-        current_isaac_credential = app.state.isaac_credential()
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -3419,7 +3364,6 @@ def create_app(
                 "smart_routing_sources": smart_routing_sources,
                 "features": frontend_features,
                 "harness_install_enabled": current_harness_install_enabled,
-                "isaac_credential": current_isaac_credential,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,

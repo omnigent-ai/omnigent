@@ -101,7 +101,6 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     }
     # Compatibility field for frontend builds predating the nested map.
     assert data["harness_install_enabled"] is False
-    assert data["isaac_credential"] == "auto"
     # installable_harnesses is the allowlist the SPA offers setup for; blank
     # while the feature is off so the UI never offers an install the disabled
     # route would reject.

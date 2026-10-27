@@ -80,13 +80,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const canonicalHarness = canonicalNativeHarness(harness);
   const accountKey = harnessAccountKey(harness);
   const credentialFamily = harnessCredentialFamily(harness);
-  const serverInfoLoaded = info !== "loading";
-  const isaacMode = serverInfoLoaded ? info.isaac_credential : undefined;
-  const shouldDetectIsaac = serverInfoLoaded && (isaacMode === undefined || isaacMode === "auto");
-  const detectedCredentials = useDetectedCredentials(
-    hostId,
-    open && credentialFamily !== null && shouldDetectIsaac,
-  );
+  const detectedCredentials = useDetectedCredentials(hostId, open && credentialFamily !== null);
   const loginCommand = useMemo(() => {
     if (accountKey === "codex") return "codex login --device-auth";
     if (accountKey === "pi") return null;
@@ -98,15 +92,10 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   }, [accountKey, canonicalHarness, setupSteps]);
   const isaacSupported =
     credentialFamily !== null &&
-    (isaacMode === "on" ||
-      (shouldDetectIsaac &&
-        (host.harness_accounts === undefined ||
-          detectedCredentials.isError ||
-          detectedCredentials.data?.some((credential) => credential.family === "databricks") ===
-            true)));
-  const credentialDecisionPending =
-    credentialFamily !== null &&
-    (!serverInfoLoaded || (shouldDetectIsaac && detectedCredentials.isPending));
+    (host.harness_accounts_supported !== true ||
+      detectedCredentials.isError ||
+      detectedCredentials.data?.some((credential) => credential.family === "databricks") === true);
+  const credentialDecisionPending = credentialFamily !== null && detectedCredentials.isPending;
   const personalSupported =
     loginCommand !== null && (accountKey === "codex" || accountKey === "claude");
   const hasCredentialCards = isaacSupported || personalSupported;
