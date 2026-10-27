@@ -11298,6 +11298,9 @@ def _reject_server_reserved_label_seed(
         raise OmnigentError(
             "Sandbox profile labels are server-owned", code=ErrorCode.INVALID_INPUT
         )
+    from omnigent.session_recovery import reject_recovery_labels
+
+    reject_recovery_labels(labels)
     from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
     if any(key.startswith(MCP_SELECTION_PREFIX) for key in labels):
