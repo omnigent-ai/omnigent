@@ -1,7 +1,8 @@
-import { useEffect, useState } from "react";
+import { useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
 import {
   AppWindowIcon,
   ChevronDownIcon,
+  CheckIcon,
   CodeIcon,
   FolderOpenIcon,
   TerminalIcon,
@@ -9,6 +10,7 @@ import {
 import { toast } from "sonner";
 import { authenticatedFetch } from "@/lib/identity";
 import { Button } from "@/components/ui/button";
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from "@/components/ui/tooltip";
 import {
   DropdownMenu,
   DropdownMenuContent,
@@ -33,11 +35,53 @@ import {
   useLocalFileTarget,
 } from "./RevealInFileManager";
 
+const APP_PREFERENCE_EVENT = "omnigent:open-in-app-changed";
+const preferenceKey = (remote: boolean) => `omnigent:open-in-app:${remote ? "remote" : "local"}`;
+
+function readPreferredApp(remote: boolean): string {
+  try {
+    return localStorage.getItem(preferenceKey(remote)) ?? "";
+  } catch {
+    return "";
+  }
+}
+
+function rememberApp(remote: boolean, appId: string) {
+  try {
+    localStorage.setItem(preferenceKey(remote), appId);
+  } catch {
+    // Opening still works if this browser cannot save preferences.
+  }
+  window.dispatchEvent(new Event(APP_PREFERENCE_EVENT));
+}
+
+function subscribeToAppPreference(listener: () => void) {
+  window.addEventListener(APP_PREFERENCE_EVENT, listener);
+  window.addEventListener("storage", listener);
+  return () => {
+    window.removeEventListener(APP_PREFERENCE_EVENT, listener);
+    window.removeEventListener("storage", listener);
+  };
+}
+
+interface OpenInAction {
+  key: string;
+  label: string;
+  icon: ReactNode;
+  active: boolean;
+  onSelect: () => void;
+}
+
 /** Shared actions for the folder header and the file viewer's responsive toolbar. */
-export function useOpenInActions(path: string | null, directory = false) {
+export function useOpenInActions(path: string | null, directory = false): OpenInAction[] {
   const localTarget = useLocalFileTarget(path);
   const target = useHostFileTarget(path);
   const remote = !localTarget;
+  const preferredApp = useSyncExternalStore(
+    subscribeToAppPreference,
+    () => readPreferredApp(remote),
+    () => "",
+  );
   const hostId = target?.hostId;
   const available =
     !!target &&
@@ -106,6 +150,7 @@ export function useOpenInActions(path: string | null, directory = false) {
           ),
           active: false,
           onSelect: () => {
+            rememberApp(remote, app.id);
             if (remote && sshHost) {
               void openRemoteFileInApp(target.hostId, target.path, app.id, sshHost, directory).then(
                 (ok) => {
@@ -129,31 +174,79 @@ export function useOpenInActions(path: string | null, directory = false) {
       label: revealLabel(directory),
       icon: <FolderOpenIcon className="size-4" />,
       active: false,
-      onSelect: () => revealInFileManager(localTarget),
+      onSelect: () => {
+        rememberApp(false, "reveal");
+        revealInFileManager(localTarget);
+      },
     });
   }
+  const defaultAction =
+    actions.find((action) => action.key === preferredApp) ??
+    actions.find((action) => action.key === "vscode" || action.key === "cursor") ??
+    actions[0];
+  for (const action of actions) action.active = action === defaultAction;
   return actions;
 }
 
-export function OpenInMenu({ path, directory = false }: { path: string; directory?: boolean }) {
-  const actions = useOpenInActions(path, directory);
-  if (!actions.length) return null;
+export function OpenInSplitButton({
+  actions,
+  interactive = true,
+}: {
+  actions: OpenInAction[];
+  interactive?: boolean;
+}) {
+  const defaultAction = actions.find((action) => action.active) ?? actions[0];
+  if (!defaultAction) return null;
+  const label =
+    defaultAction.key === "reveal" ? defaultAction.label : `Open in ${defaultAction.label}`;
   return (
     <DropdownMenu>
-      <DropdownMenuTrigger asChild>
-        <Button type="button" variant="ghost" size="sm" className="shrink-0" aria-label="Open in…">
-          Open in…
-          <ChevronDownIcon />
-        </Button>
-      </DropdownMenuTrigger>
+      <div role="group" aria-label="Open in" className="inline-flex shrink-0">
+        <TooltipProvider>
+          <Tooltip>
+            <TooltipTrigger asChild>
+              <Button
+                type="button"
+                variant="outline"
+                size="icon-sm"
+                className="rounded-r-none border-r-0"
+                aria-label={label}
+                tabIndex={interactive ? undefined : -1}
+                onClick={interactive ? defaultAction.onSelect : undefined}
+              >
+                {defaultAction.icon}
+              </Button>
+            </TooltipTrigger>
+            <TooltipContent>{label}</TooltipContent>
+          </Tooltip>
+        </TooltipProvider>
+        <DropdownMenuTrigger asChild>
+          <Button
+            type="button"
+            variant="outline"
+            size="icon-sm"
+            className="w-6 rounded-l-none"
+            aria-label="Choose app to open in"
+            tabIndex={interactive ? undefined : -1}
+          >
+            <ChevronDownIcon />
+          </Button>
+        </DropdownMenuTrigger>
+      </div>
       <DropdownMenuContent align="end">
         {actions.map((action) => (
-          <DropdownMenuItem key={action.key} onSelect={action.onSelect}>
+          <DropdownMenuItem key={action.key} onSelect={interactive ? action.onSelect : undefined}>
             {action.icon}
             {action.label}
+            {action.active && <CheckIcon className="ml-auto size-4" />}
           </DropdownMenuItem>
         ))}
       </DropdownMenuContent>
     </DropdownMenu>
   );
+}
+
+export function OpenInMenu({ path, directory = false }: { path: string; directory?: boolean }) {
+  const actions = useOpenInActions(path, directory);
+  return <OpenInSplitButton actions={actions} />;
 }

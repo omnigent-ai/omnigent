@@ -1756,7 +1756,7 @@ describe("FileViewer view-settings menu", () => {
     expect(revealFile).toHaveBeenCalledWith("this-mac", "/repo/file1.py");
   });
 
-  it("opens the selected file from the menu beside Copy link", async () => {
+  it("opens the selected file directly beside Copy link", async () => {
     const openFileInApp = vi.fn().mockResolvedValue(true);
     vi.stubGlobal("omnigentDesktop", {
       kind: "electron",
@@ -1770,11 +1770,10 @@ describe("FileViewer view-settings menu", () => {
         {viewerTree({ open: true })}
       </FileViewerContext.Provider>,
     );
-    const openIn = await screen.findByRole("button", { name: "Open in…" });
+    const openIn = await screen.findByRole("button", { name: "Open in VS Code" });
     const copy = screen.getByRole("button", { name: "Copy link to file" });
     expect(copy.compareDocumentPosition(openIn) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
-    fireEvent.pointerDown(openIn, { button: 0 });
-    fireEvent.click(screen.getByRole("menuitem", { name: "VS Code" }));
+    fireEvent.click(openIn);
     expect(openFileInApp).toHaveBeenCalledWith("this-mac", "/repo/file1.py", "vscode");
   });
 

@@ -11,7 +11,7 @@
 
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
 import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
-import { useOpenInActions } from "./OpenInMenu";
+import { OpenInSplitButton, useOpenInActions } from "./OpenInMenu";
 import {
   dismissFilePosition,
   isFilePositionDismissed,
@@ -1139,8 +1139,8 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
-    /** Keep independent actions grouped in a submenu when the toolbar collapses. */
-    nestedMenu?: boolean;
+    /** Keep the default action directly available beside its app picker. */
+    splitMenu?: boolean;
   }
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
@@ -1362,10 +1362,9 @@ function FileViewerBody({
     toolbarActions.push({
       key: "open-in",
       label: "Open in…",
-      textLabel: "Open in…",
       icon: null,
       menu: openInActions,
-      nestedMenu: true,
+      splitMenu: true,
     });
   }
 
@@ -1397,7 +1396,9 @@ function FileViewerBody({
   // measurement clone so it stays out of the tab order / a11y tree.
   const renderActionButtons = (interactive: boolean) =>
     toolbarActions.map((action) =>
-      action.menu ? (
+      action.splitMenu && action.menu ? (
+        <OpenInSplitButton key={action.key} actions={action.menu} interactive={interactive} />
+      ) : action.menu ? (
         // A settings menu: one trigger opening a list of independent items
         // (toggles + actions). Toggles carry `keepOpen` so the menu stays open
         // as the user flips them; actions close it on select.
@@ -1640,36 +1641,58 @@ function FileViewerBody({
               )}
             </span>
           )}
-          {/* Responsive action switcher: inline icon buttons until they no
-              longer fit (decided by useToolbarOverflow from the header width),
-              then a single "⋯" menu with the same options. The offscreen clone
-              below measures the full row's natural width. */}
+          {/* Collapse overflowing actions into "⋯", keeping the Open in split
+              button visible. The offscreen clone measures the full row. */}
           <div className="flex items-center justify-end gap-1">
             {toolbarCollapsed ? (
-              <DropdownMenu>
-                <DropdownMenuTrigger asChild>
-                  <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
-                    <MoreHorizontalIcon className="size-4" />
-                  </Button>
-                </DropdownMenuTrigger>
-                <DropdownMenuContent align="end" className="w-auto min-w-40">
-                  {toolbarActions.map((action) =>
-                    action.options || action.nestedMenu ? (
-                      // Keep view-mode choices and app destinations grouped
-                      // in submenus when the toolbar collapses.
-                      <DropdownMenuSub key={action.key}>
-                        <DropdownMenuSubTrigger className="whitespace-nowrap">
-                          {action.icon}
-                          {action.tooltip ?? action.label}
-                        </DropdownMenuSubTrigger>
-                        <DropdownMenuSubContent>
-                          {(action.options ?? action.menu ?? []).map((option) => (
+              <>
+                <DropdownMenu>
+                  <DropdownMenuTrigger asChild>
+                    <Button type="button" variant="ghost" size="icon-sm" aria-label="More actions">
+                      <MoreHorizontalIcon className="size-4" />
+                    </Button>
+                  </DropdownMenuTrigger>
+                  <DropdownMenuContent align="end" className="w-auto min-w-40">
+                    {toolbarActions
+                      .filter((action) => !action.splitMenu)
+                      .map((action) =>
+                        action.options ? (
+                          // Keep view-mode choices grouped in a submenu.
+                          <DropdownMenuSub key={action.key}>
+                            <DropdownMenuSubTrigger className="whitespace-nowrap">
+                              {action.icon}
+                              {action.tooltip ?? action.label}
+                            </DropdownMenuSubTrigger>
+                            <DropdownMenuSubContent>
+                              {action.options.map((option) => (
+                                <DropdownMenuItem
+                                  key={option.key}
+                                  className={cn(
+                                    "whitespace-nowrap",
+                                    option.active && "bg-muted dark:bg-muted/50",
+                                  )}
+                                  onSelect={(e) => {
+                                    if (option.keepOpen) e.preventDefault();
+                                    option.onSelect();
+                                  }}
+                                >
+                                  {option.icon}
+                                  {option.label}
+                                  {option.active && !option.noActiveCheck && (
+                                    <CheckIcon className="ml-auto size-4" />
+                                  )}
+                                </DropdownMenuItem>
+                              ))}
+                            </DropdownMenuSubContent>
+                          </DropdownMenuSub>
+                        ) : action.menu ? (
+                          // The settings menu's items are already independent
+                          // toggles/actions, so flatten them straight into this "⋯"
+                          // overflow rather than nesting a "⋯"-in-"⋯" submenu.
+                          action.menu.map((option) => (
                             <DropdownMenuItem
                               key={option.key}
-                              className={cn(
-                                "whitespace-nowrap",
-                                option.active && "bg-muted dark:bg-muted/50",
-                              )}
+                              className="whitespace-nowrap"
                               onSelect={(e) => {
                                 if (option.keepOpen) e.preventDefault();
                                 option.onSelect();
@@ -1681,42 +1704,22 @@ function FileViewerBody({
                                 <CheckIcon className="ml-auto size-4" />
                               )}
                             </DropdownMenuItem>
-                          ))}
-                        </DropdownMenuSubContent>
-                      </DropdownMenuSub>
-                    ) : action.menu ? (
-                      // The settings menu's items are already independent
-                      // toggles/actions, so flatten them straight into this "⋯"
-                      // overflow rather than nesting a "⋯"-in-"⋯" submenu.
-                      action.menu.map((option) => (
-                        <DropdownMenuItem
-                          key={option.key}
-                          className="whitespace-nowrap"
-                          onSelect={(e) => {
-                            if (option.keepOpen) e.preventDefault();
-                            option.onSelect();
-                          }}
-                        >
-                          {option.icon}
-                          {option.label}
-                          {option.active && !option.noActiveCheck && (
-                            <CheckIcon className="ml-auto size-4" />
-                          )}
-                        </DropdownMenuItem>
-                      ))
-                    ) : (
-                      <DropdownMenuItem
-                        key={action.key}
-                        className="whitespace-nowrap"
-                        onSelect={action.onSelect}
-                      >
-                        {action.icon}
-                        {action.tooltip ?? action.label}
-                      </DropdownMenuItem>
-                    ),
-                  )}
-                </DropdownMenuContent>
-              </DropdownMenu>
+                          ))
+                        ) : (
+                          <DropdownMenuItem
+                            key={action.key}
+                            className="whitespace-nowrap"
+                            onSelect={action.onSelect}
+                          >
+                            {action.icon}
+                            {action.tooltip ?? action.label}
+                          </DropdownMenuItem>
+                        ),
+                      )}
+                  </DropdownMenuContent>
+                </DropdownMenu>
+                <OpenInSplitButton actions={openInActions} />
+              </>
             ) : (
               renderActionButtons(true)
             )}

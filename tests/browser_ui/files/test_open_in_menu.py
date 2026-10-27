@@ -31,7 +31,11 @@ def test_open_folder_and_file_in_app(
 ) -> None:
     session = seeded_session
     sid = session.session_id
-    path = "src/main.md"
+    path = (
+        "src/components/file-browser/toolbars/main.md"
+        if width == 360 and host_id == "local"
+        else "src/main.md"
+    )
     _mock_markdown_files(page, session, {path: "# Open in an editor\n\nWorkspace document."})
     session.contract.json(
         f"/v1/sessions/{sid}",
@@ -97,14 +101,16 @@ def test_open_folder_and_file_in_app(
     page.goto(f"{session.contract.base_url}/c/{sid}")
     rail = page.get_by_role("complementary", name="Workspace")
     rail.get_by_role("tab", name=re.compile("^Files")).click()
-    folder_open = rail.get_by_role("button", name="Open in…", exact=True)
+    folder_open = rail.get_by_role("button", name="Choose app to open in", exact=True)
     if host_id == "remote":
         page.wait_for_function("window.__sshDiscoveryDone === true")
         expect(folder_open).to_have_count(0)
         rail.get_by_text("main.md", exact=True).click()
         viewer = rail.get_by_test_id("file-viewer")
         expect(viewer).to_be_visible()
-        expect(viewer.get_by_role("button", name="Open in…", exact=True)).to_have_count(0)
+        expect(
+            viewer.get_by_role("button", name="Choose app to open in", exact=True)
+        ).to_have_count(0)
         # With fewer actions the toolbar fits inline, even in a narrow panel.
         expect(viewer.get_by_role("button", name="Copy link to file")).to_be_visible()
         expect(page.get_by_role("dialog")).to_have_count(0)
@@ -113,44 +119,59 @@ def test_open_folder_and_file_in_app(
         return
     expect(folder_open).to_be_visible()
     copy_folder = rail.get_by_role("button", name="Copy folder path: workspace")
-    assert copy_folder.bounding_box()["x"] < folder_open.bounding_box()["x"]
-    folder_open.click()
-    expect(page.get_by_role("menuitem", name="VS Code", exact=True)).to_be_visible()
-    page.screenshot(path=str(tmp_path / "folder-menu.png"), animations="disabled")
-    if host_id == "local":
-        page.get_by_role("menuitem", name="Terminal", exact=True).click()
-        expected_folder = ["local", host_id, "/workspace", "terminal"]
-    else:
-        expect(page.get_by_role("menuitem", name="Terminal", exact=True)).to_have_count(0)
-        expect(page.get_by_role("menuitem", name="Default app", exact=True)).to_have_count(0)
-        page.get_by_role("menuitem", name="Cursor", exact=True).click()
-        expected_folder = ["remote", host_id, "/workspace", "cursor", ssh_host, True]
+    default_folder = rail.get_by_role("button", name="Open in VS Code", exact=True)
+    assert (
+        copy_folder.bounding_box()["x"]
+        < default_folder.bounding_box()["x"]
+        < folder_open.bounding_box()["x"]
+    )
+    page.screenshot(path=str(tmp_path / "folder-split-button.png"), animations="disabled")
+    default_folder.click()
+    expected_folder = (
+        ["local", host_id, "/workspace", "vscode"]
+        if host_id == "local"
+        else ["remote", host_id, "/workspace", "vscode", ssh_host, True]
+    )
     page.wait_for_function("window.__openInCalls.length === 1")
     assert page.evaluate("window.__openInCalls") == [expected_folder]
+    expect(page.get_by_role("menu")).to_have_count(0)
+    folder_open.click()
+    page.screenshot(path=str(tmp_path / "folder-menu.png"), animations="disabled")
+    if host_id != "local":
+        expect(page.get_by_role("menuitem", name="Terminal", exact=True)).to_have_count(0)
+        expect(page.get_by_role("menuitem", name="Default app", exact=True)).to_have_count(0)
+    page.get_by_role("menuitem", name="Cursor", exact=True).click()
+    page.wait_for_function("window.__openInCalls.length === 2")
+    expect(rail.get_by_role("button", name="Open in Cursor", exact=True)).to_be_visible()
 
     rail.get_by_text("main.md", exact=True).click()
     viewer = rail.get_by_test_id("file-viewer")
     expect(viewer).to_be_visible()
-    if width < 500:
-        viewer.get_by_role("button", name="More actions", exact=True).click()
-        # The nested app menu stays available when the toolbar collapses.
-        submenu = page.get_by_role("menuitem", name="Open in…", exact=True)
-        submenu.focus()
-        page.keyboard.press("ArrowRight")
-    else:
-        open_file = viewer.get_by_role("button", name="Open in…", exact=True)
-        expect(open_file).to_be_visible()
-        copy_file = viewer.get_by_role("button", name="Copy link to file")
-        assert copy_file.bounding_box()["x"] < open_file.bounding_box()["x"]
-        open_file.click()
+    if width == 360:
+        expect(viewer.get_by_role("button", name="More actions", exact=True)).to_be_visible()
+    # One-click opening stays visible when the other toolbar actions collapse.
+    default_file = viewer.get_by_role("button", name="Open in Cursor", exact=True)
+    expect(default_file).to_be_visible()
+    expect(viewer.get_by_role("button", name="Choose app to open in", exact=True)).to_be_visible()
+    page.screenshot(path=str(tmp_path / "file-split-button.png"), animations="disabled")
+    default_file.click()
+    page.wait_for_function("window.__openInCalls.length === 3")
+    expected_file = [host_id, f"/workspace/{path}", "cursor"]
+    expected_file = (
+        ["local", *expected_file]
+        if host_id == "local"
+        else ["remote", *expected_file, ssh_host, False]
+    )
+    assert page.evaluate("window.__openInCalls")[2] == expected_file
+    viewer.get_by_role("button", name="Choose app to open in", exact=True).click()
     expect(page.get_by_role("menuitem", name="VS Code", exact=True)).to_be_visible()
     page.screenshot(path=str(tmp_path / "file-menu.png"), animations="disabled")
     page.get_by_role("menuitem", name="VS Code", exact=True).click()
-    page.wait_for_function("window.__openInCalls.length === 2")
+    page.wait_for_function("window.__openInCalls.length === 4")
     expect(page.get_by_role("dialog")).to_have_count(0)
-    expected_file = [host_id, "/workspace/src/main.md", "vscode"]
+    expected_file = [host_id, f"/workspace/{path}", "vscode"]
     if host_id == "local":
         expected_file = ["local", *expected_file]
     else:
         expected_file = ["remote", *expected_file, ssh_host, False]
-    assert page.evaluate("window.__openInCalls")[1] == expected_file
+    assert page.evaluate("window.__openInCalls")[3] == expected_file
