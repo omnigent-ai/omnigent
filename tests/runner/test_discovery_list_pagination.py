@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import json
 from pathlib import Path
@@ -493,6 +494,70 @@ async def test_sys_session_list_continues_server_catalog_with_cursor() -> None:
     assert second["sessions"][0]["session_id"] == "conv_0100"
     assert received_afters == [None, "conv_0099"]
     assert received_visibilities == ["all", "all"]
+
+
+@pytest.mark.asyncio
+async def test_sys_session_list_checks_runner_status_only_for_returned_rows() -> None:
+    """
+    Runner status is resolved for the rows the tool returns, with bounded concurrency.
+
+    The default call fetches 1,000 sessions (each on its own runner) and the
+    output budget keeps 100. Resolving before paging used to fire 1,000
+    concurrent status calls, which bursts the caller's per-user rate limit.
+    """
+    rows = [
+        {
+            "id": f"conv_{index:04d}",
+            "agent_id": f"ag_{index:04d}",
+            "agent_name": "researcher",
+            "title": f"Session {index}",
+            "status": "idle",
+            "runner_id": f"runner_{index:04d}",
+            "parent_session_id": None,
+        }
+        for index in range(1_000)
+    ]
+    status_calls: list[str] = []
+    in_flight = 0
+    max_in_flight = 0
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        nonlocal in_flight, max_in_flight
+        path = request.url.path
+        if path == "/v1/sessions/conv_caller/child_sessions":
+            return httpx.Response(200, json={"data": []})
+        if path == "/v1/sessions/conv_caller":
+            return httpx.Response(200, json={"id": "conv_caller", "parent_session_id": None})
+        if path == "/v1/sessions":
+            return _server_page(request, rows)
+        if path.startswith("/v1/runners/") and path.endswith("/status"):
+            runner_id = path.split("/")[3]
+            status_calls.append(runner_id)
+            in_flight += 1
+            max_in_flight = max(max_in_flight, in_flight)
+            await asyncio.sleep(0.001)
+            in_flight -= 1
+            return httpx.Response(200, json={"runner_id": runner_id, "online": True})
+        raise AssertionError(f"unexpected path {path}")
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        raw = await execute_tool(
+            tool_name="sys_session_list",
+            arguments="{}",
+            server_client=client,
+            conversation_id="conv_caller",
+        )
+
+    result = json.loads(raw)
+    returned_runners = [row["runner_id"] for row in result["sessions"]]
+    assert result["page"]["has_more"] == {"sessions": True}
+    assert len(returned_runners) == 100
+    assert sorted(status_calls) == sorted(returned_runners)
+    assert max_in_flight <= tool_dispatch._RUNNER_STATUS_CONCURRENCY
+    assert all(row["runner_online"] is True for row in result["sessions"])
+    assert len(raw) <= 100_000
 
 
 @pytest.mark.asyncio
