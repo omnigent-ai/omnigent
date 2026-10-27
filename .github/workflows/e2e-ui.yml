@@ -159,7 +159,8 @@ jobs:
     # omits the server, runner, harness CLIs, bubblewrap, tmux, and sidecar.
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}' && (needs.setup.outputs.ui == 'full' || needs.setup.outputs.ui == 'dependency')
-    runs-on: ubuntu-latest
+    # Playwright 1.60 cannot install Chromium on ubuntu-26.04, ubuntu-latest's new image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Checkout
@@ -242,7 +243,8 @@ jobs:
     # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: [setup, build-sidecar]
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    runs-on: ubuntu-latest
+    # Playwright 1.60 cannot install Chromium on ubuntu-26.04, ubuntu-latest's new image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
