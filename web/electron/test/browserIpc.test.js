@@ -543,6 +543,44 @@ it("restores the URL and history state for the requested browser tab only", () =
   );
 });
 
+for (const initialUrl of ["", "about:blank"]) {
+  for (const loadingMethod of ["isLoadingMainFrame", "isLoading"]) {
+    it(`reports the initial pending URL for ${JSON.stringify(initialUrl)} via ${loadingMethod}`, () => {
+      const requestedUrl = "https://example.com/loading";
+      let currentUrl = initialUrl;
+      let loading = true;
+      const webContents = makeWebContents();
+      webContents.getURL = () => currentUrl;
+      webContents[loadingMethod] = () => loading;
+      const { ipcMain, event, registry } = setup({ webContents });
+      registry.get("conv_1").lastRequestedUrl = requestedUrl;
+      const probe = () =>
+        ipcMain.invoke("omnigent:browser-has-view", event, { conversationId: "conv_1" });
+
+      assert.equal(probe().pendingUrl, requestedUrl);
+      currentUrl = "https://example.com/redirected";
+      assert.equal(probe().url, currentUrl);
+      assert.equal("pendingUrl" in probe(), false, "a committed URL supersedes the initial target");
+
+      currentUrl = initialUrl;
+      loading = false;
+      assert.equal("pendingUrl" in probe(), false, "an idle blank view is not pending navigation");
+    });
+  }
+}
+
+it("does not mistake subframe loading for an initial main-frame navigation", () => {
+  const webContents = makeWebContents({ url: "about:blank" });
+  webContents.isLoadingMainFrame = () => false;
+  webContents.isLoading = () => true;
+  const { ipcMain, event, registry } = setup({ webContents });
+  registry.get("conv_1").lastRequestedUrl = "https://example.com/previous";
+  const result = ipcMain.invoke("omnigent:browser-has-view", event, {
+    conversationId: "conv_1",
+  });
+  assert.equal("pendingUrl" in result, false);
+});
+
 describe("browserIpc — trust gate", () => {
   it("registers every browser-* channel", () => {
     const { ipcMain } = setup();

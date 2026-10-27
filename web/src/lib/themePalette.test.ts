@@ -179,6 +179,25 @@ describe("themePalette", () => {
     }
   });
 
+  it("uses each palette background as its dark app-shell base", () => {
+    for (const palette of PALETTES) {
+      expect(palette.tokens.dark.shellBackground, palette.label).toBe("var(--background)");
+    }
+    expect(PALETTES[0].tokens.dark.background).toBe("#0e0b19");
+    expect(PALETTES[0].tokens.dark.sidebar).toBe("#0e0b19");
+  });
+
+  it("uses white as the base for Omnigent dark form controls", () => {
+    const omni = PALETTES.find((palette) => palette.id === "omni")!;
+    expect(omni.tokens.dark.input).toBe("rgb(255 255 255 / 15%)");
+  });
+
+  it("uses the Omnigent brand pink as the primary accent in both modes", () => {
+    const omni = PALETTES.find((palette) => palette.id === "omni")!;
+    expect(omni.tokens.light.primary).toBe("#df3c85");
+    expect(omni.tokens.dark.primary).toBe("#df3c85");
+  });
+
   it.each(PALETTES)("keeps $label links readable on page and table surfaces", (palette) => {
     for (const mode of ["light", "dark"] as const) {
       const { link, background, cardSolid } = palette.tokens[mode];
@@ -195,7 +214,20 @@ describe("themePalette", () => {
     const solarized = PALETTES.find((palette) => palette.id === "solarized");
     expect(solarized?.tokens.light.background).toBe("#fdf6e3");
     expect(solarized?.tokens.dark.background).toBe("#002b36");
-    expect(solarized?.tokens.dark.shellBackground).toBe("#002b36");
+  });
+
+  it("uses GitHub blue for primary colors", () => {
+    const github = PALETTES.find((palette) => palette.id === "github")!;
+
+    expect(github.tokens.light.primary).toBe("#0969da");
+    expect(github.tokens.dark.primary).toBe("#58a6ff");
+  });
+
+  it.each(PALETTES)("drives $label active sidebar colors from its accent", (palette) => {
+    for (const mode of ["light", "dark"] as const) {
+      expect(palette.tokens[mode].sidebarActive).toContain("var(--primary)");
+      expect(palette.tokens[mode].sidebarActiveForeground).toBe("var(--primary)");
+    }
   });
 
   it("keeps Solarized menu highlights distinct from popover surfaces", () => {
@@ -205,12 +237,11 @@ describe("themePalette", () => {
     expect(solarized.tokens.dark.muted).not.toBe(solarized.tokens.dark.popover);
   });
 
-  it("keeps Omnigent's text selection on the brand tint, not the neutral primary", () => {
-    const omni = PALETTES.find((palette) => palette.id === "omni")!;
-    expect(omni.tokens.light.selectionBackground).toBe("rgba(240, 1, 150, 0.1)");
-    expect(omni.tokens.light.selectionForeground).toBe("#651249");
-    expect(omni.tokens.dark.selectionBackground).toBe("rgba(240, 1, 150, 0.15)");
-    expect(omni.tokens.dark.selectionForeground).toBe("#f9a8d4");
+  it.each(PALETTES)("drives $label text selection from its accent", (palette) => {
+    for (const mode of ["light", "dark"] as const) {
+      const tokens = palette.tokens[mode];
+      expect(parseColor(tokens.selectionBackground).rgb).toEqual(parseColor(tokens.primary).rgb);
+    }
   });
 
   it.each(PALETTES)("keeps $label selected text readable and its highlight visible", (palette) => {

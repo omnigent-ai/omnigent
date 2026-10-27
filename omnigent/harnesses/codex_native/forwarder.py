@@ -2967,13 +2967,13 @@ async def _replay_resume_response(
                     expected_thread_id=thread_id,
                     forwarder_state=forwarder_state,
                 )
-    await _post_resume_terminal_status(
-        client,
-        session_id=session_id,
-        bridge_dir=bridge_dir,
-        thread_id=thread_id,
-        turns=turns,
-    )
+        await _post_resume_turn_status(
+            client,
+            session_id=session_id,
+            bridge_dir=bridge_dir,
+            thread_id=thread_id,
+            turns=turns,
+        )
 
 
 def _resume_turns_from(turns: list[object], replay_from_turn_id: str | None) -> list[object]:
@@ -2990,7 +2990,7 @@ def _resume_turns_from(turns: list[object], replay_from_turn_id: str | None) -> 
     return turns
 
 
-async def _post_resume_terminal_status(
+async def _post_resume_turn_status(
     client: httpx.AsyncClient,
     *,
     session_id: str,
@@ -2999,14 +2999,12 @@ async def _post_resume_terminal_status(
     turns: list[object],
 ) -> None:
     """
-    Publish a missing terminal status edge from ``thread/resume`` data.
+    Publish a missed lifecycle edge from explicit ``thread/resume`` turn state.
 
-    A reconnect can miss the live ``turn/started`` and
-    ``turn/completed`` / ``turn/failed`` notifications. When the resume
-    payload explicitly says the latest turn on the current thread is
-    terminal, the forwarder can close the Omnigent session status even though no
-    live terminal boundary was observed. It deliberately does not infer
-    terminal state from transcript items alone.
+    A fresh thread cannot be subscribed until its first turn creates a rollout,
+    so the forwarder can miss ``turn/started``. Reconcile the latest turn's
+    explicit status while replay still owns delivery order, before queued live
+    boundaries run. Transcript items alone do not establish activity.
 
     :param client: HTTP client for Omnigent event posts.
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
@@ -3018,23 +3016,23 @@ async def _post_resume_terminal_status(
     """
     if thread_id is None:
         return
-    edge = _resume_terminal_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
+    edge = _resume_turn_status_edge_for_latest_turn(bridge_dir, thread_id, turns)
     await _post_turn_status_edge(client, session_id, edge)
 
 
-def _resume_terminal_status_edge_for_latest_turn(
+def _resume_turn_status_edge_for_latest_turn(
     bridge_dir: Path,
     thread_id: str,
     turns: list[object],
 ) -> _CodexTurnStatusEdge | None:
     """
-    Return the Omnigent terminal status represented by the latest resume turn.
+    Return the Omnigent status represented by the latest resume turn.
 
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex thread id from the resume payload, e.g.
         ``"thread_123"``.
     :param turns: Raw Codex resume turn list.
-    :returns: Terminal status edge when the latest turn is terminal and
+    :returns: Status edge when the latest turn has explicit lifecycle state and
         belongs to the bridge's current thread; otherwise ``None``.
     """
     state = read_bridge_state(bridge_dir)
@@ -3051,7 +3049,7 @@ def _resume_terminal_status_edge_for_latest_turn(
         status = _omnigent_status_from_resume_turn(turn)
         if status is None:
             return None
-        update_active_turn_id(bridge_dir, None)
+        update_active_turn_id(bridge_dir, turn_id if status == "running" else None)
         # Parity with the live path — surface ``turn.error`` (if any) that
         # forced this resume turn to ``failed``.
         error = _terminal_error_from_turn({"turn": turn})
@@ -3075,8 +3073,8 @@ def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
 
     :param turn: Codex resume turn object, e.g.
         ``{"id": "turn_123", "status": "completed"}``.
-    :returns: Omnigent status literal for terminal turns, or ``None`` for active
-        or unrecognized statuses.
+    :returns: Omnigent status literal for explicit active or terminal turns,
+        or ``None`` for unrecognized statuses.
     """
     # A ``turn.error`` forces ``failed`` regardless of the recorded status.
     if _terminal_error_from_turn({"turn": turn}) is not None:
@@ -3084,6 +3082,8 @@ def _omnigent_status_from_resume_turn(turn: _JsonObject) -> str | None:
     status = turn.get("status")
     if isinstance(status, dict):
         status = status.get("type") or status.get("status")
+    if status == "inProgress":
+        return "running"
     if status in {"completed", "interrupted", "cancelled", "canceled"}:
         return "idle"
     if status in {"failed", "errored"}:

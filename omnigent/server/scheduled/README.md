@@ -10,10 +10,11 @@ the existing in-memory timers.
 ## Starting a run
 
 Each poll fills in missing `next_run_at` values, then finds active tasks that are
-due. For each task, the scheduler checks host ownership and available startup
-capacity. The store creates a `starting` run and moves `next_run_at` forward in
-one transaction. This is the **claim**: if another replica already claimed the
-occurrence or the task changed, this attempt does not start it.
+due. For each page of due tasks, the scheduler asks once which of their hosts this
+replica owns, then checks startup capacity for each owned task. The store creates a
+`starting` run and moves `next_run_at` forward in one transaction. This is the
+**claim**: if another replica already claimed the occurrence or the task changed,
+this attempt does not start it.
 
 The scheduler passes the claimed run to an executor through `on_fire(task, lease)`.
 The executor prepares the session and launches the work. A heartbeat keeps the
@@ -127,13 +128,21 @@ A deployment can override these through `ScheduledTaskDispatchHooks`, passed to
 | --- | --- | --- |
 | `on_fire(task, lease)` | Start the already-claimed run and record its startup outcome. | The built-in executor |
 | `on_expired(run)` | Inspect an interrupted startup and preserve delivered work or clean up abandoned resources. | The built-in executor |
-| `owns_host(workspace_id, host_id)` | Decide whether this replica should start or recover work for the host. | Every host |
+| `owned_hosts(keys)` | Return the subset of host keys this replica owns, so it starts or recovers only that work. | Every key |
 | `fire_identity(task)` | Async context manager the built-in executor enters to act as the task's owner, e.g. by assuming a stored delegation. | None |
 
 Replace `on_fire` and `on_expired` together or not at all. `fire_identity` is
 only for the built-in executor; a replacement executor acts as the owner itself.
 
-`owns_host` is awaited during due-task polling, so it must return promptly and
+Each key is the occurrence's host ID, or the workspace ID as a decimal string for
+a task with no host. Host IDs are bare lowercase 32-character hex, the same string
+a host or sandbox sends as its routing key. The scheduler calls `owned_hosts` once
+per page of due tasks, of Run now requests, and of expired startups, with each key
+listed once. If the call raises, or exceeds `recovery_seconds` during recovery, the
+replica owns none of that page. Due tasks it skips are checked again on the next
+poll; skipped Run now requests and expired startups are checked again once their
+scan starts over.
+`owned_hosts` is awaited during due-task polling, so it must return promptly and
 respect cancellation.
 
 The executor uses the existing `lease.run`, rather than inserting another run.
@@ -217,10 +226,11 @@ target, which may have been edited since the claim.
 | No session on the run | `failed`: launch starts only after the session is attached. |
 | Connected host, neither the prompt nor agent output in the transcript, and no active turn | `failed`: the prompt was never sent. |
 | Connected host, prompt delivered | `failed` if the session failed. `succeeded` if it is idle and its newest output is the agent's reply. Otherwise `running`. |
-| Managed sandbox whose launch already failed | `failed` |
+| Managed sandbox whose launch already failed | Tear down any sandbox registered under the run's host ID, then `failed`. |
 | Managed sandbox with its host bound | `running` while the prompt is pending, otherwise the outcome of a delivered prompt as above. |
 | Managed sandbox still provisioning on this server | `None`: check again on a later sweep. |
-| Managed sandbox with no host bound and no local launch | Tear down the sandbox registered under the run's host ID, fail the saved prompt, then `failed`. |
+| Managed sandbox with no host bound and no local launch, within the shutdown drain after the lease expired | `None`: a replica that lost the lease while shutting down may still bind the sandbox (`shutdown_drain_s`). |
+| Managed sandbox with no host bound and no local launch, after that | Tear down the sandbox registered under the run's host ID, fail the saved prompt, then `failed`. |
 | Session deleted | Tear down any sandbox for a managed run, then `failed`. |
 
 An `idle` status alone does not mean the turn finished: a session can be idle
@@ -261,7 +271,7 @@ Invalid settings fail startup when the flag is on. With the flag off, only
 Set `OMNIGENT_FEATURES=automations_v2` and restart all scheduler replicas together.
 The application requires a compatible store. Without `scheduled_task_dispatch`,
 it uses the built-in executor and owns every host, which suits a single replica.
-A multi-replica deployment passes its own `owns_host`.
+A multi-replica deployment passes its own `owned_hosts`.
 
 To switch back, stop new startups and let existing ones finish or recover. Then
 set `OMNIGENT_FEATURES=-automations_v2` and restart all replicas. Legacy startup
@@ -320,9 +330,9 @@ a result. Recovery outcomes are `running`, `succeeded`, `failed`, `uncertain`, `
 run was no longer the expired startup recovery inspected), `timeout`, or `error`.
 Operations are `poll`, `initialize`, `claim`, `recovery`, `cleanup`, and
 `lease_renewal`. `claim` failures and single-task `initialize` failures include
-`task_id` and `task_workspace_id`; a failed scan has neither. Delays are seconds
-from the scheduled time to when the scheduler was asked to record the step, so
-database write time is excluded.
+`task_id` and `task_workspace_id`; a failed scan or ownership lookup has neither.
+Delays are seconds from the scheduled time to when the scheduler was asked to record
+the step, so database write time is excluded.
 
 Outcomes are logged when the database write commits, so a write that finishes
 after its caller was cancelled or timed out still logs its real result. A run can

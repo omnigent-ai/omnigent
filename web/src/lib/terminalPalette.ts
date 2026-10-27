@@ -14,7 +14,7 @@ const TERMINAL_COLORS = {
     selection: "#0891b233",
   },
   dark: {
-    background: "#131517",
+    background: "#0a0a0a",
     foreground: "#e4e4e7",
     muted: "#27272a",
     mutedForeground: "#a1a1aa",

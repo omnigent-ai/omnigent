@@ -128,8 +128,12 @@ export function SharingPage() {
 
   if (!isSingleUser && meIsAdmin === false) {
     return (
-      <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
-        <h1 className="settings-page-title mb-2 text-2xl font-semibold">Session sharing</h1>
+      <PageScroll
+        maxWidthClassName="max-w-4xl"
+        contentClassName="px-4 md:px-8"
+        extraBottom="2.5rem"
+      >
+        <h1 className="settings-page-title mb-2 text-2xl font-medium">Session sharing</h1>
         <p className="text-ui text-muted-foreground">
           You don't have permission to manage session sharing.
         </p>
@@ -180,10 +184,10 @@ export function SharingPage() {
   }
 
   return (
-    <PageScroll contentClassName="px-4 md:px-8" extraBottom="2.5rem">
+    <PageScroll maxWidthClassName="max-w-4xl" contentClassName="px-4 md:px-8" extraBottom="2.5rem">
       <div>
         <div className="mb-6">
-          <h1 className="settings-page-title text-2xl font-semibold">Session sharing</h1>
+          <h1 className="settings-page-title text-2xl font-medium">Session sharing</h1>
           <p className="mt-1 text-ui text-muted-foreground max-md:hidden">
             Control whether users on this server can share sessions with others. Applies server-wide
             and takes effect immediately. Sharing mode and visibility defaults affect new shares.

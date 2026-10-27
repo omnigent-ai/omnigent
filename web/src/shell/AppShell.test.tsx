@@ -31,8 +31,10 @@ import { useFileViewer } from "./FileViewerContext";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { ServerInfo } from "@/lib/capabilities";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
-import { AGENT_BROWSER_TAB_ID } from "@/hooks/useBrowserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/hooks/useBrowserTabs";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
+import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
+import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import { writeWorkspacePanelDefault } from "@/lib/workspacePanelPreferences";
 import { writePinnedWorkspaceTabs } from "@/lib/workspaceTabPreferences";
@@ -1950,7 +1952,7 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 
-  it("reflects the docked sidebar's open state on the app shell for CSS to key off", () => {
+  it("reflects the docked sidebar state and width on the app shell", () => {
     // The maximized rail's traffic-light clearance (index.css) must drop when
     // the sidebar is reopened over it — the sidebar then covers the window
     // corner, so there are no lights to clear. That CSS keys off
@@ -1965,11 +1967,14 @@ describe("Workspace rail maximize", () => {
     // `:not([data-sidebar-open])` matches and the clearance still applies.
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
     expect(shell?.hasAttribute("data-sidebar-open")).toBe(false);
+    expect((shell as HTMLElement).style.getPropertyValue("--app-sidebar-width")).toBe("0px");
 
-    // Reopen the sidebar: the attribute appears, dropping the clearance.
+    // Reopen the sidebar: the attribute appears, dropping the clearance, and
+    // the background reservation expands to the live sidebar width.
     fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
+    expect((shell as HTMLElement).style.getPropertyValue("--app-sidebar-width")).toBe("320px");
   });
 
   it.each([
@@ -2922,6 +2927,57 @@ describe("Right workspace card visibility", () => {
         "true",
       );
       expect(screen.getByRole("complementary", { name: "Workspace" })).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.unstubAllGlobals();
+    }
+  });
+
+  it("persists a link's new browser tab when its session changes before navigation accepts", async () => {
+    const accepted = deferredRequest<{ ok: boolean }>();
+    const browserOpenOrNavigate = vi.fn().mockReturnValue(accepted.promise);
+    vi.stubGlobal("omnigentDesktop", {
+      kind: "electron",
+      browserOpenOrNavigate,
+      setBadgeCount: vi.fn(),
+    });
+    writeOpenLinksInApp(true);
+    writeSessionWorkspaceState("conv_from", {
+      rightRailTab: "browser",
+      openBrowsers: [AGENT_BROWSER_TAB_ID],
+      selectedBrowserId: AGENT_BROWSER_TAB_ID,
+    });
+    mockConversations([
+      { id: "conv_from", permission_level: null },
+      { id: "conv_to", permission_level: null },
+    ]);
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+
+    try {
+      render(sessionShellTree(queryClient, "/c/conv_from", <SessionNavButton to="/c/conv_to" />));
+      expect(maybeOpenLinkInApp("conv_from", "https://example.com/page")).toBe(true);
+      fireEvent.click(screen.getByTestId("nav-session"));
+      await act(async () => accepted.resolve({ ok: true }));
+
+      const saved = readSessionWorkspaceState("conv_from");
+      expect(saved.selectedBrowserId).toEqual(expect.any(String));
+      expect(saved.selectedBrowserId).not.toBe(AGENT_BROWSER_TAB_ID);
+      expect(saved.openBrowsers).toEqual([AGENT_BROWSER_TAB_ID, saved.selectedBrowserId]);
+      expect(browserOpenOrNavigate).toHaveBeenCalledWith(
+        browserViewId("conv_from", saved.selectedBrowserId!),
+        "https://example.com/page",
+        undefined,
+        { agent: true },
+      );
+      expect(screen.queryByRole("tab", { name: /Browser/i })).toBeNull();
+      expect(readSessionWorkspaceState("conv_to").openBrowsers ?? []).toEqual([]);
+
+      cleanup();
+      renderShell("/c/conv_from");
+      expect(screen.getByRole("tab", { name: "Browser 2" })).toHaveAttribute(
+        "aria-selected",
+        "true",
+      );
     } finally {
       cleanup();
       vi.unstubAllGlobals();

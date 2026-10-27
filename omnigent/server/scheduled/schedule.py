@@ -64,3 +64,8 @@ def occurrence_host_id(task: ScheduledTask, trigger_key: str) -> str | None:
     if task.execution_target != "managed_sandbox":
         return task.host_id
     return sandbox_host_id(task.id, task.workspace_id, trigger_key)
+
+
+def host_ownership_key(workspace_id: int, host_id: str | None) -> str:
+    """Key a replica's ownership check by host, or by workspace for a task with no host."""
+    return host_id if host_id is not None else str(workspace_id)

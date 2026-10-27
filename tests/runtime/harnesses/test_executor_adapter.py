@@ -416,10 +416,10 @@ async def test_executor_error_terminates_with_response_failed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
-async def test_executor_error_preserves_only_explicitly_idle_sessions(
+async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     preserve_session: bool,
 ) -> None:
-    """Ordinary errors still tear down; pre-prompt failures can retain an idle executor."""
+    """Ordinary errors still tear down; explicitly reusable executors can be retained."""
     import asyncio
     from unittest.mock import AsyncMock, Mock
 
