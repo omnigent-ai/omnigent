@@ -1,6 +1,6 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { cleanup, render, waitFor } from "@testing-library/react";
-import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import type { ReactNode } from "react";
 import type * as HostModule from "@/lib/host";
 import type * as NativeBridgeModule from "@/lib/nativeBridge";
@@ -19,12 +19,14 @@ vi.mock("@/lib/host", async (importOriginal) => ({
 vi.mock("@/lib/nativeBridge", async (importOriginal) => ({
   ...(await importOriginal<typeof NativeBridgeModule>()),
   isAndroidShell: vi.fn(() => false),
+  isElectronShell: vi.fn(() => false),
   isIOSShell: vi.fn(() => false),
 }));
 
 import { useSessionHostOnline, useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { isDatabricksWorkspace } from "@/lib/host";
-import { isAndroidShell, isIOSShell } from "@/lib/nativeBridge";
+import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
+import { setSessionHost } from "@/lib/sessionHost";
 import { useChatStore } from "@/store/chatStore";
 import {
   downloadWorkspaceFile,
@@ -106,6 +108,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
   // restore (not just reset) so any `vi.spyOn` a test installs is removed even
   // if that test threw before its own cleanup — otherwise a leaked
   // `document.createElement` spy is recaptured as the "original" by the next
@@ -271,10 +274,11 @@ describe("downloadWorkspaceFile", () => {
     ["the managed embed", isDatabricksWorkspace],
     ["the iOS shell", isIOSShell],
     ["the Android shell", isAndroidShell],
+    ["the Electron shell", isElectronShell],
   ])("fetches the bytes through the app's transport in %s", async (_label, predicate) => {
-    // The embed host supplies auth headers and replica routing that a bare
-    // navigation lacks, and the mobile shells save http(s) downloads outside
-    // the WebView's session, so the bytes come through authenticatedFetch.
+    // These hosts cannot use a bare anchor (auth/routing headers or WebView
+    // session scope), so the bytes come through authenticatedFetch; the
+    // `downloadWorkspaceFile` docstring has the per-shell rationale.
     vi.mocked(predicate).mockReturnValueOnce(true);
     const file = new Blob(["print('hi')"], { type: "text/x-python" });
     fetchMock.mockResolvedValueOnce(blobResponse(file));
@@ -297,6 +301,32 @@ describe("downloadWorkspaceFile", () => {
     vi.unstubAllGlobals();
   });
 
+  it("preserves host routing when downloading in Electron", async () => {
+    vi.mocked(isElectronShell).mockReturnValueOnce(true);
+    vi.stubEnv("VITE_OMNIGENT_HOST_ROUTING", "true");
+    setSessionHost("sess_desktop", "host_desktop");
+    onTestFinished(() => setSessionHost("sess_desktop", null));
+    const file = new Blob([new Uint8Array([0, 255, 1, 128])]);
+    fetchMock.mockImplementationOnce(async (_url: string, init: RequestInit) => {
+      const key = new Headers(init.headers).get("X-Databricks-Omnigent-Slice-Key");
+      return key === "host_desktop"
+        ? blobResponse(file)
+        : { ok: false, status: 500, statusText: "Wrong replica" };
+    });
+    const clicked = captureDownloadClicks();
+    const createObjectURL = vi.fn(() => "blob:desktop");
+    vi.stubGlobal("URL", { createObjectURL, revokeObjectURL: vi.fn() });
+
+    await downloadWorkspaceFile("sess_desktop", "report.bin");
+
+    expect(createObjectURL).toHaveBeenCalledWith(file);
+    expect(clicked).toEqual([["blob:desktop", "report.bin"]]);
+    expect(fetchMock).toHaveBeenCalledWith(
+      "/v1/sessions/sess_desktop/resources/environments/default/filesystem/report.bin?download=true",
+      expect.anything(),
+    );
+  });
+
   it("names the host base for an absolute path alongside download=true", async () => {
     const clicked = captureDownloadClicks();
 
@@ -311,8 +341,11 @@ describe("downloadWorkspaceFile", () => {
 
     vi.restoreAllMocks();
   });
-  it("propagates fetch errors to the caller", async () => {
-    vi.mocked(isDatabricksWorkspace).mockReturnValueOnce(true);
+  it.each([
+    ["the managed embed", isDatabricksWorkspace],
+    ["the Electron shell", isElectronShell],
+  ])("propagates fetch errors to the caller in %s", async (_label, predicate) => {
+    vi.mocked(predicate).mockReturnValueOnce(true);
     fetchMock.mockResolvedValueOnce({
       ok: false,
       status: 404,

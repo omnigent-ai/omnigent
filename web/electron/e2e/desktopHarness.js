@@ -156,7 +156,7 @@ async function waitForHealthy(url, label, logPath) {
  * @param {{ env?: (serverUrl: string) => Record<string, string> }} [options]
  *   `env` adds server environment derived from the server's URL (e.g. an OIDC
  *   redirect URI), since the port is chosen here.
- * @returns {Promise<{ serverUrl: string, close: () => Promise<void> }>}
+ * @returns {Promise<{ serverUrl: string, mockUrl: string, close: () => Promise<void> }>}
  */
 async function spawnServer(tmpDir, { env: extraEnv } = {}) {
   if (!fs.existsSync(path.join(WEB_UI_DIST, "index.html"))) {
@@ -273,7 +273,7 @@ async function spawnServer(tmpDir, { env: extraEnv } = {}) {
     await close();
     throw serverSpawnError ?? err;
   }
-  return { serverUrl, close };
+  return { serverUrl, mockUrl, close };
 }
 
 /** Whether ffmpeg is on PATH — needed for the composited display capture. */
