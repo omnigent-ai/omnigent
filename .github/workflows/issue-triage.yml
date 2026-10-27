@@ -74,7 +74,7 @@ env:
 jobs:
   triage:
     name: Legacy intake fallback
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     # Deprecated: remove in 0.12.0 after the seven-day V2 intake canary.
     # This fallback runs only while V2 is disabled.

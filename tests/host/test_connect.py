@@ -47,6 +47,10 @@ from omnigent.host.frames import (
     HostDetectCredentialsFrame,
     HostDetectCredentialsResultFrame,
     HostFsRequestFrame,
+    HostHarnessLoginCancelFrame,
+    HostHarnessLoginCancelResultFrame,
+    HostHarnessLoginFrame,
+    HostHarnessLoginResultFrame,
     HostHarnessReadinessFrame,
     HostHarnessStartupFrame,
     HostHarnessStartupResultFrame,
@@ -90,6 +94,7 @@ from omnigent.host.frames import (
 from omnigent.host.identity import HostIdentity
 from omnigent.host.maintenance import HostMaintenanceJanitor
 from omnigent.host.runner_zygote import ZygoteUnavailable
+from omnigent.onboarding.harness_login import CodexDeviceLogin
 from omnigent.runner.identity import (
     RUNNER_CONNECT_MARKER_ENV_VAR,
     RUNNER_DELEGATED_AUTH_ENV_VAR,
@@ -5179,6 +5184,272 @@ async def test_probe_accounts_frame_runs_once_and_returns_result(
     assert host._harness_accounts == {"codex": {"kind": "chatgpt"}}
 
 
+async def test_dispatch_codex_login_start_and_cancel(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The dispatch path retains one app-server and cancels it by login id."""
+    import omnigent.host.connect as connect
+
+    completed = asyncio.Event()
+
+    class _FakeLoginSession:
+        cancelled: list[str] = []
+
+        async def start(self) -> CodexDeviceLogin:
+            return CodexDeviceLogin("login-1", "https://example.test/device", "ABCD-EFGH")
+
+        async def wait_completed(self, login_id: str) -> tuple[bool, str | None]:
+            assert login_id == "login-1"
+            await completed.wait()
+            return True, None
+
+        async def cancel(self, login_id: str) -> None:
+            self.cancelled.append(login_id)
+
+        async def close(self) -> None:
+            return None
+
+    monkeypatch.setattr(connect, "CodexLoginSession", _FakeLoginSession)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+
+    await host._dispatch_host_frame(  # type: ignore[arg-type]
+        tunnel,
+        HostHarnessLoginFrame(request_id="start-1", harness="codex-native", login_id="login-1"),
+    )
+    started = decode_host_frame(tunnel.sent.pop())
+    assert isinstance(started, HostHarnessLoginResultFrame)
+    assert started.status == "ok"
+    assert started.login_id == "login-1"
+    assert host._owned_subprocess_ops == 0
+
+    await host._dispatch_host_frame(  # type: ignore[arg-type]
+        tunnel,
+        HostHarnessLoginCancelFrame(request_id="cancel-1", login_id="login-1"),
+    )
+    cancelled = decode_host_frame(tunnel.sent.pop())
+    assert isinstance(cancelled, HostHarnessLoginCancelResultFrame)
+    assert cancelled.status == "ok"
+    assert _FakeLoginSession.cancelled == ["login-1"]
+    assert host._active_harness_logins == {}
+
+
+async def test_failed_codex_login_cancel_still_closes_session(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import omnigent.host.connect as connect
+
+    watcher_cancelled = asyncio.Event()
+    closed = asyncio.Event()
+
+    class _FakeLoginSession:
+        pid = None
+
+        async def start(self) -> CodexDeviceLogin:
+            return CodexDeviceLogin("vendor-login", "https://example.test/device", "CODE")
+
+        async def wait_completed(self, login_id: str) -> tuple[bool, str | None]:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                watcher_cancelled.set()
+                raise
+            raise AssertionError("unreachable")
+
+        async def cancel(self, login_id: str) -> None:
+            raise RuntimeError("vendor cancel failed")
+
+        async def close(self) -> None:
+            closed.set()
+
+    monkeypatch.setattr(connect, "CodexLoginSession", _FakeLoginSession)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    started = await host._handle_harness_login(  # type: ignore[arg-type]
+        tunnel,
+        HostHarnessLoginFrame(request_id="start", harness="codex", login_id="server-login"),
+    )
+    assert started.status == "ok"
+    await asyncio.sleep(0)
+
+    result = await host._handle_harness_login_cancel(
+        HostHarnessLoginCancelFrame(request_id="cancel", login_id="server-login")
+    )
+
+    assert result.status == "ok"
+    assert "vendor cancel failed" in (result.error or "")
+    assert watcher_cancelled.is_set()
+    assert closed.is_set()
+    assert host._active_harness_logins == {}
+
+
+async def test_cancel_during_codex_login_start_returns_cancelled_result(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Cancelling startup settles both host requests without waiting for timeout."""
+    import omnigent.host.connect as connect
+
+    start_entered = asyncio.Event()
+    start_cancelled = asyncio.Event()
+    closed = asyncio.Event()
+
+    class _StartingLoginSession:
+        pid = None
+
+        async def start(self) -> CodexDeviceLogin:
+            start_entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                start_cancelled.set()
+                raise
+            raise AssertionError("unreachable")
+
+        async def cancel(self, login_id: str) -> None:
+            raise AssertionError("vendor login id is unavailable during startup")
+
+        async def close(self) -> None:
+            closed.set()
+
+    monkeypatch.setattr(connect, "CodexLoginSession", _StartingLoginSession)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    start_task = asyncio.create_task(
+        host._handle_harness_login(  # type: ignore[arg-type]
+            tunnel,
+            HostHarnessLoginFrame(
+                request_id="start",
+                harness="codex",
+                login_id="server-login",
+            ),
+        )
+    )
+    await asyncio.wait_for(start_entered.wait(), timeout=1)
+
+    cancel_result = await host._handle_harness_login_cancel(
+        HostHarnessLoginCancelFrame(request_id="cancel", login_id="server-login")
+    )
+    start_result = await asyncio.wait_for(start_task, timeout=1)
+
+    assert cancel_result.status == "ok"
+    assert start_result.status == "cancelled"
+    assert start_cancelled.is_set()
+    assert closed.is_set()
+    assert host._active_harness_logins == {}
+
+
+@pytest.mark.parametrize("start_outcome", ["failure", "timeout"])
+async def test_failed_codex_login_start_closes_app_server(
+    monkeypatch: pytest.MonkeyPatch,
+    start_outcome: str,
+) -> None:
+    """A failed or timed-out start always terminates its spawned app-server."""
+    import omnigent.host.connect as connect
+
+    class _FailingLoginSession(connect.CodexLoginSession):
+        def __init__(self) -> None:
+            super().__init__()
+            self.child: asyncio.subprocess.Process | None = None
+            sessions.append(self)
+
+        async def start(self) -> CodexDeviceLogin:
+            self.child = await asyncio.create_subprocess_exec(
+                sys.executable,
+                "-c",
+                "import time; time.sleep(60)",
+            )
+            self._process = self.child
+            if start_outcome == "failure":
+                raise RuntimeError("start failed")
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+    sessions: list[_FailingLoginSession] = []
+    monkeypatch.setattr(connect, "CodexLoginSession", _FailingLoginSession)
+    monkeypatch.setattr(connect, "HARNESS_LOGIN_START_TIMEOUT_S", 0.01)
+    host = _make_host_process()
+
+    result = await host._handle_harness_login(  # type: ignore[arg-type]
+        _FakeTunnel(),
+        HostHarnessLoginFrame(
+            request_id=f"start-{start_outcome}",
+            harness="codex",
+            login_id=f"login-{start_outcome}",
+        ),
+    )
+
+    assert result.status == "failed"
+    assert len(sessions) == 1
+    child = sessions[0].child
+    assert child is not None
+    try:
+        assert child.returncode is not None
+        assert child.pid not in host._tracked_runner_pids()
+        assert host._active_harness_logins == {}
+        assert host._owned_subprocess_ops == 0
+    finally:
+        if child.returncode is None:
+            child.kill()
+            await child.wait()
+
+
+async def test_disconnect_mid_login_start_closes_session_and_clears_busy(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tunnel drop cancels a login even before Codex returns device details."""
+    import omnigent.host.connect as connect
+
+    start_entered = asyncio.Event()
+    closed = asyncio.Event()
+
+    class _BlockedLoginSession:
+        pid = None
+
+        async def start(self) -> CodexDeviceLogin:
+            start_entered.set()
+            await asyncio.Event().wait()
+            raise AssertionError("unreachable")
+
+        async def cancel(self, login_id: str) -> None:
+            raise AssertionError("vendor login id does not exist while start is blocked")
+
+        async def close(self) -> None:
+            closed.set()
+
+    monkeypatch.setattr(connect, "CodexLoginSession", _BlockedLoginSession)
+    host = _make_host_process()
+    tunnel = _FakeTunnel()
+    start_task = asyncio.create_task(
+        host._dispatch_host_frame(  # type: ignore[arg-type]
+            tunnel,
+            HostHarnessLoginFrame(
+                request_id="start-blocked",
+                harness="codex",
+                login_id="server-login-id",
+            ),
+        )
+    )
+    await asyncio.wait_for(start_entered.wait(), timeout=1)
+
+    busy = await host._handle_harness_login(  # type: ignore[arg-type]
+        tunnel,
+        HostHarnessLoginFrame(
+            request_id="start-again",
+            harness="codex",
+            login_id="other-login-id",
+        ),
+    )
+    assert busy.status == "busy"
+    assert busy.login_id == "server-login-id"
+
+    await host._cancel_all_harness_logins()
+
+    assert start_task.cancelled()
+    assert closed.is_set()
+    assert host._owned_subprocess_ops == 0
+    assert host._active_harness_logins == {}
+
+
 async def test_dispatch_store_secret_uses_orphan_reaper_guard(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -5257,7 +5528,7 @@ def test_account_only_update_does_not_invalidate_readiness_generation() -> None:
     assert host._account_generation == 1
 
 
-async def test_stale_account_probe_cannot_overwrite_newer_account_state(
+async def test_stale_account_probe_cannot_overwrite_newer_login_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     host = _make_host_process()
@@ -5289,7 +5560,7 @@ async def test_stale_account_probe_cannot_overwrite_newer_account_state(
     assert result.harness_accounts == {"codex": {"kind": "none"}}
 
 
-async def test_stale_full_refresh_accounts_cannot_overwrite_newer_account_state(
+async def test_stale_full_refresh_accounts_cannot_overwrite_newer_login_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     host = _make_host_process()

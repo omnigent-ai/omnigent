@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Protocol
+from typing import Any, Literal, Protocol
 
 from cachetools import TTLCache
 
@@ -40,6 +40,7 @@ from omnigent.db.account_authority import (
 )
 from omnigent.db.db_models import InvalidUuidError, current_workspace_id, uuid_to_bytes
 from omnigent.harness_accounts import HarnessAccounts
+from omnigent.harness_availability import HarnessAvailability
 from omnigent.host.frames import (
     CAP_CODEX_SIDE_CHAT,
     HostHelloFrame,
@@ -191,10 +192,13 @@ def _fail_pending_mcp_servers(conn: HostConnection) -> None:
 
 
 def _fail_pending_harness_rpcs(conn: HostConnection) -> None:
-    """Wake account/readiness route waiters when their tunnel disappears."""
+    """Wake account/login route waiters when their tunnel disappears."""
     for pending in (
         conn.pending_harness_account_probes,
         conn.pending_harness_refreshes,
+        conn.pending_harness_login_starts,
+        conn.pending_harness_login_cancels,
+        conn.pending_harness_logouts,
     ):
         _fail_pending_inventory(pending, conn.host_id)
 
@@ -232,6 +236,24 @@ class RunnerExitReport:
     error: str
     owner: str | None
     had_connected: bool | None = None
+
+
+HarnessLoginStatus = Literal["pending", "succeeded", "failed", "expired", "cancelled"]
+
+
+@dataclass
+class HarnessLoginState:
+    """Server-side state for one host-owned device login."""
+
+    harness: str
+    status: HarnessLoginStatus
+    expires_at: int
+    error: str | None = None
+    expired: bool = False
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
+    terminal_at: int | None = None
+    terminal_event: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
 
 
 class RunnerExitReports:
@@ -493,6 +515,17 @@ class HostConnection:
     )
     harness_account_probe_lock: asyncio.Lock = field(default_factory=asyncio.Lock)
     harness_accounts_probed_at: float | None = None
+    pending_harness_login_starts: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_harness_login_cancels: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    pending_harness_logouts: dict[str, asyncio.Future[dict[str, Any]]] = field(
+        default_factory=dict,
+    )
+    harness_logins: dict[str, HarnessLoginState] = field(default_factory=dict)
+    active_harness_logins: dict[str, str] = field(default_factory=dict)
     inflight_installs: dict[str, asyncio.Task[dict[str, Any]]] = field(
         default_factory=dict,
     )

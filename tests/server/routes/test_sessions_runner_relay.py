@@ -1110,9 +1110,12 @@ class _ScriptedThenDropStreamResponse:
         the drop so the collector observes every scripted frame.
     """
 
-    def __init__(self, frames: list[str], gate: asyncio.Event) -> None:
+    def __init__(
+        self, frames: list[str], gate: asyncio.Event, connection: dict[str, object] | None = None
+    ) -> None:
         self._frames = frames
         self._gate = gate
+        self.extensions = {"omnigent_runner_connection": connection}
 
     async def __aenter__(self) -> _ScriptedThenDropStreamResponse:
         return self
@@ -1143,9 +1146,12 @@ class _ScriptedThenDropStreamResponse:
 class _ScriptedThenDropRunnerClient:
     """Fake runner client whose stream replays scripted frames then drops."""
 
-    def __init__(self, frames: list[str], gate: asyncio.Event) -> None:
+    def __init__(
+        self, frames: list[str], gate: asyncio.Event, connection: dict[str, object] | None = None
+    ) -> None:
         self._frames = frames
         self._gate = gate
+        self.extensions = {"omnigent_runner_connection": connection}
 
     def stream(
         self,
@@ -1155,14 +1161,18 @@ class _ScriptedThenDropRunnerClient:
         timeout: Any,
     ) -> _ScriptedThenDropStreamResponse:
         del method, path, timeout
-        return _ScriptedThenDropStreamResponse(self._frames, self._gate)
+        return _ScriptedThenDropStreamResponse(
+            self._frames, self._gate, self.extensions["omnigent_runner_connection"]
+        )
 
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("intentional", [False, True])
+@pytest.mark.parametrize("bare", [False, True])
 async def test_relay_preserves_failure_reported_during_intentional_teardown(
     monkeypatch: pytest.MonkeyPatch,
     intentional: bool,
+    bare: bool,
 ) -> None:
     """A failure arriving after stop intent keeps its status and durable details."""
     from omnigent.runtime import session_stream
@@ -1188,7 +1198,19 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         },
     }
     gate = asyncio.Event()
-    runner = _ScriptedThenDropRunnerClient([f"data: {json.dumps(event)}\n\n"], gate)
+    if bare:
+        event.pop("error")
+        event.pop("failure_context")
+    runner = _ScriptedThenDropRunnerClient(
+        [f"data: {json.dumps(event)}\n\n"],
+        gate,
+        {
+            "runner_id": runner_id,
+            "runner_version": "0.20.0",
+            "connection_id": "conn_old",
+            "generation": 17,
+        },
+    )
     store = _RecordingLabelStore(live_status="running")
     sessions_module._session_status_cache[session_id] = "running"
     collector = None
@@ -1210,20 +1232,29 @@ async def test_relay_preserves_failure_reported_during_intentional_teardown(
         [failure] = [r for r in rows if r["event_name"] == "session_turn_failed"]
         attrs = failure["attributes"]
         assert isinstance(attrs, dict)
-        assert attrs["failure_id"] == "err_synthetic_relay"
-        assert attrs["exception_cause_type"] == "ReadTimeout"
-        assert attrs["native_launch_code_origin"].endswith(".launch:42")
+        if not bare:
+            assert attrs["failure_id"] == "err_synthetic_relay"
+            assert attrs["exception_cause_type"] == "ReadTimeout"
+            assert attrs["native_launch_code_origin"].endswith(".launch:42")
         assert attrs["origin"] == "relayed_runner_status"
+        assert attrs["failure_wire_code"] == ("missing" if bare else "present")
+        assert attrs["failure_wire_message"] == ("missing" if bare else "present")
+        assert attrs["failure_wire_context"] == ("missing" if bare else "present")
+        assert attrs["failure_connection_source"] == "relay_stream"
+        assert attrs["failure_runner_version"] == "0.20.0"
+        assert attrs["failure_connection_id"] == "conn_old"
+        assert attrs["failure_connection_generation"] == "17"
 
         status = await asyncio.wait_for(collector.queue.get(), timeout=_TASK_TIMEOUT_S)
         assert status["type"] == "session.status"
         assert status["status"] == "failed"
-        assert status["error"]["code"] == error["code"]
         assert sessions_module._session_status_cache.get(session_id) == "failed"
-        persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
-        assert persisted is not None
-        assert persisted["code"] == error["code"]
-        assert persisted["message"] == error["message"]
+        if not bare:
+            assert status["error"]["code"] == error["code"]
+            persisted = sessions_module._last_task_error_from_labels(store.labels[session_id])
+            assert persisted is not None
+            assert persisted["code"] == error["code"]
+            assert persisted["message"] == error["message"]
         assert session_id not in sessions_module._intentional_stop_sessions
     finally:
         gate.set()
