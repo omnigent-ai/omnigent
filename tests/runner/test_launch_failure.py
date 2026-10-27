@@ -10,6 +10,7 @@ from omnigent.runner.launch_failure import (
     classify_native_turn_error,
     classify_terminal_failure,
     describe_failure_code,
+    describe_gateway_policy_refusal,
     diagnose_client_update_required,
     diagnose_codex_compaction_model_failure,
     diagnose_codex_model_rejection,
@@ -288,6 +289,49 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         "If this looks like an auth issue, running `codex login` may help."
     )
     assert classify_native_turn_error("codex_reauth_required", message) == "codex_reauth_required"
+
+
+@pytest.mark.parametrize(
+    ("message", "cause"),
+    [
+        (
+            'Failed to authenticate. API Error: 403 Budget "team budget" '
+            "(00000000-0000-0000-0000-000000000001) has reached its limit of $0",
+            "budget",
+        ),
+        (
+            'API Error: 403 {"error_code":"PERMISSION_DENIED",'
+            '"message":"rate limit is set to 0 for user test@example.com"}',
+            "usage limit",
+        ),
+        (
+            'Please run /login · API Error: 403 {"error_code":403,"message":"Source IP '
+            'address: 203.0.113.7 is blocked by Databricks IP ACL for workspace: 1234"}',
+            "IP access list",
+        ),
+    ],
+)
+def test_describes_gateway_policy_refusals_that_sign_in_cannot_clear(
+    message: str, cause: str
+) -> None:
+    guidance = describe_gateway_policy_refusal(message)
+
+    assert guidance is not None
+    assert "signing in again won't fix this" in guidance.lower()
+    assert cause in guidance
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        'Please run /login · API Error: 401 {"error_code":"UNAUTHENTICATED",'
+        '"message":"Invalid Token"}',
+        "Login expired · Please run /login",
+        "API Error: 403 Forbidden",
+    ],
+)
+def test_genuine_auth_failures_are_not_gateway_policy_refusals(message: str) -> None:
+    assert describe_gateway_policy_refusal(message) is None
 
 
 @pytest.mark.parametrize("code", ["native_turn_error", "codex_turn_error"])

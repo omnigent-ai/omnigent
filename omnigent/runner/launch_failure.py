@@ -28,6 +28,7 @@ __all__ = [
     "classify_native_turn_error",
     "classify_terminal_failure",
     "describe_failure_code",
+    "describe_gateway_policy_refusal",
     "diagnose_client_update_required",
     "diagnose_codex_compaction_model_failure",
     "diagnose_codex_model_rejection",
@@ -230,6 +231,7 @@ _BUDGET_EXHAUSTED_FRAGMENTS = (
     "has reached its limit",
     "rate limit is set to 0",
 )
+_IP_ACCESS_LIST_BLOCKED_FRAGMENT = "blocked by databricks ip acl"
 # Mid-stream upstream failures the gateway usually recovers from on its own;
 # the runner itself stays healthy, so the turn can be continued by the user.
 _TRANSIENT_UPSTREAM_FRAGMENTS = (
@@ -316,6 +318,29 @@ def diagnose_client_update_required(message: str) -> FailureDiagnosis | None:
         ),
         remediation="Run `claude update` on the host, then start a new session.",
     )
+
+
+def describe_gateway_policy_refusal(message: str) -> str | None:
+    """Explain a gateway 403 that signing in again cannot clear.
+
+    :param message: Turn error text, e.g. ``"Please run /login · API Error: 403
+        Budget 'team' (id) has reached its limit of $0"``.
+    :returns: The real cause and remedy, or ``None`` when *message* is not a
+        budget, usage-limit or IP access list refusal.
+    """
+    lowered = message.lower()
+    if any(fragment in lowered for fragment in _BUDGET_EXHAUSTED_FRAGMENTS):
+        return (
+            "Signing in again won't fix this: an AI gateway budget or usage limit "
+            "is exhausted, and only an admin can raise it."
+        )
+    if _IP_ACCESS_LIST_BLOCKED_FRAGMENT in lowered:
+        return (
+            "Signing in again won't fix this: the workspace's IP access list blocks "
+            "this host's network address. Connect from an allowed network, or ask a "
+            "workspace admin to allow it."
+        )
+    return None
 
 
 def diagnose_codex_model_rejection(message: str) -> FailureDiagnosis | None:
