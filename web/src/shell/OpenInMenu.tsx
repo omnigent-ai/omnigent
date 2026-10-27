@@ -208,13 +208,14 @@ export function OpenInSplitButton({
               <Button
                 type="button"
                 variant="outline"
-                size="icon-sm"
+                size="sm"
                 className="rounded-r-none border-r-0"
                 aria-label={label}
                 tabIndex={interactive ? undefined : -1}
                 onClick={interactive ? defaultAction.onSelect : undefined}
               >
                 {defaultAction.icon}
+                Open
               </Button>
             </TooltipTrigger>
             <TooltipContent>{label}</TooltipContent>
