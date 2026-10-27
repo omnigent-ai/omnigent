@@ -72,7 +72,8 @@ _FJ_LEADING_VALUES = frozenset({"-H", "--host", "-C", "--cwd", "--style", "-R", 
 _TEA_LEADING_VALUES = frozenset(
     {"--login", "-l", "--repo", "-r", "--remote", "-R", "--output", "-o"}
 )
-_CREATED_NUMBER = re.compile(r"(?m)^[^#\n]*#([1-9][0-9]*): ")
+# fj's Fluent messages wrap each value in Unicode isolation marks (U+2068, U+2069).
+_CREATED_NUMBER = re.compile("(?m)^[^#\n]*#\u2068?([1-9][0-9]*)\u2069?: ")
 _PUSH_BANNER = re.compile(
     r"(?m)^remote:[^\n]*pull request[^\n]*:[ \t\r]*\nremote:[ \t]+(https://\S+?)[ \t\r]*$"
 )

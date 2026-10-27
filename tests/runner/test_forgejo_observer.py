@@ -116,6 +116,8 @@ def test_fj_create_combines_the_named_repository_with_the_printed_number(
 ) -> None:
     printed = f"created pull request #7: Feature\nbody mentions {OTHER}\n"
     assert urls(shell(command, printed)) == ([expected], True)
+    isolated = "created pull request #\u20687\u2069: \u2068Feature\u2069\n"
+    assert urls(shell(command, isolated)) == ([expected], True)
 
 
 @pytest.mark.parametrize(
