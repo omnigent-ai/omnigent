@@ -264,6 +264,7 @@ describe("isProseText", () => {
     const started = performance.now();
     expect(isProseText("```a\n".repeat(9_000), "description")).toBe(true);
     expect(isProseText("[a\n".repeat(9_000), "description")).toBe(true);
+    expect(isProseText(("](".repeat(2_400) + ") see\n").repeat(9), "description")).toBe(true);
     expect(isProseText("a <b ".repeat(9_000), "description")).toBe(true);
     expect(isProseText("<!--a\n".repeat(8_000), "description")).toBe(false);
     expect(performance.now() - started).toBeLessThan(2_000);

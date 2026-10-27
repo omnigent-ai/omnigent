@@ -9,7 +9,9 @@ afterEach(cleanup);
 function renderValue(value: unknown) {
   // Markdown links look up workspace files through React Query, as in the app.
   return render(
-    <QueryClientProvider client={new QueryClient()}>
+    <QueryClientProvider
+      client={new QueryClient({ defaultOptions: { queries: { retry: false } } })}
+    >
       <ToolValueView value={value} />
     </QueryClientProvider>,
   ).container;

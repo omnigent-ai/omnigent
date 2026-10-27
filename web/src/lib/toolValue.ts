@@ -355,8 +355,8 @@ function withoutCode(text: string): string {
       if (htmlBlockEnd === "-->" ? line.includes("-->") : line.trim() === "") htmlBlockEnd = null;
       kept.push(line);
     } else if (HTML_BLOCK_START.test(content)) {
-      const comment = content.startsWith("<!--");
-      htmlBlockEnd = !comment ? "blank line" : content.includes("-->", 4) ? null : "-->";
+      if (!content.startsWith("<!--")) htmlBlockEnd = "blank line";
+      else if (!content.includes("-->", 4)) htmlBlockEnd = "-->";
       kept.push(line);
     } else if (spansClear) {
       const { text: withoutSpans, clear } = withoutCodeSpans(line);
@@ -388,7 +388,10 @@ function withoutCodeSpans(line: string): { text: string; clear: boolean } {
       target.lastIndex = special.lastIndex;
       const [, destination = "", title] = target.exec(line) ?? [];
       const closed = destination.includes(")") && title === undefined;
-      if (closed && !/[`<]/.test(destination)) continue;
+      if (closed && !/[`<]/.test(destination)) {
+        special.lastIndex = target.lastIndex;
+        continue;
+      }
       return { text: text + line.slice(position), clear: false };
     }
     const runs = /`+/g;
