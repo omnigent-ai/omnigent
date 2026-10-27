@@ -18,8 +18,8 @@ from omnigent.git_providers import (
     Instances,
     ParsedPullRequest,
     ParsedRemote,
+    instance_authority,
 )
-from omnigent.git_providers.gitlab import instance_authority
 
 _NAME = r"[A-Za-z0-9_.-]+"
 _REPOSITORY = re.compile(rf"{_NAME}/{_NAME}")

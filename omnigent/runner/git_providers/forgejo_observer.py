@@ -8,9 +8,8 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePath
 
-from omnigent.git_providers import EnvInstances
+from omnigent.git_providers import EnvInstances, instance_authority
 from omnigent.git_providers.forgejo import ForgejoProvider
-from omnigent.git_providers.gitlab import instance_authority
 from omnigent.runner.git_providers import ShellPrOp, ShellSegment
 from omnigent.runner.git_providers.tool_output import result_objects
 from omnigent.runner.session_prs import PullRequestRef

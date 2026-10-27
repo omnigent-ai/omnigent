@@ -18,9 +18,8 @@ from urllib.parse import quote
 
 import httpx
 
-from omnigent.git_providers import EnvInstances
+from omnigent.git_providers import EnvInstances, instance_authority
 from omnigent.git_providers.forgejo import ForgejoProvider, LoginFile, login_files
-from omnigent.git_providers.gitlab import instance_authority
 from omnigent.util.tls import client_ssl_context
 
 REQUEST_BUDGET_SECONDS = 8.0

@@ -9,8 +9,8 @@ import time
 from typing import Any
 from urllib.parse import urlencode
 
-from omnigent.git_providers import EnvInstances
-from omnigent.git_providers.gitlab import GitLabProvider, instance_authority
+from omnigent.git_providers import EnvInstances, instance_authority
+from omnigent.git_providers.gitlab import GitLabProvider
 
 REQUEST_BUDGET_SECONDS = 8.0
 _PAGE_SIZE = 100

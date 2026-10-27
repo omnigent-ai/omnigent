@@ -6,9 +6,9 @@ from pathlib import Path
 
 import pytest
 
-from omnigent.git_providers import EnvInstances
+from omnigent.git_providers import EnvInstances, instance_authority
 from omnigent.git_providers import gitlab as descriptor
-from omnigent.git_providers.gitlab import GitLabProvider, instance_authority
+from omnigent.git_providers.gitlab import GitLabProvider
 
 
 @pytest.fixture(autouse=True)

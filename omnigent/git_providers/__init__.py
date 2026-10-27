@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import importlib
 import importlib.metadata
+import ipaddress
 import logging
 import os
 import re
@@ -160,6 +161,38 @@ _lock = threading.RLock()
 _providers: tuple[GitProvider, ...] | None = None
 _failed_descriptors: set[str] = set()
 _failed_descriptors_lock = threading.Lock()
+
+
+def instance_authority(value: str) -> str | None:
+    """Normalize an HTTPS origin/authority, retaining a non-default API port."""
+    if any(c.isspace() or ord(c) < 32 or ord(c) == 127 for c in value):
+        return None
+    try:
+        parsed = urlsplit(value if "://" in value else f"https://{value}")
+        host, port = (parsed.hostname or "").lower(), parsed.port
+    except ValueError:
+        return None
+    if (
+        parsed.scheme != "https"
+        or not host
+        or parsed.username is not None
+        or parsed.password is not None
+        or parsed.path not in {"", "/"}
+        or parsed.query
+        or parsed.fragment
+    ):
+        return None
+    if ":" in host:
+        try:
+            ipaddress.IPv6Address(host)
+        except ValueError:
+            return None
+        host = f"[{host}]"
+    elif not all(
+        re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", p) for p in host.split(".")
+    ):
+        return None
+    return host if port in {None, 443} else f"{host}:{port}"
 
 
 def _load_providers() -> tuple[GitProvider, ...]:
