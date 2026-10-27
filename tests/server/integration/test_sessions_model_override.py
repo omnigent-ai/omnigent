@@ -490,6 +490,39 @@ async def test_bundled_child_runner_notify_seeds_the_requested_model(
     assert envelope["suppress_recovery_turn"] is True
 
 
+async def test_bundled_child_runner_notify_falls_back_to_the_id_only_body(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An envelope that cannot be built leaves the create alive and sends the id-only body."""
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes._sessions import helpers
+
+    resp = await _post_bundle_create(client, {})
+    assert resp.status_code == 201, resp.text
+    created = resp.json()
+    conversation = get_conversation_store().get_conversation(created["session_id"])
+    captured: dict[str, Any] = {}
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureClient:
+        return _CaptureClient(captured)
+
+    def _broken_envelope(*_: Any, **__: Any) -> dict[str, Any]:
+        raise RuntimeError("envelope build failed")
+
+    monkeypatch.setattr(helpers, "_get_runner_client", _stub)
+    monkeypatch.setattr(helpers, "build_runner_session_init_payload", _broken_envelope)
+    await helpers._notify_runner_of_bundled_child(
+        created["session_id"], created["agent_id"], None, conversation=conversation
+    )
+
+    assert captured["body"] == {
+        "session_id": created["session_id"],
+        "agent_id": created["agent_id"],
+        "sub_agent_name": None,
+    }
+
+
 class _CaptureClient:
     """Stub runner client that records the POSTed body for inspection."""
 
