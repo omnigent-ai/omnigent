@@ -298,8 +298,11 @@ const CODE_KEY_WORDS = new Set([
 ]);
 // Tags in GitHub bodies, such as `<details>`, `<summary>` and `<br>`, which render as markdown.
 const GITHUB_BODY_TAG = /<\/?(?:details|summary|br|sub|sup|kbd)(?![\w-])(?:\s[^<>]*)?\/?>/gi;
-// A markup tag such as `<instructions>`, even split over lines; autolinks do not match.
-const MARKUP_TAG = /<\/?[A-Za-z][\w-]*(?:\s[^<>]*)?\/?>/;
+// A markup tag such as `<instructions>`, even split over lines or opening a quoted value, which
+// may hold `<` or `>`; autolinks do not match.
+const MARKUP_TAG = /<\/?[A-Za-z][\w-]*(?:\s[^<>]*)?\/?>|<[A-Za-z][\w-]*\s[^<>]*=\s*["']/;
+// A line opening an HTML block: one starting with `<`, but not an autolink such as `<https://x>`.
+const HTML_BLOCK_START = /^<(?![A-Za-z][A-Za-z\d+.-]{1,31}:[^\s<>]*>)/;
 
 // Indentation, `>` quote markers and list bullets that can nest a block in a line.
 const CONTAINER_PREFIX = /^(?:[ \t>]|(?:[-*+]|\d{1,9}[.)])[ \t])*/;
@@ -351,7 +354,7 @@ function withoutCode(text: string): string {
     } else if (htmlBlockEnd !== null) {
       if (htmlBlockEnd === "-->" ? line.includes("-->") : line.trim() === "") htmlBlockEnd = null;
       kept.push(line);
-    } else if (content.startsWith("<")) {
+    } else if (HTML_BLOCK_START.test(content)) {
       const comment = content.startsWith("<!--");
       htmlBlockEnd = !comment ? "blank line" : content.includes("-->", 4) ? null : "-->";
       kept.push(line);
@@ -400,12 +403,13 @@ function withoutCodeSpans(line: string): { text: string; clear: boolean } {
   return { text: text + line.slice(position), clear: true };
 }
 
-// Whether a line opening with `<`, up to a blank line, holds a tag other than GitHub's, even an
-// unfinished one. Markdown passes such an HTML block raw, where `<pre` swallows the text after it.
+// Whether an HTML block, up to a blank line, holds a tag other than GitHub's, even an unfinished
+// one. Markdown passes such a block raw, where `<pre` swallows the text after it.
 function hidesInHtmlBlock(text: string): boolean {
   let inBlock = false;
   for (const line of text.split("\n")) {
-    inBlock = line.trim() !== "" && (inBlock || line.replace(CONTAINER_PREFIX, "").startsWith("<"));
+    const opens = HTML_BLOCK_START.test(line.replace(CONTAINER_PREFIX, ""));
+    inBlock = line.trim() !== "" && (inBlock || opens);
     if (inBlock && /<[A-Za-z/]/.test(line.replace(GITHUB_BODY_TAG, ""))) return true;
   }
   return false;

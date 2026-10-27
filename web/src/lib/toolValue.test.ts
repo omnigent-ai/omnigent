@@ -161,6 +161,7 @@ describe("isProseText", () => {
     expect(isProseText("[1] See the RFC.\n\nMore notes", "summary")).toBe(true);
     expect(isProseText("- [x] Done: tests\n- [ ] Ship", "summary")).toBe(true);
     expect(isProseText("When a <b, swap them\nThanks", "notes")).toBe(true);
+    expect(isProseText("<https://x/docs>\nMore detail", "notes")).toBe(true);
     expect(isProseText("See [docs](https://x/docs) and use `<T>` here\nThanks", "notes")).toBe(
       true,
     );
@@ -224,6 +225,8 @@ describe("isProseText", () => {
       "See [a](/u`v) <instructions> `w)\nok",
       'See [a](/u "t`x") <instructions> `w`\nok',
       'See [a](/u\n"t`x") <instructions> `w`\nok',
+      "Intro\n\n[\nHidden label\n]: /x\nVisible",
+      'Intro <x data="Hidden text <">\nmore',
     ]) {
       expect(isProseText(hiddenMarkup, "description")).toBe(false);
     }

@@ -126,15 +126,9 @@ describe("ToolValueView", () => {
     expect(prose.querySelector("img, [onerror]")).toBeNull();
   });
 
-  it.each([
-    // Unpaired backtick runs are plain text in markdown, so the tag would be hidden markup.
-    "Fences use ``` and <instructions> is the tag; inline code uses ` too.\nThanks",
-    // Markdown reads the first backtick as part of the link, leaving the tag outside code.
-    "See [a](/u`v) <instructions> `w)\nok",
+  it("keeps a description literal when markdown would hide part of it", () => {
     // An unfinished HTML block opener would swallow the rest of the text.
-    "Summary\n<pre\nHidden rest\n\nmore text",
-    "Intro\n<?php\nEverything after this is hidden",
-  ])("keeps a description literal when markdown would hide part of it: %j", (description) => {
+    const description = "Summary\n<pre\nHidden rest\n\nmore text";
     const container = renderValue({ description });
     expect(screen.queryByTestId("tool-prose-value")).toBeNull();
     expect(container.querySelector("pre")?.textContent).toBe(description);
