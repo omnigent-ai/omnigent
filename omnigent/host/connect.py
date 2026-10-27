@@ -623,6 +623,8 @@ _RUNNER_ENV_ALLOWLIST: frozenset[str] = frozenset(
         "GH_CONFIG_DIR",
         "XDG_CONFIG_HOME",
         "XDG_CONFIG_DIRS",
+        # forgejo-cli keeps its logins under the XDG data directory.
+        "XDG_DATA_HOME",
         # DATABRICKS_AUTH_STORAGE selects the token-storage backend ("secure"
         # OS keychain vs "plaintext" JSON cache) — also a non-secret selector.
         # Without it a runner falls back to the ~/.databrickscfg [__settings__]

@@ -4757,6 +4757,7 @@ def test_host_settings_survive_daemon_and_runner_hops(
         "GH_CONFIG_DIR": str(tmp_path / "gh"),
         "XDG_CONFIG_HOME": str(tmp_path / "config"),
         "XDG_CONFIG_DIRS": str(tmp_path / "system-config"),
+        "XDG_DATA_HOME": str(tmp_path / "data"),
     }
     for name, value in selectors.items():
         monkeypatch.setenv(name, value)
