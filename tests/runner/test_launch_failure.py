@@ -123,14 +123,17 @@ def test_classifies_gateway_claude_version_failure() -> None:
     assert diagnosis.remediation is not None
 
 
-def test_gateway_claude_version_remediation_names_the_upgrade() -> None:
+def test_gateway_claude_version_remediation_uses_existing_installation_method() -> None:
     diagnosis = classify_terminal_failure(
         command="env",
         exit_status=0,
         output="ERROR ug requires Claude Code 2.1.290 or newer. Your current version is 2.1.185.",
     )
     assert diagnosis is not None
-    assert "brew upgrade claude-code" in (diagnosis.remediation or "")
+    assert diagnosis.remediation is not None
+    assert "Update Claude Code" in diagnosis.remediation
+    assert "same installer or package manager you used to install it" in diagnosis.remediation
+    assert "brew upgrade claude-code" not in diagnosis.remediation
 
 
 def test_root_wins_over_generic_auth_when_both_markers_present() -> None:

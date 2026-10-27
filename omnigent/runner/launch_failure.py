@@ -196,8 +196,8 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
                 "and it does not update a copy that a package manager manages."
             ),
             remediation=(
-                "Update Claude Code on the host (for Homebrew: `brew upgrade claude-code`), "
-                "then send your message again."
+                "Update Claude Code on the host using the same installer or package manager "
+                "you used to install it, then send your message again."
             ),
         ),
     ),
