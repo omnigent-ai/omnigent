@@ -133,11 +133,11 @@ jobs:
           if-no-files-found: warn
 
   sync-linked-prs:
-    # Priority labels written above with the workflow token start no workflow
-    # runs, so sync-pr-priority.yml never sees them; mirror them onto linked PRs
-    # here. A separate job keeps pull-requests:write away from the grading job.
+    # Labels written above with the workflow token never trigger
+    # sync-pr-priority.yml, so mirror them onto linked PRs here, even if grading
+    # fails after labeling. A separate job keeps PR write access out of grading.
     needs: prioritize
-    if: inputs.apply && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'
+    if: ${{ !cancelled() && inputs.apply && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
