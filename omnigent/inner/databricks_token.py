@@ -11,6 +11,11 @@ never got a Gateway bearer. The databricks-sdk's ``Config.authenticate()`` does
 the client-credentials exchange (and env / file OIDC and a static PAT), so this
 mints through the SDK rather than reimplementing any OAuth.
 
+The generated helper runs ``databricks auth token`` before this fallback, so the
+SDK's own ``databricks-cli`` strategy is excluded here: repeating that request (a
+forced refresh on newer SDKs) rotates the shared OAuth grant again. Every other
+SDK credential source, including M2M, stays available.
+
 Identity is **fail-closed and profile-pinned**. The SDK resolves config in the
 order kwargs > environment > profile-section, so ``Config(profile=P)`` alone does
 NOT pin identity: an ambient ``DATABRICKS_TOKEN`` / ``DATABRICKS_CLIENT_ID`` (etc.)
@@ -77,6 +82,17 @@ def _sdk_bearer(profile: str | None, host: str | None) -> tuple[str, str] | None
     unreachable token endpoint) so :func:`main` can fall through quietly.
     """
     from databricks.sdk.config import Config
+    from databricks.sdk.credentials_provider import CredentialsStrategy, DefaultCredentials
+
+    class SdkFallbackCredentials(DefaultCredentials, CredentialsStrategy):
+        def __init__(self) -> None:
+            super().__init__()
+            # The helper already ran the CLI; see the module docstring.
+            self._auth_providers = [
+                provider
+                for provider in self._auth_providers
+                if provider.auth_type() != "databricks-cli"
+            ]
 
     # Bound network so a slow/unreachable OIDC or token endpoint can't stall this
     # auth command; restore the prior default so the bound never leaks out.
@@ -89,13 +105,17 @@ def _sdk_bearer(profile: str | None, host: str | None) -> tuple[str, str] | None
             # mirroring the CLI mint's ``env -u``.
             for name in _ambient_credential_env_vars():
                 os.environ.pop(name, None)
-            cfg = Config(profile=profile)
+            cfg = Config(profile=profile, credentials_strategy=SdkFallbackCredentials())
         else:
             # Unprofiled: mirror ``databricks auth token --host`` — drop any
             # ambient profile and pin the SDK to this workspace so env / OIDC
             # service-principal credentials mint against it.
             os.environ.pop("DATABRICKS_CONFIG_PROFILE", None)
-            cfg = Config(host=host) if host else Config()
+            cfg = (
+                Config(host=host, credentials_strategy=SdkFallbackCredentials())
+                if host
+                else Config(credentials_strategy=SdkFallbackCredentials())
+            )
         auth = cfg.authenticate().get("Authorization", "")
         if not cfg.host or not auth.startswith("Bearer "):
             return None
