@@ -3612,6 +3612,7 @@ def register_events_routes(
         request: Request,
         session_id: str,
         delete_branch: bool = False,
+        capture_logs: bool = False,
     ) -> ConversationDeleted:
         """Delete a session and all associated resources.
 
@@ -3635,6 +3636,12 @@ def register_events_routes(
             block the delete. Defaults to ``False`` (worktree and
             branch left untouched). See
             designs/SESSION_GIT_WORKTREE.md.
+        :param capture_logs: Opt-in, as a query param
+            (``?capture_logs=true``). When ``True`` and the session runs on a
+            managed sandbox, the server logs the sandbox's host and runner
+            log tails before terminating it, so a client that saw a turn fail
+            keeps the evidence. Ignored for sessions without a managed
+            sandbox. Defaults to ``False``.
         :returns: A :class:`ConversationDeleted` confirmation.
         :raises OmnigentError: 404 if no session or no access,
             403 if insufficient permissions, 409 if
@@ -3802,6 +3809,7 @@ def register_events_routes(
                     # terminate; None (config removed since launch)
                     # still deletes the row and revokes the token.
                     getattr(request.app.state, "sandbox_config", None),
+                    capture_logs=capture_logs,
                 )
         try:
             import time as _time

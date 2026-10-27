@@ -4504,6 +4504,8 @@ async def terminate_managed_host(
     host: Host,
     host_store: HostStore,
     config: ManagedSandboxDeployment | None,
+    *,
+    capture_logs: bool = False,
 ) -> None:
     """
     Terminate a managed host's sandbox and delete its host row.
@@ -4520,6 +4522,8 @@ async def terminate_managed_host(
     :param config: The deployment's current sandbox config (supplies
         the launcher for the provider-side terminate), or ``None``
         when managed hosts are no longer configured.
+    :param capture_logs: Log the in-sandbox host and runner log tails before
+        terminating, e.g. after a client saw the session's turn fail.
     """
     tombstone = await asyncio.to_thread(host_store.delete_host, host.host_id)
     if tombstone is None:
@@ -4528,6 +4532,10 @@ async def terminate_managed_host(
     sandbox_ids = dict.fromkeys((tombstone.sandbox_id, tombstone.terminating_sandbox_id))
     for sandbox_id in sandbox_ids:
         if sandbox_id is not None:
+            if capture_logs and launcher is not None:
+                await _log_sandbox_logs_best_effort(
+                    launcher, sandbox_id, host_id=tombstone.host_id
+                )
             terminated = await _terminate_sandbox_best_effort(
                 launcher,
                 sandbox_id,
@@ -4540,6 +4548,28 @@ async def terminate_managed_host(
                     tombstone.host_id,
                     sandbox_id=sandbox_id,
                 )
+
+
+async def _log_sandbox_logs_best_effort(
+    launcher: SandboxHostLauncher, sandbox_id: str, *, host_id: str
+) -> None:
+    """Log a sandbox's host and runner log tails; never raises."""
+    try:
+        logs = await asyncio.to_thread(launcher.capture_logs, sandbox_id)
+    except Exception:  # diagnostics must not block teardown.
+        _logger.warning(
+            "Failed to capture logs from managed sandbox %s for host %s",
+            sandbox_id,
+            host_id,
+            exc_info=True,
+        )
+        return
+    _logger.error(
+        "Managed sandbox %s logs before teardown (host %s):\n%s",
+        sandbox_id,
+        host_id,
+        logs or "<no logs captured>",
+    )
 
 
 async def _terminate_sandbox_best_effort(

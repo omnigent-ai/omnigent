@@ -13690,6 +13690,17 @@
               "title": "Delete Branch",
               "type": "boolean"
             }
+          },
+          {
+            "description": "Opt-in, as a query param (`?capture_logs=true`). When `True` and the session runs on a managed sandbox, the server logs the sandbox's host and runner log tails before terminating it, so a client that saw a turn fail keeps the evidence. Ignored for sessions without a managed sandbox. Defaults to `False`.",
+            "in": "query",
+            "name": "capture_logs",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Capture Logs",
+              "type": "boolean"
+            }
           }
         ],
         "responses": {
