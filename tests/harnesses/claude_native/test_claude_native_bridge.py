@@ -2212,6 +2212,87 @@ def test_scheduled_wake_skips_tool_results_and_real_prompts(tmp_path: Path) -> N
     assert result.items[2].response_id not in {"resp_prev_turn", None}
 
 
+@pytest.mark.parametrize(
+    ("record_fields", "message_fields", "hidden"),
+    [
+        pytest.param({}, {}, True, id="interrupted-turn-resumed"),
+        pytest.param(
+            {"isApiErrorMessage": True, "error": "rate_limit"}, {}, True, id="rate-limit"
+        ),
+        pytest.param({}, {"content": "No response requested."}, True, id="string-content"),
+        pytest.param({}, {"model": "claude-sonnet-4-5"}, False, id="model-reply"),
+        pytest.param(
+            {"isApiErrorMessage": True},
+            {"content": [{"type": "text", "text": "API Error: Connection refused"}]},
+            False,
+            id="api-error",
+        ),
+        pytest.param(
+            {},
+            {
+                "content": [
+                    {"type": "text", "text": "No response requested."},
+                    {"type": "text", "text": "Continuing."},
+                ]
+            },
+            False,
+            id="additional-text",
+        ),
+    ],
+)
+def test_read_transcript_hides_no_response_placeholder(
+    tmp_path: Path,
+    record_fields: dict[str, Any],
+    message_fields: dict[str, Any],
+    hidden: bool,
+) -> None:
+    """
+    Claude Code's synthetic no-reply placeholder never reaches the chat.
+
+    On resume the TUI writes it just before the next prompt; it must not render
+    or open a turn. Model prose and other CLI-authored messages are kept.
+    """
+    record = {
+        "type": "assistant",
+        "uuid": "placeholder",
+        "isApiErrorMessage": False,
+        "message": {
+            "role": "assistant",
+            "model": "<synthetic>",
+            "stop_reason": "stop_sequence",
+            "content": [{"type": "text", "text": "No response requested."}],
+            **message_fields,
+        },
+        **record_fields,
+    }
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        _transcript_line(record)
+        + _transcript_line(
+            {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "continue"}}
+        )
+        + _transcript_line(_assistant_text_entry("reply", "Picking the task back up.")),
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp_prev_turn",
+        settled_response_id="resp_prev_turn",
+    )
+
+    texts = [block["text"] for item in result.items for block in item.data["content"]]
+    conversation = ["continue", "Picking the task back up."]
+    if hidden:
+        assert texts == conversation
+    else:
+        kept = [block["text"] for block in record["message"]["content"]]
+        assert texts == [claude_native_bridge._SCHEDULED_WAKE_MARKER_TEXT, *kept, *conversation]
+
+
 def test_read_transcript_line_cursor_migration_preserves_legacy_source_ids(
     tmp_path: Path,
 ) -> None:

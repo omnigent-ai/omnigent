@@ -35,6 +35,7 @@ from omnigent.native.failure_telemetry import FailureContext
         "missing_native_session",
         "missing_error_text",
         "unmarked_retained_context",
+        "no_response_placeholder",
     ],
 )
 @pytest.mark.asyncio
@@ -68,6 +69,13 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
                 {"type": "text", "text": error_text},
                 {"type": "text", "text": "The current request failed."},
             ],
+        }
+    if scenario == "no_response_placeholder":
+        # Claude Code's hidden rate-limit placeholder is not error detail.
+        records[1]["message"] = {
+            "role": "assistant",
+            "model": "<synthetic>",
+            "content": [{"type": "text", "text": "No response requested."}],
         }
     transcript_path.write_text("".join(json.dumps(record) + "\n" for record in records))
     hook = {
@@ -206,6 +214,7 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
         "recovered_turn": "no_api_error_context",
         "failed_item_after_error": "no_api_error_context",
         "unmarked_prose": "no_api_error_context",
+        "no_response_placeholder": "no_api_error_context",
     }.get(scenario, "matched")
     assert context["transcript_error_context_state"] == expected_context_state
     assert len(checkpoint_reads) == (
