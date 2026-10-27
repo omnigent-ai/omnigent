@@ -914,3 +914,93 @@ async def test_unbound_gateway_preview_prefers_the_family_default_gateway():
     assert preview is not None
     assert preview["provider_label"] == "Preferred"
     assert [request.url.host for request in requests] == ["preferred.example"]
+
+
+def _litellm_state():
+    def gateway(family, wire=None, default=None):
+        endpoint = {"base_url": "http://litellm.local/v1", "api_key_ref": "env:POD_INFERENCE_KEY"}
+        if wire is not None:
+            endpoint["wire_api"] = wire
+        entry = {"kind": "gateway", family: endpoint}
+        if default is not None:
+            entry["default"] = default
+        return entry
+
+    discovery = {"base_url": "http://litellm.local/v1", "api_key_ref": "env:INFERENCE_CATALOG_KEY"}
+    target = ManagedSandboxConfig(
+        server_url="http://localhost:6767",
+        launcher_factory=lambda: None,
+        token_ttl_s=100,
+        provider="kubernetes",
+        host_config={
+            "providers": {
+                "sparks": gateway("openai", "chat", ["pi"]),
+                "codex": gateway("openai", "responses", ["openai"]),
+                "claude": gateway("anthropic"),
+            }
+        },
+        model_discovery={name: dict(discovery) for name in ("sparks", "codex", "claude")},
+    )
+    return SimpleNamespace(
+        sandbox_config=ManagedSandboxDeployment.single(target),
+        databricks_store=None,
+        databricks_client=None,
+    )
+
+
+def _litellm_transport():
+    listing = [
+        {"id": "gpt-6.1-sol", "mode": "responses"},
+        {"id": "claude-opus-5-5", "mode": "chat"},
+        {"id": "ds4"},
+        {"id": "embed-default", "mode": "embedding"},
+    ]
+    info = {
+        "gpt-6.1-sol": {
+            "mode": "responses",
+            "litellm_provider": "chatgpt",
+            "supports_reasoning": True,
+            "supports_minimal_reasoning_effort": False,
+            "supports_xhigh_reasoning_effort": True,
+        },
+        "claude-opus-5-5": {
+            "mode": "chat",
+            "litellm_provider": "anthropic",
+            "supports_reasoning": True,
+            "supports_max_reasoning_effort": True,
+        },
+        "ds4": {"litellm_provider": "openai"},
+        "embed-default": {"mode": "embedding", "litellm_provider": "openai"},
+    }
+
+    def respond(request):
+        if request.url.path == "/v1/models":
+            return httpx.Response(200, json={"data": listing})
+        return httpx.Response(
+            200,
+            json={"data": [{"model_name": n, "model_info": i} for n, i in info.items()]},
+        )
+
+    return httpx.MockTransport(respond)
+
+
+@pytest.mark.asyncio
+async def test_litellm_preview_carries_efforts_and_scopes_claude_to_anthropic_routes():
+    service = SandboxInferenceService(_litellm_state(), transport=_litellm_transport())
+
+    codex = await service.ambient_catalog("kubernetes", "codex-native", "alice")
+    assert codex is not None
+    rows = {row["id"]: row for row in codex["models"]}
+    assert list(rows) == ["gpt-6.1-sol", "claude-opus-5-5", "ds4"]
+    assert [e["reasoningEffort"] for e in rows["gpt-6.1-sol"]["supportedReasoningEfforts"]] == [
+        "low",
+        "medium",
+        "high",
+        "xhigh",
+    ]
+    assert "supportedReasoningEfforts" not in rows["ds4"]
+
+    claude = await service.ambient_catalog("kubernetes", "claude-native", "alice")
+    assert claude is not None
+    assert [row["id"] for row in claude["models"]] == ["claude-opus-5-5"]
+    assert claude["status"] == "ready"
