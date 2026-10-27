@@ -1,0 +1,31 @@
+name: Sync PR Priority Test
+
+# Offline unit test for the PR priority sync. Runs on PR head without secrets or
+# network and only when the sync logic changes.
+
+on:
+  pull_request:
+    paths:
+      - .github/scripts/sync_pr_priority.py
+      - .github/scripts/sync_pr_priority_test.py
+      - .github/workflows/sync-pr-priority.yml
+      - .github/workflows/sync-pr-priority-test.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-pr-priority-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Run sync-pr-priority unit test
+        run: python3 .github/scripts/sync_pr_priority_test.py
