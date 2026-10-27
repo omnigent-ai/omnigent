@@ -6,13 +6,17 @@ import io
 import json
 import re
 import shlex
+import subprocess
 import sys
+import threading
 import time
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
 import pytest
 
+from omnigent._platform import stable_user_id
 from omnigent.harnesses.claude_native import hook as claude_native_hook
 from omnigent.harnesses.claude_native.bridge import (
     OBSERVER_HOOK_STDERR_FILE,
@@ -1967,6 +1971,95 @@ def test_evaluate_policy_fails_closed_when_reauth_unavailable(
     )
 
 
+def test_generated_policy_command_delivers_its_verdict_through_the_fast_exit(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    The generated PreToolUse command still prints a deny verdict before exiting.
+
+    The hook leaves through ``os._exit`` with stdout on a pipe, so a verdict
+    still buffered there would be lost and Claude Code would run the tool.
+    """
+
+    class _DenyEveryPolicyRequest(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            body = b'{"result":"POLICY_ACTION_DENY","reason":"Blocked by policy"}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    # The command runs the hook with TMPDIR set to the trusted parent, so the
+    # child derives this same bridge root.
+    monkeypatch.setattr(
+        "omnigent.harnesses.claude_native.bridge._BRIDGE_ROOT",
+        tmp_path / f"omnigent-{stable_user_id()}" / "claude-native",
+    )
+    with ThreadingHTTPServer(("127.0.0.1", 0), _DenyEveryPolicyRequest) as server:
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        bridge_dir = prepare_bridge_dir("conv_abc", bridge_id="bridge_shared", workspace=tmp_path)
+        write_active_session_id(bridge_dir, "conv_active")
+        settings = build_hook_settings(
+            bridge_dir,
+            ap_server_url=f"http://127.0.0.1:{server.server_port}",
+            ap_auth_headers={"Authorization": "Bearer test-token"},
+        )
+        [command] = [
+            hook["command"] for group in settings["hooks"]["PreToolUse"] for hook in group["hooks"]
+        ]
+        result = subprocess.run(
+            ["/bin/sh", "-c", command],
+            input=json.dumps(
+                {
+                    "hook_event_name": "PreToolUse",
+                    "tool_name": "Bash",
+                    "tool_input": {"command": "rm -rf /"},
+                }
+            ),
+            text=True,
+            capture_output=True,
+            timeout=60,
+            check=False,
+        )
+        server.shutdown()
+
+    assert result.returncode == 0, result.stderr
+    verdict = json.loads(result.stdout)
+    assert verdict["hookSpecificOutput"]["permissionDecision"] == "deny"
+    assert verdict["hookSpecificOutput"]["permissionDecisionReason"] == "Blocked by policy"
+
+
+def test_policy_hook_fast_exit_finalizes_in_interpreter_order() -> None:
+    """
+    The fast exit finishes non-daemon threads, then exit handlers, then exits with the hook's code.
+
+    It skips only module teardown, so work a hook leaves on a thread or in an
+    ``atexit`` callback still completes.
+    """
+    code = "\n".join(
+        (
+            "import atexit, threading, time",
+            "from omnigent.harnesses.claude_native import hook",
+            "def late_writer():",
+            "    time.sleep(0.1)",
+            "    print('non-daemon thread finished', flush=True)",
+            "threading.Thread(target=late_writer).start()",
+            "atexit.register(print, 'exit handler ran')",
+            "hook._exit_without_teardown(3)",
+        )
+    )
+    result = subprocess.run(
+        [sys.executable, "-c", code], capture_output=True, text=True, timeout=60, check=False
+    )
+    assert result.returncode == 3, result.stderr
+    assert result.stdout.splitlines() == ["non-daemon thread finished", "exit handler ran"]
+
+
 # ── #1782: bound the reattach spin-loop ────────────────────────────────────
 #
 # Before the fix, ``_post_hook_with_reattach`` re-POSTed on every 5xx/transport
@@ -2249,6 +2342,95 @@ def test_reattach_held_poll_sever_resets_backoff(monkeypatch: pytest.MonkeyPatch
     assert sleeps == [initial, initial * 2, initial * 4, initial, initial]
 
 
+def test_reattach_parked_wait_rides_out_a_host_network_outage(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A parked approval keeps retrying while the host cannot reach the server.
+
+    The server already published the card; giving up after a few unreachable
+    connects left Claude's prompt blocking the session with no card to answer,
+    so web messages stayed buffered until the turn failed.
+    """
+    cap = claude_native_hook._PERMISSION_MAX_CONSECUTIVE_FAILURES
+    held = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S + 290.0
+    client = _scripted_client(
+        script=[("5xx", held)] + [("connect", 30.0)] * (cap * 3) + [("ok", 0.0)],
+        monkeypatch=monkeypatch,
+    )
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+    )
+
+    assert resp is not None and resp.status_code == 200, (
+        "a parked approval fail-asked during a network outage"
+    )
+    assert len(client.calls) == cap * 3 + 2
+
+
+def test_reattach_re_posts_a_held_poll_whose_reply_never_arrives(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A held poll on a dead socket is re-POSTed instead of blocking for a day.
+
+    After a host network outage the gateway's idle-cut reply is lost, so the
+    connection stays open with nothing left to read. The hook must time the
+    read out and re-park the same elicitation once the server answers again.
+    """
+    monkeypatch.setattr(claude_native_hook, "_PERMISSION_POLL_READ_TIMEOUT_S", 0.3)
+    monkeypatch.setattr(claude_native_hook, "_PERMISSION_HELD_POLL_FLOOR_S", 0.1)
+    monkeypatch.setattr(claude_native_hook, "_PERMISSION_RETRY_INITIAL_BACKOFF_S", 0.0)
+    elicitation_ids: list[object] = []
+    release = threading.Event()
+
+    class _Handler(BaseHTTPRequestHandler):
+        def do_POST(self) -> None:
+            body = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+            elicitation_ids.append(body.get("_omnigent_elicitation_id"))
+            if len(elicitation_ids) == 1:
+                release.wait(10.0)  # the reply that a dead network swallows
+                return
+            payload = b'{"ok": true}'
+            self.send_response(200)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+        def log_message(self, format: str, *args: object) -> None:
+            del format, args
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _Handler)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    result: dict[str, httpx.Response | None] = {}
+
+    def _run() -> None:
+        result["resp"] = claude_native_hook._post_hook_with_reattach(
+            url=f"http://127.0.0.1:{server.server_port}/v1/sessions/conv_x/hooks/permission-request",
+            headers={},
+            payload={"hook_event_name": "PermissionRequest"},
+            hook_label="permission",
+        )
+
+    worker = threading.Thread(target=_run, daemon=True)
+    try:
+        worker.start()
+        worker.join(5.0)
+        assert not worker.is_alive(), "the hook stayed blocked on a poll that never answers"
+    finally:
+        release.set()
+        server.shutdown()
+        server.server_close()
+    resp = result["resp"]
+    assert resp is not None and resp.status_code == 200
+    assert len(elicitation_ids) == 2 and elicitation_ids[0] == elicitation_ids[1]
+
+
 def test_reattach_holds_the_approval_wait_marker_until_the_wait_ends(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2432,6 +2614,129 @@ def test_reattach_reauths_again_after_a_held_poll_sever(monkeypatch: pytest.Monk
     assert resp is not None and resp.status_code == 200
     assert minted == [1, 2], "the second lapse must be re-minted too"
     assert seen_auth == ["Bearer stale", "Bearer fresh1", "Bearer fresh1", "Bearer fresh2"]
+
+
+@pytest.mark.parametrize("status", [401, 403])
+@pytest.mark.parametrize("parked", [True, False], ids=["parked", "never-parked"])
+def test_reattach_auth_rejection_without_renewal(
+    monkeypatch: pytest.MonkeyPatch, status: int, parked: bool
+) -> None:
+    """
+    A parked prompt outlives a login that can't be renewed yet; a new one fails fast.
+
+    After a held poll the server has accepted this hook, so a rejection it
+    can't re-mint past is a lapse: retry until a credential is available.
+    Before any held poll the same rejection is final.
+    """
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    clock = {"t": 0.0}
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", lambda _s: None)
+    script = [("severed", floor + 290.0)] if parked else []
+    script += [("rejected", 0.0)] * 3 + [("ok", 0.0)]
+    seen_auth: list[str] = []
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del timeout
+            self._headers = headers
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            seen_auth.append(self._headers.get("Authorization", ""))
+            kind, held_s = script[len(seen_auth) - 1]
+            clock["t"] += held_s
+            req = httpx.Request("POST", url)
+            if kind == "severed":
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            if kind == "rejected":
+                return httpx.Response(status, request=req)
+            return httpx.Response(200, json={"ok": True}, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+    failed_mints = {"left": 2}
+
+    def _reauth() -> dict[str, str] | None:
+        """
+        Fail to mint until the user has signed in again.
+
+        :returns: Fresh headers once signed in, else ``None``.
+        """
+        failed_mints["left"] -= 1
+        return None if failed_mints["left"] >= 0 else {"Authorization": "Bearer fresh"}
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        reauth=_reauth,
+    )
+
+    if parked:
+        assert resp is not None and resp.status_code == 200
+        assert seen_auth == ["Bearer stale"] * 4 + ["Bearer fresh"], seen_auth
+    else:
+        assert resp is None
+        assert seen_auth == ["Bearer stale"], "a rejection before any held poll must not retry"
+
+
+def test_reattach_auth_lapse_retry_stops_at_deadline(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A parked prompt whose login is never renewed backs off, capped, until the deadline."""
+    floor = claude_native_hook._PERMISSION_HELD_POLL_FLOOR_S
+    clock = {"t": 0.0}
+    sleeps: list[float] = []
+
+    def _sleep(seconds: float) -> None:
+        sleeps.append(seconds)
+        clock["t"] += seconds
+
+    monkeypatch.setattr(claude_native_hook.time, "monotonic", lambda: clock["t"])
+    monkeypatch.setattr(claude_native_hook.time, "sleep", _sleep)
+    attempts = {"n": 0}
+
+    class _Client:
+        def __init__(self, *, headers: dict[str, str], timeout: object) -> None:
+            del headers, timeout
+
+        def __enter__(self) -> _Client:
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            del args
+
+        def post(self, url: str, *, json: dict[str, object]) -> httpx.Response:
+            del json
+            attempts["n"] += 1
+            req = httpx.Request("POST", url)
+            if attempts["n"] == 1:
+                clock["t"] += floor + 290.0
+                raise httpx.RemoteProtocolError("gateway severed the poll", request=req)
+            return httpx.Response(401, request=req)
+
+    monkeypatch.setattr(native_policy_hook.httpx, "Client", _Client)
+
+    resp = claude_native_hook._post_hook_with_reattach(
+        url="http://127.0.0.1:8787/v1/sessions/conv_x/hooks/permission-request",
+        headers={"Authorization": "Bearer stale"},
+        payload={"hook_event_name": "PreToolUse"},
+        hook_label="permission",
+        reauth=lambda: None,
+    )
+
+    assert resp is None
+    assert clock["t"] >= claude_native_hook._PERMISSION_TIMEOUT_S
+    assert sleeps[:6] == [1.0, 2.0, 4.0, 8.0, 16.0, 30.0], sleeps[:6]
+    assert max(sleeps) == claude_native_hook._PERMISSION_RETRY_MAX_BACKOFF_S
+    assert "retry budget exhausted" in capsys.readouterr().err
 
 
 def test_reattach_fast_flapping_connection_is_hard_failure(

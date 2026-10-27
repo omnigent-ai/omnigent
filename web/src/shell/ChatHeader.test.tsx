@@ -738,6 +738,24 @@ describe("ChatHeader — title-adjacent conversation actions", () => {
     permission_level: 3,
   };
 
+  it.each([
+    { name: "landing", actionConversation: null },
+    { name: "shared session", actionConversation: null, conversationId: "conv-1" },
+    { name: "sub-agent", actionConversation: conversation, isChildSession: true },
+    { name: "pending session", actionConversation: conversation, pending: true },
+  ])("leaves the rename shortcut untouched on $name", (props) => {
+    renderHeader({ sidebarOpen: true, conversationTitle: conversation.title, ...props });
+    const pressed = new KeyboardEvent("keydown", {
+      code: "KeyR",
+      ctrlKey: true,
+      altKey: true,
+      cancelable: true,
+    });
+    window.dispatchEvent(pressed);
+    expect(pressed.defaultPrevented).toBe(false);
+    expect(screen.queryByRole("textbox", { name: "Session name" })).toBeNull();
+  });
+
   it("keeps the overflow trigger immediately after a truncating title", () => {
     renderHeader({
       sidebarOpen: true,

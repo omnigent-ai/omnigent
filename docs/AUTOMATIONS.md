@@ -30,9 +30,34 @@ To provision a fresh sandbox per firing, set `execution_target: "managed_sandbox
 
 `max_cost_usd` is a positive per-firing budget. Each fired session gets its own cost-budget policy, which blocks subsequent requests and tool calls once recorded spend reaches the cap. It does not interrupt an in-progress model turn: spend can overshoot before the next check, and denying a native tool call does not terminate the turn. Omit the field to attach no automation-specific cap; other applicable policies still apply.
 
-**Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work. The create and update tools expose the same `permission_mode`, `max_cost_usd`, and `execution_target` controls.
+**Agent tools.** An agent can manage automations itself with `sys_scheduled_task_create`, `sys_scheduled_task_list`, `sys_scheduled_task_update`, and `sys_scheduled_task_delete` -- so an agent can schedule its own follow-up work. The create and update tools expose the same `permission_mode`, `max_cost_usd`, and `execution_target` controls. Because they persist or change unattended work, every agent call to `sys_scheduled_task_create` or `sys_scheduled_task_update` parks on an approval prompt in the session, even when no other guardrails apply. The prompt lists the requested settings (agent, schedule, timezone, host, execution target, permission mode, cost cap) and the prompt's length, and the card's argument preview shows the request itself, truncated after 1,024 characters; review them before approving. This also holds inside an automation's own run: if its agent creates or updates another automation, that call waits for approval too and is denied when nobody answers before the approval timeout. `sys_scheduled_task_list` and `sys_scheduled_task_delete` are not gated this way, and changes you make directly in the UI or REST API keep their existing authorization rules.
+
+Agent calls to `sys_scheduled_task_create` and `sys_scheduled_task_update`
+require interactive approval before persisting future work. Review the agent,
+prompt, host and permission settings in that request. This also applies when
+the call inherits defaults. Direct changes you make in the UI or REST API keep
+their existing authorization rules.
 
 ## Schedules are RRULEs, not cron
+
+Persisted RRULEs have a 512-character storage limit. The parser also applies a
+4096-character safety ceiling; that ceiling does not increase storage capacity.
+Use a single RRULE with at most 24 combinations of
+`BYHOUR`, `BYMINUTE`, and `BYSECOND`. `INTERVAL` is limited to 1–366 periods;
+for minute and second frequencies the equivalent maximum is 366 hours.
+Hourly-equivalent rules such as `FREQ=MINUTELY;INTERVAL=60` and
+`FREQ=SECONDLY;INTERVAL=3600` remain valid, including when loaded from storage.
+Validation and next-fire lookup have an eight-year occurrence horizon and a
+100,000-step search budget that counts calendar candidates, position selections,
+and inner time-filter searches. Each search also has a 250 ms monotonic deadline.
+Every `BY*` list is deduplicated and limited to 24 distinct values before parsing.
+Create and update validation runs off the HTTP event loop. Exhausting
+the budget raises a validation error. If this happens while re-arming a task,
+the scheduler logs the reason and clears its next-run time instead of leaving
+an expired timestamp. Update the rule to resume scheduling.
+An empty search stops at the horizon even when filters yield no candidates.
+Schedules with no occurrence in the window are not armed; validation requires
+at least two occurrences and an hourly minimum.
 
 A schedule is an [RFC 5545](https://datatracker.ietf.org/doc/html/rfc5545) recurrence rule evaluated in the task's IANA timezone.
 
@@ -63,7 +88,7 @@ Two timing caveats are worth knowing:
 2. **The launch target is resolved.** A `managed_sandbox` task checks that managed launches are available; its fresh sandbox is provisioned during launch. For `connected_host`, a task with no pinned `host_id` uses the owner's most-recently-active live host, chosen at fire time. A task with no pinned `workspace` starts the runner in that host's home directory, which is what makes chat-only, research, and MCP-only automations possible. A pinned host that is missing or offline -- or an owner with no live host at all -- records a **failed** run rather than a running one (`error_code` `host_offline`, `host_not_found`, or `no_online_host`).
 3. **A session is created**, bound to the task's agent and carrying any `model_override`, `reasoning_effort`, and supported `permission_mode`. Connected-host sessions carry the resolved workspace and host; managed-sandbox sessions are bound to their new sandbox during launch. If `max_cost_usd` is set, a per-session cost-budget policy is attached before the prompt is dispatched.
 4. **Ownership is granted.** The new session gets a `LEVEL_OWNER` grant for the task's owner (a reserved local user in single-user and OSS deployments). Without the grant the run would be invisible.
-5. **The runner launches and the prompt is dispatched**, so the agent actually works. A seeded prompt with no launched runner would just sit in history.
+5. **The runner launches and the prompt is dispatched**, so the agent actually works. A seeded prompt with no launched runner would just sit in history. A `managed_sandbox` fire saves the prompt in the session first, records the run, and then provisions the sandbox in the background. The prompt is delivered when the sandbox host connects, even after a server restart or on another replica. A launch failure fails the run with `error_code` `launch_failed`.
 6. **The run is recorded** in `scheduled_task_runs`, and `last_run_at` and `last_run_conversation_id` are stamped on the task.
 
 Firing is fire-and-forget: the guard steps run synchronously so a dead fire costs nothing, then session creation and launch move to a background task and the scheduler re-arms immediately. A failure in that background work is logged and never crashes the scheduler.
@@ -81,11 +106,11 @@ Each run carries `status`, `scheduled_at`, `fired_at`, `finished_at`, `conversat
 | `failed` | The firing or the turn failed; see `error_code`. |
 | `skipped` | The firing was deliberately not attempted -- for example an unsupported `execution_target`. |
 
-`ScheduledTaskRun` also declares a `scheduled` status, but no code path writes it: a run row is created at dispatch, so `running` is the earliest state a client can observe.
+`ScheduledTaskRun` also declares `scheduled` and `starting` statuses, but the current scheduler creates runs at dispatch with status `running`. Once integrated, the persistent scheduler will use `starting` while preparing a run, with `automations_v2` enabled.
 
 ## Lifecycle
 
-A task is `active`, `paused`, or `deleted`. `PATCH /v1/scheduled-tasks/{id}` changes supported mutable fields and can move a task between `active` and `paused`; it cannot set `deleted` (use `DELETE`). Omitting a field normally leaves it unchanged. Moving a task to a different `agent_id` clears `model_override`, `reasoning_effort`, and `permission_mode` unless the same request resends them, because a harness switch invalidates the settings stored beside the agent -- so re-pin an automation's execution controls in the request that switches its agent, or it fires the new agent on defaults. `max_cost_usd` is not agent-bound and survives the switch. Sending `permission_mode: null` clears the permission override, and `max_cost_usd: null` clears the cost cap. An explicit `null` for `workspace` or `host_id` is rejected -- the rejection is on the presence of the key, so it applies even to a task where that field is currently unset; there is no direct null-based way to clear either one.
+Clients see tasks as `active` or `paused`. Deleted tasks are hidden immediately; their database rows may remain until unfinished claimed runs complete or are reconciled. `PATCH /v1/scheduled-tasks/{id}` changes supported mutable fields and can move a task between `active` and `paused`; it cannot set `deleted` (use `DELETE`). Omitting a field normally leaves it unchanged. Moving a task to a different `agent_id` clears `model_override`, `reasoning_effort`, and `permission_mode` unless the same request resends them, because a harness switch invalidates the settings stored beside the agent -- so re-pin an automation's execution controls in the request that switches its agent, or it fires the new agent on defaults. `max_cost_usd` is not agent-bound and survives the switch. Sending `permission_mode: null` clears the permission override, and `max_cost_usd: null` clears the cost cap. An explicit `null` for `workspace` or `host_id` is rejected -- the rejection is on the presence of the key, so it applies even to a task where that field is currently unset; there is no direct null-based way to clear either one.
 
 Switching to `execution_target: "managed_sandbox"` clears both stored pins. Omit the `host_id` and `workspace` keys entirely in that PATCH, even if their values would be null. Switching back to `connected_host` leaves both unset unless the request supplies new pins, so the next fire resolves the owner's live host and its home directory.
 
@@ -111,7 +136,7 @@ The scheduler is the timing engine only, and its behavior is deliberately simple
 
 - **Missed fires are not replayed.** On startup the scheduler arms the next future occurrence of every active task; occurrences that passed while the server was down are gone. There is no backfill or replay.
 - **No automatic retry.** A failed run is recorded and visible in history; the retry policy is that the next occurrence fires normally.
-- **Overlapping fires are skipped.** If the previous firing of the same task is still being dispatched when the next tick arrives, the tick is dropped. No run row is recorded for it, so a dropped tick leaves no trace in history beyond the server log.
+- **Overlapping fires are skipped.** If the previous firing of the same task is still being dispatched when the next tick arrives, the tick is dropped. A `managed_sandbox` firing stops counting once its prompt is saved and its sandbox has started provisioning, so the next tick runs in its own new sandbox. No run row is recorded for it, so a dropped tick leaves no trace in history beyond the server log.
 - **Late ticks are skipped.** A tick arriving more than 30 seconds after its scheduled time (a blocked event loop, for instance) is skipped rather than fired late.
 - **One scheduler per server process.** Timers are in-process with no distributed leasing, so a multi-replica deployment would fire each task once per replica. Shared session-create orchestration is the intended path for that.
 - **Execution targets.** Runs use either a connected host with an existing workspace or a fresh managed sandbox. Reusing an existing managed sandbox is not supported. Git branch selection at fire time is not available: `base_branch` is rejected as an unknown API field. A stored row with an unsupported `execution_target` records a `skipped` run with `error_code` `unsupported_target`.

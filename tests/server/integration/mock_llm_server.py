@@ -34,7 +34,9 @@ Usage::
 
     python tests/server/integration/mock_llm_server.py 9999
 
-Configuration via ``POST /mock/configure``::
+Configuration via ``POST /mock/configure``:
+
+.. code-block:: json
 
     {
         "key": "mock-model",
@@ -65,6 +67,7 @@ import contextlib
 import hashlib
 import json
 import os
+import re
 import sys
 import threading
 import time as _time_mod
@@ -147,7 +150,9 @@ def _response_usage(output_tokens: int, overrides: dict | None = None) -> dict:
     return usage
 
 
-def sse_text_response(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
+def sse_text_response(
+    text: str, model: str = "mock-model", usage: dict | None = None, *, stream: bool = False
+) -> str:
     """
     Build a complete SSE stream for a simple text response.
 
@@ -159,6 +164,7 @@ def sse_text_response(text: str, model: str = "mock-model", usage: dict | None =
     :param text: The assistant response text.
     :param model: Model name to include in the response.
     :param usage: Optional token-usage overrides.
+    :param stream: Include incremental text deltas before completing the message.
     :returns: SSE-formatted string.
     """
     resp_id = _response_id()
@@ -205,8 +211,26 @@ def sse_text_response(text: str, model: str = "mock-model", usage: dict | None =
     _add(
         "response.output_item.added",
         output_index=0,
-        item=message_item,
+        item={**message_item, "status": "in_progress", "content": []} if stream else message_item,
     )
+    if stream:
+        _add(
+            "response.content_part.added",
+            output_index=0,
+            item_id=msg_id,
+            content_index=0,
+            part={"type": "output_text", "text": "", "annotations": [], "logprobs": []},
+        )
+        # Keep original whitespace so streamed text agrees with the final message.
+        for delta in re.findall(r"\s+|\S+\s*", text):
+            _add(
+                "response.output_text.delta",
+                output_index=0,
+                item_id=msg_id,
+                content_index=0,
+                delta=delta,
+                logprobs=[],
+            )
     _add(
         "response.output_text.done",
         output_index=0,
@@ -214,6 +238,14 @@ def sse_text_response(text: str, model: str = "mock-model", usage: dict | None =
         content_index=0,
         text=text,
     )
+    if stream:
+        _add(
+            "response.content_part.done",
+            output_index=0,
+            item_id=msg_id,
+            content_index=0,
+            part={"type": "output_text", "text": text, "annotations": [], "logprobs": []},
+        )
     _add(
         "response.output_item.done",
         output_index=0,
@@ -351,6 +383,17 @@ def truncate_sse(body: str, keep_events: int) -> str:
     return "".join(f"{seg}\n\n" for seg in kept)
 
 
+async def paced_sse(sse_body: str, chunk_delay: float) -> AsyncIterator[str]:
+    """Yield SSE events with real delays, or the entire body when delay is zero."""
+    if chunk_delay > 0:
+        for index, event in enumerate(filter(None, sse_body.split("\n\n"))):
+            if index:
+                await asyncio.sleep(chunk_delay)
+            yield event + "\n\n"
+    else:
+        yield sse_body
+
+
 def sse_streaming_text(text: str, model: str = "mock-model", usage: dict | None = None) -> str:
     """
     Build SSE with text deltas followed by a completed event.
@@ -360,12 +403,7 @@ def sse_streaming_text(text: str, model: str = "mock-model", usage: dict | None 
     :param usage: Optional token-usage overrides.
     :returns: SSE-formatted string with delta events.
     """
-    events = []
-    for word in text.split():
-        delta = {"delta": word + " "}
-        events.append(f"event: response.output_text.delta\ndata: {json.dumps(delta)}\n\n")
-    events.append(sse_text_response(text, model, usage))
-    return "".join(events)
+    return sse_text_response(text, model, usage, stream=True)
 
 
 def sse_text_with_native_items(
@@ -786,6 +824,8 @@ class QueuedResponse:
     """
 
     text: str = "Mock LLM response"
+    # Optional Chat wire content blocks, including provider-specific metadata.
+    chat_content: list[dict[str, object]] | None = None
     tool_calls: list[dict[str, str]] | None = None
     native_items: list[dict] | None = None
     block: bool = False
@@ -813,8 +853,8 @@ class QueuedResponse:
     thinking: str | None = None
     # Seconds to sleep between SSE events on ``/v1/messages`` and
     # ``/v1/responses``. ``0`` keeps the historical single-chunk body; a small
-    # value paces the stream so live surfaces (a native TUI) visibly render
-    # intermediate deltas.
+    # value paces the stream so live surfaces (the web SPA, a native TUI)
+    # visibly render intermediate deltas.
     chunk_delay: float = 0.0
     _gate: asyncio.Event = field(default_factory=asyncio.Event)
     _pending: asyncio.Event = field(default_factory=asyncio.Event)
@@ -1070,6 +1110,7 @@ _state = MockState()
 
 
 @app.post("/v1/responses", response_model=None)
+@app.post("/ai-gateway/codex/v1/responses", response_model=None)
 async def create_response(
     request: Request,
 ) -> StreamingResponse | JSONResponse:
@@ -1140,20 +1181,8 @@ async def create_response(
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
-    chunk_delay = qr.chunk_delay
-
-    async def _generate() -> AsyncIterator[str]:
-        if chunk_delay > 0:
-            # Paced like ``/v1/messages``: one SSE event at a time.
-            for event in sse_body.split("\n\n"):
-                if event:
-                    yield event + "\n\n"
-                    await asyncio.sleep(chunk_delay)
-        else:
-            yield sse_body
-
     return StreamingResponse(
-        _generate(),
+        paced_sse(sse_body, qr.chunk_delay),
         media_type="text/event-stream",
     )
 
@@ -1258,27 +1287,14 @@ async def create_message(
     if qr.truncate_after is not None:
         sse_body = truncate_sse(sse_body, qr.truncate_after)
 
-    chunk_delay = qr.chunk_delay
-
-    async def _generate() -> AsyncIterator[str]:
-        if chunk_delay > 0:
-            # Pace the stream one SSE event at a time so live surfaces
-            # render intermediate deltas instead of one instant repaint.
-            for event in sse_body.split("\n\n"):
-                if not event:
-                    continue
-                yield event + "\n\n"
-                await asyncio.sleep(chunk_delay)
-        else:
-            yield sse_body
-
     return StreamingResponse(
-        _generate(),
+        paced_sse(sse_body, qr.chunk_delay),
         media_type="text/event-stream",
     )
 
 
 @app.post("/v1/chat/completions", response_model=None)
+@app.post("/ai-gateway/mlflow/v1/chat/completions", response_model=None)
 async def create_chat_completion(
     request: Request,
 ) -> StreamingResponse | JSONResponse:
@@ -1332,6 +1348,11 @@ async def create_chat_completion(
                     "name": tc.get("name", ""),
                     "arguments": tc.get("arguments", "{}"),
                 },
+                **(
+                    {"thoughtSignature": tc["thoughtSignature"]}
+                    if "thoughtSignature" in tc
+                    else {}
+                ),
             }
             for tc in qr.tool_calls
         ]
@@ -1339,7 +1360,8 @@ async def create_chat_completion(
         else None
     )
     finish_reason = "tool_calls" if cc_tool_calls else "stop"
-    cc_message: dict[str, object] = {"role": "assistant", "content": text or None}
+    content = qr.chat_content if qr.chat_content is not None else text or None
+    cc_message: dict[str, object] = {"role": "assistant", "content": content}
     if cc_tool_calls:
         cc_message["tool_calls"] = cc_tool_calls
     resp_id = _response_id()
@@ -1362,7 +1384,7 @@ async def create_chat_completion(
         "usage": cc_usage,
     }
     if parsed.get("stream"):
-        delta: dict[str, object] = {"role": "assistant", "content": text or None}
+        delta: dict[str, object] = {"role": "assistant", "content": content}
         if cc_tool_calls:
             delta["tool_calls"] = [{"index": i, **tc} for i, tc in enumerate(cc_tool_calls)]
         chunk = {
@@ -1499,6 +1521,7 @@ async def configure(request: Request) -> dict[str, object]:
             queue.responses.append(
                 QueuedResponse(
                     text=entry.get("text", "Mock LLM response"),
+                    chat_content=entry.get("chat_content"),
                     tool_calls=entry.get("tool_calls"),
                     native_items=entry.get("native_items"),
                     block=entry.get("block", False),

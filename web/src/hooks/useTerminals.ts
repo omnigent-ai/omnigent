@@ -82,6 +82,11 @@ export function isAgentTerminalKey(terminalKey: string): boolean {
  * briefly while the agent terminal is starting or reconciling; treating that
  * shell as a fallback duplicates it in the main viewport.
  */
+/** Display label for a terminal, e.g. ``"zsh · u-abc123"``. */
+export function terminalDisplayLabel(terminal: TerminalInfo): string {
+  return terminal.session ? `${terminal.name} · ${terminal.session}` : terminal.name;
+}
+
 export function findAgentTerminal(terminals: TerminalInfo[]): TerminalInfo | null {
   return terminals.find((terminal) => AGENT_TERMINAL_IDS.has(terminal.id)) ?? null;
 }
@@ -106,9 +111,20 @@ export function inventoryTerminals(
   return terminals.filter((t) => !AGENT_TERMINAL_IDS.has(t.id));
 }
 
+// When each conversation's list last came from a complete runner answer. SSE
+// deltas, soft-status answers and failed fetches never set it.
+const completeTerminalListAt = new Map<string, number>();
+
 interface UseTerminalsResult {
   terminals: TerminalInfo[];
   isLoading: boolean;
+  /** True while the authoritative list is (re)fetching; SSE may have filled it partially. */
+  isFetching?: boolean;
+  /**
+   * Epoch ms of the last complete runner answer, 0 if none. Until then the list
+   * may hold only SSE-delivered terminals; absent means "not known complete".
+   */
+  listCompleteAt?: number;
   error: Error | null;
 }
 
@@ -196,10 +212,15 @@ const SOFT_TERMINAL_LIST_STATUSES = new Set([404, 409, 502, 503]);
  * :raises Error: On a non-soft HTTP error status.
  */
 export async function fetchTerminals(conversationId: string): Promise<TerminalInfo[]> {
+  return (await fetchTerminalList(conversationId)) ?? [];
+}
+
+/** {@link fetchTerminals}, but null when the runner could not answer (a soft status). */
+async function fetchTerminalList(conversationId: string): Promise<TerminalInfo[] | null> {
   const res = await authenticatedFetch(
     `/v1/sessions/${encodeURIComponent(conversationId)}/resources/terminals?order=asc&limit=1000`,
   );
-  if (SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return [];
+  if (SOFT_TERMINAL_LIST_STATUSES.has(res.status)) return null;
   if (!res.ok) throw new Error(`terminals fetch failed: ${res.status} ${res.statusText}`);
   const json = (await res.json()) as { data?: unknown };
   const rows = Array.isArray(json.data) ? json.data : [];
@@ -389,14 +410,16 @@ export function useTerminals(
   // continuous mask would read stale-`false` during a cold/relaunch boot and
   // wrongly hide a terminal the SSE just delivered.
   const runnerOnline = useSessionRunnerOnline(conversationId ?? undefined);
-  const { data, isLoading, error } = useQuery({
+  const { data, isLoading, isFetching, error } = useQuery({
     queryKey:
       conversationId === null
         ? ["conversation", null, "terminals"]
         : terminalsQueryKey(conversationId),
     queryFn: async () => {
       const key = terminalsQueryKey(conversationId!);
-      const fetched = await fetchTerminals(conversationId!);
+      const list = await fetchTerminalList(conversationId!);
+      if (list !== null) completeTerminalListAt.set(conversationId!, Date.now());
+      const fetched = list ?? [];
       // Union with any SSE-written entries already in the cache so a
       // ``session.resource.created`` that raced the fetch is not lost.
       // Fetched rows win on id collision (they are the fresher snapshot).
@@ -439,6 +462,7 @@ export function useTerminals(
       if (runnerOnline === true && wasRunnerOnline.current !== true) {
         void queryClient.invalidateQueries({ queryKey: terminalsQueryKey(conversationId) });
       } else if (runnerOnline === false && wasRunnerOnline.current === true) {
+        completeTerminalListAt.delete(conversationId);
         queryClient.setQueryData<TerminalInfo[]>(terminalsQueryKey(conversationId), []);
       }
     }
@@ -449,6 +473,8 @@ export function useTerminals(
     // corrected on poll edges above). No continuous runner-online mask.
     terminals: data ?? [],
     isLoading,
+    isFetching,
+    listCompleteAt: conversationId === null ? 0 : (completeTerminalListAt.get(conversationId) ?? 0),
     error: (error as Error | null) ?? null,
   };
 }

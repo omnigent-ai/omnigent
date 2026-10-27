@@ -64,7 +64,11 @@ export type FeatureKey =
   | "arca_shutdown_warnings"
   | "import_review"
   | "custom_agents_settings_ui"
-  | "sidebar_grouping_ui";
+  | "sidebar_grouping_ui"
+  | "workspace_content_search"
+  | "grid_sessions_display_ui"
+  | "automations_v2"
+  | "splittable_terminal_view_ui";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -105,6 +109,8 @@ export interface ServerInfo {
    * the new-session host picker.
    */
   managed_sandboxes_enabled: boolean;
+  /** The create request durably accepts managed sessions' first input. */
+  durable_initial_input?: boolean;
   /**
    * Short name of the backing sandbox provider (e.g. ``"modal"``,
    * ``"lakebox"``) used to label the new-session sandbox option per
@@ -212,6 +218,18 @@ export interface ServerInfo {
    */
   archive_worktree_cleanup?: boolean;
   /**
+   * True when ``GET /v1/sessions`` accepts ``search_scope``. Older servers
+   * ignore it, so the palette lists one mixed search group there. Fails to
+   * ``false``.
+   */
+  session_search_scope?: boolean;
+  /**
+   * True when a managed create accepts ``host_id`` naming its new sandbox
+   * host. Older servers reject it, so the create omits it there. Fails to
+   * ``false``.
+   */
+  request_managed_sandbox_host_id?: boolean;
+  /**
    * True when the server stores user agents (``omnigent agent add``,
    * ``GET /v1/agents?scope=user``). Gates the picker's "my agents" source
    * and the Import bundle button. Absent on older servers (off).
@@ -219,8 +237,33 @@ export interface ServerInfo {
   agent_install?: boolean;
   /** True when GET /v1/agents/{id} is available; absent on older servers (off). */
   agent_detail?: boolean;
+  /** Owner-only configuration reads and conditional PATCH updates. */
+  agent_config_edit?: boolean;
+  /**
+   * Which uploads Claude Code and Codex sessions receive as files. Null on
+   * older servers, whose policy is the default extension list.
+   */
+  filesystem_attachments?: FilesystemAttachmentsInfo | null;
   /** Operator branding, or null when the built-in identity should be used. */
   branding?: Branding | null;
+}
+
+/** The server's filesystem attachment policy, as reported by ``/v1/info``. */
+export interface FilesystemAttachmentsInfo {
+  /** Lowercase extensions always delivered as files, e.g. ``".zip"``. */
+  extensions: string[];
+  /** Whether every other file that can't be inlined is delivered as a file. */
+  all_types: boolean;
+}
+
+function parseFilesystemAttachments(raw: unknown): FilesystemAttachmentsInfo | null {
+  if (raw === null || typeof raw !== "object") return null;
+  const value = raw as Record<string, unknown>;
+  if (!Array.isArray(value.extensions)) return null;
+  return {
+    extensions: value.extensions.filter((ext): ext is string => typeof ext === "string"),
+    all_types: value.all_types === true,
+  };
 }
 
 function parseBranding(raw: unknown): Branding | null {
@@ -279,6 +322,8 @@ export const FALLBACK_SERVER_INFO: ServerInfo = {
   installable_harnesses: [],
   dictation_available: false,
   archive_worktree_cleanup: false,
+  session_search_scope: false,
+  request_managed_sandbox_host_id: false,
   branding: null,
 };
 
@@ -355,6 +400,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           needs_setup: data.needs_setup === true,
           databricks_features: data.databricks_features === true,
           managed_sandboxes_enabled: data.managed_sandboxes_enabled === true,
+          durable_initial_input: data.durable_initial_input === true,
           sandbox_provider:
             typeof data.sandbox_provider === "string" ? data.sandbox_provider : null,
           sandbox_providers: Array.isArray(data.sandbox_providers)
@@ -390,8 +436,12 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
             : [],
           dictation_available: data.dictation_available === true,
           archive_worktree_cleanup: data.archive_worktree_cleanup === true,
+          session_search_scope: data.session_search_scope === true,
+          request_managed_sandbox_host_id: data.request_managed_sandbox_host_id === true,
           agent_install: data.agent_install === true,
           agent_detail: data.agent_detail === true,
+          agent_config_edit: data.agent_config_edit === true,
+          filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           branding: parseBranding(data.branding),
         };
         return cachedServerInfo;

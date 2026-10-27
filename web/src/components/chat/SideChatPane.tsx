@@ -1,5 +1,14 @@
 import { SelectionPopup } from "./SelectionPopup";
-import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import {
+  useCallback,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  type ClipboardEvent,
+  type KeyboardEvent,
+} from "react";
 import { MessagesSquareIcon, TriangleAlertIcon } from "lucide-react";
 import { toast } from "sonner";
 import { useQueryClient } from "@tanstack/react-query";
@@ -23,24 +32,62 @@ import {
   shouldShowWorkingIndicator,
   stripGatedSubagentRoutingChips,
 } from "@/components/chat/chatBubbleParts";
-import { ChatComposer, ComposerSendButton } from "@/components/composer/ChatComposer";
+import {
+  ChatComposer,
+  ComposerFeedbackRow,
+  ComposerSendButton,
+  type ComposerKeyIntent,
+} from "@/components/composer/ChatComposer";
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { ComposerMicButton } from "@/components/ComposerMicButton";
-import { isSlashCommandText } from "@/components/SlashCommandMenu";
+import {
+  BUILTIN_SLASH_COMMANDS,
+  SlashCommandMenu,
+  isSlashCommandText,
+  matchSlashCommandInvocation,
+  skillDisplayNames,
+  skillMenuDescription,
+} from "@/components/SlashCommandMenu";
 import { ComposerAttachments } from "@/components/ComposerAttachments";
 import { ReplyDraftBlocks } from "@/components/composer/ReplyDraftBlocks";
 import { Button } from "@/components/ui/button";
+import { TooltipProvider } from "@/components/ui/tooltip";
 import {
   EMPTY_SIDE_CHAT_COMPOSER,
   ensureConversationStreamed,
+  holdsInitialDraft,
+  isCompactControl,
+  rejectBusyCompact,
+  restoredSendDraftUnchanged,
+  takeFailedSendDraft,
+  type SideChatComposerDraft,
   useChatStore,
 } from "@/store/chatStore";
+import { conversationRegistry } from "@/store/conversationRegistry";
+import { QueuedMessagesStrip } from "@/pages/QueuedMessagesStrip";
+import { readAlwaysSteer } from "@/lib/alwaysSteerPreferences";
+import { shouldQueueSend } from "@/lib/messageQueue";
+import { attachmentAccept, clipboardFiles, validateAttachments } from "@/lib/attachments";
+import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useAutoGrowTextarea } from "@/hooks/useAutoGrowTextarea";
 import { useDictationInsert } from "@/hooks/useDictationInsert";
 import { useSession } from "@/hooks/useSession";
+import type { Session } from "@/lib/types";
+import { useSkills } from "@/hooks/useSkills";
+import { useSlashCompletion } from "@/hooks/useSlashCompletion";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { skillInvocationPrefix } from "@/lib/harnessSetup";
+import { isNativeTerminalSession } from "@/lib/nativeCodingAgents";
 import { usesNativeSideChatFork } from "@/lib/sideChat";
-import { serializeReplyDraft } from "@/lib/replyDraft";
+import { parentIdFromLabels } from "@/lib/sessionHost";
+import {
+  appendReplyQuote,
+  removeReplyQuote,
+  restoreReplyDraft,
+  serializeReplyDraft,
+  snapshotReplyDraft,
+} from "@/lib/replyDraft";
 import { interrupt } from "@/lib/sessionsApi";
 import { ConversationScopeContext } from "@/components/chat/conversationScope";
 
@@ -100,12 +147,15 @@ export function SideChatPane({
   selectionParentId,
   onStart,
   readOnly: restoredReadOnly = false,
+  fullSession = false,
 }: {
   childId: string;
   selectionParentId?: string;
   onStart?: (text: string) => Promise<void>;
   /** A dead, restored Codex side chat: show the transcript without a composer. */
   readOnly?: boolean;
+  /** Display an existing session with its complete history and scoped composer. */
+  fullSession?: boolean;
 }) {
   const pending = isPendingSideChat(childId);
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
@@ -148,7 +198,7 @@ export function SideChatPane({
   // GENERIC forks only — they copy the parent transcript. A native Codex child
   // already holds only its own turns (context lives in the native thread), so
   // filtering there would wrongly hide the side chat's first question.
-  const filterHistory = !usesNativeSideChatFork(sessionHarness);
+  const filterHistory = !fullSession && !usesNativeSideChatFork(sessionHarness);
   // Load the persisted boundary when the child changes (mount / rekey); the
   // in-mount ref avoids re-reading storage every render and tracks whether we've
   // actually observed a load run, so we don't capture a boundary on the initial
@@ -228,7 +278,8 @@ export function SideChatPane({
 
   const lastAssistantIndex = liveCandidateAssistantIndex(bubbles);
   const showsWorking =
-    !readOnly && (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
+    (!readOnly || fullSession) &&
+    (starting || computeIsTurnActive(sessionStatus, state.status === "streaming"));
   // Native interruption needs an observed turn; local streaming can start before one exists.
   const interruptReady =
     !usesNativeSideChatFork(sessionHarness) || activeResponse?.state === "streaming";
@@ -237,9 +288,10 @@ export function SideChatPane({
   // so a bottom sentinel scrolled on each change is enough.
   const transcriptRef = useRef<HTMLDivElement>(null);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const followTail = useRef(true);
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ block: "end" });
-  }, [bubbles.length, activeResponse]);
+    if (!fullSession || followTail.current) bottomRef.current?.scrollIntoView({ block: "end" });
+  }, [bubbles.length, activeResponse, fullSession]);
 
   const loadFailed = !pending && conversationLoadError !== null && bubbles.length === 0;
   const isEmpty = bubbles.length === 0 && !loadingConversation && !loadFailed && !showsWorking;
@@ -267,11 +319,33 @@ export function SideChatPane({
   return (
     <ConversationScopeContext.Provider value={childId}>
       <div className="side-chat-backdrop flex h-full min-h-0 flex-col">
-        <div ref={transcriptRef} className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4">
+        <div
+          ref={transcriptRef}
+          className="flex min-h-0 flex-1 flex-col overflow-y-auto px-3 py-4"
+          onScroll={(event) => {
+            const node = event.currentTarget;
+            followTail.current = node.scrollHeight - node.scrollTop - node.clientHeight < 64;
+          }}
+        >
+          {fullSession && state.hasMoreHistory && (
+            <Button
+              variant="ghost"
+              size="sm"
+              disabled={state.loadingMoreHistory}
+              onClick={() => {
+                followTail.current = false;
+                void useChatStore.getState().loadMoreHistory(childId);
+              }}
+            >
+              {state.loadingMoreHistory ? "Loading…" : "Load earlier messages"}
+            </Button>
+          )}
           {loadFailed ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
               <TriangleAlertIcon className="size-6 text-muted-foreground" />
-              <p className="text-ui font-medium text-foreground">Couldn’t load this side chat</p>
+              <p className="text-ui font-medium text-foreground">
+                {fullSession ? "Couldn’t load this session" : "Couldn’t load this side chat"}
+              </p>
               <p className="max-w-[36ch] text-sm text-muted-foreground">
                 {conversationLoadError?.message ?? "Please try again."}
               </p>
@@ -285,11 +359,19 @@ export function SideChatPane({
                 Retry
               </Button>
             </div>
+          ) : fullSession && loadingConversation && bubbles.length === 0 ? (
+            <p role="status" className="m-auto text-sm text-muted-foreground">
+              Loading session…
+            </p>
           ) : isEmpty ? (
             <div className="flex flex-1 flex-col items-center justify-center gap-2 px-6 text-center">
               <MessagesSquareIcon className="size-6 text-muted-foreground" />
-              <p className="text-ui font-medium text-foreground">Side chat</p>
-              <p className="max-w-[36ch] text-sm text-muted-foreground">{EMPTY_STATE_BODY}</p>
+              <p className="text-ui font-medium text-foreground">
+                {fullSession ? "No messages yet" : "Side chat"}
+              </p>
+              {!fullSession && (
+                <p className="max-w-[36ch] text-sm text-muted-foreground">{EMPTY_STATE_BODY}</p>
+              )}
             </div>
           ) : (
             <div className="flex flex-col gap-4">
@@ -313,29 +395,34 @@ export function SideChatPane({
             onReply={(text) => {
               useChatStore.getState().updateSideChatComposer(childId, (current) => ({
                 ...current,
-                quotes: [...(current.quotes ?? []), text],
+                ...appendReplyQuote(current, text),
               }));
             }}
           />
         )}
-        <div className="shrink-0 px-3 pt-3 pb-5">
-          {readOnly ? (
-            <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
-              This side chat has ended and can’t be continued.
-            </p>
-          ) : (
-            <SideChatComposer
-              childId={childId}
-              agentId={boundAgentId}
-              responseId={activeResponse?.responseId}
-              interruptReady={interruptReady}
-              busy={showsWorking}
-              pending={pending}
-              starting={starting}
-              onStart={onStart ? startSideChat : undefined}
-            />
-          )}
-        </div>
+        {(!fullSession || !readOnly) && (
+          <div className="shrink-0 px-3 pt-3 pb-5">
+            {readOnly ? (
+              <p className="rounded-md border border-border bg-muted/40 px-3 py-2 text-center text-sm text-muted-foreground">
+                This side chat has ended and can’t be continued.
+              </p>
+            ) : (
+              <SideChatComposer
+                fullSession={fullSession}
+                childId={childId}
+                harness={sessionHarness}
+                session={session}
+                agentId={boundAgentId}
+                responseId={activeResponse?.responseId}
+                interruptReady={interruptReady}
+                busy={showsWorking}
+                pending={pending}
+                starting={starting}
+                onStart={onStart ? startSideChat : undefined}
+              />
+            )}
+          </div>
+        )}
       </div>
     </ConversationScopeContext.Provider>
   );
@@ -349,7 +436,10 @@ export function SideChatPane({
  * the text is kept if creation fails so it isn't lost.
  */
 function SideChatComposer({
+  fullSession,
   childId,
+  harness,
+  session,
   agentId,
   responseId,
   interruptReady,
@@ -358,7 +448,10 @@ function SideChatComposer({
   starting,
   onStart,
 }: {
+  fullSession: boolean;
   childId: string;
+  harness: string | null | undefined;
+  session: Session | null | undefined;
   agentId: string | null;
   responseId: string | undefined;
   interruptReady: boolean;
@@ -368,6 +461,7 @@ function SideChatComposer({
   onStart?: (text: string) => Promise<void>;
 }) {
   const send = useChatStore((s) => s.send);
+  const sendSlashCommand = useChatStore((s) => s.sendSlashCommand);
   const queryClient = useQueryClient();
   const clearSideChatDraft = useChatStore((s) => s.clearSideChatDraft);
   // Unsent text + attachments live in the store, keyed by child id, NOT in
@@ -378,8 +472,92 @@ function SideChatComposer({
   const { text, files } = composer ?? EMPTY_SIDE_CHAT_COMPOSER;
   const updateComposer = useChatStore((s) => s.updateSideChatComposer);
   const clearComposer = useChatStore((s) => s.clearSideChatComposer);
+  const enqueueMessage = useChatStore((s) => s.enqueueMessage);
+  const maybeFlushQueuedHead = useChatStore((s) => s.maybeFlushQueuedHead);
+  const dequeueMessage = useChatStore((s) => s.dequeueMessage);
+  const steerMessage = useChatStore((s) => s.steerMessage);
+  const steerAllQueuedMessages = useChatStore((s) => s.steerAllQueuedMessages);
+  const reorderQueuedMessage = useChatStore((s) => s.reorderQueuedMessage);
+  const allQueuedMessages = useChatStore((s) => s.queuedMessages);
+  const queuedMessages = useMemo(
+    () => allQueuedMessages.filter((message) => message.conversationId === childId),
+    [allQueuedMessages, childId],
+  );
+  // Grid sessions keep waiting for the turn to end; side chats queue like the main composer.
+  const queues = !pending && !fullSession;
+  useEffect(() => {
+    if (queues && queuedMessages.length > 0) maybeFlushQueuedHead(childId);
+  }, [queues, queuedMessages, busy, agentId, childId, maybeFlushQueuedHead]);
+  const info = useServerInfo();
+  const attachmentPolicy = info === "loading" ? null : (info.filesystem_attachments ?? null);
+  useEffect(() => {
+    if (info === "loading") return;
+    const current = useChatStore.getState().sideChatComposers[childId];
+    if (!current) return;
+    const { accepted, errors } = validateAttachments(current.files, attachmentPolicy);
+    if (errors.length === 0) return;
+    updateComposer(childId, (draft) => ({ ...draft, files: accepted }));
+    errors.forEach((message) => toast.error(message));
+  }, [attachmentPolicy, childId, info, updateComposer]);
+  const { failedSendDraft, restoredSendDraft } = useConversationEntryState(
+    fullSession ? childId : null,
+  );
+  useEffect(() => {
+    if (!fullSession || !failedSendDraft) return;
+    const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
+    const failed = takeFailedSendDraft(
+      childId,
+      !!(current.text.trim() || current.files.length || current.quotes?.length),
+    );
+    if (!failed) return;
+    const { accepted, errors } = validateAttachments(failed.files, attachmentPolicy);
+    errors.forEach((message) => toast.error(message));
+    updateComposer(childId, () => ({ text: failed.text, files: accepted }));
+    // Track the displayed draft for delivery; filtered files require a fresh send ID.
+    const entry = conversationRegistry.peek(childId)!;
+    const restored = entry.getState().restoredSendDraft;
+    if (restored)
+      entry.setState({
+        restoredSendDraft: { ...restored, files: accepted, replyDraft: undefined },
+        pendingRetryStableId: errors.length > 0 ? null : entry.getState().pendingRetryStableId,
+      });
+  }, [fullSession, childId, failedSendDraft, updateComposer, attachmentPolicy]);
+  useEffect(() => {
+    if (!fullSession || !restoredSendDraft?.delivered) return;
+    const entry = conversationRegistry.peek(childId);
+    const restored = entry?.getState().restoredSendDraft;
+    if (!restored?.delivered || restored.conversationId !== childId) return;
+    const current = useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
+    entry!.setState({ restoredSendDraft: null });
+    if (current.quotes?.length) return;
+    if (
+      restoredSendDraftUnchanged(
+        restored,
+        restored.stableId,
+        current.text,
+        current.files,
+        undefined,
+      )
+    )
+      clearComposer(childId);
+  }, [fullSession, childId, restoredSendDraft, clearComposer]);
   const setText = useCallback(
     (next: string) => updateComposer(childId, (current) => ({ ...current, text: next })),
+    [childId, updateComposer],
+  );
+  const [activeTextId, setActiveTextId] = useState<string | null>(null);
+  const editText = useCallback(
+    (id: string | null, next: string) =>
+      updateComposer(childId, (current) =>
+        id === null
+          ? { ...current, text: next }
+          : {
+              ...current,
+              quotes: current.quotes?.map((quote) =>
+                quote.id === id ? { ...quote, before: next } : quote,
+              ),
+            },
+      ),
     [childId, updateComposer],
   );
   const setFiles = useCallback(
@@ -389,10 +567,50 @@ function SideChatComposer({
   );
   const [interrupting, setInterrupting] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const tailTextareaRef = useRef<HTMLTextAreaElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const voiceSnapshotRef = useRef("");
-  const dictation = useDictationInsert(text, setText, textareaRef);
-  useAutoGrowTextarea(textareaRef, text);
+  const voiceEditsRef = useRef(
+    new Map<string | null, { before: string; after: string; quoteIds: Set<string> }>(),
+  );
+  const reconcileVoiceEdits = useCallback((current: SideChatComposerDraft) => {
+    for (const [id, edit] of voiceEditsRef.current) {
+      // Appending a quote moves the old tail into that quote's preceding text.
+      const targetId =
+        id ?? current.quotes?.find((item) => !edit.quoteIds.has(item.id))?.id ?? null;
+      const value =
+        targetId === null
+          ? current.text
+          : current.quotes?.find((item) => item.id === targetId)?.before;
+      if (value !== edit.after || targetId !== id) voiceEditsRef.current.delete(id);
+      if (value === edit.after && targetId !== id) voiceEditsRef.current.set(targetId, edit);
+    }
+  }, []);
+  // Manual edits and merged reply fields relinquish dictation's undo ownership.
+  useLayoutEffect(() => {
+    reconcileVoiceEdits(composer ?? EMPTY_SIDE_CHAT_COMPOSER);
+  }, [composer, reconcileVoiceEdits]);
+  const activeText = composer?.quotes?.find((quote) => quote.id === activeTextId)?.before ?? text;
+  const setActiveText = useCallback(
+    (next: string) => {
+      const current =
+        useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER;
+      reconcileVoiceEdits(current);
+      const before =
+        activeTextId === null
+          ? current.text
+          : current.quotes?.find((item) => item.id === activeTextId)?.before;
+      if (before === undefined) return;
+      const previous = voiceEditsRef.current.get(activeTextId);
+      voiceEditsRef.current.set(activeTextId, {
+        before: previous?.before ?? before,
+        after: next,
+        quoteIds: previous?.quoteIds ?? new Set(current.quotes?.map((item) => item.id)),
+      });
+      editText(activeTextId, next);
+    },
+    [activeTextId, childId, editText, reconcileVoiceEdits],
+  );
+  const dictation = useDictationInsert(activeText, setActiveText, textareaRef);
 
   // This tab's seeded text: on a pending tab the "Ask in side chat" selection
   // to QUOTE, on a live tab the `/side` question to SEND.
@@ -400,16 +618,15 @@ function SideChatComposer({
   const quote = pending ? draft : undefined;
   const quotes = [
     ...(quote === undefined ? [] : [{ id: "seed", before: "", text: quote }]),
-    ...(composer?.quotes ?? []).map((selection, index) => ({
-      id: String(index),
-      before: "",
-      text: selection,
-    })),
+    ...(composer?.quotes ?? []),
   ];
+  useAutoGrowTextarea(tailTextareaRef, text, quotes.length ? Infinity : 10);
   const autoSend = pending ? undefined : draft;
   useEffect(() => {
-    if (quote !== undefined || composer?.quotes?.length) textareaRef.current?.focus();
-  }, [quote, composer?.quotes]);
+    setActiveTextId(null);
+    textareaRef.current = tailTextareaRef.current;
+    if (quote !== undefined || composer?.quotes?.length) tailTextareaRef.current?.focus();
+  }, [quote, composer?.quotes?.length]);
   // Re-read the labels so a side chat the server just sealed turns read-only.
   const refreshLabels = useCallback(
     () => void queryClient.invalidateQueries({ queryKey: ["session", childId] }),
@@ -433,8 +650,127 @@ function SideChatComposer({
   }, [autoSend, agentId, send, childId, clearSideChatDraft, refreshLabels]);
 
   const ready = pending ? !starting : agentId !== null;
-  const canSend = text.trim().length > 0 || (!pending && files.length > 0);
-  const showInterrupt = !pending && busy;
+  const canSend =
+    serializeReplyDraft({ quotes, text }).trim().length > 0 || (!pending && files.length > 0);
+  const addFiles = (incoming: File[]) => {
+    const { accepted, errors } = validateAttachments(incoming, attachmentPolicy);
+    errors.forEach((message) => toast.error(message));
+    if (accepted.length) setFiles((current) => [...current, ...accepted]);
+  };
+  const onPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const pasted = clipboardFiles(event.clipboardData);
+    if (!pasted.length) return;
+    event.preventDefault();
+    if (!ready) return;
+    if (pending) {
+      toast.error("Send a text question to start the side chat before attaching files.");
+      return;
+    }
+    addFiles(pasted);
+  };
+  // Slash suggestions mirror the main composer: the session's skills plus /help.
+  // Other built-ins (/model, /compact, …) act on the main session and stay out.
+  const isMobile = useIsMobileViewport();
+  const [inputFocused, setInputFocused] = useState(false);
+  const [commandNotice, setCommandNotice] = useState<string | null>(null);
+  const nativeSession = isNativeTerminalSession({ harness, labels: session?.labels });
+  // A generic side chat has no host/workspace of its own: it forks the parent and
+  // runs in the parent's workspace. Discover skills against the parent (the same
+  // catalog the main composer shows); the hostless child always reads unavailable.
+  const parentId = fullSession
+    ? childId
+    : nativeSession
+      ? null
+      : parentIdFromLabels(session?.labels);
+  const { session: parentSession, isLoading: parentLoading } = useSession(parentId);
+  const {
+    skills,
+    skillsStatus,
+    refetch: refreshSkills,
+  } = useSkills({
+    target:
+      !pending && parentId !== null && parentSession?.hostId && parentSession.workspace
+        ? {
+            sessionId: parentId,
+            scope: {
+              hostId: parentSession.hostId,
+              harness: parentSession.harness,
+              workspace: parentSession.workspace,
+              agentId: parentSession.agentId,
+              subAgentName: parentSession.subAgentName,
+            },
+          }
+        : null,
+    enabled: !pending && ready,
+    // A still-loading parent lookup has no target yet; treat it as discovery in
+    // flight so a quickly typed /skill is held, not sent to the agent as plaintext.
+    starting: starting || (parentId !== null && parentLoading),
+  });
+  const skillPrefix = skillInvocationPrefix(harness);
+  const sideChatBuiltins = useMemo<Record<string, string>>(() => {
+    const builtins: Record<string, string> = {};
+    if (!nativeSession) builtins["/help"] = BUILTIN_SLASH_COMMANDS["/help"];
+    return builtins;
+  }, [nativeSession]);
+  // A skill whose command exactly matches a built-in can never run (the built-in
+  // wins), so drop it to keep the menu's labels aligned with what submitting runs.
+  const routableSkills = useMemo(
+    () => skills.filter((skill) => !Object.hasOwn(sideChatBuiltins, `${skillPrefix}${skill.name}`)),
+    [skills, skillPrefix, sideChatBuiltins],
+  );
+  const skillCommands = useMemo(
+    () =>
+      Object.fromEntries(
+        routableSkills.map((skill) => [`${skillPrefix}${skill.name}`, skillMenuDescription(skill)]),
+      ),
+    [routableSkills, skillPrefix],
+  );
+  const skillLabels = useMemo(
+    () => skillDisplayNames(routableSkills, skillPrefix),
+    [routableSkills, skillPrefix],
+  );
+  const menuCommands = useMemo(
+    () => ({ ...sideChatBuiltins, ...skillCommands }),
+    [sideChatBuiltins, skillCommands],
+  );
+  // /help lists what this side chat offers; shown locally, never sent as a turn.
+  const showHelp = useCallback(() => {
+    const lines = Object.entries(menuCommands).map(([name, desc]) => `${name} — ${desc}`);
+    setCommandNotice(lines.join("\n"));
+  }, [menuCommands]);
+  // Tab fills the draft with the chosen command; Enter or click runs a built-in.
+  const completeMenuSelection = (cmd: string) => {
+    setText(slashCompletion.complete(cmd).text);
+  };
+  // Insert a chosen skill at the caret; a built-in runs immediately (no args).
+  const applyMenuSelection = (cmd: string) => {
+    if (Object.hasOwn(sideChatBuiltins, cmd)) {
+      setText("");
+      if (cmd === "/help") showHelp();
+      return;
+    }
+    completeMenuSelection(cmd);
+  };
+  const slashCompletion = useSlashCompletion({
+    text,
+    commands: menuCommands,
+    skills: skillCommands,
+    labels: skillLabels,
+    textareaRef,
+    prefix: skillPrefix,
+    status: skillsStatus,
+    mobile: isMobile,
+    mobileEnterCompletes: false,
+    escapeClearsOnlyWithContent: true,
+    // A pending tab has no session yet; a native TUI reads slash text itself.
+    allowOpen:
+      inputFocused && !pending && !nativeSession && quotes.length === 0 && files.length === 0,
+    onSelect: applyMenuSelection,
+    onTabComplete: completeMenuSelection,
+    clearText: () => setText(""),
+  });
+  // Like the main composer, a draft turns Interrupt into Send.
+  const showInterrupt = !pending && busy && (fullSession || !canSend);
 
   const interruptSideChat = () => {
     if (interrupting || !interruptReady) return;
@@ -447,22 +783,97 @@ function SideChatComposer({
   const submit = () => {
     const trimmed = isSlashCommandText(text) ? text.trim() : text.trimEnd();
     if (pending) {
-      if (trimmed.length === 0 || starting || !onStart) return;
+      if (!canSend || starting || !onStart) return;
       // Keep the text so a failed fork can be retried without re-typing.
       void onStart(serializeReplyDraft({ quotes, text: trimmed }));
       return;
     }
-    if (busy || (trimmed.length === 0 && files.length === 0) || agentId === null) return;
-    const outgoing = files;
-    clearComposer(childId);
-    void send(
-      serializeReplyDraft({ quotes, text: trimmed }),
-      agentId,
-      outgoing.length > 0 ? outgoing : undefined,
-      {
+    if ((busy && fullSession) || !canSend || agentId === null) return;
+    // On in-process harnesses /help and skills resolve locally; native TUIs
+    // (claude-native, codex-native) read the text themselves, and a quote or
+    // attachment is always an ordinary message.
+    const routeLocally = !nativeSession && quotes.length === 0 && files.length === 0;
+    // A lone command token with skill discovery in flight has nothing to run
+    // yet; only hold when the submission would route locally.
+    if (routeLocally && slashCompletion.pendingCompletion) return;
+    const builtin = routeLocally
+      ? matchSlashCommandInvocation(trimmed, Object.keys(sideChatBuiltins))
+      : null;
+    const skill = routeLocally
+      ? matchSlashCommandInvocation(trimmed, Object.keys(skillCommands))
+      : null;
+    const runSkill = (match: { command: string; args: string }) => {
+      clearComposer(childId);
+      void sendSlashCommand(match.command.slice(1), match.args, agentId, {
         pinnedConversationId: childId,
-      },
-    ).finally(refreshLabels);
+      }).finally(refreshLabels);
+    };
+    // A multi-word catalog skill outranks a built-in that matches only its first
+    // word ("/help desk ..." runs the skill); an exact-name collision keeps
+    // built-in precedence.
+    if (skill !== null && skill.command !== trimmed.split(/\s+/)[0]) {
+      runSkill(skill);
+      return;
+    }
+    if (builtin !== null) {
+      setText("");
+      if (builtin.command === "/help") showHelp();
+      return;
+    }
+    if (skill !== null) {
+      runSkill(skill);
+      return;
+    }
+    const outgoing = files.length > 0 ? files : undefined;
+    const message = serializeReplyDraft({ quotes, text: trimmed });
+    const child = conversationRegistry.peek(childId)?.getState();
+    if (
+      queues &&
+      child !== undefined &&
+      shouldQueueSend(
+        childId,
+        child.status,
+        child.sessionStatus,
+        useChatStore.getState().queuedMessages,
+        readAlwaysSteer(),
+        false,
+        holdsInitialDraft(child),
+      )
+    ) {
+      clearComposer(childId);
+      enqueueMessage(message, outgoing, snapshotReplyDraft({ quotes, text: trimmed }), childId);
+      return;
+    }
+    // A running Codex chat refuses a steered /compact; keep the draft as the main composer does.
+    if (isCompactControl(harness, message, outgoing) && rejectBusyCompact(childId)) return;
+    clearComposer(childId);
+    void send(message, agentId, outgoing, { pinnedConversationId: childId }).finally(refreshLabels);
+  };
+
+  const handleKeyDown = (event: KeyboardEvent<HTMLTextAreaElement>, intent: ComposerKeyIntent) => {
+    // Mod+Enter submits any draft, then steers the whole queue into the running turn.
+    if (queues && intent.shouldSteerAllFromKeyboard) {
+      event.preventDefault();
+      submit();
+      steerAllQueuedMessages(childId);
+      return;
+    }
+    if (slashCompletion.handleKey(event, intent)) return;
+    // A grid pane is a whole session, so only side chats let Escape stop the turn.
+    if (event.key === "Escape" && queues && busy) {
+      event.preventDefault();
+      interruptSideChat();
+      return;
+    }
+    if (intent.shouldSubmitFromKeyboard) {
+      event.preventDefault();
+      submit();
+    }
+  };
+  const focusText = (id: string | null, input: HTMLTextAreaElement) => {
+    setActiveTextId(id);
+    textareaRef.current = input;
+    dictation.noteFocus();
   };
 
   return (
@@ -472,48 +883,96 @@ function SideChatComposer({
           ref={fileInputRef}
           type="file"
           multiple
-          accept="image/*,application/pdf,text/*,application/json"
+          accept={attachmentAccept(attachmentPolicy)}
           className="hidden"
           onChange={(event) => {
             if (event.target.files) {
-              setFiles((prev) => [...prev, ...Array.from(event.target.files ?? [])]);
+              addFiles(Array.from(event.target.files));
               event.target.value = "";
             }
           }}
         />
       )}
+      {commandNotice !== null && (
+        <ComposerFeedbackRow data-testid="side-chat-command-notice">
+          {commandNotice}
+        </ComposerFeedbackRow>
+      )}
+      {queues && (
+        <TooltipProvider>
+          <QueuedMessagesStrip
+            messages={queuedMessages}
+            onDelete={dequeueMessage}
+            onEdit={(queueId) => {
+              const target = queuedMessages.find((message) => message.queueId === queueId);
+              if (!target) return;
+              const restored = restoreReplyDraft(target.text, target.replyDraft);
+              updateComposer(childId, () => ({ ...restored, files: target.files ?? [] }));
+              dequeueMessage(queueId);
+              tailTextareaRef.current?.focus();
+            }}
+            onSteer={steerMessage}
+            onReorder={reorderQueuedMessage}
+            widthClassName="mx-3 w-auto"
+          />
+        </TooltipProvider>
+      )}
       <ChatComposer
         keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
         input={{
-          ref: textareaRef,
+          ref: tailTextareaRef,
           value: text,
-          onChange: (event) => setText(event.target.value),
-          placeholder: "Ask a side question...",
+          onChange: (event) => {
+            if (commandNotice !== null) setCommandNotice(null);
+            slashCompletion.onSelectionChange(event.target);
+            setText(event.target.value);
+          },
+          onSelect: (event) => slashCompletion.onSelectionChange(event.currentTarget),
+          onFocus: (event) => {
+            setInputFocused(true);
+            focusText(null, event.currentTarget);
+          },
+          // Menu rows preventDefault on mousedown so selecting one keeps focus.
+          onBlur: () => setInputFocused(false),
+          placeholder: fullSession ? "Reply to this session..." : "Ask a side question...",
           disabled: !ready,
           "data-testid": "side-chat-input",
-          onKeyDown: (event, intent) => {
-            if (intent.shouldSubmitFromKeyboard) {
-              event.preventDefault();
-              submit();
-            }
-          },
+          onKeyDown: handleKeyDown,
+          onPaste,
+          className: quotes.length ? "max-h-none overflow-y-hidden" : undefined,
         }}
         slots={{
+          beforeInput: slashCompletion.open ? (
+            <SlashCommandMenu
+              query={slashCompletion.query}
+              activeIndex={slashCompletion.index}
+              onSelect={applyMenuSelection}
+              commands={slashCompletion.commands}
+              builtinNames={slashCompletion.builtinNames}
+              labels={slashCompletion.labels}
+              skillsStatus={skillsStatus}
+              onRetrySkills={() => void refreshSkills()}
+            />
+          ) : undefined,
           inputPrefix:
             quotes.length === 0 ? undefined : (
               <ReplyDraftBlocks
                 quotes={quotes}
-                activeTextId={null}
-                showTextInputs={false}
+                activeTextId={activeTextId}
                 keyboard={{ submitWithModEnter: false, preventsKeyboardSubmit: false }}
                 disabled={!ready}
-                inputFor={() => ({})}
+                inputFor={(replyQuote) => ({
+                  onChange: (event) => editText(replyQuote.id, event.target.value),
+                  onFocus: (event) => focusText(replyQuote.id, event.currentTarget),
+                  onKeyDown: handleKeyDown,
+                  onPaste,
+                })}
                 onRemove={(id) => {
                   if (id === "seed") clearSideChatDraft(childId);
                   else
                     updateComposer(childId, (current) => ({
                       ...current,
-                      quotes: current.quotes?.filter((_, index) => String(index) !== id),
+                      ...removeReplyQuote({ ...current, quotes: current.quotes ?? [] }, id),
                     }));
                 }}
               />
@@ -542,21 +1001,32 @@ function SideChatComposer({
               <ComposerMicButton
                 className="size-8 md:size-7"
                 disabled={!ready}
-                onVoiceStart={() => {
-                  voiceSnapshotRef.current = text;
+                onVoiceStart={() => voiceEditsRef.current.clear()}
+                onVoiceDiscard={() => {
+                  reconcileVoiceEdits(
+                    useChatStore.getState().sideChatComposers[childId] ?? EMPTY_SIDE_CHAT_COMPOSER,
+                  );
+                  const edits = [...voiceEditsRef.current];
+                  voiceEditsRef.current.clear();
+                  for (const [id, edit] of edits) editText(id, edit.before);
                 }}
-                onVoiceDiscard={() => setText(voiceSnapshotRef.current)}
                 onTranscript={(spoken) => dictation.appendFinal(spoken)}
                 onInterim={(spoken) => dictation.replaceInterim(spoken)}
               />
               <ComposerSendButton
                 type="button"
-                label={showInterrupt ? "Interrupt side chat" : "Send side question"}
-                interrupt={showInterrupt}
-                busy={interrupting}
-                disabled={
-                  showInterrupt ? interrupting || !interruptReady : !canSend || !ready || busy
+                label={
+                  fullSession
+                    ? showInterrupt
+                      ? "Interrupt session"
+                      : "Send message"
+                    : showInterrupt
+                      ? "Interrupt side chat"
+                      : "Send side question"
                 }
+                interrupt={showInterrupt}
+                busy={showInterrupt && interrupting}
+                disabled={showInterrupt ? interrupting || !interruptReady : !canSend || !ready}
                 onClick={showInterrupt ? interruptSideChat : submit}
                 data-testid={showInterrupt ? "side-chat-interrupt" : "side-chat-send"}
               />

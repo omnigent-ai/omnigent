@@ -69,6 +69,12 @@ env:
   UV_PYTHON_PREFERENCE: only-system
 
 jobs:
+  gate:
+    uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
   # Cheap pre-flight (no container/build): does this PR touch anything that can
   # change the render? The heavy job below is `if`-gated on it, so non-UI PRs
   # skip the render (no wasted CI, no flaking against unrelated changes). The
@@ -79,16 +85,30 @@ jobs:
   # risk a false pass.
   detect:
     name: Detect render-affecting changes
+    needs: gate
     runs-on: ubuntu-latest
     outputs:
       ui: ${{ steps.changes.outputs.ui }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
       - id: changes
         env:
+          DEPENDENCY: ${{ steps.scope.outputs.dependency }}
+          UI_SCOPE: ${{ steps.scope.outputs.ui }}
           GH_TOKEN: ${{ github.token }}
           PR: ${{ github.event.pull_request.number }}
           REPO: ${{ github.repository }}
         run: |
+          # Dependency-only PRs skip only when the scope rules out the web UI.
+          if [ "$DEPENDENCY" = true ] && { [ "$UI_SCOPE" = none ] || [ "$UI_SCOPE" = sidecar ]; }; then
+            echo "ui=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           if [ -z "${PR:-}" ]; then
             echo "ui=true" >> "$GITHUB_OUTPUT"; echo "no PR (dispatch) -> render"; exit 0
           fi
@@ -126,19 +146,19 @@ jobs:
     timeout-minutes: 20
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           ref: ${{ github.event.inputs.ref || github.ref }}
 
       # The pinned Playwright image doesn't ship Node, so install Node before
       # the pnpm action (pnpm/action-setup's self-installer needs a Node binary).
       - name: Set up Node
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
 
       - name: Install pnpm
-        uses: pnpm/action-setup@b906affcce14559ad1aafd4ab0e942779e9f58b1 # v4
+        uses: pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413 # v6.1.0
         with:
           version: 11.15.1
           standalone: true
@@ -149,7 +169,7 @@ jobs:
           enable-cache: true
 
       - name: Cache virtualenv
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
           # Namespaced away from e2e-ui.yml's host venv: this venv is built with
@@ -203,7 +223,7 @@ jobs:
       - name: Upload screenshots
         id: upload_screens
         if: ${{ always() && (steps.snapshot.conclusion == 'success' || steps.snapshot.conclusion == 'failure') }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: ui-snapshot-${{ github.run_id }}
           # snapshots/ is this run's render (identical to the baseline on a pass;

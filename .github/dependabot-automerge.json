@@ -1,0 +1,256 @@
+{
+  "cooldown_days": 7,
+  "python": {
+    "default": "minor",
+    "manual": [
+      "claude-agent-sdk",
+      "openai-agents",
+      "cursor-sdk",
+      "google-adk",
+      "google-antigravity",
+      "github-copilot-sdk",
+      "kiro-cli",
+      "copilot-sdk",
+      "pi-coding-agent"
+    ],
+    "zero_minor": [
+      "*"
+    ],
+    "beta": [
+      "opentelemetry-distro",
+      "opentelemetry-exporter-http-transport",
+      "opentelemetry-exporter-otlp-common",
+      "opentelemetry-instrumentation",
+      "opentelemetry-instrumentation-aiohttp-client",
+      "opentelemetry-instrumentation-asgi",
+      "opentelemetry-instrumentation-fastapi",
+      "opentelemetry-instrumentation-httpx",
+      "opentelemetry-instrumentation-sqlalchemy",
+      "opentelemetry-semantic-conventions",
+      "opentelemetry-util-genai",
+      "opentelemetry-util-http"
+    ]
+  },
+  "npm": {
+    "default": "minor",
+    "manual": [
+      "@anthropic-ai/claude-code",
+      "@openai/codex",
+      "@earendil-works/pi-coding-agent",
+      "@mariozechner/pi-*",
+      "@github/copilot*",
+      "@cursor/*",
+      "electron",
+      "@electron/*",
+      "electron-builder*",
+      "electron-updater",
+      "electron-winstaller",
+      "electron-publish",
+      "dmg-builder",
+      "app-builder-*",
+      "builder-util*",
+      "@vscode/vsce*",
+      "wrangler",
+      "@capacitor/*",
+      "react-native",
+      "react-pdf",
+      "pdfjs-dist",
+      "katex",
+      "shiki",
+      "@shikijs/*",
+      "vite",
+      "tailwindcss",
+      "@tailwindcss/vite",
+      "@tailwindcss/node",
+      "@tailwindcss/postcss"
+    ],
+    "zero_minor": [
+      "*"
+    ],
+    "consumers": {
+      "web": [],
+      "web/electron": [
+        {
+          "workflow": "web-tests.yml",
+          "job": "web test",
+          "step": "Test and build workspace consumers"
+        }
+      ],
+      "editors/vscode": [
+        {
+          "workflow": "web-tests.yml",
+          "job": "web test",
+          "step": "Test and build workspace consumers"
+        }
+      ],
+      "sdks/web-extension": [
+        {
+          "workflow": "web-tests.yml",
+          "job": "web test",
+          "step": "Test and build workspace consumers"
+        }
+      ],
+      "examples/extensions/hello-page/web": [
+        {
+          "workflow": "web-tests.yml",
+          "job": "web test",
+          "step": "Test and build workspace consumers"
+        }
+      ],
+      "deploy/cloudflare": [
+        {
+          "workflow": "docker-build.yml",
+          "job": "Docker build",
+          "step": "Cloudflare Worker and container dry-run"
+        },
+        {
+          "workflow": "docker-build.yml",
+          "job": "Docker build",
+          "step": "Build and smoke-test the Cloudflare image"
+        }
+      ]
+    }
+  },
+  "actions": {
+    "default": "minor",
+    "manual": [
+      "pypa/gh-action-pypi-publish",
+      "softprops/action-gh-release",
+      "release-drafter/release-drafter",
+      "googleapis/release-please-action",
+      "actions/attest*",
+      "actions/create-github-app-token",
+      "docker/login-action",
+      "docker/build-push-action",
+      "aws-actions/configure-aws-credentials"
+    ],
+    "shared_evidence": [
+      "actions/checkout",
+      "actions/download-artifact",
+      "docker/setup-buildx-action"
+    ],
+    "zero_minor": [
+      "*"
+    ]
+  },
+  "action_test_paths": {
+    ".github/workflows/ci.yml": "ci.yml",
+    ".github/workflows/lint.yml": "lint.yml",
+    ".github/workflows/web-tests.yml": "web-tests.yml",
+    ".github/workflows/e2e.yml": "e2e.yml",
+    ".github/workflows/e2e-ui.yml": "e2e-ui.yml",
+    ".github/workflows/integration.yml": "integration.yml",
+    ".github/actions/setup-pnpm/action.yml": "web-tests.yml",
+    ".github/actions/e2e-run/action.yml": "e2e.yml",
+    ".github/actions/integration-run/action.yml": "integration.yml",
+    ".github/actions/setup-uv/action.yml": "ci.yml",
+    ".github/workflows/docker-build.yml": "docker-build.yml",
+    ".github/workflows/trivy.yml": "trivy.yml",
+    ".github/workflows/windows.yml": "windows.yml",
+    ".github/workflows/android-bundle.yml": "android-bundle.yml"
+  },
+  "pre_commit": [
+    "https://github.com/pre-commit/pre-commit-hooks"
+  ],
+  "cargo": {
+    "default": "minor",
+    "manual": [],
+    "zero_minor": [
+      "*"
+    ],
+    "targets": {
+      "tests/codex_parity/sidecar/Cargo.lock": {
+        "workflows": [
+          "ci.yml",
+          "e2e-ui.yml"
+        ],
+        "checks": [
+          "Pytest (codex-parity)"
+        ],
+        "workflow_test_jobs": {
+          "ci.yml": [
+            "CI coverage scope",
+            "CI result",
+            "Pytest (codex-parity)"
+          ],
+          "e2e-ui.yml": [
+            "UI coverage scope",
+            "E2E UI result",
+            "E2E UI Tests (shard *)"
+          ]
+        }
+      },
+      "dev/omnidev/Cargo.lock": {
+        "workflows": [
+          "ci.yml"
+        ],
+        "checks": [
+          "Rust tests (omnidev)"
+        ],
+        "workflow_test_jobs": {
+          "ci.yml": [
+            "CI coverage scope",
+            "CI result",
+            "Rust tests (omnidev)"
+          ]
+        }
+      }
+    }
+  },
+  "dependency_workflow_test_jobs": {
+    "npm": {
+      "ci.yml": [
+        "CI coverage scope",
+        "CI result"
+      ]
+    },
+    "pre-commit": {
+      "ci.yml": [
+        "CI coverage scope",
+        "CI result"
+      ]
+    }
+  },
+  "workflow_test_jobs": {
+    "windows.yml": [
+      "Windows smoke + unit"
+    ],
+    "ci.yml": [
+      "CI coverage scope",
+      "CI result",
+      "Pytest (*)"
+    ],
+    "lint.yml": [
+      "Pre-commit checks"
+    ],
+    "trivy.yml": [
+      "Trivy CVE Scan (repository)",
+      "Trivy CVE Scan (dev-tools)"
+    ],
+    "integration.yml": [
+      "Integration (openai-agents)"
+    ],
+    "e2e.yml": [
+      "E2E coverage scope",
+      "E2E Tests (shard *)"
+    ],
+    "web-tests.yml": [
+      "Web coverage scope",
+      "web test",
+      "Web result"
+    ],
+    "e2e-ui.yml": [
+      "UI coverage scope",
+      "E2E UI result",
+      "Browser Contract UI",
+      "E2E UI Tests (shard *)"
+    ],
+    "docker-build.yml": [
+      "Docker build",
+      "Docker result"
+    ],
+    "android-bundle.yml": [
+      "Build unsigned AAB"
+    ]
+  }
+}

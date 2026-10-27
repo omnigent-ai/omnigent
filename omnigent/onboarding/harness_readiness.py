@@ -33,7 +33,6 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
-import omnigent.onboarding.gemini_auth as _gemini_auth
 import omnigent.onboarding.kimi_auth as _kimi_auth
 from omnigent._platform import IS_WINDOWS, resolve_cli_binary
 from omnigent.harness_aliases import HARNESS_ALIASES, NATIVE_HARNESSES, canonicalize_harness
@@ -45,6 +44,7 @@ from omnigent.harness_availability import (
     HarnessAvailability,
 )
 from omnigent.harness_plugins import harness_install_keys, valid_harnesses
+from omnigent.harnesses.antigravity_native.credentials import antigravity_credentials_ready
 from omnigent.onboarding.harness_install import (
     COPILOT_KEY,
     CURSOR_KEY,
@@ -106,12 +106,9 @@ _SDK_HARNESSES: frozenset[str] = frozenset(
 # an API key in ``~/.kimi-code/config.toml`` (kimi has no login-status probe) —
 # ``kimi_auth_configured`` accepts either. The ``anthropic`` / ``openai``
 # families authenticate via subscription provider config and do not appear here.
-# Each lambda resolves through its module at call time so a test can monkeypatch
-# ``…gemini_auth.gemini_login_detected`` / ``…kimi_auth.kimi_auth_configured``
-# and have the patch take effect without this dict caching the old function
-# object.
+# Resolve Kimi through its module so patches do not leave a cached function here.
 _FAMILY_CREDENTIAL_CHECK: dict[str, Callable[[], bool]] = {
-    GEMINI_FAMILY: lambda: _gemini_auth.gemini_login_detected(),
+    GEMINI_FAMILY: antigravity_credentials_ready,
     KIMI_KEY: lambda: _kimi_auth.kimi_auth_configured(),
 }
 
@@ -1028,11 +1025,10 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
 
     Built so the server/web UI can do a plain dict lookup with whatever
     spelling it holds — canonical ids, executor-type spellings, the
-    ``claude`` alias, and ``pi``. Unknown harnesses map to ``True`` (never
-    gated); CLI-wrapping harnesses map to whether their binary is on
-    ``PATH``; SDK harnesses map to ``True`` when a locally visible credential
-    source could serve them, else ``"needs-auth"``. Codex entries use a
-    structured string reason when unavailable: ``"binary-missing"`` or
+    ``claude`` alias, ``pi``, and every configured ``acp:<slug>`` ID. Unknown
+    harnesses map to ``True``; CLI wrappers report local binary/auth readiness; SDK
+    harnesses report ``"needs-auth"`` when no local credential source is
+    visible. Codex entries distinguish ``"binary-missing"`` from
     ``"needs-auth"``.
 
     :returns: Mapping of harness spelling to readiness, e.g.
@@ -1058,6 +1054,13 @@ def configured_harness_map() -> dict[str, HarnessAvailability]:
     spellings.add(GOOSE_KEY)  # headless Goose (``goose acp``) gates on the goose binary
     spellings.add(HERMES_KEY)  # Hermes Agent wraps the ``hermes`` CLI
     spellings.add(COPILOT_KEY)
+    # Include configured ACP slugs because the picker uses their full IDs.
+    try:
+        from omnigent.onboarding.acp_auth import acp_agents
+
+        spellings.update(f"acp:{agent.slug}" for agent in acp_agents())
+    except Exception as exc:
+        _logger.debug("readiness: acp agent slug enumeration failed (%s)", type(exc).__name__)
     canonical_by_cache_key: dict[tuple[str, ...], str] = {}
     cache_key_by_spelling: dict[str, tuple[str, ...]] = {}
     for spelling in spellings:

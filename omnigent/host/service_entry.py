@@ -3,10 +3,39 @@
 from __future__ import annotations
 
 import argparse
+import time
 
 import click
 
 from omnigent.host import HOST_FATAL_EXIT_CODE
+
+# How often a service host waiting behind another daemon checks whether it still runs.
+_STANDBY_POLL_S = 60.0
+
+
+def _wait_while_workspace_is_served(server: str) -> None:
+    """Wait while another live daemon already serves *server*'s workspace.
+
+    The host would be refused and exit, and the service manager would restart
+    it every few seconds. Waiting keeps the other daemon as the only one and
+    lets this service take over once it stops, up to a minute later.
+
+    :param server: Remote Omnigent server URL, e.g.
+        ``"https://example.databricks.com/omnigent"``.
+    """
+    from omnigent.cli import _resolve_host_server, _same_workspace_daemon
+
+    resolved = _resolve_host_server(server)
+    announced = False
+    while (sibling := _same_workspace_daemon(resolved)) is not None:
+        if not announced:
+            click.echo(
+                f"Host daemon pid {sibling.pid} already serves this workspace through "
+                f"{sibling.target}; waiting until it stops.",
+                err=True,
+            )
+            announced = True
+        time.sleep(_STANDBY_POLL_S)
 
 
 def main() -> int:
@@ -21,6 +50,8 @@ def main() -> int:
 
     server = "" if args.local else args.server
     try:
+        if server:
+            _wait_while_workspace_is_served(server)
         cli.main(
             args=["host", "--server", server, "--non-interactive"],
             prog_name="omnigent",

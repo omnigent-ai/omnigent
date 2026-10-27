@@ -188,6 +188,30 @@ their screen-only excerpt independently of this flag; the flag is not a master
 content switch for ordinary lifecycle logs. Other terminals still export no
 pane text in these event attributes.
 
+## Native startup failure context
+
+Native terminal startup failures carry bounded `failure_context` metadata on
+the existing runner status event and terminal-ensure error response. Updated
+servers retain it on the existing `session_turn_failed` record for both delivery
+paths, including when the runner's local logs are unavailable.
+
+`failure_id` matches the runner's `native_terminal_start_failed` `error_id`, and
+`failure_source` is `native_terminal_start`. `exception_type`,
+`exception_cause_type`, and `exception_context_type` name available exception
+classes. `native_launch_os_errno`, `native_launch_os_errno_name`, and
+`native_launch_winerror` preserve available OS facts from the bounded cause
+chain. Missing fields mean unavailable evidence. These fields contain no raw
+exception messages, paths, arguments, or pane output.
+
+`native_launch_code_origin` identifies the last available Omnigent module,
+function, and line in the exception traceback, falling back to the available
+leaf when no framework frame exists. It names the launch operation without
+exporting its filesystem path; an exception without a traceback omits it.
+
+Older runners can omit the context; malformed and unknown fields are ignored.
+The context does not change error codes, display text, status handling, or
+retry policy, and does not add failure records.
+
 ## Codex startup failure snapshot
 
 When a fresh native Codex session's TUI exits, thread discovery times out, or
@@ -270,6 +294,19 @@ error or the CLI's startup error. Cancellation emits no event. If the collector
 fails, the row carries `diagnostics_error_type` instead of the snapshot; a
 logging failure cannot replace the startup error or skip teardown.
 
+When the readiness budget expires while the spawned process is still alive and
+has never accepted a probe, `start()` instead emits
+`event_name=codex_app_server_silent_start_respawn` at WARNING level, terminates
+that process, and spawns one replacement on the same transport with a fresh
+readiness budget, so recovery can take two full budgets plus teardown rather
+than ending after the first. The row carries the same snapshot attributes for
+the silent process plus `recent_stderr_bytes`, the size of its retained stderr
+tail, and `last_error_type`, the class of the last failed readiness probe (for
+example `ConnectionRefusedError`); the stderr text itself appears only in the
+opt-in, redacted `stderr_tail` attribute, never in the message. If the replacement fails in turn, the
+`codex_app_server_start_failed` row describes the replacement, so the respawn
+row is the only record of the original silent process.
+
 ## Native turn failure evidence
 
 Failed `external_session_status` events accept optional `failure_context`
@@ -286,11 +323,17 @@ evidence of the cause. If the server fills in absent detail from stored assistan
 output, it records `detail_source=assistant_output_fallback`; if it finds no
 output, it records `detail_source=missing`.
 
+If Claude hook evidence collection raises, the failed status still carries the
+hook identity, category when present, and runner version. Its
+`failure_context_error_phase` and `failure_context_error_type` describe the
+diagnostic failure, not the native turn's cause; no exception text is added.
+
 | Attributes | Source and meaning |
 | --- | --- |
 | `failure_source`, `detail_source` | Distinguish Claude hooks, explicit transcript API errors, forwarder delivery failures, and legacy external status data |
 | `failure_id` | Stable observation identity across forwarding retries; deduplicate observations by this ID |
 | `native_error_category` | Original hook category, retained even when last-assistant text is also present |
+| `transcript_error_context_state` | Why a failed parent hook reused or declined the retained transcript API error; `hook_details_present` means the hook supplied its own detail and no lookup ran |
 | `native_error_message` | Bounded, redacted text from an explicit API-error record or formatted API-error payload, before display rewriting |
 | `native_session_id`, `native_agent_id`, `native_agent_role` | Native actor identity when supplied or established by the existing hook suppression rules |
 | `native_hook_event`, `native_hook_cursor`, `native_hook_offset`, `native_hook_recorded_at` | Original hook position and timestamp; not the time of a retry |
@@ -300,6 +343,32 @@ output, it records `detail_source=missing`.
 | `native_request_id`, `native_error_request_id` | Claude's `requestId` and an unqualified error-body `request_id`, respectively; neither is assumed to be a provider ID |
 | `gateway_request_id`, `provider_request_id` | Only populated when the source explicitly names that ownership |
 | `failure_context_missing_fields` | Comma-separated list of unavailable source fields, including IDs, versions, and inference details |
+
+The server also retains typed provider fields from explicit failed-status
+`output` or `failure_detail`, including gateway JSON whose message contains
+another JSON error. Parsing is limited to 16,384 characters and three envelopes; malformed
+or unmarked text adds no inferred facts. Stored assistant prose and idle or
+cancelled status edges are not parsed for provider facts.
+
+For category-only Claude hooks, `transcript_error_context_state` distinguishes
+`matched`, `forward_state_unavailable`, `native_session_unavailable`,
+`response_mismatch`, `no_api_error_context`, `unmarked_error_context`,
+`native_session_mismatch`, `subagent_context`, and `error_text_unavailable`.
+An unavailable forwarder checkpoint may be missing, unreadable or malformed;
+it does not establish that the transcript file is missing. No retained API-error
+context can mean it was never observed or was cleared by later output. These
+states explain the existing lookup decision without reading the transcript or
+diagnostic files again, exporting their paths, or inferring a provider cause.
+The runner and server both need the updated failure-context normalizer; older
+servers drop this field.
+
+`provider_error_type`, `provider_error_code`, `provider_error_param`, available
+HTTP status and explicitly named request IDs reach the existing failure record
+with `inference_detail_source=provider_error_json`. An unqualified error-body
+`request_id` remains separate from the session event's transport request ID.
+Existing structured evidence takes precedence. Values use the shared bounds
+and credential redaction; raw messages, unrelated fields and request bodies
+are not copied into this metadata. Status policy and display text stay the same.
 
 Claude forwarding failures retain the rejected delivery's `http_status` and,
 when recognized, `forwarder_rejection_reason`. The reason is restricted to
@@ -417,6 +486,26 @@ possible append overshoot). This is CLI-version-dependent, not an Omnigent disk
 quota. The next enabled launch in the same bridge directory removes the prior
 owned file and its rotated predecessor. Other user debug files are never read
 or deleted.
+
+## Codex bridge availability
+
+When an input cannot be delivered because bridge state is unavailable, the
+executor emits one INFO `codex_bridge_state_unavailable` record after its
+existing startup wait. Polling does not emit this record. `bridge_state_status`
+distinguishes `missing`, `not_file`, `unreadable`, `invalid_encoding`,
+`invalid_json`, and `invalid_state`; `bridge_state_errno` retains an observed
+OS error number when available. Invalid UTF-8 is treated as unavailable state,
+like malformed JSON, rather than escaping as a decoding exception.
+
+`wait_sleep_ms` is accumulated polling sleep, and `wait_budget_ms` is the
+current nominal budget. `startup_wait_extended` records whether a configured
+command received its longer allowance. `startup_error_present` distinguishes
+a runner-reported startup failure, and `startup_failure_coded` indicates a
+semantic failure code without exporting the marker's content.
+The record uses the same state read that stopped delivery and carries existing
+input correlation IDs when available. It contains no file paths, state bytes,
+startup-error text, or user input. Error wording, wait budgets, and undelivered
+input handling are unchanged.
 
 ## Verification
 

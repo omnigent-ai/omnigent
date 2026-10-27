@@ -55,6 +55,7 @@ from playwright.async_api import Request, Route, async_playwright, expect
 
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
 from tests._helpers.picker_routes import OWN_AGENTS
+from tests._helpers.polling import poll_until_async
 from tests.e2e_ui.start_session.helpers import (
     commit_landing_workspace_picker,
     open_landing_workspace_picker,
@@ -77,22 +78,6 @@ _FILESYSTEM_RE = re.compile(r"/v1/hosts/[^/]+/filesystem")
 # The worktree-list endpoint the branch combobox queries for the picked repo.
 # Distinct ``/worktrees`` segment, so it never collides with ``/filesystem``.
 _WORKTREES_RE = re.compile(r"/v1/hosts/[^/]+/worktrees")
-
-
-async def _wait_until(predicate, *, timeout_s: float = 15.0) -> None:
-    """Poll ``predicate`` on the event loop until true or timeout.
-
-    :param predicate: Zero-arg callable returning truthy when satisfied.
-    :param timeout_s: Max seconds to wait before failing the test.
-    :raises AssertionError: If the predicate never becomes truthy.
-    """
-    loop = asyncio.get_running_loop()
-    deadline = loop.time() + timeout_s
-    while loop.time() < deadline:
-        if predicate():
-            return
-        await asyncio.sleep(0.05)
-    raise AssertionError(f"condition not met within {timeout_s:.0f}s")
 
 
 def _agents_body() -> str:
@@ -536,7 +521,7 @@ async def _drive_permission_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_claude_e2e", body
             assert body["host_id"] == _HOST_ID, body
@@ -648,7 +633,7 @@ async def _drive_send_busy_spinner(base_url: str, session_id: str) -> None:
 
             # The create is still in flight, but the landing screen is gone and
             # the optimistic prompt is already visible under a temporary URL.
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             await expect(page).to_have_url(
                 re.compile(rf"{re.escape(base_url)}/c/temp:[0-9a-f]{{32}}")
             )
@@ -796,12 +781,12 @@ async def _drive_ignore_uncorrelated_announcement(base_url: str, session_id: str
             await page.get_by_test_id("new-chat-landing-input").wait_for(
                 state="visible", timeout=30_000
             )
-            await _wait_until(lambda: len(sockets) == 1)
+            await poll_until_async(lambda: len(sockets) == 1)
 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
             # The create is in flight and will stay that way.
-            await _wait_until(create_seen.is_set)
+            await poll_until_async(create_seen.is_set)
 
             announced_id = session_id
             sockets[0].send(
@@ -989,7 +974,7 @@ async def _drive_no_redirect_after_navigating_away(
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
             # The create is in flight and parked on the gate.
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
 
             # Leave for another session via the sidebar — a client-side
             # navigation, so the create fetch keeps running (a reload would
@@ -1135,7 +1120,7 @@ async def _drive_landing_clears_after_navigating_away(
 
             await landing_input.fill(message)
             await page.get_by_test_id("new-chat-landing-submit").click()
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
 
             # Detour through another session and come straight back, all
             # while the create is still bootstrapping.
@@ -1245,7 +1230,7 @@ async def _drive_remembers_last_picked_host(base_url: str, session_id: str) -> N
 def test_start_session_keeps_offline_host_selected(
     seeded_session: tuple[str, str], managed: bool
 ) -> None:
-    """An offline last pick stays selected and blocks sending until an explicit switch."""
+    """An offline last pick blocks sending; other offline hosts expand in a bounded list."""
     base_url, session_id = seeded_session
     _run_in_fresh_loop(_drive_keeps_offline_host_selected(base_url, session_id, managed))
 
@@ -1259,6 +1244,21 @@ async def _drive_keeps_offline_host_selected(
         browser = await pw.chromium.launch()
         page = await browser.new_page()
         hosts = json.loads(_two_hosts_body())
+        # API order represents most recent activity, independent of the host name.
+        offline_names = [
+            "workstation",
+            "build-box",
+            "laptop",
+            "dev-vm",
+            "sandbox",
+            "mac",
+            "archive",
+        ]
+        hosts["hosts"].extend(
+            {"host_id": f"host_e2e_{name}", "name": name, "owner": "e2e", "status": "offline"}
+            for name in offline_names
+        )
+        stale_row = page.get_by_test_id("new-chat-landing-host-host_e2e_workstation")
         try:
             create_bodies: list[dict[str, Any]] = []
             await _register_common_routes(
@@ -1295,8 +1295,37 @@ async def _drive_keeps_offline_host_selected(
             await page.goto(f"{base_url}/")
             chip = page.get_by_test_id("new-chat-landing-host-chip")
             await chip.click()
-            await page.get_by_test_id(f"new-chat-landing-host-{beta_id}").click()
+            beta_row = page.get_by_test_id(f"new-chat-landing-host-{beta_id}")
+            await expect(beta_row).to_be_visible()
+            await expect(stale_row).to_have_count(0)
+            toggle = page.get_by_role("menuitem", name="Offline hosts (7)")
+            await expect(toggle).to_have_attribute("aria-expanded", "false")
+            await toggle.click()
+            offline = page.get_by_role("group", name="Offline hosts")
+            await expect(offline.get_by_role("menuitem")).to_have_count(5)
+            await expect(offline.get_by_role("menuitem")).to_have_text(
+                [f"{name}offline" for name in offline_names[:5]]
+            )
+            await expect(stale_row).to_have_attribute("aria-disabled", "true")
+            # Keyboard activation must also keep the menu open.
+            more = page.get_by_role("menuitem", name="Show more (2 remaining)")
+            await more.focus()
+            await more.press("Enter")
+            await expect(offline.get_by_role("menuitem")).to_have_count(7)
+            await expect(more).to_have_count(0)
+            assert await offline.evaluate("el => el.scrollHeight > el.clientHeight")
+            await offline.evaluate("el => { el.scrollTop = el.scrollHeight; }")
+            await expect(offline.get_by_role("menuitem").last).to_be_in_viewport()
+            await toggle.click()
+            await expect(offline).to_have_count(0)
+            await toggle.click()
+            await expect(offline.get_by_role("menuitem")).to_have_count(5)
+            await beta_row.click()
             await expect(chip).to_have_attribute("aria-label", f"Host: {beta_name}, Online")
+            await expect(page.get_by_test_id("new-chat-landing-host-menu")).to_have_count(0)
+            await chip.click()
+            await expect(toggle).to_have_attribute("aria-expanded", "false")
+            await page.keyboard.press("Escape")
 
             # Reload without the in-memory draft after the chosen host disconnects.
             hosts["hosts"][1]["status"] = "offline"
@@ -1314,6 +1343,13 @@ async def _drive_keeps_offline_host_selected(
             await expect(
                 page.get_by_test_id(f"new-chat-landing-host-{beta_id}")
             ).to_have_attribute("data-active", "true")
+            await expect(stale_row).to_have_count(0)
+            await toggle.click()
+            await expect(offline.get_by_role("menuitem")).to_have_count(5)
+            await expect(beta_row).to_have_count(1)
+            await expect(offline.get_by_test_id(f"new-chat-landing-host-{beta_id}")).to_have_count(
+                0
+            )
             assert create_bodies == []
 
             # Only an explicit destination change permits creation elsewhere.
@@ -1325,7 +1361,7 @@ async def _drive_keeps_offline_host_selected(
             await page.get_by_test_id(replacement).click()
             await expect(submit).to_be_enabled()
             await submit.click()
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             if managed:
                 assert create_bodies[0]["host_type"] == "managed"
                 assert "host_id" not in create_bodies[0]
@@ -1389,7 +1425,7 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
             # stub exposes only the Mac. No landing draft exists on this path.
             await page.goto(f"{base_url}/c/{session_id}")
             await page.get_by_test_id("new-chat-button").wait_for(state="visible", timeout=30_000)
-            await _wait_until(lambda: route_state["requests"] >= 2)
+            await poll_until_async(lambda: route_state["requests"] >= 2)
 
             # NewChat mounts with cached Mac-only data and completes another
             # Mac-only request. Neither snapshot may silently replace the saved
@@ -1409,7 +1445,7 @@ async def _drive_preserves_unavailable_remembered_host(base_url: str, session_id
             route_state["include_remembered"] = True
             requests_before_focus = route_state["requests"]
             await page.evaluate("window.dispatchEvent(new Event('visibilitychange'))")
-            await _wait_until(lambda: route_state["requests"] > requests_before_focus)
+            await poll_until_async(lambda: route_state["requests"] > requests_before_focus)
             await expect(chip).to_have_attribute("aria-label", re.compile(beta_name))
         finally:
             await browser.close()
@@ -1519,7 +1555,7 @@ async def _drive_managed_repository_workspace_bar(
             await page.keyboard.press("Escape")
             await page.get_by_test_id("new-chat-landing-input").fill("audit the repository")
             await page.get_by_test_id("new-chat-landing-submit").click()
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_type"] == "managed", body
             assert body["workspaces"] == [repo_url], body
@@ -1717,7 +1753,7 @@ async def _drive_managed_multi_provider(base_url: str, session_id: str) -> None:
             # A managed create carries the chosen provider in its body.
             await page.get_by_test_id("new-chat-landing-input").fill("audit the repo")
             await page.get_by_test_id("new-chat-landing-submit").click()
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_type"] == "managed", body
             assert body["sandbox_provider"] == "e2b", body
@@ -1938,7 +1974,7 @@ async def _drive_model_effort(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_claude_e2e", body
             assert body.get("model_override") == "opus", body
@@ -2038,7 +2074,7 @@ async def _drive_codex_model(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body.get("model_override") == "gpt-live-fast", body
@@ -2136,7 +2172,7 @@ async def _drive_agent_picker_pagination_dedupe(base_url: str, session_id: str) 
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_codex_e2e", body
         finally:
@@ -2200,7 +2236,7 @@ async def _drive_approval_mode(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body["host_id"] == _HOST_ID, body
@@ -2285,7 +2321,7 @@ async def _drive_bypass_sandbox(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_codex_e2e", body
             assert body["host_id"] == _HOST_ID, body
@@ -2408,7 +2444,7 @@ async def _drive_select_harness(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("debate the design")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_polly_e2e", body
             assert body["host_id"] == _HOST_ID, body
@@ -2520,7 +2556,7 @@ async def _drive_folder_selection(base_url: str, session_id: str) -> None:
 
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/home/e2e/projects", body
@@ -2628,7 +2664,7 @@ async def _drive_create_folder(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("workspace-picker-new-folder-create").click()
 
             # The picker POSTs the joined path and drops into the new folder.
-            await _wait_until(lambda: len(create_dir_bodies) == 1)
+            await poll_until_async(lambda: len(create_dir_bodies) == 1)
             assert create_dir_bodies[0]["path"] == "/home/e2e/projects/new-app", create_dir_bodies
             await commit_landing_workspace_picker(page)
 
@@ -2640,7 +2676,7 @@ async def _drive_create_folder(base_url: str, session_id: str) -> None:
 
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/home/e2e/projects/new-app", body
@@ -2742,7 +2778,7 @@ async def _drive_type_tilde_path(base_url: str, session_id: str) -> None:
 
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/home/e2e/Desktop", body
@@ -2902,7 +2938,7 @@ async def _drive_add_worktree(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("implement login")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             assert body["workspace"] == "/work/repo", body
@@ -3006,7 +3042,7 @@ async def _drive_select_existing_worktree(base_url: str, session_id: str) -> Non
             await page.get_by_test_id("new-chat-landing-input").fill("work in the worktree")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["host_id"] == _HOST_ID, body
             # Workspace is the worktree dir; the git spec is in bind mode
@@ -3257,7 +3293,7 @@ async def _drive_native_permissions_without_edit(
             await page.get_by_test_id("new-chat-landing-input").fill("inspect this repository")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == agent_id, body
             assert body["host_id"] == _HOST_ID, body
@@ -3358,7 +3394,7 @@ async def _drive_agy_skip_permissions(base_url: str, session_id: str) -> None:
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_antigravity_e2e", body
             assert body["host_id"] == _HOST_ID, body
@@ -3425,7 +3461,7 @@ async def _drive_agy_default_permissions(base_url: str, session_id: str) -> None
             await page.get_by_test_id("new-chat-landing-input").fill("set up the project")
             await page.get_by_test_id("new-chat-landing-submit").click()
 
-            await _wait_until(lambda: len(create_bodies) == 1)
+            await poll_until_async(lambda: len(create_bodies) == 1)
             body = create_bodies[0]
             assert body["agent_id"] == "ag_antigravity_e2e", body
             assert not body.get("terminal_launch_args"), body

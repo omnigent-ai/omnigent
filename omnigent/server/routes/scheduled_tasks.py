@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
+from datetime import UTC, datetime
 from typing import Any
 from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
@@ -36,7 +37,7 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
-from omnigent.server.scheduled.rrule import RRuleValidationError, validate_rrule
+from omnigent.server.scheduled.rrule import RRuleSearchError, RRuleValidationError, validate_rrule
 from omnigent.server.scheduled.run_reconciler import force_fail_stale_runs
 from omnigent.stores import AgentStore, ConversationStore, PermissionStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -137,6 +138,17 @@ class UpdateScheduledTaskRequest(BaseModel):
         return self
 
 
+def _next_run_at(task: ScheduledTask, request: Request) -> str | None:
+    if getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
+        return (
+            datetime.fromtimestamp(task.next_run_at, UTC).isoformat()
+            if task.next_run_at is not None
+            else None
+        )
+    scheduler = getattr(request.app.state, "scheduled_task_scheduler", None)
+    return scheduler.next_run_at(task.id) if scheduler is not None else None
+
+
 def _to_response(
     task: ScheduledTask,
     *,
@@ -200,10 +212,10 @@ def _run_to_response(run: ScheduledTaskRun) -> dict[str, Any]:
     }
 
 
-def _validate_rrule_or_400(rrule: str) -> None:
+async def _validate_rrule_or_400(rrule: str) -> None:
     """Raise a 400 ``OmnigentError`` if the RRULE is invalid."""
     try:
-        validate_rrule(rrule)
+        await asyncio.to_thread(validate_rrule, rrule)
     except RRuleValidationError as exc:
         raise OmnigentError(f"invalid rrule: {exc}", code=ErrorCode.INVALID_INPUT) from exc
 
@@ -347,9 +359,13 @@ def create_scheduled_tasks_router(
         )
 
     def _owns_task(task: ScheduledTask, owner: str | None) -> bool:
-        return task.user_id == owner and (
-            current_account_user() is None
-            or task.account_generation == account_generation(owner or RESERVED_USER_LOCAL)
+        return (
+            task.state != "deleted"
+            and task.user_id == owner
+            and (
+                current_account_user() is None
+                or task.account_generation == account_generation(owner or RESERVED_USER_LOCAL)
+            )
         )
 
     def _require_owned(scheduled_task_id: str, owner: str | None) -> ScheduledTask:
@@ -370,7 +386,7 @@ def create_scheduled_tasks_router(
     ) -> dict[str, Any]:
         """Create a scheduled task and arm it on the live scheduler."""
         owner = _owner(request)
-        _validate_rrule_or_400(body.rrule)
+        await _validate_rrule_or_400(body.rrule)
         _validate_timezone_or_400(body.timezone)
         permission_mode = validate_session_permission_mode(body.permission_mode)
         agent, workspace, model_override, reasoning_effort = await _validate_launch_inputs(
@@ -403,18 +419,26 @@ def create_scheduled_tasks_router(
                 host_id=body.host_id,
                 execution_target=body.execution_target,
             )
-        except Exception:
+        except Exception as exc:
             if bound.id != agent.id:
                 agent_store.delete(bound.id)
+            if isinstance(exc, RRuleSearchError):
+                raise OmnigentError(
+                    "Could not calculate the next run time for this schedule. "
+                    "The task was not created.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
             raise
         scheduler = _scheduler(request)
-        if scheduler is not None:
+        if scheduler is not None and not getattr(
+            request.app.state, "scheduled_task_dispatch_enabled", False
+        ):
             scheduler.add(task)
         # A freshly created task has no runs (last_run_status is None); its
-        # next_run_at is available now that the scheduler armed it above.
+        # next_run_at comes from the legacy timer or the persisted schedule.
         return _to_response(
             task,
-            next_run_at=scheduler.next_run_at(task.id) if scheduler is not None else None,
+            next_run_at=_next_run_at(task, request),
         )
 
     @router.get("/scheduled-tasks")
@@ -439,13 +463,12 @@ def create_scheduled_tasks_router(
         # dead run as ``failed`` rather than a stuck ``running``.
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks(task_ids)
-        scheduler = _scheduler(request)
         return {
             "scheduled_tasks": [
                 _to_response(
                     t,
                     last_run_status=latest_status.get(t.id),
-                    next_run_at=scheduler.next_run_at(t.id) if scheduler is not None else None,
+                    next_run_at=_next_run_at(t, request),
                 )
                 for t in tasks
             ]
@@ -463,11 +486,10 @@ def create_scheduled_tasks_router(
         running = store.list_running_runs_for_tasks([task.id])
         force_fail_stale_runs(store, running)
         latest_status = store.list_latest_run_status_for_tasks([task.id])
-        scheduler = _scheduler(request)
         return _to_response(
             task,
             last_run_status=latest_status.get(task.id),
-            next_run_at=scheduler.next_run_at(task.id) if scheduler is not None else None,
+            next_run_at=_next_run_at(task, request),
         )
 
     @router.get("/scheduled-tasks/{scheduled_task_id}/runs")
@@ -518,8 +540,8 @@ def create_scheduled_tasks_router(
         A manual override that reuses the SHARED scheduled-fire path (the same
         ``on_fire`` machinery — session create, owner grant, runner launch,
         prompt dispatch, run recording) via ``app.state.scheduled_task_run_now``.
-        It does NOT re-implement the fire logic and cannot collide with a
-        scheduled fire of the same task (both share the in-flight overlap guard).
+        Legacy scheduled fires share its process-local overlap guard. Persistent
+        scheduled fires use database claims, which this manual path does not join.
 
         Paused tasks ARE runnable here — run-now is an explicit manual override,
         so it does not require the ``active`` state the scheduler enforces.
@@ -562,7 +584,7 @@ def create_scheduled_tasks_router(
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         existing = _require_owned(scheduled_task_id, owner_id)
         if body.rrule is not None:
-            _validate_rrule_or_400(body.rrule)
+            await _validate_rrule_or_400(body.rrule)
         if body.timezone is not None:
             _validate_timezone_or_400(body.timezone)
         fields = body.model_dump(exclude_unset=True)
@@ -654,19 +676,27 @@ def create_scheduled_tasks_router(
             updated = store.update(scheduled_task_id, **fields)
             if updated is None:
                 raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
-        except Exception:
+        except Exception as exc:
             # The task never bound the copy, so nothing else uses it.
             if new_copy is not None:
                 agent_store.delete(new_copy.id)
+            if isinstance(exc, RRuleSearchError):
+                raise OmnigentError(
+                    "Could not calculate the next run time for this schedule. "
+                    "Your changes were not saved.",
+                    code=ErrorCode.INVALID_INPUT,
+                ) from exc
             raise
         scheduler = _scheduler(request)
-        if scheduler is not None:
+        if scheduler is not None and not getattr(
+            request.app.state, "scheduled_task_dispatch_enabled", False
+        ):
             scheduler.update(updated)
         latest_status = store.list_latest_run_status_for_tasks([updated.id])
         return _to_response(
             updated,
             last_run_status=latest_status.get(updated.id),
-            next_run_at=scheduler.next_run_at(updated.id) if scheduler is not None else None,
+            next_run_at=_next_run_at(updated, request),
         )
 
     @router.delete("/scheduled-tasks/{scheduled_task_id}")
@@ -674,13 +704,18 @@ def create_scheduled_tasks_router(
         request: Request,
         scheduled_task_id: str,
     ) -> dict[str, Any]:
-        """Delete a task and drop its timer from the scheduler."""
+        """Check ownership, then delete the task and history in a worker thread.
+
+        The ownership lookup remains synchronous; remove the timer after deletion.
+        """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         _require_owned(scheduled_task_id, owner_id)
-        store.delete(scheduled_task_id)
+        await asyncio.to_thread(store.delete, scheduled_task_id)
         scheduler = _scheduler(request)
-        if scheduler is not None:
+        if scheduler is not None and not getattr(
+            request.app.state, "scheduled_task_dispatch_enabled", False
+        ):
             scheduler.remove(scheduled_task_id)
         return {"deleted": True, "id": scheduled_task_id}
 

@@ -14,6 +14,8 @@ app-rejects-token failure, and non-interference with accounts mode.
 
 from __future__ import annotations
 
+import base64
+import hashlib
 import json
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -55,7 +57,15 @@ class _FakeHttpx:
         """
         headers = kwargs.get("headers")
         auth = headers.get("Authorization") if isinstance(headers, dict) else None
-        self.requests.append({"url": url, "authorization": auth, "params": kwargs.get("params")})
+        verifier = headers.get("X-Omnigent-Code-Verifier") if isinstance(headers, dict) else None
+        self.requests.append(
+            {
+                "url": url,
+                "authorization": auth,
+                "params": kwargs.get("params"),
+                "verifier": verifier,
+            }
+        )
         return self.responses.pop(0)
 
 
@@ -397,6 +407,152 @@ def test_login_workspace_hosted_with_selector_binds_and_succeeds(
     assert load_databricks_workspace_host(_WORKSPACE_API_URL) == _WORKSPACE
 
 
+@pytest.mark.parametrize("auth_path", ["cached", "refreshed", "header"])
+def test_login_rejects_workspace_mismatch_without_changing_login(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, auth_path: str
+) -> None:
+    """Even an HTTP 200 must not replace a login with a different workspace."""
+    from omnigent.cli_auth import store_databricks_auth
+
+    store_databricks_auth(
+        _WORKSPACE_API_URL, _WORKSPACE, user_id="previous@example.com", org_id="123456"
+    )
+    auth_file = token_dir / "auth_tokens.json"
+    original_auth = auth_file.read_bytes()
+    config_file = token_dir / "config.yaml"
+    config_file.write_text("server: https://previous.example.com\n")
+    original_config = config_file.read_bytes()
+    challenge = _response(401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'})
+    responses = [] if auth_path == "header" else [challenge]
+    if auth_path == "refreshed":
+        responses.append(_response(403))
+    responses.append(
+        _response(
+            200,
+            headers={"x-databricks-org-id": "123456"},
+            body={"user_id": "alice@example.com"},
+        )
+    )
+    fake = _FakeHttpx(responses=responses)
+    login_calls = _patch_login_env(
+        monkeypatch, fake_httpx=fake, cached_tokens=["tok-cached", "tok-fresh"]
+    )
+
+    result = CliRunner().invoke(cli_group, ["login", f"{_WORKSPACE_API_URL}?o=123"])
+
+    assert result.exit_code != 0, result.output
+    assert "Requested workspace 123," in result.output
+    assert "reports workspace 123456." in result.output
+    assert "truncated" in result.output
+    assert "Saved Omnigent login details were not changed" in result.output
+    assert "omnigent stop" not in result.output
+    assert fake.requests[-1]["params"] == {"o": "123"}
+    assert auth_file.read_bytes() == original_auth
+    assert config_file.read_bytes() == original_config
+    assert len(login_calls) == (1 if auth_path == "refreshed" else 0)
+
+
+@pytest.mark.parametrize("reported_org_id", ["123", None])
+@pytest.mark.parametrize("auth_path", ["cached", "header"])
+def test_login_saves_selector_only_after_successful_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    token_dir: Path,
+    reported_org_id: str | None,
+    auth_path: str,
+) -> None:
+    """An accepted selector can switch workspaces, including on older servers."""
+    from omnigent.cli_auth import store_databricks_auth
+
+    store_databricks_auth(
+        _WORKSPACE_API_URL, _WORKSPACE, user_id="previous@example.com", org_id="123456"
+    )
+    responses = (
+        [_response(401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'})]
+        if auth_path == "cached"
+        else []
+    )
+    responses.append(
+        _response(
+            200,
+            headers={"x-databricks-org-id": reported_org_id} if reported_org_id else {},
+            body={"user_id": "alice@example.com"},
+        )
+    )
+    fake = _FakeHttpx(responses=responses)
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+
+    result = CliRunner().invoke(cli_group, ["login", f"{_WORKSPACE_API_URL}?o=123"])
+
+    assert result.exit_code == 0, result.output
+    saved = json.loads((token_dir / "auth_tokens.json").read_text())[_WORKSPACE_API_URL]
+    assert saved["org_id"] == "123"
+    assert saved["user_id"] == (
+        "alice@example.com" if auth_path == "cached" else "previous@example.com"
+    )
+    assert fake.requests[-1]["params"] == {"o": "123"}
+
+
+@pytest.mark.parametrize("entry_point", ["login", "preflight"])
+def test_verified_selector_write_failure_is_actionable(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, entry_point: str
+) -> None:
+    """A failed post-verification write reports how to fix it and preserves the login."""
+    from omnigent.cli_auth import store_databricks_auth
+    from omnigent.cli_diagnostics import SUPPRESS_RECOVERY_HINT_ATTR
+
+    store_databricks_auth(_WORKSPACE_API_URL, _WORKSPACE, org_id="123456")
+    auth_file = token_dir / "auth_tokens.json"
+    original_auth = auth_file.read_bytes()
+    fake = _FakeHttpx(responses=[_response(200, headers={"x-databricks-org-id": "123"})])
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    monkeypatch.setattr("omnigent.chat._remote_headers", lambda **kwargs: {})
+
+    def fail_to_write(*args: object) -> None:
+        raise PermissionError("read-only data directory")
+
+    monkeypatch.setattr("omnigent.cli_auth._write_tokens_file", fail_to_write)
+    if entry_point == "login":
+        result = CliRunner().invoke(cli_group, ["login", f"{_WORKSPACE_API_URL}?o=123"])
+        assert result.exit_code != 0
+        assert "omnigent stop" not in result.output
+        error_message = result.output
+    else:
+        resolved = cli_mod._resolve_server_url(f"{_WORKSPACE_API_URL}?o=123")
+        with pytest.raises(click.ClickException) as caught:
+            cli_mod._ensure_databricks_server_auth(resolved.api_base, non_interactive=True)
+        assert getattr(caught.value, SUPPRESS_RECOVERY_HINT_ATTR, False)
+        error_message = str(caught.value)
+
+    assert "Could not persist the workspace routing selector" in error_message
+    assert "data directory is writable" in error_message
+    assert not fake.responses
+    assert auth_file.read_bytes() == original_auth
+
+
+def test_rejected_login_preserves_saved_workspace(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path
+) -> None:
+    """A failed token verification cannot save the URL's proposed selector."""
+    from omnigent.cli_auth import store_databricks_auth
+
+    store_databricks_auth(_WORKSPACE_API_URL, _WORKSPACE, org_id="123456")
+    auth_file = token_dir / "auth_tokens.json"
+    original_auth = auth_file.read_bytes()
+    fake = _FakeHttpx(
+        responses=[
+            _response(401, headers={"www-authenticate": 'Bearer realm="DatabricksRealm"'}),
+            _response(403),
+        ]
+    )
+    _patch_login_env(monkeypatch, fake_httpx=fake, cached_tokens=[None, "tok-fresh"])
+
+    result = CliRunner().invoke(cli_group, ["login", f"{_WORKSPACE_API_URL}?o=123"])
+
+    assert result.exit_code != 0
+    assert "rejected the token" in result.output
+    assert auth_file.read_bytes() == original_auth
+
+
 def test_login_apps_fails_loud_without_databricks_extra(
     monkeypatch: pytest.MonkeyPatch, token_dir: Path
 ) -> None:
@@ -416,6 +572,34 @@ def test_login_apps_fails_loud_without_databricks_extra(
     assert result.exit_code != 0
     # The error must carry the canonical install hint, not a generic failure.
     assert "omnigent[databricks]" in result.output
+    assert load_databricks_workspace_host(_APPS_URL) is None
+
+
+def test_login_apps_fails_loud_without_databricks_cli(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The Python extra alone cannot complete a fresh workspace browser login."""
+    from omnigent.cli_auth import load_databricks_workspace_host
+    from omnigent.cli_diagnostics import suppresses_recovery_hint
+
+    fake = _FakeHttpx(responses=[_response(302, headers={"location": _APPS_REDIRECT})])
+    login_calls = _patch_login_env(monkeypatch, fake_httpx=fake, cached_tokens=[None])
+    monkeypatch.setattr(cli_mod.shutil, "which", lambda name: None)
+
+    result = CliRunner().invoke(cli_group, ["login", _APPS_URL], standalone_mode=False)
+
+    assert result.exit_code != 0
+    assert isinstance(result.exception, click.ClickException), result.output
+    assert suppresses_recovery_hint(result.exception)
+    result.exception.show()
+    error_output = capsys.readouterr().err
+    assert "Databricks CLI not found on PATH" in error_output
+    assert "Install it, then retry this command." in error_output
+    assert "https://docs.databricks.com/dev-tools/cli/install.html" in error_output
+    error_lines = error_output.splitlines()
+    assert len(error_lines) == 2
+    assert all(len(line) <= 80 for line in error_lines)
+    assert login_calls == []
     assert load_databricks_workspace_host(_APPS_URL) is None
 
 
@@ -664,10 +848,7 @@ def test_login_threads_org_id_through_workspace_login_and_verify(
     # The verify request routes to the workspace via ?o= (and used the token).
     assert fake.requests[-1]["params"] == {"o": _ORG_ID}
     assert fake.requests[-1]["authorization"] == "Bearer tok-fresh"
-    # The selector is persisted (from the URL, authoritative over any header),
-    # keyed by the canonical query-free base — ``ServerUrl`` never lets ``?o=``
-    # onto ``api_base``, so the store key is the bare host even though the
-    # identity-patched expansion above didn't strip the query itself.
+    # Persisted after verification, keyed by the query-free canonical base.
     assert load_databricks_org_id(_WORKSPACE) == _ORG_ID
     assert load_databricks_workspace_host(_WORKSPACE) == _WORKSPACE
 
@@ -767,11 +948,16 @@ def test_login_oidc_mode_sets_default_server(
         ]
     )
     _patch_login_env(monkeypatch, fake_httpx=fake)
-    monkeypatch.setattr(
-        httpx,
-        "post",
-        lambda url, **kw: _response(200, body={"ticket": "t", "login_url": "/auth/go"}),
-    )
+    post_calls: list[dict[str, object]] = []
+
+    def _post(url: str, **kwargs: object) -> httpx.Response:
+        post_calls.append(kwargs)
+        return _response(
+            200,
+            body={"ticket": "t", "login_url": "/auth/go", "user_code": "ABCD-2345"},
+        )
+
+    monkeypatch.setattr(httpx, "post", _post)
     monkeypatch.setattr(webbrowser, "open", lambda url: True)
     monkeypatch.setattr(time, "sleep", lambda seconds: None)
 
@@ -779,6 +965,52 @@ def test_login_oidc_mode_sets_default_server(
 
     assert result.exit_code == 0, result.output
     assert cli_mod._load_global_config().get("server") == server
+    body = post_calls[0]["json"]
+    assert isinstance(body, dict)
+    challenge = body["code_challenge"]
+    assert body["code_challenge_method"] == "S256"
+    params = fake.requests[-1]["params"]
+    assert params == {"ticket": "t"}
+    verifier = fake.requests[-1]["verifier"]
+    assert isinstance(verifier, str)
+    expected = (
+        base64.urlsafe_b64encode(hashlib.sha256(verifier.encode("ascii")).digest())
+        .rstrip(b"=")
+        .decode("ascii")
+    )
+    assert challenge == expected
+
+
+@pytest.mark.parametrize("stage,status", [("create", 400), ("poll", 403), ("poll", 410)])
+def test_login_oidc_failure_leaves_default_server_unchanged(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, stage: str, status: int
+) -> None:
+    import time
+    import webbrowser
+
+    server = "http://omni-oidc.internal:6767"
+    cli_mod._save_global_config({"server": "https://existing.example.com"})
+    error = "Login request rejected"
+    responses = [_response(401, body={"login_url": "/auth/login"})]
+    if stage == "poll":
+        responses.append(_response(status, body={"error": error}))
+    fake = _FakeHttpx(responses=responses)
+    _patch_login_env(monkeypatch, fake_httpx=fake)
+    creation = (
+        _response(status, body={"error": error})
+        if stage == "create"
+        else _response(200, body={"ticket": "t", "login_url": "/auth/go"})
+    )
+    monkeypatch.setattr(httpx, "post", lambda *args, **kwargs: creation)
+    monkeypatch.setattr(webbrowser, "open", lambda url: True)
+    monkeypatch.setattr(time, "sleep", lambda seconds: None)
+
+    result = CliRunner().invoke(cli_group, ["login", server])
+
+    assert result.exit_code != 0
+    assert error in result.output
+    assert cli_mod._load_global_config().get("server") == "https://existing.example.com"
+    assert len(fake.requests) == (1 if stage == "create" else 2)
 
 
 def test_login_failure_leaves_default_server_unchanged(
@@ -957,6 +1189,25 @@ def test_workspace_url_leaves_oss_server_alone(
     )
 
 
+@pytest.mark.parametrize("suffix", ["", "/omnigent"])
+@pytest.mark.parametrize(
+    "failure",
+    [httpx.ConnectError("connection refused"), httpx.InvalidURL("invalid proxy")],
+    ids=["connection-error", "invalid-proxy"],
+)
+def test_workspace_url_keeps_input_when_probe_cannot_connect(
+    suffix: str,
+    failure: Exception,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """An optional workspace probe leaves connection errors to the requesting command."""
+    server = f"https://omni.example.com{suffix}"
+    probed = _scripted_normalizer_httpx(monkeypatch, {"https://omni.example.com/v1/me": failure})
+
+    assert cli_mod._workspace_api_server_url(server) == server
+    assert probed == ["https://omni.example.com/v1/me"]
+
+
 def test_workspace_url_leaves_apps_edge_alone(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -1000,6 +1251,7 @@ def test_workspace_url_with_path_probes_nothing(
 
 def test_workspace_url_expands_when_mount_hidden_from_anonymous_probe(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """A mount invisible to anonymous probes expands via a cached bearer.
 
@@ -1051,6 +1303,9 @@ def test_workspace_url_expands_when_mount_hidden_from_anonymous_probe(
         f"{_WORKSPACE_API_URL}/v1/me",
     ]
     assert [r["authorization"] for r in fake.requests] == [None, None, "Bearer tok-ws"]
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "(Databricks workspace-hosted omnigent)." in captured.err
 
 
 def test_workspace_url_hints_when_mount_dark_and_no_cached_grant(
@@ -1085,10 +1340,12 @@ def test_workspace_url_hints_when_mount_dark_and_no_cached_grant(
     # anonymous probes ran. A third request here would mean a Bearer
     # header was fabricated from nothing.
     assert [r["authorization"] for r in fake.requests] == [None, None]
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    # Hints go to stderr so a command's JSON stdout stays parseable.
+    assert captured.out == ""
     # The hint must name the remedy, otherwise the user is back to
     # debugging an opaque host-tunnel 404 on the bare workspace URL.
-    assert f"databricks auth login --host {_WORKSPACE}" in out
+    assert f"databricks auth login --host {_WORKSPACE}" in captured.err
 
 
 def test_workspace_url_hints_when_authed_probe_also_misses(
@@ -1124,10 +1381,11 @@ def test_workspace_url_hints_when_authed_probe_also_misses(
     # The authed retry ran and presented the cached bearer; without it
     # this test would be identical to the no-grant case.
     assert [r["authorization"] for r in fake.requests] == [None, None, "Bearer tok-ws"]
-    out = capsys.readouterr().out
+    captured = capsys.readouterr()
+    assert captured.out == ""
     # The message must say credentials were already tried — pointing
     # the user at `auth login` alone would send them in a circle.
-    assert "even with the cached workspace credentials" in out
+    assert "even with the cached workspace credentials" in captured.err
 
 
 def test_workspace_url_skips_authed_probe_without_databricks_extra(
@@ -1302,39 +1560,47 @@ def test_resolve_server_url_does_not_store_selector_off_managed_mount(
     assert stored == []
 
 
-def test_resolve_server_url_reports_selector_persistence_failure(
+@pytest.mark.parametrize("saved_login", [False, True])
+def test_resolve_server_url_keeps_selector_process_local(
+    monkeypatch: pytest.MonkeyPatch, token_dir: Path, saved_login: bool
+) -> None:
+    """Parsing routes the command without creating or replacing a saved login."""
+    from omnigent.cli_auth import databricks_request_headers, store_databricks_auth
+
+    if saved_login:
+        store_databricks_auth(_WORKSPACE_API_URL, _WORKSPACE, org_id="123456")
+    auth_file = token_dir / "auth_tokens.json"
+    original_auth = auth_file.read_bytes() if saved_login else None
+
+    resolved = cli_mod._resolve_server_url(f"{_WORKSPACE_API_URL}?o=123")
+
+    assert resolved.org_id == "123"
+    assert databricks_request_headers(resolved.api_base)["X-Databricks-Org-Id"] == "123"
+    assert (auth_file.read_bytes() if auth_file.exists() else None) == original_auth
+
+
+def test_resolve_server_url_works_without_writable_auth_state(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """A routing selector must not be silently dropped when state is unwritable."""
-
-    def fail_to_store(_server: str, _org_id: str) -> None:
-        raise PermissionError("read-only data directory")
-
-    monkeypatch.setattr(
-        cli_mod,
-        "_workspace_api_server_url",
-        lambda _server: _WORKSPACE_API_URL,
-    )
+    """URL parsing needs no disk write even when the command has a selector."""
     monkeypatch.setattr(
         "omnigent.cli_auth.store_databricks_org_id",
-        fail_to_store,
+        lambda *_args: pytest.fail("URL parsing must not save an unverified selector"),
     )
-
-    with pytest.raises(
-        click.ClickException,
-        match="Could not persist the workspace routing selector",
-    ):
-        cli_mod._resolve_server_url(f"{_WORKSPACE}/?o=2850744067564480")
+    assert cli_mod._resolve_server_url(f"{_WORKSPACE_API_URL}?o=123").org_id == "123"
 
 
 def test_workspace_url_expands_web_ui_path_to_api_mount(
     monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
 ) -> None:
     """The guide's web-UI URL (``<ws>/omnigent``) expands to the API mount.
 
     The internal user guide hands out ``<ws>/omnigent`` for the browser;
     a user who pastes it into ``omnigent login`` must reach the API mount
-    (``/api/2.0/omnigent``), not 404 the UI path's own /v1/me probe.
+    (``/api/2.0/omnigent``), not 404 the UI path's own /v1/me probe. The
+    desktop passes this URL to ``host status --json`` and parses its
+    stdout, so the expansion notice must stay on stderr.
     """
 
     probed = _scripted_normalizer_httpx(
@@ -1350,6 +1616,9 @@ def test_workspace_url_expands_web_ui_path_to_api_mount(
     assert cli_mod._workspace_api_server_url(f"{_WORKSPACE}/omnigent") == _WORKSPACE_API_URL
     # The bare root and its API mount were probed — never the UI path itself.
     assert f"{_WORKSPACE}/omnigent/v1/me" not in probed
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert "(Databricks workspace-hosted omnigent)." in captured.err
 
 
 def test_workspace_url_web_ui_path_left_alone_off_workspace(

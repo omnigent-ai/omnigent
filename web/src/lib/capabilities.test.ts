@@ -90,6 +90,15 @@ describe("sandboxProviderOptions", () => {
 });
 
 describe("resolveServerInfo sandbox_providers", () => {
+  it.each([undefined, false, "true", true])(
+    "requires an explicit durable-input capability (%s)",
+    async (value) => {
+      expect((await probe({ durable_initial_input: value })).durable_initial_input).toBe(
+        value === true,
+      );
+    },
+  );
+
   it.each([undefined, null, "", "manage", 2, true])(
     "defaults an absent or invalid public ceiling %s to Read",
     async (value) => {
@@ -139,9 +148,20 @@ describe("resolveServerInfo sandbox_providers", () => {
 describe("resolveServerInfo release features", () => {
   it("keeps boolean feature values and drops malformed entries", async () => {
     const parsed = await probe({
-      features: { usage_page: true, harness_install: false, malformed: "yes" },
+      features: {
+        usage_page: true,
+        harness_install: false,
+        automations_v2: true,
+        malformed: "yes",
+      },
     });
-    expect(parsed.features).toEqual({ usage_page: true, harness_install: false });
+    expect(parsed.features).toEqual({
+      usage_page: true,
+      harness_install: false,
+      automations_v2: true,
+    });
+    const { isFeatureEnabled } = await import("./capabilities");
+    expect(isFeatureEnabled(parsed, "automations_v2")).toBe(true);
   });
 
   it("defaults missing features off", async () => {
@@ -167,6 +187,16 @@ describe("resolveServerInfo release features", () => {
   });
 });
 
+describe("resolveServerInfo session_search_scope", () => {
+  it("reads the advertised capability", async () => {
+    expect((await probe({ session_search_scope: true })).session_search_scope).toBe(true);
+  });
+
+  it("is off for an older server that omits it", async () => {
+    expect((await probe({})).session_search_scope).toBe(false);
+  });
+});
+
 describe("resolveServerInfo archive_worktree_cleanup", () => {
   it("reads the advertised capability", async () => {
     expect((await probe({ archive_worktree_cleanup: true })).archive_worktree_cleanup).toBe(true);
@@ -174,6 +204,17 @@ describe("resolveServerInfo archive_worktree_cleanup", () => {
 
   it("is off for an older server that omits it", async () => {
     expect((await probe({})).archive_worktree_cleanup).toBe(false);
+  });
+});
+
+describe("resolveServerInfo request_managed_sandbox_host_id", () => {
+  it.each([
+    [true, true],
+    [undefined, false],
+    ["true", false],
+  ])("parses %s strictly as %s", async (advertised, expected) => {
+    const parsed = await probe({ request_managed_sandbox_host_id: advertised });
+    expect(parsed.request_managed_sandbox_host_id).toBe(expected);
   });
 });
 
@@ -250,6 +291,12 @@ describe("resolveServerInfo branding", () => {
 });
 
 describe("custom agents settings capability", () => {
+  it.each([undefined, false, "true", true])(
+    "parses agent_config_edit strictly: %s",
+    async (edit) => {
+      expect((await probe({ agent_config_edit: edit })).agent_config_edit).toBe(edit === true);
+    },
+  );
   it.each([undefined, false, "true", true])("parses agent_detail strictly: %s", async (detail) => {
     const parsed = await probe({ agent_detail: detail });
     expect(parsed.agent_detail).toBe(detail === true);

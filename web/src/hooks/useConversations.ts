@@ -57,7 +57,7 @@ import {
 } from "@/shell/sidebarNav";
 import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
-import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
@@ -113,6 +113,8 @@ function isAbortTimeout(error: unknown): boolean {
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
 export type SessionSortBy = "updated_at" | "created_at";
+/** `?search_scope=`: `title` and `content` are disjoint groups of one search. */
+export type SessionSearchScope = "all" | "title" | "content";
 
 export interface UseConversationsOptions {
   sortBy?: SessionSortBy;
@@ -172,6 +174,8 @@ export interface Conversation {
   agent_id?: string;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
   agent_name?: string | null;
+  /** Effective harness, including any per-session override. */
+  harness?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
   status?: "idle" | "running" | "failed";
@@ -481,7 +485,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   // enter client state only through here, and terminal-attach / session-scoped
   // requests key their slice off this map — so record the host before returning
   // the row, or those requests fall back to the modal and can miss the replica.
-  setSessionHost(wire.id, wire.host_id);
+  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
@@ -497,6 +501,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     workspace: wire.workspace ?? null,
     agent_id: wire.agent_id,
     agent_name: wire.agent_name ?? null,
+    harness: wire.harness ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
     status: wire.status ?? "idle",
     runner_online: wire.runner_online ?? undefined,
@@ -516,9 +521,11 @@ export async function fetchConversationsPage({
   signal: requestSignal,
   limit = sidebarConfig.sessionPageSize,
   sortBy = "updated_at",
+  searchScope = "all",
 }: {
   after?: string;
   searchQuery: string;
+  searchScope?: SessionSearchScope;
   includeArchived: boolean;
   project?: string;
   visibility?: "mine" | "shared" | "archived";
@@ -536,6 +543,7 @@ export async function fetchConversationsPage({
   });
   if (after) params.set("after", after);
   if (searchQuery) params.set("search_query", searchQuery);
+  if (searchQuery && searchScope !== "all") params.set("search_scope", searchScope);
   // Only request archived rows when the toggle is on, so the default
   // sidebar never pays to fetch them. The server excludes archived
   // sessions unless include_archived=true.
@@ -565,7 +573,7 @@ export async function fetchConversationsPage({
   // falling back to the modal. host_id is fixed for a session's life, so this
   // can't seed a stale value; a hostless row clears any prior mapping.
   for (const row of page.data) {
-    setSessionHost(row.id, row.host_id);
+    setSessionHost(row.id, sessionRoutingHostId(row.host_id, row.labels));
     setSessionParent(row.id, row.parent_session_id, row.labels);
   }
   return applySessionTombstones(
@@ -723,6 +731,41 @@ export function useConversations(
   });
   // A session deleted between two scroll pages kills the cursor; reload the
   // list from page 1 rather than replacing the sidebar with the raw 400.
+  useRestartOnStaleCursor(queryKey);
+  return query;
+}
+
+/**
+ * One palette search group; keyed outside `["conversations"]`, which patches rows
+ * live. Dropped once unobserved, so a later search never shows a stale row.
+ */
+export function useSessionSearch(
+  searchQuery: string,
+  searchScope: SessionSearchScope,
+  { enabled = true, limit = 10 }: { enabled?: boolean; limit?: number } = {},
+) {
+  const queryClient = useQueryClient();
+  const queryKey = ["session-search", searchQuery, searchScope, limit];
+  const query = useInfiniteQuery({
+    queryKey,
+    queryFn: ({ pageParam }) =>
+      fetchConversationsPage({
+        after: pageParam,
+        searchQuery,
+        searchScope,
+        includeArchived: false,
+        queryClient,
+        limit,
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
+    staleTime: 0,
+    gcTime: 0,
+    retry: (failureCount, error) =>
+      !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
+    enabled: enabled && searchQuery !== "",
+  });
   useRestartOnStaleCursor(queryKey);
   return query;
 }
@@ -1786,6 +1829,7 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
     labels: session.labels ?? {},
     permission_level: session.permissionLevel,
     agent_id: session.agentId,
+    harness: session.harness,
     archived: session.archived,
   };
 }

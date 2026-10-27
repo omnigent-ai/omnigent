@@ -18,6 +18,7 @@ from sqlalchemy.orm import Session
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import (
     CompactionData,
+    Conversation,
     ErrorData,
     FunctionCallData,
     FunctionCallOutputData,
@@ -96,23 +97,28 @@ def test_fork_drops_import_provenance_labels(
 def test_fork_drops_sandbox_repo_label(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    """A fork must not inherit the repository the source's sandbox was built
-    from: the label is what a sandbox RELAUNCH re-clones, so a clone that
-    asked for an empty sandbox would get the source's repo re-cloned into it
-    on the first relaunch. The fork's own launch re-stamps whatever it
-    resolves."""
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    """A fork must not inherit the source sandbox's labels: the repository is
+    what a sandbox RELAUNCH re-clones, so a clone that asked for an empty
+    sandbox would get the source's repo re-cloned into it on the first
+    relaunch; the host id routes requests to the source's host, while the fork
+    launches its own. The fork's own launch re-stamps whatever it resolves."""
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY
 
     source = conversation_store.create_conversation()
     conversation_store.set_labels(
         source.id,
-        {MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main", "kept": "yes"},
+        {
+            MANAGED_REPO_LABEL_KEY: "https://github.com/org/repo#main",
+            REQUESTED_HOST_ID_LABEL_KEY: "0123456789abcdef0123456789abcdef",
+            "kept": "yes",
+        },
     )
 
     fork = conversation_store.fork_conversation(source.id)
 
     assert fork.labels["kept"] == "yes"
     assert MANAGED_REPO_LABEL_KEY not in fork.labels
+    assert REQUESTED_HOST_ID_LABEL_KEY not in fork.labels
 
 
 def test_fork_drops_per_repo_sandbox_labels(
@@ -1831,6 +1837,129 @@ def test_list_conversations_search_query_matches_content(
     assert conv_neither.id not in matched_ids, "non-matching conversation excluded"
 
 
+def test_list_conversations_search_scope_splits_title_and_content_matches(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """
+    ``search_scope`` returns disjoint title and content groups of one search.
+
+    A session matching in both its title and content is a title match only,
+    and each group pages with the ordinary cursor.
+
+    :param conversation_store: The conversation store fixture.
+    """
+
+    def add_message(conversation_id: str, text: str) -> None:
+        conversation_store.append(
+            conversation_id,
+            [
+                NewConversationItem(
+                    type="message",
+                    response_id=f"resp_{conversation_id}",
+                    data=MessageData(role="user", content=[{"type": "input_text", "text": text}]),
+                ),
+            ],
+        )
+
+    title_only = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_only.id, title="Kestrel plan")
+    title_and_content = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_and_content.id, title="kestrel notes")
+    add_message(title_and_content.id, "more kestrel detail")
+    content_ids = []
+    for index in range(3):
+        content_only = conversation_store.create_conversation()
+        conversation_store.update_conversation(content_only.id, title=f"Sync {index}")
+        add_message(content_only.id, "the kestrel checklist")
+        content_ids.append(content_only.id)
+    unrelated = conversation_store.create_conversation()
+    conversation_store.update_conversation(unrelated.id, title="Unrelated")
+
+    def page_through(scope: str) -> list[Conversation]:
+        """Read every match of ``scope`` two rows at a time."""
+        rows: list[Conversation] = []
+        after: str | None = None
+        while True:
+            page = conversation_store.list_conversations(
+                search_query="kestrel", search_scope=scope, limit=2, after=after
+            )
+            rows.extend(page.data)
+            if not page.has_more:
+                return rows
+            after = page.last_id
+
+    title_rows = page_through("title")
+    assert sorted(c.id for c in title_rows) == sorted([title_only.id, title_and_content.id])
+    # The title already shows the hit, so the title group skips snippets.
+    assert all(c.search_snippet is None for c in title_rows)
+
+    content_rows = page_through("content")
+    # Paging walks the same order as one unpaged read, with no repeats or gaps.
+    unpaged = conversation_store.list_conversations(search_query="kestrel", search_scope="content")
+    assert [c.id for c in content_rows] == [c.id for c in unpaged.data]
+    assert sorted(c.id for c in content_rows) == sorted(content_ids)
+    assert all(c.search_snippet for c in content_rows)
+
+    all_ids = {c.id for c in conversation_store.list_conversations(search_query="kestrel").data}
+    assert all_ids == {title_only.id, title_and_content.id, *content_ids}
+
+    with pytest.raises(ValueError, match="search_scope"):
+        conversation_store.list_conversations(search_query="kestrel", search_scope="body")
+
+
+@pytest.mark.parametrize("query", ["50%", "a_b", "x/y"])
+def test_list_conversations_search_matches_like_wildcards_literally(
+    conversation_store: SqlAlchemyConversationStore,
+    query: str,
+) -> None:
+    """
+    ``%``, ``_`` and the escape character in a search match only themselves,
+    in titles, content and the content snippet.
+
+    :param conversation_store: The conversation store fixture.
+    :param query: A search containing a LIKE wildcard or the escape character.
+    """
+    title_hit = conversation_store.create_conversation()
+    conversation_store.update_conversation(title_hit.id, title=f"Plan {query} rollout")
+    content_hit = conversation_store.create_conversation()
+    conversation_store.update_conversation(content_hit.id, title="Notes")
+    conversation_store.append(
+        content_hit.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_wildcard_hit",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": f"ship {query} today"}]
+                ),
+            ),
+        ],
+    )
+    # Each would match if the query's wildcard or escape character were active.
+    near_miss = query.replace("%", "0").replace("_", "-").replace("/", "")
+    decoy = conversation_store.create_conversation()
+    conversation_store.update_conversation(decoy.id, title=f"Plan {near_miss} rollout")
+    conversation_store.append(
+        decoy.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="resp_wildcard_decoy",
+                data=MessageData(
+                    role="user",
+                    content=[{"type": "input_text", "text": f"ship {near_miss} today"}],
+                ),
+            ),
+        ],
+    )
+
+    by_id = {c.id: c for c in conversation_store.list_conversations(search_query=query).data}
+    assert set(by_id) == {title_hit.id, content_hit.id}
+    snippet = by_id[content_hit.id].search_snippet
+    assert snippet is not None
+    assert query in snippet
+
+
 def test_list_conversations_search_query_content_only(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
@@ -3145,6 +3274,65 @@ def test_list_child_conversation_ids_by_parent_groups_direct_subagents(
     assert nested.id not in result[parent_a.id]
     nested_result = conversation_store.list_child_conversation_ids_by_parent([child_a1.id])
     assert nested_result[child_a1.id] == [nested.id]
+
+    pages: list[tuple[str, int]] = []
+    while True:
+        cursor = (pages[-1][1], pages[-1][0]) if pages else None
+        page = conversation_store.list_child_conversation_ids_page(
+            parent_a.id, after=cursor, limit=1
+        )
+        if not page:
+            break
+        pages.extend(page)
+    assert pages == sorted(
+        [(child_a1.id, child_a1.created_at), (child_a2.id, child_a2.created_at)],
+        key=lambda row: (row[1], row[0]),
+        reverse=True,
+    )
+    assert conversation_store.list_child_conversation_ids_page(parent_b.id) == [
+        (child_b.id, child_b.created_at)
+    ]
+    assert conversation_store.list_child_conversation_ids_page(child_a1.id) == [
+        (nested.id, nested.created_at)
+    ]
+
+
+def test_child_conversation_page_uses_parent_index_for_first_and_next_page(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    if conversation_store._engine.dialect.name != "sqlite":
+        pytest.skip("SQLite query-plan assertion")
+    parent = conversation_store.create_conversation()
+    children = [
+        conversation_store.create_conversation(kind="sub_agent", parent_conversation_id=parent.id)
+        for _ in range(3)
+    ]
+    queries = []
+
+    def capture(_conn, _cursor, statement, parameters, _context, _executemany):
+        if statement.lstrip().upper().startswith("SELECT"):
+            queries.append((statement, parameters))
+
+    event.listen(conversation_store._engine, "before_cursor_execute", capture)
+    try:
+        first = conversation_store.list_child_conversation_ids_page(parent.id, limit=1)
+        following = conversation_store.list_child_conversation_ids_page(
+            parent.id, after=(first[0][1], first[0][0]), limit=1
+        )
+    finally:
+        event.remove(conversation_store._engine, "before_cursor_execute", capture)
+    assert len(first) == len(following) == 1
+    assert {first[0][0], following[0][0]} <= {child.id for child in children}
+    assert len(queries) == 2
+    with conversation_store._engine.connect() as conn:
+        plans = [
+            str(conn.exec_driver_sql("EXPLAIN QUERY PLAN " + statement, parameters).all())
+            for statement, parameters in queries
+        ]
+    for plan in plans:
+        assert "idx_conversations_parent" in plan, plan
+        assert "TEMP B-TREE" not in plan, plan
+    assert "(created_at,id)<(?,?)" in "".join(plans[1].split()), plans[1]
 
 
 # ── agent_id filter on list_conversations ──────────────
@@ -5876,10 +6064,11 @@ def test_fork_only_dropped_label_keys_match_sandbox_repo_constant() -> None:
     the first relaunch. Importing the real constant here makes that rename
     fail loudly at test time.
     """
-    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY
+    from omnigent.server.managed_hosts import MANAGED_REPO_LABEL_KEY, REQUESTED_HOST_ID_LABEL_KEY
     from omnigent.stores.conversation_store import _FORK_ONLY_DROPPED_LABEL_KEYS
 
     assert MANAGED_REPO_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
+    assert REQUESTED_HOST_ID_LABEL_KEY in _FORK_ONLY_DROPPED_LABEL_KEYS
 
 
 def test_fork_conversation_copies_reasoning_effort(

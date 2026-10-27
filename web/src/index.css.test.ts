@@ -519,6 +519,8 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           handleProps: { tabIndex: 0 },
           rightRailTab: "files",
           onRightRailTabChange: () => {},
+          openPanels: [],
+          onClosePanel: () => {},
           showFilesPanel: true,
           showGithubTab: false,
           showBrowserTab: false,
@@ -1212,6 +1214,19 @@ describe("index.css electron-mac sidebar header", () => {
     // /settings swaps the header row out entirely; without this its Back row
     // would sit underneath the window controls.
     expect(settingsHeaderRule).toContain("padding-top: calc(var(--mac-titlebar-height) + 0.5rem)");
+  });
+
+  it("hands the phone layout's headers the lights' corner below md", () => {
+    // Electron's 720px minimum is below md, where the drawer and chat header
+    // carry their own controls; a fixed rem pad would drift with zoom.
+    const narrowBlock = cssSource.match(
+      /@media \(width < 48rem\) \{(?=\s*html\[data-electron-mac\] \.electron-sidebar-header-actions \{)(?:[^{}]|\{[^{}]*\})*\}/,
+    )?.[0];
+    expect(narrowBlock, "expected the macOS sub-md header block").toBeDefined();
+    expect(narrowBlock).toMatch(/\.electron-sidebar-header-actions \{\s*display: none;/);
+    expect(narrowBlock).toMatch(
+      /\.traffic-light-clearance,\s*html\[data-electron-mac\] \.sidebar-header-row \{\s*padding-left: var\(--mac-traffic-light-width\);/,
+    );
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {

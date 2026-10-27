@@ -628,3 +628,51 @@ def test_branding_logo_rejects_symlinked_assets_directory(
     (tmp_path / BRANDING_ASSETS_DIRNAME).symlink_to(external, target_is_directory=True)
 
     assert branding_logo_asset() is None
+
+
+_DEFAULT_EXTENSIONS = {".zip", ".docx", ".xlsx", ".pptx", ".db", ".sqlite", ".sqlite3"}
+
+
+@pytest.mark.parametrize(
+    ("raw", "extensions", "all_types"),
+    [
+        (None, _DEFAULT_EXTENSIONS, False),
+        ("*", _DEFAULT_EXTENSIONS, True),
+        # A list-valued setting can express "all types" the same way.
+        (["*"], _DEFAULT_EXTENSIONS, True),
+        (["*", "log"], _DEFAULT_EXTENSIONS | {".log"}, True),
+        # A list replaces the defaults.
+        ([".gz", "HAR"], {".gz", ".har"}, False),
+        ([], set(), False),
+        # A malformed entry is skipped; nothing usable keeps the defaults.
+        ([42, ".gz"], {".gz"}, False),
+        ([42], _DEFAULT_EXTENSIONS, False),
+        ({"gz": True}, _DEFAULT_EXTENSIONS, False),
+        # Files match on their last extension, so a compound entry can never match.
+        ([".tar.gz", ".har"], {".har"}, False),
+        ([".tar.gz"], _DEFAULT_EXTENSIONS, False),
+    ],
+)
+def test_parse_filesystem_attachment_policy(
+    raw: object, extensions: set[str], all_types: bool
+) -> None:
+    """Configured values map to the extensions delivered as files and the fallback rule."""
+    from omnigent.server.server_config import parse_filesystem_attachment_policy
+
+    policy = parse_filesystem_attachment_policy(raw)
+
+    assert set(policy.extensions) == extensions
+    assert policy.all_types is all_types
+
+
+def test_filesystem_attachment_policy_reads_the_config_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The setting comes from the server config file."""
+    from omnigent.server.server_config import filesystem_attachment_policy
+
+    config = tmp_path / "config.yaml"
+    config.write_text('filesystem_attachment_allowed_extensions: "*"\n')
+    monkeypatch.setenv("OMNIGENT_CONFIG", str(config))
+
+    assert filesystem_attachment_policy().all_types

@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import uuid
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
 from pathlib import Path
+from threading import Barrier
 
 import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
+from omnigent.db.db_models import workspace_scope
 from omnigent.db.utils import get_or_create_engine
 from omnigent.entities import Agent, PagedList
 from omnigent.errors import StaleCursorError
@@ -35,6 +39,13 @@ def test_create_and_get(agent_store: SqlAlchemyAgentStore) -> None:
     assert fetched is not None
     assert fetched.id == agent.id
     assert fetched.name == "gpt-4"
+    assert agent_store.get_many([agent.id, "5ff5b2e31fe10beb80134394037b17b0", agent.id]) == {
+        agent.id: agent
+    }
+    assert agent_store.get_many([]) == {}
+    assert AgentStore.get_many(agent_store, [agent.id]) == {agent.id: agent}
+    with workspace_scope(42):
+        assert agent_store.get_many([agent.id]) == {}
 
 
 def test_get_nonexistent(agent_store: SqlAlchemyAgentStore) -> None:
@@ -230,6 +241,7 @@ def test_update_agent(agent_store: SqlAlchemyAgentStore) -> None:
         agent_id="409a6849f6efefc6ba8da809a29b9b0b",
         name="updatable",
         bundle_location="ag_test_upd/hash1",
+        description="Original description",
     )
     # version=1 and updated_at=None on creation
     assert agent.version == 1
@@ -242,6 +254,12 @@ def test_update_agent(agent_store: SqlAlchemyAgentStore) -> None:
     assert updated.updated_at is not None
     # Name stays the same
     assert updated.name == "updatable"
+    assert updated.description == "Original description"
+    replaced = agent_store.update(agent.id, "ag_test_upd/hash3", description="Replacement")
+    assert replaced is not None and replaced.description == "Replacement"
+    cleared = agent_store.update(agent.id, "ag_test_upd/hash4", description=None)
+    assert cleared is not None and cleared.description is None and cleared.version == 4
+    assert agent_store.get(agent.id) == cleared
 
 
 def test_update_nonexistent_agent(agent_store: SqlAlchemyAgentStore) -> None:
@@ -250,16 +268,25 @@ def test_update_nonexistent_agent(agent_store: SqlAlchemyAgentStore) -> None:
 
 
 def test_update_increments_version(agent_store: SqlAlchemyAgentStore) -> None:
-    """Multiple updates increment version monotonically."""
-    agent_store.create(
+    """Concurrent unconditional updates each increment the stored version."""
+    agent = agent_store.create(
         agent_id="9dafdd1d4311d9f16337323a6d653308",
         name="versioned",
         bundle_location="ag_test_ver/h1",
     )
-    v2 = agent_store.update("9dafdd1d4311d9f16337323a6d653308", "ag_test_ver/h2")
-    v3 = agent_store.update("9dafdd1d4311d9f16337323a6d653308", "ag_test_ver/h3")
-    assert v2 is not None and v2.version == 2
-    assert v3 is not None and v3.version == 3
+    ready = Barrier(2)
+
+    def write(location: str) -> Agent | None:
+        ready.wait(timeout=10)
+        return agent_store.update(agent.id, location)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write, ["ag_test_ver/h2", "ag_test_ver/h3"]))
+    assert all(result is not None for result in results)
+    assert sorted(result.version for result in results if result is not None) == [2, 3]
+    assert agent_store.get(agent.id) == next(
+        result for result in results if result is not None and result.version == 3
+    )
 
 
 def test_update_stamps_created_by_when_null(agent_store: SqlAlchemyAgentStore) -> None:
@@ -284,6 +311,16 @@ def test_update_never_gives_a_server_agent_an_owner(agent_store: SqlAlchemyAgent
 
     assert updated is not None and updated.created_by is None
     assert [a.id for a in agent_store.list().data] == [agent.id]
+    assert (
+        agent_store.update_configuration(
+            updated, updated.bundle_location, description=None, created_by="alice@example.com"
+        )
+        == updated
+    )
+    edited = agent_store.update_configuration(
+        updated, "ag_s/h3", description=None, created_by="alice@example.com"
+    )
+    assert edited is not None and edited.created_by is None
 
 
 def test_update_does_not_overwrite_existing_created_by(
@@ -741,3 +778,150 @@ def test_agent_store_defaults_report_user_agents_unsupported(
     assert AgentStore.list_user_agents(agent_store, _OWNER).data == []
     with pytest.raises(NotImplementedError):
         AgentStore.create_user_agent(agent_store, "x", "n", "x/y", owner=_OWNER)
+    assert agent_store.supports_config_edit is True
+    assert AgentStore.supports_config_edit.fget(agent_store) is False  # type: ignore[attr-defined]
+    agent = _user_agent(agent_store, "editable")
+    with pytest.raises(NotImplementedError):
+        AgentStore.update_configuration(agent_store, agent, "x/y", description=None)
+
+
+@pytest.mark.parametrize("owner", [_OWNER, None])
+def test_update_configuration_description_and_noop(
+    agent_store: SqlAlchemyAgentStore, clock: None, owner: str | None
+) -> None:
+    agent = _user_agent(agent_store, "editable", owner=owner)
+    assert (
+        agent_store.update_configuration(agent, agent.bundle_location, description=None) == agent
+    )
+    updated = agent_store.update_configuration(agent, "new/bundle", description="New text")
+    assert updated is not None
+    assert updated == replace(
+        agent,
+        bundle_location="new/bundle",
+        description="New text",
+        version=2,
+        updated_at=updated.updated_at,
+    )
+    assert updated.updated_at is not None
+    assert agent_store.get(agent.id) == updated
+    assert (
+        agent_store.update_configuration(updated, "new/bundle", description="New text") == updated
+    )
+    cleared = agent_store.update_configuration(updated, "new/bundle", description=None)
+    assert cleared is not None
+    assert cleared.description is None and cleared.version == 3
+    assert cleared.updated_at is not None
+    assert cleared.updated_at > updated.updated_at
+    assert agent_store.get(agent.id) == cleared
+
+
+def test_update_configuration_concurrent_writers_and_deletion(
+    agent_store: SqlAlchemyAgentStore, clock: None
+) -> None:
+    agent = _user_agent(agent_store, "editable")
+    ready = Barrier(2)
+
+    def write(location: str) -> Agent | None:
+        ready.wait(timeout=10)
+        return agent_store.update_configuration(agent, location, description=location)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        results = list(pool.map(write, ["first/bundle", "second/bundle"]))
+    assert results.count(None) == 1
+    winner = next(result for result in results if result is not None)
+    assert winner.version == 2 and winner.description == winner.bundle_location
+    assert agent_store.get(agent.id) == winner
+    # A stale no-op must fail too, including after an unconditional reinstall.
+    assert agent_store.update_configuration(agent, agent.bundle_location, description=None) is None
+    reinstalled = agent_store.update(agent.id, "reinstalled/bundle")
+    assert reinstalled is not None and reinstalled.version == 3
+    assert agent_store.update_configuration(winner, "stale/bundle", description="stale") is None
+    assert agent_store.get(agent.id) == reinstalled
+    assert agent_store.delete(agent.id)
+    for location in (reinstalled.bundle_location, "deleted/bundle"):
+        assert (
+            agent_store.update_configuration(
+                reinstalled, location, description=reinstalled.description
+            )
+            is None
+        )
+    assert agent_store.get(agent.id) is None
+
+    recreated = agent_store.create_user_agent(
+        agent.id, agent.name, agent.bundle_location, owner=agent.created_by
+    )
+    assert recreated.created_at > agent.created_at
+    assert recreated == replace(agent, created_at=recreated.created_at)
+    for location in (agent.bundle_location, "stale/bundle"):
+        assert agent_store.update_configuration(agent, location, description=None) is None
+    assert agent_store.get(agent.id) == recreated
+    assert (
+        agent_store.update_configuration(recreated, recreated.bundle_location, description=None)
+        == recreated
+    )
+
+
+@pytest.mark.parametrize("change_bundle", [False, True])
+def test_update_configuration_claims_only_the_observed_unowned_user_agent(
+    agent_store: SqlAlchemyAgentStore, change_bundle: bool
+) -> None:
+    agent = _user_agent(agent_store, "legacy", owner=None)
+    location = "new/bundle" if change_bundle else agent.bundle_location
+    claimed = agent_store.update_configuration(
+        agent, location, description=None, created_by=_OWNER
+    )
+    assert claimed is not None and claimed.created_by == _OWNER and claimed.version == 2
+    assert (
+        agent_store.update_configuration(
+            agent, location, description=None, created_by="bob@example.com"
+        )
+        is None
+    )
+    assert (
+        agent_store.update_configuration(
+            claimed, location, description=None, created_by="bob@example.com"
+        )
+        == claimed
+    )
+    edited = agent_store.update_configuration(
+        claimed, location, description="Edited", created_by="bob@example.com"
+    )
+    assert edited is not None and edited.created_by == _OWNER and edited.version == 3
+    assert agent_store.get(agent.id) == edited
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("id", "f" * 32),
+        ("kind", "server"),
+        ("created_by", None),
+        ("version", 99),
+        ("bundle_location", "stale/bundle"),
+    ],
+)
+@pytest.mark.parametrize("noop", [False, True])
+def test_update_configuration_compares_observed_identity_and_revision(
+    agent_store: SqlAlchemyAgentStore, field: str, value: object, noop: bool
+) -> None:
+    agent = _user_agent(agent_store, "editable")
+    expected = replace(agent, **{field: value})
+    location = expected.bundle_location if noop else "new/bundle"
+    assert agent_store.update_configuration(expected, location, description=None) is None
+    assert agent_store.get(agent.id) == agent
+
+
+def test_agent_updates_are_workspace_scoped(agent_store: SqlAlchemyAgentStore) -> None:
+    agent = _user_agent(agent_store, "editable")
+    with workspace_scope(42):
+        assert agent_store.update_configuration(agent, "new/bundle", description=None) is None
+        assert agent_store.update(agent.id, "new/bundle") is None
+        other = agent_store.create_user_agent(
+            agent.id, agent.name, agent.bundle_location, owner=agent.created_by
+        )
+    updated = agent_store.update_configuration(agent, "new/bundle", description="New text")
+    assert updated is not None and updated.version == 2
+    updated = agent_store.update(agent.id, "reinstalled/bundle")
+    assert updated is not None and updated.version == 3
+    with workspace_scope(42):
+        assert agent_store.get(agent.id) == other

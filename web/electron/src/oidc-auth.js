@@ -4,6 +4,8 @@
 
 "use strict";
 
+const { diagnostics } = require("./diagnostics");
+
 const { serverEndpoint } = require("./oidc-credentials");
 
 // The SPA asking to sign in again this soon after a renewal means the server
@@ -198,11 +200,19 @@ function createOidcAuth({
     const existing = await storedToken(serverUrl, cookieName);
     signal?.throwIfAborted();
     if (existing && (await tokenAccepted(serverUrl, cookieName, existing, signal))) {
+      diagnostics.record("oidc_session", {
+        origin: new URL(serverUrl).origin,
+        outcome: "existing",
+      });
       return "existing";
     }
     const renewError = await renewForConnect(serverUrl, cookieName, signal);
-    if (!renewError) return "renewed";
+    if (!renewError) {
+      diagnostics.record("oidc_session", { origin: new URL(serverUrl).origin, outcome: "renewed" });
+      return "renewed";
+    }
     if (!interactive) throw renewError;
+    diagnostics.record("oidc_session", { origin: new URL(serverUrl).origin, outcome: "browser" });
     onBrowserSignIn?.();
     const minted = await credentials.signInWithBrowser(serverUrl, { signal });
     signal?.throwIfAborted();
@@ -212,6 +222,7 @@ function createOidcAuth({
       });
     }
     await installSession(serverUrl, cookieName, minted);
+    diagnostics.record("oidc_session", { origin: new URL(serverUrl).origin, outcome: "signed_in" });
     return "signed-in";
   }
 
@@ -272,10 +283,15 @@ function createOidcAuth({
     if (reload) ctx.reloadRequested = true;
     if (ctx.pending) return ctx.pending;
     clearTimeoutFn(ctx.timer);
+    diagnostics.record("oidc_renewal", {
+      origin: ctx.origin,
+      phase: reload ? "recovery" : "background",
+    });
     console.log("[omnigent] oidc auth: silent renewal", { origin: ctx.origin, reason, reload });
     ctx.pending = renewSession(ctx.serverUrl, ctx.cookieName)
       .then(async () => {
         if (!current(ctx)) return;
+        diagnostics.record("oidc_renewal", { origin: ctx.origin, outcome: "renewed" });
         await schedule(ctx);
         if (!ctx.reloadRequested || !current(ctx)) return;
         ctx.reloadRequested = false;
@@ -291,6 +307,11 @@ function createOidcAuth({
         }
       })
       .catch((error) => {
+        diagnostics.record("oidc_renewal", {
+          origin: ctx.origin,
+          outcome: "failed",
+          code: error?.code,
+        });
         if (ctx.reloadRequested) {
           fail(ctx, error);
           return;
@@ -349,13 +370,19 @@ function createOidcAuth({
       revocation = credentials.signOut(serverUrl);
     } catch (error) {
       complete = false;
-      console.warn("[omnigent] oidc auth: could not forget the grant", { origin, error });
+      console.warn("[omnigent] oidc auth: could not forget the grant", {
+        origin,
+        code: error?.code,
+      });
     }
     try {
       await session.cookies.remove(origin, cookieName);
     } catch (error) {
       complete = false;
-      console.warn("[omnigent] oidc auth: could not clear the session cookie", { origin, error });
+      console.warn("[omnigent] oidc auth: could not clear the session cookie", {
+        origin,
+        code: error?.code,
+      });
     }
     for (const c of signedOut)
       if (!c.win.isDestroyed()) onSignedOut(c.win, serverUrl, { complete });

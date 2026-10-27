@@ -723,10 +723,27 @@ async def test_native_transcript_preserves_browser_title_preference(
                 pending_inputs.resolve(session_id, pending["pending_id"])
 
 
+@pytest.mark.parametrize(
+    "harness,message_text,rejected_auth,active_turn",
+    [
+        ("claude-native", "set up the worktree", False, False),
+        ("claude-native", "/login", True, False),
+        ("claude-native", "/logout", True, False),
+        ("claude-native", " \n/login workspace", True, False),
+        ("claude-native", "/login-help", False, False),
+        ("claude-native", "Explain /login", False, False),
+        ("codex-native", "/login", False, False),
+        ("claude-native", "/login", True, True),
+    ],
+)
 async def test_native_message_repeat_with_same_stable_id_forwards_once(
     client: httpx.AsyncClient,
     app: Any,
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
+    message_text: str,
+    rejected_auth: bool,
+    active_turn: bool,
 ) -> None:
     """
     A resend that reuses the web client's stable message id is answered with
@@ -755,7 +772,7 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
         "type": "message",
         "data": {
             "role": "user",
-            "content": [{"type": "input_text", "text": "set up the worktree"}],
+            "content": [{"type": "input_text", "text": message_text}],
             "stable_id": "7f3a9c1e5b2d4f6a8c0e1d2b3a4f5c6d",
         },
     }
@@ -767,25 +784,58 @@ async def test_native_message_repeat_with_same_stable_id_forwards_once(
             "omnigent.server.routes._sessions.orchestration._get_runner_client",
             AsyncMock(return_value=runner),
         )
-        agent = await create_test_agent(client, name="claude-native-ui")
+        agent = await create_test_agent(
+            client,
+            name=f"{harness}-ui",
+            executor={"type": "omnigent", "config": {"harness": harness}},
+        )
         created = await client.post(
             "/v1/sessions",
             json={
                 "agent_id": agent["id"],
                 "labels": {
                     "omnigent.ui": "terminal",
-                    "omnigent.wrapper": "claude-code-native-ui",
+                    "omnigent.wrapper": (
+                        "claude-code-native-ui"
+                        if harness == "claude-native"
+                        else "codex-native-ui"
+                    ),
                 },
             },
         )
         assert created.status_code == 201, created.text
         session_id = created.json()["id"]
+        if active_turn:
+            sessions_module._publish_status(session_id, "running", response_id="response_active")
+        before = (await client.get(f"/v1/sessions/{session_id}")).json()
+        published: list[tuple[str, dict[str, Any]]] = []
+        _capture_published(monkeypatch, published)
         try:
 
             def message_forwards() -> int:
                 return sum(1 for r in forwarded if r.url.path.endswith("/events"))
 
             first = await client.post(f"/v1/sessions/{session_id}/events", json=message)
+            if rejected_auth:
+                assert first.status_code == 400, first.text
+                assert first.json()["error"]["code"] == "invalid_input"
+                assert "omni setup" in first.json()["error"]["message"]
+                assert message_forwards() == 0
+                assert pending_inputs.snapshot_for(session_id) == []
+                after = (await client.get(f"/v1/sessions/{session_id}")).json()
+                assert after["items"] == before["items"]
+                assert after["status"] == before["status"]
+                if active_turn:
+                    assert sessions_module._session_active_response_cache[session_id] == (
+                        "response_active"
+                    )
+                assert not any(
+                    event.get("type") in {"response.error", "response.failed"}
+                    or (event.get("type") == "session.status" and event.get("status") == "failed")
+                    for published_session, event in published
+                    if published_session == session_id
+                )
+                return
             assert first.status_code == 202, first.text
             assert message_forwards() == 1
             # The runner learns the message's id so a failed turn can name it.
@@ -1378,8 +1428,10 @@ async def test_external_session_superseded_leaves_interrupted_entries_hidden(
 # ── POST /v1/sessions/{id}/events external_subagent_start ─────────
 
 
+@pytest.mark.parametrize("tool_use_id", ["toolu_016PwCnwmHv8h7kVpWLVd9YX", None])
 async def test_external_subagent_start_mints_child_session(
     client: httpx.AsyncClient,
+    tool_use_id: str | None,
 ) -> None:
     """
     Posting ``external_subagent_start`` to a claude-native parent
@@ -1406,7 +1458,7 @@ async def test_external_subagent_start_mints_child_session(
                 "subagent_id": "a5c7effac5a9a35ab",
                 "agent_type": "Explore",
                 "description": "Trace the auth flow",
-                "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
+                **({"tool_use_id": tool_use_id} if tool_use_id is not None else {}),
             },
         },
     )
@@ -1436,6 +1488,7 @@ async def test_external_subagent_start_mints_child_session(
     # Description is preserved on the row's labels for surfaces that
     # want it; the rail's row UI ignores ``session_name``.
     assert child["labels"]["omnigent.claude_native.description"] == "Trace the auth flow"
+    assert child["labels"].get("omnigent.claude_native.tool_use_id") == tool_use_id
 
 
 async def test_session_event_batch_is_ordered_and_idempotent(
@@ -2149,8 +2202,10 @@ async def test_external_subagent_start_falls_back_to_the_bare_agent_type(
     assert child["session_name"] == "a361e6a6aa05689cb"
 
 
+@pytest.mark.parametrize("tool_use_id", ["toolu_016PwCnwmHv8h7kVpWLVd9YX", None])
 async def test_external_subagent_start_is_idempotent_on_subagent_id(
     client: httpx.AsyncClient,
+    tool_use_id: str | None,
 ) -> None:
     """
     Two POSTs carrying the same ``subagent_id`` resolve to the same
@@ -2170,7 +2225,7 @@ async def test_external_subagent_start_is_idempotent_on_subagent_id(
             "subagent_id": "a5c7effac5a9a35ab",
             "agent_type": "Explore",
             "description": "Trace the auth flow",
-            "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
+            **({"tool_use_id": tool_use_id} if tool_use_id is not None else {}),
         },
     }
 
@@ -2323,31 +2378,38 @@ async def test_external_subagent_start_idempotency_pages_beyond_first_100(
 
 
 @pytest.mark.parametrize(
-    "missing_key",
-    ["subagent_id", "agent_type", "description", "tool_use_id"],
+    ("invalid_key", "invalid_value"),
+    [
+        ("subagent_id", None),
+        ("agent_type", None),
+        ("description", None),
+        ("tool_use_id", None),
+        ("tool_use_id", ""),
+        ("tool_use_id", 123),
+    ],
 )
-async def test_external_subagent_start_rejects_missing_required_keys(
+async def test_external_subagent_start_rejects_invalid_fields(
     client: httpx.AsyncClient,
-    missing_key: str,
+    invalid_key: str,
+    invalid_value: object,
 ) -> None:
-    """
-    A POST missing any of the four required ``data`` keys returns
-    400 — payload validation is at the route boundary so the handler
-    body always sees a complete record.
-    """
+    """Missing required fields and malformed optional tool IDs return 400."""
     agent = await create_test_agent(client)
     parent = await _create_session(
         client,
         agent["id"],
         labels={"omnigent.wrapper": "claude-code-native-ui"},
     )
-    data = {
+    data: dict[str, object] = {
         "subagent_id": "a5c7effac5a9a35ab",
         "agent_type": "Explore",
         "description": "Trace the auth flow",
         "tool_use_id": "toolu_016PwCnwmHv8h7kVpWLVd9YX",
     }
-    data.pop(missing_key)
+    if invalid_key == "tool_use_id":
+        data[invalid_key] = invalid_value
+    else:
+        data.pop(invalid_key)
     resp = await client.post(
         f"/v1/sessions/{parent['id']}/events",
         json={"type": "external_subagent_start", "data": data},
@@ -2355,7 +2417,7 @@ async def test_external_subagent_start_rejects_missing_required_keys(
     assert resp.status_code == 400
     # Error message must name the missing field so the forwarder's
     # logs point at the bug rather than reading "Invalid payload".
-    assert missing_key in resp.text
+    assert invalid_key in resp.text
 
 
 # ── POST /v1/sessions/{id}/events skill slash_command ─────
@@ -5010,6 +5072,7 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
                     "native_error_category": "invalid_request",
                     "detail_source": "hook_last_assistant_message",
                     "failure_source": "claude_hook",
+                    "transcript_error_context_state": "hook_details_present",
                     "native_session_id": "native-session",
                     "failure_id": "native-failure-synthetic",
                     "http_status": 400,
@@ -5039,6 +5102,7 @@ async def test_post_external_session_status_failure_detail_keeps_native_code(
     assert attrs["native_error_category"] == "invalid_request"
     assert attrs["detail_source"] == "hook_last_assistant_message"
     assert attrs["failure_source"] == "claude_hook"
+    assert attrs["transcript_error_context_state"] == "hook_details_present"
     assert attrs["native_session_id"] == "native-session"
     assert attrs["failure_id"] == "native-failure-synthetic"
     assert attrs["http_status"] == "400"
@@ -5589,11 +5653,14 @@ async def test_post_external_session_status_failed_keeps_wire_output_and_harness
     assert snapshot_error["message"] == detail
 
 
-@pytest.mark.parametrize("wire_output", [False, True])
+@pytest.mark.parametrize(
+    ("wire_output", "partial_output"), [(False, False), (True, False), (False, True)]
+)
 async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
     wire_output: bool,
+    partial_output: bool,
 ) -> None:
     """Native 429 reports retain a retryable code on the stream and snapshot."""
     detail = (
@@ -5631,6 +5698,9 @@ async def test_native_rate_limit_failure_is_classified_live_and_after_reload(
     data: dict[str, Any] = {"status": "failed", "response_id": response_id}
     if wire_output:
         data["output"] = detail
+    if partial_output:
+        data["output"] = "The earlier request returned HTTP 403; I am checking the result."
+        data["failure_detail"] = detail
     status_resp = await client.post(
         f"/v1/sessions/{session_id}/events",
         json={"type": "external_session_status", "data": data},
@@ -5681,21 +5751,130 @@ _CODEX_MODEL_CARD = {
 }
 
 
+_CODEX_COMPACTION_MODELS = {
+    "compaction_model": "system.ai.gpt-6-astra",
+    "selected_model": "system.ai.gpt-6-1-sol",
+}
+_CODEX_COMPACTION_BUDGET_DETAIL = (
+    'unexpected status 403 Forbidden: {"error_code":"PERMISSION_DENIED","message":'
+    '"Budget \\"example-budget\\" has reached its limit of $100."}'
+)
+_CODEX_COMPACTION_BUDGET_CARD = {
+    "title": "gpt-6-astra is over its AI gateway budget",
+    "cause": (
+        "The AI gateway refused a compaction request on gpt-6-astra: its budget is exhausted. "
+        "Codex retries it every turn before switching to gpt-6-1-sol, so switching models "
+        "doesn't help."
+    ),
+    "remediation": (
+        "Fork this session to continue on gpt-6-1-sol. The fork rebuilds the conversation "
+        "from its history, so it doesn't need gpt-6-astra. Or ask an admin to raise that "
+        "budget."
+    ),
+}
+_CODEX_COMPACTION_RETRY_CARD = {
+    "title": "Codex can't compact on gpt-6-astra right now",
+    "cause": (
+        "Codex compacts this conversation on the previous model, gpt-6-astra, before "
+        "switching to gpt-6-1-sol, and that model is temporarily unavailable."
+    ),
+    "remediation": "Retry later, or choose Fork in the session menu to continue on gpt-6-1-sol.",
+}
+_CODEX_LOGIN_EXPIRED_DETAIL = (
+    "unexpected status 401 Unauthorized: Provided authentication token is expired."
+)
+
+
 @pytest.mark.parametrize("wire_output", [False, True])
 @pytest.mark.parametrize(
-    ("detail", "expected_code", "card", "wrapper", "reauth_required"),
+    ("detail", "expected_code", "card", "wrapper", "reauth_required", "status_extra"),
     [
+        (
+            "Request timed out",
+            "transient_upstream_error",
+            {},
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (
+            "We’re currently experiencing high demand, which may cause temporary errors.",
+            "transient_upstream_error",
+            {},
+            "codex-native-ui",
+            False,
+            {},
+        ),
+        (
+            "We’re currently experiencing high demand, which may cause temporary errors.",
+            "transient_upstream_error",
+            _CODEX_COMPACTION_RETRY_CARD,
+            "codex-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
         (
             'API Error: 499 {"error_code":"CANCELLED","message":""}',
             "transient_upstream_error",
             {},
             "claude-code-native-ui",
             False,
+            {},
         ),
-        (_OLD_CLI_DETAIL, "client_update_required", _OLD_CLI_CARD, "claude-code-native-ui", False),
-        (_CODEX_MODEL_DETAIL, None, _CODEX_MODEL_CARD, "codex-native-ui", False),
-        (_CODEX_MODEL_DETAIL, "native_turn_error", {}, "claude-code-native-ui", False),
-        (_CODEX_MODEL_DETAIL, "codex_reauth_required", {}, "codex-native-ui", True),
+        (
+            _OLD_CLI_DETAIL,
+            "client_update_required",
+            _OLD_CLI_CARD,
+            "claude-code-native-ui",
+            False,
+            {},
+        ),
+        (_CODEX_MODEL_DETAIL, None, _CODEX_MODEL_CARD, "codex-native-ui", False, {}),
+        (_CODEX_MODEL_DETAIL, "native_turn_error", {}, "claude-code-native-ui", False, {}),
+        (_CODEX_MODEL_DETAIL, "codex_reauth_required", {}, "codex-native-ui", True, {}),
+        (
+            _CODEX_COMPACTION_BUDGET_DETAIL,
+            "codex_compaction_model_failed",
+            _CODEX_COMPACTION_BUDGET_CARD,
+            "codex-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
+        # A retry can clear a temporary failure, so its retryable code stays.
+        (
+            "unexpected status 429 Too Many Requests: rate limit exceeded",
+            "rate_limit_exceeded",
+            _CODEX_COMPACTION_RETRY_CARD,
+            "codex-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
+        (
+            "unexpected status 503 Service Unavailable",
+            "transient_upstream_error",
+            _CODEX_COMPACTION_RETRY_CARD,
+            "codex-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
+        # A fork doesn't renew an expired login, so the sign-in recovery stays.
+        (
+            _CODEX_LOGIN_EXPIRED_DETAIL,
+            "codex_reauth_required",
+            {},
+            "codex-native-ui",
+            True,
+            _CODEX_COMPACTION_MODELS,
+        ),
+        # Only a Codex session's compaction runs on its previous model.
+        (
+            _CODEX_COMPACTION_BUDGET_DETAIL,
+            "budget_exhausted",
+            {},
+            "claude-code-native-ui",
+            False,
+            _CODEX_COMPACTION_MODELS,
+        ),
     ],
 )
 async def test_native_failures_are_coded_live_and_after_reload(
@@ -5707,6 +5886,7 @@ async def test_native_failures_are_coded_live_and_after_reload(
     card: dict[str, str],
     wrapper: str,
     reauth_required: bool,
+    status_extra: dict[str, str],
 ) -> None:
     """Native failures keep their diagnosis and raw detail through status and persistence."""
     published: list[dict[str, Any]] = []
@@ -5741,7 +5921,7 @@ async def test_native_failures_are_coded_live_and_after_reload(
     )
     assert item_resp.status_code == 202, item_resp.text
 
-    data: dict[str, Any] = {"status": "failed", "response_id": response_id}
+    data: dict[str, Any] = {"status": "failed", "response_id": response_id, **status_extra}
     if reauth_required:
         data["reauth_required"] = True
     if wire_output:
@@ -8636,7 +8816,6 @@ async def test_post_external_permission_mode_change_is_quiet_when_unchanged(
 @pytest.mark.parametrize(
     "mode",
     [
-        "dontAsk",  # real CLI mode, but never rendered as a pane footer
         "turbo",  # not a mode at all
         "",
     ],
@@ -8646,7 +8825,7 @@ async def test_post_external_permission_mode_change_rejects_unsupported_modes(
     mode: str,
 ) -> None:
     """
-    Only switchable modes become labels; anything else fails loud.
+    Only modes the pane footer can report become labels; anything else fails loud.
 
     A footer misread into an unknown value would otherwise persist a mode the
     PATCH path and the web picker can't represent, leaving the picker blank.
@@ -8666,17 +8845,19 @@ async def test_post_external_permission_mode_change_rejects_unsupported_modes(
     assert "external_permission_mode_change" in resp.text
 
 
-async def test_post_external_permission_mode_change_accepts_bypass_read_back(
+@pytest.mark.parametrize("mode", ["bypassPermissions", "dontAsk"])
+async def test_post_external_permission_mode_change_accepts_launch_only_read_back(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    mode: str,
 ) -> None:
     """
-    A pane reporting bypass lands on the label and rewrites the launch arg.
+    A pane reporting a launch-only mode lands on the label and rewrites the launch arg.
 
-    Bypass is launch-only and stays rejected as a PATCH target, but a session
-    launched into it (or cycled back to it inside the TUI) must read back as
-    bypass, or the picker shows a stale mode and a relaunch reopens in the
-    mode last recorded instead of the one the pane is in.
+    Bypass and don't-ask stay rejected as PATCH targets, but a session launched
+    into either must read back as that mode, or the picker shows a stale mode
+    and a relaunch reopens in the mode last recorded instead of the one the
+    pane is in.
     """
     published: list[tuple[str, dict[str, Any]]] = []
     _capture_published(monkeypatch, published)
@@ -8690,20 +8871,15 @@ async def test_post_external_permission_mode_change_accepts_bypass_read_back(
         f"/v1/sessions/{session['id']}/events",
         json={
             "type": "external_permission_mode_change",
-            "data": {"permission_mode": "bypassPermissions"},
+            "data": {"permission_mode": mode},
         },
     )
     assert resp.status_code == 202, resp.text
     assert [event["type"] for _, event in published] == ["session.permission_mode"]
-    assert published[0][1]["permission_mode"] == "bypassPermissions"
+    assert published[0][1]["permission_mode"] == mode
     snapshot = (await client.get(f"/v1/sessions/{session['id']}")).json()
-    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == "bypassPermissions"
-    assert snapshot["terminal_launch_args"] == [
-        "--model",
-        "opus",
-        "--permission-mode",
-        "bypassPermissions",
-    ]
+    assert snapshot["labels"]["omnigent.claude_native.permission_mode"] == mode
+    assert snapshot["terminal_launch_args"] == ["--model", "opus", "--permission-mode", mode]
 
 
 async def test_in_pane_permission_mode_switch_reaches_the_sse_wire_end_to_end(
@@ -10065,6 +10241,7 @@ async def test_retry_session_retries_native_terminal_ensure_after_runner_reconne
 async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel_drops(
     client: httpx.AsyncClient,
     db_uri: str,
+    app: Any,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A send as a host runner's tunnel drops is refused, not recorded as a failed turn."""
@@ -10086,10 +10263,14 @@ async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel
     store.replace_runner_id(session["id"], "native-runner")
     terminals_path = f"/v1/sessions/{session['id']}/resources/terminals"
     runner_paths: list[str] = []
-    tunnel_up = False
+    tunnel_up = True
 
     def runner(request: httpx.Request) -> httpx.Response:
         runner_paths.append(request.url.path)
+        if request.url.path == "/v1/sessions":
+            return httpx.Response(
+                201, json={"session_init_protocol_version": 2, "terminal_ready": False}
+            )
         if request.url.path == terminals_path:
             if not tunnel_up:
                 # What WSTunnelTransport raises when the tunnel dies under the request.
@@ -10115,6 +10296,15 @@ async def test_native_message_is_refused_with_input_kept_when_host_runner_tunnel
         monkeypatch.setattr(
             "omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock()
         )
+        bound = store.get_conversation(session["id"])
+        assert bound is not None
+        initialized = await app.state.runner_session_initializer.initialize(
+            bound, runner_client, timeout=5, suppress_recovery_turn=True
+        )
+        assert initialized.status_code == 201
+        assert runner_paths == ["/v1/sessions"]
+        runner_paths.clear()
+        tunnel_up = False
         try:
             refused = await client.post(f"/v1/sessions/{session['id']}/events", json=message)
 
@@ -10350,6 +10540,61 @@ async def test_interrupt_codex_side_chat_targets_its_turn_on_parent_runner(
         _interrupt_fenced_sessions.discard(child_id)
         _session_active_response_cache.pop(child_id, None)
         _session_status_cache.pop(child_id, None)
+
+
+async def test_codex_side_chat_message_drives_parent_thread_without_child_init(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A side-chat follow-up must not start a runner session (and terminal) for the child."""
+    from omnigent.server.routes.sessions import routes_events
+
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "codex-native"}},
+    )
+    parent = await _create_session(
+        client, agent["id"], labels={"omnigent.wrapper": "codex-native-ui"}
+    )
+    child_response = await client.post(
+        f"/v1/sessions/{parent['id']}/events",
+        json={
+            "type": "external_codex_subagent_start",
+            "data": {"thread_id": "thread_side", "agent_nickname": "Side chat"},
+        },
+    )
+    assert child_response.status_code == 202, child_response.text
+    child_id = child_response.json()["child_session_id"]
+    SqlAlchemyConversationStore(db_uri).replace_runner_id(child_id, "native-runner")
+    forwarded: list[tuple[str, dict[str, Any]]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        forwarded.append((request.url.path, json.loads(request.content)))
+        return httpx.Response(202)
+
+    initialize = AsyncMock(return_value=True)
+    monkeypatch.setattr(routes_events, "_ensure_runner_session_initialized", initialize)
+    monkeypatch.setattr(routes_events, "_ensure_runner_relay_ready", AsyncMock())
+    monkeypatch.setattr("omnigent.server.routes.sessions._ensure_runner_relay_ready", AsyncMock())
+    content = [{"type": "input_text", "text": "and why?"}]
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://runner"
+    ) as runner:
+        monkeypatch.setattr(routes_events, "_get_runner_client", AsyncMock(return_value=runner))
+        response = await client.post(
+            f"/v1/sessions/{child_id}/events",
+            json={"type": "message", "data": {"role": "user", "content": content}},
+        )
+
+    assert response.status_code == 202, response.text
+    initialize.assert_not_awaited()
+    assert forwarded == [
+        (
+            f"/v1/sessions/{parent['id']}/events",
+            {"type": "message", "content": content, "codex_side_thread_id": "thread_side"},
+        )
+    ]
 
 
 async def test_interrupt_forward_success_keeps_stop_fence(
@@ -12568,6 +12813,97 @@ async def test_native_message_persisted_when_runner_offline(
     assert snap["status"] == "failed"
 
 
+async def _post_native_message(client: httpx.AsyncClient, sid: str) -> httpx.Response:
+    return await client.post(
+        f"/v1/sessions/{sid}/events",
+        json={
+            "type": "message",
+            "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        },
+    )
+
+
+async def test_native_message_to_hostless_gone_runner_is_refused(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """
+    A message to a session whose host-less runner is gone is refused.
+
+    A runner bound without a host ran in a local terminal; once it's gone
+    nothing can relaunch it. The server refuses with a resume command and
+    records nothing, so the client keeps the message.
+    """
+    agent = await create_test_agent(client)
+    session = await _create_session(
+        client,
+        agent["id"],
+        labels={"omnigent.wrapper": "claude-code-native-ui"},
+    )
+    sid = session["id"]
+    assert SqlAlchemyConversationStore(db_uri).set_runner_id(sid, "runner_local_terminal")
+
+    resp = await _post_native_message(client, sid)
+    assert resp.status_code == 503, resp.text
+    error = resp.json()["error"]
+    assert error["code"] == "runner_unavailable"
+    assert f"claude --resume {sid}" in error["message"]
+
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    assert not [i for i in items if i["type"] in {"message", "error"}], items
+    snap = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snap["status"] == "idle"
+
+
+@pytest.mark.parametrize("case", ["side_chat", "sub_agent", "exit_report"])
+async def test_native_message_to_gone_runner_still_persisted_when_recoverable(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+) -> None:
+    """
+    Side chats, sub-agents, and runners with an exit report keep the failed turn.
+
+    Their failure is recorded rather than refused: side chats and sub-agents
+    recover through their parent, and an exit report explains the failure.
+    """
+    from omnigent.server.host_registry import RunnerExitReports
+
+    agent = await create_test_agent(client)
+    labels = {"omnigent.wrapper": "claude-code-native-ui"}
+    store = SqlAlchemyConversationStore(db_uri)
+    if case == "sub_agent":
+        parent = await _create_session(client, agent["id"], labels=labels)
+        sid = store.create_conversation(
+            kind="sub_agent",
+            title="coder:child",
+            parent_conversation_id=parent["id"],
+            agent_id=agent["id"],
+            labels=labels,
+        ).id
+    else:
+        if case == "side_chat":
+            labels = {**labels, "omnigent.side_chat": "1"}
+        sid = (await _create_session(client, agent["id"], labels=labels))["id"]
+    assert store.set_runner_id(sid, "runner_local_terminal")
+    if case == "exit_report":
+        monkeypatch.setattr(
+            RunnerExitReports, "get", lambda self, runner_id: "runner process exited with code 1"
+        )
+
+    resp = await _post_native_message(client, sid)
+    assert "No host can restart" not in resp.text
+    # A sub-agent's send also tries to wake its runner-less parent, which answers 503.
+    assert resp.status_code == (503 if case == "sub_agent" else 202), resp.text
+    items = (await client.get(f"/v1/sessions/{sid}/items")).json()["data"]
+    errors = [i for i in items if i["type"] == "error"]
+    assert len(errors) == 1, items
+    assert errors[0]["code"] == "runner_failed_to_start"
+    snap = (await client.get(f"/v1/sessions/{sid}")).json()
+    assert snap["status"] == "failed"
+
+
 async def test_runner_re_tunnelled_to_sibling_returns_wrong_replica(
     client: httpx.AsyncClient,
     db_uri: str,
@@ -12887,3 +13223,102 @@ async def test_external_info_error_item_publishes_and_persists_level(
     errors = [item for item in items.json()["data"] if item["type"] == "error"]
     assert len(errors) == 1
     assert errors[0]["level"] == "info"
+
+
+_PI_MODEL_NOT_FOUND = (
+    'Pi model error: 404 {"type":"error","error":{"type":"not_found_error",'
+    '"message":"model: anthropic/claude-opus-4-8"}}'
+)
+_MODEL_UNAVAILABLE_REMEDIATION = (
+    "Choose a different model with the model picker or /model, or check that the "
+    "provider is configured and your account can access this model."
+)
+
+
+@pytest.mark.parametrize(
+    ("item_data", "card"),
+    [
+        pytest.param(
+            {"source": "execution", "code": "RuntimeError", "message": _PI_MODEL_NOT_FOUND},
+            {
+                "title": "Model unavailable",
+                "cause": _PI_MODEL_NOT_FOUND,
+                "remediation": _MODEL_UNAVAILABLE_REMEDIATION,
+            },
+            id="bare-provider-rejection-gains-card",
+        ),
+        pytest.param(
+            {
+                "source": "execution",
+                "code": "pi_model_change_failed",
+                "message": _PI_MODEL_NOT_FOUND,
+                "title": "Pi kept its model",
+                "remediation": "Pick another model.",
+            },
+            {"title": "Pi kept its model", "cause": None, "remediation": "Pick another model."},
+            id="harness-card-preserved",
+        ),
+        pytest.param(
+            {
+                "source": "execution",
+                "code": "RuntimeError",
+                "message": _PI_MODEL_NOT_FOUND,
+                "cause": "The provider rejected the pinned model.",
+            },
+            {
+                "title": None,
+                "cause": "The provider rejected the pinned model.",
+                "remediation": None,
+            },
+            id="poster-cause-preserved",
+        ),
+        pytest.param(
+            {
+                "source": "execution",
+                "code": "RuntimeError",
+                "message": (
+                    'Pi model error: 401 {"type":"error","error":{"type":"authentication_error",'
+                    '"message":"invalid x-api-key"}}'
+                ),
+            },
+            {"title": None, "cause": None, "remediation": None},
+            id="unrelated-error-unlabeled",
+        ),
+    ],
+)
+async def test_external_error_item_model_unavailable_card_live_and_after_reload(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    item_data: dict[str, str],
+    card: dict[str, str | None],
+) -> None:
+    """
+    A provider model rejection a native harness forwards verbatim gains the
+    shared recovery card on both the live frame and the persisted item, while
+    the original code and message stay intact. Harness-classified and
+    unrelated errors are left as posted.
+    """
+    published: list[tuple[str, dict[str, Any]]] = []
+    _capture_published(monkeypatch, published)
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+
+    resp = await client.post(
+        f"/v1/sessions/{session['id']}/events",
+        json={
+            "type": "external_conversation_item",
+            "data": {"item_type": "error", "item_data": item_data},
+        },
+    )
+    assert resp.status_code in (200, 202), resp.text
+
+    done = [ev for _sid, ev in published if ev.get("type") == "response.output_item.done"]
+    assert len(done) == 1
+    items = await client.get(f"/v1/sessions/{session['id']}/items")
+    errors = [item for item in items.json()["data"] if item["type"] == "error"]
+    assert len(errors) == 1
+    for shown in (done[0]["item"], errors[0]):
+        assert shown["code"] == item_data["code"]
+        assert shown["message"] == item_data["message"]
+        for field, value in card.items():
+            assert shown.get(field) == value, (field, shown)

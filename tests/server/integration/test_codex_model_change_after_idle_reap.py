@@ -8,6 +8,7 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -27,7 +28,15 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.terminals.pane_reaper import NativePaneReaper
 from omnigent.terminals.registry import TerminalRegistry
-from tests.runner.conftest import _build_app_for_spec, _runner_client
+from tests._helpers.polling import poll_until_async
+from tests.budgets import budget
+from tests.runner.conftest import (
+    _build_app_for_spec,
+    _FakeProcessManager,
+    _runner_client,
+    _ScriptedHarnessClient,
+    _sse,
+)
 from tests.runner.helpers import make_test_terminal_instance
 from tests.runner.native_helpers import _harness_spec
 from tests.server.helpers import create_test_agent
@@ -58,12 +67,22 @@ class _LoopbackCodex:
     applied_updates: list[dict[str, Any]] = field(default_factory=list)
     rpc_errors: list[dict[str, Any]] = field(default_factory=list)
     response_errors: dict[str, list[dict[str, Any]]] = field(default_factory=dict)
+    refuse_handshake: bool = False
+    proc: SimpleNamespace | None = None
 
     async def start(self) -> None:
         assert self.server is None
         bridge.clear_bridge_state(self.bridge_dir)
         self.ready.clear()
-        self.server = await serve(self.handle, "127.0.0.1", 0)
+        self.proc = SimpleNamespace(returncode=None)
+        self.server = await serve(
+            self.handle,
+            "127.0.0.1",
+            0,
+            process_request=lambda connection, _request: (
+                connection.respond(403, "Forbidden") if self.refuse_handshake else None
+            ),
+        )
         port = self.server.sockets[0].getsockname()[1]
         self.transport = f"ws://127.0.0.1:{port}"
         self.launches += 1
@@ -101,6 +120,8 @@ class _LoopbackCodex:
         self.ready.set()
 
     async def close(self) -> None:
+        if self.proc is not None:
+            self.proc.returncode = 0
         if self.startup_task is not None:
             self.startup_task.cancel()
             await asyncio.gather(self.startup_task, return_exceptions=True)
@@ -167,7 +188,9 @@ class _NativeSession:
     session_id: str
     store: SqlAlchemyConversationStore
     runner: httpx.AsyncClient
+    process_manager: _FakeProcessManager
     terminals: TerminalRegistry
+    resources: SessionResourceRegistry
     reaper: NativePaneReaper
     codex: _LoopbackCodex
     events: list[dict[str, Any]]
@@ -283,7 +306,7 @@ async def native_session(
         )
 
     monkeypatch.setattr(native_runtime, "_auto_create_codex_terminal", launch)
-    runner_app, _ = await _build_app_for_spec(
+    runner_app, process_manager = await _build_app_for_spec(
         _harness_spec("codex-native", model=_PREVIOUS_MODEL), terminal_registry=terminals
     )
     reaper = runner_app.state.native_pane_reaper
@@ -323,7 +346,16 @@ async def native_session(
             )
             monkeypatch.setattr(routes_core, "_ensure_runner_relay_ready", AsyncMock())
             session = _NativeSession(
-                session_id, store, runner, terminals, reaper, codex, events, runner_replies
+                session_id,
+                store,
+                runner,
+                process_manager,
+                terminals,
+                runner_app.state.session_resource_registry,
+                reaper,
+                codex,
+                events,
+                runner_replies,
             )
             await session.reopen_terminal()
             assert codex.launches == 1
@@ -342,6 +374,264 @@ async def test_connected_codex_model_change_before_idle_reap(
     )
     native_session.assert_applied(response)
     assert native_session.codex.launches == 1
+
+
+@pytest.mark.parametrize("backend", ["running", "exited", "forwarder-ended", "unowned"])
+async def test_new_turn_recovers_stopped_backend_behind_live_codex_pane(
+    native_session: _NativeSession,
+    backend: str,
+) -> None:
+    session = native_session
+    pane = session.terminals.get(session.session_id, "codex", "main")
+    assert pane is not None and await pane.is_alive()
+    if backend != "running":
+        await session.codex.close()
+    if backend == "forwarder-ended":
+        native_runtime._AUTO_CODEX_APP_SERVERS.pop(session.session_id)
+        failure = bridge.CODEX_APP_SERVER_STOPPED
+        bridge.write_bridge_startup_error(
+            session.codex.bridge_dir, failure.message, code=failure.code
+        )
+    elif backend == "unowned":
+        session.resources._terminal_roles.pop(
+            (session.session_id, terminal_resource_id("codex", "main"))
+        )
+    harness = _ScriptedHarnessClient(
+        [
+            _sse({"type": "response.created", "response": {"id": "resp_recovered"}}),
+            _sse({"type": "response.completed", "response": {"id": "resp_recovered"}}),
+        ]
+    )
+    session.process_manager._client = harness
+
+    response = await session.runner.post(
+        f"/v1/sessions/{session.session_id}/events",
+        json={
+            "type": "message",
+            "role": "user",
+            "agent_id": session.store.get_conversation(session.session_id).agent_id,
+            "content": [{"type": "input_text", "text": "Continue the session"}],
+        },
+    )
+    assert response.status_code == 202, response.text
+    await poll_until_async(lambda: harness.posted_bodies, timeout_s=budget(5))
+
+    expected_launches = 2 if backend in {"exited", "forwarder-ended"} else 1
+    assert session.codex.launches == expected_launches
+    if backend in {"running", "unowned"}:
+        assert session.terminals.get(session.session_id, "codex", "main") is pane
+    else:
+        assert session.terminals.get(session.session_id, "codex", "main") is not pane
+        assert bridge.read_bridge_startup_error(session.codex.bridge_dir) is None
+        state = bridge.read_bridge_state(session.codex.bridge_dir)
+        assert state is not None
+        client = app_server.client_for_transport(state.socket_path, client_name="recovery-test")
+        try:
+            await client.connect()
+            loaded = await client.request("thread/list/loaded", {})
+            assert loaded["result"]["data"] == [session.codex.thread_id]
+        finally:
+            await client.close()
+
+
+@pytest.mark.parametrize("combined", [False, True], ids=["model", "model-and-effort"])
+async def test_model_change_recovers_dead_backend_while_codex_pane_is_alive(
+    client: httpx.AsyncClient, native_session: _NativeSession, combined: bool
+) -> None:
+    session = native_session
+    pane = session.terminals.get(session.session_id, "codex", "main")
+    assert pane is not None and await pane.is_alive()
+    await session.codex.close()
+    assert native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] is session.codex
+    assert bridge.read_bridge_state(session.codex.bridge_dir) is not None
+    selection = {"model_override": _REQUESTED_MODEL}
+    if combined:
+        selection["reasoning_effort"] = "low"
+
+    response = await asyncio.wait_for(
+        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=budget(5)
+    )
+
+    session.assert_applied(response, effort="low" if combined else "high")
+    assert session.codex.launches == 2
+
+
+async def test_codex_listener_refusal_preserves_a_live_backend_connection(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    accepted = app_server.CodexAppServerClient(ws_url=session.codex.transport)
+    await accepted.connect()
+    server = session.codex.server
+    assert server is not None
+    server.close(close_connections=False)
+    while server.is_serving():
+        await asyncio.sleep(0)
+
+    try:
+        response = await client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        )
+        _assert_codex_refusal(session, response)
+        assert session.codex.stops == 0
+        assert session.codex.launches == 1
+        result = await accepted.request("thread/list/loaded", {})
+        assert result["result"] == {
+            "data": [session.codex.thread_id],
+            "nextCursor": None,
+        }
+    finally:
+        await accepted.close()
+
+
+async def test_codex_refused_connection_does_not_close_a_replacement_backend(
+    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = native_session
+    await session.codex.close()
+    replacement = SimpleNamespace(
+        bridge_dir=session.codex.bridge_dir,
+        proc=SimpleNamespace(returncode=0),
+        close=AsyncMock(),
+    )
+    connect = app_server.CodexAppServerClient.connect
+    replaced = False
+
+    async def replace_before_refusal(rpc: app_server.CodexAppServerClient) -> None:
+        nonlocal replaced
+        if not replaced:
+            replaced = True
+            native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] = replacement
+            raise ConnectionRefusedError("The old listener disappeared during replacement")
+        await connect(rpc)
+
+    monkeypatch.setattr(app_server.CodexAppServerClient, "connect", replace_before_refusal)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    replacement.close.assert_not_awaited()
+    assert native_runtime._AUTO_CODEX_APP_SERVERS[session.session_id] is replacement
+    assert session.codex.launches == 2
+
+
+async def test_codex_unregistered_backend_is_not_restarted_after_connection_refusal(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    await session.codex.close()
+    native_runtime._AUTO_CODEX_APP_SERVERS.pop(session.session_id)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    assert session.codex.launches == 1
+    assert session.session_id not in native_runtime._AUTO_CODEX_APP_SERVERS
+
+
+async def test_codex_live_handshake_refusal_does_not_restart_backend(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    session.codex.refuse_handshake = True
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    assert session.codex.launches == 1
+    assert session.codex.stops == 0
+    assert session.codex.requests == []
+
+    session.codex.refuse_handshake = False
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    assert response.status_code == 200, response.text
+    session.assert_settings(_REQUESTED_MODEL)
+    assert len(session.codex.applied_updates) == 1
+    assert session.codex.launches == 1
+
+
+async def test_codex_connection_refused_after_settings_send_is_not_replayed(
+    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = native_session
+    request = app_server.CodexAppServerClient.request
+
+    async def lose_reply(
+        rpc: app_server.CodexAppServerClient, method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        result = await request(rpc, method, params)
+        if method == "thread/settings/update":
+            raise ConnectionRefusedError("Settings reply was lost")
+        return result
+
+    monkeypatch.setattr(app_server.CodexAppServerClient, "request", lose_reply)
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    assert response.status_code == 503, response.text
+    assert len(session.codex.applied_updates) == 1
+    assert session.codex.launches == 1
+    assert session.codex.stops == 0
+
+
+async def test_unowned_codex_pane_is_not_restarted_after_connection_refusal(
+    client: httpx.AsyncClient, native_session: _NativeSession
+) -> None:
+    session = native_session
+    await session.codex.close()
+    session.resources._terminal_roles.pop(
+        (session.session_id, terminal_resource_id("codex", "main"))
+    )
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+    )
+    _assert_codex_refusal(session, response)
+    assert session.codex.launches == 1
+
+
+async def test_codex_replacement_connection_refusal_is_not_retried_again(
+    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = native_session
+    await session.codex.close()
+    launch = native_runtime._auto_create_codex_terminal
+
+    async def launch_without_listener(*args: Any, **kwargs: Any) -> SessionResourceView:
+        resource = await launch(*args, **kwargs)
+        await session.codex.close()
+        return resource
+
+    monkeypatch.setattr(native_runtime, "_auto_create_codex_terminal", launch_without_listener)
+    response = await asyncio.wait_for(
+        client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        ),
+        timeout=budget(5),
+    )
+    _assert_codex_refusal(session, response)
+    assert session.codex.launches == 2
+    assert session.codex.requests == []
+
+
+async def test_codex_dead_backend_recovery_startup_timeout_keeps_settings(
+    client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session = native_session
+    await session.codex.close()
+    session.codex.ready_gate = asyncio.Event()
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_TIMEOUT_S", 0.1)
+    monkeypatch.setattr(native_controls, "_CODEX_SETTINGS_READY_POLL_S", 0.005)
+    response = await asyncio.wait_for(
+        client.patch(
+            f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
+        ),
+        timeout=budget(2),
+    )
+    _assert_codex_unconfirmed(session, response)
+    assert session.codex.launches == 2
+    assert session.codex.requests == []
 
 
 @pytest.mark.parametrize("clear_bridge", [False, True], ids=["stale-bridge", "missing-bridge"])
@@ -413,6 +703,20 @@ def _assert_codex_refusal(
     assert session.codex.applied_updates == []
 
 
+def _assert_codex_unconfirmed(
+    session: _NativeSession, response: httpx.Response, *, effort: str = "high"
+) -> None:
+    """The selection stays persisted for the next turn; nothing reached Codex yet."""
+    assert response.status_code == 200, response.text
+    assert session.runner_replies[0].status_code == 504
+    assert session.runner_replies[0].json()["error"] == "codex_native_settings_update_timeout"
+    assert not any(event.get("type") == "response.error" for event in session.events)
+    saved = session.store.get_conversation(session.session_id)
+    assert saved.model_override == _REQUESTED_MODEL
+    assert saved.reasoning_effort == effort
+    assert session.codex.applied_updates == []
+
+
 @pytest.mark.parametrize("native_session", ["starting"], indirect=True)
 async def test_model_change_waits_for_codex_startup(
     client: httpx.AsyncClient, native_session: _NativeSession, monkeypatch: pytest.MonkeyPatch
@@ -429,11 +733,11 @@ async def test_model_change_waits_for_codex_startup(
         )
     )
     try:
-        await asyncio.wait_for(missing.wait(), timeout=5)
+        await asyncio.wait_for(missing.wait(), timeout=budget(5))
         assert session.codex.applied_updates == []
         session.codex.ready_gate.set()
-        await asyncio.wait_for(session.codex.ready.wait(), timeout=5)
-        response = await asyncio.wait_for(change, timeout=5)
+        await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(5))
+        response = await asyncio.wait_for(change, timeout=budget(5))
     finally:
         session.codex.ready_gate.set()
         change.cancel()
@@ -451,7 +755,7 @@ async def test_model_change_succeeds_after_delayed_codex_startup(
     assert session.codex.ready_gate is not None
     assert bridge.read_bridge_state(session.codex.bridge_dir) is None
     session.codex.ready_gate.set()
-    await asyncio.wait_for(session.codex.ready.wait(), timeout=5)
+    await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(5))
     response = await client.patch(
         f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
     )
@@ -461,7 +765,7 @@ async def test_model_change_succeeds_after_delayed_codex_startup(
 
 @pytest.mark.parametrize("native_session", ["starting"], indirect=True)
 @pytest.mark.parametrize("selection", ["model", "effort", "model-and-effort"])
-async def test_codex_settings_forward_outlasts_tui_budget_during_startup(
+async def test_codex_settings_forward_uses_startup_budget(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -470,11 +774,13 @@ async def test_codex_settings_forward_outlasts_tui_budget_during_startup(
     session = native_session
     assert session.codex.ready_gate is not None
     monkeypatch.setattr(routes_core, "_TUI_INJECT_FORWARD_TIMEOUT_S", 0.05)
-    monkeypatch.setattr(routes_core, "_CODEX_SETTINGS_FORWARD_TIMEOUT_S", 1.0)
+    settings_timeout_s = routes_core._CODEX_SETTINGS_FORWARD_TIMEOUT_S
     missing = _observe_missing_bridge(monkeypatch, session)
     post = session.runner.post
+    forward_timeouts: list[float] = []
 
     async def timed_post(url: str, **kwargs: Any) -> httpx.Response:
+        forward_timeouts.append(kwargs["timeout"])
         # ASGITransport doesn't enforce HTTP timeouts; use the actual forward
         # budget here so a premature public rollback is observable.
         try:
@@ -490,11 +796,12 @@ async def test_codex_settings_forward_outlasts_tui_budget_during_startup(
         settings["reasoning_effort"] = "low"
     change = asyncio.create_task(client.patch(f"/v1/sessions/{session.session_id}", json=settings))
     try:
-        await asyncio.wait_for(missing.wait(), timeout=2)
-        await asyncio.sleep(0.1)
+        await asyncio.wait_for(missing.wait(), timeout=budget(5))
+        assert forward_timeouts == [settings_timeout_s]
         assert not change.done()
+        assert session.codex.applied_updates == []
         session.codex.ready_gate.set()
-        response = await asyncio.wait_for(change, timeout=2)
+        response = await asyncio.wait_for(change, timeout=budget(5))
     finally:
         session.codex.ready_gate.set()
         change.cancel()
@@ -511,7 +818,7 @@ async def test_codex_settings_forward_outlasts_tui_budget_during_startup(
 
 @pytest.mark.parametrize("native_session", ["starting"], indirect=True)
 @pytest.mark.parametrize("combined", [False, True], ids=["model", "model-and-effort"])
-async def test_codex_startup_timeout_refuses_settings_and_allows_retry(
+async def test_codex_startup_timeout_keeps_settings_for_the_next_turn(
     client: httpx.AsyncClient,
     native_session: _NativeSession,
     monkeypatch: pytest.MonkeyPatch,
@@ -525,18 +832,18 @@ async def test_codex_startup_timeout_refuses_settings_and_allows_retry(
     if combined:
         selection["reasoning_effort"] = "low"
     response = await asyncio.wait_for(
-        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=2
+        client.patch(f"/v1/sessions/{session.session_id}", json=selection), timeout=budget(2)
     )
-    _assert_codex_refusal(session, response, combined=combined)
+    _assert_codex_unconfirmed(session, response, effort="low" if combined else "high")
     assert session.codex.requests == []
     assert session.codex.launches == 1
 
     session.codex.ready_gate.set()
-    await asyncio.wait_for(session.codex.ready.wait(), timeout=2)
-    response = await client.patch(f"/v1/sessions/{session.session_id}", json=selection)
-    assert response.status_code == 200, response.text
-    session.assert_settings(_REQUESTED_MODEL, "low" if combined else "high")
-    assert len(session.codex.applied_updates) == 1
+    await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(2))
+    response = await client.patch(
+        f"/v1/sessions/{session.session_id}", json={**selection, "model_override": _LATEST_MODEL}
+    )
+    session.assert_applied(response, model=_LATEST_MODEL, effort="low" if combined else "high")
     assert session.codex.launches == 1
 
 
@@ -554,7 +861,7 @@ async def test_cancelling_codex_readiness_wait_releases_settings_lock(
         )
     )
     try:
-        await asyncio.wait_for(missing.wait(), timeout=2)
+        await asyncio.wait_for(missing.wait(), timeout=budget(2))
     finally:
         change.cancel()
         await asyncio.gather(change, return_exceptions=True)
@@ -563,10 +870,10 @@ async def test_cancelling_codex_readiness_wait_releases_settings_lock(
     assert bridge.read_codex_config_model(session.codex.bridge_dir) == _PREVIOUS_MODEL
 
     session.codex.ready_gate.set()
-    await asyncio.wait_for(session.codex.ready.wait(), timeout=2)
+    await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(2))
     response = await asyncio.wait_for(
         client.patch(f"/v1/sessions/{session.session_id}", json={"model_override": _LATEST_MODEL}),
-        timeout=2,
+        timeout=budget(2),
     )
     session.assert_applied(response, model=_LATEST_MODEL)
     assert session.codex.launches == 1
@@ -587,7 +894,7 @@ async def test_codex_relaunch_failure_refuses_settings_and_allows_retry(
         client.patch(
             f"/v1/sessions/{session.session_id}", json={"model_override": _REQUESTED_MODEL}
         ),
-        timeout=2,
+        timeout=budget(2),
     )
     _assert_codex_refusal(session, response)
     assert session.codex.requests == []
@@ -671,7 +978,7 @@ async def test_codex_readiness_wait_rejects_another_sessions_bridge(
         )
     )
     try:
-        await asyncio.wait_for(missing.wait(), timeout=2)
+        await asyncio.wait_for(missing.wait(), timeout=budget(2))
         bridge.write_bridge_state(
             session.codex.bridge_dir,
             bridge.CodexNativeBridgeState(
@@ -681,7 +988,7 @@ async def test_codex_readiness_wait_rejects_another_sessions_bridge(
                 codex_home=str(bridge.codex_home_for_bridge_dir(session.codex.bridge_dir)),
             ),
         )
-        response = await asyncio.wait_for(change, timeout=2)
+        response = await asyncio.wait_for(change, timeout=budget(2))
     finally:
         change.cancel()
         await asyncio.gather(change, return_exceptions=True)
@@ -789,7 +1096,7 @@ async def test_overlapping_model_picks_during_recovery_keep_the_latest_selection
     )
     tasks = [first]
     try:
-        await asyncio.wait_for(missing.wait(), timeout=5)
+        await asyncio.wait_for(missing.wait(), timeout=budget(5))
         tasks.append(
             asyncio.create_task(
                 client.patch(
@@ -797,12 +1104,12 @@ async def test_overlapping_model_picks_during_recovery_keep_the_latest_selection
                 )
             )
         )
-        await asyncio.wait_for(latest_waiting.wait(), timeout=5)
+        await asyncio.wait_for(latest_waiting.wait(), timeout=budget(5))
         assert not any(task.done() for task in tasks)
         session.codex.ready_gate.set()
-        await asyncio.wait_for(session.codex.ready.wait(), timeout=5)
+        await asyncio.wait_for(session.codex.ready.wait(), timeout=budget(5))
         release_reply.set()
-        earlier, latest = await asyncio.wait_for(asyncio.gather(*tasks), timeout=10)
+        earlier, latest = await asyncio.wait_for(asyncio.gather(*tasks), timeout=budget(10))
     finally:
         session.codex.ready_gate.set()
         release_reply.set()

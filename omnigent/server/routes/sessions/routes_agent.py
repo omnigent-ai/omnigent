@@ -36,7 +36,6 @@ from omnigent.server.auth import (
     LEVEL_OWNER,
     LEVEL_READ,
     AuthProvider,
-    local_single_user_enabled,
 )
 from omnigent.server.bundles import bundle_location, validate_agent_bundle
 from omnigent.server.host_registry import HostRegistry
@@ -354,7 +353,7 @@ def register_agent_routes(
         spec = await asyncio.to_thread(
             validate_agent_bundle,
             bundle_bytes,
-            enforce_handler_allowlist=not local_single_user_enabled(),
+            enforce_handler_allowlist=True,
         )
         if spec.name is None:
             raise OmnigentError("spec missing name", code=ErrorCode.INVALID_INPUT)
@@ -398,7 +397,12 @@ def register_agent_routes(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         artifact_store.put(new_loc, bundle_bytes)
-        updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
+        if agent_store.supports_config_edit:
+            updated = await asyncio.to_thread(
+                agent_store.update, agent.id, new_loc, user_id, description=spec.description
+            )
+        else:
+            updated = await asyncio.to_thread(agent_store.update, agent.id, new_loc, user_id)
         if updated is None:
             raise OmnigentError(
                 f"Agent not found: {agent.id!r}",

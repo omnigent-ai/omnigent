@@ -1,18 +1,23 @@
 # Recording lanes — how to film a bug's journey on each surface
 
-Shared reference for **repro-agent** and **resolve-agent**. Both film the same
-kinds of journeys on the same surfaces; only *which* clip they produce differs:
+Shared reference for **repro-agent**, **resolve-agent**, and **feature-agent**.
+They film the same kinds of journeys on the same surfaces; only *which* clip
+they produce differs:
 
-- **repro-agent** films the product journey — a `reproduced` facet yields a
-  **`before`** clip showing the live bug; an `already_fixed` facet yields a
-  **`fixed`** clip showing the correct user-visible outcome.
+- **repro-agent** films the product journey — a `reproduced` or `likely_repro`
+  facet yields a **`before`** clip showing the live bug (on the stand-in, when
+  one was driven); an `already_fixed` facet yields a **`fixed`** clip showing
+  the correct user-visible outcome.
 - **resolve-agent** films the product journey after the fix as the **`after`**
   clip (the human-visible half of the fail→pass proof). The recovered test
   verifies the result separately. On the review path it films the reviewed PR
   head.
+- **feature-agent** films each covered CUJ as a **`demo`** clip, with the CUJ ID
+  as the facet. Its demo is required, not best-effort; its `feature-demo` skill
+  replaces "Internal/API-only results" and "If recording is blocked" below.
 
 Everything else below — which surface to drive, how to stand the recorder up, and
-the per-surface mechanics — is identical for both. Each agent's own AGENTS.md says
+the per-surface mechanics — is identical for all of them. Each agent's own AGENTS.md says
 which clip `kind` it produces and where it goes; this file is the how.
 
 The recording driver may be an existing test or a temporary journey script,
@@ -45,6 +50,9 @@ the `cli` section below for setup steps.
   just to produce a video.
 - Record one clip per facet, with a `kind` that matches its verdict. Do not add
   unrelated working examples as extra clips.
+- An absence is filmable. When the bug is that nothing happens, show the
+  triggering action and the screen staying in the stale state, with whatever
+  error the product does show, for longer than a healthy response takes.
 
 ## If recording is blocked
 
@@ -54,6 +62,12 @@ Recording is **best-effort**:
   to show, set `recordings: []` for that facet. Name the specific blocker in
   `recording_unavailable_reason`, such as missing `vhs` or `ttyd`, or a server
   that cannot start.
+- A blocker is the observed result of a recorder run. When your environment
+  check found the recorder available, point it at the facet's lane before
+  declaring the facet blocked, and name the command you ran and its observed
+  error. A reason that names no attempted recorder run — "the recorder was not
+  stood up", a multi-process journey, a flaky boot, a bug that is an absence —
+  is insufficient.
 - Text-only CLI output is not a reason to skip recording. A missing recording
   from an earlier run is not a reason either.
 - Do not block the verdict, fix, or PR because footage is missing or rejected.
@@ -335,6 +349,12 @@ already displayed. Keep backend findings in `evidence`; describe the visible
 outcome in the caption. Check each claimed moment, especially claims that text
 or controls are absent. If the frames contradict the caption, correct it or
 re-record.
+
+Verify that each captioned element is in the recorded viewport and unobstructed.
+Quote only text the viewer can see: DOM attributes and hidden accessibility
+labels do not establish what the screen displayed. Describe icon-only controls
+by their visible appearance. If frame inspection is unavailable, disclose that
+and limit claims to states the recording driver actually verified.
 
 ### Timed captions inside the video
 

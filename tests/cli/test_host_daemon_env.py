@@ -151,11 +151,14 @@ def test_runner_can_read_keyring_from_cli_desktop_session(
 )
 def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
     server_url: str | None,
     keeps_provider_secret: bool,
 ) -> None:
     """Proxy selectors reach both daemon modes without widening provider secrets."""
     # Given
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.delenv(RUNNER_ENV_PASSTHROUGH_ENV_VAR, raising=False)
     for name, value in _PROXY_ENV.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("DATABRICKS_CONFIG_PROFILE", "corp")
@@ -167,7 +170,9 @@ def test_host_daemon_env_preserves_proxy_vars_and_provider_secret_split(
     # Then
     assert {name: env.get(name) for name in _PROXY_ENV} == _PROXY_ENV
     assert env["DATABRICKS_CONFIG_PROFILE"] == "corp"
-    assert ("OPENAI_API_KEY" in env) is keeps_provider_secret
+    assert env.get("OPENAI_API_KEY") == (
+        "local-provider-secret" if keeps_provider_secret else None
+    )
 
 
 def test_runner_env_excludes_proxy_vars_by_default() -> None:
@@ -217,14 +222,29 @@ def test_runner_env_explicit_proxy_passthrough_remains_available() -> None:
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
-@pytest.mark.parametrize("enabled", ["0", "1"])
-def test_host_slice_key_gate_reaches_daemon_and_runner(
+@pytest.mark.parametrize(
+    ("name", "value", "expected_osc"),
+    [
+        ("OMNIGENT_HOST_SLICE_KEY_ENABLED", "0", True),
+        ("OMNIGENT_HOST_SLICE_KEY_ENABLED", "1", True),
+        ("OMNIGENT_FEATURES", None, True),
+        ("OMNIGENT_FEATURES", "", True),
+        ("OMNIGENT_FEATURES", "usage_page,claude_osc_status", True),
+        ("OMNIGENT_FEATURES", "usage_page,-claude_osc_status", False),
+        ("OMNIGENT_FEATURES", "-claude_osc_status,claude_osc_status", False),
+    ],
+)
+def test_release_controls_reach_daemon_and_runner(
     monkeypatch: pytest.MonkeyPatch,
     server_url: str | None,
-    enabled: str,
+    name: str,
+    value: str | None,
+    expected_osc: bool,
 ) -> None:
-    """The host and its spawned runner make the same slice-key decision."""
-    monkeypatch.setenv("OMNIGENT_HOST_SLICE_KEY_ENABLED", enabled)
+    """Operator controls survive both environment boundaries in either server mode."""
+    monkeypatch.delenv(name, raising=False)
+    if value is not None:
+        monkeypatch.setenv(name, value)
 
     daemon_env = _build_host_daemon_env(server_url=server_url)
     runner_env = _build_runner_env(
@@ -236,8 +256,15 @@ def test_host_slice_key_gate_reaches_daemon_and_runner(
         parent_pid=12345,
     )
 
-    assert daemon_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
-    assert runner_env["OMNIGENT_HOST_SLICE_KEY_ENABLED"] == enabled
+    assert daemon_env.get(name) == value
+    assert runner_env.get(name) == value
+    if name == "OMNIGENT_FEATURES":
+        from omnigent.runner.resource_registry import SessionResourceRegistry
+        from omnigent.server.feature_flags import Feature
+
+        with patch.dict(os.environ, runner_env, clear=True):
+            registry = SessionResourceRegistry()
+        assert registry._feature_flags.enabled(Feature.CLAUDE_OSC_STATUS) == expected_osc
 
 
 _CLAUDE_TOOL_SEARCH_ENV: Final = {
@@ -429,6 +456,51 @@ def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
     assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
 
 
+_IDLE_TIMEOUT_KNOBS: Final = {
+    "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S": "0",
+    "OMNIGENT_HARNESS_IDLE_TIMEOUT_S": "0",
+}
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_idle_timeout_knobs(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """The runner-tuning idle windows survive the CLI→daemon strip in both modes."""
+    # Given
+    for name, value in _IDLE_TIMEOUT_KNOBS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OMNIGENT_LOG_LEVEL", "INFO")
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then: the knobs travel with the other non-secret OMNIGENT_ tuning vars.
+    assert env.get("OMNIGENT_LOG_LEVEL") == "INFO"
+    assert {name: env.get(name) for name in _IDLE_TIMEOUT_KNOBS} == _IDLE_TIMEOUT_KNOBS
+
+
+def test_runner_env_preserves_idle_timeout_knobs() -> None:
+    """The idle windows set on the host reach the runner that reads them."""
+    # Given
+    base_env = {"PATH": "/usr/bin", "OMNIGENT_LOG_LEVEL": "INFO", **_IDLE_TIMEOUT_KNOBS}
+
+    # When
+    env = _build_runner_env(
+        base_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_idle",
+        binding_token="binding-idle",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert env.get("OMNIGENT_LOG_LEVEL") == "INFO"
+    assert {name: env.get(name) for name in _IDLE_TIMEOUT_KNOBS} == _IDLE_TIMEOUT_KNOBS
+
+
 _TELEMETRY_OPTOUTS = [
     ("CI", "true"),
     ("CI", ""),
@@ -521,3 +593,48 @@ def test_ci_detection_stays_on_the_local_server(
     )
     assert "CI" not in runner_env
     assert "OMNIGENT_DISABLE_TELEMETRY" not in runner_env
+
+
+def test_gemini_gateway_survives_local_daemon_and_runner(monkeypatch, tmp_path) -> None:
+    monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
+    monkeypatch.setenv("GEMINI_API_KEY", "fake-gateway-key")
+    monkeypatch.setenv("GOOGLE_GEMINI_BASE_URL", "https://gateway.example/gemini")
+    daemon = _build_host_daemon_env(server_url=None)
+    runner = _build_runner_env(
+        daemon,
+        server_url="http://localhost:6767",
+        runner_id="test-gemini",
+        binding_token="fake-binding",
+        workspace=str(tmp_path),
+        parent_pid=os.getpid(),
+    )
+    for env in (daemon, runner):
+        assert env["GEMINI_API_KEY"] == "fake-gateway-key"
+        assert env["GOOGLE_GEMINI_BASE_URL"] == "https://gateway.example/gemini"
+
+
+def test_remote_daemon_and_runners_are_pinned_to_the_selected_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """One account host can front many workspaces; each daemon keeps its own."""
+    from omnigent.cli_auth import PINNED_DATABRICKS_ORG_ENV_VAR, store_databricks_org_id
+
+    monkeypatch.setattr(
+        "omnigent.cli_auth._token_file_path", lambda: tmp_path / "auth_tokens.json"
+    )
+    server = "https://acct.example.com/api/2.0/omnigent"
+
+    store_databricks_org_id(server, "111")
+    prod_env = _build_host_daemon_env(server_url=server)
+    store_databricks_org_id(server, "222")
+
+    assert prod_env[PINNED_DATABRICKS_ORG_ENV_VAR] == f"{server}?o=111"
+    runner_env = _build_runner_env(
+        prod_env,
+        server_url=server,
+        runner_id="runner_pinned_org",
+        binding_token="synthetic-binding-token",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+    assert runner_env[PINNED_DATABRICKS_ORG_ENV_VAR] == f"{server}?o=111"

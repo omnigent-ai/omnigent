@@ -24,6 +24,7 @@ from pydantic import (
     model_serializer,
     model_validator,
 )
+from pydantic.json_schema import SkipJsonSchema
 
 from omnigent.entities import (
     DEFAULT_GENERATED_TITLE_MAX_CHARS,
@@ -156,6 +157,80 @@ class UpsertMCPServerRequest(BaseModel):
             if self.url:
                 raise ValueError("url is not allowed when transport is 'stdio'")
         return self
+
+
+class MCPServerPatch(BaseModel):
+    """Partial MCP declaration; omitted fields and credential keys are preserved."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    transport: Literal["http", "stdio"] | None = None
+    description: str | None = Field(default=None, max_length=512)
+    url: str | None = None
+    command: str | None = None
+    args: list[str] | None = Field(default=None, max_length=64)
+    headers: dict[str, str | None] | None = None
+    env: dict[str, str | None] | None = None
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> Self:
+        for key in ("transport", "url", "command", "args"):
+            if key in self.model_fields_set and getattr(self, key) is None:
+                raise ValueError(f"{key} cannot be null")
+        for values in (self.headers, self.env):
+            if values and "[REDACTED]" in values.values():
+                raise ValueError("Omit unchanged credentials instead of sending placeholders")
+        return self
+
+
+class AgentConfigPatch(BaseModel):
+    """Merge-style update of an owned agent, with immutable identity."""
+
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    description: str | None = Field(default=None, max_length=4096)
+    instructions: str | None = None
+    model: str | None = Field(default=None, min_length=1)
+    harness: str | None = Field(default=None, min_length=1)
+    mcp_servers: (
+        dict[Annotated[str, Field(pattern=_MCP_SERVER_NAME_RE)], MCPServerPatch | None] | None
+    ) = None
+
+    @model_validator(mode="after")
+    def validate_patch(self) -> Self:
+        for key in ("model", "harness", "mcp_servers"):
+            if key in self.model_fields_set and getattr(self, key) is None:
+                raise ValueError(f"{key} cannot be null")
+        for value in (self.model, self.harness):
+            if value is not None and not value.strip():
+                raise ValueError("Model and harness must be nonempty")
+        return self
+
+
+class AgentMCPConfig(BaseModel):
+    """Editable MCP projection without credential values."""
+
+    transport: str
+    description: str | None = None
+    url: str | None = None
+    command: str | None = None
+    args: list[str] = Field(default_factory=list)
+    configured_header_names: list[str] = Field(default_factory=list)
+    configured_env_names: list[str] = Field(default_factory=list)
+    editable: bool = True
+
+
+class AgentConfigObject(BaseModel):
+    """Owner-only configuration read and PATCH result."""
+
+    id: str
+    name: str
+    version: int
+    description: str | None = None
+    harness: str | None = None
+    model: str | None = None
+    instructions: str | None = None
+    mcp_servers: dict[str, AgentMCPConfig] = Field(default_factory=dict)
 
 
 class SkillSummary(BaseModel):
@@ -1034,8 +1109,8 @@ class CreateResponseRequest(BaseModel):
         "description": "...", "parameters": {...}}}]``.
     :param tool_choice: Ignored — agent controls this. Silently
         dropped.
-    :param max_output_tokens: Ignored — agent controls this.
-        Silently dropped.
+    :param max_output_tokens: Output token cap, e.g. ``32``.
+        Executors that support a cap apply it; others ignore it.
     :param frequency_penalty: Ignored — agent controls this.
         Silently dropped.
     :param presence_penalty: Ignored — agent controls this.
@@ -1327,6 +1402,31 @@ class SessionEventInput(BaseModel):
         return data
 
 
+class SessionStartupInput(SessionEventInput):
+    """A first user input the server accepts durably before provisioning a host."""
+
+    @model_validator(mode="after")
+    def _validate_startup_input(self) -> Self:
+        from omnigent.entities.conversation import MessageData
+
+        if self.type not in ("message", "slash_command"):
+            raise ValueError("initial_input must be a message or skill invocation")
+        if self.created_by is not None:
+            raise ValueError("initial_input attribution comes from the authenticated creator")
+        if self.type == "message":
+            message = MessageData.model_validate(self.data)
+            if message.role != "user":
+                raise ValueError("initial_input must be a user message")
+        elif (
+            self.data.get("kind") != "skill"
+            or not isinstance(self.data.get("name"), str)
+            or not self.data["name"].strip()
+            or not isinstance(self.data.get("arguments", ""), str)
+        ):
+            raise ValueError("initial_input slash_command requires a skill name and arguments")
+        return self
+
+
 class SessionGitOptions(BaseModel):
     """
     Git worktree options for ``POST /v1/sessions``.
@@ -1396,6 +1496,9 @@ class SessionGitOptions(BaseModel):
 # abusive request.
 # ponytail: bump this one constant if larger repo sets ever need supporting.
 _MAX_MANAGED_WORKSPACES = 10
+# Shape of a server-minted host id (``uuid.uuid4().hex``); a managed create's
+# ``host_id`` must match it.
+_MANAGED_HOST_ID_RE = re.compile(r"[0-9a-f]{32}")
 
 
 class _SessionCreateRequestBase(BaseModel):
@@ -1442,7 +1545,19 @@ class _SessionCreateRequestBase(BaseModel):
         ``"host_a1b2c3d4..."``. When set, the server triggers the
         host launch flow (generate binding token, write runner_id,
         send launch frame). ``None`` for CLI-initiated sessions.
-        Must be ``None`` when ``host_type`` is ``"managed"``.
+        With ``host_type: "managed"`` it instead names the NEW sandbox
+        host: 32 lowercase hex characters (the shape of
+        ``uuid.uuid4().hex``), so the caller can route the create, and
+        every request after it, by that id from the start. Send it only
+        when ``GET /v1/info`` reports ``request_managed_sandbox_host_id``;
+        older servers reject it. The server
+        registers the host under it and records it in the
+        ``omnigent.sandbox.requested_host_id`` label, since the
+        session's ``host_id`` stays null until the host binds. ``None``
+        lets the server mint one. JSON creates only, and not with
+        ``parent_session_id`` (a child runs on its parent's host). An id
+        naming an existing host, or sharing its ``managed-<first 8 hex>``
+        name with one of the caller's hosts, fails with ``409``.
     :param sandbox_provider: Which configured sandbox provider to
         provision on, e.g. ``"modal"`` — one of the names ``GET /v1/info``
         reports in ``sandbox_providers``. Only valid with
@@ -1546,6 +1661,7 @@ class _SessionCreateRequestBase(BaseModel):
     agent_id: Any
     project_id: str | None = None
     initial_items: list[SessionEventInput] = Field(default_factory=list)
+    initial_input: SessionStartupInput | None = None
     mcp_registry_services: list[McpRegistryServiceId] = Field(default_factory=list, max_length=40)
     title: str | None = Field(default=None, max_length=USER_SESSION_TITLE_MAX_CHARS)
     labels: dict[str, str] = Field(default_factory=dict)
@@ -1553,6 +1669,9 @@ class _SessionCreateRequestBase(BaseModel):
     sub_agent_name: str | None = None
     host_type: Literal["external", "managed"] = "external"
     host_id: str | None = None
+    # A managed create's ``host_id``, moved here at validation so ``host_id``
+    # keeps meaning the caller's existing host everywhere downstream.
+    requested_host_id: SkipJsonSchema[str | None] = None
     sandbox_provider: str | None = None
     workspace: str | None = None
     workspaces: list[str] | None = None
@@ -1564,6 +1683,15 @@ class _SessionCreateRequestBase(BaseModel):
     subagent_routing_override: str | None = None
     harness_override: str | None = None
     smart_routing_message: str | None = None
+
+    @model_validator(mode="after")
+    def _check_startup_input(self) -> Self:
+        if self.initial_input is not None and (self.host_type != "managed" or self.initial_items):
+            raise ValueError(
+                "initial_input requires host_type=managed "
+                "and cannot be combined with initial_items"
+            )
+        return self
 
     @model_validator(mode="after")
     def _check_git_requires_host(self) -> Self:
@@ -1582,14 +1710,31 @@ class _SessionCreateRequestBase(BaseModel):
             raise ValueError("git worktree creation requires host_id")
         return self
 
+    @model_validator(mode="before")
+    @classmethod
+    def _move_managed_host_id(cls, data: Any) -> Any:
+        """
+        Move a managed create's ``host_id`` into ``requested_host_id``.
+
+        :param data: The raw request body.
+        :returns: The body, with a managed ``host_id`` moved.
+        """
+        if (
+            isinstance(data, dict)
+            and data.get("host_type") == "managed"
+            and data.get("host_id") is not None
+        ):
+            return {**data, "host_id": None, "requested_host_id": data["host_id"]}
+        return data
+
     @model_validator(mode="after")
     def _check_managed_host_fields(self) -> Self:
         """
         Enforce the per-``host_type`` workspace and host-id contract.
 
-        A managed session's host is chosen by the server (sandbox
-        provisioning), so a caller-supplied ``host_id`` is a
-        contradiction. Its ``workspace``, when given, must be a git
+        A managed session's host is provisioned by the server, so its
+        ``host_id`` (already moved to ``requested_host_id``) can only name
+        the new host. Its ``workspace``, when given, must be a git
         repository URL (optionally ``#<branch>``) the server clones
         into the sandbox — a path points at nothing in a sandbox that
         doesn't exist yet. Conversely, a repository-URL workspace on
@@ -1599,7 +1744,8 @@ class _SessionCreateRequestBase(BaseModel):
         caller's intent.
 
         :returns: The validated instance.
-        :raises ValueError: On ``"managed"`` + ``host_id``, a managed
+        :raises ValueError: On a malformed managed ``host_id`` (or one on
+            a child create), a managed
             workspace/workspaces that isn't a valid repository URL,
             ``workspace`` and ``workspaces`` set together, too many
             ``workspaces``, or an external repository-URL workspace.
@@ -1610,10 +1756,16 @@ class _SessionCreateRequestBase(BaseModel):
         from omnigent.server.managed_hosts import is_repo_workspace, parse_repo_workspace
 
         if self.host_type == "managed":
-            if self.host_id is not None:
+            if self.requested_host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(
+                self.requested_host_id
+            ):
                 raise ValueError(
-                    "host_type 'managed' lets the server provision the host; "
-                    "host_id must not be set"
+                    "host_type 'managed' takes a host_id of 32 lowercase hex characters"
+                )
+            if self.requested_host_id is not None and self.parent_session_id is not None:
+                raise ValueError(
+                    "host_id does not apply to a managed child session; "
+                    "it runs on its parent's host"
                 )
             if self.workspace is not None and self.workspaces is not None:
                 raise ValueError(
@@ -1634,6 +1786,8 @@ class _SessionCreateRequestBase(BaseModel):
                         f"(optionally '#<branch>') as workspace(s): {exc}"
                     ) from exc
             return self
+        if self.requested_host_id is not None:
+            raise ValueError("requested_host_id only applies to host_type 'managed'")
         if self.sandbox_provider is not None:
             raise ValueError(
                 "sandbox_provider only applies to host_type 'managed' — "
@@ -1763,6 +1917,14 @@ class SessionCreateMetadata(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
+    initial_input: SessionStartupInput | None = None
+
+    @model_validator(mode="after")
+    def _check_startup_input(self) -> Self:
+        if self.initial_input is not None and self.host_type != "managed":
+            raise ValueError("initial_input requires host_type=managed")
+        return self
+
     @model_validator(mode="after")
     def _check_managed_bundle_fields(self) -> SessionCreateMetadata:
         """
@@ -1850,9 +2012,11 @@ class SessionLabelsResponse(BaseModel):
 # is provisioned, the repository workspace is cloned into it (skipped
 # when the session has no repo workspace), the in-sandbox host starts
 # and registers, and the agent runner is launched on it. ``ready`` and
-# ``failed`` are terminal.
+# ``failed`` are terminal. ``action_required`` is a provisioning-time
+# warning: the user needs to do what the status's ``details`` say.
 SandboxLaunchStage = Literal[
     "provisioning",
+    "action_required",
     "cloning",
     "starting",
     "connecting",
@@ -1872,11 +2036,17 @@ class SandboxStatus(BaseModel):
 
     :param stage: Current launch stage, e.g. ``"provisioning"`` —
         one of :data:`SandboxLaunchStage`, in pipeline order:
-        ``provisioning`` (creating the sandbox) → ``cloning``
+        ``provisioning`` (creating the sandbox; ``action_required``
+        while it also needs the user to act) → ``cloning``
         (cloning the repository workspace; skipped when the session
         has none) → ``starting`` (starting the in-sandbox host) →
         ``connecting`` (launching the agent runner) → ``ready`` /
         ``failed``.
+    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
+        or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -1884,6 +2054,20 @@ class SandboxStatus(BaseModel):
 
     stage: SandboxLaunchStage
     error: str | None = None
+    provider: str | None = None
+    details: str | None = None
+
+
+class NativeUsageBaseline(BaseModel):
+    """Own-session cumulative tokens for resuming a native usage reporter.
+
+    Excludes spawned sessions. Input includes cache reads, matching the native
+    usage event contract rather than the display's separate token buckets.
+    """
+
+    cumulative_input_tokens: int = Field(default=0, ge=0)
+    cumulative_output_tokens: int = Field(default=0, ge=0)
+    cumulative_cache_read_input_tokens: int = Field(default=0, ge=0)
 
 
 class ModelUsage(BaseModel):
@@ -2110,6 +2294,9 @@ class SessionResponse(BaseModel):
         them with a separate ``GET /v1/sessions/{id}`` using
         ``include_usage=true``, ``include_items=false``,
         ``include_liveness=false``, and ``refresh_state=false``.
+    :param native_usage_baseline: Pi's own cumulative token baseline, excluding
+        descendants. Available even when display usage aggregation is skipped;
+        ``None`` for other harnesses or older servers.
     :param last_task_error: Error details from the most recently
         failed task. Only present when ``status == "failed"`` and
         the task stored an error. Lets clients display the failure
@@ -2140,15 +2327,13 @@ class SessionResponse(BaseModel):
         Empty list when no prompts are outstanding. Sourced from
         the Omnigent server's in-memory
         :mod:`omnigent.runtime.pending_elicitations` index.
-    :param pending_inputs: Un-consumed web-composer user messages on
-        native-terminal (claude-native / codex-native) sessions at
-        snapshot time, each ``{"pending_id", "content"}``. Native
-        sessions don't persist a web message at POST time (the
-        transcript forwarder is the single writer), so a client that
-        posted then navigated away / rebound would lose its optimistic
-        bubble; replaying these re-hydrates it. Empty list otherwise.
-        Sourced from the in-memory
-        :mod:`omnigent.runtime.pending_inputs` index.
+    :param pending_inputs: Accepted messages awaiting consumption, each
+        ``{"pending_id", "content"}``. Includes durable managed-startup
+        inputs and native messages awaiting a transcript receipt. Clients
+        restore their pending bubbles from this list after reconnecting.
+        Ordinary native sends use the in-memory
+        :mod:`omnigent.runtime.pending_inputs` index; startup inputs also
+        survive server restart in the conversation store.
     :param workspace: Absolute path on disk where the runner cd's,
         e.g. ``"/Users/corey/universe/src/foo"``. Set when the
         session was bound to a host workspace at create-time, or
@@ -2239,17 +2424,13 @@ class SessionResponse(BaseModel):
     total_cost_usd: float | None = None
     usage_by_model: dict[str, ModelUsage] | None = None
     usage_included: bool = True
+    native_usage_baseline: NativeUsageBaseline | None = None
     last_task_error: dict[str, str] | None = None
     external_session_id: str | None = None
     terminal_launch_args: list[str] | None = None
     pending_elicitations: list[dict[str, Any]] = Field(default_factory=list)
-    # Un-consumed web-composer user messages on native-terminal
-    # sessions at snapshot time, each ``{"pending_id", "content"}``.
-    # Replayed so a client that posted a message then navigated away /
-    # rebound re-hydrates the optimistic bubble (the live SSE stream
-    # has no replay). Empty for non-native sessions, which persist the
-    # message at POST time and thus already carry it in ``items``.
-    # Source: :mod:`omnigent.runtime.pending_inputs`.
+    # Durable startup inputs plus ordinary native inputs awaiting a receipt.
+    # Each {"pending_id", "content"} restores a pending bubble on reconnect.
     pending_inputs: list[dict[str, Any]] = Field(default_factory=list)
     workspace: str | None = None
     git_branch: str | None = None
@@ -2308,7 +2489,7 @@ class UpdateSessionRequest(BaseModel):
         ``"plan"`` enters Plan mode and ``"default"`` returns to Default
         mode for subsequent Codex turns. Only valid for sessions stamped
         with the codex-native wrapper label. Omitted leaves unchanged.
-    :param permission_mode: Claude-native permission mode to switch a
+    :param permission_mode: Owner-only Claude-native permission mode to switch a
         running session to, e.g. ``"auto"``. Only the modes Claude Code's
         shift+tab cycle can reach are accepted (``default``,
         ``acceptEdits``, ``plan``, ``auto``) — ``dontAsk`` and
@@ -2357,6 +2538,7 @@ class UpdateSessionRequest(BaseModel):
         surface programmer errors. ``None`` leaves unchanged.
     :param terminal_launch_args: Per-session native-terminal
         pass-through args, e.g. ``["--dangerously-skip-permissions"]``.
+        Updating this field requires session ownership.
         A list (including ``[]``) replaces the stored value wholesale
         — resume is last-write-wins, never an append. Bounds (count /
         length) are validated server-side. ``None`` leaves unchanged.
@@ -2616,6 +2798,10 @@ class SessionForkRequest(BaseModel):
         provision on ``host_type: "managed"`` (one of the server's
         ``sandbox_providers``); ``None`` takes the server's first. Only
         valid with ``host_type: "managed"``.
+    :param host_id: Id for the fork's new sandbox host, with the same shape,
+        capability gate, label and ``409`` as a managed create's ``host_id``.
+        ``None`` lets the server mint one. Only valid with
+        ``host_type: "managed"``.
     :param workspace: Git repository URL (optionally ``#<branch>``) the
         server clones into the fork's sandbox as its working directory,
         e.g. ``"https://github.com/org/repo#release-1.2"``. **Omitting**
@@ -2635,6 +2821,7 @@ class SessionForkRequest(BaseModel):
     codex_bypass_sandbox: bool = False
     host_type: Literal["external", "managed"] = "external"
     sandbox_provider: str | None = None
+    host_id: str | None = None
     workspace: str | None = None
     # Marks the fork as a side chat: it is stamped with the side-chat label so
     # it is hidden from the left sidebar (it surfaces only as a Workspace-rail
@@ -2659,7 +2846,8 @@ class SessionForkRequest(BaseModel):
 
         :returns: The validated instance.
         :raises ValueError: On a managed workspace that isn't a valid
-            repository URL, or ``sandbox_provider`` / ``workspace`` without
+            repository URL, a malformed managed ``host_id``, or
+            ``host_id`` / ``sandbox_provider`` / ``workspace`` without
             ``host_type: "managed"``.
         """
         # Lazy import: schemas is imported by nearly every module, so
@@ -2668,6 +2856,10 @@ class SessionForkRequest(BaseModel):
         from omnigent.server.managed_hosts import parse_repo_workspace
 
         if self.host_type == "managed":
+            if self.host_id is not None and not _MANAGED_HOST_ID_RE.fullmatch(self.host_id):
+                raise ValueError(
+                    "host_type 'managed' takes a host_id of 32 lowercase hex characters"
+                )
             if self.workspace is not None:
                 try:
                     parse_repo_workspace(self.workspace)
@@ -2677,6 +2869,11 @@ class SessionForkRequest(BaseModel):
                         f"(optionally '#<branch>') as workspace: {exc}"
                     ) from exc
             return self
+        if self.host_id is not None:
+            raise ValueError(
+                "host_id only applies to host_type 'managed' — an external "
+                "fork binds its host afterwards"
+            )
         if self.sandbox_provider is not None:
             raise ValueError(
                 "sandbox_provider only applies to host_type 'managed' — "
@@ -2727,6 +2924,7 @@ class SessionListItem(BaseModel):
     :param agent_name: Human-readable name of the bound agent,
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
+    :param harness: Canonical effective harness, including per-session overrides.
     :param status: Derived session lifecycle status.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
@@ -2820,6 +3018,7 @@ class SessionListItem(BaseModel):
     id: str
     agent_id: str
     agent_name: str | None = None
+    harness: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
@@ -3448,6 +3647,11 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     :param stage: The launch stage just entered, e.g.
         ``"provisioning"`` — see :class:`SandboxStatus` for the full
         pipeline order.
+    :param provider: Sandbox provider being launched, e.g. ``"arclet"``,
+        or ``None`` when unknown.
+    :param details: What the user needs to do when
+        ``stage == "action_required"``, e.g. ``"Sign in on your laptop."``.
+        ``None`` otherwise.
     :param error: Failure detail when ``stage == "failed"``, e.g.
         ``"managed sandbox launch failed: spend limit reached"``.
         ``None`` otherwise.
@@ -3462,6 +3666,8 @@ class SessionSandboxStatusEvent(_SSEEventBase):
     conversation_id: str
     stage: SandboxLaunchStage
     error: str | None = None
+    provider: str | None = None
+    details: str | None = None
 
 
 class McpServerStartup(BaseModel):
@@ -4168,6 +4374,13 @@ class ElicitationRequestEvent(_SSEEventBase):
     params: ElicitationRequestParams
 
 
+class UiOpenFileEvent(_SSEEventBase):
+    """Ask current session viewers to open a workspace-relative file; never replayed."""
+
+    type: Literal["ui.open_file"]
+    path: str
+
+
 class BrowserActionRequestEvent(_SSEEventBase):
     """
     Request that the desktop renderer perform one browser action.
@@ -4793,6 +5006,7 @@ ServerStreamEvent = Annotated[
     | ElicitationResolvedEvent
     # ── Transient (SSE-only) — embedded-browser action request ─
     | BrowserActionRequestEvent
+    | UiOpenFileEvent
     # ── Transient (SSE-only) — native policy DENY signal ───────
     | PolicyDeniedEvent
     # ── Transient (SSE-only) — Responses-API turn lifecycle ────
