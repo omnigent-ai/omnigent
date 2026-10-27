@@ -377,7 +377,7 @@ def test_a_configured_provider_without_a_facet_is_unsupported(
     repo: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     _git(repo, "remote", "add", "origin", "https://github.com/acme/repo.git")
-    _git(repo, "config", "omnigent.gitprovider", "forgejo")
+    _git(repo, "config", "omnigent.gitprovider", "unknown-forge")
     _forbid_gh(monkeypatch)
 
     info = pr_resource.pr_info(str(repo))

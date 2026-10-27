@@ -169,6 +169,14 @@ def test_invalid_object_responses_raise(body: str) -> None:
             client.object("repos", "o", "r")
 
 
+@pytest.mark.parametrize("body", ["not json", "{}", "[1]"])
+def test_invalid_list_responses_raise(body: str) -> None:
+    transport = Recorder(lambda _request: httpx.Response(200, text=body))
+    with ForgejoClient("tea.test", transport=transport) as client:
+        with pytest.raises(ForgejoError):
+            client.items("repos", "o", "r", "issues", 1, "comments")
+
+
 def _paged(pages: list[list[dict[str, int]] | int], has_more: bool | None) -> Handler:
     def handle(request: httpx.Request) -> httpx.Response:
         page = pages[int(request.url.params["page"]) - 1]

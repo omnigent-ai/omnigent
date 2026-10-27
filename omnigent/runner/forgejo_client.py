@@ -167,6 +167,8 @@ class ForgejoClient:
         remaining = self.deadline - time.monotonic()
         if remaining <= 0:
             raise ForgejoTimeoutError("Forgejo request timed out. Refresh to retry.")
+        if any(str(segment) in {"", ".", ".."} for segment in segments):
+            raise ForgejoError("Invalid Forgejo API path.")
         path = "/".join(quote(str(segment), safe="") for segment in segments)
         request = self._http.build_request("GET", path, params=params, timeout=remaining)
         if request.url.scheme != "https" or _authority(request.url) != self.login.authority:
@@ -202,6 +204,13 @@ class ForgejoClient:
     def raw(self, *segments: str | int, **params: str | int) -> bytes:
         """GET raw file bytes."""
         return self._send(segments, params).content
+
+    def items(self, *segments: str | int) -> list[dict[str, Any]]:
+        """GET a whole unpaginated JSON list, such as an issue's comments."""
+        values = _json(self._send(segments, {}))
+        if not isinstance(values, list) or any(not isinstance(v, dict) for v in values):
+            raise ForgejoError("Forgejo returned an invalid list response.")
+        return values
 
     def pages(
         self, *segments: str | int, **params: str | int
