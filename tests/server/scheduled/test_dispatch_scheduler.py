@@ -232,7 +232,12 @@ async def test_heartbeat_renews_only_local_startup_and_stops_after_prompt(
             failed_once = True
             raise RuntimeError("temporary database outage")
         result = original_renew(run_id, now=now, lease_seconds=lease_seconds)
-        if now() == task.next_run_at + 30:
+        # The clock can advance while an earlier renewal commits.
+        if (
+            result is not None
+            and result.lease_expires_at == task.next_run_at + 150
+            and (failed_once or not transient_failure)
+        ):
             loop.call_soon_threadsafe(renewed.set)
         return result
 
