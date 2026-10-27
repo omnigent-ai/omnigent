@@ -1,13 +1,26 @@
-import { useSession } from "@/hooks/useSession";
+import { useQuery } from "@tanstack/react-query";
 import { Link } from "@/lib/routing";
+import { getSessionSlim } from "@/lib/sessionsApi";
 import { UNTITLED_CONVERSATION_LABEL } from "./sidebarNav";
 
 export const CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id";
 
 /** Resolve the creator through its own access-checked snapshot, never the worker's title. */
 export function CreatedBySession({ sessionId }: { sessionId: string }) {
-  const { session, isLoading, error } = useSession(sessionId);
-  if (isLoading) return null;
+  // Previously cached session metadata does not establish current access.
+  const {
+    data: session,
+    isFetchedAfterMount,
+    isFetching,
+    error,
+  } = useQuery({
+    queryKey: ["session-creator", sessionId],
+    queryFn: () => getSessionSlim(sessionId),
+    staleTime: 0,
+    refetchOnMount: "always",
+    retry: false,
+  });
+  if (!isFetchedAfterMount || isFetching) return null;
   return (
     <span className="min-w-0 truncate text-xs text-muted-foreground">
       Created by{" "}

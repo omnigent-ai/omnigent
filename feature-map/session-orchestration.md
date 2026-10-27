@@ -12,7 +12,8 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
 - `created-by`: independent workers record their creating session. The worker's
-  Chat/Terminal header links to it when accessible; otherwise it says "Created by
+  Chat/Terminal header rechecks access when opened, hides attribution during the
+  lookup, and links to the creator when accessible; otherwise it says "Created by
   another session". `sys_session_list` and `sys_session_get_info` expose
   `created_by_session_id` so managers can identify their workers across restarts.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
@@ -58,6 +59,8 @@ can supply their own provider through the existing launcher interface.
 For `created-by`, extend the creation journey below: open the worker, reload,
 and follow its creator link. Share only the worker with a second viewer and
 verify they see "Created by another session" with no creator link or title.
+Also revoke creator access after that viewer has visited the creator, then open
+the worker through in-app navigation: no cached creator title or link should appear.
 Fork the worker and verify the fork has no "Created by" label. The API/runner
 contract is covered by `tests/server/integration/test_session_orchestration.py`;
 the header states are covered by `web/src/shell/ChatHeader.test.tsx`.

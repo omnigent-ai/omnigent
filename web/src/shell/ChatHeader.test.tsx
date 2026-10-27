@@ -72,6 +72,7 @@ function renderHeader(props: {
   subAgentName?: string | null;
   conversationId?: string;
   createdBySessionId?: string;
+  queryClient?: QueryClient;
   actionConversation?: Conversation | null;
   conversationTitle?: string | null;
   projectName?: string | null;
@@ -94,7 +95,8 @@ function renderHeader(props: {
   onFork?: () => void;
   settingsMode?: boolean;
 }) {
-  const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+  const qc =
+    props.queryClient ?? new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return render(
     <MemoryRouter initialEntries={["/"]}>
       <QueryClientProvider client={qc}>
@@ -165,17 +167,37 @@ it.each([false, true])("links the creating session (mobile=%s)", async (mobile) 
     "href",
     "/c/manager",
   );
-  expect(lookup).toHaveBeenCalledWith("manager", { refreshState: true });
+  expect(lookup).toHaveBeenCalledWith("manager");
   expect(screen.getByText(/Created by/)).toBeInTheDocument();
   expect(screen.queryByRole("link", { name: "Back to parent session" })).not.toBeInTheDocument();
 });
 
-it.each([403, 404])("does not link or name an unavailable creator (%s)", async (status) => {
-  vi.spyOn(sessionsApi, "getSessionSlim").mockRejectedValue(
-    new sessionsApi.ApiError("Unavailable", status, null),
+it("rechecks creator access without displaying cached metadata", async () => {
+  const queryClient = new QueryClient();
+  const cached = { id: "private", title: "Previously shared manager" } as Session;
+  queryClient.setQueryData(["session", "private"], cached);
+  queryClient.setQueryData(["session-creator", "private"], cached);
+  let rejectCreator!: (error: Error) => void;
+  const lookup = vi.spyOn(sessionsApi, "getSessionSlim").mockReturnValue(
+    new Promise<Session>((_, reject) => {
+      rejectCreator = reject;
+    }),
   );
-  renderHeader({ sidebarOpen: true, conversationId: "worker", createdBySessionId: "private" });
+  renderHeader({
+    sidebarOpen: true,
+    conversationId: "worker",
+    createdBySessionId: "private",
+    queryClient,
+  });
+  expect(screen.queryByText(/Created by/)).not.toBeInTheDocument();
+  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
+  expect(screen.queryByRole("link")).not.toBeInTheDocument();
+  await act(async () => {
+    rejectCreator(new sessionsApi.ApiError("Unavailable", 403, null));
+  });
   expect(await screen.findByText("Created by another session")).toBeInTheDocument();
+  expect(lookup).toHaveBeenCalledWith("private");
+  expect(screen.queryByText(cached.title!)).not.toBeInTheDocument();
   expect(screen.queryByRole("link")).not.toBeInTheDocument();
 });
 

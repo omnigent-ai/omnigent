@@ -624,6 +624,11 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(created.id)
     assert [grant.user_id for grant in grants] == ["alice"]
 
+    assert CREATED_BY_SESSION_LABEL_KEY not in store.get_conversation(manager["id"]).labels
+    # Discovery and label-write rules are independent of the routing variants above.
+    if child_manager or move_before_recheck or policy_denied:
+        return
+
     info = json.loads(
         await execute_tool(
             tool_name="sys_session_get_info",
@@ -644,8 +649,6 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     worker = next(row for row in listing["sessions"] if row["session_id"] == created_id)
     assert worker["created_by_session_id"] == manager["id"]
     assert worker["parent_session_id"] is None
-    assert CREATED_BY_SESSION_LABEL_KEY not in store.get_conversation(manager["id"]).labels
-
     for value in ("", source["id"]):
         labels = {CREATED_BY_SESSION_LABEL_KEY: value}
         response = await auth_client.patch(f"/v1/sessions/{created_id}", json={"labels": labels})
