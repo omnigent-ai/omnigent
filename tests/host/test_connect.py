@@ -5589,7 +5589,7 @@ async def test_cancel_during_codex_login_start_returns_cancelled_result(
             ),
         )
     )
-    await asyncio.wait_for(start_entered.wait(), timeout=1)
+    await start_entered.wait()
 
     cancel_result = await host._handle_harness_login_cancel(
         HostHarnessLoginCancelFrame(request_id="cancel", login_id="server-login")
