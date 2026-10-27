@@ -11,7 +11,7 @@ import re
 import urllib.error
 import urllib.request
 from collections import deque
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Collection
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -417,8 +417,10 @@ class _PartialTextBuffer:
 # Codex token totals as ``(input, cached input, output)``, in the order of
 # ``_CUMULATIVE_TOKEN_KEYS``.
 _UsageTotals = tuple[int, int, int]
+# One usage frame as ``(turn id, totals)``.
+_UsageFrame = tuple[str | None, _UsageTotals]
 _NO_INHERITED_USAGE: _UsageTotals = (0, 0, 0)
-_RECENT_USAGE_TOTALS_LIMIT = 256
+_RECENT_USAGE_FRAMES_PER_THREAD = 64
 
 
 @dataclass
@@ -514,12 +516,16 @@ class _CodexForwarderState:
         repeatedly as edits land; only the newest diff is kept and it is
         flushed once at the terminal turn boundary (see
         :func:`_handle_turn_diff_updated` / :func:`_flush_turn_diff`).
-    :param recent_usage_totals: Raw token totals most recently reported by any
-        thread on this connection, e.g. ``deque([(5000, 4000, 100)])``.
+    :param recent_usage_frames: Raw usage frames each thread most recently
+        reported on this connection, e.g.
+        ``{"thread_parent": deque([("turn_1", (5000, 4000, 100))])}``.
+    :param usage_source_threads: Thread each Codex child was spawned from, per
+        its ``thread/started``, e.g. ``{"thread_child": "thread_parent"}``.
+        Other children, such as ``thread/fork`` side chats, fork the parent.
     :param child_usage_baselines: Token totals each Codex child thread inherited
         from the thread it was forked from, keyed by child thread id and
         subtracted from the child's posted usage. Zeros for a fresh child.
-    :param child_usage_baseline_dir: Bridge directory that persists non-zero
+    :param child_usage_baseline_dir: Bridge directory that persists
         ``child_usage_baselines`` across forwarder restarts. ``None`` keeps
         them in memory only.
     """
@@ -586,9 +592,8 @@ class _CodexForwarderState:
     # thread rotation), so a settled round stays settled and later items
     # can skip re-reading the bridge file for the life of the session.
     mcp_startup_settled: bool = False
-    recent_usage_totals: deque[_UsageTotals] = field(
-        default_factory=lambda: deque(maxlen=_RECENT_USAGE_TOTALS_LIMIT)
-    )
+    recent_usage_frames: dict[str, deque[_UsageFrame]] = field(default_factory=dict)
+    usage_source_threads: dict[str, str] = field(default_factory=dict)
     child_usage_baselines: dict[str, _UsageTotals] = field(default_factory=dict)
     child_usage_baseline_dir: Path | None = None
 
@@ -608,10 +613,11 @@ class _CodexForwarderState:
         Record one Codex usage frame, deciding a new child thread's inherited usage.
 
         A forked thread starts with its source thread's totals (``thread/fork``,
-        and ``spawn_agent`` forks before Codex 0.153). Its first frame repeats
-        those totals or adds its first request to them, so it is matched against
-        totals other threads already reported. Callers record frames before
-        routing, so a not-yet-registered child's first frame still counts.
+        and ``spawn_agent`` forks before Codex 0.153). Its first frame either
+        repeats a source frame, turn id included, or adds its own first request
+        to a source total. Codex reports source totals before forking; a child
+        whose source frame was not seen, e.g. across a restart, keeps its usage.
+        Callers record frames before routing, so an unregistered child counts.
 
         :param params: Codex ``thread/tokenUsage/updated`` params.
         :param parent_thread_id: Current parent Codex thread id, e.g.
@@ -622,21 +628,27 @@ class _CodexForwarderState:
         if not isinstance(token_usage, dict):
             return
         total = _usage_token_totals(token_usage.get("total"))
-        if total is None:
-            return
         thread_id = _thread_id_from_params(params)
-        if (
-            thread_id is not None
-            and thread_id != parent_thread_id
-            and thread_id not in self.child_usage_baselines
-        ):
+        if total is None or thread_id is None:
+            return
+        turn_id = params.get("turnId")
+        frame: _UsageFrame = (turn_id if isinstance(turn_id, str) else None, total)
+        if thread_id != parent_thread_id and thread_id not in self.child_usage_baselines:
+            source_thread_id = self.usage_source_threads.get(thread_id, parent_thread_id)
+            source_frames = (
+                self.recent_usage_frames.get(source_thread_id, ())
+                if source_thread_id is not None
+                else ()
+            )
             baseline = _inherited_usage_baseline(
-                total, _usage_token_totals(token_usage.get("last")), self.recent_usage_totals
+                frame, _usage_token_totals(token_usage.get("last")), source_frames
             )
             self.child_usage_baselines[thread_id] = baseline
-            if baseline != _NO_INHERITED_USAGE and self.child_usage_baseline_dir is not None:
+            if self.child_usage_baseline_dir is not None:
                 record_child_usage_baseline(self.child_usage_baseline_dir, thread_id, baseline)
-        self.recent_usage_totals.append(total)
+        self.recent_usage_frames.setdefault(
+            thread_id, deque(maxlen=_RECENT_USAGE_FRAMES_PER_THREAD)
+        ).append(frame)
 
     def note_resume_response(self, response: CodexMessage) -> None:
         """
@@ -800,6 +812,8 @@ class _CodexForwarderState:
             ``"thread_parent"``. ``None`` when Codex omitted it.
         :returns: None.
         """
+        if parent_thread_id is not None:
+            self.usage_source_threads[thread_id] = parent_thread_id
         if thread_id not in self.subagents_by_thread:
             self.pending_child_threads[thread_id] = parent_thread_id
 
@@ -3337,11 +3351,9 @@ async def _handle_event(
         forwarder_state=event_state,
     ):
         return
-    # Child token-usage events must post to the child session, not the
-    # parent's coalescer. A fresh coalescer is created per-event for
-    # children and flushed immediately so accumulated data is not lost.
-    # Seed it with the session model so the server can price the child's tokens,
-    # and with any usage the child inherited at its fork so only its own is posted.
+    # Child token-usage events post to the child session through a per-event
+    # coalescer, flushed immediately and seeded with the session model for
+    # pricing and with the usage the child inherited at its fork.
     child_coalescer = (
         _SessionUsageCoalescer(
             client,
@@ -7832,25 +7844,27 @@ def _usage_token_totals(usage: object) -> _UsageTotals | None:
 
 
 def _inherited_usage_baseline(
-    total: _UsageTotals,
+    frame: _UsageFrame,
     last: _UsageTotals | None,
-    recent_totals: deque[_UsageTotals],
+    source_frames: Collection[_UsageFrame],
 ) -> _UsageTotals:
     """
     Return the token totals a child thread's first usage frame inherited.
 
-    :param total: Cumulative totals from the child's first frame.
+    :param frame: Turn id and cumulative totals from the child's first frame.
     :param last: Latest-request totals from the same frame, or ``None``.
-    :param recent_totals: Totals other threads reported on this connection.
-    :returns: The source thread's totals when the frame repeats them, or
-        repeats them plus its latest request; zeros for a fresh thread.
+    :param source_frames: Frames the child's source thread reported on this
+        connection.
+    :returns: The source totals the frame repeats under the source's turn id,
+        or adds its latest request to; zeros for a fresh thread.
     """
-    if total in recent_totals:
+    turn_id, total = frame
+    if turn_id is not None and frame in source_frames:
         return total
     if last is None or last == total:
         return _NO_INHERITED_USAGE
     inherited = (total[0] - last[0], total[1] - last[1], total[2] - last[2])
-    if min(inherited) >= 0 and inherited in recent_totals:
+    if min(inherited) >= 0 and any(source_total == inherited for _, source_total in source_frames):
         return inherited
     return _NO_INHERITED_USAGE
 

@@ -478,7 +478,9 @@ def test_forwarder_child_usage_excludes_inherited_totals_across_restart(
             [
                 _usage_event("thread_parent", (2500, 1000, 110), (1500, 1000, 10)),
                 _collab_item_started_event(),
-                _usage_event("thread_child", (2500, 1000, 110), (1500, 1000, 10)),
+                _usage_event(
+                    "thread_child", (2500, 1000, 110), (1500, 1000, 10), "turn_thread_parent"
+                ),
                 _usage_event("thread_parent", (4500, 2000, 160), (2000, 1000, 50)),
                 _usage_event("thread_child", (2800, 1000, 140), (300, 0, 30)),
             ]

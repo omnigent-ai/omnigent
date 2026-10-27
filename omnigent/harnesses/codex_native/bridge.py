@@ -69,8 +69,8 @@ _STARTUP_TIMEOUT_MAX_BYTES = 256
 # events), read by the executor's first-turn gate and the runner's
 # Stop handler.
 _MCP_STARTUP_FILE = "mcp_startup.json"
-# Usage each forked Codex child thread inherited at its fork, kept across
-# forwarder restarts because resumed threads report the inherited totals again.
+# Usage each Codex child thread inherited at its fork (zeros when fresh), kept
+# across forwarder restarts because resumed threads report their totals again.
 _CHILD_USAGE_BASELINES_FILE = "child_usage_baselines.json"
 _CHILD_USAGE_BASELINES_LOCK_FILE = "child_usage_baselines.lock"
 
@@ -1226,7 +1226,7 @@ def _write_bridge_record(bridge_dir: Path, filename: str, record: Mapping[str, o
 
 def read_child_usage_baselines(bridge_dir: Path) -> dict[str, tuple[int, int, int]]:
     """
-    Read the usage each forked Codex child thread inherited from its source.
+    Read the usage each Codex child thread inherited from its source.
 
     :param bridge_dir: Native Codex bridge directory.
     :returns: Inherited ``(input, cached input, output)`` token totals keyed by
@@ -1257,7 +1257,7 @@ def record_child_usage_baseline(
     bridge_dir: Path, thread_id: str, baseline: tuple[int, int, int]
 ) -> None:
     """
-    Persist the usage one forked Codex child thread inherited (best-effort).
+    Persist the usage one Codex child thread inherited (best-effort).
 
     :param bridge_dir: Native Codex bridge directory.
     :param thread_id: Codex child thread id, e.g. ``"thread_child"``.

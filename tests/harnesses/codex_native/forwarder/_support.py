@@ -13,7 +13,9 @@ from omnigent.harnesses.codex_native.bridge import (
 _Tokens = tuple[int, int, int]
 
 
-def _usage_event(thread_id: str, total: _Tokens, last: _Tokens) -> dict:
+def _usage_event(
+    thread_id: str, total: _Tokens, last: _Tokens, turn_id: str | None = None
+) -> dict:
     """Build a ``thread/tokenUsage/updated`` notification from ``(input, cached, output)``."""
 
     def breakdown(tokens: _Tokens) -> dict[str, int]:
@@ -27,7 +29,7 @@ def _usage_event(thread_id: str, total: _Tokens, last: _Tokens) -> dict:
         "method": "thread/tokenUsage/updated",
         "params": {
             "threadId": thread_id,
-            "turnId": f"turn_{thread_id}",
+            "turnId": turn_id or f"turn_{thread_id}",
             "tokenUsage": {
                 "total": breakdown(total),
                 "last": breakdown(last),
