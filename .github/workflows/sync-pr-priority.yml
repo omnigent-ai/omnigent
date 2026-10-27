@@ -42,7 +42,7 @@ jobs:
       github.repository == 'omnigent-ai/omnigent' &&
       (github.event_name != 'issues' ||
        contains(fromJSON('["P0-critical", "P1-high", "P2-medium", "P3-low"]'), github.event.label.name))
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     permissions:
       contents: read

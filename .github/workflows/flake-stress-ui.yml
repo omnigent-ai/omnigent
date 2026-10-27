@@ -77,7 +77,7 @@ jobs:
     # out across (arrays must exist at job-graph construction time; the
     # downstream job picks it up via ``fromJSON``).
     name: Validate inputs
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       attempts_json: ${{ steps.gen.outputs.attempts_json }}
     steps:
@@ -156,7 +156,7 @@ jobs:
     # under test.
     name: build codex-parity sidecar
     needs: prep
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -196,7 +196,6 @@ jobs:
   repro:
     name: Attempt ${{ matrix.attempt }}
     needs: [prep, build-sidecar]
-    # Playwright 1.60 cannot install Chromium on ubuntu-26.04, ubuntu-latest's new image.
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
@@ -346,7 +345,7 @@ jobs:
     name: Summarize results
     needs: repro
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     steps:
       - name: Download all attempt artifacts
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2

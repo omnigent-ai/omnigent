@@ -147,7 +147,7 @@ repos:
 
       # iOS Swift formatting + linting via Apple's `swift format` (config:
       # web/ios/.swift-format). The wrapper no-ops when the Swift toolchain
-      # is absent, so these run on macOS dev machines but skip the ubuntu-latest
+      # is absent, so these run on macOS dev machines but skip the Ubuntu
       # CI pre-commit job — there is no Swift there. Enforcement is local.
       - id: web-ios-swift-format
         name: web ios swift-format

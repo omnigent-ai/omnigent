@@ -41,7 +41,7 @@ concurrency:
 jobs:
   scan:
     name: Security Scan
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     env:
       # Route uv at PyPI for the semgrep fetch.
