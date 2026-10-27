@@ -14,6 +14,10 @@ name: E2E Tests
 #                       ci.yml, with no fork-e2e/** mirror (#802 removed the
 #                       credential setup). The eight shard checks are required by
 #                       merge-ready.yml.
+#
+# Workers per shard: the dispatch input, else the E2E_PARALLELISM repository
+# variable, else 3. Set the variable to retune runs without a code change;
+# fork PRs never see repository variables and always use the default.
 
 on:
   schedule:
@@ -41,9 +45,9 @@ on:
   workflow_dispatch:
     inputs:
       parallelism:
-        description: "Number of pytest workers per shard (-n flag). Default 3 runs up to 24 workers across 8 shards."
+        description: "Number of pytest workers per shard (-n flag). Empty uses the E2E_PARALLELISM repository variable, else 3."
         required: false
-        default: "3"
+        default: ""
 
 concurrency:
   # PRs key by number, dispatch by branch (so re-runs cancel); schedule keys
@@ -148,5 +152,5 @@ jobs:
         with:
           shard_id: ${{ matrix.shard_id }}
           num_shards: ${{ matrix.num_shards }}
-          parallelism: ${{ github.event.inputs.parallelism || '3' }}
+          parallelism: ${{ github.event.inputs.parallelism || vars.E2E_PARALLELISM || '3' }}
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
