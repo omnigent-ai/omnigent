@@ -203,6 +203,11 @@ classes. `native_launch_os_errno`, `native_launch_os_errno_name`, and
 chain. Missing fields mean unavailable evidence. These fields contain no raw
 exception messages, paths, arguments, or pane output.
 
+`native_launch_code_origin` identifies the last available Omnigent module,
+function, and line in the exception traceback, falling back to the available
+leaf when no framework frame exists. It names the launch operation without
+exporting its filesystem path; an exception without a traceback omits it.
+
 Older runners can omit the context; malformed and unknown fields are ignored.
 The context does not change error codes, display text, status handling, or
 retry policy, and does not add failure records.
@@ -317,6 +322,11 @@ For example, a Claude `StopFailure` containing `error=server_error` and
 evidence of the cause. If the server fills in absent detail from stored assistant
 output, it records `detail_source=assistant_output_fallback`; if it finds no
 output, it records `detail_source=missing`.
+
+If Claude hook evidence collection raises, the failed status still carries the
+hook identity, category when present, and runner version. Its
+`failure_context_error_phase` and `failure_context_error_type` describe the
+diagnostic failure, not the native turn's cause; no exception text is added.
 
 | Attributes | Source and meaning |
 | --- | --- |

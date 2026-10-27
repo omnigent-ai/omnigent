@@ -453,11 +453,11 @@ _INPUT_LIFECYCLE_EVENT_TYPES = frozenset(
 )
 
 
-def _input_stable_id(source: Mapping[str, object]) -> str | None:
-    """Return one validated web input id from a runner or harness body."""
-    value = source.get("input_stable_id") or source.get("stable_id")
-    validated = input_attributes({"input_stable_id": value}).get("input_stable_id")
-    return validated if isinstance(validated, str) else None
+def _input_identity(source: Mapping[str, object]) -> dict[str, str | int]:
+    """Return validated client and server input IDs from a runner or harness body."""
+    return input_attributes(
+        {**source, "input_stable_id": source.get("input_stable_id") or source.get("stable_id")}
+    )
 
 
 def _response_body_preview(resp: object, *, limit: int = 500) -> str:
@@ -795,7 +795,7 @@ def _response_failed_payload(
     error: Mapping[str, object],
     source: str = "execution",
     *,
-    input_stable_id: str | None = None,
+    input_identity: Mapping[str, object] | None = None,
 ) -> _JsonObject:
     """Build a failure envelope with required error fields and a legacy mirror."""
     failure_error = {**_normalize_turn_error(error), **error}
@@ -805,8 +805,7 @@ def _response_failed_payload(
         "response": {"status": "failed", "error": failure_error},
         "error": failure_error,
     }
-    if input_stable_id is not None:
-        payload["input_stable_id"] = input_stable_id
+    payload.update(input_attributes(input_identity))
     return payload
 
 
@@ -814,7 +813,7 @@ def _response_failed_event(
     error: Mapping[str, object],
     source: str = "execution",
     *,
-    input_stable_id: str | None = None,
+    input_identity: Mapping[str, object] | None = None,
 ) -> bytes:
     """
     Encode one ``response.failed`` SSE frame.
@@ -835,7 +834,7 @@ def _response_failed_event(
         _response_failed_payload(
             error,
             source=source,
-            input_stable_id=input_stable_id,
+            input_identity=input_identity,
         )
     )
     return f"event: response.failed\ndata: {payload}\n\n".encode()
@@ -4912,13 +4911,13 @@ def create_runner_app(
                 )
                 error: dict[str, object] = {"message": f"turn setup failed: {exc}"}
                 if not handed_off[0]:
-                    stable_id = _input_stable_id(msg_body)
-                    if stable_id is not None:
+                    identity = _input_identity(msg_body)
+                    if identity:
                         _publish_event(
                             conv,
                             _response_failed_payload(
                                 {**error, "undelivered": True},
-                                input_stable_id=stable_id,
+                                input_identity=identity,
                             ),
                         )
                 _on_proxy_stream_end(conv, error=error)
@@ -5363,14 +5362,14 @@ def create_runner_app(
                 error["message"],
                 extra={"session_id": conv},
             )
-            stable_id = _input_stable_id(harness_body)
-            if stable_id is not None:
+            identity = _input_identity(harness_body)
+            if identity:
                 _publish_event(
                     conv,
                     _response_failed_payload(
                         {**error, "undelivered": True},
                         source="harness",
-                        input_stable_id=stable_id,
+                        input_identity=identity,
                     ),
                 )
             _on_proxy_stream_end(conv, error=error)
@@ -5701,7 +5700,7 @@ def create_runner_app(
                 should_dispatch_locally,
             )
 
-            turn_input_stable_id = _input_stable_id(body)
+            turn_input_identity = _input_identity(body)
 
             if _eager_spec_error is not None:
                 _err_type, _err_msg = _eager_spec_error
@@ -5712,7 +5711,7 @@ def create_runner_app(
                 }
                 _fail = _response_failed_payload(
                     _error,
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
                 _publish_event(conv_id, _fail)
                 _on_proxy_stream_end(
@@ -5721,7 +5720,7 @@ def create_runner_app(
                 )
                 yield _response_failed_event(
                     _error,
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
                 return
 
@@ -5816,7 +5815,7 @@ def create_runner_app(
                         _fail_status = _response_failed_payload(
                             _rejection,
                             source="harness",
-                            input_stable_id=turn_input_stable_id,
+                            input_identity=turn_input_identity,
                         )
                         _publish_event(
                             conv_id,
@@ -5829,7 +5828,7 @@ def create_runner_app(
                         yield _response_failed_event(
                             _rejection,
                             source="harness",
-                            input_stable_id=turn_input_stable_id,
+                            input_identity=turn_input_identity,
                         )
                         return
 
@@ -6023,7 +6022,7 @@ def create_runner_app(
                                             _err_type, _err_msg = _lazy_err
                                             _fail = _response_failed_payload(
                                                 {"message": _err_msg, "type": _err_type},
-                                                input_stable_id=turn_input_stable_id,
+                                                input_identity=turn_input_identity,
                                             )
                                             _publish_event(conv_id, _fail)
                                             _on_proxy_stream_end(
@@ -6036,7 +6035,7 @@ def create_runner_app(
                                             )
                                             yield _response_failed_event(
                                                 {"message": _err_msg, "type": _err_type},
-                                                input_stable_id=turn_input_stable_id,
+                                                input_identity=turn_input_identity,
                                             )
                                             return
                                         _local_tool_workdir = _resolved_workdir_for_spec(
@@ -6209,9 +6208,9 @@ def create_runner_app(
                                 continue
                             if (
                                 event.get("type") in _INPUT_LIFECYCLE_EVENT_TYPES
-                                and turn_input_stable_id is not None
+                                and turn_input_identity
                             ):
-                                event["input_stable_id"] = turn_input_stable_id
+                                event.update(turn_input_identity)
                                 if data_index is not None:
                                     frame_lines[data_index] = f"data: {_json.dumps(event)}"
                                     raw_sse_bytes = ("\n".join(frame_lines) + "\n\n").encode()
@@ -6245,14 +6244,14 @@ def create_runner_app(
                 _overflow_fail = _response_failed_payload(
                     _error,
                     source="llm",
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
                 _publish_event(conv_id, _overflow_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(
                     _error,
                     source="llm",
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
 
             except (httpx.HTTPError, RuntimeError) as exc:
@@ -6306,14 +6305,14 @@ def create_runner_app(
                 _http_fail = _response_failed_payload(
                     _error,
                     source="harness",
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
                 _publish_event(conv_id, _http_fail)
                 _on_proxy_stream_end(conv_id, error=_error, owner_response_id=_response_id)
                 yield _response_failed_event(
                     _error,
                     source="harness",
-                    input_stable_id=turn_input_stable_id,
+                    input_identity=turn_input_identity,
                 )
 
         return StreamingResponse(

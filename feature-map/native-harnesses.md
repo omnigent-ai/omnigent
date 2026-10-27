@@ -45,16 +45,17 @@ implements them separately, so a fix for one harness does not reach the others.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.
-- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups
-  stay in that thread, and closing it leaves the parent usable.
+- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
+  including those sent while it works, stay in that thread, and closing it
+  leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
 - `idle-reap`: a finished native pane left alone past the idle window closes
   with its forwarder, helper server and tool relay; the next message brings it
   back with the conversation. Kimi is exempt; live work and open prompts stay.
 - `subagent-discovery`: Claude children appear under the agent that spawned
-  them, including delayed spawns; an unresolved spawn does not keep an idle
-  runner re-reading unchanged conversations.
+  them, including forked slash commands and delayed spawns; an unresolved
+  spawn does not keep an idle runner re-reading unchanged conversations.
 - `disconnect`: startup waits and active operations settle when their native
   connection ends; reconnect can receive fresh events. Distinguish a native
   CLI disconnect, a runner going offline, and a browser stream reconnect.
@@ -112,7 +113,9 @@ without a session ID to resume.
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
 the linked session's Agents panel and check the child under its parent. Ask a
 child to delegate again to check nested ownership; completed children remain
-visible while the runner idles.
+visible while the runner idles. Also invoke an installed skill configured with
+`context: fork`, such as `/code-review`, from Chat or the native terminal.
+The skill's agent and any helpers it delegates should appear in the same tree.
 
 **Native Gemini setup:** run `omni setup` → Antigravity → Configure native agy
 API key / gateway. If existing providers conflict, choose the Gemini default
@@ -371,6 +374,29 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`model-and-effort`, Claude runtime selection (own environment):**
+  `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
+  uses real Claude catalog discovery, tmux, statusLine and the runner event
+  endpoint. With the per-session options cache still cold, repeated `opus` and
+  `opus[1m]` selections retain the exact launch-pinned generation and context.
+  It then switches to a managed GLM picker ID and back, opens Claude's model
+  picker, and confirms another switch reclaims that surface successfully.
+  Run `OMNIGENT_E2E_CLAUDE_NATIVE=1 uv run --no-sync pytest tests/e2e/test_claude_native_managed_model_switch.py --reruns 0`.
+  Requires Claude Code and tmux; use a clean container if machine-managed
+  settings override the fixture's picker. It makes no model calls and does not
+  verify browser rendering or live gateway servability.
+- **`model-and-effort`, Claude browser selection and refusal (nightly):**
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
+  proves alias picks through the gear, model pill and Ctrl+Shift+M using
+  the real browser, server, owned isolated host, runner and CLI. Subsequent
+  mock requests preserve the wire model's generation; native status and
+  `requestedModel` retain `[1m]`, with a correlated `context-1m` request beta.
+  Chat and the transcript each contain the reply once.
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
+  pauses its owned CLI to force a real unconfirmed switch; a late 503 preserves
+  a newer same-value model write and its effort while the applied model stays
+  unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
+  These cases do not cover live providers or a post-refusal retry.
 - **`model-and-effort`, Pi inference bindings (component):**
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal
@@ -558,6 +584,14 @@ Cross-harness journeys:
   terminal. Check retained history and cumulative input usage 1,000 → 1,100 →
   1,200. The provider replies and usage are scripted; this does not prove live
   billing or recovery after the runner deletes the bridge directory.
+- **`resume`, Pi cost reporting (component boundaries):**
+  `tests/harnesses/pi_native/test_pi_native_extension.py` exercises Pi-reported
+  dollars, duplicate callbacks, local/server restart baselines and missing pricing.
+  `tests/server/routes/test_sessions_usage_loading.py` checks the real HTTP
+  snapshot-to-runner handoff, excluding child-session cost. An incomplete or
+  older reporter keeps server pricing; its last display subtotal is not a complete
+  cost baseline. Check the session cost before and after a resumed turn; provider
+  pricing must be available to compare dollars. These tests do not prove live billing.
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`approvals`, Pi extension dialogs:**
@@ -774,8 +808,11 @@ Cross-harness journeys:
   transcripts, then registration under the right parent when the spawn arrives.
   The same module covers cache invalidation on append and same-size rewrites,
   eviction, deleted files, transient read failures, and existing Task/fork and
-  restart behavior. These use real transcript files and forwarder code with a
-  mocked HTTP peer; they do not measure runner CPU or prove browser rendering.
+  restart behavior. The `slash_command` variant of
+  `test_subagent_watcher_preserves_nested_parent_graph_across_restart`
+  checks a forked skill without a tool-call ID and its nested helpers.
+  These use real transcript files and forwarder code with a mocked HTTP peer;
+  they do not measure runner CPU or prove browser rendering.
 - **`subagent-discovery`, Claude (manual runner performance):** use an isolated
   server/runner from this checkout, with real Claude Code and tmux and a scripted
   model endpoint. Follow the native prerequisites above; do not use a developer

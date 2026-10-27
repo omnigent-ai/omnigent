@@ -751,6 +751,19 @@ export type AnyBlock =
   | PolicyDeniedBlock
   | ResponseEndBlock;
 
+/** Whether a pending card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
+export function hasPendingOwnElicitation(
+  blocks: readonly AnyBlock[],
+  sessionId: string | null,
+): boolean {
+  return blocks.some(
+    (b) =>
+      b.type === "elicitation" &&
+      b.status === "pending" &&
+      (b.targetSessionId == null || b.targetSessionId === sessionId),
+  );
+}
+
 /**
  * Item-id prefix marking a provisional, in-flight assistant-text block —
  * a live-streaming preview that lives in `blocks` until its authoritative

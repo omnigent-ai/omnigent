@@ -23,6 +23,9 @@ import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { useSessionActive } from "@/hooks/useWorkspaceChangedFiles";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+import { useFileViewer } from "./FileViewerContext";
+import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceImage";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
@@ -226,6 +229,7 @@ function MarkdownRichTextViewerInner({
   searchInputRef,
   setContentRef,
 }: InnerProps) {
+  const openFile = useFileViewer();
   const [isCopied, setIsCopied] = useState(false);
   const copyTimeoutRef = useRef<number>(0);
   useEffect(
@@ -235,6 +239,7 @@ function MarkdownRichTextViewerInner({
     [],
   );
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const linkMouseDownRef = useRef<{ x: number; y: number } | null>(null);
   // Persist/restore the editor's scroll position across unmount/remount and
   // session switches. Content is present at mount (the parent gates on the
   // file query), so the restore is ready immediately.
@@ -475,17 +480,47 @@ function MarkdownRichTextViewerInner({
         ref={scrollContainerRef}
         onScroll={handleScrollPersist}
         className="relative flex-1 overflow-auto px-8 py-6"
-        // Link following. The Link extension runs with openOnClick:false so a
-        // plain click in edit mode positions the cursor instead of navigating.
-        // Read-only: any click on a link opens it. Edit mode: a modifier-click
-        // (⌘/Ctrl) opens it, and the caret in a link shows MarkdownLinkBubble's
-        // Open action, so plain-click-to-edit is preserved (incl. in tables).
-        onClick={(e) => {
-          if (canEdit && !e.metaKey && !e.ctrlKey) return;
-          const anchor = (e.target as Element).closest("a[href]");
-          if (anchor) {
-            e.preventDefault();
-            window.open(anchor.getAttribute("href")!, "_blank", "noopener,noreferrer");
+        onMouseDown={(event) => {
+          linkMouseDownRef.current = { x: event.clientX, y: event.clientY };
+        }}
+        // Follow links with one click in both modes. Alt-click places the
+        // editing caret; Shift-click and dragging retain text selection.
+        onClick={(event) => {
+          const mouseDown = linkMouseDownRef.current;
+          linkMouseDownRef.current = null;
+          if (event.defaultPrevented || event.button !== 0) return;
+          const anchor = (event.target as Element).closest("a[href]");
+          if (!anchor) return;
+          const href = anchor.getAttribute("href");
+          // The editor may collapse a previous selection only after click.
+          // Suppress navigation for a selection gesture, not that stale range.
+          const selectingText =
+            window.getSelection()?.isCollapsed === false &&
+            (event.detail > 1 ||
+              (mouseDown &&
+                (Math.abs(event.clientX - mouseDown.x) > 4 ||
+                  Math.abs(event.clientY - mouseDown.y) > 4)));
+          if (
+            !href ||
+            /^[?#]/.test(href) ||
+            selectingText ||
+            (canEdit && !event.metaKey && !event.ctrlKey && (event.altKey || event.shiftKey))
+          ) {
+            event.preventDefault();
+            return;
+          }
+          if (isWorkspaceRelativeSrc(href)) {
+            event.preventDefault();
+            const filePath = resolveWorkspacePath(path, href);
+            if (filePath) openFile?.(filePath);
+            return;
+          }
+          followLinkWithPopupFallback(event, href, conversationId);
+          // Contenteditable anchors have no native navigation, including
+          // modified clicks and the desktop shell's external-browser path.
+          if (!event.defaultPrevented) {
+            event.preventDefault();
+            window.open(href, "_blank", "noopener,noreferrer");
           }
         }}
       >

@@ -3400,22 +3400,27 @@ def _databricks_launch_materialization(
         raise CodexDatabricksProfileMissingError(profile)
     host = host.rstrip("/")
     resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
-    base_url, auth_command, auth_refresh_interval_ms = _databricks_codex_gateway(host, profile)
+    base_url, auth_command, auth_refresh_interval_ms, auth_config = _databricks_codex_gateway(
+        host, profile
+    )
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
             model=resolved_model,
             base_url=base_url,
             auth_command=auth_command,
             auth_refresh_interval_ms=auth_refresh_interval_ms,
+            auth_config=auth_config,
         ),
         model=resolved_model,
         host=host,
     )
 
 
-def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | None]:
+def _databricks_codex_gateway(
+    host: str, profile: str
+) -> tuple[str, str, int | None, dict[str, object] | None]:
     """
-    Return the Codex gateway base URL, auth command and refresh cadence for *host*.
+    Return the Codex gateway URL, shell helper, cadence and structured auth for *host*.
 
     ucode state is the source of truth for the gateway and auth; the
     profile-derived gateway is the fallback.
@@ -3423,7 +3428,7 @@ def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | 
     :param host: Databricks workspace host, e.g. ``"https://example.databricks.com"``.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
     :returns: ucode's ``codex`` entry for *host* when it names both a base URL and
-        an auth command, else the profile-derived gateway with the default cadence.
+        an auth command, else the profile-derived gateway with default auth settings.
     """
     from omnigent.onboarding.ucode_state import read_ucode_state
 
@@ -3439,8 +3444,13 @@ def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | 
         workspace_state = None
     agent = workspace_state.agent("codex") if workspace_state is not None else None
     if agent is not None and agent.base_url and agent.auth_command:
-        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms
-    return _databricks_codex_base_url(host), _databricks_codex_auth_command(host, profile), None
+        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms, agent.auth
+    return (
+        _databricks_codex_base_url(host),
+        _databricks_codex_auth_command(host, profile),
+        None,
+        None,
+    )
 
 
 # DATABRICKS-PATCH(codex-live-model-discovery)

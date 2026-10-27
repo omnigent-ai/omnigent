@@ -522,8 +522,10 @@ def mark_delivery_stage(
 
 def mark_lifecycle(
     conversation_id: str,
-    stable_id: str,
+    stable_id: str | None = None,
     *,
+    pending_id: str | None = None,
+    delivery_attempt_id: str | None = None,
     stage: NativeInputDeliveryStage,
     cause_class: NativeInputCauseClass | None = None,
     reason_code: str | None = None,
@@ -531,8 +533,18 @@ def mark_lifecycle(
     lifecycle_response_id: str | None = None,
 ) -> str | None:
     """Attach one identity-linked runner lifecycle edge to a queued input."""
-    stable = input_attributes({"input_stable_id": stable_id}).get("input_stable_id")
-    if not isinstance(stable, str) or stage not in _DELIVERY_STAGES:
+    identity = {
+        key: value
+        for key, value in {
+            "input_stable_id": stable_id,
+            "pending_id": pending_id,
+            "delivery_attempt_id": delivery_attempt_id,
+        }.items()
+        if value is not None
+    }
+    if input_attributes(identity) != identity or stage not in _DELIVERY_STAGES:
+        return None
+    if stable_id is None and (pending_id is None or delivery_attempt_id is None):
         return None
     if cause_class is not None and cause_class not in _CAUSE_CLASSES:
         cause_class = None
@@ -547,7 +559,14 @@ def mark_lifecycle(
     with _lock:
         _evict_stale_locked(conversation_id, _now())
         for entry in _pending.get(conversation_id, {}).values():
-            if entry.stable_id != stable:
+            if stable_id is not None and entry.stable_id != stable_id:
+                continue
+            if pending_id is not None and entry.pending_id != pending_id:
+                continue
+            if (
+                delivery_attempt_id is not None
+                and entry.delivery_attempt_id != delivery_attempt_id
+            ):
                 continue
             entry.last_delivery_stage = stage
             if cause_class is not None:

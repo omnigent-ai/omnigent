@@ -2191,6 +2191,7 @@ def _databricks_codex_config_overrides(
     base_url: str,
     auth_command: str,
     auth_refresh_interval_ms: int | None = None,
+    auth_config: Mapping[str, object] | None = None,
 ) -> list[str]:
     """Return TOML-fragment overrides for the Codex per-conversation config.
 
@@ -2202,10 +2203,28 @@ def _databricks_codex_config_overrides(
         a bearer token, e.g. ``"databricks auth token --host ..."``.
     :param auth_refresh_interval_ms: Refresh cadence in milliseconds,
         e.g. ``900000``.
+    :param auth_config: ucode's structured auth command, args and timeout.
+        Invalid or missing values retain the legacy shell helper and defaults.
     :returns: Codex TOML-fragment override strings.
     """
     provider_name = "omnigent_databricks"
-    auth_command_json = json.dumps(auth_command)
+    command = "sh"
+    args = ["-c", auth_command]
+    timeout_ms = _GATEWAY_AUTH_TIMEOUT_MS
+    if auth_config is not None:
+        configured_command = auth_config.get("command")
+        configured_args = auth_config.get("args", [])
+        if (
+            isinstance(configured_command, str)
+            and configured_command.strip()
+            and isinstance(configured_args, list)
+            and all(isinstance(arg, str) for arg in configured_args)
+        ):
+            command = configured_command
+            args = configured_args
+        configured_timeout = auth_config.get("timeout_ms")
+        if type(configured_timeout) is int and configured_timeout > 0:
+            timeout_ms = configured_timeout
     return [
         f"model={json.dumps(model)}",
         f'model_provider="{provider_name}"',
@@ -2214,9 +2233,9 @@ def _databricks_codex_config_overrides(
             "model_providers.omnigent_databricks="
             '{name="Omnigent Databricks",'
             f"base_url={json.dumps(base_url)},"
-            'auth={command="sh",'
-            f'args=["-c",{auth_command_json}],'
-            f"timeout_ms={_GATEWAY_AUTH_TIMEOUT_MS},"
+            f"auth={{command={json.dumps(command)},"
+            f"args={json.dumps(args)},"
+            f"timeout_ms={timeout_ms},"
             f"refresh_interval_ms={auth_refresh_interval_ms or _GATEWAY_AUTH_REFRESH_MS}"
             "},"
             'wire_api="responses"}'
