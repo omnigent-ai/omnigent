@@ -39,6 +39,7 @@ from typing import Any
 import httpx
 import pytest
 
+from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.live_server import isolated_process_env
 from tests.e2e._harness_probes import cli_unavailable_reason
 from tests.e2e.conftest import configure_mock_llm, get_mock_requests
@@ -403,12 +404,7 @@ def test_pi_native_smart_routing_applies_pick(pi_home: Path, mock_llm: str, surf
 
 
 def _teardown(child: Any, env: dict[str, str]) -> None:
-    """Detach the CLI and stop the auto-spawned server + local daemon.
-
-    A broad ``pkill`` is deliberately avoided: this test's own filename on the
-    pytest command line contains ``pi_native``, so a broad pattern would kill
-    the runner. ``omni server stop`` reaps the runner-owned Pi/tmux via the daemon.
-    """
+    """Detach the CLI and reap only this test's server and daemon processes."""
     with contextlib.suppress(Exception):
         child.kill(signal.SIGTERM)
     time.sleep(2)
@@ -419,9 +415,5 @@ def _teardown(child: Any, env: dict[str, str]) -> None:
     if child.logfile_read is not None:
         with contextlib.suppress(Exception):
             child.logfile_read.close()
-    omni_bin = Path(sys.executable).parent / "omni"
-    if omni_bin.exists():
-        with contextlib.suppress(Exception):
-            subprocess.run(
-                [str(omni_bin), "server", "stop"], env=env, capture_output=True, timeout=60
-            )
+    _, survivors = reap_leaked_omnigent_processes(env["OMNIGENT_DATA_DIR"])
+    assert not survivors, f"Test processes survived cleanup: {survivors}"
