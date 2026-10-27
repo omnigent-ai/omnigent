@@ -219,7 +219,14 @@ _CODEX_HOME_SYMLINK_DIRS = (
     # same memories and rules as the real home without replicating them.
     Path("memories"),
     Path("rules"),
+    # Codex's account-keyed remote plugin catalog (~40 MB, 3 h TTL), written
+    # atomically; shared so each session reuses a fresh copy instead of
+    # downloading and storing its own.
+    Path("cache") / "remote_plugin_catalog",
 )
+# Shared dirs Codex creates only on first use; created in the real home so a
+# host that never ran ``codex`` directly still shares one copy.
+_CODEX_HOME_CREATED_SYMLINK_DIRS = frozenset({Path("cache") / "remote_plugin_catalog"})
 _CODEX_MINIMAL_CONFIG_ENV = "HARNESS_CODEX_MINIMAL_CONFIG"
 _CODEX_PROVIDER_CONFIG_PREFIX = "model_providers."
 _BROKERED_CODEX_PROVIDER_NAME = "omnigent_brokered"
@@ -1235,6 +1242,12 @@ def _populate_codex_home_config(
     if not minimal_config:
         for reldir in _CODEX_HOME_SYMLINK_DIRS:
             source_subdir = source_dir / reldir
+            if reldir in _CODEX_HOME_CREATED_SYMLINK_DIRS:
+                # Codex writes this cache, so an unwritable source keeps it private.
+                with suppress(OSError):
+                    source_subdir.mkdir(parents=True, exist_ok=True)
+                if not os.access(source_subdir, os.W_OK):
+                    continue
             if not source_subdir.is_dir():
                 continue
             link_path = target_dir / reldir
