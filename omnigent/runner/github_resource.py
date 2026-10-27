@@ -435,7 +435,7 @@ def _summarize_checks(rollup: Any) -> dict[str, Any]:
 
 
 # Cap the comments list so a very chatty PR can't bloat the payload; keep the
-# earliest comments after merging issue comments and review bodies.
+# latest comments after merging issue comments and review bodies.
 _MAX_COMMENTS = 100
 
 
@@ -514,14 +514,14 @@ def _shape_comments(
             }
         )
     shaped.sort(key=lambda comment: comment["created_at"] or "")
-    return shaped[:_MAX_COMMENTS] if cap else shaped
+    return shaped[-_MAX_COMMENTS:] if cap else shaped
 
 
 def _comments_payload(data: dict[str, Any]) -> dict[str, Any]:
     comments = data.get("comments")
     reviews = data.get(_PR_COMMENTS_FIELD)
     shaped = _shape_comments(comments, reviews, pr_url=data.get("url"), cap=False)
-    result: dict[str, Any] = {"comments": shaped[:_MAX_COMMENTS]}
+    result: dict[str, Any] = {"comments": shaped[-_MAX_COMMENTS:]}
     if (
         not isinstance(comments, list)
         or not isinstance(reviews, list)
@@ -714,7 +714,59 @@ def _gh_pr_view(
         data = json.loads(out)
     except ValueError:
         return None
-    return data if isinstance(data, dict) else None
+    if not isinstance(data, dict):
+        return None
+    comments = data.get("comments")
+    if isinstance(comments, list) and len(comments) >= _MAX_COMMENTS:
+        _refresh_latest_comments(data, cwd=cwd, token=token)
+    return data
+
+
+def _refresh_latest_comments(data: dict[str, Any], *, cwd: str, token: str | None) -> None:
+    """Read the latest page when gh's bounded conversation list may omit new posts."""
+    url = data.get("url")
+    if not isinstance(url, str):
+        return
+    try:
+        reference = PullRequestRef.from_url(url)
+        host = _host_args(cwd, reference)
+    except ValueError:
+        return
+    owner, name = reference.repository.split("/", 1)
+    query = """query($owner: String!, $name: String!, $number: Int!) {
+      repository(owner: $owner, name: $name) {
+        pullRequest(number: $number) {
+          comments(last: 100) {
+            nodes { author { login } body createdAt url isMinimized }
+          }
+        }
+      }
+    }"""
+    rc, out, _ = _gh(
+        [
+            "api",
+            *host,
+            "graphql",
+            "-f",
+            f"query={query}",
+            "-f",
+            f"owner={owner}",
+            "-f",
+            f"name={name}",
+            "-F",
+            f"number={reference.number}",
+        ],
+        cwd=cwd,
+        token=token,
+    )
+    if rc != 0:
+        return
+    try:
+        latest = json.loads(out)["data"]["repository"]["pullRequest"]["comments"]["nodes"]
+    except (ValueError, KeyError, TypeError):
+        return
+    if isinstance(latest, list):
+        data["comments"] = latest
 
 
 def _checks_fields(data: dict[str, Any]) -> dict[str, Any]:
@@ -1870,6 +1922,70 @@ _ATTACHMENT_REQUEST_SECONDS = 110.0
 _ATTACHMENT_TIMED_OUT = "GitHub took too long to upload the file. Try again."
 
 
+def _pr_json_write(
+    root: str,
+    *,
+    host: list[str],
+    token: str | None,
+    method: str,
+    endpoint: str,
+    fields: dict[str, Any],
+) -> tuple[int | None, str, str]:
+    """Send Markdown in a JSON file so shell syntax and long bodies remain literal."""
+    with tempfile.NamedTemporaryFile(
+        "w", suffix=".json", encoding="utf-8", delete_on_close=False
+    ) as payload:
+        json.dump(fields, payload)
+        payload.close()
+        return _gh(
+            ["api", *host, "-X", method, endpoint, "--input", payload.name],
+            cwd=root,
+            token=token,
+        )
+
+
+def _create_comment(root: str, reference: PullRequestRef, *, body: str) -> dict[str, Any]:
+    """Post once and return GitHub's canonical comment, without a follow-up read."""
+    uncertain = "Could not confirm comment posting. Check GitHub before retrying."
+    with _gh_deadline_scope(time.monotonic() + _PR_EDIT_REQUEST_SECONDS):
+        host = _host_args(root, reference)
+        token = _pr_token(root, reference)
+        if _gh_timed_out.get():
+            raise ValueError("GitHub authentication timed out. Your comment was not sent.")
+        rc, out, err = _pr_json_write(
+            root,
+            host=host,
+            token=token,
+            method="POST",
+            endpoint=f"repos/{reference.repository}/issues/{reference.number}/comments",
+            fields={"body": body},
+        )
+        if _gh_timed_out.get():
+            raise ValueError(uncertain)
+    try:
+        result = json.loads(out)
+    except ValueError:
+        result = None
+    if rc != 0 or not isinstance(result, dict):
+        if re.search(r"\(HTTP 40[134]\)", err):
+            raise ValueError("The GitHub account on the host cannot post to this conversation.")
+        if "(HTTP 422)" in err:
+            raise ValueError("GitHub rejected the comment. Check its length and try again later.")
+        raise ValueError(uncertain)
+    if not result.get("id") or not isinstance(result.get("html_url"), str):
+        raise ValueError(uncertain)
+    author = result.get("user")
+    return {
+        "object": "session.github.pr_comment",
+        "comment": {
+            "author": author.get("login") if isinstance(author, dict) else None,
+            "body": result.get("body") or "",
+            "created_at": result.get("created_at"),
+            "url": result["html_url"],
+        },
+    }
+
+
 def _edit_details(
     root: str, reference: PullRequestRef, *, title: str | None, body: str | None
 ) -> dict[str, Any]:
@@ -1887,24 +2003,14 @@ def _edit_details(
         fields = {
             key: value for key, value in (("title", title), ("body", body)) if value is not None
         }
-        with tempfile.NamedTemporaryFile(
-            "w", suffix=".json", encoding="utf-8", delete_on_close=False
-        ) as payload:
-            json.dump(fields, payload)
-            payload.close()
-            rc, out, err = _gh(
-                [
-                    "api",
-                    *host,
-                    "-X",
-                    "PATCH",
-                    f"repos/{reference.repository}/pulls/{reference.number}",
-                    "--input",
-                    payload.name,
-                ],
-                cwd=root,
-                token=token,
-            )
+        rc, out, err = _pr_json_write(
+            root,
+            host=host,
+            token=token,
+            method="PATCH",
+            endpoint=f"repos/{reference.repository}/pulls/{reference.number}",
+            fields=fields,
+        )
         if _gh_timed_out.get():
             raise ValueError(_DETAILS_EDIT_TIMED_OUT)
     try:

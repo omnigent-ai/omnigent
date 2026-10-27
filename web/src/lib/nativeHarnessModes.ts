@@ -61,6 +61,14 @@ export function canonicalNativeHarness(harness: string): string {
   return NATIVE_HARNESS_ALIASES[harness] ?? harness;
 }
 
+/** Canonical key used by host account metadata and login/logout routes. */
+export function harnessAccountKey(harness: string): string {
+  const canonical = canonicalNativeHarness(harness);
+  if (canonical.endsWith("-native")) return canonical.slice(0, -"-native".length);
+  if (canonical.startsWith("native-")) return canonical.slice("native-".length);
+  return canonical;
+}
+
 /** Shared permission concept for presentation across native harness vocabularies. */
 export function permissionModeConcept(
   harness: string | null | undefined,

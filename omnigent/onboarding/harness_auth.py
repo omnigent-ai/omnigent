@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import os
+import shutil
 from collections.abc import Callable
 from typing import Literal, NamedTuple, Protocol
 
@@ -247,7 +248,7 @@ class DetectedCredential(NamedTuple):
     Carries only non-secret metadata — the source label (e.g. an env var name)
     and the family it serves — never the secret value itself.
 
-    :param family: The family it serves, ``"anthropic"`` or ``"openai"``.
+    :param family: The family it serves, including non-adoptable ``"databricks"``.
     :param source: A human-readable, non-secret source label, e.g.
         ``"$ANTHROPIC_API_KEY"`` (an env var) or ``"claude CLI login"``.
     :param env_var: The environment variable name when the source is an env
@@ -261,24 +262,42 @@ class DetectedCredential(NamedTuple):
 
 
 def detect_adoptable_credentials() -> list[DetectedCredential]:
-    """Return credentials already on the host the UI can offer to adopt.
+    """Return non-secret credential sources already present on the host.
 
     Wraps the existing ambient detection (:func:`ambient.detect_providers`),
     surfacing only the ``key``-kind env-var credentials for the v1 UI-auth
     families as non-secret descriptors. Never returns a secret value — only the
     source label + env var name, so the UI can offer "Use $ANTHROPIC_API_KEY"
-    and adopt it by reference. Never raises (a detection failure yields an empty
-    list rather than crashing the readiness/adopt path).
+    and adopt it by reference. Databricks sources are visibility hints only and
+    carry no env var, so the existing adoption path rejects them. Never raises.
     """
+    result: list[DetectedCredential] = []
+    try:
+        from omnigent.onboarding.harness_readiness import _databricks_credential_source
+
+        databricks_source = _databricks_credential_source()
+    except Exception:
+        databricks_source = None
+        _logger.debug("detect_adoptable_credentials: Databricks detection failed", exc_info=True)
+    if databricks_source is not None:
+        result.append(DetectedCredential("databricks", databricks_source, None))
+    else:
+        try:
+            isaac_available = shutil.which("isaac") is not None
+        except Exception:
+            isaac_available = False
+            _logger.debug("detect_adoptable_credentials: isaac detection failed", exc_info=True)
+        if isaac_available:
+            result.append(DetectedCredential("databricks", "isaac CLI", None))
+
     try:
         from omnigent.onboarding.ambient import detect_providers
 
         detected = detect_providers()
     except Exception:
         _logger.debug("detect_adoptable_credentials: detection failed", exc_info=True)
-        return []
+        return result
 
-    result: list[DetectedCredential] = []
     seen: set[tuple[str, str]] = set()
     for provider in detected:
         family = getattr(provider, "family", None)

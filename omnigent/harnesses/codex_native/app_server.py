@@ -187,7 +187,7 @@ _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
 class CodexAppServerSilentStartTimeout(RuntimeError):
-    """Readiness timed out while the app-server process was alive but never listened.
+    """Readiness timed out while the app-server process was alive but never initialized.
 
     Carries the timeout message; ``start()`` respawns the process once and
     turns a second occurrence into a plain ``RuntimeError``.
@@ -2341,12 +2341,12 @@ class CodexNativeAppServer:
             try:
                 startup_client = await self._wait_until_ready()
             except CodexAppServerSilentStartTimeout as silent:
-                # A loaded host can leave a fresh app-server silent; a second spawn
-                # listens. It must reuse the transport: callers captured the listen
+                # A fresh app-server can stall before initialization; a second spawn
+                # can recover. Reuse the transport: callers captured the listen
                 # URL before start() and hand it to the TUI, forwarder and bridge.
                 with contextlib.suppress(Exception):  # diagnostics never block recovery
                     _logger.warning(
-                        "Codex app-server never listened and is still running "
+                        "Codex app-server never initialized and is still running "
                         "(recent_stderr_bytes=%d); respawning it once on the same transport",
                         silent.recent_stderr_bytes,
                         extra=self._startup_snapshot_event(
@@ -2644,18 +2644,18 @@ class CodexNativeAppServer:
         Wait until the app-server socket accepts an initialized
         client, and return that connection for startup RPCs.
 
-        The budget bounds the retry loop; a connect attempt already in
-        flight when it expires is not interrupted.
+        The budget bounds both connection retries and the initialize handshake.
 
         :returns: Connected app-server client. The caller owns it.
         :raises CodexAppServerSilentStartTimeout: If the budget expires while
-            the process is still alive and never listened; ``start()``
+            the process is still alive and never initialized; ``start()``
             respawns it once.
         :raises RuntimeError: If the app-server exits early.
         """
-        deadline = asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _APP_SERVER_READY_TIMEOUT_SECONDS
         last_error: Exception | None = None
-        while asyncio.get_running_loop().time() < deadline:
+        while loop.time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:
                 detail = " | ".join((self.recent_stderr or [])[-5:])
                 raise RuntimeError(f"Codex app-server exited early: {detail}")
@@ -2671,7 +2671,8 @@ class CodexNativeAppServer:
                         self.socket_path,
                         client_name="omnigent-probe",
                     )
-                await client.connect()
+                async with asyncio.timeout_at(deadline):
+                    await client.connect()
                 return client
             except asyncio.CancelledError:
                 if client is not None:
@@ -2683,7 +2684,9 @@ class CodexNativeAppServer:
                 if client is not None:
                     with contextlib.suppress(Exception):
                         await client.close()
-                await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+                remaining = deadline - loop.time()
+                if remaining > 0:
+                    await asyncio.sleep(min(_CONNECT_RETRY_DELAY_SECONDS, remaining))
 
         detail = " | ".join((self.recent_stderr or [])[-5:])
         target = self.listen_url or f"unix://{self.socket_path}"
@@ -2691,7 +2694,7 @@ class CodexNativeAppServer:
             f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
             f"Codex app-server at {target}: {last_error}; stderr={detail}"
         )
-        # Still running but never listened: start() can respawn it once.
+        # Still running but never initialized: start() can respawn it once.
         if self.proc is not None and self.proc.returncode is None:
             recent_stderr_bytes = sum(
                 len(line.encode("utf-8")) for line in (self.recent_stderr or [])
@@ -3400,22 +3403,27 @@ def _databricks_launch_materialization(
         raise CodexDatabricksProfileMissingError(profile)
     host = host.rstrip("/")
     resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
-    base_url, auth_command, auth_refresh_interval_ms = _databricks_codex_gateway(host, profile)
+    base_url, auth_command, auth_refresh_interval_ms, auth_config = _databricks_codex_gateway(
+        host, profile
+    )
     return _DatabricksLaunchMaterialization(
         config_overrides=_databricks_codex_config_overrides(
             model=resolved_model,
             base_url=base_url,
             auth_command=auth_command,
             auth_refresh_interval_ms=auth_refresh_interval_ms,
+            auth_config=auth_config,
         ),
         model=resolved_model,
         host=host,
     )
 
 
-def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | None]:
+def _databricks_codex_gateway(
+    host: str, profile: str
+) -> tuple[str, str, int | None, dict[str, object] | None]:
     """
-    Return the Codex gateway base URL, auth command and refresh cadence for *host*.
+    Return the Codex gateway URL, shell helper, cadence and structured auth for *host*.
 
     ucode state is the source of truth for the gateway and auth; the
     profile-derived gateway is the fallback.
@@ -3423,7 +3431,7 @@ def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | 
     :param host: Databricks workspace host, e.g. ``"https://example.databricks.com"``.
     :param profile: ``~/.databrickscfg`` profile name, e.g. ``"oss"``.
     :returns: ucode's ``codex`` entry for *host* when it names both a base URL and
-        an auth command, else the profile-derived gateway with the default cadence.
+        an auth command, else the profile-derived gateway with default auth settings.
     """
     from omnigent.onboarding.ucode_state import read_ucode_state
 
@@ -3439,8 +3447,13 @@ def _databricks_codex_gateway(host: str, profile: str) -> tuple[str, str, int | 
         workspace_state = None
     agent = workspace_state.agent("codex") if workspace_state is not None else None
     if agent is not None and agent.base_url and agent.auth_command:
-        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms
-    return _databricks_codex_base_url(host), _databricks_codex_auth_command(host, profile), None
+        return agent.base_url, agent.auth_command, agent.auth_refresh_interval_ms, agent.auth
+    return (
+        _databricks_codex_base_url(host),
+        _databricks_codex_auth_command(host, profile),
+        None,
+        None,
+    )
 
 
 # DATABRICKS-PATCH(codex-live-model-discovery)

@@ -130,3 +130,66 @@ def test_active_ecosystems_carry_labels_and_commit_prefix(entries: list[dict[str
             continue
         assert "dependencies" in entry.get("labels", []), entry["package-ecosystem"]
         assert entry.get("commit-message", {}).get("prefix") == "chore(deps)", entry
+
+
+def test_workspace_coverage_maps_to_real_jobs_and_steps():
+    import json
+
+    policy = json.loads((REPO_ROOT / ".github/dependabot-automerge.json").read_text())
+    for importer, coverage in policy["npm"]["consumers"].items():
+        assert (REPO_ROOT / importer / "package.json").is_file()
+        for consumer in coverage:
+            assert consumer["workflow"] in policy["workflow_test_jobs"], consumer
+            workflow = yaml.safe_load(
+                (REPO_ROOT / ".github/workflows" / consumer["workflow"]).read_text()
+            )
+            jobs = [job for job in workflow["jobs"].values() if job.get("name") == consumer["job"]]
+            assert len(jobs) == 1, consumer
+            assert not jobs[0].get("continue-on-error"), consumer
+            steps = [step for step in jobs[0]["steps"] if step.get("name") == consumer["step"]]
+            assert len(steps) == 1 and not steps[0].get("continue-on-error"), consumer
+
+
+@pytest.mark.parametrize(
+    "path,allowed",
+    [
+        ("uv.lock", True),
+        ("pnpm-lock.yaml", True),
+        ("tests/codex_parity/sidecar/Cargo.lock", True),
+        (".github/actions/setup-uv/action.yml", True),
+        (".github/workflows/ci.yml", True),
+        (".github/workflows/ui-snapshot-update.yml", True),
+        (".github/workflows/release-omnigent.yml", False),
+        (".github/workflows/benchmark-pr.yml", False),
+    ],
+)
+def test_app_refresh_permissions_cover_optional_and_reusable_workflows(monkeypatch, path, allowed):
+    monkeypatch.syspath_prepend(str(REPO_ROOT / ".github/scripts"))
+    from dependabot_policy import NeedsReview, require_refresh_permissions
+
+    workflows = {
+        str(workflow.relative_to(REPO_ROOT)): workflow.read_text()
+        for workflow in (REPO_ROOT / ".github/workflows").iterdir()
+        if workflow.suffix in {".yml", ".yaml"}
+    }
+    if allowed:
+        require_refresh_permissions(workflows, {path}, "dependabot/uv/ruff")
+    else:
+        with pytest.raises(NeedsReview, match="automatic branch refresh") as raised:
+            require_refresh_permissions(workflows, {path}, "dependabot/uv/ruff")
+        assert path in str(raised.value)
+
+
+@pytest.mark.parametrize("name", ["oss-regen-on-comment.yml", "oss-regenerate-and-smoke.yml"])
+def test_regeneration_preserves_pins_and_skips_install_scripts(name):
+    workflow = yaml.safe_load((REPO_ROOT / ".github/workflows" / name).read_text())
+    steps = [step for job in workflow["jobs"].values() for step in job["steps"]]
+    regeneration = [
+        step["run"] for step in steps if "pnpm install --lockfile-only" in step.get("run", "")
+    ]
+    assert len(regeneration) == 1
+    assert "pnpm install --lockfile-only --ignore-scripts" in regeneration[0]
+    assert not any("rm -f pnpm-lock.yaml" in step.get("run", "") for step in steps)
+    if name == "oss-regen-on-comment.yml":
+        setup = next(step for step in steps if "/setup-uv@" in step.get("uses", ""))
+        assert setup["with"]["version"] == "0.13.4"

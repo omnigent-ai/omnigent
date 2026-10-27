@@ -282,7 +282,10 @@ When migrating from a custom integration that inferred public-client mode from
 an absent secret, explicitly add `OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none`.
 If your trusted enterprise directory omits `email_verified`, the existing
 `OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION=1` remains a separate operator choice;
-these compatibility options never enable it automatically.
+these compatibility options never enable it automatically. Likewise, if CLI or
+device sign-in fails with "IdP did not confirm re-authentication" because the
+IdP omits `auth_time` (for example, Cloudflare Access), opt out with
+`OMNIGENT_OIDC_REQUIRE_REAUTH=0`; see `.env.example` for the trade-off.
 
 To verify a deployment, restart with the settings above, sign in from a private
 browser window, then run `omnigent login <server-url>` and finish the browser

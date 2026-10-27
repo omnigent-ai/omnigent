@@ -88,7 +88,13 @@ from omnigent.server.background_session_titles import (
     BackgroundSessionTitleCoordinator,
     RunnerBackgroundTitleGenerator,
 )
-from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
+from omnigent.server.feature_flags import (
+    Feature,
+    FeatureFlags,
+    harness_install_enabled,
+    resolve_feature_flags,
+)
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
@@ -948,7 +954,7 @@ def _ensure_default_agents(
     """
     Register all built-in agents that should always be available.
 
-    Called on every server lifespan startup. Each helper is
+    Called during server startup. Each helper is
     content-aware via :func:`_ensure_builtin_agent`: it creates the
     agent if missing and refreshes it in place when the packaged
     bundle changed, so a redeploy picks up a new spec instead of
@@ -1380,12 +1386,14 @@ def create_app(
     filesystem_attachment_allowed_extensions: (
         str | list[str] | Callable[[], str | list[str] | None] | None
     ) = None,
+    harness_install: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
     base_path: str | None = None,
     host_sharded: bool = False,
     *,
+    default_agents_seeded: bool = False,
     preference_store: PreferenceStore | None = None,
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
@@ -1406,6 +1414,8 @@ def create_app(
         file content).
     :param agent_cache: Cache for loaded agent specs and working
         directories.
+    :param default_agents_seeded: The CLI already refreshed built-ins before
+        registering explicit agent bundles; skip a second refresh at startup.
     :param runner_tunnel_tokens: Optional allow-list of binding
         tokens accepted by the runner WebSocket tunnel route, e.g.
         ``frozenset({"uA6Zz..."})``. ``None`` accepts any
@@ -1569,6 +1579,12 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    if harness_install is None:
+        app_harness_install: bool | Callable[[], bool] = resolved_feature_flags.enabled(
+            Feature.HARNESS_INSTALL
+        )
+    else:
+        app_harness_install = harness_install
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
     if automations_v2_enabled:
         if scheduled_task_store is None:
@@ -1792,7 +1808,8 @@ def create_app(
         # SessionFilesystemRegistry moved to the runner. Both
         # warmup blocks deleted here.
 
-        _ensure_default_agents(agent_store, artifact_store, agent_cache)
+        if not default_agents_seeded:
+            _ensure_default_agents(agent_store, artifact_store, agent_cache)
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.
@@ -2077,6 +2094,7 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.harness_install = app_harness_install
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -3303,10 +3321,10 @@ def create_app(
         except ImportError:
             smart_routing_enabled = False
             smart_routing_sources = {"external": False, "oss": False}
-        # The immutable feature snapshot is shared by capability
-        # advertisement and route enforcement, so frontend and backend cannot
-        # disagree during a process lifetime.
-        harness_install_enabled = app.state.feature_flags.enabled(Feature.HARNESS_INSTALL)
+        # Resolve the gate per request with the same resolver used by route enforcement.
+        current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
+        frontend_features = app.state.feature_flags.frontend_dict()
+        frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -3315,7 +3333,7 @@ def create_app(
         from omnigent.onboarding.harness_install import ui_installable_harnesses
 
         installable_harnesses = (
-            sorted(ui_installable_harnesses()) if harness_install_enabled else []
+            sorted(ui_installable_harnesses()) if current_harness_install_enabled else []
         )
         # dictation_available gates the composer mic button's server
         # speech-to-text fallback (designs/server-dictation.md). Checks
@@ -3344,8 +3362,8 @@ def create_app(
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,
-                "features": app.state.feature_flags.frontend_dict(),
-                "harness_install_enabled": harness_install_enabled,
+                "features": frontend_features,
+                "harness_install_enabled": current_harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
@@ -3704,7 +3722,11 @@ def create_app(
             pending.cancel()
 
     async def _mark_disconnected_runner_failed(
-        runner_id: str, reference_stamp: int | None, *, idle_shutdown: bool = False
+        runner_id: str,
+        reference_stamp: int | None,
+        *,
+        idle_shutdown: bool = False,
+        evidence: DisconnectEvidence | None = None,
     ) -> None:
         """Reconcile a dropped runner's sessions once the liveness lease expires.
 
@@ -3811,7 +3833,9 @@ def create_app(
             code="runner_disconnected",
             message="Runner disconnected unexpectedly.",
         )
+        hold_started = time.monotonic()
         hold = None if idle_shutdown else await _hold_for_offline_host(runner_id, affected)
+        hold_s = None if hold is None else time.monotonic() - hold_started
         if hold in ("runner_reconnected", "server_shutdown"):
             return
         if hold is not None:
@@ -3862,7 +3886,12 @@ def create_app(
                 runner_id,
                 len(affected),
             )
-        await _mark_runner_sessions_offline(affected, error, conversation_store)
+        await _mark_runner_sessions_offline(
+            affected,
+            error,
+            conversation_store,
+            disconnect_evidence=drop_attributes(evidence, hold_s=hold_s, hold_outcome=hold),
+        )
 
     async def _routing_host_id(convs: "list[Conversation]") -> str | None:
         """Return the host *convs*' shared runner runs on, or ``None`` when unknown."""
@@ -4071,6 +4100,7 @@ def create_app(
                 runner_id,
                 reference_stamp,
                 idle_shutdown=idle_shutdown,
+                evidence=DisconnectEvidence.from_session(connection),
             ),
             name=f"runner-disconnect-grace-{runner_id}",
         )
@@ -4555,6 +4585,7 @@ def create_app(
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
+                harness_install=app.state.harness_install,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -4569,6 +4600,7 @@ def create_app(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
+                harness_install=app.state.harness_install,
             ),
             prefix="/v1",
             tags=["hosts"],

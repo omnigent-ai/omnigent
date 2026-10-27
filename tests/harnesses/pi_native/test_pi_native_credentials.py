@@ -4441,7 +4441,12 @@ def test_native_token_helper_reaps_its_process_group(
     if outcome in ("timeout", "shell_parent"):
         monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 2_000)
     pid_file = tmp_path / "descendant.pid"
-    helper = "import os,sys,time; open(sys.argv[1],'w').write(str(os.getpid())); time.sleep(30)"
+    # Publish only a complete PID before cancellation can terminate the helper.
+    helper = (
+        "import os,sys,time; from pathlib import Path; pid_file = Path(sys.argv[1]); "
+        "pending = pid_file.with_suffix('.pending'); "
+        "pending.write_text(str(os.getpid())); pending.replace(pid_file); time.sleep(30)"
+    )
     if outcome == "output_limit":
         helper = helper.replace(
             "time.sleep(30)",

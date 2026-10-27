@@ -418,3 +418,137 @@ async def test_runner_routes_edit_details_and_upload_attachments(
     assert calls[-1].input == PNG
     assert unsupported.status_code == 400
     assert "Attach a PNG" in unsupported.json()["detail"]
+
+
+@pytest.mark.parametrize("url", [PR_URL, ENTERPRISE_PR_URL])
+def test_create_comment_posts_literal_markdown_as_selected_account(
+    monkeypatch: pytest.MonkeyPatch, reference: PullRequestRef, url: str
+) -> None:
+    reference = PullRequestRef.from_url(url)
+    monkeypatch.setattr(github, "_list_accounts", lambda _root: (True, [{"host": reference.host}]))
+    calls: list[GhCall] = []
+    body = "  **Thanks**\n`$(literal)` <!-- preserved -->"
+    answer = {
+        "id": 99,
+        "body": body,
+        "html_url": url + "#issuecomment-99",
+        "user": {"login": "octocat"},
+        "created_at": "2026-10-26T12:00:00Z",
+    }
+    monkeypatch.setattr(github, "_gh", _fake_gh(calls, [(0, json.dumps(answer), "")]))
+    result = github._create_comment("/workspace", reference, body=body)
+    [call] = calls
+    assert call.argv[:6] == [
+        "api",
+        "--hostname",
+        reference.host,
+        "-X",
+        "POST",
+        "repos/acme/widgets/issues/17/comments",
+    ]
+    assert call.token == "selected-token"
+    assert call.input is not None and json.loads(call.input) == {"body": body}
+    assert result["comment"] == {
+        "author": "octocat",
+        "body": body,
+        "created_at": answer["created_at"],
+        "url": answer["html_url"],
+    }
+
+
+@pytest.mark.parametrize(
+    "response,message",
+    [
+        ((1, "", "gh: Forbidden (HTTP 403)"), "cannot post"),
+        ((1, "", "gh: Validation Failed (HTTP 422)"), "rejected the comment"),
+        ((None, "", "timed out"), "Check GitHub before retrying"),
+        ((1, "", "HTTP 502"), "Check GitHub before retrying"),
+        ((0, "{}", ""), "Check GitHub before retrying"),
+        ((0, "not json", ""), "Check GitHub before retrying"),
+    ],
+)
+def test_create_comment_does_not_retry_unknown_outcomes(
+    monkeypatch: pytest.MonkeyPatch,
+    reference: PullRequestRef,
+    response: GhResponse,
+    message: str,
+) -> None:
+    calls: list[GhCall] = []
+    monkeypatch.setattr(github, "_gh", _fake_gh(calls, [response]))
+    with pytest.raises(ValueError, match=message):
+        github._create_comment("/workspace", reference, body="Hello")
+    assert len(calls) == 1
+
+
+@pytest.mark.parametrize(
+    "kwargs,message",
+    [
+        ({"body": None}, "Expected body"),
+        ({"body": []}, "Expected body"),
+        ({"body": " \n"}, "cannot be empty"),
+        ({"body": "x" * 65537}, "at most 65536"),
+        ({"pr_url": None}, "Select a pull request"),
+        ({"pr_url": PR_URL.replace("17", "18")}, "not associated"),
+        ({"pr_url": GITLAB_MR_URL}, "not supported"),
+    ],
+)
+def test_invalid_comments_never_reach_github(
+    tracked: str,
+    monkeypatch: pytest.MonkeyPatch,
+    kwargs: dict[str, object],
+    message: str,
+) -> None:
+    monkeypatch.setattr(github, "_gh", _fake_gh([], []))
+    request: dict[str, object] = {"pr_url": PR_URL, "body": "Hello", **kwargs}
+    with pytest.raises(ValueError, match=message):
+        pr_resource.create_pr_comment(tracked, session_id="session", **request)  # type: ignore[arg-type]
+
+
+async def test_runner_posts_comment_once(tracked: str, monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[GhCall] = []
+
+    def gh(argv: list[str], **kwargs: object) -> GhResponse:
+        calls.append(GhCall(argv, None, None))
+        return (
+            0,
+            json.dumps({"id": 99, "body": "  Hello\n", "html_url": PR_URL + "#issuecomment-99"}),
+            "",
+        )
+
+    monkeypatch.setattr(github, "_gh", gh)
+    app = create_runner_app(runner_workspace=Path(tracked), server_client=NullServerClient())  # type: ignore[arg-type]
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://runner"
+    ) as client:
+        response = await client.post(
+            "/v1/sessions/session/resources/github/comments",
+            json={"pr_url": PR_URL, "body": "  Hello\n"},
+        )
+    assert response.status_code == 200, response.text
+    assert response.json()["comment"]["body"] == "  Hello\n"
+    assert len(calls) == 1
+    assert calls[0].input is not None and json.loads(calls[0].input) == {"body": "  Hello\n"}
+
+
+@pytest.mark.parametrize("stage", ["authentication", "post"])
+def test_comment_deadline_distinguishes_unsent_from_uncertain(
+    monkeypatch: pytest.MonkeyPatch, reference: PullRequestRef, stage: str
+) -> None:
+    calls = []
+
+    def token(_root: str, _reference: PullRequestRef) -> str:
+        if stage == "authentication":
+            github._gh_timed_out.set(True)
+        return "selected-token"
+
+    def post(argv: list[str], **kwargs: object) -> GhResponse:
+        calls.append(argv)
+        github._gh_timed_out.set(True)
+        return None, "", "timed out"
+
+    monkeypatch.setattr(github, "_pr_token", token)
+    monkeypatch.setattr(github, "_gh", post)
+    message = "was not sent" if stage == "authentication" else "Check GitHub before retrying"
+    with pytest.raises(ValueError, match=message):
+        github._create_comment("/workspace", reference, body="Hello")
+    assert len(calls) == (0 if stage == "authentication" else 1)

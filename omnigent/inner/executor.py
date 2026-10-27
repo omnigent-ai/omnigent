@@ -469,6 +469,11 @@ class MessageSplit:
     transient: list[Message]
 
 
+def without_tool_history(messages: list[Message]) -> list[Message]:
+    """Drop ``tool_call`` / ``tool_result`` items, which only a fresh-session replay uses."""
+    return [msg for msg in messages if msg.get("role") not in ("tool_call", "tool_result")]
+
+
 def split_transient_tail(
     messages: list[Message],
 ) -> MessageSplit:
@@ -685,6 +690,14 @@ class Executor:
         Instead it should pass through ToolCallRequest/ToolCallComplete from
         the executor as-is (they are informational events from the internal
         tool-call loop).
+        """
+        return False
+
+    def replays_tool_history(self) -> bool:
+        """Whether history handed to this executor keeps recorded tool calls and outputs.
+
+        Off by default: an executor that renders history as prompt text would
+        inline every tool output on each fresh session.
         """
         return False
 

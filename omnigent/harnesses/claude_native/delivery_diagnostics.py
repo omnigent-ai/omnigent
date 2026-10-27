@@ -264,6 +264,27 @@ def start_attempt() -> None:
 
 
 @_best_effort
+def record_composer_not_cleared(
+    *, pane: str, rows: list[str] | None, framed: bool, rule_count: int
+) -> None:
+    """Record the input box's shape when a leftover draft could not be cleared, without text."""
+    lines = pane.splitlines()
+    rows = rows or []
+    record_details(
+        composer_capture_empty=not pane.strip(),
+        composer_box_found=bool(rows),
+        composer_box_framed=framed,
+        composer_box_rows=len(rows),
+        composer_box_blank_rows=sum(1 for row in rows if not row.strip()),
+        # A glyph-only first row means the prompt row itself held no draft text.
+        composer_first_row_glyph_only=bool(rows) and len(rows[0].strip()) <= 1,
+        composer_rule_rows=rule_count,
+        composer_pane_rows=len(lines),
+        composer_pane_max_columns=max((len(line) for line in lines), default=0),
+    )
+
+
+@_best_effort
 def record_draft(
     *,
     pane: str,

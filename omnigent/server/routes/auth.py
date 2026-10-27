@@ -496,26 +496,29 @@ def create_auth_router(
         if not email:
             return fail(400, "Could not determine user email from IdP", "server_error")
 
-        # Forced re-auth verification (anti-phishing device-consent gate).
-        # /login stamped reauth_at when it sent prompt=login + max_age=0.
-        # A conformant IdP must then set the id_token's auth_time to the
-        # actual (re-)authentication instant; if it silently reused its
-        # session, auth_time predates our demand and we must refuse rather
-        # than mint a fresh session that would pass the freshness gate.
-        # GitHub has no id_token / auth_time, so reauth is never set for it.
+        # Forced re-auth gate (device consent, CLI tickets): /login sent prompt=login + max_age=0
+        # and stamped reauth_at, so a missing or older auth_time means re-auth is unproven.
+        # Refuse it unless OMNIGENT_OIDC_REQUIRE_REAUTH is off; GitHub never stamps reauth_at.
         reauth_at = state_payload.get("reauth_at")
-        if isinstance(reauth_at, int):
+        if isinstance(reauth_at, int) and not config.require_reauth:
+            _logger.info(
+                "Accepting reauth login without verifying auth_time "
+                "(OMNIGENT_OIDC_REQUIRE_REAUTH is disabled)"
+            )
+        elif isinstance(reauth_at, int):
             auth_time = _resolve_oidc_auth_time(token_json, config)
             if auth_time is None:
                 _logger.warning(
                     "Rejecting reauth login: IdP id_token has no auth_time claim, "
-                    "so forced re-authentication (prompt=login) cannot be verified"
+                    "so forced re-authentication (prompt=login) cannot be verified; "
+                    "set OMNIGENT_OIDC_REQUIRE_REAUTH=0 if this IdP never issues it"
                 )
                 return fail(403, "IdP did not confirm re-authentication")
             if auth_time < reauth_at:
                 _logger.warning(
                     "Rejecting reauth login: id_token auth_time %d predates the "
-                    "re-authentication demand at %d (IdP reused its session)",
+                    "re-authentication demand at %d (IdP reused its session; "
+                    "set OMNIGENT_OIDC_REQUIRE_REAUTH=0 if it ignores max_age)",
                     auth_time,
                     reauth_at,
                 )

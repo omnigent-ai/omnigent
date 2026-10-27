@@ -92,7 +92,7 @@ export function maybeOpenLinkInApp(conversationId: string | undefined, href: str
  * window.open regardless, so it would navigate twice.
  */
 export function followLinkWithPopupFallback(
-  event: MouseEvent<HTMLAnchorElement>,
+  event: MouseEvent,
   href: string,
   conversationId: string | undefined,
 ): void {

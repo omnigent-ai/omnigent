@@ -64,9 +64,11 @@ the header menu), and each place is a separate entry point.
   fork uses the chosen agent.
 - `fork-access`: require read access to the source and, for a custom target,
   its owning session. The caller owns the fork; source grants are not copied.
-- `unsupported-sandbox-actions`: Databricks Sandbox and Arclet fork and
-  host-switch controls stay visible but disabled, with hover and keyboard
-  explanations. Their forms cannot submit.
+- `unsupported-sandbox-actions`: Databricks Sandbox fork controls and
+  Databricks Sandbox and Arclet host-switch controls stay visible but disabled,
+  with hover and keyboard explanations. Their forms cannot submit.
+- `fork-arclet`: an Arclet session forks only onto a new Arclet, the dialog's
+  single host choice. Without one on the server, Fork stays disabled.
 - `clone`: copy a session into a new workspace, including a typed `~` path.
 - `reconnect`: a stopped or stranded session shows a reconnect affordance and a
   dialog with the command to run; the desktop app reconnects a local host
@@ -121,7 +123,7 @@ the header menu), and each place is a separate entry point.
 - `canvas-session-health`: an opened Canvas session receives host health and
   live updates even before it appears in the loaded sidebar pages.
 - `view-options`: the one filter menu, on the Projects header, with Grouping
-  (Default / Status / Created / Updated), Display (All / My / Shared / Archived), Ordering
+  (Default / Status / Harness / Created / Updated), Display (All / My / Shared / Archived), Ordering
   (Updated / Created) and Show (Updated / Environment / Repo / Branch) submenus,
   saved per device. Created ordering keeps sessions newest-created first as messages
   arrive;
@@ -134,6 +136,9 @@ the header menu), and each place is a separate entry point.
   when empty. Starting or running sessions enter Working immediately; idle must
   last 10 seconds before they leave it. Errors and approvals bypass that delay.
   This only affects grouping, and existing hover/rename holds still apply.
+  Harness groups sessions under alphabetically ordered harness names (such as
+  Claude Code, Codex, and Pi), including custom agents using the same harness.
+  Sessions without harness information appear under Unknown harness; pins stay separate.
   Created and Updated group by their respective date, independently of ordering,
   with the Created/Updated prefix only on the first date section, followed by
   headings such as “Yesterday” and “Earlier”. Environment metadata shows an icon
@@ -241,7 +246,7 @@ menu, then filter by project.
 
 **Sidebar filter menu:** with `sidebar_grouping_ui` on, the funnel on the
 Projects header holds Grouping, Display, Ordering and Show. In
-Status, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
+Status, Harness, Created or Updated grouping, Projects is hidden and the funnel sits in the same spot on the
 first group's header. The Select sessions button sits beside it and selects
 project, Shared and Sessions rows together; the Sessions header keeps only New
 session. Hovering a row opens
@@ -284,7 +289,14 @@ asks for confirmation before running, and a failed attempt opens the dialog,
 whose **Reconnect Arca** action retries. Success is reported only once the
 server lists the session's own host online; otherwise the dialog says the host
 is still offline and points to **Switch host** in case Arca came back as a
-different host.
+different host. In a session on an offline Arca host, the desktop app keeps the
+composer open: sending starts the same Arca reconnect, the message waits in the
+queue as **Waiting for host** without reaching the server, and it sends once the
+host is back. In a sandbox session (for example an Arclet) whose host is
+asleep, **Reconnect host** in the composer's host menu has the server wake the
+sandbox and start the agent without sending a message, in the browser too; a
+toast says when it's back online or why the wake failed. Reloading during the
+wake keeps its progress (for example "Provisioning sandbox…") in the chat.
 
 **Message recovery:** send the first prompt while a runner is starting, or send
 another message after its runner restarts. Also open a sub-agent's conversation
@@ -313,13 +325,21 @@ than the main session.
 **Mobile:** the header menu and the sidebar drawer offer the same actions; touch
 devices fold some row controls into the menu.
 
-**Databricks Sandbox and Arclet sessions:** Fork is disabled in the header,
-sidebar menus, and message actions. The composer's host menu shows a disabled
-**Switch host…** item when you have write access. Read-only viewers retain the
+**Arclet sessions:** Fork in the header, sidebar menus, or message actions opens
+the clone dialog with a new Arclet sandbox as its only host; connected hosts
+and other sandbox providers are not offered. The repository prefills from the
+source's. Fork stays disabled when the server offers no Arclet, and **Continue
+in another directory…** is disabled because the session can only be cloned onto
+a new sandbox.
+
+**Databricks Sandbox and Arclet sessions:** Fork is disabled for Databricks
+Sandbox sessions in the header, sidebar menus, and message actions. The
+composer's host menu shows a disabled **Switch host…** item for both when you
+have write access. Read-only viewers retain the
 existing host menu without switching controls. Hover or focus a disabled action
 to read why it is unsupported.
-The reconnect dialog also disables Clone and Switch host; directory selection
-cannot enable either action.
+The reconnect dialog also disables Switch host, and Clone wherever Fork is
+disabled; directory selection cannot enable either action.
 While support is being checked, actions stay disabled. If that check fails,
 the explanation asks you to reload. A missing source-host record keeps switching
 disabled while ordinary shared sessions remain forkable. Direct dialogs show a loading status without
@@ -344,7 +364,11 @@ after stopping; this relaunches the parent and both use one runner. Sending to
 an existing side chat or choosing Resume after the parent's runner exited (for
 example, on its idle timeout) also relaunches the parent, then moves the side
 chat to that runner. Close a side
-chat with its tab's close button; the parent and sibling chats keep running. A
+chat with its tab's close button; the parent and sibling chats keep running.
+While a side chat works, typing a follow-up turns Interrupt into Send, which
+queues or steers it as the main composer does; Escape still interrupts. Its queue
+strip offers edit, steer, reorder and delete, and Mod+Enter steers them all.
+Closing the side chat discards its queued follow-ups. A
 chat-only side chat can also send messages from its direct `/c/<child_id>` URL
 without choosing a workspace. The side-chat composer opens the same `/` menu
 affordance as the main composer but with a narrower set — `/help` and the
@@ -559,6 +583,15 @@ plain `uv run pytest`, which starts a private server for the test.
   Supported host-switch UI coverage:
   `tests/e2e_ui/sessions/test_host_badge.py::test_host_badge_switches_the_session_to_another_host`
   checks the release/launch requests with stubbed host APIs.
+- **`fork-arclet`:**
+  `tests/e2e_ui/fork_session/test_sandbox_disabled_controls.py::test_arclet_session_forks_only_onto_a_new_arclet`
+  checks that the sidebar dropdown and message action are enabled, drives the
+  header Fork, and checks the dialog's single Arclet choice and the managed fork
+  request. The server advertises Arclet through a stubbed `/v1/info` and the fork
+  is forwarded without its managed fields, so no Arclet is provisioned. The
+  server-unavailable and recovery cases, plus repository prefill, are covered in
+  `web/src/shell/ForkSessionDialog.test.tsx` and
+  `web/src/hooks/useSessionActionRestrictions.test.tsx`.
 - **`reconnect`, spinner (own environment):**
   `tests/e2e_ui/chat/test_reconnecting_spinner.py::test_reconnecting_state_shows_spinner`
   seeds an error item directly into the spawned server's database.
@@ -601,6 +634,13 @@ plain `uv run pytest`, which starts a private server for the test.
   real runner crash that must still report a failure. Requires both native
   CLIs and tmux; Claude's machine-managed credentials require an isolated
   container for the local model endpoint.
+- **`stop`, `archive`, host-bound sub-agent children:**
+  `tests/server/integration/test_session_host_launch.py` (`-k shared_runner`)
+  creates a child through `POST /v1/sessions` with `host_id` and
+  `parent_session_id`, so it rides its parent's runner over a real host tunnel.
+  Archiving, stopping, or relaunching the child leaves that runner up for the
+  parent and its siblings, including a grandchild still bound to the root's
+  runner; a child bound to a runner of its own still tears it down.
 - **`stop`, `side-chat-lifecycle`, hosted side chats (own environment):**
   `tests/e2e_ui/sessions/test_stop_side_chats.py::test_stop_session_stops_hosted_side_chats`
   drives both desktop sidebar menus and the mobile long-press menu with a real
@@ -659,11 +699,18 @@ plain `uv run pytest`, which starts a private server for the test.
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_performs_local_host_reconnect`,
   `tests/e2e_ui/sessions/test_reconnect_local_host_from_app.py::test_desktop_reconnect_failure_offers_retry`,
   `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_reconnects_arca_from_current_chat`,
-  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_arca_reconnect_failure_offers_retry`
+  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_arca_reconnect_failure_offers_retry`,
+  `tests/e2e_ui/sessions/test_reconnect_arca_from_app.py::test_desktop_send_reconnects_offline_arca_then_sends`
   drive the real SPA and server with an injected desktop bridge and offline host
   responses. The Arca journeys cover a remembered host and a CLI-seeded host
   with no saved ID; they check one-action start, progress, failure and retry,
-  not live SSH or the desktop's consent console.
+  and a message that waits for the host, not live SSH or the desktop's consent
+  console.
+- **`reconnect`, asleep sandbox:**
+  `tests/e2e_ui/sessions/test_host_asleep_composer.py::test_reconnect_host_asks_server_to_wake_asleep_host`
+  drives the real SPA and server with the session patched to an asleep host. It
+  checks that Reconnect host sends `retry_session` and shows the server's answer,
+  not a live sandbox resume.
 - **`message-recovery`, native binding races (own environment):**
   `tests/e2e/test_native_runner_binding_races_e2e.py::test_native_send_rechecks_binding_after_runner_miss`
   drives real servers, runners, and Claude/Codex CLIs with a mock model. It
@@ -792,6 +839,8 @@ plain `uv run pytest`, which starts a private server for the test.
   ordinary sessions still return to the new-session page in
   `tests/e2e_ui/sessions/test_canvas_creation.py::test_stale_regular_creation_url_returns_to_new_session`.
 - **`view-options`:**
+  `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_harness_grouping_persists_across_reload`
+  (desktop and narrow-browser navigation),
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_grouping_and_show_toggles_persist_across_reload`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_tooltip_fetches_repo_and_pr_only_when_opened`,
   `tests/e2e_ui/sessions/test_sidebar_view_options.py::test_created_ordering_persists_and_flag_off_uses_updated`
@@ -842,6 +891,9 @@ plain `uv run pytest`, which starts a private server for the test.
   shared sessions. Other sandbox providers support forking. Verify the supported
   path with
   `tests/e2e_ui/fork_session/test_fork_managed_sandbox.py::test_fork_onto_managed_sandbox_with_no_host_online`.
+- An Arclet source is recognized from its host's provider, so a shared managed
+  Arclet session whose host is not in your host list keeps Fork disabled.
+  Without the managed label, such a session forks like an ordinary one.
 - A custom agent outlives its sessions: forks of your own sessions share it,
   and forking someone else's session gives you your own copy. Appearing in the
   picker does not prove the fork API accepts it; check the bound agent after

@@ -226,6 +226,89 @@ def test_build_codex_native_server_defaults_cadence_without_one_in_ucode_state(
     assert "refresh_interval_ms=900000" in overrides
 
 
+def test_build_codex_native_server_preserves_structured_ucode_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native launch retains ucode's direct argv and OAuth refresh deadline."""
+    auth = {
+        "command": "/opt/tools with spaces/ug",
+        "args": ["auth-token", "--profile", 'gateway "profile"', "--host", _UCODE_HOST],
+        "timeout_ms": 180000,
+        "refresh_interval_ms": 60000,
+    }
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": _UCODE_AUTH, "auth": auth},
+    )
+    provider = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]
+    assert provider["auth"] == auth
+    assert provider["base_url"] == _UCODE_BASE_URL
+
+
+def test_build_codex_native_server_preserves_legacy_auth_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy shell helper can also supply its own refresh deadline."""
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {
+            "base_url": _UCODE_BASE_URL,
+            "auth_command": _UCODE_AUTH,
+            "auth": {"timeout_ms": 180000},
+        },
+    )
+    auth = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]["auth"]
+    assert auth == {
+        "command": "sh",
+        "args": ["-c", _UCODE_AUTH],
+        "timeout_ms": 180000,
+        "refresh_interval_ms": 900000,
+    }
+
+
+@pytest.mark.parametrize("timeout", [None, 0, -1, True, "180000", 1.5])
+def test_build_codex_native_server_defaults_invalid_ucode_auth_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: object
+) -> None:
+    """Malformed state cannot emit an invalid Codex auth deadline."""
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {
+            "base_url": _UCODE_BASE_URL,
+            "auth_command": _UCODE_AUTH,
+            "auth": {"timeout_ms": timeout},
+        },
+    )
+    auth = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]["auth"]
+    assert auth["timeout_ms"] == 15000
+
+
+@pytest.mark.parametrize(
+    "structured",
+    [
+        {"command": "", "args": []},
+        {"command": 1, "args": []},
+        {"command": "ug", "args": "auth-token"},
+        {"command": "ug", "args": ["auth-token", None]},
+    ],
+)
+def test_build_codex_native_server_falls_back_from_malformed_auth_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, structured: dict[str, object]
+) -> None:
+    """An invalid structured command keeps the working legacy shell helper."""
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": _UCODE_AUTH, "auth": structured},
+    )
+    auth = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]["auth"]
+    assert auth["command"] == "sh"
+    assert auth["args"] == ["-c", _UCODE_AUTH]
+
+
 def test_build_codex_native_server_keeps_profile_path_when_ucode_state_is_unreadable(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

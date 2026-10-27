@@ -15,6 +15,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import NotRequired, TypedDict
 
 import httpx
 
@@ -1890,7 +1891,7 @@ async def _post_external_subagent_start(
     subagent_id: str,
     agent_type: str,
     description: str,
-    tool_use_id: str,
+    tool_use_id: str | None,
 ) -> str:
     """
     POST ``external_subagent_start`` to the Omnigent server and return the
@@ -1906,8 +1907,8 @@ async def _post_external_subagent_start(
         e.g. ``"Explore"``.
     :param description: Free-form description from the meta file,
         e.g. ``"Investigate web UI session data flow"``.
-    :param tool_use_id: Parent transcript's ``Task`` tool-use block
-        id this sub-agent was spawned from, e.g. ``"toolu_..."``.
+    :param tool_use_id: Spawning ``Agent`` / ``Task`` call id, or ``None``
+        for a forked slash command that has no tool call.
     :returns: The Omnigent child conversation id, e.g. ``"conv_child456"``.
     :raises httpx.HTTPError: If the Omnigent request fails or is rejected.
     :raises KeyError: If the server response is missing
@@ -1923,10 +1924,20 @@ async def _post_external_subagent_start(
                 "subagent_id": subagent_id,
                 "agent_type": agent_type,
                 "description": description,
-                "tool_use_id": tool_use_id,
+                **({"tool_use_id": tool_use_id} if tool_use_id is not None else {}),
             },
         },
     )
+    if (
+        tool_use_id is None
+        and resp.status_code == 400
+        and "external_subagent_start requires non-empty data.tool_use_id" in resp.text
+    ):
+        # Keep the child retryable until an older server supports command spawns.
+        raise httpx.HTTPError(
+            "Omnigent server needs an upgrade to register Claude sub-agents without "
+            "tool-use IDs; retrying after backoff"
+        )
     resp.raise_for_status()
     body = _parse_json_response(resp, context=f"sub-agent start for {parent_session_id!r}")
     child_session_id = body.get("child_session_id")
@@ -1935,7 +1946,17 @@ async def _post_external_subagent_start(
     return child_session_id
 
 
-def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
+class _SubagentMeta(TypedDict):
+    """Validated Claude metadata, including optional native spawn ancestry."""
+
+    agentType: str
+    description: str
+    toolUseId: NotRequired[str]
+    parentAgentId: NotRequired[str]
+    spawnDepth: NotRequired[int]
+
+
+def _read_subagent_meta(meta_path: Path) -> _SubagentMeta | None:
     """
     Read a Claude sub-agent's ``.meta.json`` file, validating the
     fields the forwarder needs.
@@ -1945,9 +1966,8 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
     on the next tick.
 
     :param meta_path: Path to ``agent-<id>.meta.json``.
-    :returns: A dict with string-typed ``agentType``, ``description``,
-        and ``toolUseId``; or ``None`` when the file is missing /
-        malformed / missing any required key.
+    :returns: Validated display and ancestry fields, or ``None`` when the
+        file is malformed or has neither a spawn call nor explicit ancestry.
     """
     try:
         raw = json.loads(meta_path.read_text(encoding="utf-8"))
@@ -1957,18 +1977,34 @@ def _read_subagent_meta(meta_path: Path) -> dict[str, str] | None:
         return None
     agent_type = raw.get("agentType")
     description = raw.get("description")
-    tool_use_id = raw.get("toolUseId")
     if not isinstance(agent_type, str) or not agent_type:
         return None
     if not isinstance(description, str):
         return None
-    if not isinstance(tool_use_id, str) or not tool_use_id:
+    meta: _SubagentMeta = {"agentType": agent_type, "description": description}
+    if "toolUseId" in raw:
+        tool_use_id = raw["toolUseId"]
+        if not isinstance(tool_use_id, str) or not tool_use_id:
+            return None
+        meta["toolUseId"] = tool_use_id
+    if "spawnDepth" in raw:
+        spawn_depth = raw["spawnDepth"]
+        if type(spawn_depth) is not int or spawn_depth < 1:
+            return None
+        meta["spawnDepth"] = spawn_depth
+    if "parentAgentId" in raw:
+        parent_agent_id = raw["parentAgentId"]
+        if (
+            not isinstance(parent_agent_id, str)
+            or not parent_agent_id
+            or parent_agent_id == _subagent_id_from_meta_path(meta_path)
+            or meta.get("spawnDepth") == 1
+        ):
+            return None
+        meta["parentAgentId"] = parent_agent_id
+    if "toolUseId" not in meta and "parentAgentId" not in meta and meta.get("spawnDepth") != 1:
         return None
-    return {
-        "agentType": agent_type,
-        "description": description,
-        "toolUseId": tool_use_id,
-    }
+    return meta
 
 
 def _external_conversation_item_event(item: ClaudeTranscriptItem) -> dict[str, object]:
@@ -2665,7 +2701,7 @@ def _subagent_own_spawn_tool_use_id(agent_jsonl_path: Path) -> str | None:
         agent_jsonl_path.name.removesuffix(".jsonl") + ".meta.json"
     )
     meta = _read_subagent_meta(meta_path)
-    return meta["toolUseId"] if meta is not None else None
+    return meta.get("toolUseId") if meta is not None else None
 
 
 def _subagent_parents_by_tool_use(
@@ -2790,13 +2826,19 @@ async def _forward_available_subagents(
         if candidate_meta_paths
         else {}
     )
-    pending: list[tuple[Path, dict[str, str], str | None]] = []
+    pending: list[tuple[Path, _SubagentMeta, str | None]] = []
     for meta_path in candidate_meta_paths:
         meta = await asyncio.to_thread(_read_subagent_meta, meta_path)
         if meta is None:
             continue
-        tool_use_id = meta["toolUseId"]
-        if tool_use_id not in parents_by_tool_use:
+        tool_use_id = meta.get("toolUseId")
+        if "parentAgentId" in meta:
+            parent_subagent_id = meta["parentAgentId"]
+        elif meta.get("spawnDepth") == 1:
+            parent_subagent_id = None
+        elif tool_use_id is not None and tool_use_id in parents_by_tool_use:
+            parent_subagent_id = parents_by_tool_use[tool_use_id]
+        else:
             # No transcript owns this spawn yet: the record is still mid-write, or
             # it resolved to two owners and was dropped as ambiguous. Either way we
             # retry next tick; log so a persistent miss (e.g. a transcript-format
@@ -2809,10 +2851,10 @@ async def _forward_available_subagents(
                 tool_use_id,
             )
             continue
-        pending.append((meta_path, meta, parents_by_tool_use[tool_use_id]))
+        pending.append((meta_path, meta, parent_subagent_id))
 
     while pending:
-        deferred: list[tuple[Path, dict[str, str], str | None]] = []
+        deferred: list[tuple[Path, _SubagentMeta, str | None]] = []
         made_progress = False
         for meta_path, meta, parent_subagent_id in pending:
             subagent_id = _subagent_id_from_meta_path(meta_path)
@@ -2863,7 +2905,7 @@ async def _forward_available_subagents(
                     subagent_id=subagent_id,
                     agent_type=meta["agentType"],
                     description=meta["description"],
-                    tool_use_id=meta["toolUseId"],
+                    tool_use_id=meta.get("toolUseId"),
                 )
             except httpx.HTTPError as exc:
                 decision = start_retry_tracker.record_failure(
@@ -2886,7 +2928,7 @@ async def _forward_available_subagents(
                             "subagent_id": subagent_id,
                             "agent_type": meta["agentType"],
                             "description": meta["description"],
-                            "tool_use_id": meta["toolUseId"],
+                            **({"tool_use_id": meta["toolUseId"]} if "toolUseId" in meta else {}),
                             "parent_subagent_id": parent_subagent_id,
                         },
                         reason="permanent HTTP failure after retries",
@@ -4574,12 +4616,14 @@ async def _forward_available_status_events(
         failure_context: FailureContext | None = None
         transcript_context: FailureContext | None = None
         if status == "failed":
+            failure_context_phase = "transcript_lookup"
             try:
                 transcript_context_state = "hook_details_present"
                 if record.failure_message is None:
                     transcript_context, transcript_context_state = await asyncio.to_thread(
                         _transcript_api_error_for_hook, bridge_dir, record, response_id
                     )
+                failure_context_phase = "context_assembly"
                 failure_context = _stop_failure_context(
                     record,
                     session_id=session_id,
@@ -4589,6 +4633,32 @@ async def _forward_available_status_events(
                     transcript_context_state=transcript_context_state,
                 )
             except Exception as exc:  # noqa: BLE001 - telemetry must not prevent status delivery
+                # Keep the hook's identity when richer evidence cannot be collected.
+                failure_context = normalize_failure_context(
+                    {
+                        "failure_id": native_failure_id(
+                            "claude_hook",
+                            session_id,
+                            record.claude_session_id,
+                            record.agent_id,
+                            record.event_cursor,
+                            record.byte_offset,
+                            record.recorded_at,
+                        ),
+                        "failure_source": "claude_hook",
+                        "native_harness": "claude-native",
+                        "native_error_category": record.failure_category,
+                        "native_session_id": record.claude_session_id,
+                        "native_agent_id": record.agent_id,
+                        "native_hook_event": record.event_name,
+                        "native_hook_cursor": record.event_cursor,
+                        "native_hook_offset": record.byte_offset,
+                        "native_hook_recorded_at": record.recorded_at,
+                        "runner_version": VERSION,
+                        "failure_context_error_type": type(exc).__name__,
+                        "failure_context_error_phase": failure_context_phase,
+                    }
+                )
                 _logger.debug("Claude hook failure telemetry failed: %s", type(exc).__name__)
         try:
             await post_external_session_status(
@@ -6471,6 +6541,23 @@ async def _post_external_compaction_status(
     resp.raise_for_status()
 
 
+def _compaction_snapshot_message(
+    role: object, message: dict[object, object], content: object
+) -> dict[str, object]:
+    """
+    Build one snapshot entry from a Claude transcript record.
+
+    Claude Code writes one record per content block and rejoins records that
+    share ``message.id`` into one API message on resume, so that id travels
+    with the snapshot as ``message_id``.
+    """
+    snapshot: dict[str, object] = {"type": "message", "role": role, "content": content}
+    message_id = message.get("id")
+    if isinstance(message_id, str) and message_id:
+        snapshot["message_id"] = message_id
+    return snapshot
+
+
 def _compaction_summary_boundary(
     records: Mapping[str, dict[str, object]], summary: Mapping[str, object]
 ) -> dict[str, object] | None:
@@ -6656,7 +6743,7 @@ def _restore_preserved_compaction_messages(
         if not content:
             _logger.warning("Skipping empty Claude retained message")
             continue
-        snapshot.append((uid, {"type": "message", "role": role, "content": content}))
+        snapshot.append((uid, _compaction_snapshot_message(role, message, content)))
 
     # The SDK may have followed either the summary or the retained tail.
     # Replace that prefix while preserving turns that followed compaction.
@@ -6766,14 +6853,11 @@ async def _persist_native_compaction_item(
             content = raw_message.get("content")
             if not isinstance(content, (str, list)):
                 continue
-            message_id = getattr(message, "uuid", None)
-            if not isinstance(message_id, str) or not message_id:
-                message_id = f"native-message-{index}"
+            record_uuid = getattr(message, "uuid", None)
+            if not isinstance(record_uuid, str) or not record_uuid:
+                record_uuid = f"native-message-{index}"
             native_messages.append(
-                (
-                    message_id,
-                    {"type": "message", "role": role, "content": content},
-                )
+                (record_uuid, _compaction_snapshot_message(role, raw_message, content))
             )
         if not native_messages:
             raise ValueError("Claude session reader returned no usable messages")
@@ -6811,11 +6895,11 @@ async def _persist_native_compaction_item(
     compacted_messages: list[dict[str, object]] | None = None
     if native_messages is not None:
         compacted_messages = []
-        for message_id, message in native_messages:
+        for record_uuid, message in native_messages:
             snapshot_message = dict(message)
             try:
                 _, forwarded_items = _transcript_items_from_entry(
-                    {"type": message["role"], "uuid": message_id, "message": message},
+                    {"type": message["role"], "uuid": record_uuid, "message": message},
                     line_number=0,
                     record_offset=None,
                     agent_name="claude-native",
