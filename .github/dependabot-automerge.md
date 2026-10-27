@@ -159,10 +159,14 @@ CI blocked solely by failed Security Gates after Security Scan passes; real test
 failures are never retried automatically. Gate recovery stops at three attempts.
 If required workflows and consumer steps are green on one older base, and approval
 is successful or recoverable, the worker can update the branch with an expected-head
-guard. It stops that sweep and waits for new policy, scans and CI. Three merge
-commits exhaust the refresh budget; incomplete inventories, mixed bases, holds,
-review objections, conflicts and moved heads block recovery. API failures report
-bounded context. Report mode never updates or merges.
+guard. It stops that sweep and waits for new policy, scans and CI. The policy's
+`max_base_refreshes` allows 20 branch refreshes per PR, counting merge commits
+already in its history. Set it to `0` to disable automatic branch refreshes.
+Existing PRs use this limit on the next sweep, including those stopped at the
+previous limit of three. The summary reports the used and allowed counts when
+the budget is exhausted. Incomplete inventories, mixed bases, holds, review
+objections, conflicts and moved heads block recovery. API failures report bounded
+context. Report mode never updates or merges.
 
 Updates use the GitHub App identity, so subsequent events may receive ordinary
 same-repository token/secrets treatment. Before updating, the worker inventories

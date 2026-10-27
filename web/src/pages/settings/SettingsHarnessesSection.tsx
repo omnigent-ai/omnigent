@@ -23,7 +23,13 @@ import { cn } from "@/lib/utils";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { isFeatureEnabled } from "@/lib/capabilities";
 import { ComposerAgentIcon } from "@/shell/NewChatDialog";
-import { useHarnessStartup, useHosts, type Host } from "@/hooks/useHosts";
+import {
+  useHarnessStartup,
+  useHosts,
+  useRefreshHarnessAccounts,
+  type HarnessAccount,
+  type Host,
+} from "@/hooks/useHosts";
 import { ApiError } from "@/lib/sessionsApi";
 import { INVENTORY_HARNESS_IDS } from "@/hooks/useHarnessInventory";
 import { BRAND_HARNESSES } from "@/components/onboarding/harnessBrand";
@@ -36,6 +42,7 @@ import {
   type HarnessCredentialKind,
 } from "@/lib/harnessSetup";
 import { NATIVE_CODING_AGENTS } from "@/lib/nativeCodingAgents";
+import { harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { BackButton, HarnessCatalog } from "./HarnessCatalog";
 import { HarnessFixDialog, type HarnessFixMode } from "./HarnessFixDialog";
 import { useSettingsRoute } from "../../shell/settingsNav";
@@ -112,6 +119,7 @@ export const SettingsHarnessesSection = () => {
     harness: string;
     hostId: string;
     version?: string;
+    account?: HarnessAccount;
   } | null>(null);
 
   // Gate the "Set up" affordance on the install feature, matching New Chat: with
@@ -134,6 +142,10 @@ export const SettingsHarnessesSection = () => {
   );
   const selectedHost =
     onlineHosts.find((h) => h.host_id === selectedHostId) ?? onlineHosts[0] ?? null;
+  useRefreshHarnessAccounts(
+    selectedHost?.host_id ?? null,
+    canSetup && selectedHost?.harness_accounts_supported === true,
+  );
 
   // Capture the selected host when the fix opens so a later host change cannot
   // redirect an in-progress install or credential write to another machine.
@@ -249,7 +261,13 @@ export const SettingsHarnessesSection = () => {
           host={fixTarget.host}
           harness={fixTarget.entry.harness}
           harnessLabel={fixTarget.entry.name}
-          onFixed={({ configuredHarnesses, credentialKind, version, gatewayInference }) => {
+          onFixed={({
+            configuredHarnesses,
+            credentialKind,
+            version,
+            gatewayInference,
+            harnessAccounts,
+          }) => {
             const { host: fixedHost, entry } = fixTarget;
             queryClient.setQueriesData<Host[]>({ queryKey: ["hosts"] }, (cachedHosts) =>
               cachedHosts?.map((cachedHost) =>
@@ -257,6 +275,9 @@ export const SettingsHarnessesSection = () => {
                   ? {
                       ...cachedHost,
                       configured_harnesses: configuredHarnesses,
+                      ...(harnessAccounts !== undefined
+                        ? { harness_accounts: harnessAccounts }
+                        : {}),
                       ...(gatewayInference !== undefined
                         ? { gateway_inference: gatewayInference }
                         : {}),
@@ -270,7 +291,12 @@ export const SettingsHarnessesSection = () => {
                 [hostHarnessKey(fixedHost.host_id, entry.harness)]: credentialKind,
               }));
             }
-            setReadyNotice({ harness: entry.harness, hostId: fixedHost.host_id, version });
+            setReadyNotice({
+              harness: entry.harness,
+              hostId: fixedHost.host_id,
+              version,
+              account: harnessAccounts?.[harnessAccountKey(entry.harness)],
+            });
           }}
         />
       )}
@@ -382,7 +408,53 @@ function credentialPresentation(
   if (override === "isaac" || host?.gateway_inference?.[harness] === true) {
     return HARNESS_CREDENTIAL_COPY.isaac;
   }
+  const account = host?.harness_accounts?.[harnessAccountKey(harness)];
+  if (account) {
+    if (account.kind === "providers") {
+      return {
+        label: "Providers",
+        description: providerDetails(account),
+      };
+    }
+    if (account.kind === "api_key") {
+      return { label: "API key", description: "Uses an API key configured on this host" };
+    }
+    if (account.kind === "chatgpt" || account.kind === "subscription") {
+      return {
+        label: "Personal subscription",
+        description: accountDetails(account),
+      };
+    }
+  }
   return { label: "Signed in", description: "Uses the harness's own login on this host" };
+}
+
+function accountDetails(account: HarnessAccount): string {
+  return [account.email, account.org, account.plan].filter(Boolean).join(" · ") || "Signed in";
+}
+
+function providerDetails(account: HarnessAccount): string {
+  const providers = account.providers ?? [];
+  if (providers.length === 0) return "No providers configured";
+  return providers
+    .map((provider) => {
+      const authType = provider.auth_type.replaceAll("_", " ");
+      return `${provider.label} (${authType === "api key" ? "API key" : authType})`;
+    })
+    .join(" · ");
+}
+
+function configuredAccountLabel(host: Host | null, harness: string): string | undefined {
+  if (host?.gateway_inference?.[harness] === true) {
+    return HARNESS_CREDENTIAL_COPY.isaac.label;
+  }
+  const account = host?.harness_accounts?.[harnessAccountKey(harness)];
+  if (!account) return undefined;
+  if (account.kind === "providers") {
+    const labels = (account.providers ?? []).map((provider) => provider.label);
+    return labels.length > 0 ? labels.join(", ") : undefined;
+  }
+  return [account.email, account.plan].filter(Boolean).join(" · ") || undefined;
 }
 
 function reconfigurationReason(reason: string | null) {
@@ -512,7 +584,8 @@ function HarnessCard({
               enhanced={canSetup}
               configuredCredential={
                 status.ready && canSetup
-                  ? credentialPresentation(host, entry.harness, credentialKind).label
+                  ? (configuredAccountLabel(host, entry.harness) ??
+                    credentialPresentation(host, entry.harness, credentialKind).label)
                   : undefined
               }
             />
@@ -579,7 +652,12 @@ function HarnessDetail({
   canSetup: boolean;
   installable: boolean;
   credentialKind?: HarnessCredentialKind;
-  readyNotice: { harness: string; hostId: string; version?: string } | null;
+  readyNotice: {
+    harness: string;
+    hostId: string;
+    version?: string;
+    account?: HarnessAccount;
+  } | null;
   onFix: (mode: HarnessFixMode) => void;
 }) {
   const status = harnessStatus(entry.harness, host);
@@ -587,7 +665,8 @@ function HarnessDetail({
   const mode = fixMode(status.reason);
   const canFix = canSetup && !!host && !host.sandbox_provider;
   const gateway = host?.gateway_inference?.[entry.harness] === true;
-  const credential = canSetup
+  const account = host?.harness_accounts?.[harnessAccountKey(entry.harness)];
+  const presentedCredential = canSetup
     ? credentialPresentation(host, entry.harness, credentialKind)
     : gateway
       ? {
@@ -595,6 +674,13 @@ function HarnessDetail({
           description: "Managed credential via the Databricks Unity Gateway",
         }
       : { label: "Signed in", description: "Uses the harness's own login on this host" };
+  const credential =
+    account?.expired && status.reason === "needs-auth"
+      ? {
+          label: "Sign-in expired",
+          description: `${accountDetails(account)} — new sessions on ${host?.name ?? "this host"} can’t use ${entry.name} until you sign in again.`,
+        }
+      : presentedCredential;
   const header = (
     <>
       <BackButton label="Harnesses" to="/settings/harnesses" />
@@ -606,7 +692,11 @@ function HarnessDetail({
             <HarnessStatusText
               status={status}
               enhanced={canSetup}
-              configuredCredential={status.ready && canSetup ? credential.label : undefined}
+              configuredCredential={
+                status.ready && canSetup
+                  ? (configuredAccountLabel(host, entry.harness) ?? credential.label)
+                  : undefined
+              }
             />
           </div>
         </div>
@@ -616,11 +706,19 @@ function HarnessDetail({
   );
   const credentialCard = (
     <CredentialCard
-      label={credentialProblem ? "Not signed in" : credential.label}
+      label={
+        account?.expired && credentialProblem
+          ? "Sign-in expired"
+          : credentialProblem
+            ? "Not signed in"
+            : credential.label
+      }
       description={
-        credentialProblem && host
-          ? missingHarnessCredentialCopy(entry.harness, entry.name, host.name)
-          : credential.description
+        account?.expired && credentialProblem
+          ? credential.description
+          : credentialProblem && host
+            ? missingHarnessCredentialCopy(entry.harness, entry.name, host.name)
+            : credential.description
       }
       ready={status.ready}
       warning={credentialProblem}
@@ -630,12 +728,23 @@ function HarnessDetail({
           ? reconfigurationReason(status.reason)
           : "Needs reconfiguration"
       }
-      onReconfigure={credentialProblem && canFix ? () => onFix(mode) : undefined}
+      action={
+        credentialProblem && canFix
+          ? { label: "Reconfigure", onClick: () => onFix(mode) }
+          : undefined
+      }
     />
   );
   const settings = host ? (
     <div className="flex flex-col gap-6">
-      {readyNotice && <ReadyNotice entry={entry} host={host} version={readyNotice.version} />}
+      {readyNotice && (
+        <ReadyNotice
+          entry={entry}
+          host={host}
+          version={readyNotice.version}
+          account={readyNotice.account}
+        />
+      )}
       {status.needsSetup && !credentialProblem && (
         <HarnessWarning
           entry={entry}
@@ -674,7 +783,14 @@ function HarnessDetail({
             <p className="text-ui text-muted-foreground">
               MCP servers, skills, and plugins aren't listed for {entry.name} yet.
             </p>
-            {readyNotice && <ReadyNotice entry={entry} host={host} version={readyNotice.version} />}
+            {readyNotice && (
+              <ReadyNotice
+                entry={entry}
+                host={host}
+                version={readyNotice.version}
+                account={readyNotice.account}
+              />
+            )}
             {credentialCard}
           </>
         ) : canFix ? (
@@ -770,17 +886,20 @@ function ReadyNotice({
   entry,
   host,
   version,
+  account,
 }: {
   entry: HarnessEntry;
   host: Host;
   version?: string;
+  account?: HarnessAccount;
 }) {
   return (
     <div className="flex items-center gap-3 rounded-xl border border-green-500/30 bg-green-500/10 p-4 text-ui text-green-700 dark:text-green-300">
       <CheckCircle2Icon className="size-4 shrink-0" aria-hidden />
       <p>
         {entry.name}
-        {version ? ` ${version}` : ""} is ready on {host.name}. Checked just now.
+        {version ? ` ${version}` : ""} is ready on {host.name}.
+        {account ? ` Signed in as ${accountDetails(account)}.` : " Checked just now."}
       </p>
     </div>
   );
@@ -900,7 +1019,7 @@ function CredentialCard({
   warning,
   showStatus,
   statusLabel,
-  onReconfigure,
+  action,
 }: {
   label: string;
   description: string;
@@ -908,7 +1027,7 @@ function CredentialCard({
   warning: boolean;
   showStatus: boolean;
   statusLabel: string;
-  onReconfigure?: () => void;
+  action?: { label: string; onClick: () => void };
 }) {
   const body = (
     <>
@@ -926,12 +1045,17 @@ function CredentialCard({
         />
       </span>
       <span className="flex min-w-0 flex-1 flex-col text-left">
-        <span className="text-ui font-medium">{label}</span>
+        <span
+          className={cn("text-ui font-medium", warning && "text-amber-700 dark:text-amber-300")}
+        >
+          {warning && <TriangleAlertIcon className="mr-1 inline size-3.5" aria-hidden />}
+          {label}
+        </span>
         <span className="text-xs text-muted-foreground">{description}</span>
       </span>
-      {onReconfigure ? (
+      {action ? (
         <span className="inline-flex h-7 shrink-0 items-center justify-center rounded-[var(--radius-md)] bg-primary px-2.5 text-ui text-primary-foreground">
-          Reconfigure
+          {action.label}
         </span>
       ) : showStatus ? (
         <span
@@ -950,12 +1074,17 @@ function CredentialCard({
       <h2 className="text-xs font-medium tracking-wide text-muted-foreground uppercase">
         Credential
       </h2>
-      {onReconfigure ? (
+      {action ? (
         <button
           type="button"
-          aria-label="Reconfigure"
-          className="flex w-full cursor-pointer items-center gap-3 rounded-xl border border-amber-500/30 bg-amber-500/10 p-3 text-left transition-colors hover:bg-amber-500/15 focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none"
-          onClick={onReconfigure}
+          aria-label={action.label}
+          className={cn(
+            "flex w-full cursor-pointer items-center gap-3 rounded-xl border p-3 text-left transition-colors focus-visible:ring-3 focus-visible:ring-ring/50 focus-visible:outline-none",
+            warning
+              ? "border-amber-500/30 bg-amber-500/10 hover:bg-amber-500/15"
+              : "border-border hover:bg-muted/50",
+          )}
+          onClick={action.onClick}
         >
           {body}
         </button>

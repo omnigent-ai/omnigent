@@ -14,6 +14,7 @@ import dataclasses
 import errno
 import json
 import logging
+import math
 import os
 import shlex
 import shutil
@@ -717,7 +718,7 @@ class _PiNativeLaunchConfig:
     fork_carry_history: bool = False
     model_override: str | None = None
     reasoning_effort: str | None = None
-    native_usage_baseline: dict[str, int] | None = None
+    native_usage_baseline: dict[str, int | float] | None = None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1310,12 +1311,21 @@ async def _pi_native_launch_config(
         "cumulative_output_tokens",
         "cumulative_cache_read_input_tokens",
     )
-    native_usage_baseline = (
+    native_usage_baseline: dict[str, int | float] | None = (
         {key: int(baseline[key]) for key in usage_fields}
         if isinstance(baseline, dict)
         and all(type(baseline.get(key)) is int and baseline[key] >= 0 for key in usage_fields)
         else None
     )
+    if native_usage_baseline is not None and isinstance(baseline, dict):
+        cost = baseline.get("cumulative_cost_usd")
+        if (
+            isinstance(cost, (int, float))
+            and not isinstance(cost, bool)
+            and math.isfinite(cost)
+            and cost >= 0
+        ):
+            native_usage_baseline["cumulative_cost_usd"] = cost
     return _PiNativeLaunchConfig(
         workspace=_pi_session_workspace(session_workspace),
         server_url=os.environ.get("RUNNER_SERVER_URL", "http://localhost:6767").rstrip("/"),
