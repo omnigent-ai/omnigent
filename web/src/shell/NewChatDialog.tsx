@@ -278,7 +278,7 @@ import {
 } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
-import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
@@ -4939,19 +4939,31 @@ export function NewChatLandingScreen() {
   const skillsHarness = autoRoutingSelected
     ? null
     : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
-  const skillsUnavailableMessage = sandboxSelected
-    ? "Host skills will be available after the sandbox starts."
-    : selectedAgent?.id === PENDING_AGENT_ID
-      ? "Skills will be available after this session starts."
-      : !selectedHostId
-        ? "Choose a host to discover skills."
-        : selectedHost?.status !== "online"
-          ? "Skills unavailable while the host is offline."
-          : !workspaceValid
-            ? "Choose a working directory to discover skills."
-            : !skillsHarness
-              ? "Choose a harness to discover host skills."
-              : undefined;
+  // Preview the connected Arca's home catalog before the Arclet has its own host.
+  const arcletSkills = sandboxSelected && effectiveSandboxProvider === "arclet";
+  const skillsHost = sandboxSelected
+    ? arcletSkills
+      ? findConnectedArcaHost(allHosts, readArcaHostId())
+      : undefined
+    : selectedHost;
+  const skillsHostId = sandboxSelected ? skillsHost?.host_id : selectedHostId;
+  const skillsPath = sandboxSelected ? "~" : workspaceTrimmed;
+  const skillsUnavailableMessage =
+    sandboxSelected && !arcletSkills
+      ? "Host skills will be available after the sandbox starts."
+      : selectedAgent?.id === PENDING_AGENT_ID
+        ? "Skills will be available after this session starts."
+        : !skillsHostId
+          ? arcletSkills
+            ? "Connect your Arca to discover skills before the sandbox starts."
+            : "Choose a host to discover skills."
+          : skillsHost?.status !== "online"
+            ? "Skills unavailable while the host is offline."
+            : !sandboxSelected && !workspaceValid
+              ? "Choose a working directory to discover skills."
+              : !skillsHarness
+                ? "Choose a harness to discover host skills."
+                : undefined;
   const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
   const {
     skills: hostSkills,
@@ -4959,16 +4971,16 @@ export function NewChatLandingScreen() {
     refetch: refreshSkills,
   } = useSkills({
     target:
-      selectedHostId && skillsHarness && workspaceTrimmed
+      skillsHostId && skillsHarness && skillsPath
         ? {
-            hostId: selectedHostId,
+            hostId: skillsHostId,
             harness: skillsHarness,
-            path: workspaceTrimmed,
+            path: skillsPath,
             agentId: selectedAgent?.id,
           }
         : null,
     enabled: canDiscoverHostSkills,
-    starting: !sandboxSelected && (hostsLoading || agentsLoading),
+    starting: (!sandboxSelected || arcletSkills) && (hostsLoading || agentsLoading),
   });
   const availableSkills = useMemo(
     () => (skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? [])),
