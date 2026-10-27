@@ -11,6 +11,20 @@ interface BrowserTabsState {
   selected: string | null;
 }
 
+interface BrowserPage {
+  url?: string;
+  title?: string;
+}
+
+interface BrowserTabsBridge {
+  browserHasView?: (
+    viewId: string,
+  ) => Promise<BrowserPage & { exists: boolean; pendingUrl?: string }>;
+  onBrowserUrlChanged?: (
+    callback: (page: BrowserPage & { conversationId: string }) => void,
+  ) => () => void;
+}
+
 const agentNavigationEpochs = new Map<string, number>();
 
 function agentNavigationEpoch(conversationId: string): number {
@@ -50,9 +64,76 @@ export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
 
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
+  const [pages, setPages] = useState<Record<string, BrowserPage>>({});
   useEffect(() => {
     setState(readBrowserTabsState(conversationId));
   }, [conversationId]);
+
+  useEffect(() => {
+    const viewIds = new Set(state.tabs.map((tabId) => browserViewId(conversationId, tabId)));
+    setPages((current) =>
+      Object.fromEntries(Object.entries(current).filter(([viewId]) => viewIds.has(viewId))),
+    );
+    const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
+    if (!bridge || viewIds.size === 0) return;
+    let active = true;
+    const updated = new Set<string>();
+    const setPage = (viewId: string, page: BrowserPage) => {
+      setPages((current) => ({ ...current, [viewId]: page }));
+    };
+    const unsubscribe = bridge.onBrowserUrlChanged?.((page) => {
+      if (!active || !viewIds.has(page.conversationId)) return;
+      updated.add(page.conversationId);
+      setPage(page.conversationId, { url: page.url, title: page.title });
+    });
+    const restore = async (viewId: string) => {
+      try {
+        const page = await bridge.browserHasView?.(viewId);
+        // Live updates take precedence over an earlier restore snapshot.
+        if (!active || updated.has(viewId) || !page) return;
+        setPage(
+          viewId,
+          page.exists
+            ? {
+                url: page.url && page.url !== "about:blank" ? page.url : page.pendingUrl,
+                title: page.title,
+              }
+            : {},
+        );
+      } catch {
+        // A closed view or an older shell can leave the default tab label.
+      }
+    };
+    for (const viewId of viewIds) void restore(viewId);
+    return () => {
+      active = false;
+      unsubscribe?.();
+    };
+  }, [conversationId, state.tabs]);
+
+  const labelFor = (tabId: string, index: number): string => {
+    const page = pages[browserViewId(conversationId, tabId)];
+    const title = page?.title?.trim();
+    if (page?.url) {
+      try {
+        const hostname = new URL(page.url).hostname;
+        // Chromium supplies the URL as the title for untitled documents.
+        const urlTitle = page.url.replace(/^https?:\/\//, "");
+        if (
+          title &&
+          title !== page.url &&
+          title !== urlTitle &&
+          title !== urlTitle.replace(/\/$/, "")
+        ) {
+          return title;
+        }
+        if (hostname) return hostname;
+      } catch {
+        // Blank or invalid URLs keep the numbered placeholder.
+      }
+    }
+    return title && title !== "about:blank" ? title : `Browser ${index + 1}`;
+  };
 
   const update = useCallback(
     (mutate: (current: BrowserTabsState) => BrowserTabsState) => {
@@ -127,6 +208,7 @@ export function useBrowserTabs(conversationId: string) {
 
   return {
     ...state,
+    labelFor,
     add,
     close,
     select,
