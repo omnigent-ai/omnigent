@@ -174,6 +174,7 @@ from omnigent.util.reasoning_effort import (
 # objects. The mutable caches are shared by reference across the package.
 # isort: off
 from omnigent.server.routes._sessions.common import (
+    CLIENT_SESSION_EVENT_TYPES as CLIENT_SESSION_EVENT_TYPES,
     COST_CONTROL_OVERRIDE_VALUES as COST_CONTROL_OVERRIDE_VALUES,
     _ALLOWED_EVENT_TYPES as _ALLOWED_EVENT_TYPES,
     _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S as _ANTIGRAVITY_NATIVE_ELICITATION_HOOK_TIMEOUT_S,

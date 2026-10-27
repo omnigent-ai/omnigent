@@ -19,6 +19,7 @@ from omnigent.debug_logging import record_to_row
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
@@ -661,6 +662,32 @@ async def test_launch_native_terminal_publishes_start_error_on_failure(
 
 
 @pytest.mark.asyncio
+async def test_launch_native_terminal_publishes_model_outside_allowlist_without_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model outside the harness's list is published as a setup error, not a crash."""
+    from omnigent.runner.native import _launch_native_terminal
+
+    async def _reject_model(ctx: NativeLaunchContext) -> object:
+        raise ModelNotAllowedError("model-b", "pi-native", ("model-a",))
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _reject_model)
+    events: list[dict[str, Any]] = []
+    result = await _launch_native_terminal(
+        "pi-native",
+        _launch_ctx(publish_event=lambda _name, event: events.append(event)),
+        ensure_locks={},
+    )
+
+    assert result is False
+    failed = next(event for event in events if event.get("status") == "failed")
+    assert failed["error"]["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert "Allowed models: 'model-a'." in failed["error"]["message"]
+    assert all(record.exc_info is None for record in caplog.records)
+
+
+@pytest.mark.asyncio
 async def test_launch_native_terminal_resolves_spec_lazily_only_on_create(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -904,6 +931,27 @@ async def test_ensure_native_terminal_missing_workspace_returns_410_without_stac
     assert all(record.exc_info is None for record in caplog.records)
     assert "resource unavailable" in caplog.text
     assert "agent unavailable" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_model_outside_allowlist_returns_412_without_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model outside the harness's list is a setup error, not a startup defect."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _reject_model(ctx: NativeLaunchContext) -> object:
+        raise ModelNotAllowedError("model-b", "goose-native", ("model-a",))
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _reject_model)
+    resp = await _ensure_native_terminal(
+        "goose", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
+    )
+
+    assert resp is not None and resp.status_code == 412
+    assert json.loads(bytes(resp.body))["error"]["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 @pytest.mark.asyncio

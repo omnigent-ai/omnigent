@@ -85,6 +85,7 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     assert child_thread_id
     assert child_thread_id != parent["external_session_id"]
 
+    expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     page.get_by_test_id("side-chat-input").fill(followup)
     expect(page.get_by_test_id("side-chat-send")).to_be_enabled(timeout=30_000)
     page.get_by_test_id("side-chat-send").click()

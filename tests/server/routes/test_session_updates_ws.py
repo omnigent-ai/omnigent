@@ -350,6 +350,25 @@ def test_cleared_field_pushes_explicit_null(app: FastAPI, stores, fast_rescan: N
         assert item["runner_id"] is None
 
 
+def test_harness_override_is_streamed_and_cleared(app: FastAPI, stores, fast_rescan: None) -> None:
+    """Harness grouping follows streamed overrides and clears an unknown harness."""
+    conversation_store = stores[0]
+    session_id = _seed_session(stores, owner=ALICE, title="custom agent")
+    conversation_store.update_conversation(session_id, harness_override="pi")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["harness"] == "pi"
+        conversation_store.update_conversation(session_id, _unset_harness_override=True)
+        changed = _recv_until(ws, {"changed"})
+        item = {item["id"]: item for item in changed["items"]}[session_id]
+        # The seeded agent has no bundle, so its default harness is unknown.
+        assert "harness" in item
+        assert item["harness"] is None
+
+
 def test_no_change_emits_no_changed_frame(app: FastAPI, stores, fast_rescan: None) -> None:
     """An idle watched session produces no ``changed`` frames — only
     heartbeats — so a static list generates no diff traffic."""

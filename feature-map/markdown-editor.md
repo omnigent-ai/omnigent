@@ -34,7 +34,8 @@ and the recording protocol for comparing revisions.
   Markdown path, or call the [file-opening endpoint](../docs/agent-ui-api.md).
   Only current session viewers (the selected pane in grids) open the file;
   background requests are not replayed.
-- `document-link`: follow a relative file link inside the editor's link popup.
+- `document-link`: click a web or relative file link directly in the editor;
+  Alt-click or move the caret with the keyboard to edit it and use its link popup.
 - `mobile`: use the session Files surface or a file link at a phone width.
 
 ## Driving it with the repro environment
@@ -165,8 +166,12 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   the real file viewer. Grid targeting and dirty-navigation guards are covered
   by `web/src/grid/GridSessionPane.test.tsx`; native app/device runs remain manual.
 - `document-link`:
+  `tests/e2e_ui/files/test_markdown_editor_link_popup.py::test_editor_links_open_with_one_click`
+  opens a table's web link and a relative file link with one desktop click or
+  phone-width tap, preserves drag selection, and checks the source is unchanged.
   `tests/e2e_ui/files/test_markdown_editor_link_popup.py::test_editor_link_popup_opens_relative_link_from_keyboard`
-  opens a relative file from the keyboard-accessible link popup.
+  uses Alt-click to place the caret, then opens a relative file from the
+  keyboard-accessible link popup.
 - `chat-link`, `offline`:
   `tests/browser_ui/files/test_file_line_navigation.py::test_citation_preserves_offline_markdown_draft_with_diff_preference`
   exercises a citation, offline editing, and the dirty-navigation guard. Its

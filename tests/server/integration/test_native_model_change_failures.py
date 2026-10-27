@@ -359,6 +359,31 @@ async def _pick_model(client: httpx.AsyncClient, session: _NativeSession) -> htt
     )
 
 
+@asynccontextmanager
+async def _held_model_reply(
+    client: httpx.AsyncClient, session: _NativeSession
+) -> AsyncIterator[tuple[asyncio.Task[httpx.Response], asyncio.Event]]:
+    """Hold the runner's model reply while another settings write completes."""
+    reply_ready = asyncio.Event()
+    release_reply = asyncio.Event()
+
+    async def hold_reply(response: httpx.Response) -> None:
+        if response.request.url.path.endswith("/events"):
+            reply_ready.set()
+            await release_reply.wait()
+
+    session.runner.event_hooks["response"].append(hold_reply)
+    pending = asyncio.create_task(_pick_model(client, session))
+    try:
+        await asyncio.wait_for(reply_ready.wait(), timeout=5)
+        yield pending, release_reply
+    finally:
+        release_reply.set()
+        pending.cancel()
+        await asyncio.gather(pending, return_exceptions=True)
+        session.runner.event_hooks["response"].remove(hold_reply)
+
+
 @pytest.mark.parametrize("confirmed", [False, True], ids=["timeout", "confirmed"])
 async def test_claude_model_confirmation_controls_public_patch_and_rollback(
     client: httpx.AsyncClient,
@@ -386,6 +411,146 @@ async def test_claude_model_confirmation_controls_public_patch_and_rollback(
         assert refused["error"] == "claude_native_model_unconfirmed"
         assert "did not confirm" in refused["detail"]
         assert "did not confirm" in session.errors[0]["message"]
+
+
+@pytest.mark.parametrize(
+    "newer_model",
+    ["claude-sonnet-4-6", "claude-opus-4-7", None],
+    ids=["different-model", "same-model", "cleared-model"],
+)
+async def test_refused_model_change_preserves_newer_silent_selection(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    newer_model: str | None,
+) -> None:
+    """A late refusal cannot overwrite model metadata saved by a newer launch."""
+    session = native_session
+    assert session.claude is not None
+    session.claude.confirm = False
+    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    async with _held_model_reply(client, session) as (first, release_refusal):
+        newer = await client.patch(
+            f"/v1/sessions/{session.session_id}",
+            json={"model_override": newer_model or "default", "silent": True},
+        )
+        assert newer.status_code == 200, newer.text
+        if newer_model is not None:
+            session.claude.report_model(newer_model)
+        assert session.store.get_conversation(session.session_id).model_override == newer_model
+        release_refusal.set()
+        refused = await asyncio.wait_for(first, timeout=5)
+
+    assert refused.status_code == 503, refused.text
+    assert "Please check the current selection and try again" in refused.text
+    assert session.runner_replies[0].json()["error"] == "claude_native_model_unconfirmed"
+    assert session.errors[0]["code"] == "model_change_not_applied"
+    saved = session.store.get_conversation(session.session_id)
+    assert saved.model_override == newer_model
+    assert saved.reasoning_effort == "high"
+    assert claude_bridge.read_claude_status_model(session.claude.bridge_dir) == (
+        newer_model or session.previous_model
+    )
+    assert session.tunnel.dispatch_errors == []
+
+
+@pytest.mark.parametrize("reported_setting", ["model", "effort"])
+async def test_refused_model_change_preserves_concurrent_terminal_report(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    reported_setting: str,
+) -> None:
+    """Restoring a refused selection retains the terminal's newer model or effort report."""
+    session = native_session
+    assert session.claude is not None
+    session.claude.confirm = False
+    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    async with _held_model_reply(client, session) as (first, release_refusal):
+        event = (
+            {"type": "external_model_change", "data": {"model": "claude-sonnet-4-6"}}
+            if reported_setting == "model"
+            else {
+                "type": "external_reasoning_effort_change",
+                "data": {"reasoning_effort": "low"},
+            }
+        )
+        reported = await client.post(f"/v1/sessions/{session.session_id}/events", json=event)
+        assert reported.status_code == 202, reported.text
+        release_refusal.set()
+        refused = await asyncio.wait_for(first, timeout=5)
+
+    assert refused.status_code == 503, refused.text
+    saved = session.store.get_conversation(session.session_id)
+    assert saved.model_override == session.previous_model
+    assert saved.reported_model == ("claude-sonnet-4-6" if reported_setting == "model" else None)
+    assert saved.reasoning_effort == ("low" if reported_setting == "effort" else "high")
+
+
+@pytest.mark.parametrize("prior_model", ["claude-opus-4-6", None], ids=["override", "default"])
+async def test_refused_claude_model_change_keeps_effort_applied_by_the_same_patch(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+    prior_model: str | None,
+) -> None:
+    """A model refusal restores its prior override while retaining the applied effort."""
+    session = native_session
+    assert session.claude is not None
+    if prior_model is None:
+        session.store.update_conversation(session.session_id, _unset_model_override=True)
+    commands: list[str] = []
+
+    def inject(_bridge_dir: Path, *, command: str, **_kwargs: Any) -> None:
+        commands.append(command)
+
+    monkeypatch.setattr(claude_bridge, "inject_slash_command", inject)
+    refused = await client.patch(
+        f"/v1/sessions/{session.session_id}",
+        json={"model_override": session.requested_model, "reasoning_effort": "low"},
+    )
+
+    assert refused.status_code == 503, refused.text
+    assert commands == ["/effort low", f"/model {session.requested_model}"]
+    assert [reply.status_code for reply in session.runner_replies] == [204, 503]
+    saved = session.store.get_conversation(session.session_id)
+    assert saved.model_override == prior_model
+    assert saved.reasoning_effort == "low"
+    assert (
+        claude_bridge.read_claude_status_model(session.claude.bridge_dir) == session.previous_model
+    )
+
+
+async def test_refused_model_change_keeps_the_new_replicas_same_selection(
+    client: httpx.AsyncClient,
+    native_session: _NativeSession,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A stale refusal cannot restore over the same model confirmed on another replica."""
+    import time
+
+    from omnigent.server.routes.sessions import routes_events
+
+    session = native_session
+    assert session.claude is not None
+    session.claude.confirm = False
+    monkeypatch.setattr(claude_bridge, "inject_slash_command", session.claude.inject)
+    monkeypatch.setattr(routes_events, "last_liveness_stamp", lambda _runner: None)
+    async with _held_model_reply(client, session) as (first, release_refusal):
+        session.store.touch_runner_liveness(["runner_connected"], int(time.time()))
+        session.store.update_conversation(session.session_id, model_override="claude-sonnet-4-6")
+        session.store.update_conversation(
+            session.session_id, model_override=session.requested_model
+        )
+        release_refusal.set()
+        refused = await asyncio.wait_for(first, timeout=5)
+
+    assert refused.status_code == 400, refused.text
+    assert "wrong_replica" in refused.text
+    assert (
+        session.store.get_conversation(session.session_id).model_override
+        == session.requested_model
+    )
 
 
 @pytest.mark.parametrize("screen", [_QUESTION, _PERMISSION], ids=["question", "permission"])

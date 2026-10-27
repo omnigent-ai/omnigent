@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import json
 import logging
 import threading
 import time
@@ -17,6 +18,7 @@ from asgiref.testing import ApplicationCommunicator
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 from starlette.requests import HTTPConnection
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from omnigent.errors import OmnigentError
 from omnigent.runner import create_runner_app
@@ -485,6 +487,68 @@ async def test_abnormal_peer_disconnect_preserves_code_during_registry_cleanup(
     assert ends[0]["connection_id"] == "conn-peer"
     assert ends[0]["code"] == 1006
     assert ends[0]["reason"] == ""
+    assert ends[0]["receive_close_code"] == 1006
+    assert json.loads(ends[0]["helper_outcomes"])["receive"] == "error:WebSocketDisconnect"
+    assert ends[0]["asgi_client_state"] == "DISCONNECTED"
+    assert ends[0]["asgi_application_state"] == "CONNECTED"
+    assert route_app.registry.get(_RUNNER_ID) is None
+
+
+async def test_tunnel_close_race_logs_each_helper_outcome(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A failed sender must not hide the receive helper's peer-close evidence."""
+    caplog.set_level(logging.INFO, logger="omnigent.server.routes.runner_tunnel")
+    frame_in_transport = asyncio.Event()
+    peer_closed = asyncio.Event()
+    private_detail = "transport-private-detail"
+
+    class ClosingTransport:
+        def __init__(self, app: ASGIApp) -> None:
+            self.app = app
+
+        async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+            async def receive_frame() -> Message:
+                message = await receive()
+                if message["type"] == "websocket.disconnect":
+                    peer_closed.set()
+                return message
+
+            async def send_frame(message: Message) -> None:
+                if message["type"] == "websocket.send":
+                    frame_in_transport.set()
+                    await peer_closed.wait()
+                    # RuntimeError after disconnect is an expected send/close race.
+                    raise ValueError(private_detail)
+                await send(message)
+
+            await self.app(scope, receive_frame, send_frame)
+
+    route_app = _tunnel_route_app()
+    route_app.app.add_middleware(ClosingTransport)
+    communicator = await _connect_route(route_app.app, _TUNNEL_PATH)
+    try:
+        await _send_hello(communicator, route_app.registry, connection_id="conn-close-race")
+        session = route_app.registry.get(_RUNNER_ID)
+        assert session is not None
+        await route_app.registry.send_text(session, encode_frame(PingFrame(ts=0)))
+        await asyncio.wait_for(frame_in_transport.wait(), timeout=budget(1.0))
+        await communicator.send_input({"type": "websocket.disconnect", "code": 1006})
+        await asyncio.wait_for(communicator.future, timeout=budget(1.0))
+    finally:
+        communicator.stop(exceptions=False)
+        await asyncio.gather(communicator.future, return_exceptions=True)
+
+    ends = _tunnel_end_events(caplog)
+    assert len(ends) == 1
+    assert ends[0]["connection_id"] == "conn-close-race"
+    outcomes = json.loads(ends[0]["helper_outcomes"])
+    assert outcomes["sender"] == "error:ValueError"
+    assert outcomes["receive"] == "error:WebSocketDisconnect"
+    assert ends[0]["receive_close_code"] == 1006
+    assert ends[0]["asgi_client_state"] == "DISCONNECTED"
+    assert ends[0]["asgi_application_state"] == "CONNECTED"
+    assert private_detail not in str(ends[0])
     assert route_app.registry.get(_RUNNER_ID) is None
 
 
