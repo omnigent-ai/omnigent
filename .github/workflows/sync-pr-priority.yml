@@ -6,9 +6,8 @@ name: Sync PR Priority
 # change. Uses only default-branch code and never checks out or executes PR
 # files; it edits labels through the API.
 #
-# Labels written with a workflow's GITHUB_TOKEN start no workflow runs, so the
-# `issues` trigger never sees issue triage's own priority labels;
-# issue-prioritization-v2.yml runs the same script after labeling instead.
+# Issue triage's own labels (written with GITHUB_TOKEN) never trigger this, so
+# issue-prioritization-v2.yml runs the same script after labeling.
 
 on:
   # No `synchronize`: priority is derived from the linked issue's label and the
