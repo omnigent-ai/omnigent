@@ -47,8 +47,8 @@ from omnigent.util.tunnel_limits import RUNNER_TUNNEL_MAX_MESSAGE_BYTES
 HARNESS_NOT_CONFIGURED_ERROR_CODE = "harness_not_configured"
 
 # when the host refuses a launch because the session's workspace directory
-# does not exist on the host (e.g. the worktree was deleted). Shared by the
-# daemon (producer) and server (consumer) so both can handle it structurally.
+# does not exist on the host and could not be recreated. Shared by the daemon
+# (producer) and server (consumer) so both can handle it structurally.
 WORKSPACE_MISSING_ERROR_CODE = "workspace_missing"
 
 # when the host's launch handler raised before any runner process was spawned
@@ -348,6 +348,10 @@ class HostLaunchRunnerResultFrame:
         :data:`WORKSPACE_MISSING_ERROR_CODE`. ``None`` for uncategorized
         failures and on success (and always from older hosts that don't
         send it).
+    :param workspace_recreated: ``True`` when the host found the session
+        workspace missing and recreated it as an empty directory before
+        spawning the runner, so the server can tell the user. ``False`` on
+        failure and from older hosts that don't send it.
     """
 
     request_id: str
@@ -355,6 +359,7 @@ class HostLaunchRunnerResultFrame:
     runner_id: str | None = None
     error: str | None = None
     error_code: str | None = None
+    workspace_recreated: bool = False
 
 
 @dataclass
@@ -1586,6 +1591,7 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "runner_id": frame.runner_id,
                 "error": frame.error,
                 "error_code": frame.error_code,
+                "workspace_recreated": frame.workspace_recreated,
             }
         )
     if isinstance(frame, HostStopRunnerFrame):
@@ -2671,6 +2677,7 @@ def _decode_launch_runner_result(
         runner_id=_optional_nullable_str(msg, "runner_id"),
         error=_optional_nullable_str(msg, "error"),
         error_code=_optional_nullable_str(msg, "error_code"),
+        workspace_recreated=_optional_bool(msg, "workspace_recreated"),
     )
 
 
@@ -3489,6 +3496,22 @@ def _required_bool(msg: _JsonObject, key: str) -> bool:
     val = msg.get(key)
     if not isinstance(val, bool):
         raise ValueError(f"frame missing required bool field: {key!r}")
+    return val
+
+
+def _optional_bool(msg: _JsonObject, key: str) -> bool:
+    """Extract an optional boolean field, ``False`` when absent or null.
+
+    :param msg: Decoded frame object.
+    :param key: Field name.
+    :returns: The boolean value, or ``False`` for an older peer that omits it.
+    :raises ValueError: If the field is present and not a bool.
+    """
+    val = msg.get(key)
+    if val is None:
+        return False
+    if not isinstance(val, bool):
+        raise ValueError(f"frame field must be a bool: {key!r}")
     return val
 
 

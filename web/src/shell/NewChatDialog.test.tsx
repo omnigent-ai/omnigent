@@ -153,6 +153,7 @@ describe("ComposerAddMenu", () => {
     );
     fireEvent.pointerDown(screen.getByRole("button", { name: "Add" }), { button: 0 });
     fireEvent.click(screen.getByRole("menuitem", { name: /Work in a project/ }));
+    expect(screen.getByTestId("composer-add-menu")).toHaveClass("menu-surface");
     expect(screen.getByText("Choose a project")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("menuitem", { name: "docs" }));
     expect(onProjectSelect).toHaveBeenCalledWith("docs");
@@ -4158,7 +4159,7 @@ describe("NewChatLandingScreen", () => {
       "rounded-t-2xl",
       "border",
       "border-b-0",
-      "composer-workspace-surface",
+      "composer-context-bar",
       "px-2",
       "py-0.5",
       "md:px-3",

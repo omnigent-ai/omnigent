@@ -46,6 +46,7 @@ from typing import TYPE_CHECKING
 import httpx
 
 from omnigent.host.identity import HOST_TOKEN_ENV_VAR, MANAGED_HOST_TOKEN_HEADER
+from omnigent.host.identity_env import in_managed_sandbox
 
 if TYPE_CHECKING:
     from omnigent.spec.types import AgentSpec
@@ -308,7 +309,7 @@ def configure_host_databricks(server_url: str, host_id: str) -> bool:
     :returns: ``True`` when the per-user profile was written; ``False`` otherwise
         (no-op — ambient config, if any, is left untouched).
     """
-    if os.environ.get("IS_SANDBOX") != "1":
+    if not in_managed_sandbox():
         return False
     token = (os.environ.get(HOST_TOKEN_ENV_VAR) or "").strip()
     if not token:

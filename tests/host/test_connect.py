@@ -274,16 +274,82 @@ async def test_host_skills_distinguishes_empty_and_failure(
     host = _make_host_process()
     frame = HostSkillsFrame(request_id="r", harness="claude-native", path=str(tmp_path))
     monkeypatch.setattr(skill_sources, "resolve_harness_skills", lambda *_: [])
-    assert host._handle_skills(frame) == HostSkillsResultFrame(request_id="r", status="ok")
+    with _captured_host_debug_rows() as rows:
+        assert host._handle_skills(frame) == HostSkillsResultFrame(request_id="r", status="ok")
+    assert rows == []
 
     def fail(*_args: object) -> None:
         raise OSError("unreadable skill directory")
 
     monkeypatch.setattr(skill_sources, "resolve_harness_skills", fail)
     host = _make_host_process()
-    result = host._handle_skills(frame)
+    with _captured_host_debug_rows() as rows:
+        result = host._handle_skills(frame)
     assert result.status == "failed"
     assert result.error_code == "discovery_failed"
+    assert rows[0]["session_id"] is None
+    assert rows[0]["attributes"]["discovery_scope"] == "directory"
+    assert rows[0]["attributes"]["error_type"] == "OSError"
+
+
+@pytest.mark.parametrize("failure", ["unauthorized", "unavailable", "timeout", "disk_full"])
+async def test_host_skill_failure_retains_session_and_typed_cause(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, failure: str
+) -> None:
+    import httpx
+
+    host = _make_host_process()
+    frame = HostSkillsFrame(
+        request_id="skill-request",
+        harness="session",
+        path=str(tmp_path),
+        session_id="session-a",
+        agent_id="agent-a",
+        agent_version="1",
+    )
+    request = httpx.Request("GET", "https://server.test/private-bundle?opaque=private-value")
+
+    def fetch(_frame: HostSkillsFrame) -> httpx.Response:
+        if failure == "timeout":
+            raise httpx.ReadTimeout("private timeout detail", request=request)
+        if failure == "disk_full":
+            raise OSError(errno.ENOSPC, "private local path")
+        return httpx.Response(401 if failure == "unauthorized" else 503, request=request)
+
+    monkeypatch.setattr(host._skill_discovery, "_fetch_bundle", fetch)
+    with _captured_host_debug_rows() as rows:
+        result = host._handle_skills(frame)
+
+    assert result.status == "failed"
+    assert result.error_code == "discovery_failed"
+    assert result.error == "skill discovery failed; see the host log"
+    assert len(rows) == 1
+    row = rows[0]
+    assert row["event_name"] == "host_skill_discovery_failed"
+    assert row["session_id"] == "session-a"
+    attrs = row["attributes"]
+    assert attrs["request_id"] == "skill-request"
+    assert attrs["host_id"] == "host_test_connect"
+    assert attrs["harness"] == "session"
+    assert attrs["discovery_scope"] == "session"
+    assert (
+        attrs["error_type"]
+        == {
+            "unauthorized": "HTTPStatusError",
+            "unavailable": "HTTPStatusError",
+            "timeout": "ReadTimeout",
+            "disk_full": "OSError",
+        }[failure]
+    )
+    if failure in ("unauthorized", "unavailable"):
+        assert attrs["http_status"] == ("401" if failure == "unauthorized" else "503")
+    else:
+        assert "http_status" not in attrs
+    if failure == "disk_full":
+        assert attrs["errno"] == str(errno.ENOSPC)
+    else:
+        assert "errno" not in attrs
+    assert "private" not in json.dumps(attrs)
 
 
 async def test_skill_bundle_fetch_survives_a_deleted_ssl_cert_file(
@@ -926,28 +992,183 @@ async def test_handle_launch_spawns_subprocess(
         "runner subprocess must be spawned with cwd=<session workspace>"
     )
 
+    # An existing workspace was not touched, so the server has nothing to report.
+    assert result.workspace_recreated is False
+
     # Clean up the spawned sleep process (and its exit watcher).
+    _cleanup_host(host)
+
+
+async def test_handle_launch_recreates_missing_workspace(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Verify that a launch whose workspace directory has been deleted recreates
+    the leaf and spawns the runner there instead of refusing.
+
+    A worktree tool or the agent itself can remove the directory between
+    turns; refusing would block the session until someone recreates it by
+    hand. The result flags the recreation so the server can tell the user.
+    """
+    host = _make_host_process()
+    host._auth_token_factory = lambda: "host-bootstrap-bearer"
+    host._auth_token_factory_resolved = True
+    # The pruned-worktree case: the container survives, only the leaf is gone.
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.parent.mkdir(parents=True)
+    assert not workspace.exists()
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_003",
+        binding_token="test_token_abc",
+        workspace=str(workspace),
+        session_id="session_recreated_workspace",
+    )
+
+    spawned_kwargs: dict[str, object] = {}
+    original_popen = subprocess.Popen
+
+    def _fake_popen(args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        """Capture the spawn kwargs and start a no-op process.
+
+        :param args: Command args (ignored — we spawn a real sleep).
+        :param kwargs: Popen kwargs including cwd.
+        :returns: A real subprocess handle.
+        """
+        spawned_kwargs.update(kwargs)
+        return original_popen(
+            ["sleep", "10"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+    with (
+        caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen),
+    ):
+        result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "launched", (
+        f"a deleted workspace must be recreated, not refused; got {result.status!r}: "
+        f"{result.error}"
+    )
+    assert workspace.is_dir(), "the missing workspace directory should have been recreated"
+    assert spawned_kwargs.get("cwd") == str(workspace)
+    assert result.runner_id == token_bound_runner_id("test_token_abc")
+    assert result.error is None
+    assert result.error_code is None
+    assert result.workspace_recreated is True
+    assert str(workspace) in caplog.text, "the host should log which directory it recreated"
+
+    _cleanup_host(host)
+
+
+async def test_handle_launch_refuses_when_workspace_parent_missing(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Verify that a workspace whose parent chain is gone is refused, not rebuilt.
+
+    Only the leaf is recreated. A missing parent signals a stale path or an
+    unmounted volume rather than a pruned worktree, so the host must refuse
+    with ``workspace_missing`` instead of creating a fresh tree on the wrong
+    filesystem.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "gone" / "feature-x"
+    assert not workspace.parent.exists()
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_004",
+        binding_token="test_token_def",
+        workspace=str(workspace),
+        session_id="session_missing_parent",
+    )
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+        result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed", "a missing parent chain must be refused, not rebuilt"
+    assert result.error_code == WORKSPACE_MISSING_ERROR_CODE
+    assert result.workspace_recreated is False
+    assert not workspace.exists(), "the host must not create a workspace under a missing parent"
+
+    _cleanup_host(host)
+
+
+async def test_handle_launch_refuses_when_workspace_mkdir_denied(
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """
+    Verify that a workspace the host cannot recreate is refused, not launched.
+
+    The leaf is gone and its parent exists, so recreation is attempted, but
+    the host lacks permission to create it (for example a read-only mount).
+    The refusal must report ``workspace_missing`` and spawn no runner. Raising
+    the error keeps the test deterministic regardless of CI privileges.
+    """
+    host = _make_host_process()
+    workspace = tmp_path / "worktrees" / "feature-x"
+    workspace.parent.mkdir(parents=True)
+    assert not workspace.exists()
+
+    frame = HostLaunchRunnerFrame(
+        request_id="req_005",
+        binding_token="test_token_ghi",
+        workspace=str(workspace),
+        session_id="session_mkdir_denied",
+    )
+
+    def _deny_mkdir(*_args: object, **_kwargs: object) -> None:
+        raise PermissionError(errno.EACCES, "Permission denied", str(workspace))
+
+    def _unexpected_popen(*_args: object, **_kwargs: object) -> object:
+        raise AssertionError("a workspace that cannot be recreated must not spawn a runner")
+
+    with (
+        caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_unexpected_popen),
+        patch.object(Path, "mkdir", _deny_mkdir),
+    ):
+        result = await host._handle_launch(frame)
+
+    assert isinstance(result, HostLaunchRunnerResultFrame)
+    assert result.status == "failed", "a workspace that cannot be recreated must be refused"
+    assert result.error_code == WORKSPACE_MISSING_ERROR_CODE
+    assert result.workspace_recreated is False
+    assert result.runner_id is None
+    assert not workspace.exists(), "a denied mkdir must leave no workspace behind"
+
     _cleanup_host(host)
 
 
 @pytest.mark.parametrize("binding_token", ["token_xyz", "", "   "])
 async def test_handle_launch_fails_for_bad_workspace(
+    tmp_path: Path,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
     binding_token: str,
 ) -> None:
     """
     Verify that _handle_launch returns status='failed' when the
-    workspace path does not exist.
+    workspace path does not exist and cannot be recreated.
 
     If it returns 'launched', the path validation is missing and
     the runner would start in a nonexistent directory.
     """
     host = _make_host_process()
+    # A regular file where a parent directory should be: mkdir cannot help.
+    (tmp_path / "not-a-dir").write_text("")
+    missing_workspace = tmp_path / "not-a-dir" / "workspace"
     frame = HostLaunchRunnerFrame(
         request_id="req_002",
         binding_token=binding_token,
-        workspace="/nonexistent/path/that/does/not/exist",
+        workspace=str(missing_workspace),
         session_id="session_missing_workspace",
     )
 
@@ -976,11 +1197,11 @@ async def test_handle_launch_fails_for_bad_workspace(
     assert failure.attributes["error_impact"] == "blocking"
     assert failure.attributes["error_phase"] == "harness_setup"
     assert "session_missing_workspace" in caplog.text
-    assert "/nonexistent/path/that/does/not/exist" in caplog.text
+    assert str(missing_workspace) in caplog.text
     output = capsys.readouterr().out
     assert "Runner launch failed" in output
     assert "session_missing_workspace" in output
-    assert "/nonexistent/path/that/does/not/exist" in output
+    assert str(missing_workspace) in output
 
 
 async def test_host_boot_skips_managed_gateway_with_malformed_profile(
@@ -1319,10 +1540,22 @@ async def test_handle_launch_without_harness_skips_check(
     _cleanup_host(host)
 
 
+@pytest.mark.parametrize(
+    ("console_error", "log_sink_closed"),
+    [
+        (None, False),
+        (BrokenPipeError(), False),
+        (ValueError("closed"), False),
+        (BrokenPipeError(), True),
+    ],
+)
 async def test_handle_launch_prints_exact_runner_log_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    console_error: Exception | None,
+    log_sink_closed: bool,
 ) -> None:
     """The launch banner names the exact runner log file, not just the dir.
 
@@ -1360,21 +1593,39 @@ async def test_handle_launch_prints_exact_runner_log_path(
             stderr=subprocess.DEVNULL,
         )
 
-    with patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen):
-        result = await host._handle_launch(frame)
+    try:
+        with (
+            patch("omnigent.host.connect.subprocess.Popen", side_effect=_fake_popen),
+            patch("omnigent.host.connect.print", side_effect=console_error, create=True)
+            if console_error is not None
+            else contextlib.nullcontext(),
+            patch("omnigent.host.connect._logger.warning", side_effect=BrokenPipeError())
+            if log_sink_closed
+            else contextlib.nullcontext(),
+        ):
+            result = await host._handle_launch(frame)
+    finally:
+        _cleanup_host(host)
 
     assert result.status == "launched", result.error
     # Exactly one runner-*.log was created under the runner log dir.
     runner_log_dir = tmp_path / ".omnigent" / "logs" / "runner"
     log_files = list(runner_log_dir.glob("runner-*.log"))
     assert len(log_files) == 1
-    out = capsys.readouterr().out
-    assert "↑ Runner started:" in out
-    # The exact file path is printed, home-collapsed to ``~`` for readability.
-    assert f"log: ~/.omnigent/logs/runner/{log_files[0].name}" in out
-    assert "session: conv_log" in out
-
-    _cleanup_host(host)
+    if console_error is None:
+        out = capsys.readouterr().out
+        assert "↑ Runner started:" in out
+        assert f"log: ~/.omnigent/logs/runner/{log_files[0].name}" in out
+        assert "session: conv_log" in out
+    elif not log_sink_closed:
+        [record] = [
+            row
+            for row in caplog.records
+            if getattr(row, "event_name", None) == "host_console_write_failed"
+        ]
+        assert record.attributes["exception_type"] == type(console_error).__name__
+        assert record.session_id == "conv_log"
+        assert record.attributes["runner_id"] == token_bound_runner_id("tok_log")
 
 
 class _FakeTunnel:
@@ -1926,9 +2177,11 @@ def test_runner_exit_error_redacts_credential_values(tmp_path: Path) -> None:
     assert "code 3" in error
 
 
+@pytest.mark.parametrize("console_closed", [False, True])
 async def test_watch_runner_silent_on_intentional_stop(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    console_closed: bool,
 ) -> None:
     """A host.stop_runner termination is NOT reported as a crash.
 
@@ -1973,9 +2226,14 @@ async def test_watch_runner_silent_on_intentional_stop(
     assert result.status == "launched", result.error
 
     runner_id = token_bound_runner_id("tok_stop")
-    stop_result = await host._handle_stop(
-        HostStopRunnerFrame(request_id="req_stop_2", runner_id=runner_id)
-    )
+    with (
+        patch("omnigent.host.connect.print", side_effect=BrokenPipeError(), create=True)
+        if console_closed
+        else contextlib.nullcontext()
+    ):
+        stop_result = await host._handle_stop(
+            HostStopRunnerFrame(request_id="req_stop_2", runner_id=runner_id)
+        )
     assert stop_result.status == "stopped"
 
     # Let the watcher observe the (intentional) death and finish.
@@ -2357,10 +2615,13 @@ async def test_connect_watchdog_silent_on_intentional_stop(
 
 @pytest.mark.parametrize("had_connected", [None, False, True])
 @pytest.mark.parametrize("send_fails", [False, True])
+@pytest.mark.parametrize("console_error", [None, BrokenPipeError, ValueError, OSError])
 async def test_unreported_exit_flushes_after_reconnect(
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
     had_connected: bool | None,
     send_fails: bool,
+    console_error: type[Exception] | None,
 ) -> None:
     """An exit report that raced a disconnect is sent after the next hello.
 
@@ -2379,6 +2640,10 @@ async def test_unreported_exit_flushes_after_reconnect(
     )
     assert "runner_parked" in host._unreported_exits
     tunnel = _FakeTunnel()
+    if console_error is not None:
+        monkeypatch.setattr(
+            "omnigent.host.connect.print", Mock(side_effect=console_error), raising=False
+        )
 
     # _serve_frames sends hello, flushes parked reports, then hits the
     # fake recv's immediate disconnect.
@@ -7184,8 +7449,13 @@ async def test_accepted_connect_resets_loopback_refused_streak(
     assert spy.call_count == 6
 
 
+@pytest.mark.parametrize("console_error", [None, BrokenPipeError(), ValueError("closed")])
 def test_run_host_process_exits_nonzero_on_fatal(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    console_error: Exception | None,
 ) -> None:
     """run_host_process surfaces a fatal tunnel failure as its own exit code.
 
@@ -7198,7 +7468,12 @@ def test_run_host_process_exits_nonzero_on_fatal(
     """
     _patch_connect(monkeypatch, _ConnectSpy([_invalid_status(403)]))
 
-    with pytest.raises(SystemExit) as excinfo:
+    with (
+        patch("omnigent.host.connect.print", side_effect=console_error, create=True)
+        if console_error is not None
+        else contextlib.nullcontext(),
+        pytest.raises(SystemExit) as excinfo,
+    ):
         run_host_process(
             server_url="https://app.example.databricks.com",
             config_path=tmp_path / "config.yaml",
@@ -7208,10 +7483,14 @@ def test_run_host_process_exits_nonzero_on_fatal(
     # from a crash so supervision doesn't retry it.
     assert excinfo.value.code == HOST_FATAL_EXIT_CODE
     assert HOST_FATAL_EXIT_CODE != 1
-    err = capsys.readouterr().err
-    # The actionable message reached stderr (banner + the 403 cause).
-    assert "Could not connect" in err
-    assert "HTTP 403" in err
+    assert _host_exit_reasons(caplog) == ["fatal_connect"]
+    assert isinstance(excinfo.value.__cause__, HostConnectError)
+    assert "HTTP 403" in str(excinfo.value.__cause__)
+    if console_error is None:
+        err = capsys.readouterr().err
+        # The actionable message reached stderr (banner + the 403 cause).
+        assert "Could not connect" in err
+        assert "HTTP 403" in err
 
 
 def _host_exit_reasons(caplog: pytest.LogCaptureFixture) -> list[object]:
@@ -7859,10 +8138,12 @@ async def test_sustained_recycle_failures_fall_back_to_backoff(
     assert prompt == [0, 1, 2], f"prompt cadence must stop after the streak cap: {prompt}"
 
 
+@pytest.mark.parametrize("console_error", [None, BrokenPipeError, ValueError, OSError])
 async def test_silent_connect_streak_escalates_and_slows_reconnects(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
+    console_error: type[Exception] | None,
 ) -> None:
     """Repeated accepted-but-silent connections escalate to slow backoff."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
@@ -7873,14 +8154,37 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     spy = _ConnectSpy([None, None, None, None, None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
     host = _host()
+    if console_error is not None:
+        monkeypatch.setattr(
+            "omnigent.host.connect.print", Mock(side_effect=console_error), raising=False
+        )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+    with (
+        caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
+        patch.object(
+            _DroppedTunnel,
+            "recv",
+            new_callable=AsyncMock,
+            side_effect=ConnectionClosedError(None, None),
+        ) as recv,
+    ):
         await host.run()
 
+    assert spy.call_count == 6
+    assert recv.await_count == 5
     errors = [record for record in caplog.records if record.levelno == logging.ERROR]
     assert len(errors) == 1
     assert "3 consecutive connections but never responded" in errors[0].message
-    assert capsys.readouterr().err.count("never responded") == 1
+    if console_error is None:
+        assert capsys.readouterr().err.count("never responded") == 1
+    else:
+        failed_streams = [
+            record.attributes["stream"]
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "host_console_write_failed"
+        ]
+        assert failed_streams.count("stdout") == 5
+        assert failed_streams.count("stderr") == 1
     reconnects = [
         record.message for record in caplog.records if "Reconnecting in" in record.message
     ]
@@ -9892,6 +10196,50 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
     )
     assert out == {"object": "session.github.info", "ok": True}
     assert seen == {"root": "/ws/omnigent", "account": "octocat", "remote": "origin"}
+
+
+def test_host_serves_a_pr_the_server_vouches_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reads and writes serve a PR this host never recorded once the server vouches for it."""
+    from omnigent.host.frames import HostFsResultFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    monkeypatch.setattr(github_resource, "_gh", lambda *_a, **_kw: (0, "{}", ""))
+    url = "https://github.com/example/one/pull/42"
+    host = _make_host_process()
+
+    def read(params: dict[str, object]) -> HostFsResultFrame:
+        return host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="merge-options",
+                op="github_merge_options",
+                workspace=str(tmp_path),
+                session_id="session",
+                params=params,
+            )
+        )
+
+    try:
+        refused = read({"pr_url": url})
+        served = read({"pr_url": url, "server_tracked": True})
+        written = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="disable-auto-merge",
+                op="github_disable_auto_merge",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "server_tracked": True},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+    assert refused.status == "error"
+    assert "not associated" in (refused.error or "")
+    assert served.status == "ok", served
+    assert written.status == "ok", written
 
 
 async def test_dispatch_fs_write_op_unknown_op_raises() -> None:

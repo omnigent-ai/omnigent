@@ -306,16 +306,6 @@ export function SettingsPage() {
   // `section` is a closed SettingsSectionId union (no PII / unbounded values).
   useOmnigentPageView(`settings.${section}`);
 
-  const pageWrapperSettings = useMemo(() => {
-    if (section === "harnesses" || section === "custom-agents") {
-      return {
-        maxWidthClassName: "max-w-4xl",
-        contentClassName: "px-4 md:px-8",
-      };
-    }
-    return undefined;
-  }, [section]);
-
   // Members / Policies are admin-only management surfaces that own their full
   // layout (their own PageScroll + admin gating), so they render directly —
   // NOT inside the shared section PageScroll below, which would nest two
@@ -339,12 +329,12 @@ export function SettingsPage() {
 
   return (
     <PageScroll
+      maxWidthClassName="max-w-4xl"
       contentClassName="px-4 md:px-8"
       extraBottom="2.5rem"
       // Reserve the scrollbar's width so the centered column doesn't shift when
       // switching between a page or tab that scrolls and one that doesn't.
       className="[scrollbar-gutter:stable]"
-      {...pageWrapperSettings}
     >
       {section === "appearance" && <AppearanceSection />}
       {section === "general" && <GeneralSection />}
@@ -389,7 +379,7 @@ function Section({
 }) {
   return (
     <section>
-      <h1 className="settings-page-title text-2xl font-semibold">{title}</h1>
+      <h1 className="settings-page-title text-2xl font-medium">{title}</h1>
       {description && (
         <p
           className={cn(
@@ -786,7 +776,10 @@ function ColorThemeControl() {
       title="Color theme"
       helper="Choose a preset, then tune it across light and dark mode."
     >
-      <div className="overflow-hidden rounded-xl border bg-card/55">
+      <div
+        data-testid="color-theme-editor"
+        className="overflow-hidden rounded-xl border bg-transparent"
+      >
         <div className="flex flex-col gap-3 border-b bg-muted/30 p-4 sm:flex-row sm:items-center sm:justify-between">
           <div className="flex min-w-0 items-center gap-3">
             <div className="w-28 shrink-0 overflow-hidden rounded-lg shadow-sm">
@@ -838,15 +831,15 @@ function ColorThemeControl() {
         <div className="px-4">
           <ThemeColorPicker
             label="Accent"
-            value={editableTheme.accent}
+            value={isDark ? editableTheme.darkAccent : editableTheme.accent}
             testId="custom-theme-accent"
-            onChange={(accent) => updateCustomTheme({ accent, darkAccent: accent })}
+            onChange={(accent) => updateCustomTheme(isDark ? { darkAccent: accent } : { accent })}
           />
           <ThemeColorPicker
             label="Background tint"
-            value={editableTheme.tint}
+            value={isDark ? editableTheme.darkTint : editableTheme.tint}
             testId="custom-theme-tint"
-            onChange={(tint) => updateCustomTheme({ tint })}
+            onChange={(tint) => updateCustomTheme(isDark ? { darkTint: tint } : { tint })}
           />
           <div className="flex items-center justify-between gap-4 border-b border-border/70 py-4">
             <SettingsLabel label="Contrast" description="Separates text, borders, and surfaces." />
@@ -1990,7 +1983,7 @@ function UiFontSizeControl() {
         role="group"
         aria-label="Interface font size"
         className={cn(
-          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
+          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input",
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >
@@ -2154,7 +2147,7 @@ function UiCodeFontSizeControl() {
         role="group"
         aria-label="Code font size"
         className={cn(
-          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input/30",
+          "inline-flex h-9 items-stretch overflow-hidden rounded-lg border border-input bg-background transition-colors dark:bg-input",
           "focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50",
         )}
       >

@@ -1383,6 +1383,37 @@ def test_launch_runner_result_frame_legacy_payload_decodes_error_code_none() -> 
     assert decoded.error_code is None
 
 
+def test_launch_runner_result_frame_workspace_recreated_round_trip() -> None:
+    """
+    Verify ``workspace_recreated`` survives encode → decode and reads as
+    False from an OLDER host that never sends the key.
+
+    The server persists its "workspace was recreated" notice off this flag;
+    if it is dropped, the user is never told their directory is now empty.
+    """
+    original = HostLaunchRunnerResultFrame(
+        request_id="req_001",
+        status="launched",
+        runner_id="runner_token_abc",
+        workspace_recreated=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostLaunchRunnerResultFrame)
+    assert decoded.workspace_recreated is True
+
+    legacy = json.dumps(
+        {
+            "kind": "host.launch_runner_result",
+            "request_id": "req_001",
+            "status": "launched",
+            "runner_id": "runner_token_abc",
+        }
+    )
+    decoded_legacy = decode_host_frame(legacy)
+    assert isinstance(decoded_legacy, HostLaunchRunnerResultFrame)
+    assert decoded_legacy.workspace_recreated is False
+
+
 def test_stop_runner_frame_round_trip() -> None:
     """
     Verify HostStopRunnerFrame survives encode → decode.

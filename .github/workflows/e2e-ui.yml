@@ -34,6 +34,11 @@ on:
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
+    inputs:
+      parallelism:
+        description: "Number of pytest workers per shard (-n flag). Empty uses the E2E_UI_PARALLELISM repository variable, else 1 (serial)."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -359,6 +364,9 @@ jobs:
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
           UI_SCOPE: ${{ needs.setup.outputs.ui }}
+          # Dispatch input, else the E2E_UI_PARALLELISM repository variable (unset on
+          # fork PRs), else serial.
+          PARALLELISM_INPUT: ${{ inputs.parallelism || vars.E2E_UI_PARALLELISM || '1' }}
           OMNIGENT_E2E_ANTIGRAVITY: mock
           # Prebuilt sidecar from build-sidecar; the codex goal-mode fixture
           # uses this instead of running cargo build. Absolute path: the
@@ -372,6 +380,16 @@ jobs:
           MARKER="not visual"
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             MARKER="$MARKER and not nightly"
+          fi
+          if ! [[ "$PARALLELISM_INPUT" =~ ^[1-9]$ ]]; then
+            echo "Invalid parallelism input: $PARALLELISM_INPUT (expected 1-9)" >&2
+            exit 1
+          fi
+          # Each xdist worker boots its own server; loadscope keeps a module's
+          # tests, and so its module-scoped fixtures, on one worker.
+          worker_args=()
+          if [[ "$PARALLELISM_INPUT" -gt 1 ]]; then
+            worker_args+=(-n "$PARALLELISM_INPUT" --dist=loadscope)
           fi
           scope_args=()
           if [[ "$UI_SCOPE" == "sidecar" ]]; then
@@ -389,7 +407,7 @@ jobs:
           # Retry every otherwise-unmarked failure once for transient CI races;
           # per-test @pytest.mark.flaky settings still take precedence.
           # Keep the failed attempt's traceback even when its retry passes.
-          uv run pytest tests/e2e_ui "${scope_args[@]}" \
+          uv run pytest tests/e2e_ui "${scope_args[@]}" "${worker_args[@]}" \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --durations=25 --durations-min=1.0 \
             --reruns=1 --reruns-delay=5 --rerun-show-tracebacks \

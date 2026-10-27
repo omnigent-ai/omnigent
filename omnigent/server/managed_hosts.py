@@ -576,10 +576,14 @@ class ManagedLaunch:
     :param error: Failure detail once settled unsuccessfully, e.g.
         ``"managed sandbox launch failed: …"``. ``None`` while
         in flight and on success.
+    :param bound: Set once the session row records its new host. From
+        then on the host's replica can finish the launch and deliver
+        saved inputs, so a scheduled fire can hand off at this point.
     """
 
     settled: asyncio.Event
     error: str | None = None
+    bound: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
 
 
 class ManagedLaunchTracker:

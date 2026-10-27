@@ -5659,6 +5659,8 @@ def test_fork_conversation_drops_instance_scoped_labels(
             "omnigent.last_context_window": "1000000",
             # The dangerous bypass opt-in must NOT ride into the fork.
             "omnigent.codex_native.bypass_sandbox": "1",
+            # Creation origin belongs to the source, not the fork.
+            "omnigent.created_by_session_id": "original-manager",
             # An ordinary, non-instance label that SHOULD carry over.
             "omnigent.wrapper": "claude-code-native-ui",
         },

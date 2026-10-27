@@ -592,7 +592,12 @@ def test_workspace_tray_aligns_with_the_card(
     expected = input_box["x"] - card["x"]
     assert tray_box["x"] - card["x"] == pytest.approx(12, abs=TOLERANCE)
     assert right_inset(card, tray_box) == pytest.approx(12, abs=TOLERANCE)
-    assert box(chip)["x"] - tray_box["x"] == pytest.approx(expected, abs=TOLERANCE)
+    compact_inset = tray.evaluate(
+        "el => parseFloat(getComputedStyle(el).paddingLeft) + "
+        "parseFloat(getComputedStyle(el).borderLeftWidth)"
+    )
+    assert compact_inset < expected
+    assert box(chip)["x"] - tray_box["x"] == pytest.approx(compact_inset, abs=TOLERANCE)
 
 
 def test_queued_rows_and_nested_workspace_share_the_tray_grid(
@@ -628,7 +633,9 @@ def test_queued_rows_and_nested_workspace_share_the_tray_grid(
         assert columns[0][name]["x"] == pytest.approx(columns[1][name]["x"], abs=TOLERANCE)
     assert_primitive_inset(columns[0]["status"]["x"] - box(strip)["x"])
     tray = page.get_by_test_id("composer-workspace-controls")
-    assert tray.evaluate("el => getComputedStyle(el).borderTopWidth") == "0px"
+    assert tray.evaluate("el => parseFloat(getComputedStyle(el).borderTopWidth)") == pytest.approx(
+        0
+    )
     assert box(strip)["x"] == pytest.approx(box(tray)["x"], abs=TOLERANCE)
     card = box(page.locator("[data-composer-card]"))
     input_box = box(composer)

@@ -11,6 +11,11 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   allowed and their readers see the message. Normal queue/steering applies.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
+- `created-by`: independent workers record their creating session. The worker's
+  Chat/Terminal header rechecks access when opened, hides attribution during the
+  lookup, and links to the creator when accessible; otherwise it says "Created by
+  another session". `sys_session_list` and `sys_session_get_info` expose
+  `created_by_session_id` so managers can identify their workers across restarts.
 - `kill-switch`: an explicit disable refuses new peer sends and independent
   creates, even if an enable is also listed. Restart every server replica to
   apply it. Already accepted tasks may finish; ordinary reads and child work remain.
@@ -39,6 +44,9 @@ workers on its host or a new managed sandbox. This is enabled by default, with
 - In a session with creation tools enabled, ask for a worker with
   `sys_session_create` and `placement="same_host"` or `placement="managed"`.
 - Use the existing Share dialog to share the sender or receiver, then repeat.
+- Open an independent worker in Chat or Terminal and follow its "Created by"
+  link. On mobile web, the same link is in the header. Ask the manager to list
+  its sessions and match `created_by_session_id` to its own session ID.
 
 ## Driving it with the repro environment
 
@@ -47,6 +55,15 @@ Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
 server's sandbox configuration (for example, Modal or Daytona). Internal deployments
 can supply their own provider through the existing launcher interface.
+
+For `created-by`, extend the creation journey below: open the worker, reload,
+and follow its creator link. Share only the worker with a second viewer and
+verify they see "Created by another session" with no creator link or title.
+Also revoke creator access after that viewer has visited the creator, then open
+the worker through in-app navigation: no cached creator title or link should appear.
+Fork the worker and verify the fork has no "Created by" label. The API/runner
+contract is covered by `tests/server/integration/test_session_orchestration.py`;
+the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
 
 - Own environment: `uv run --no-sync pytest
   tests/e2e/test_private_session_orchestration.py --reruns 0` uses real local
@@ -84,6 +101,12 @@ can supply their own provider through the existing launcher interface.
   verification; local process checks do not cover them.
 
 ## Gotchas
+
+- "Created by" records origin only: workers remain top-level and have their own
+  permissions and lifecycle. Sharing a worker does not share its creator; the
+  opaque creator ID remains in worker metadata, but the UI resolves its title
+  through a separate authorized read. Forks drop the creator label. Older
+  workers have no label; there is no backfill or automatic completion reply.
 
 - Same host also means the same workspace, inherited together from the host-bound
   ancestor for child managers. Separate sessions do not isolate filesystem edits.

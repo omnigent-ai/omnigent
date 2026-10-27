@@ -247,6 +247,45 @@ _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
+def _print_host_status(
+    message: str,
+    *,
+    stderr: bool = False,
+    runner_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """A detached console must not interrupt host work or replace its failure cause."""
+    stream = sys.stderr if stderr else sys.stdout
+    try:
+        print(message, file=stream, flush=True)
+    except (OSError, ValueError) as exc:
+        if (
+            isinstance(exc, BrokenPipeError)
+            and (stream is sys.__stdout__ or stream is sys.__stderr__)
+            and stream is not None
+        ):
+            # Python retries buffered output at shutdown and can replace the exit code.
+            # Confirm the real stream is broken before redirecting its descriptor.
+            with contextlib.suppress(OSError, ValueError):
+                try:
+                    stream.flush()
+                except BrokenPipeError:
+                    with open(os.devnull, "w") as sink:
+                        os.dup2(sink.fileno(), stream.fileno())
+        # A log handler may share the detached console.
+        with contextlib.suppress(OSError, ValueError):
+            _logger.warning(
+                "Host console output is unavailable",
+                extra=debug_event(
+                    "host_console_write_failed",
+                    runner_id=runner_id,
+                    session_id=session_id,
+                    exception_type=type(exc).__name__,
+                    stream="stderr" if stderr else "stdout",
+                ),
+            )
+
+
 def _coerce_int(value: object) -> int:
     """Convert a validated JSON scalar with the standard ``int`` semantics."""
     return int(cast(str | bytes | bytearray | SupportsInt | SupportsIndex, value))
@@ -1659,11 +1698,10 @@ class HostProcess:
                 # terminal — print once per redirect streak so a foreground
                 # `omnigent host` shows the auth problem and its fix instead
                 # of sitting silent while it retries.
-                print(
+                _print_host_status(
                     f"⚠ {cause} Retrying — this also happens briefly while "
                     f"the server restarts. {self._credentials_fix_hint()}",
-                    file=sys.stderr,
-                    flush=True,
+                    stderr=True,
                 )
             return None
         # Carry the upgrade response's body through so a refusal that names its
@@ -1725,19 +1763,18 @@ class HostProcess:
                         "host. Still retrying."
                     )
                     _logger.warning("%s", escalated)
-                    print(f"⚠ {escalated}", file=sys.stderr, flush=True)
+                    _print_host_status(f"⚠ {escalated}", stderr=True)
                 else:
                     _logger.warning("%s Retrying — check your VPN/network.", cause)
                     if self._auth_retry_streak == 1:
                         # The warning above lands only in the CLI log file;
                         # print once per outage so a foreground `omnigent host`
                         # isn't silent.
-                        print(
+                        _print_host_status(
                             f"⚠ {cause} Retrying — this usually means the VPN or "
                             "network dropped. It will reconnect automatically "
                             "once connectivity returns.",
-                            file=sys.stderr,
-                            flush=True,
+                            stderr=True,
                         )
                 return None
         if status == 401:
@@ -1849,12 +1886,11 @@ class HostProcess:
                 error_phase=mapped_phase.value,
             ),
         )
-        print(
+        _print_host_status(
             "  ! Runner launch failed\n"
             f"    session: {session_id!r}\n"
             f"    workspace: {frame.workspace!r}\n"
             f"    reason: {diagnostic!r}",
-            flush=True,
         )
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
@@ -1903,18 +1939,17 @@ class HostProcess:
                     "deployment. Still retrying."
                 )
                 _logger.warning("%s", escalated)
-                print(f"⚠ {escalated}", file=sys.stderr, flush=True)
+                _print_host_status(f"⚠ {escalated}", stderr=True)
             else:
                 _logger.warning("%s Retrying.", cause)
                 if self._transient_404_streak == 1:
                     # The warning lands in the CLI log file — print once per
                     # restart window so a foreground `omnigent host` isn't
                     # silent while it rides the 404s out.
-                    print(
+                    _print_host_status(
                         f"⚠ {cause} Retrying — it will reconnect automatically "
                         "once the server is back.",
-                        file=sys.stderr,
-                        flush=True,
+                        stderr=True,
                     )
             return None
         return HostConnectError(
@@ -2014,11 +2049,42 @@ class HostProcess:
             )
 
         workspace = Path(frame.workspace).expanduser()
+        workspace_recreated = False
         if not workspace.is_dir():
-            return self._launch_failed(
-                frame,
-                workspace_missing_message(workspace),
-                error_code=WORKSPACE_MISSING_ERROR_CODE,
+            # Recreate a vanished leaf (pruned worktree, an agent's rm -rf) so the
+            # session keeps working; a missing *parent* signals a stale path or an
+            # unmounted volume, so refuse rather than build on the wrong filesystem.
+            try:
+                await asyncio.to_thread(workspace.mkdir, exist_ok=True)
+            except OSError as exc:
+                _logger.warning(
+                    "Cannot recreate missing workspace %r for session %r: %s",
+                    str(workspace),
+                    frame.session_id or "<unknown>",
+                    exc,
+                )
+                return self._launch_failed(
+                    frame,
+                    workspace_missing_message(workspace),
+                    error_code=WORKSPACE_MISSING_ERROR_CODE,
+                )
+            workspace_recreated = True
+            _logger.warning(
+                "Recreated missing workspace %r for session %r",
+                str(workspace),
+                frame.session_id or "<unknown>",
+                extra=debug_event(
+                    "workspace_recreated",
+                    session_id=frame.session_id,
+                    host_request_id=frame.request_id,
+                    stage="runner_launch",
+                ),
+            )
+            print(
+                "  ! Recreated missing workspace\n"
+                f"    session: {frame.session_id or '<unknown>'!r}\n"
+                f"    workspace: {str(workspace)!r}",
+                flush=True,
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
@@ -2175,16 +2241,18 @@ class HostProcess:
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
         session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
-        print(
+        _print_host_status(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
             f"    log: {display_log_path(log_path)}"
             f"{session_line}",
-            flush=True,
+            runner_id=runner_id,
+            session_id=frame.session_id,
         )
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
             status="launched",
             runner_id=runner_id,
+            workspace_recreated=workspace_recreated,
         )
 
     def _ensure_zygote_started(self) -> ZygoteManager | None:
@@ -2374,9 +2442,10 @@ class HostProcess:
         # freeze the daemon's control handler.
         await self._stop_runner_and_trigger(handle.proc, "runner_stopped")
         _logger.info("Stopped runner %s", frame.runner_id)
-        print(
+        _print_host_status(
             f"  ↓ Runner stopped: {frame.runner_id}",
-            flush=True,
+            runner_id=frame.runner_id,
+            session_id=handle.session_id,
         )
         return HostStopRunnerResultFrame(
             request_id=frame.request_id,
@@ -3659,8 +3728,13 @@ class HostProcess:
             self._fs_readers.move_to_end(expanded)
             reader = cached[1]
         params = frame.params or {}
+        from omnigent.runner import pr_resource
+
         try:
-            payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
+            with pr_resource.server_tracking(
+                params.get("server_tracked"), params.get("default_pr_url")
+            ):
+                payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
         except WorkspaceReaderError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3733,8 +3807,26 @@ class HostProcess:
                 session_id=frame.session_id,
                 agent_id=frame.agent_id,
             )
-        except Exception:
-            _logger.exception("Skill discovery failed for %r", frame.harness)
+        except Exception as exc:
+            _logger.exception(
+                "Skill discovery failed for %r",
+                frame.harness,
+                extra=debug_event(
+                    "host_skill_discovery_failed",
+                    session_id=frame.session_id,
+                    request_id=frame.request_id,
+                    host_id=self._identity.host_id,
+                    harness=frame.harness,
+                    discovery_scope="session" if frame.session_id is not None else "directory",
+                    error_type=type(exc).__name__,
+                    http_status=(
+                        exc.response.status_code
+                        if isinstance(exc, httpx.HTTPStatusError)
+                        else None
+                    ),
+                    errno=exc.errno if isinstance(exc, OSError) else None,
+                ),
+            )
             return HostSkillsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -4148,10 +4240,14 @@ class HostProcess:
                 error_code="not_found",
                 error="workspace directory does not exist on host",
             )
+        params = {**(frame.params or {}), "session_id": frame.session_id}
+        from omnigent.runner import pr_resource
+
         try:
-            payload = self._dispatch_fs_write_op(
-                expanded, frame.op, {**(frame.params or {}), "session_id": frame.session_id}
-            )
+            with pr_resource.server_tracking(
+                params.get("server_tracked"), params.get("default_pr_url")
+            ):
+                payload = self._dispatch_fs_write_op(expanded, frame.op, params)
         except ValueError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -4403,11 +4499,10 @@ class HostProcess:
         except Exception as exc:
             _logger.exception("Host harness readiness probe failed")
             if startup:
-                print(
+                _print_host_status(
                     "⚠ Could not inspect installed harnesses; the host will "
                     f"connect with harness readiness unknown: {exc}",
-                    file=sys.stderr,
-                    flush=True,
+                    stderr=True,
                 )
             return None
 
@@ -4488,11 +4583,10 @@ class HostProcess:
         except Exception as exc:
             _logger.exception("Host gateway-inference probe failed")
             if startup:
-                print(
+                _print_host_status(
                     "⚠ Could not inspect gateway inference; the host will "
                     f"connect with gateway backing unknown: {exc}",
-                    file=sys.stderr,
-                    flush=True,
+                    stderr=True,
                 )
             return None
 
@@ -4515,10 +4609,9 @@ class HostProcess:
                 "Host capability discovery exceeded %.0fs; continuing with unknown metadata",
                 _HOST_CAPABILITY_INIT_TIMEOUT_S,
             )
-            print(
+            _print_host_status(
                 "⚠ Host capability discovery timed out; connecting with readiness unknown.",
-                file=sys.stderr,
-                flush=True,
+                stderr=True,
             )
         if self._capability_generation == generation:
             self._replace_capabilities(configured, gateway)
@@ -4758,12 +4851,11 @@ class HostProcess:
                                 "reconnecting on slow backoff until it responds.",
                                 cause,
                             )
-                            print(
+                            _print_host_status(
                                 f"⚠ {cause} The server may be unhealthy. "
                                 "Retrying on a slower cadence — this recovers "
                                 "automatically once the server responds.",
-                                file=sys.stderr,
-                                flush=True,
+                                stderr=True,
                             )
                     else:
                         self._silent_connect_streak = 0
@@ -5329,11 +5421,10 @@ class HostProcess:
                 await self._report_runner_exit(
                     runner_id, report.error, had_connected=report.had_connected
                 )
-            print(
+            _print_host_status(
                 f"✓ Connected as {self._identity.name!r} "
                 f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
                 "Listening for sessions — Ctrl-C to disconnect.",
-                flush=True,
             )
 
             # Readiness refresh runs in its own task, never on this receive loop:
@@ -5953,21 +6044,20 @@ def _serve_host_until_exit(
         crash_reporting.report_host_exit(
             "identity_error", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
         )
-        print(
+        _print_host_status(
             f"\n✗ Could not start host.\n{exc}",
-            file=sys.stderr,
-            flush=True,
+            stderr=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from None
     crash_reporting.set_host_exit_context(host_id=identity.host_id)
     crash_reporting.log_host_started()
     if not path.exists():
-        print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
+        _print_host_status(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
     # known) — the API mount is an implementation detail.
     from omnigent.util.server_url import display_server_url
 
-    print(
+    _print_host_status(
         f"Connecting to {display_server_url(server_url)} as {identity.name!r} ({identity.host_id})"
     )
     # Tell the user where logs land up front — `omnigent host` used to run
@@ -5975,13 +6065,13 @@ def _serve_host_until_exit(
     # work goes to per-runner files under the runner dir (the exact
     # file is printed when each runner launches). The host process's
     # own diagnostics go to the host destination.
-    print(f"Session logs: {display_log_path(_runner_log_dir())}/")
-    print(f"This host's log: {display_log_path(host_log_path)}")
+    _print_host_status(f"Session logs: {display_log_path(_runner_log_dir())}/")
+    _print_host_status(f"This host's log: {display_log_path(host_log_path)}")
     from omnigent.cli_diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()
     if _cli_log is not None and _cli_log != host_log_path:
-        print(f"CLI diagnostics: {display_log_path(_cli_log)}")
+        _print_host_status(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
     # Executor-agnostic GitHub setup: point git at the server's credential
     # broker and attribute commits to the owner. Best-effort; the host runs in
@@ -6032,10 +6122,9 @@ def _serve_host_until_exit(
         crash_reporting.report_host_exit(
             "fatal_connect", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
         )
-        print(
+        _print_host_status(
             f"\n✗ Could not connect to {display_server_url(server_url)}.\n{exc}",
-            file=sys.stderr,
-            flush=True,
+            stderr=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
     return host.lifecycle_lost

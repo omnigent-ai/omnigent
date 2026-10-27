@@ -1485,6 +1485,101 @@ def test_startup_lease_renewal_expiry_and_conditional_reconciliation(
     )
 
 
+def test_recovery_records_a_session_that_already_finished(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    now = task.next_run_at
+    run = store.claim_scheduled_run(
+        task, now=now, next_run_at=now + 3600, host_id=task.host_id, lease_seconds=120
+    )
+    # Only recovery can tell that a session finished before startup was recorded.
+    with pytest.raises(ValueError, match="Only recovery records 'succeeded'"):
+        store.transition_starting_run(run, now=lambda: now + 30, status="succeeded")
+    succeeded = store.transition_starting_run(
+        run, now=lambda: now + 120, status="succeeded", expired=True
+    )
+    assert succeeded.status == "succeeded"
+    assert succeeded.finished_at == now + 120
+    assert succeeded.lease_expires_at is None
+    assert store.list_expired_starting_runs(now + 300) == []
+
+
+def test_run_now_requests_wait_as_pending_runs_until_claimed(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    paused = store.update(task.id, state="paused")
+    now = task.created_at + 10
+    first, second = (
+        store.request_manual_run(paused, now=now, trigger_key=key, host_id=paused.host_id)
+        for key in ("manual:first", "manual:second")
+    )
+    assert (first.status, first.fired_at, first.lease_expires_at) == ("scheduled", None, None)
+    assert (first.trigger_key, first.host_id) == ("manual:first", paused.host_id)
+    page = store.list_pending_runs(limit=1)
+    rest = store.list_pending_runs(after=(page[0].workspace_id, page[0].id))
+    assert sorted(run.id for run in [*page, *rest]) == sorted([first.id, second.id])
+
+    # Run now is a manual override, so a paused task still starts.
+    claimed_task, claimed = store.claim_pending_run(first, now=now + 5, lease_seconds=120)
+    assert (claimed_task.id, claimed_task.state) == (task.id, "paused")
+    assert (claimed.status, claimed.fired_at, claimed.lease_expires_at) == (
+        "starting",
+        now + 5,
+        now + 125,
+    )
+    assert store.claim_pending_run(first, now=now + 6, lease_seconds=120) is None
+    assert [run.id for run in store.list_pending_runs()] == [second.id]
+    assert store.list_expired_starting_runs(now + 125) == [claimed]
+
+
+def test_run_now_requests_for_a_deleted_task_never_start(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    now = task.created_at + 10
+    pending = store.request_manual_run(task, now=now, trigger_key="manual:a", host_id=None)
+    # A deletion that has not purged history yet: the claim records the skip.
+    store.update(task.id, state="deleted")
+    assert store.claim_pending_run(pending, now=now + 1, lease_seconds=120) is None
+    assert store.list_pending_runs() == []
+    assert store.get(task.id) is None
+    assert store.request_manual_run(task, now=now, trigger_key="manual:b", host_id=None) is None
+
+
+def test_run_now_request_follows_a_target_change_before_its_claim(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    from omnigent.server.scheduled.schedule import sandbox_host_id
+
+    task = _due_task(store)
+    now = task.created_at + 10
+    pending = store.request_manual_run(task, now=now, trigger_key="manual:a", host_id=task.host_id)
+    store.update(task.id, execution_target="managed_sandbox", host_id=None, workspace=None)
+    # The request moves to its new sandbox host and waits for that host's owner.
+    assert store.claim_pending_run(pending, now=now + 1, lease_seconds=120) is None
+    [moved] = store.list_pending_runs()
+    assert moved.host_id == sandbox_host_id(task.id, task.workspace_id, "manual:a")
+    claimed_task, claimed = store.claim_pending_run(moved, now=now + 2, lease_seconds=120)
+    assert claimed_task.execution_target == "managed_sandbox"
+    assert (claimed.status, claimed.host_id) == ("starting", moved.host_id)
+
+
+def test_switching_to_legacy_timers_skips_pending_run_now_requests(
+    store: SqlAlchemyScheduledTaskStore,
+) -> None:
+    task = _due_task(store)
+    pending = store.request_manual_run(
+        task, now=task.created_at + 10, trigger_key="manual:a", host_id=task.host_id
+    )
+    store.reset_dispatch_cursors()
+    assert store.list_pending_runs() == []
+    [run] = store.list_runs(task.id)[0]
+    assert (run.id, run.status, run.error_code) == (pending.id, "skipped", "dispatch_disabled")
+    assert store.claim_pending_run(pending, now=task.created_at + 11, lease_seconds=120) is None
+
+
 def test_schedule_edits_and_run_now_metadata(store: SqlAlchemyScheduledTaskStore) -> None:
     task = _due_task(store)
     assert task.next_run_at > task.created_at

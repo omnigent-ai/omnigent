@@ -470,9 +470,11 @@ def test_tool_rows_read_as_actions_with_their_outcome(
     plan_result = plan.get_by_test_id("tool-result-line")
     expect(plan_result).to_have_text("Task plan updated (2 tasks).")
     issue = page.get_by_role("button", name=re.compile(r"^Get issue"))
-    expect(issue).to_contain_text("linear")
+    # Known MCP servers carry their brand spelling, not the config name.
+    expect(issue.get_by_text("Linear", exact=True)).to_be_visible()
     expect(issue.get_by_test_id("tool-result-line")).to_have_text(f"{_ISSUE_TITLE} · In Review")
     failure = page.get_by_role("button", name=re.compile(r"^Create pull request"))
+    expect(failure.get_by_text("GitHub", exact=True)).to_be_visible()
     failure_result = failure.get_by_test_id("tool-result-line")
     expect(failure_result).to_have_text(_PR_ERROR)
     color = "el => getComputedStyle(el).color"

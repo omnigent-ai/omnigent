@@ -54,6 +54,7 @@ from omnigent.harnesses.claude_native.bridge import (
     inject_user_message,
     is_auth_slash_command,
     kill_session,
+    pane_closed_by_omnigent,
     post_tools_changed,
     prepare_bridge_dir,
     read_assistant_text_since,
@@ -1861,6 +1862,31 @@ def test_read_transcript_rewrites_logout_and_login_together(tmp_path: Path) -> N
     assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
 
 
+def test_read_transcript_login_guidance_in_managed_sandbox_points_at_a_new_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A managed sandbox (``IS_SANDBOX=1``) cannot run ``omni setup``.
+
+    Its credentials arrive at launch, so the appended remedy names the only
+    self-service step (a new session) and the fallback when that still fails
+    (the sandbox administrator). The CLI's own text is kept.
+    """
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    raw_text = "Login expired · Please run /login"
+
+    rendered = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
+
+    assert rendered.startswith(f"{raw_text}\n\n")
+    assert "credentials at launch" in rendered
+    assert "new session" in rendered
+    assert "if sign-in still fails" in rendered
+    assert "sandbox administrator" in rendered
+    assert "refresh its credentials" in rendered
+    assert "omni setup" not in rendered
+
+
 def test_read_transcript_items_from_offset_skips_existing_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2184,6 +2210,87 @@ def test_scheduled_wake_skips_tool_results_and_real_prompts(tmp_path: Path) -> N
     assert result.items[0].response_id == "resp_prev_turn"
     assert result.items[2].data["role"] == "assistant"
     assert result.items[2].response_id not in {"resp_prev_turn", None}
+
+
+@pytest.mark.parametrize(
+    ("record_fields", "message_fields", "hidden"),
+    [
+        pytest.param({}, {}, True, id="interrupted-turn-resumed"),
+        pytest.param(
+            {"isApiErrorMessage": True, "error": "rate_limit"}, {}, True, id="rate-limit"
+        ),
+        pytest.param({}, {"content": "No response requested."}, True, id="string-content"),
+        pytest.param({}, {"model": "claude-sonnet-4-5"}, False, id="model-reply"),
+        pytest.param(
+            {"isApiErrorMessage": True},
+            {"content": [{"type": "text", "text": "API Error: Connection refused"}]},
+            False,
+            id="api-error",
+        ),
+        pytest.param(
+            {},
+            {
+                "content": [
+                    {"type": "text", "text": "No response requested."},
+                    {"type": "text", "text": "Continuing."},
+                ]
+            },
+            False,
+            id="additional-text",
+        ),
+    ],
+)
+def test_read_transcript_hides_no_response_placeholder(
+    tmp_path: Path,
+    record_fields: dict[str, Any],
+    message_fields: dict[str, Any],
+    hidden: bool,
+) -> None:
+    """
+    Claude Code's synthetic no-reply placeholder never reaches the chat.
+
+    On resume the TUI writes it just before the next prompt; it must not render
+    or open a turn. Model prose and other CLI-authored messages are kept.
+    """
+    record = {
+        "type": "assistant",
+        "uuid": "placeholder",
+        "isApiErrorMessage": False,
+        "message": {
+            "role": "assistant",
+            "model": "<synthetic>",
+            "stop_reason": "stop_sequence",
+            "content": [{"type": "text", "text": "No response requested."}],
+            **message_fields,
+        },
+        **record_fields,
+    }
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text(
+        _transcript_line(record)
+        + _transcript_line(
+            {"type": "user", "uuid": "prompt", "message": {"role": "user", "content": "continue"}}
+        )
+        + _transcript_line(_assistant_text_entry("reply", "Picking the task back up.")),
+        encoding="utf-8",
+    )
+
+    result = read_transcript_items_from_offset(
+        transcript_path,
+        0,
+        start_line=0,
+        agent_name="claude-native-ui",
+        current_response_id="resp_prev_turn",
+        settled_response_id="resp_prev_turn",
+    )
+
+    texts = [block["text"] for item in result.items for block in item.data["content"]]
+    conversation = ["continue", "Picking the task back up."]
+    if hidden:
+        assert texts == conversation
+    else:
+        kept = [block["text"] for block in record["message"]["content"]]
+        assert texts == [claude_native_bridge._SCHEDULED_WAKE_MARKER_TEXT, *kept, *conversation]
 
 
 def test_read_transcript_line_cursor_migration_preserves_legacy_source_ids(
@@ -5856,6 +5963,86 @@ def test_kill_session_raises_on_unexpected_tmux_failure(
         kill_session(bridge_dir)
 
 
+def test_expected_close_marks_the_pane_before_the_kill(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A kill Omnigent asks for marks the pane's private dir before tmux kills it.
+
+    The runner reads the pane's exit moments later. The marker must already
+    exist when the kill runs, or the exit reads as the terminal dying on its own.
+    """
+    private_dir = tmp_path / "omnigent-terminal-pane"
+    private_dir.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=private_dir / "tmux.sock",
+        tmux_target="main",
+    )
+    marked_at_kill: list[bool] = []
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        marked_at_kill.append(pane_closed_by_omnigent(private_dir))
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    kill_session(bridge_dir, expected_close=True)
+
+    assert marked_at_kill == [True]
+    assert pane_closed_by_omnigent(private_dir)
+
+
+def test_failed_expected_close_kill_leaves_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A kill that fails did not close the pane, so a later exit is still a crash."""
+    private_dir = tmp_path / "omnigent-terminal-pane"
+    private_dir.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=private_dir / "tmux.sock",
+        tmux_target="main",
+    )
+
+    def _fake_run(cmd: list[str], **kwargs: object) -> SimpleNamespace:
+        del cmd, kwargs
+        return SimpleNamespace(returncode=1, stdout="", stderr="permission denied")
+
+    monkeypatch.setattr("subprocess.run", _fake_run)
+    with pytest.raises(RuntimeError, match="permission denied"):
+        kill_session(bridge_dir, expected_close=True)
+
+    assert not pane_closed_by_omnigent(private_dir)
+
+
+def test_kill_session_without_expected_close_leaves_no_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The stop affordance keeps its existing exit handling; it marks nothing."""
+    private_dir = tmp_path / "omnigent-terminal-pane"
+    private_dir.mkdir()
+    bridge_dir = tmp_path / "bridge"
+    write_tmux_target(
+        bridge_dir,
+        socket_path=private_dir / "tmux.sock",
+        tmux_target="main",
+    )
+
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    kill_session(bridge_dir)
+
+    assert not pane_closed_by_omnigent(private_dir)
+
+
 def test_inject_slash_command_clears_draft_pastes_literal_then_enter(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8630,6 +8817,30 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert login.failure_message is not None
     assert login.failure_message.startswith("Login expired · Please run /login\n\n")
     assert "omni setup" in login.failure_message
+
+
+def test_hook_record_stop_failure_login_guidance_in_managed_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure card's remedy follows the host kind like the transcript's."""
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    login = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "error_details": "Login expired · Please run /login",
+            }
+        )
+    )
+    assert login.failure_message is not None
+    assert login.failure_message.startswith("Login expired · Please run /login\n\n")
+    assert "omni setup" not in login.failure_message
+    assert "credentials at launch" in login.failure_message
+    assert "new session" in login.failure_message
+    assert "if sign-in still fails" in login.failure_message
+    assert "sandbox administrator" in login.failure_message
+    assert "refresh its credentials" in login.failure_message
 
 
 def test_hook_record_stop_failure_last_assistant_message_not_used() -> None:

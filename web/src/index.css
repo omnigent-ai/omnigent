@@ -82,6 +82,8 @@
   --color-secondary: var(--secondary);
   --color-primary-foreground: var(--primary-foreground);
   --color-primary: var(--primary);
+  --color-primary-cta-foreground: var(--primary-cta-foreground);
+  --color-primary-cta: var(--primary-cta);
   --color-link: var(--link);
   --color-popover-foreground: var(--popover-foreground);
   --color-popover: var(--popover);
@@ -158,6 +160,9 @@
   --onboarding-modal-shadow: 0 24px 80px 8px #00000012;
   --composer-shadow: 0 0 12px -6px rgb(0 0 0 / 12%);
   --composer-shadow-focus: 0 0 20px -6px rgb(0 0 0 / 12%);
+  --composer-header-bg: color-mix(in srgb, var(--background) 94%, black);
+  --primary-cta: #11171c;
+  --primary-cta-foreground: #fff;
 
   /* User-controlled UI font family (see Appearance settings /
    * lib/uiFontPreferences.ts). Deliberately left unset here so the `html` rule's
@@ -262,6 +267,27 @@
 }
 
 .dark {
+  --app-shell-bg: var(--background);
+  --session-composer-mask-bg: var(--app-shell-bg);
+  --foreground-tertiary: rgb(245 245 244 / 24%);
+  --sidebar-surface-image:
+    linear-gradient(transparent 35%, rgb(255 255 255 / 6%)),
+    linear-gradient(135deg, rgb(255 255 255 / 4%), transparent 60%);
+  --composer-header-bg: color-mix(in srgb, var(--app-shell-bg) 97%, white);
+  --composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white);
+  --primary-cta: #e8ecf0;
+  --primary-cta-foreground: #11171c;
+  --menu-surface-bg: var(--composer-surface-bg);
+  --card-surface-bg: color-mix(
+    in srgb,
+    color-mix(in srgb, var(--card) 95%, white) 75%,
+    transparent
+  );
+  --menu-surface-border: rgb(255 255 255 / 8%);
+  --menu-surface-backdrop-filter: blur(24px) saturate(120%);
+  --segmented-active-bg: rgb(255 255 255 / 12%);
+  --segmented-inactive-bg: transparent;
+  --segmented-trough-bg: rgb(255 255 255 / 6%);
   --ui-shadow-neutral-rgb: 0 0 0;
   --ui-shadow-warm-rgb: 0 0 0;
   --onboarding-wizard-background: #131315;
@@ -457,40 +483,39 @@
 
 .composer-reference-surface {
   border-color: color(srgb 0.129412 0 0.0509804 / 0.1);
-  background-color: rgba(255, 255, 255, 0.8);
+  background-color: color-mix(in srgb, white 80%, var(--background));
   background-image: none;
 }
 
 .dark .composer-reference-surface {
   border-width: 0.5px;
   border-color: color(srgb 0.960784 0.960784 0.956863 / 0.04);
-  background-color: rgba(255, 255, 255, 0.05);
+  background-color: var(--composer-surface-bg);
 }
 
-/* --background is the opaque palette canvas; flatten tints over it to mask the stack. */
-.composer-workspace-surface {
-  background:
-    linear-gradient(
-      color-mix(in oklch, var(--muted) 70%, transparent),
-      color-mix(in oklch, var(--muted) 70%, transparent)
-    ),
-    var(--background);
+.composer-context-bar {
+  position: relative;
+  z-index: 20;
+  width: calc(100% - 24px);
+  margin-inline: 12px;
+  margin-bottom: -0.5px;
+  padding: 6px 8px;
+  background-color: var(--composer-header-bg);
+  border: 0.5px solid color-mix(in srgb, var(--foreground) 2%, transparent);
+  border-bottom: none;
+  border-radius: 16px 16px 0 0;
 }
 
-/* Preserve the translucent dark tray while matching the mock's single warm
-   surface across queued rows and workspace metadata in light themes. */
+.composer-context-bar.rounded-t-none {
+  border-top-width: 0;
+  border-top-left-radius: 0;
+  border-top-right-radius: 0;
+}
+
+/* Queued rows and workspace metadata form one continuous composer surface. */
 .composer-queued-surface {
-  background-color: color-mix(in oklab, var(--tray) 40%, transparent);
-}
-
-:root:not(.dark) .composer-workspace-surface,
-:root:not(.dark) .composer-queued-surface {
-  background:
-    linear-gradient(
-      color-mix(in oklch, var(--muted) 85%, transparent),
-      color-mix(in oklch, var(--muted) 85%, transparent)
-    ),
-    var(--background);
+  background-color: var(--composer-header-bg);
+  background-image: none;
 }
 
 .composer-subagent-surface {
@@ -585,6 +610,31 @@
   transition: none;
 }
 
+.session-header-glass {
+  isolation: isolate;
+}
+
+.session-header-glass::before {
+  position: absolute;
+  z-index: -1;
+  inset: 0 0 -12px;
+  background: linear-gradient(135deg, rgb(255 255 255 / 48%), rgb(255 255 255 / 22%));
+  -webkit-backdrop-filter: blur(28px) saturate(145%);
+  backdrop-filter: blur(28px) saturate(145%);
+  -webkit-mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+  mask-image: linear-gradient(to bottom, black 55%, transparent 100%);
+  pointer-events: none;
+  content: "";
+}
+
+.dark .session-header-glass::before {
+  background: linear-gradient(
+    135deg,
+    rgb(255 255 255 / 6%),
+    color-mix(in srgb, var(--app-shell-bg) 42%, transparent) 60%
+  );
+}
+
 @starting-style {
   .workspace-panel-motion[data-state="open"][data-animate-visibility] {
     width: 0 !important;
@@ -595,15 +645,36 @@
 
 /* The transparent <main> shows the palette canvas through. */
 .app-shell {
-  background: var(--background);
+  background: var(--shell-background, var(--background));
+}
+
+:root:not(.dark) .conversations-sidebar {
+  background: var(--sidebar-background, var(--sidebar));
+}
+
+.dark .app-shell {
+  --sidebar-edge-border: color-mix(in srgb, var(--foreground) 4%, transparent);
+
+  background-color: var(--app-shell-bg) !important;
+  background-image: url("./assets/omnigent-center-glow.svg") !important;
+  background-position: right center;
+  background-repeat: no-repeat;
+  background-size: calc(100% - var(--app-sidebar-width, 0px)) 100%;
+}
+
+.dark .omnigent-native-sidebar-surface,
+.dark .omnigent-sidebar-panel {
+  background-color: var(--sidebar);
+  background-image: var(--sidebar-surface-image);
+  background-position: 0 0;
+  background-size: auto;
+  background-clip: padding-box;
 }
 
 /* A desktop peek floats over the chat instead of pushing it aside, so its
- * gradient layers need an opaque base rather than the translucent card color. */
-:root:not(.dark):not([data-theme]) .conversations-sidebar.is-peek,
-:root:not(.dark)[data-theme] .conversations-sidebar.is-peek,
-.dark:not([data-theme]) .conversations-sidebar.is-peek,
-.dark[data-theme] .conversations-sidebar.is-peek {
+ * gradient needs an opaque base rather than a translucent palette color. */
+:root:not([data-theme]) .conversations-sidebar.is-peek,
+:root[data-theme] .conversations-sidebar.is-peek {
   background-color: var(--card-solid);
 }
 
@@ -613,42 +684,38 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
 }
 .dark .conversations-sidebar {
-  border-right: 1px solid rgb(255 255 255 / 2%);
+  border-right: 1px solid var(--sidebar-edge-border);
   box-shadow: inset -8px 0 12px -8px rgb(0 0 0 / 5%);
 }
 
-/* Below md the sidebar is a full-screen overlay ON TOP of the chat, so it has
- * to be opaque — the rules above set `background` as a shorthand, which resets
- * background-color and would otherwise let the conversation show through the
- * translucent layers. Restores what Sidebar.tsx's max-md:bg-card-solid does on
- * desktop. Above md the sidebar pushes content aside instead of covering it,
- * so it keeps its translucent canvas there. */
+.dark .workspace-panel-motion {
+  --workspace-panel-border: rgb(255 255 255 / 8%);
+
+  border-left-color: var(--workspace-panel-border);
+}
+
+.dark .workspace-panel-motion .workspace-tab-strip {
+  border-bottom-color: var(--workspace-panel-border);
+}
+
+.dark .workspace-panel-motion .workspace-panel-header-divider {
+  border-color: var(--workspace-panel-border);
+}
+
+/* Below md the sidebar is a full-screen overlay on top of the chat, so every
+ * palette and mode needs an opaque base. */
 @media (width < 48rem) {
-  :root:not(.dark):not([data-theme]) .conversations-sidebar,
-  :root:not(.dark)[data-theme] .conversations-sidebar,
-  .dark:not([data-theme]) .conversations-sidebar,
-  .dark[data-theme] .conversations-sidebar {
+  :root:not([data-theme]) .conversations-sidebar,
+  :root[data-theme] .conversations-sidebar {
     background-color: var(--card-solid);
   }
 }
 
-/* Fade scrolling content before it reaches the transparent header or composer.
- * Both ramps are 32px; the header's control band occupies the first 48px. */
+/* Let conversation content scroll behind the glass header, then fade it into
+ * the composer at the bottom. */
 .chat-scroll-fade {
-  mask-image: linear-gradient(
-    to bottom,
-    transparent 48px,
-    black 80px,
-    black calc(100% - 32px),
-    transparent 100%
-  );
-  -webkit-mask-image: linear-gradient(
-    to bottom,
-    transparent 48px,
-    black 80px,
-    black calc(100% - 32px),
-    transparent 100%
-  );
+  mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
+  -webkit-mask-image: linear-gradient(to bottom, black calc(100% - 32px), transparent 100%);
 }
 
 /* A pinned plan already clears the header, so only fade into the composer. */
@@ -658,9 +725,7 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
 }
 
 /* Snap target for the "Worked for" fold row (scrollIntoView block:"start").
- * Must land BELOW the fade above: the mask is fully opaque only from 80px,
- * so a smaller margin parks the row in the transparent band — scrolled
- * "to the top" yet invisible. Kept next to the fade so they can't desync. */
+ * Keep it below the overlaid glass header after programmatic navigation. */
 .turn-fold-row {
   scroll-margin-top: 88px;
 }
@@ -686,11 +751,7 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   );
 }
 
-/* Elevated surfaces — frosted glass effect with backdrop blur.
- * Targets top-level cards only. A bg-card nested inside another bg-card
- * (e.g. FilesPanel inside the workspace panel, toolbars inside the
- * composer) is an interior fill, and re-decorating it with its own
- * border/shadow visually carves the parent card into pieces.
+/* Elevated surfaces — one palette-aware frosted treatment for every bg-card.
  * :not([data-collapsed]) skips closed rails/drawers/sidebars: they
  * collapse to w-0 with their utility borders removed, but this rule's
  * border+shadow would still paint them as a thin glowing strip along the
@@ -702,23 +763,15 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
  * Both rails (Workspace, Conversations) are excluded — they paint their own
  * canvas layers above, not a glass card. */
 .dark
-  :is(.bg-card, [class*="md:bg-card"]):not(
-    :is(.bg-card, [class*="md:bg-card"]) :is(.bg-card, [class*="md:bg-card"])
-  ):not([data-collapsed]):not([aria-label="Workspace"]):not([aria-label="Conversations"]) {
+  :is(.bg-card, [class*="md:bg-card"]):not([data-collapsed]):not([aria-label="Workspace"]):not(
+    [aria-label="Conversations"]
+  ) {
   /* -webkit- must come BEFORE the unprefixed property: LightningCSS (vite
    * build) collapses the pair and keeps only the last declaration. */
-  -webkit-backdrop-filter: blur(32px) saturate(180%) !important;
-  backdrop-filter: blur(32px) saturate(180%) !important;
-  border: 1px solid rgba(255, 255, 255, 0.09);
-  border-top-color: rgba(255, 255, 255, 0.14);
-  background-image: linear-gradient(
-    135deg,
-    rgba(255, 255, 255, 0.04) 0%,
-    rgba(255, 255, 255, 0) 60%
-  );
-  box-shadow:
-    0 4px 16px rgba(0, 0, 0, 0.22),
-    0 1px 3px rgba(0, 0, 0, 0.16);
+  -webkit-backdrop-filter: var(--menu-surface-backdrop-filter) !important;
+  backdrop-filter: var(--menu-surface-backdrop-filter) !important;
+  background-color: var(--card-surface-bg);
+  border: 1px solid var(--menu-surface-border);
 }
 
 /* Side panels (FileViewer, TerminalsPanel, FilesPanelDrawer) manage their own
@@ -744,6 +797,14 @@ html:not(.dark) .conversations-sidebar:not(.is-peek) {
   background: transparent !important;
 }
 
+/* The workspace rail owns the panel edge. Its full-height tab surfaces must
+ * not pick up a second border from the shared bg-card treatment. */
+.dark
+  aside[aria-label="Workspace"]
+  :is([data-workspace-panel-content] > *, [data-workspace-panel-surface]) {
+  border: none !important;
+}
+
 /* When maximized the workspace panel covers the full content area; use an
  * opaque background so the chat underneath doesn't bleed through. */
 aside[aria-label="Workspace"][data-maximized] {
@@ -757,13 +818,25 @@ aside[aria-label="Workspace"][data-maximized] {
 
 /* Popovers/menus — same glass treatment */
 .dark [data-slot="popover-content"],
-.dark [data-slot="select-content"],
-.dark [role="menu"],
-.dark [data-radix-popper-content-wrapper] > * {
+.dark [data-slot="select-content"]:not(.menu-surface),
+.dark [role="menu"]:not(.menu-surface),
+.dark [data-radix-popper-content-wrapper] > :not(.menu-surface) {
   /* -webkit- before unprefixed — see comment on the bg-card rule above. */
   -webkit-backdrop-filter: blur(24px) saturate(150%) !important;
   backdrop-filter: blur(24px) saturate(150%) !important;
   border: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+:root:not(.dark) .menu-surface {
+  background-color: #fff;
+  border: 1px solid rgb(0 0 0 / 8%);
+}
+
+.dark .menu-surface {
+  background-color: var(--menu-surface-bg);
+  border: 1px solid var(--menu-surface-border);
+  -webkit-backdrop-filter: var(--menu-surface-backdrop-filter);
+  backdrop-filter: var(--menu-surface-backdrop-filter);
 }
 
 /* Native clearance uses window pixels, independent of rem and page zoom.
@@ -2326,12 +2399,16 @@ html[data-electron-mac] .breadcrumb-folder {
 @media (min-width: 48rem) {
   :root:not(.dark)[data-theme="custom"][data-custom-translucent-sidebar]
     :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
-    background: var(--custom-light-sidebar);
+    background-color: var(--custom-light-sidebar);
+    background-image: none;
+    -webkit-backdrop-filter: blur(20px) saturate(1.12);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   .dark[data-theme="custom"][data-custom-translucent-sidebar]
     :is(.conversations-sidebar, aside[aria-label="Workspace"]:not([data-maximized])) {
-    background: var(--custom-dark-sidebar);
+    background-color: var(--sidebar);
+    background-image: var(--sidebar-surface-image);
+    -webkit-backdrop-filter: blur(20px) saturate(1.12);
     backdrop-filter: blur(20px) saturate(1.12);
   }
   :root[data-theme="custom"][data-custom-translucent-sidebar]
