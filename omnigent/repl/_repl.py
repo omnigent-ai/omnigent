@@ -89,6 +89,10 @@ if TYPE_CHECKING:
 
 _log = logging.getLogger(__name__)
 
+# The session stream has no replay, so the REPL waits for the server's
+# subscription heartbeat before posting; the cap covers servers without one.
+_STREAM_READY_TIMEOUT_S: float = 5.0
+
 
 def _is_recoverable_sse_transport_error(exc: BaseException) -> bool:
     """Return ``True`` when *exc* is a transient SSE transport interruption.
@@ -1466,6 +1470,8 @@ class _SessionsChatReplAdapter:
         # Set by run_repl() to the rendering callback.
         self._on_event: Callable[[object], None] | None = None
         self._stream_task: asyncio.Task[None] | None = None
+        # Set once the current stream subscription registers or its attempt ends.
+        self._stream_ready = asyncio.Event()
         self._recover_task: asyncio.Task[None] | None = None
         self._recover_lock = asyncio.Lock()
         self._bind_lock = asyncio.Lock()
@@ -1794,10 +1800,7 @@ class _SessionsChatReplAdapter:
                 self._hydrate_from_session_snapshot(session)
             await self._bind_runner_if_needed()
             if self._stream_task is None:
-                self._stream_task = asyncio.create_task(
-                    self._stream_pump(),
-                    name=f"sessions-adapter-stream-{self._session_id}",
-                )
+                await self._start_stream_pump()
             if self._runner_recover is not None and self._recover_task is None:
                 self._recover_task = asyncio.create_task(
                     self._runner_recover_watch(),
@@ -2228,7 +2231,7 @@ class _SessionsChatReplAdapter:
         self._hydrate_from_session_snapshot(session)
         await self._bind_runner_if_needed()
 
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        await self._start_stream_pump()
         return new_session_id
 
     async def view_session(
@@ -2277,7 +2280,7 @@ class _SessionsChatReplAdapter:
             self._stream_task = None
         session = await self._client.sessions.get(new_session_id)
         self._hydrate_from_session_snapshot(session)
-        self._stream_task = asyncio.create_task(self._stream_pump())
+        await self._start_stream_pump()
         return new_session_id
 
     async def aclose(self) -> None:
@@ -2304,6 +2307,28 @@ class _SessionsChatReplAdapter:
                 return_exceptions=True,
             )
             self._pending_local_tasks.clear()
+
+    async def _start_stream_pump(self) -> None:
+        """Start the persistent stream and wait until the server has registered it.
+
+        Events published before registration are never delivered, which would
+        lose e.g. the approval prompt for the message posted right after this.
+        """
+        self._stream_ready.clear()
+        self._stream_task = asyncio.create_task(
+            self._stream_pump(),
+            name=f"sessions-adapter-stream-{self._session_id}",
+        )
+        ready = asyncio.ensure_future(self._stream_ready.wait())
+        try:
+            # A pump that exits early will never register; stop waiting on it.
+            await asyncio.wait(
+                {ready, self._stream_task},
+                timeout=_STREAM_READY_TIMEOUT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+        finally:
+            ready.cancel()
 
     async def _stream_pump(self) -> None:
         """Subscribe to ``/v1/sessions/{id}/stream`` indefinitely.
@@ -2337,6 +2362,7 @@ class _SessionsChatReplAdapter:
                         flush=True,
                     )
                 async for event in self._client.sessions.stream(self._session_id):
+                    self._stream_ready.set()
                     if isinstance(event, _StatusEv) and event.status in (
                         "idle",
                         "waiting",
@@ -2348,11 +2374,14 @@ class _SessionsChatReplAdapter:
                     if self._on_event is not None:
                         self._on_event(event)
                 # Clean close (server sent [DONE]). Reopen.
+                self._stream_ready.set()
                 await asyncio.sleep(backoff)
                 backoff = 0.5
             except asyncio.CancelledError:
                 raise
             except Exception as exc:  # noqa: BLE001 — reconnect on any error
+                # A failed attempt will not register; don't hold up the post.
+                self._stream_ready.set()
                 # Recoverable transport errors (peer closed mid-chunk,
                 # read timeout, transient network error) are normal
                 # background noise — the session continues server-side
