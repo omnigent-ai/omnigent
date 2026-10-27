@@ -5,6 +5,7 @@
 
 import type { MouseEvent } from "react";
 import { showToast } from "@/components/ui/toast";
+import { browserViewId } from "./browserTabs";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
 import { isNativeShell, supportsBrowser } from "./nativeBridge";
 
@@ -15,10 +16,12 @@ type OpenOrNavigate = (
   opts: { agent: boolean },
 ) => Promise<{ ok: boolean; error?: string }>;
 
-const listeners = new Set<(conversationId: string) => void>();
+const listeners = new Set<(conversationId: string, tabId: string) => void>();
 
 /** Subscribe to links the embedded browser accepted; returns an unsubscribe. */
-export function onInAppLinkOpen(listener: (conversationId: string) => void): () => void {
+export function onInAppLinkOpen(
+  listener: (conversationId: string, tabId: string) => void,
+): () => void {
   listeners.add(listener);
   return () => void listeners.delete(listener);
 }
@@ -29,14 +32,18 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
   ).omnigentDesktop;
   let error: string | undefined;
   try {
+    const tabId = crypto.randomUUID();
     // Chat and workspace-file links are agent- or repo-authored and the agent can
     // read the view, so they get the agent's navigation policy (no loopback/private
     // hosts, even via redirect).
-    const result = await bridge.browserOpenOrNavigate(conversationId, url, undefined, {
-      agent: true,
-    });
+    const result = await bridge.browserOpenOrNavigate(
+      browserViewId(conversationId, tabId),
+      url,
+      undefined,
+      { agent: true },
+    );
     if (result?.ok) {
-      for (const listener of listeners) listener(conversationId);
+      for (const listener of listeners) listener(conversationId, tabId);
       return;
     }
     error = result?.error;
@@ -66,7 +73,7 @@ export function parseHttpUrl(href: string): URL | null {
 }
 
 /**
- * Open an http(s) `href` in the conversation's embedded browser when the user
+ * Open an http(s) `href` in a new in-app browser tab when the user
  * opted in. Returns true when routed (the caller cancels the default click).
  */
 export function maybeOpenLinkInApp(conversationId: string | undefined, href: string): boolean {
@@ -83,11 +90,11 @@ export function maybeOpenLinkInApp(conversationId: string | undefined, href: str
  * the link still opens a new tab, but in an embedding host pane (or under a
  * popup blocker) a bare `_blank` click is silently swallowed — nothing opens
  * and nothing navigates — so a click must fall back to navigating in place.
- * Modified clicks (cmd/ctrl/shift/alt, non-primary buttons) keep their native
- * open-in-new-tab / menu semantics. In a native shell the default path is the
+ * Modified clicks keep their native semantics outside the in-app browser.
+ * In a native shell the default path is the
  * shell's window-open policy (external browser / system handlers) — except
- * when the user opted in to the in-app browser, where a plain click on a web
- * link routes to the conversation's embedded browser pane instead. The web
+ * when the user opted in to the in-app browser: plain and Cmd/Ctrl clicks open
+ * new in-app tabs, while Shift-click opens externally. The web
  * popup fallback never runs natively: the shell's policy reports `null` from
  * window.open regardless, so it would navigate twice.
  */
@@ -97,11 +104,12 @@ export function followLinkWithPopupFallback(
   conversationId: string | undefined,
 ): void {
   if (event.defaultPrevented || event.button !== 0) return;
-  if (event.metaKey || event.ctrlKey || event.shiftKey || event.altKey) return;
+  if (event.shiftKey || event.altKey) return;
   if (isNativeShell()) {
     if (maybeOpenLinkInApp(conversationId, href)) event.preventDefault();
     return;
   }
+  if (event.metaKey || event.ctrlKey) return;
   if (!/^(?:https?:)?\/\//i.test(href)) return;
   event.preventDefault();
   const popup = window.open("about:blank", "_blank");

@@ -9,7 +9,7 @@ const CONV = "conv-1";
 const URL_ = "https://example.com/page";
 
 let openOrNavigate: ReturnType<typeof vi.fn>;
-let surfaced: string[];
+let surfaced: { conversationId: string; tabId: string }[];
 let unsubscribe: () => void;
 
 beforeEach(() => {
@@ -20,7 +20,9 @@ beforeEach(() => {
   vi.spyOn(window, "open").mockReturnValue(null);
   vi.spyOn(console, "warn").mockImplementation(() => {});
   surfaced = [];
-  unsubscribe = onInAppLinkOpen((id) => surfaced.push(id));
+  unsubscribe = onInAppLinkOpen((conversationId, tabId) =>
+    surfaced.push({ conversationId, tabId }),
+  );
   writeOpenLinksInApp(true);
 });
 
@@ -32,12 +34,21 @@ afterEach(() => {
   window.localStorage.clear();
 });
 
-it("surfaces the Browser tab only after the view accepts the link", async () => {
+it("opens each link in its own tab only after the view accepts it", async () => {
   expect(maybeOpenLinkInApp(CONV, URL_)).toBe(true);
   // Model-authored links get the agent navigation policy (no internal hosts).
-  expect(openOrNavigate).toHaveBeenCalledWith(CONV, URL_, undefined, { agent: true });
+  const firstViewId = openOrNavigate.mock.calls[0][0];
+  expect(firstViewId).toMatch(/^browser-tab:conv-1:[^:]+$/);
+  expect(openOrNavigate).toHaveBeenCalledWith(firstViewId, URL_, undefined, { agent: true });
   expect(surfaced).toEqual([]);
-  await vi.waitFor(() => expect(surfaced).toEqual([CONV]));
+  await vi.waitFor(() =>
+    expect(surfaced).toEqual([{ conversationId: CONV, tabId: firstViewId.split(":")[2] }]),
+  );
+  expect(maybeOpenLinkInApp(CONV, URL_)).toBe(true);
+  const secondViewId = openOrNavigate.mock.calls[1][0];
+  expect(secondViewId).not.toBe(firstViewId);
+  await vi.waitFor(() => expect(surfaced).toHaveLength(2));
+  expect(surfaced[1]).toEqual({ conversationId: CONV, tabId: secondViewId.split(":")[2] });
   expect(window.open).not.toHaveBeenCalled();
 });
 
@@ -64,6 +75,12 @@ it.each([
 
 it.each([
   ["the preference is off", CONV, URL_, () => writeOpenLinksInApp(false)],
+  [
+    "the shell has no browser bridge",
+    CONV,
+    URL_,
+    () => Reflect.deleteProperty(window, "omnigentDesktop"),
+  ],
   ["there is no conversation", undefined, URL_, () => {}],
   ["the scheme is not web", CONV, "mailto:a@example.com", () => {}],
   ["the href is unparseable", CONV, "http://[::1", () => {}],

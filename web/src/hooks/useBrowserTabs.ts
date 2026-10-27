@@ -1,27 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
 import { onBrowserActionRequest } from "@/lib/browserActionBus";
+import { AGENT_BROWSER_TAB_ID, browserViewId } from "@/lib/browserTabs";
 import { onInAppLinkOpen } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState, writeSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 
-/** Stable soft-tab id for the browser view driven by agents and opted-in links. */
-export const AGENT_BROWSER_TAB_ID = "agent-browser";
-
-export function browserViewId(conversationId: string, tabId: string): string {
-  return tabId === AGENT_BROWSER_TAB_ID
-    ? conversationId
-    : `browser-tab:${encodeURIComponent(conversationId)}:${tabId}`;
-}
-
-/** Owning session ID for a browser view ID; mirrors the Electron view-registry parser. */
-export function browserViewOwnerId(viewId: string): string {
-  const tab = /^browser-tab:([^:]+):[^:]+$/.exec(viewId);
-  if (!tab) return viewId;
-  try {
-    return decodeURIComponent(tab[1]);
-  } catch {
-    return viewId;
-  }
-}
+export { AGENT_BROWSER_TAB_ID, browserViewId, browserViewOwnerId } from "@/lib/browserTabs";
 
 interface BrowserTabsState {
   tabs: string[];
@@ -43,24 +26,26 @@ function readBrowserTabsState(conversationId: string): BrowserTabsState {
   };
 }
 
-function withAgentBrowserSelected(current: BrowserTabsState): BrowserTabsState {
-  return {
-    tabs: current.tabs.includes(AGENT_BROWSER_TAB_ID)
-      ? current.tabs
-      : [...current.tabs, AGENT_BROWSER_TAB_ID],
-    selected: AGENT_BROWSER_TAB_ID,
+/** Persist a browser view as a selected soft tab for its owning session. */
+export function openBrowserTab(conversationId: string, tabId: string): BrowserTabsState {
+  if (tabId === AGENT_BROWSER_TAB_ID) {
+    agentNavigationEpochs.set(conversationId, agentNavigationEpoch(conversationId) + 1);
+  }
+  const current = readBrowserTabsState(conversationId);
+  const next = {
+    tabs: current.tabs.includes(tabId) ? current.tabs : [...current.tabs, tabId],
+    selected: tabId,
   };
-}
-
-/** Persist the agent/link browser as a selected soft tab for a session. */
-export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
-  agentNavigationEpochs.set(conversationId, agentNavigationEpoch(conversationId) + 1);
-  const next = withAgentBrowserSelected(readBrowserTabsState(conversationId));
   writeSessionWorkspaceState(conversationId, {
     openBrowsers: next.tabs,
     selectedBrowserId: next.selected,
   });
   return next;
+}
+
+/** Persist the agent browser as a selected soft tab for a session. */
+export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
+  return openBrowserTab(conversationId, AGENT_BROWSER_TAB_ID);
 }
 
 export function useBrowserTabs(conversationId: string) {
@@ -86,17 +71,17 @@ export function useBrowserTabs(conversationId: string) {
   };
 
   useEffect(() => {
-    const selectAgentBrowser = (sourceConversationId: string) => {
+    const selectBrowser = (sourceConversationId: string, tabId: string) => {
       if (sourceConversationId === conversationId) {
-        setState(openAgentBrowserTab(conversationId));
+        setState(openBrowserTab(conversationId, tabId));
       }
     };
     const unsubscribeAction = onBrowserActionRequest((event, sourceConversationId) => {
       if (sourceConversationId === conversationId && event.action === "navigate") {
-        selectAgentBrowser(sourceConversationId);
+        selectBrowser(sourceConversationId, AGENT_BROWSER_TAB_ID);
       }
     });
-    const unsubscribeLink = onInAppLinkOpen(selectAgentBrowser);
+    const unsubscribeLink = onInAppLinkOpen(selectBrowser);
     return () => {
       unsubscribeAction();
       unsubscribeLink();
@@ -121,7 +106,7 @@ export function useBrowserTabs(conversationId: string) {
       ?.browserClose?.(browserViewId(conversationId, tabId))
       .catch(() => ({ ok: false }));
     if (result && !result.ok) return false;
-    // A fresh agent/link navigation supersedes an older close of the reserved
+    // A fresh agent navigation supersedes an older close of the reserved
     // agent view. Keep the recreated tab selected when the close resolves late.
     if (
       tabId === AGENT_BROWSER_TAB_ID &&

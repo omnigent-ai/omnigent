@@ -1,12 +1,15 @@
 import { act, cleanup, renderHook } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { emitBrowserActionRequest } from "@/lib/browserActionBus";
+import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
+import { maybeOpenLinkInApp } from "@/lib/openLinkInApp";
 import { readSessionWorkspaceState } from "@/lib/sessionWorkspaceState";
 import {
   AGENT_BROWSER_TAB_ID,
   browserViewId,
   browserViewOwnerId,
   openAgentBrowserTab,
+  openBrowserTab,
   useBrowserTabs,
 } from "./useBrowserTabs";
 
@@ -157,6 +160,65 @@ describe("browser soft tabs", () => {
     expect(result.current.agentBrowser).toBe(true);
   });
 
+  it("keeps existing and agent views when accepted links open independent tabs", async () => {
+    const browserOpenOrNavigate = vi.fn().mockResolvedValue({ ok: true });
+    Object.assign(window, {
+      omnigentDesktop: { kind: "electron", browserOpenOrNavigate },
+    });
+    writeOpenLinksInApp(true);
+    openAgentBrowserTab("session-a");
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    act(() => result.current.add());
+    const existingTab = result.current.selected!;
+
+    await act(async () => {
+      expect(maybeOpenLinkInApp("session-a", "https://example.com/first")).toBe(true);
+    });
+    const firstLinkTab = result.current.selected!;
+    expect(firstLinkTab).toEqual(expect.any(String));
+    expect(firstLinkTab).not.toBe(existingTab);
+    expect(firstLinkTab).not.toBe(AGENT_BROWSER_TAB_ID);
+    expect(result.current.agentBrowser).toBe(false);
+
+    await act(async () => {
+      expect(maybeOpenLinkInApp("session-a", "https://example.com/second")).toBe(true);
+    });
+    const secondLinkTab = result.current.selected!;
+    expect(secondLinkTab).toEqual(expect.any(String));
+    expect(secondLinkTab).not.toBe(firstLinkTab);
+    expect(result.current.tabs).toEqual([
+      AGENT_BROWSER_TAB_ID,
+      existingTab,
+      firstLinkTab,
+      secondLinkTab,
+    ]);
+    expect(browserOpenOrNavigate.mock.calls.map(([viewId]) => viewId)).toEqual([
+      browserViewId("session-a", firstLinkTab),
+      browserViewId("session-a", secondLinkTab),
+    ]);
+    expect(readSessionWorkspaceState("session-a").selectedBrowserId).toBe(secondLinkTab);
+  });
+
+  it("restores the exact tab accepted while its session was in the background", () => {
+    openAgentBrowserTab("session-a");
+    const hook = renderHook(({ conversationId }) => useBrowserTabs(conversationId), {
+      initialProps: { conversationId: "session-a" },
+    });
+    hook.rerender({ conversationId: "session-b" });
+    act(() => hook.result.current.add());
+    const otherSessionTab = hook.result.current.selected;
+    act(() => openBrowserTab("session-a", "accepted-link"));
+    act(() => openBrowserTab("session-a", "accepted-link"));
+    expect(hook.result.current.selected).toBe(otherSessionTab);
+
+    hook.rerender({ conversationId: "session-a" });
+    expect(hook.result.current.tabs).toEqual([AGENT_BROWSER_TAB_ID, "accepted-link"]);
+    expect(hook.result.current.viewId).toBe(browserViewId("session-a", "accepted-link"));
+    hook.unmount();
+    const restored = renderHook(() => useBrowserTabs("session-a"));
+    expect(restored.result.current.selected).toBe("accepted-link");
+  });
+
   it("closes and later recreates the agent browser soft tab", async () => {
     const browserClose = vi.fn().mockResolvedValue({ ok: true });
     Object.assign(window, { omnigentDesktop: { browserClose } });
@@ -210,6 +272,29 @@ describe("browser soft tabs", () => {
 
     expect(result.current.tabs).toEqual([AGENT_BROWSER_TAB_ID]);
     expect(result.current.selected).toBe(AGENT_BROWSER_TAB_ID);
+  });
+
+  it("still closes the agent view when a separate link tab opens during its close", async () => {
+    let finishClose!: (value: { ok: boolean }) => void;
+    Object.assign(window, {
+      omnigentDesktop: {
+        browserClose: () =>
+          new Promise<{ ok: boolean }>((resolve) => {
+            finishClose = resolve;
+          }),
+      },
+    });
+    openAgentBrowserTab("session-a");
+    const { result } = renderHook(() => useBrowserTabs("session-a"));
+    const pendingClose = result.current.close(AGENT_BROWSER_TAB_ID);
+    act(() => openBrowserTab("session-a", "accepted-link"));
+    await act(async () => {
+      finishClose({ ok: true });
+      await pendingClose;
+    });
+
+    expect(result.current.tabs).toEqual(["accepted-link"]);
+    expect(result.current.selected).toBe("accepted-link");
   });
 
   it("keeps newer background navigation after switching sessions during a close", async () => {
