@@ -30,7 +30,7 @@ import re
 import tempfile
 import uuid
 import weakref
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
@@ -119,6 +119,7 @@ from omnigent.tools.builtins.timer import (
 from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
+from omnigent.util.reasoning_effort import validate_effort_for_harness
 from omnigent.util.session_lifecycle import (
     CLOSED_LABEL_KEY,
     CLOSED_LABEL_VALUE,
@@ -1877,36 +1878,6 @@ def _subagent_reasoning_effort_from_args(args: _JsonObject) -> str | None:
     return raw_effort
 
 
-def _validate_subagent_reasoning_effort(effort: str, harness: str | None) -> str:
-    """
-    Validate *effort* against the child harness's declared effort family.
-
-    A harness whose family is ``NONE`` has no effort plumbing, and an
-    unrecognized one cannot be checked at all — the caller asked for this
-    explicitly, so reject rather than accept-and-drop. (Delivery of a
-    persisted effort takes the opposite tack and filters quietly; see the
-    reasoning guard in :mod:`omnigent.runner.app`.)
-
-    :param effort: Requested effort, e.g. ``"high"``.
-    :param harness: Resolved child harness, e.g. ``"claude-native"``.
-    :returns: The canonical effort that harness accepts.
-    :raises ValueError: If the harness supports no effort override, or
-        the value falls outside its vocabulary.
-    """
-    from omnigent.util.reasoning_effort import efforts_for_harness, validate_effort
-
-    canonical = canonicalize_harness(harness) if harness is not None else None
-    supported = efforts_for_harness(harness)
-    if not supported:
-        raise ValueError(
-            f"harness {canonical or harness or 'unknown'!r} does not support "
-            "a reasoning-effort override"
-        )
-    validated = validate_effort(effort, canonical or harness or "unknown", supported)
-    assert validated is not None
-    return validated
-
-
 def _subagent_file_ids_from_args(args: _JsonObject) -> list[str]:
     """
     Extract the optional ``file_ids`` from ``sys_session_send`` args.
@@ -2903,7 +2874,7 @@ async def _execute_subagent_tool(
                 effort_source = f"sub-agent {sub_agent_name!r} spec"
         if effective_effort is not None:
             try:
-                create_body["reasoning_effort"] = _validate_subagent_reasoning_effort(
+                create_body["reasoning_effort"] = validate_effort_for_harness(
                     effective_effort,
                     child_harness,
                 )
@@ -3329,6 +3300,31 @@ async def _send_to_existing_session(
     )
 
 
+# sys_session_create argument -> session-create field, shared by the JSON
+# (agent_id) and multipart (config_path) creates so neither drops one.
+_SESSION_CREATE_FIELDS = (
+    ("title", "title"),
+    ("model", "model_override"),
+    ("reasoning_effort", "reasoning_effort"),
+)
+
+
+def _session_create_fields(args: Mapping[str, object]) -> _JsonObject:
+    """
+    Map ``sys_session_create`` arguments to the per-session create fields.
+
+    :param args: Tool arguments, e.g. ``{"model": "databricks-glm-5-2"}``.
+    :returns: The non-empty string fields under their create names, e.g.
+        ``{"model_override": "databricks-glm-5-2"}``.
+    """
+    fields: _JsonObject = {}
+    for arg_name, field_name in _SESSION_CREATE_FIELDS:
+        value = args.get(arg_name)
+        if isinstance(value, str) and value:
+            fields[field_name] = value
+    return fields
+
+
 def _build_session_create_body(
     agent_id: str,
     conversation_id: str,
@@ -3367,13 +3363,10 @@ def _build_session_create_body(
     body: _JsonObject = {
         "agent_id": agent_id,
         "parent_session_id": conversation_id,
+        **_session_create_fields(
+            {"title": title, "model": model, "reasoning_effort": reasoning_effort}
+        ),
     }
-    if isinstance(title, str) and title:
-        body["title"] = title
-    if isinstance(model, str) and model:
-        body["model_override"] = model
-    if isinstance(reasoning_effort, str) and reasoning_effort:
-        body["reasoning_effort"] = reasoning_effort
     if isinstance(message, str) and message:
         body["initial_items"] = [
             {
@@ -3775,6 +3768,37 @@ async def _post_child_first_message(
     return None
 
 
+async def _bundle_model_override_unsupported(server_client: httpx.AsyncClient) -> str | None:
+    """
+    Refuse a config_path ``model`` the server cannot store.
+
+    Servers that predate ``session_bundle_model_override`` in ``GET /v1/info``
+    reject the field with a bare 400; name the cause instead, and never drop
+    the model, which would run the child on the bundle's own.
+
+    :param server_client: HTTP client pointed at the Omnigent server.
+    :returns: ``None`` when the server accepts the field; a JSON error otherwise.
+    """
+    try:
+        info = await server_client.get("/v1/info", timeout=30.0)
+        info.raise_for_status()
+        supported = info.json().get("session_bundle_model_override") is True
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"error": f"sys_session_create could not check server support: {exc}"})
+    if supported:
+        return None
+    return json.dumps(
+        {
+            "error": "server_too_old",
+            "detail": (
+                "This server cannot set 'model' on a config_path child. Set "
+                "executor.model in the config, create the child by agent_id, "
+                "or upgrade the server."
+            ),
+        }
+    )
+
+
 async def _upload_config_bundle(
     config_path: str,
     args: _JsonObject,
@@ -3820,16 +3844,17 @@ async def _upload_config_bundle(
     except Exception as exc:  # noqa: BLE001 — disk/tar errors become a typed tool error.
         return json.dumps({"error": f"sys_session_create failed to bundle config: {exc}"})
 
-    metadata: _JsonObject = {"parent_session_id": conversation_id}
-    # Same per-session fields the agent_id create sends; the server validates them.
-    for arg_name, metadata_key in (
-        ("title", "title"),
-        ("model", "model_override"),
-        ("reasoning_effort", "reasoning_effort"),
-    ):
-        value = args.get(arg_name)
-        if isinstance(value, str) and value:
-            metadata[metadata_key] = value
+    for arg_name in ("model", "reasoning_effort"):
+        if args.get(arg_name) is not None and not isinstance(args.get(arg_name), str):
+            return json.dumps({"error": f"sys_session_create '{arg_name}' must be a string"})
+    metadata: _JsonObject = {
+        "parent_session_id": conversation_id,
+        **_session_create_fields(args),
+    }
+    if "model_override" in metadata:
+        unsupported = await _bundle_model_override_unsupported(server_client)
+        if unsupported is not None:
+            return unsupported
     try:
         resp = await server_client.post(
             "/v1/sessions",
@@ -3871,8 +3896,8 @@ async def _session_create_from_config_path(
     :param config_path: Caller-supplied path to the agent config YAML,
         agent directory, or ``.tar.gz`` bundle, relative to the os_env
         cwd, e.g. ``".omnigent/agent-configs/helper.yaml"``.
-    :param args: Parsed tool arguments; optional ``title`` /
-        ``message``.
+    :param args: Parsed tool arguments; optional ``title``, ``message``,
+        ``model`` and ``reasoning_effort``.
     :param server_client: HTTP client pointed at the Omnigent server.
     :param conversation_id: The caller's session id — the forced parent.
     :param publish_event: SSE publish callback for ``session.created``.

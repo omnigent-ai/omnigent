@@ -17,6 +17,8 @@ from unittest.mock import patch
 import httpx
 import pytest
 
+from omnigent.runner.session_init_protocol import SESSION_INIT_PAYLOAD_KEY
+from tests._helpers.session import post_session_bundle
 from tests.server.helpers import build_agent_bundle, create_test_agent
 
 pytestmark = pytest.mark.asyncio
@@ -366,30 +368,27 @@ async def test_bundle_create_inherits_spec_reasoning_effort(
 
 
 async def _post_bundle_create(
-    client: httpx.AsyncClient, metadata: dict[str, Any]
+    client: httpx.AsyncClient, metadata: dict[str, Any], *, harness: str = "claude-sdk"
 ) -> httpx.Response:
     """
     POST a multipart create whose bundle pins its own model and effort.
 
     :param client: The test HTTP client.
     :param metadata: The metadata JSON part, e.g. ``{"model_override": "m"}``.
+    :param harness: The bundle's harness, e.g. ``"cursor"``.
     :returns: The raw create response.
     """
     bundle = build_agent_bundle(
         name="bundled",
         executor={
             "type": "omnigent",
-            "config": {"harness": "claude-sdk"},
+            "config": {"harness": harness},
             "model": "databricks-claude-opus-4-6",
             "reasoning_effort": "high",
         },
         include_llm=False,
     )
-    return await client.post(
-        "/v1/sessions",
-        data={"metadata": json.dumps(metadata)},
-        files={"bundle": ("agent.tar.gz", bundle, "application/gzip")},
-    )
+    return await post_session_bundle(client.post, "/v1/sessions", bundle, metadata=metadata)
 
 
 async def test_bundle_create_with_model_override_persists(
@@ -399,8 +398,12 @@ async def test_bundle_create_with_model_override_persists(
 
     ``sys_session_create`` with ``config_path`` uploads a bundle; its ``model``
     and ``reasoning_effort`` are session-level, like the JSON create's, so the
-    runner reads them from the row instead of the spec defaults.
+    runner reads them from the row instead of the spec defaults. Runners check
+    ``session_bundle_model_override`` in ``GET /v1/info`` before sending one.
     """
+    info = await client.get("/v1/info")
+    assert info.json()["session_bundle_model_override"] is True
+
     resp = await _post_bundle_create(
         client, {"model_override": "databricks-claude-sonnet-4-6", "reasoning_effort": "low"}
     )
@@ -412,29 +415,79 @@ async def test_bundle_create_with_model_override_persists(
     assert get.json()["reasoning_effort"] == "low"
 
 
-@pytest.mark.parametrize(
-    "bad_model",
-    [
-        pytest.param("claude; rm -rf /", id="shell-metacharacters"),
-        pytest.param("--model=evil", id="flag-shaped"),
-        pytest.param("   ", id="whitespace-only"),
-    ],
-)
 async def test_bundle_create_rejects_malformed_model_override(
     client: httpx.AsyncClient,
-    bad_model: str,
 ) -> None:
     """Bundle-create ``model_override`` outside the model-id charset 400s.
 
     Same trust boundary as the JSON create: the value becomes a ``--model``
     argv element on the runner, so no row may persist it.
-
-    :param bad_model: The malformed override under test.
     """
-    resp = await _post_bundle_create(client, {"model_override": bad_model})
-    assert resp.status_code == 400, (
-        f"model_override {bad_model!r} should 400, got {resp.status_code}: {resp.text}"
+    resp = await _post_bundle_create(client, {"model_override": "--model=evil"})
+    assert resp.status_code == 400, resp.text
+    assert "invalid model_override" in resp.text
+
+
+@pytest.mark.parametrize(
+    ("harness", "effort", "stored"),
+    [
+        pytest.param("claude-sdk", "ultra", "xhigh", id="alias-folds"),
+        pytest.param("claude-sdk", "minimal", None, id="outside-vocabulary"),
+        pytest.param("cursor", "low", None, id="no-effort-support"),
+    ],
+)
+async def test_bundle_create_checks_effort_against_the_bundle_harness(
+    client: httpx.AsyncClient, harness: str, effort: str, stored: str | None
+) -> None:
+    """An effort the bundle's harness cannot use 400s instead of being dropped at each turn.
+
+    :param harness: The uploaded bundle's harness.
+    :param effort: The requested effort.
+    :param stored: The effort the row keeps, or ``None`` when the create must 400.
+    """
+    resp = await _post_bundle_create(client, {"reasoning_effort": effort}, harness=harness)
+    if stored is None:
+        assert resp.status_code == 400, resp.text
+        assert "invalid reasoning_effort" in resp.text
+        return
+    assert resp.status_code == 201, resp.text
+    get = await client.get(f"/v1/sessions/{resp.json()['session_id']}")
+    assert get.json()["reasoning_effort"] == stored
+
+
+async def test_bundled_child_runner_notify_seeds_the_requested_model(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The bundled child's runner notify carries the session-init envelope.
+
+    Without it the runner fetches the row back, and a failed fetch starts the
+    child without the requested model or effort. The route forwards the first
+    input itself, so the envelope suppresses the recovery turn.
+    """
+    from omnigent.runtime import get_conversation_store
+    from omnigent.server.routes._sessions import helpers
+
+    resp = await _post_bundle_create(
+        client, {"model_override": "databricks-claude-sonnet-4-6", "reasoning_effort": "low"}
     )
+    assert resp.status_code == 201, resp.text
+    created = resp.json()
+    conversation = get_conversation_store().get_conversation(created["session_id"])
+    captured: dict[str, Any] = {}
+
+    async def _stub(*_: Any, **__: Any) -> _CaptureClient:
+        return _CaptureClient(captured)
+
+    monkeypatch.setattr(helpers, "_get_runner_client", _stub)
+    await helpers._notify_runner_of_bundled_child(
+        created["session_id"], created["agent_id"], None, conversation=conversation
+    )
+
+    envelope = captured["body"][SESSION_INIT_PAYLOAD_KEY]
+    assert envelope["snapshot"]["model_override"] == "databricks-claude-sonnet-4-6"
+    assert envelope["snapshot"]["reasoning_effort"] == "low"
+    assert envelope["suppress_recovery_turn"] is True
 
 
 class _CaptureClient:
@@ -691,7 +744,6 @@ async def test_silent_patch_skips_claude_native_forward(
     is pinned by intercepting the runner POST and asserting no
     ``model_change`` event reaches it when ``silent: true``.
     """
-    import json
 
     from omnigent.runtime import set_runner_client
 

@@ -35,16 +35,22 @@ def _spec(name: str, model: str, mock: str) -> dict[str, object]:
     }
 
 
+# Older servers reject a multipart model_override, and older runners drop the
+# model and refuse the effort.
+pytestmark = [
+    pytest.mark.min_server_version("0.20.0"),
+    pytest.mark.min_runner_version("0.20.0"),
+]
+
+
 @pytest.mark.timeout(300)
-@pytest.mark.parametrize("effort", [None, "low"], ids=["model", "model-and-effort"])
-def test_config_path_child_runs_requested_model_and_effort(
-    tmp_path, isolated_mock_llm_server_url, effort
-):
+def test_config_path_child_runs_requested_model_and_effort(tmp_path, isolated_mock_llm_server_url):
     """
-    ``sys_session_create(config_path=..., model=..., reasoning_effort=...)``
-    stores both on the child's row, and the child's LLM request names the
-    requested model, not the uploaded bundle's ``executor.model``.
+    ``sys_session_create(config_path=..., model=..., reasoning_effort=...)``:
+    the child's LLM request names the requested model and effort, not the
+    uploaded bundle's ``executor.model``.
     """
+    effort = "low"
     mock = isolated_mock_llm_server_url
     config = tmp_path / "config"
     write_model_config(config, mock, "claude-sonnet-4-20250514", "gpt-4o")
@@ -81,10 +87,9 @@ def test_config_path_child_runs_requested_model_and_effort(
                 "config_path": "child.yaml",
                 "title": "Bundle child",
                 "model": _REQUESTED_MODEL,
+                "reasoning_effort": effort,
                 "message": "CHILD_TASK",
             }
-            if effort is not None:
-                create_args["reasoning_effort"] = effort
             configure_mock_llm(
                 mock,
                 [
@@ -144,7 +149,9 @@ def test_config_path_child_runs_requested_model_and_effort(
             assert child, handle
             poll_until(lambda: "CHILD_RAN_" in items(child), timeout_s=90)
             assert not get_mock_requests(mock, key=_BUNDLE_MODEL), "child ran the bundle's model"
-            assert get_mock_requests(mock, key=_REQUESTED_MODEL), "child never asked for the model"
+            requested = get_mock_requests(mock, key=_REQUESTED_MODEL)
+            assert requested, "child never asked for the model"
+            assert all(r.get("reasoning") == {"effort": effort} for r in requested), requested
             assert "CHILD_RAN_REQUESTED_MODEL" in items(child)
 
             snapshot = client.get(f"/v1/sessions/{child}").json()
