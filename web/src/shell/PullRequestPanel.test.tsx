@@ -2204,7 +2204,7 @@ describe("session PR selection", () => {
     },
   );
 
-  it.each(["failing", "pending", "cancelled", "partial", "read-only"])(
+  it.each(["failing", "pending", "cancelled", "skipped", "partial", "read-only"])(
     "keeps check details and uses mergeability for %s",
     async (reason) => {
       const pr = {
@@ -2216,6 +2216,8 @@ describe("session PR selection", () => {
           passing: 1,
           failing: 0,
           pending: 0,
+          cancelled: 1,
+          skipped: 2,
           runs: [{ name: "Build", bucket: "passing" as const, url: null }],
           ...(reason === "partial"
             ? { partial: true }
@@ -2241,7 +2243,13 @@ describe("session PR selection", () => {
       });
       renderPanel();
       expect(!!screen.queryByRole("button", { name: "Merge" })).toBe(reason !== "read-only");
-      const passed = screen.getByRole("button", { name: "1 passed" });
+      const list = within(screen.getByRole("list", { name: "Pull requests" }));
+      expect(list.queryByRole("button", { name: /cancelled|skipped/ })).toBeNull();
+      if (reason === "cancelled" || reason === "skipped") {
+        expect(list.queryByRole("button", { name: "1 passed" })).toBeNull();
+        return;
+      }
+      const passed = list.getByRole("button", { name: "1 passed" });
       expect(passed).toHaveTextContent(/^1$/);
       fireEvent.pointerEnter(passed);
       fireEvent.mouseOver(passed);
