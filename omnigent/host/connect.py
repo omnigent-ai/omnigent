@@ -3302,8 +3302,13 @@ class HostProcess:
             self._fs_readers.move_to_end(expanded)
             reader = cached[1]
         params = frame.params or {}
+        from omnigent.runner import pr_resource
+
         try:
-            payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
+            with pr_resource.server_tracking(
+                params.get("server_tracked"), params.get("default_pr_url")
+            ):
+                payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
         except WorkspaceReaderError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3791,10 +3796,14 @@ class HostProcess:
                 error_code="not_found",
                 error="workspace directory does not exist on host",
             )
+        params = {**(frame.params or {}), "session_id": frame.session_id}
+        from omnigent.runner import pr_resource
+
         try:
-            payload = self._dispatch_fs_write_op(
-                expanded, frame.op, {**(frame.params or {}), "session_id": frame.session_id}
-            )
+            with pr_resource.server_tracking(
+                params.get("server_tracked"), params.get("default_pr_url")
+            ):
+                payload = self._dispatch_fs_write_op(expanded, frame.op, params)
         except ValueError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,

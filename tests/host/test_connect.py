@@ -9293,6 +9293,50 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
     assert seen == {"root": "/ws/omnigent", "account": "octocat", "remote": "origin"}
 
 
+def test_host_serves_a_pr_the_server_vouches_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reads and writes serve a PR this host never recorded once the server vouches for it."""
+    from omnigent.host.frames import HostFsResultFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    monkeypatch.setattr(github_resource, "_gh", lambda *_a, **_kw: (0, "{}", ""))
+    url = "https://github.com/example/one/pull/42"
+    host = _make_host_process()
+
+    def read(params: dict[str, object]) -> HostFsResultFrame:
+        return host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="merge-options",
+                op="github_merge_options",
+                workspace=str(tmp_path),
+                session_id="session",
+                params=params,
+            )
+        )
+
+    try:
+        refused = read({"pr_url": url})
+        served = read({"pr_url": url, "server_tracked": True})
+        written = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="disable-auto-merge",
+                op="github_disable_auto_merge",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "server_tracked": True},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+    assert refused.status == "error"
+    assert "not associated" in (refused.error or "")
+    assert served.status == "ok", served
+    assert written.status == "ok", written
+
+
 async def test_dispatch_fs_write_op_unknown_op_raises() -> None:
     """An unknown write op fails loud rather than silently no-op'ing."""
     with pytest.raises(ValueError, match="unknown fs write op"):
