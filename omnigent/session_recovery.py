@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import Literal
 
+from omnigent.errors import ErrorCode, OmnigentError
+
+RECOVERY_LABEL_PREFIX = "omnigent.recovery."
 RECOVERY_NOTICE = "[System: session resumed]"
 RECOVERY_PROMPT = (
     f"{RECOVERY_NOTICE}\n"
@@ -16,6 +20,14 @@ MAX_RECOVERY_ATTEMPTS = 3
 RECOVERY_MAX_AGE_S = 86400
 RECOVERY_RETRY_S = 30
 RECOVERY_ATTEMPT_S = 120
+
+
+def reject_recovery_labels(keys: Iterable[str]) -> None:
+    """Only the recovery store may mutate its private labels."""
+    if any(key.lower().startswith(RECOVERY_LABEL_PREFIX) for key in keys):
+        raise OmnigentError(
+            "Session recovery labels are server-internal", code=ErrorCode.INVALID_INPUT
+        )
 
 
 @dataclass(frozen=True)

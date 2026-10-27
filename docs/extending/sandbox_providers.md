@@ -331,7 +331,11 @@ budget. This is not an exactly-once guarantee for tool side effects.
 Custom conversation stores opt in with `supports_session_recovery = True` after
 implementing `get_session_recovery` and atomic `replace_session_recovery`, ordered
 with user input, Stop, archive, and deletion. The SQLAlchemy store implements this
-contract in the conversation database, including split-database deployments.
+contract using private `omnigent.recovery.*` rows in the existing conversation
+labels table. Each field fits the existing label limit; no schema migration is
+needed. These rows are excluded from ordinary label reads and forks, and ordinary
+label writes cannot change them. Recovery and input acceptance share a transaction,
+including in split-database deployments.
 No task ledger file or customer hook configuration is required.
 
 ## Provider capabilities
