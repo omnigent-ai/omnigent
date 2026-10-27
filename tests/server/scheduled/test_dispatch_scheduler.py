@@ -2208,7 +2208,7 @@ async def test_recovery_ownership_lookup_is_bounded_and_retried(store, caplog) -
 
     recover = AsyncMock(return_value="failed")
     scheduler = PersistentTaskScheduler(
-        store, AsyncMock(), recover, owned_hosts=owned, now=clock.now, recovery_seconds=0.05
+        store, AsyncMock(), recover, owned_hosts=owned, now=clock.now, recovery_seconds=1
     )
     try:
         await scheduler.poll_once()
