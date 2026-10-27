@@ -29,6 +29,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
 import {
   ArrowLeftIcon,
+  CopyIcon,
+  EllipsisIcon,
   ChevronDownIcon,
   ChevronRightIcon,
   ChevronsDownUpIcon,
@@ -64,6 +66,15 @@ import {
 import { FileDiff } from "@pierre/diffs/react";
 import { parsePatchFiles, type FileDiffMetadata } from "@pierre/diffs";
 import { cn } from "@/lib/utils";
+import { copyText } from "@/lib/clipboard";
+import { toast } from "sonner";
+import {
+  DropdownMenu,
+  DropdownMenuTrigger,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSeparator,
+} from "@/components/ui/dropdown-menu";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -1072,10 +1083,14 @@ function PullRequestListRow({
   conversationId,
   association,
   onSelect,
+  onUnlink,
+  unlinkPending,
 }: {
   conversationId: string;
   association: PullRequestAssociation;
   onSelect: () => void;
+  onUnlink?: () => void;
+  unlinkPending: boolean;
 }) {
   const info = usePullRequestInfo(conversationId, { poll: true, prUrl: association.url });
   const canEdit = useCanEdit(conversationId);
@@ -1100,6 +1115,12 @@ function PullRequestListRow({
   const title = (pr?.title ?? association.title)?.trim();
   const identity = pullRequestLabel({ ...association, title: null });
   const label = title ? `${identity} — ${title}` : identity;
+  const providerCopy = gitProviderCopy(
+    association.provider,
+    undefined,
+    association.provider_display,
+  );
+  const href = parseHttpUrl(association.url)?.href;
   return (
     <li className="flex min-w-0 items-center gap-2 rounded-md px-1.5 hover:bg-muted/50">
       <button
@@ -1161,6 +1182,45 @@ function PullRequestListRow({
           </>
         )}
       </div>
+      <DropdownMenu>
+        <DropdownMenuTrigger asChild>
+          <Button
+            variant="ghost"
+            size="icon-xs"
+            aria-label={`Actions for ${identity}`}
+            className="shrink-0"
+          >
+            <EllipsisIcon aria-hidden className="size-3.5" />
+          </Button>
+        </DropdownMenuTrigger>
+        <DropdownMenuContent align="end">
+          {canEdit && onUnlink && (
+            <>
+              <DropdownMenuItem disabled={unlinkPending} onSelect={onUnlink}>
+                <Trash2Icon aria-hidden /> Unlink PR
+              </DropdownMenuItem>
+              <DropdownMenuSeparator />
+            </>
+          )}
+          {href && (
+            <DropdownMenuItem asChild>
+              <a href={href} target="_blank" rel="noreferrer">
+                <ExternalLinkIcon aria-hidden /> Open in {providerCopy.label}
+              </a>
+            </DropdownMenuItem>
+          )}
+          <DropdownMenuItem
+            onSelect={() => {
+              void copyText(association.url).then(
+                () => toast.success("PR link copied"),
+                () => toast.error("Couldn’t copy PR link"),
+              );
+            }}
+          >
+            <CopyIcon aria-hidden /> Copy PR link
+          </DropdownMenuItem>
+        </DropdownMenuContent>
+      </DropdownMenu>
     </li>
   );
 }
@@ -1423,6 +1483,20 @@ export function PullRequestPanel({
                   provider_display:
                     pr.provider_display ?? associations?.provider_display ?? undefined,
                 }}
+                unlinkPending={update.isPending}
+                onUnlink={
+                  associations?.tracking_available
+                    ? () =>
+                        update.mutate(
+                          { url: pr.url, action: "remove" },
+                          {
+                            onSuccess: (data) => {
+                              if (pr.url === selected) changeSelection(data.selected_pr_url);
+                            },
+                          },
+                        )
+                    : undefined
+                }
                 onSelect={() => {
                   changeSelection(pr.url);
                   setDetailsSession(conversationId);

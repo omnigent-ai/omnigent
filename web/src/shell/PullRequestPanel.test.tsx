@@ -53,6 +53,7 @@ const state = vi.hoisted(() => ({
   diff: null as PullRequestDiffResponse | null,
   diffError: null as Error | null,
   canEdit: true,
+  updateSessionPr: vi.fn(),
   repoLabels: {
     data: undefined as PullRequestRepoLabels | undefined,
     isPending: true,
@@ -117,7 +118,7 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
     // The account selector (shown in the repo-unresolved empty state) calls this;
     // stub the mutation shape it reads.
-    useUpdateSessionPr: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    useUpdateSessionPr: () => ({ mutate: state.updateSessionPr, isPending: false, isError: false }),
     useSetPullRequestPreference: () => ({
       mutate: () => {},
       isPending: false,
@@ -1486,7 +1487,9 @@ describe("PullRequestPanel", () => {
         ],
       };
       const { rerender } = renderPanel();
-      fireEvent.click(screen.getByRole("button", { name: /contoso\/web\/app !7$/ }));
+      fireEvent.click(
+        screen.getByRole("button", { name: /^(?!Actions for).*contoso\/web\/app !7$/ }),
+      );
       expect(screen.getByTitle("Example Forge")).toHaveTextContent("Example Forge");
       // Mid-switch there's no request to name, and the header never named one.
       state.info = { isLoading: true, error: null, isFetching: true };
@@ -1681,7 +1684,9 @@ describe("PullRequestPanel", () => {
         prs: [association()],
       };
       renderPanel();
-      fireEvent.click(screen.getByRole("button", { name: /contoso\/web\/app !7/ }));
+      fireEvent.click(
+        screen.getByRole("button", { name: /^(?!Actions for).*contoso\/web\/app !7/ }),
+      );
       expect(screen.getByText("No supported remote")).toBeInTheDocument();
       expect(screen.getByRole("link", { name: "Open the PR on Example Forge" })).toHaveAttribute(
         "href",
@@ -2242,6 +2247,14 @@ describe("session PR selection", () => {
         ],
       });
       renderPanel();
+      if (reason === "read-only") {
+        const user = userEvent.setup();
+        await user.click(screen.getByRole("button", { name: /Actions for/ }));
+        expect(screen.queryByRole("menuitem", { name: "Unlink PR" })).toBeNull();
+        expect(screen.getByRole("menuitem", { name: "Copy PR link" })).toBeEnabled();
+        await user.keyboard("{Escape}");
+      }
+
       expect(!!screen.queryByRole("button", { name: "Merge" })).toBe(reason !== "read-only");
       const list = within(screen.getByRole("list", { name: "Pull requests" }));
       expect(list.queryByRole("button", { name: /cancelled|skipped/ })).toBeNull();
@@ -2295,6 +2308,17 @@ describe("session PR selection", () => {
       },
     };
     const { rerender } = renderPanel();
+    await user.click(screen.getByRole("button", { name: "Actions for example/two #42" }));
+    expect(screen.getByRole("menuitem", { name: "Open in GitHub" })).toHaveAttribute("href", two);
+    await user.click(screen.getByRole("menuitem", { name: "Copy PR link" }));
+    expect(await navigator.clipboard.readText()).toBe(two);
+    await user.click(screen.getByRole("button", { name: "Actions for example/two #42" }));
+    await user.click(screen.getByRole("menuitem", { name: "Unlink PR" }));
+    expect(state.updateSessionPr).toHaveBeenCalledWith(
+      { url: two, action: "remove" },
+      expect.any(Object),
+    );
+
     expect(screen.queryByRole("tab", { name: "Summary" })).toBeNull();
     await user.click(screen.getByRole("button", { name: "example/two #42 — Second repository" }));
     expect(usePullRequestInfo).toHaveBeenLastCalledWith("conv_1", { poll: true, prUrl: two });
