@@ -94,14 +94,20 @@ def test_message_phase_is_assistant_only_and_omitted_when_unset() -> None:
         MessageData(role="user", content=[], phase="final_answer")
 
 
-def test_unknown_message_phase_reads_as_unlabelled() -> None:
-    """A phase from a newer Codex (or a newer server's row) must not reject the message."""
+@pytest.mark.parametrize(
+    ("phase", "stored"),
+    [("summary", "summary"), ("x" * 64, "x" * 64), ("x" * 65, None), ("", None), (3, None)],
+)
+def test_message_phase_keeps_short_strings_and_drops_malformed(
+    phase: object, stored: str | None
+) -> None:
+    """Values a newer Codex adds are kept; malformed ones read as unlabelled, not rejected."""
     msg = parse_item_data(
         "message",
-        {"role": "assistant", "agent": "codex-native-ui", "content": [], "phase": "summary"},
+        {"role": "assistant", "agent": "codex-native-ui", "content": [], "phase": phase},
     )
     assert isinstance(msg, MessageData)
-    assert msg.phase is None
+    assert msg.phase == stored
 
 
 def test_assistant_message_includes_agent() -> None:

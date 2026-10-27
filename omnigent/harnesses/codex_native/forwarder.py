@@ -6436,7 +6436,7 @@ async def _post_agent_message(
         "agent": _AGENT_NAME,
         "content": [{"type": "output_text", "text": text}],
     }
-    # Codex labels progress vs. answer text; the server drops values it doesn't know.
+    # Codex labels progress vs. answer text; the web UI folds commentary.
     phase = item.get("phase")
     if isinstance(phase, str):
         item_data["phase"] = phase

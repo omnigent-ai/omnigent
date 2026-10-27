@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from typing import Any, Literal, get_args
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -289,9 +289,8 @@ class StartupInputOptions(BaseModel):
     background_titles_enabled: bool = False
 
 
-# Codex ``MessagePhase`` values: progress narration vs. answer text
-# (``partial_answer`` only from newer Codex releases, e.g. 0.164).
-AssistantMessagePhase = Literal["commentary", "partial_answer", "final_answer"]
+# Longest harness message phase kept, e.g. Codex ``"partial_answer"``.
+_MAX_MESSAGE_PHASE_LENGTH = 64
 
 
 class MessageData(BaseModel):
@@ -319,8 +318,9 @@ class MessageData(BaseModel):
         prevents legacy content cleanup from hiding literal agent markup.
     :param subagent_return_id: Native task id of an explicitly completed child.
     :param phase: Assistant-only harness label for the message, e.g. Codex
-        ``"commentary"`` (progress) or ``"final_answer"``. ``None`` when the
-        harness doesn't report one or reports a value this build doesn't know.
+        ``"commentary"`` (progress), ``"partial_answer"`` or ``"final_answer"``.
+        Stored as given so clients can act on values added later; ``None``
+        when unset, not a string, or longer than 64 characters.
     """
 
     role: Literal["user", "assistant"]
@@ -332,9 +332,7 @@ class MessageData(BaseModel):
     subagent_return_id: str | None = Field(default=None, exclude_if=lambda value: value is None)
     interrupted: bool = Field(default=False, exclude_if=lambda value: value is False)
     stream_message_id: str | None = None
-    phase: AssistantMessagePhase | None = Field(
-        default=None, exclude_if=lambda value: value is None
-    )
+    phase: str | None = Field(default=None, exclude_if=lambda value: value is None)
     startup_options: StartupInputOptions | None = Field(
         default=None, exclude_if=lambda value: value is None
     )
@@ -347,9 +345,11 @@ class MessageData(BaseModel):
 
     @field_validator("phase", mode="before")
     @classmethod
-    def drop_unknown_phase(cls, phase: object) -> object:
-        """Read an unknown phase as unlabelled so newer producers and stored rows still load."""
-        return phase if phase in get_args(AssistantMessagePhase) else None
+    def drop_malformed_phase(cls, phase: object) -> str | None:
+        """Read a malformed phase as unlabelled rather than rejecting the message."""
+        if isinstance(phase, str) and 0 < len(phase) <= _MAX_MESSAGE_PHASE_LENGTH:
+            return phase
+        return None
 
     @model_validator(mode="after")
     def check_agent_for_assistant(self) -> MessageData:

@@ -549,7 +549,7 @@ async def test_transient_delta_post_uses_one_short_attempt() -> None:
         ("commentary", "commentary"),
         ("partial_answer", "partial_answer"),
         ("final_answer", "final_answer"),
-        # The server, not the forwarder, decides which values it knows.
+        # Passed through as-is; clients act only on phases they know.
         ("summary", "summary"),
         (None, None),
     ],

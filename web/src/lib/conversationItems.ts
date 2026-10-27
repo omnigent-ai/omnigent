@@ -40,8 +40,8 @@ export interface MessageItem extends BaseItem {
   interrupted?: boolean;
   /** Native live-preview stream finalized by this persisted assistant message. */
   stream_message_id?: string;
-  /** Assistant-only harness label (Codex); `commentary` is progress narration. */
-  phase?: AssistantMessagePhase;
+  /** Assistant-only harness label as stored, e.g. Codex `commentary`; may be newer than this client. */
+  phase?: string;
 }
 
 /** Codex `MessagePhase`: progress narration vs. (partial or final) answer text. */
