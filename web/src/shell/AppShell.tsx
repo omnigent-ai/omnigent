@@ -1643,12 +1643,9 @@ function AppShellImpl() {
         peekDismissTimer.current = null;
       }
     };
-    // Anything the peek card legitimately spawns outside its own subtree (Radix
-    // menus, tooltips, dialogs) must not count as "outside", or opening a row's
-    // context menu would dismiss the card under it. Both peek triggers count as
-    // inside too: while the card's entry animation keeps it click-through, the
-    // pointer still rests on the chat-header toggle beneath it, and a wobble
-    // there must not arm the dismiss timer.
+    // Portaled Radix content (menus, tooltips, dialogs) and both peek triggers
+    // count as inside, so opening a row's menu or a wobble on the toggle that
+    // armed the card doesn't dismiss it.
     const insidePeekSurface = (target: EventTarget | null) => {
       if (!(target instanceof Element)) return false;
       return !!target.closest(
@@ -2399,14 +2396,9 @@ function AppShellImpl() {
           canvas for the traffic lights, and the strip is the window's one
           drag surface — content below and right stays fully clickable. */}
             {isMacElectronShell() && <div className="electron-drag-strip" aria-hidden="true" />}
-            {/* The Search/Settings/toggle cluster lives HERE on the macOS shell,
-          not in the sidebar, so the three icons hold one fixed position beside
-          the traffic lights no matter what the sidebar does. Inside the sidebar
-          they would be clipped and inert once it collapses (md:w-0 +
-          overflow-hidden + inert), and while peeking the floating card's
-          inset-2 would drag them off the lights' centre line. The sidebar's own
-          copy is hidden on mac by CSS; this one is positioned by
-          .electron-sidebar-header-actions in index.css. */}
+            {/* On macOS this cluster lives in the title-bar strip (.electron-sidebar-header-actions)
+          so it stays fixed beside the traffic lights while the sidebar collapses or
+          peeks; CSS hides the sidebar's own copy there. */}
             {/* Hidden on /settings: the settings nav replaces the session list
           INSIDE the sidebar, and its "Back" row is the only way out. Leaving a
           collapse toggle up here would let the user hide the one exit and strand
