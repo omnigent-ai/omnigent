@@ -5717,39 +5717,66 @@ def _count_running_sessions(base_url: str) -> int:
     return 0
 
 
+def _wait_for_running_sessions(count_running: Callable[[], int], *, force_hint: str) -> None:
+    """Block until ``count_running`` reports no session mid-turn.
+
+    Polls every :data:`_UPGRADE_DRAIN_POLL_S` seconds and re-prints the count
+    whenever it changes; ``Ctrl-C`` aborts the wait (and the caller) cleanly.
+
+    :param count_running: Returns how many sessions are still running a turn.
+    :param force_hint: How to skip the wait, e.g.
+        ``"re-run with --force to stop them now"``.
+    """
+    count = count_running()
+    if count == 0:
+        return
+    click.echo(
+        f"Waiting for {count} running session(s) to finish — press Ctrl-C to "
+        f"abort, or {force_hint}."
+    )
+    last = count
+    while True:
+        time.sleep(_UPGRADE_DRAIN_POLL_S)
+        count = count_running()
+        if count == 0:
+            return
+        if count != last:
+            click.echo(f"  {count} session(s) still running…")
+            last = count
+
+
 def _wait_for_local_sessions_to_drain() -> None:
     """Block until no local session is actively running a turn.
 
     Used by ``omni upgrade`` (without ``--force``) so an upgrade never
     yanks a running agent turn. Waits only on sessions whose status is
     ``"running"`` (see :func:`_count_running_sessions`) — idle-but-connected
-    sessions do not hold it up. Polls every :data:`_UPGRADE_DRAIN_POLL_S`
-    seconds and re-prints the count whenever it changes; ``Ctrl-C`` aborts
-    the wait (and the upgrade) cleanly. Returns immediately when the server
-    is down or already idle.
+    sessions do not hold it up. Returns immediately when the server is down
+    or already idle.
     """
-    info = local_server_status()
-    if not (info.running and info.url is not None):
-        return
-    count = _count_running_sessions(info.url)
-    if count == 0:
-        return
-    click.echo(
-        f"Waiting for {count} running session(s) to finish — press Ctrl-C to "
-        "abort, or re-run with --force to stop them now."
-    )
-    last = count
-    while True:
-        time.sleep(_UPGRADE_DRAIN_POLL_S)
+
+    def _count() -> int:
         info = local_server_status()
         if not (info.running and info.url is not None):
-            return
-        count = _count_running_sessions(info.url)
-        if count == 0:
-            return
-        if count != last:
-            click.echo(f"  {count} session(s) still running…")
-            last = count
+            return 0
+        return _count_running_sessions(info.url)
+
+    _wait_for_running_sessions(_count, force_hint="re-run with --force to stop them now")
+
+
+def _count_running_daemon_sessions(record: _HostDaemonRecord) -> int:
+    """Count a daemon's sessions that are running a turn.
+
+    A failed session listing counts as none, so an unreachable server never
+    blocks the caller, matching :func:`_count_running_sessions`.
+
+    :param record: Daemon record whose host-bound sessions are counted.
+    :returns: Number of sessions with ``status == "running"``.
+    """
+    result = _sessions_for_daemon(record, connected_only=True)
+    if result.error is not None:
+        return 0
+    return sum(1 for session in result.sessions if session.get("status") == "running")
 
 
 def _drain_and_stop_local_server(*, force: bool) -> None:
@@ -10780,17 +10807,25 @@ def _echo_daemon_payloads(payloads: list[_HostPayload]) -> None:
     default=False,
     help="Do not launch browser sign-in while preparing the service.",
 )
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Replace a running host now, even mid-turn.",
+)
 @click.pass_context
 def host_enable(
     ctx: click.Context,
     server: str | None,
     non_interactive: bool,
+    force: bool,
 ) -> None:
     """Install and start the host as a per-user system service.
 
     :param ctx: Click context carrying group-level options.
     :param server: Optional server target; empty selects local mode.
     :param non_interactive: Fail instead of launching browser sign-in.
+    :param force: Replace a running host without waiting for its running turns.
     """
     if server is None:
         server = _host_group_option(ctx, "server")
@@ -10806,6 +10841,12 @@ def host_enable(
     target = _normalize_daemon_target(resolved_server)
     record = _find_daemon_record(target)
     if record is not None:
+        # Replacing the daemon kills its runners, so let running turns finish first.
+        if not force and _daemon_owner_is_live(record):
+            _wait_for_running_sessions(
+                lambda: _count_running_daemon_sessions(record),
+                force_hint="re-run with --force to replace the host now",
+            )
         _terminate_daemon(record, force=False)
 
     from omnigent.host.service import HostServiceError, enable_user_host_service

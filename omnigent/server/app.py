@@ -89,7 +89,12 @@ from omnigent.server.background_session_titles import (
     RunnerBackgroundTitleGenerator,
 )
 from omnigent.server.disconnect_evidence import DisconnectEvidence, drop_attributes
-from omnigent.server.feature_flags import Feature, FeatureFlags, resolve_feature_flags
+from omnigent.server.feature_flags import (
+    Feature,
+    FeatureFlags,
+    harness_install_enabled,
+    resolve_feature_flags,
+)
 from omnigent.server.managed_hosts import ManagedSandboxDeployment
 from omnigent.server.managed_sandbox_reaper import ManagedSandboxReaper
 from omnigent.server.mcp_gateway import McpGatewayBackend
@@ -120,6 +125,7 @@ from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
+    CLIENT_SESSION_EVENT_TYPES,
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
@@ -237,6 +243,8 @@ class ServerInfoResponse(BaseModel):
     agent_detail: bool = False
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
+    # Client event types POST /v1/sessions/{id}/events accepts; empty on older servers.
+    session_event_types: list[str] = []
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     branding: BrandingInfo
@@ -1381,6 +1389,7 @@ def create_app(
     filesystem_attachment_allowed_extensions: (
         str | list[str] | Callable[[], str | list[str] | None] | None
     ) = None,
+    harness_install: bool | Callable[[], bool] | None = None,
     server_config: dict[str, Any] | None = None,
     feature_flags: FeatureFlags | None = None,
     extension_state: ExtensionPluginState | None = None,
@@ -1573,6 +1582,12 @@ def create_app(
     branding_snapshot = load_branding_snapshot(resolved_server_config)
     title_instructions = session_title_instructions(resolved_server_config)
     resolved_feature_flags = feature_flags or resolve_feature_flags()
+    if harness_install is None:
+        app_harness_install: bool | Callable[[], bool] = resolved_feature_flags.enabled(
+            Feature.HARNESS_INSTALL
+        )
+    else:
+        app_harness_install = harness_install
     automations_v2_enabled = resolved_feature_flags.enabled(Feature.AUTOMATIONS_V2)
     if automations_v2_enabled:
         if scheduled_task_store is None:
@@ -2082,6 +2097,7 @@ def create_app(
     app.state.sandbox_config = sandbox_config
     app.state.branding_snapshot = branding_snapshot
     app.state.feature_flags = resolved_feature_flags
+    app.state.harness_install = app_harness_install
     app.state.scheduled_task_dispatch_enabled = automations_v2_enabled
     # Deployment base path (e.g. "/proxy/6767"), so route handlers that build
     # a full-page redirect (not covered by BasePathMiddleware's inbound-only
@@ -3308,10 +3324,10 @@ def create_app(
         except ImportError:
             smart_routing_enabled = False
             smart_routing_sources = {"external": False, "oss": False}
-        # The immutable feature snapshot is shared by capability
-        # advertisement and route enforcement, so frontend and backend cannot
-        # disagree during a process lifetime.
-        harness_install_enabled = app.state.feature_flags.enabled(Feature.HARNESS_INSTALL)
+        # Resolve the gate per request with the same resolver used by route enforcement.
+        current_harness_install_enabled = harness_install_enabled(app.state.harness_install)
+        frontend_features = app.state.feature_flags.frontend_dict()
+        frontend_features[Feature.HARNESS_INSTALL.value] = current_harness_install_enabled
         # installable_harnesses: the exact harness ids the install route accepts
         # (bare ids + native spellings resolving to an npm-installable family),
         # so the SPA offers setup only where it will succeed and never has to
@@ -3320,7 +3336,7 @@ def create_app(
         from omnigent.onboarding.harness_install import ui_installable_harnesses
 
         installable_harnesses = (
-            sorted(ui_installable_harnesses()) if harness_install_enabled else []
+            sorted(ui_installable_harnesses()) if current_harness_install_enabled else []
         )
         # dictation_available gates the composer mic button's server
         # speech-to-text fallback (designs/server-dictation.md). Checks
@@ -3349,8 +3365,8 @@ def create_app(
                 "server_version": _server_version(),
                 "smart_routing_enabled": smart_routing_enabled,
                 "smart_routing_sources": smart_routing_sources,
-                "features": app.state.feature_flags.frontend_dict(),
-                "harness_install_enabled": harness_install_enabled,
+                "features": frontend_features,
+                "harness_install_enabled": current_harness_install_enabled,
                 "installable_harnesses": installable_harnesses,
                 "dictation_available": dictation_available,
                 "archive_worktree_cleanup": True,
@@ -3360,6 +3376,7 @@ def create_app(
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
+                "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
@@ -4572,6 +4589,7 @@ def create_app(
                 on_host_connect=_on_hosts_changed,
                 on_host_disconnect=_on_hosts_changed,
                 on_host_update=_on_hosts_changed,
+                harness_install=app.state.harness_install,
             ),
             prefix="/v1",
             tags=["hosts"],
@@ -4586,6 +4604,7 @@ def create_app(
                 agent_store=agent_store,
                 agent_cache=agent_cache,
                 feature_flags=resolved_feature_flags,
+                harness_install=app.state.harness_install,
             ),
             prefix="/v1",
             tags=["hosts"],

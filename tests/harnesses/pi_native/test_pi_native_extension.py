@@ -228,10 +228,11 @@ const ctx = {
 function usageEvents() {
   return postedEvents.filter((e) => e.type === "external_session_usage");
 }
-async function recordUsage(handlers, timestamp, input, output) {
+async function recordUsage(handlers, timestamp, input, output, cost) {
   await handlers.message_end({ message: {
     role: "assistant", model: "databricks-claude-sonnet-4-6", timestamp,
-    usage: { input, output, cacheRead: 0, cacheWrite: 0, totalTokens: input + output },
+    usage: { input, output, cacheRead: 0, cacheWrite: 0,
+      totalTokens: input + output, cost: { total: cost } },
   }}, ctx);
 }
 """
@@ -477,10 +478,11 @@ def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
 (async () => {
 
   await handlers.session_start({}, ctx);
-  await recordUsage(handlers, 1000, 150000, 30000);
+  await recordUsage(handlers, 1000, 150000, 30000, 0.75);
   const saved = JSON.parse(fs.readFileSync(statePath));
   assert.equal(saved.cumulative_input_tokens, 150000);
   assert.equal(saved.cumulative_output_tokens, 30000);
+  assert.equal(saved.cumulative_cost_usd, 0.75);
   if (baselineSource !== "local") {
     const cfg = JSON.parse(fs.readFileSync(configPath));
     cfg.usageBaseline = { ...saved };
@@ -488,6 +490,7 @@ def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
     if (baselineSource === "unreported-local") {
       cfg.usageBaseline.cumulative_input_tokens = 100000;
       cfg.usageBaseline.cumulative_output_tokens = 20000;
+      cfg.usageBaseline.cumulative_cost_usd = 0.5;
     }
     fs.writeFileSync(configPath, JSON.stringify(cfg));
     if (baselineSource === "server") fs.unlinkSync(statePath);
@@ -499,14 +502,55 @@ def test_usage_baseline_survives_native_restart(baseline_source: str) -> None:
   postedEvents.length = 0;
   const resumed = launchExtension();
   await resumed.session_start({}, ctx);
-  await recordUsage(resumed, 2000, 900, 250);
+  await recordUsage(resumed, 2000, 900, 250, 0.25);
+  await recordUsage(resumed, 2000, 900, 250, 0.25);
   const reasserts = baselineSource === "local" || baselineSource === "unreported-local";
   assert.deepEqual(usageEvents().map(({data}) => [
-    data.cumulative_input_tokens, data.cumulative_output_tokens, data.model,
+    data.cumulative_input_tokens, data.cumulative_output_tokens, data.cumulative_cost_usd,
   ]), [
-    ...(reasserts ? [[150000, 30000, "databricks-claude-sonnet-4-6"]] : []),
-    [150900, 30250, "databricks-claude-sonnet-4-6"],
+    ...(reasserts ? [[150000, 30000, 0.75]] : []),
+    [150900, 30250, 1],
   ]);
+})().catch(error => { console.error(error); process.exit(1); });
+"""
+    )
+    result = _run_node(script, str(_extension_path()))
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+@pytest.mark.parametrize("cost", [None, 0, -1, "0.5", True])
+@pytest.mark.parametrize("baseline_source", ["local", "server"])
+@pytest.mark.parametrize("priced_first", [False, True])
+def test_incomplete_pi_cost_keeps_server_pricing(
+    cost: object, baseline_source: str, priced_first: bool
+) -> None:
+    script = (
+        _usage_test_preamble()
+        + "\nconst cost = "
+        + json.dumps(cost)
+        + "; const baselineSource = "
+        + json.dumps(baseline_source)
+        + "; const pricedFirst = "
+        + json.dumps(priced_first)
+        + ";\n"
+        + r"""
+(async () => {
+  await recordUsage(handlers, 1000, 100, 20, pricedFirst ? 0.5 : cost);
+  await recordUsage(handlers, 2000, 100, 20, pricedFirst ? cost : 0.5);
+  assert.ok(!("cumulative_cost_usd" in usageEvents().at(-1).data));
+  assert.equal(usageEvents().at(-1).data.cost_complete, false);
+  postedEvents.length = 0;
+  const cfg = JSON.parse(fs.readFileSync(configPath));
+  cfg.usageBaseline = JSON.parse(fs.readFileSync(statePath));
+  delete cfg.usageBaseline.cost_complete;
+  if (baselineSource === "server") fs.unlinkSync(statePath);
+  else cfg.usageBaseline.cumulative_cost_usd = 0.75; // stale display subtotal
+  fs.writeFileSync(configPath, JSON.stringify(cfg));
+  const resumed = launchExtension();
+  await resumed.session_start({}, ctx);
+  await recordUsage(resumed, 3000, 100, 20, 0.5);
+  assert.ok(usageEvents().every(({data}) => !("cumulative_cost_usd" in data)));
+  assert.equal(usageEvents().at(-1).data.cumulative_input_tokens, 300);
 })().catch(error => { console.error(error); process.exit(1); });
 """
     )

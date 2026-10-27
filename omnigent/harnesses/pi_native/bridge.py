@@ -373,7 +373,7 @@ def write_extension_files(
     conversation_url: str,
     auth_headers: dict[str, str] | None = None,
     tools: list[_JsonObject] | None = None,
-    usage_baseline: dict[str, int] | None = None,
+    usage_baseline: dict[str, int | float] | None = None,
 ) -> tuple[Path, Path]:
     """
     Write the Pi extension and config used by a native Pi terminal.
@@ -391,7 +391,7 @@ def write_extension_files(
         runner uses), so the Pi agent can invoke Omnigent ``sys_*`` tools with
         centralized server-side policy enforcement. ``None``/empty registers no
         tools (Pi falls back to its own built-in tool surface only).
-    :param usage_baseline: Server-recorded own-session cumulative tokens,
+    :param usage_baseline: Server-recorded own-session cumulative usage,
         excluding child sessions; ``None`` retains local-only restoration.
     :returns: ``(extension_path, config_path)``.
     """

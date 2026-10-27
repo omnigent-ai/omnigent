@@ -1088,6 +1088,11 @@ export async function getDesktopFeatures(): Promise<DesktopFeatures | null> {
   }
 }
 
+/** Whether this desktop shell can connect the user's Arca instance as a host. */
+export function supportsArcaConnect(): boolean {
+  return typeof electronApi()?.connectArcaHost === "function";
+}
+
 /**
  * Connect the user's Arca instance (Databricks-internal sandbox) to the
  * window's server as a host, via the desktop shell. The shell asks native
