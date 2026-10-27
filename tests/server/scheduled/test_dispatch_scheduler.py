@@ -159,7 +159,7 @@ async def test_two_pollers_fire_once_and_do_not_catch_up_outage(store) -> None:
     assert len(fired) == 1
 
 
-async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store) -> None:
+async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store, caplog) -> None:
     tasks = [_task(store, str(i), host_id=uuid.uuid4().hex) for i in range(3)]
     clock = FakeClock(max(task.next_run_at for task in tasks))
     ordered = store.list_due_tasks(int(clock.now()))
@@ -183,6 +183,8 @@ async def test_scan_pages_past_unowned_tasks_and_ownership_errors(store) -> None
     await _drain(scheduler)
     # One lookup per page; a failed lookup skips only its own page.
     assert calls == [[task.host_id] for task in ordered]
+    failures = _events(caplog, "scheduled_task_operation_failed")
+    assert [event["operation"] for event in failures] == ["claim"]
     assert store.list_runs(own.id)[0][0].status == "running"
     assert store.list_runs(ordered[0].id)[0] == []
 
@@ -2215,6 +2217,8 @@ async def test_recovery_ownership_lookup_is_bounded_and_retried(store, caplog) -
         await _drain(scheduler)
         recover.assert_not_awaited()
         assert "Could not check which of 1 hosts this server owns" in caplog.text
+        failures = _events(caplog, "scheduled_task_operation_failed")
+        assert [event["operation"] for event in failures] == ["recovery"]
         hang = False
         await scheduler.poll_once()
         await _drain(scheduler)
@@ -2223,5 +2227,6 @@ async def test_recovery_ownership_lookup_is_bounded_and_retried(store, caplog) -
         await scheduler.stop()
     # The host-less run is keyed by its workspace.
     assert calls == [["7"], ["7"]]
+    assert len(_events(caplog, "scheduled_task_operation_failed")) == 1
     with workspace_scope(7):
         assert store.list_runs(task.id)[0][0].status == "failed"
