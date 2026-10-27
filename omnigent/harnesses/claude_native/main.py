@@ -232,14 +232,13 @@ _CLAUDE_NONESSENTIAL_TRAFFIC_ENV = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC"
 #: same rows page fine at smaller sizes.
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT = 1000
 _CLAUDE_RESUME_ITEMS_PAGE_LIMIT_FLOOR = 100
-_CLAUDE_MODEL_PROBE_TIMEOUT_S = 20.0
+# Configured launchers may bootstrap credentials and settings before Claude starts.
+_CLAUDE_MODEL_PROBE_TIMEOUT_S = 60.0
 #: Wall-clock cap for the per-alias resolution fan-out as a whole; aliases
 #: still unresolved when it expires keep their bare rows (the cache's
-#: revalidation retries them later). Startup dominates each run and
-#: stretches with box load (measured 0.7s–17s for the same command), so the
-#: concurrency covers a whole alias set in one wave and the budget fits one
-#: slow wave.
-_CLAUDE_ALIAS_RESOLUTION_BUDGET_S = 30.0
+#: revalidation retries them later). Allow one full probe wave, including
+#: configured-launcher bootstrap, while concurrency bounds process fan-out.
+_CLAUDE_ALIAS_RESOLUTION_BUDGET_S = _CLAUDE_MODEL_PROBE_TIMEOUT_S
 _CLAUDE_ALIAS_RESOLUTION_CONCURRENCY = 12
 _CLAUDE_CODE_ENABLE_TOOL_SEARCH_ENV = "ENABLE_TOOL_SEARCH"
 _CLAUDE_CODE_CUSTOM_HEADERS_ENV = "ANTHROPIC_CUSTOM_HEADERS"
