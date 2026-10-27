@@ -196,7 +196,8 @@ jobs:
   repro:
     name: Attempt ${{ matrix.attempt }}
     needs: [prep, build-sidecar]
-    runs-on: ubuntu-latest
+    # Playwright 1.60 cannot install Chromium on ubuntu-26.04, ubuntu-latest's new image.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       # Keep going after a failure to observe the full distribution.
