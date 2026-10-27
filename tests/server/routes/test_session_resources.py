@@ -6530,16 +6530,21 @@ async def test_kiro_prompt_with_literal_attachment_text_matches_its_entry() -> N
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("expire_during_append", [False, True])
 @pytest.mark.parametrize("prior_state", ["plain", "uncertain", "interrupted"])
 async def test_claude_native_failed_slash_command_append_restores_its_entry(
     prior_state: str,
+    expire_during_append: bool,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """A slash-command mirror whose append fails puts its queued entry back, in order."""
     from omnigent.runtime import pending_inputs
     from omnigent.server.routes.sessions import _persist_external_conversation_item
 
     pending_inputs.reset_for_tests()
-    store = _FailOnceStore()
+    now = [100.0]
+    monkeypatch.setattr(pending_inputs, "_now", lambda: now[0])
+    store = _BlockingStore(fail_first_append=True)
     sid = "64a784c3aa907d1774f44313546947c6"
     conv = store.get_conversation(sid)
     assert conv is not None
@@ -6565,13 +6570,23 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry(
     )
 
     try:
-        with pytest.raises(RuntimeError, match="database unavailable"):
-            await _persist_external_conversation_item(
+        persist = asyncio.create_task(
+            _persist_external_conversation_item(
                 sid,
                 conv,
                 body,
                 store,  # type: ignore[arg-type]
             )
+        )
+        try:
+            assert await asyncio.to_thread(store.first_append_started.wait, 2)
+            if expire_during_append:
+                now[0] += pending_inputs._TTL_S + 1
+                assert pending_inputs.snapshot_for(sid) == []
+        finally:
+            store.release_first_append.set()
+        with pytest.raises(RuntimeError, match="database unavailable"):
+            await persist
         assert store.appended_items == []
         assert pending_inputs.pending_ids(sid) == [older, command]
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
@@ -6590,9 +6605,27 @@ async def test_claude_native_failed_slash_command_append_restores_its_entry(
         assert [entry["pending_id"] for entry in pending_inputs.snapshot_for(sid)] == (
             [] if prior_state == "interrupted" else [older]
         )
-        delayed = pending_inputs.resolve_matching_text(sid, "still on its way")
-        assert delayed.matched is not None and delayed.matched.pending_id == older
-        assert delayed.matched.interrupted == (prior_state == "interrupted")
+        pending_inputs.record(sid, [{"type": "input_text", "text": "continue"}])
+        await _persist_external_conversation_item(
+            sid,
+            conv,
+            SessionEventInput(
+                type="external_conversation_item",
+                data={
+                    "item_type": "message",
+                    "item_data": {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "continue"}],
+                    },
+                    "response_id": "resp_continue",
+                    "source_id": "claude:continue:0",
+                },
+            ),
+            store,  # type: ignore[arg-type]
+        )
+        errors = [item.data.code for item in store.appended_items if item.type == "error"]
+        assert errors == (["native_prompt_not_recorded"] if prior_state == "plain" else [])
+        assert pending_inputs.snapshot_for(sid) == []
     finally:
         pending_inputs.reset_for_tests()
 
