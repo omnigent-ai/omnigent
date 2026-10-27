@@ -296,10 +296,10 @@ const CODE_KEY_WORDS = new Set([
   "xml",
   "yaml",
 ]);
-// A markup tag such as `<instructions>`, which markdown would hide; autolinks do not match.
-// GitHub bodies' `<details>`, `<summary>` and `<br>` render as markdown and do not count.
+// A markup tag such as `<instructions>`, even split over lines, which markdown would hide;
+// autolinks do not match. GitHub bodies' `<details>`, `<summary>` and `<br>` do not count.
 const MARKUP_TAG =
-  /<\/?(?!(?:details|summary|br|sub|sup|kbd)(?![\w-]))[A-Za-z][\w-]*(?:\s[^<>\n]*)?\/?>/i;
+  /<\/?(?!(?:details|summary|br|sub|sup|kbd)(?![\w-]))[A-Za-z][\w-]*(?:\s[^<>]*)?\/?>/i;
 
 // Indentation, `>` quote markers and list bullets that can nest a block in a line.
 const CONTAINER_PREFIX = /^(?:[ \t>]|(?:[-*+]|\d{1,9}[.)])[ \t])*/;
@@ -421,9 +421,11 @@ export function isProseText(text: string, key?: string): boolean {
   if (isPathologicalText(text) || looksLikeData(text)) return false;
   // Fenced and inline code render literally as markdown too, so only the rest is checked.
   const outsideCode = withoutHtmlComments(withoutCode(text));
-  // An unclosed `<!--` hides the rest of the text, like a markup tag.
-  if (MARKUP_TAG.test(outsideCode) || outsideCode.includes("<!--")) return false;
+  // An unclosed `<!--`, `<?`, `<![CDATA[` or `<!X` hides text, like a markup tag.
+  if (MARKUP_TAG.test(outsideCode) || /<[?!]/.test(outsideCode)) return false;
   const lines = outsideCode.split("\n").filter((line) => line.trim().length > 0);
+  // A link reference definition such as `[//]: # (note)` renders as nothing.
+  if (lines.some((line) => /^\[[^\]]+\]:/.test(line.replace(CONTAINER_PREFIX, "")))) return false;
   const codeLike = lines.filter(
     (line) => !/^\s+(?:[-*+]|\d+\.) /.test(line) && /^(?:\t| {4})|[;{}]\s*$/.test(line),
   ).length;

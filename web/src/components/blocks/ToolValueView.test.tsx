@@ -120,8 +120,7 @@ describe("ToolValueView", () => {
     cleanup();
     // `<img/src=...>` is not read as a markup tag, so it reaches the markdown sanitizer.
     renderValue({
-      description:
-        "# Plan\n\n- first <img/src=x onerror=alert(1)>\n- second <img\nsrc=x\nonerror=alert(1)>",
+      description: "# Plan\n\n- first <img/src=x onerror=alert(1)>\n- second",
     });
     const prose = await screen.findByTestId("tool-prose-value");
     expect(prose.querySelector("img, [onerror]")).toBeNull();
