@@ -2059,7 +2059,7 @@ class SandboxStatus(BaseModel):
 
 
 class NativeUsageBaseline(BaseModel):
-    """Own-session cumulative tokens for resuming a native usage reporter.
+    """Own-session cumulative usage for resuming a native usage reporter.
 
     Excludes spawned sessions. Input includes cache reads, matching the native
     usage event contract rather than the display's separate token buckets.
@@ -2068,6 +2068,7 @@ class NativeUsageBaseline(BaseModel):
     cumulative_input_tokens: int = Field(default=0, ge=0)
     cumulative_output_tokens: int = Field(default=0, ge=0)
     cumulative_cache_read_input_tokens: int = Field(default=0, ge=0)
+    cumulative_cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class ModelUsage(BaseModel):
@@ -2924,6 +2925,7 @@ class SessionListItem(BaseModel):
     :param agent_name: Human-readable name of the bound agent,
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
+    :param harness: Canonical effective harness, including per-session overrides.
     :param status: Derived session lifecycle status.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
@@ -3017,6 +3019,7 @@ class SessionListItem(BaseModel):
     id: str
     agent_id: str
     agent_name: str | None = None
+    harness: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int

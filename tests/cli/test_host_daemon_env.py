@@ -456,6 +456,51 @@ def test_runner_env_preserves_claude_telemetry_opt_in() -> None:
     assert env.get("CLAUDE_CODE_ENABLE_TELEMETRY") == "1"
 
 
+_IDLE_TIMEOUT_KNOBS: Final = {
+    "OMNIGENT_NATIVE_PANE_IDLE_TIMEOUT_S": "0",
+    "OMNIGENT_HARNESS_IDLE_TIMEOUT_S": "0",
+}
+
+
+@pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
+def test_host_daemon_env_preserves_idle_timeout_knobs(
+    monkeypatch: pytest.MonkeyPatch,
+    server_url: str | None,
+) -> None:
+    """The runner-tuning idle windows survive the CLI→daemon strip in both modes."""
+    # Given
+    for name, value in _IDLE_TIMEOUT_KNOBS.items():
+        monkeypatch.setenv(name, value)
+    monkeypatch.setenv("OMNIGENT_LOG_LEVEL", "INFO")
+
+    # When
+    env = _build_host_daemon_env(server_url=server_url)
+
+    # Then: the knobs travel with the other non-secret OMNIGENT_ tuning vars.
+    assert env.get("OMNIGENT_LOG_LEVEL") == "INFO"
+    assert {name: env.get(name) for name in _IDLE_TIMEOUT_KNOBS} == _IDLE_TIMEOUT_KNOBS
+
+
+def test_runner_env_preserves_idle_timeout_knobs() -> None:
+    """The idle windows set on the host reach the runner that reads them."""
+    # Given
+    base_env = {"PATH": "/usr/bin", "OMNIGENT_LOG_LEVEL": "INFO", **_IDLE_TIMEOUT_KNOBS}
+
+    # When
+    env = _build_runner_env(
+        base_env,
+        server_url=_REMOTE_SERVER_URL,
+        runner_id="runner_idle",
+        binding_token="binding-idle",
+        workspace="/tmp/workspace",
+        parent_pid=12345,
+    )
+
+    # Then
+    assert env.get("OMNIGENT_LOG_LEVEL") == "INFO"
+    assert {name: env.get(name) for name in _IDLE_TIMEOUT_KNOBS} == _IDLE_TIMEOUT_KNOBS
+
+
 _TELEMETRY_OPTOUTS = [
     ("CI", "true"),
     ("CI", ""),

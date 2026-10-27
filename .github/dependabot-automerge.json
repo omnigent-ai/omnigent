@@ -1,5 +1,6 @@
 {
   "cooldown_days": 7,
+  "max_base_refreshes": 20,
   "python": {
     "default": "minor",
     "manual": [

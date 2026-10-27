@@ -68,7 +68,7 @@ jobs:
     # Skipped on reconcile_floating dispatches — that only drives the
     # reconcile-floating retag job.
     if: github.repository == 'omnigent-ai/omnigent' && !inputs.reconcile_floating
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Multi-arch: the linux/arm64 leg cross-builds under QEMU emulation on this
     # amd64 runner, which roughly doubles the host-image build time (emulated
     # npm/pip native steps). Cold-cache server, host, and provider image builds
@@ -290,7 +290,7 @@ jobs:
     permissions:
       contents: read
       packages: read
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - name: Log in to GHCR (read-only)
@@ -365,7 +365,7 @@ jobs:
     permissions:
       contents: read
       packages: write # retag within GHCR via GITHUB_TOKEN
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Checkout

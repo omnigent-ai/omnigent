@@ -91,12 +91,15 @@ function QueuedRow({
   onDelete,
   onEdit,
   onSteer,
+  steerBlocked,
   reorderable,
 }: {
   message: QueuedMessage;
   onDelete: (queueId: string) => void;
   onEdit: (queueId: string) => void;
   onSteer?: (queueId: string) => void;
+  /** The conversation waits for its host, so nothing can be sent now. */
+  steerBlocked: boolean;
   reorderable: boolean;
 }) {
   // The whole row drags (via its grip) and is the drop target, so the row
@@ -226,6 +229,7 @@ function QueuedRow({
                   message.requiresRetry ? "Retry queued message" : "Send queued message now"
                 }
                 className={ACTION_BUTTON_CLASS}
+                disabled={steerBlocked}
                 onClick={() => onSteer(message.queueId)}
               >
                 <ArrowUpIcon className="size-4 max-md:size-4" aria-hidden="true" />
@@ -293,6 +297,7 @@ export function QueuedMessagesStrip({
     onReorder(String(active.id), beforeQueueId);
   };
 
+  const steerBlocked = messages.some((m) => m.waitingForHost);
   const rows = messages.map((message) => (
     <QueuedRow
       key={message.queueId}
@@ -300,6 +305,7 @@ export function QueuedMessagesStrip({
       onDelete={onDelete}
       onEdit={onEdit}
       onSteer={onSteer}
+      steerBlocked={steerBlocked}
       reorderable={onReorder !== undefined}
     />
   ));
