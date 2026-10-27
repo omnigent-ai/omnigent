@@ -31,6 +31,11 @@ Covered facets (each is a claim from the bug report):
 - ``test_create_directory_accepts_drive_letter_path`` — creating a
   folder under a Windows path must work (bug: the route only accepts
   paths starting with ``/`` or ``~``).
+- ``test_windows_folder_pick_enables_start_session`` — selecting a
+  drive-letter folder as the working directory must enable Start session
+  and create the session there (bug: the composer gate only accepted
+  ``/``-prefixed paths, so Send stayed disabled with "Please choose a
+  host and working directory").
 
 The async-in-a-fresh-thread shape is inherited from
 ``test_start_session.py`` (pytest-asyncio can't start a loop on the main
@@ -42,6 +47,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import os
+import re
 import uuid
 from collections.abc import AsyncIterator
 from typing import Any
@@ -74,7 +80,10 @@ from omnigent.runner.transports.ws_tunnel.frames import (
     encode_frame,
 )
 from tests._helpers.async_thread import run_in_fresh_loop as _run_in_fresh_loop
-from tests.e2e_ui.start_session.helpers import open_landing_workspace_picker
+from tests.e2e_ui.start_session.helpers import (
+    commit_landing_workspace_picker,
+    open_landing_workspace_picker,
+)
 
 _HOST_NAME = "win11-e2e"
 _WIN_HOME = "C:\\Users\\alice"
@@ -85,7 +94,13 @@ _WIN_HOME = "C:\\Users\\alice"
 # Copied per host connection so a create_dir in one test can't leak
 # into another.
 _FS_TEMPLATE: dict[str, list[tuple[str, str]]] = {
-    "C:\\": [("Program Files", "directory"), ("Users", "directory"), ("Windows", "directory")],
+    "C:\\": [
+        ("Program Files", "directory"),
+        ("Users", "directory"),
+        ("Windows", "directory"),
+        ("general_agent_temp", "directory"),
+    ],
+    "C:\\general_agent_temp": [],
     "C:\\Users": [("alice", "directory")],
     "C:\\Users\\alice": [("Documents", "directory"), ("work", "directory")],
     "C:\\Users\\alice\\Documents": [("notes.txt", "file")],
@@ -441,6 +456,71 @@ async def _drive_up_from_home_child(base_url: str) -> None:
             # … and must NOT show the drive root (the buggy build lists
             # ``C:\`` — Program Files / Users / Windows — here).
             await expect(page.get_by_test_id("workspace-picker-entry-Windows")).to_have_count(0)
+        finally:
+            await context.close()
+            await browser.close()
+
+
+def test_windows_folder_pick_enables_start_session(seeded_session: tuple[str, str]) -> None:
+    """Picking a drive-letter folder enables Start session and sends it as the workspace.
+
+    The reported bug: the composer's workspace gate accepted only
+    ``/``-prefixed paths, so with ``C:\\general_agent_temp`` selected the
+    Send button stayed disabled ("Please choose a host and working
+    directory") and Enter dispatched no session-create request.
+    """
+    base_url, session_id = seeded_session
+    _run_in_fresh_loop(_drive_windows_folder_pick_enables_start_session(base_url, session_id))
+
+
+async def _drive_windows_folder_pick_enables_start_session(base_url: str, session_id: str) -> None:
+    async with _windows_host(base_url) as host_id, async_playwright() as pw:
+        browser = await pw.chromium.launch()
+        context = await browser.new_context(**_video_kwargs())
+        page = await context.new_page()
+        create_bodies: list[dict[str, Any]] = []
+
+        # The fake host cannot launch a runner: capture the create POST (the
+        # assertion target) and land the navigation on a seeded session.
+        async def handle_sessions(route: Any) -> None:
+            if route.request.method == "POST":
+                create_bodies.append(route.request.post_data_json)
+                await route.fulfill(json={"id": session_id})
+            else:
+                await route.continue_()
+
+        try:
+            await page.route(re.compile(r"/v1/sessions(\?.*)?$"), handle_sessions)
+            await page.route(
+                "**/v1/sessions/*/events",
+                lambda route: route.fulfill(json={"queued": True, "item_id": "ci_e2e"}),
+            )
+            await _open_picker_at_windows_home(page, base_url, host_id)
+            # Up twice: C:\Users\alice -> C:\Users -> C:\.
+            await page.get_by_test_id("workspace-picker-up").dispatch_event("click")
+            await expect(page.get_by_test_id("workspace-picker-entry-alice")).to_be_visible(
+                timeout=10_000
+            )
+            await page.get_by_test_id("workspace-picker-up").dispatch_event("click")
+            target = page.get_by_test_id("workspace-picker-entry-general_agent_temp")
+            await expect(target).to_be_visible(timeout=10_000)
+            await target.dispatch_event("click")
+            await commit_landing_workspace_picker(page)
+            await expect(page.get_by_test_id("new-chat-landing-workspace-chip")).to_contain_text(
+                "C:\\general_agent_temp"
+            )
+
+            await page.get_by_test_id("new-chat-landing-input").click()
+            await page.keyboard.type("set up the project on this Windows machine", delay=20)
+            submit = page.get_by_test_id("new-chat-landing-submit")
+            await expect(submit).to_be_enabled(timeout=10_000)
+            await submit.hover()
+            error_tooltip = page.get_by_test_id("new-chat-landing-submit-error-tooltip")
+            await expect(error_tooltip).to_have_count(0)
+
+            await page.get_by_test_id("new-chat-landing-input").press("Enter")
+            await expect(page).to_have_url(re.compile("/c/" + session_id), timeout=15_000)
+            assert [body["workspace"] for body in create_bodies] == ["C:\\general_agent_temp"]
         finally:
             await context.close()
             await browser.close()

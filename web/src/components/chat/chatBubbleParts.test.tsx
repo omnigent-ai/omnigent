@@ -211,6 +211,27 @@ describe("message navigation highlight", () => {
 });
 
 describe("UserBubble literal text", () => {
+  it.each(["", "[Attached: docs/a.md]\n\n", "[Attached file: docs/a.md]\r\n\r\n"])(
+    "keeps indented bullets as siblings after stripping %j",
+    (preamble) => {
+      render(
+        <BubbleView
+          bubble={{
+            kind: "user",
+            itemId: "user_list",
+            content: [{ type: "input_text", text: `${preamble}  - first\n  - second` }],
+          }}
+          isLastAssistant={false}
+        />,
+      );
+
+      expect(screen.getAllByRole("list")).toHaveLength(1);
+      const items = screen.getAllByRole("listitem");
+      expect(items).toHaveLength(2);
+      expect(items[0].parentElement).toBe(items[1].parentElement);
+    },
+  );
+
   it.each([
     [
       "unfinished placeholder",
@@ -458,6 +479,85 @@ describe("AssistantBubble error retry", () => {
     const [url, init] = fetchMock.mock.calls[0] as [string, RequestInit];
     expect(url).toBe("/v1/sessions/conv_retry/events");
     expect(JSON.parse(init.body as string)).toEqual({ type: "retry_session", data: {} });
+  });
+});
+
+describe("AssistantBubble error-only role", () => {
+  // The reconnect journey counts [data-role="assistant"] bubbles as Claude
+  // replies. An undelivered-message notice is a standalone error item with no
+  // prose, so it must not carry the assistant role and inflate that count.
+  it("tags an undelivered-message notice as an error bubble, not an assistant reply", () => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_undelivered",
+            stableId: "undelivered_notice",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              {
+                kind: "error",
+                itemId: "undelivered_notice",
+                message: "Message not delivered. Try sending it again.",
+                source: "runtime",
+                code: "native_prompt_not_recorded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "error");
+    expect(bubble).toHaveTextContent("Message not delivered. Try sending it again.");
+  });
+
+  it.each<{ name: string; nonError: Extract<Bubble, { kind: "assistant" }>["items"][number] }>([
+    {
+      name: "a prose reply carrying a trailing error",
+      nonError: { kind: "text", itemId: "reply_text", text: "the answer is 42", final: true },
+    },
+    {
+      name: "a failed turn with reasoning but no prose",
+      nonError: {
+        kind: "reasoning",
+        itemId: "thinking",
+        text: "Weighing the options.",
+        duration: 1,
+      },
+    },
+  ])("keeps $name on the assistant role", ({ nonError }) => {
+    render(
+      <QueryClientProvider client={new QueryClient()}>
+        <BubbleView
+          bubble={{
+            kind: "assistant",
+            responseId: "resp_mixed_failure",
+            stableId: "mixed_failure",
+            lifecycle: "failed",
+            error: null,
+            items: [
+              nonError,
+              {
+                kind: "error",
+                itemId: "mixed_error",
+                message: "API Error: Request rejected (429): rate limit",
+                source: "execution",
+                code: "rate_limit_exceeded",
+              },
+            ],
+          }}
+          isLastAssistant={false}
+        />
+      </QueryClientProvider>,
+    );
+
+    const bubble = screen.getByTestId("message-bubble");
+    expect(bubble).toHaveAttribute("data-role", "assistant");
   });
 });
 

@@ -359,7 +359,16 @@ def _configure_brokered_codex_with_ucode(
     spec: AgentSpec,
     provider: ProviderEntry,
 ) -> None:
-    """Bind the supported Databricks Codex route to signer-only authority."""
+    """Bind the supported Databricks Codex route to signer-only authority.
+
+    A spec without an active sandbox runs on the platform sandbox, and one
+    without a ``model_egress`` grant gets the provider's single model route.
+    """
+    import dataclasses
+
+    from omnigent.inner.datamodel import OSEnvSpec
+    from omnigent.inner.sandbox import _default_sandbox_for_platform
+
     profile = provider.profile
     if os.environ.get("HARNESS_CODEX_GATEWAY_AUTH_COMMAND"):
         raise OmnigentError(
@@ -368,15 +377,20 @@ def _configure_brokered_codex_with_ucode(
         )
     sandbox = spec.os_env.sandbox if spec.os_env is not None else None
     if sandbox is None or sandbox.type == "none":
-        raise OmnigentError(
-            "signer-backed Codex requires an active os_env sandbox",
-            code=ErrorCode.INVALID_INPUT,
+        platform_sandbox = _default_sandbox_for_platform()
+        sandbox = (
+            dataclasses.replace(sandbox, type=platform_sandbox.type)
+            if sandbox is not None
+            else platform_sandbox
         )
-    if not spec.model_egress:
-        raise OmnigentError(
-            "signer-backed Codex requires an explicit model_egress grant",
-            code=ErrorCode.INVALID_INPUT,
-        )
+        if spec.os_env is None:
+            # Worker only: a spec without os_env has no OS tools to contain.
+            env["HARNESS_CODEX_OS_ENV"] = json.dumps(
+                dataclasses.asdict(OSEnvSpec(sandbox=sandbox))
+            )
+        else:
+            # In place, so the session's OS tools share the worker's sandbox.
+            spec.os_env.sandbox = sandbox
     if sandbox.egress_rules:
         raise OmnigentError(
             "signer-backed Codex does not support os_env.sandbox.egress_rules; "
@@ -399,13 +413,17 @@ def _configure_brokered_codex_with_ucode(
         )
     assert agent_state is not None
     try:
-        registered_model_provider_binding(
+        binding = registered_model_provider_binding(
             binding_id=UCODE_SIGNER_BINDING_ID,
             trusted_session_endpoint=endpoint,
             trusted_host=state.workspace_host,
         )
     except ValueError as exc:
         raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from exc
+    # No grant means the provider's own route, the most the signer ever signs.
+    model_egress = spec.model_egress or [
+        f"{route.method} {route.host}{route.path}" for route in binding.maximum_routes
+    ]
     if "HARNESS_CODEX_MODEL" not in env:
         env["HARNESS_CODEX_MODEL"] = agent_state.model or _resolve_catalog_default_model(
             "databricks",
@@ -416,7 +434,7 @@ def _configure_brokered_codex_with_ucode(
     env["HARNESS_CODEX_SIGNER_ENDPOINT"] = endpoint
     env["HARNESS_CODEX_GATEWAY_HOST"] = state.workspace_host
     env["HARNESS_CODEX_DATABRICKS_PROFILE"] = profile
-    env["HARNESS_CODEX_MODEL_EGRESS"] = json.dumps(spec.model_egress)
+    env["HARNESS_CODEX_MODEL_EGRESS"] = json.dumps(model_egress)
 
 
 def _inject_ucode_agent_state(
@@ -1417,6 +1435,9 @@ def _build_claude_sdk_spawn_env(
     permission_mode = spec.executor.config.get("permission_mode")
     if permission_mode is not None:
         env["HARNESS_CLAUDE_SDK_PERMISSION_MODE"] = str(permission_mode)
+    # Explicitly clear inherited presets for agents that have not opted in.
+    preset = spec.executor.config.get("system_prompt_preset")
+    env["HARNESS_CLAUDE_SDK_SYSTEM_PROMPT_PRESET"] = str(preset) if preset is not None else ""
     return env
 
 
@@ -1552,7 +1573,9 @@ def _build_pi_spawn_env(
     :param workdir: The bundle's on-disk path (extracted by the
         agent cache). Threaded through as ``HARNESS_PI_BUNDLE_DIR``
         so the harness wrap's executor can source bundled skills
-        from ``<bundle>/skills/<dir>/``.
+        from ``<bundle>/skills/<dir>/`` and ``<bundle>/.pi/skills/<dir>/``,
+        extensions from ``<bundle>/.pi/extensions``, and a bundle-root
+        context file (``AGENTS.md`` et al.).
     :returns: A dict of env-var overrides for
         :meth:`HarnessProcessManager.get_client(env=...)`.
     """
@@ -2555,27 +2578,13 @@ def _build_copilot_spawn_env(
 
 
 def _serialize_os_env(value: OSEnvSpec | None) -> str | None:
-    """
-    Encode an :class:`OSEnvSpec` for the wrap's env-var input.
-
-    JSON-encodes :func:`dataclasses.asdict` of the OSEnvSpec so
-    the wrap can :func:`json.loads` it back on the harness side
-    (per the per-spawn env-var pattern from §Step 5a). When
-    *value* is ``None`` (no os_env declared on the spec), this
-    returns ``None`` and ``_build_claude_sdk_spawn_env`` omits
-    the env var entirely — the wrap then falls back to its
-    enable-natives-by-default rule.
-
-    :param value: ``spec.os_env`` — an :class:`OSEnvSpec`
-        instance or ``None``.
-    :returns: JSON string encoding the OSEnvSpec, or ``None``
-        when *value* is ``None``.
-    """
-    import dataclasses
+    """Encode an OS environment for harness subprocesses."""
 
     if value is None:
         return None
-    return json.dumps(dataclasses.asdict(value))
+    from omnigent.inner.os_env_serialization import encode_os_env_spec
+
+    return json.dumps(encode_os_env_spec(value))
 
 
 def _serialize_retry_policy(value: RetryPolicy | None) -> str | None:

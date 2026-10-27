@@ -1,8 +1,7 @@
-"""UI: the admin "Default visibility for new sessions" setting makes new
-sessions start public.
+"""UI: the admin default-sharing switch scopes which new sessions start public.
 
-Drives the real SPA on a dedicated multi-user server: the admin picks "All
-sessions public" on Settings > Sharing, the choice survives a reload, and a
+Drives the real SPA on a dedicated multi-user server: enabling defaults to
+managed hosts only, then the admin picks "All sessions". Both survive a reload. A
 session created afterwards opens its Share dialog with General access set to
 Read (backed by a ``__public__`` read grant). The session seeded before the
 change stays private. The data dir is isolated so the admin override file never
@@ -17,16 +16,17 @@ import httpx
 import pytest
 from playwright.sync_api import Browser, Locator, Page, expect
 
-from tests._helpers.session import post_session_bundle
+from tests._helpers.browser import user_page
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
     MultiUserServer,
+    create_user_session,
     spawn_multi_user_server,
 )
-from tests.e2e_ui.conftest import _build_hello_world_bundle
 
 _ADMIN_HEADERS = {"X-Forwarded-Email": ADMIN_EMAIL}
-_GROUP = "Default visibility for new sessions"
+_GROUP = "Automatically share"
+_TOGGLE = "Share new sessions by default"
 
 
 @pytest.fixture(scope="module")
@@ -59,18 +59,6 @@ def _permissions(base_url: str, session_id: str) -> dict[str, int]:
     return {p["user_id"]: p["level"] for p in resp.json()["permissions"]}
 
 
-def _create_session(base_url: str) -> str:
-    resp = post_session_bundle(
-        httpx.post,
-        f"{base_url}/v1/sessions",
-        _build_hello_world_bundle(),
-        headers=_ADMIN_HEADERS,
-        timeout=30,
-    )
-    resp.raise_for_status()
-    return resp.json()["session_id"]
-
-
 def _share_dialog_general_access(page: Page, url: str) -> Locator:
     page.goto(url)
     share = page.get_by_role("button", name="Share session")
@@ -86,32 +74,46 @@ def test_admin_default_public_all_makes_new_sessions_public(
     default_public_server: MultiUserServer,
 ) -> None:
     server = default_public_server
-    context = browser.new_context(extra_http_headers=_ADMIN_HEADERS)
-    page = context.new_page()
+    with user_page(browser, headers=_ADMIN_HEADERS) as page:
+        page.goto(f"{server.public_url}/settings/sharing")
+        toggle = page.get_by_role("switch", name=_TOGGLE)
+        expect(toggle).not_to_be_checked(timeout=60_000)
+        expect(page.get_by_role("group", name=_GROUP)).not_to_be_visible()
+        toggle.click()
+        group = page.get_by_role("group", name=_GROUP)
+        expect(group.get_by_role("radio", name="Managed hosts only")).to_be_checked()
 
-    # ── Admin picks "All sessions public" on Settings > Sharing ──────
-    page.goto(f"{server.public_url}/settings/sharing")
-    group = page.get_by_role("group", name=_GROUP)
-    expect(group).to_be_visible(timeout=60_000)
-    expect(group.locator('input[value="off"]')).to_be_checked()
-    group.get_by_text("All sessions public").click()
-    expect(group.locator('input[value="all"]')).to_be_checked()
+        page.reload()
+        expect(group.get_by_role("radio", name="Managed hosts only")).to_be_checked(timeout=30_000)
+        local_session = create_user_session(server.base_url, headers=_ADMIN_HEADERS)
+        assert "__public__" not in _permissions(server.base_url, local_session)
 
-    # Persisted server-side: survives a reload.
-    page.reload()
-    expect(page.get_by_role("group", name=_GROUP).locator('input[value="all"]')).to_be_checked(
-        timeout=30_000
-    )
+        group.get_by_role("radio", name="All sessions", exact=True).click()
+        expect(group.get_by_role("radio", name="All sessions", exact=True)).to_be_checked()
 
-    # ── A session created now starts public; the older one does not ──
-    new_session = _create_session(server.base_url)
-    assert _permissions(server.base_url, new_session).get("__public__") == 1
-    assert "__public__" not in _permissions(server.base_url, server.session_id)
+        # Persisted server-side: survives a reload.
+        page.reload()
+        expect(group.get_by_role("radio", name="All sessions", exact=True)).to_be_checked(
+            timeout=30_000
+        )
 
-    expect(
-        _share_dialog_general_access(page, f"{server.public_url}/c/{new_session}")
-    ).to_have_text("Read")
-    expect(
-        _share_dialog_general_access(page, f"{server.public_url}/c/{server.session_id}")
-    ).to_have_text("No access")
-    context.close()
+        # ── A session created now starts public; the older one does not ──
+        new_session = create_user_session(server.base_url, headers=_ADMIN_HEADERS)
+        assert _permissions(server.base_url, new_session).get("__public__") == 1
+        assert "__public__" not in _permissions(server.base_url, server.session_id)
+
+        toggle.click()
+        expect(toggle).not_to_be_checked()
+        expect(group).not_to_be_visible()
+        page.reload()
+        expect(toggle).not_to_be_checked(timeout=30_000)
+        private_session = create_user_session(server.base_url, headers=_ADMIN_HEADERS)
+        assert "__public__" not in _permissions(server.base_url, private_session)
+        assert _permissions(server.base_url, new_session).get("__public__") == 1
+
+        expect(
+            _share_dialog_general_access(page, f"{server.public_url}/c/{new_session}")
+        ).to_have_text("Read")
+        expect(
+            _share_dialog_general_access(page, f"{server.public_url}/c/{server.session_id}")
+        ).to_have_text("No access")

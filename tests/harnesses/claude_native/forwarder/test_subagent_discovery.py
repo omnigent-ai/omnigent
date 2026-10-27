@@ -4,8 +4,10 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import errno
 import json
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -23,6 +25,25 @@ from tests.harnesses.claude_native.forwarder._support import (
     _start_recording_server_with_responses,
     _wait_for_json_state,
 )
+
+
+@pytest.fixture(autouse=True)
+def _fresh_spawn_id_memo(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Start every test with an empty spawn-id memo so entries never leak between tests."""
+    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE", {})
+
+
+def _count_transcript_scans(monkeypatch: pytest.MonkeyPatch) -> list[Path]:
+    """Record every transcript the forwarder parses for spawn ids from now on."""
+    scans: list[Path] = []
+    real_scan = forwarder._tool_use_ids_in_transcript
+
+    def counting_scan(path: Path, *, include_sidechains: bool) -> set[str] | None:
+        scans.append(path)
+        return real_scan(path, include_sidechains=include_sidechains)
+
+    monkeypatch.setattr(forwarder, "_tool_use_ids_in_transcript", counting_scan)
+    return scans
 
 
 async def test_subagent_watcher_registers_a_task_named_spawn(
@@ -166,8 +187,14 @@ async def test_subagent_watcher_posts_external_subagent_start_for_new_meta(
         server.server_close()
 
 
+@pytest.mark.parametrize(
+    ("parent_spawn", "server_requires_tool_id"),
+    [("tool", False), ("slash_command", False), ("slash_command", True)],
+)
 async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
     tmp_path: Path,
+    parent_spawn: str,
+    server_requires_tool_id: bool,
 ) -> None:
     """Nested Claude agents register under their immediate Omnigent parent."""
     bridge_dir = tmp_path / "bridge"
@@ -219,6 +246,20 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
             )
             + "\n"
         )
+    if parent_spawn == "slash_command":
+        # Forked slash commands have no tool call; native metadata identifies
+        # their children even before the corresponding spawn record is flushed.
+        transcript_path.write_text("", encoding="utf-8")
+        parent_transcript.write_text("", encoding="utf-8")
+        parent_meta_path = parent_transcript.with_suffix(".meta.json")
+        parent_meta = json.loads(parent_meta_path.read_text(encoding="utf-8"))
+        parent_meta.pop("toolUseId")
+        parent_meta.update(description="/code-review example", spawnDepth=1)
+        parent_meta_path.write_text(json.dumps(parent_meta), encoding="utf-8")
+        child_meta_path = child_transcript.with_suffix(".meta.json")
+        child_meta = json.loads(child_meta_path.read_text(encoding="utf-8"))
+        child_meta.update(parentAgentId="z-parent", spawnDepth=2)
+        child_meta_path.write_text(json.dumps(child_meta), encoding="utf-8")
     start_paths: dict[str, str] = {}
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -226,6 +267,15 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
         if body.get("type") != "external_subagent_start":
             return httpx.Response(202, json={})
         subagent_id = body["data"]["subagent_id"]
+        if parent_spawn == "slash_command" and subagent_id == "z-parent":
+            assert "tool_use_id" not in body["data"]
+            if server_requires_tool_id:
+                return httpx.Response(
+                    400,
+                    json={
+                        "message": "external_subagent_start requires non-empty data.tool_use_id"
+                    },
+                )
         start_paths[subagent_id] = request.url.path
         return httpx.Response(
             202,
@@ -236,12 +286,30 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
         transport=httpx.MockTransport(handler),
         base_url="http://ap",
     ) as client:
+        if server_requires_tool_id:
+            rejected = await forwarder._forward_available_subagents(
+                client=client,
+                parent_session_id="conv_root",
+                bridge_dir=bridge_dir,
+                transcript_path=transcript_path,
+                state=forwarder.SubagentForwardState(subagents={}),
+                agent_name="claude-native-ui",
+                start_retry_tracker=forwarder._PostRetryTracker(
+                    base_delay_s=0.0, max_permanent_attempts=1
+                ),
+                item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+                status_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
+            )
+            assert rejected.subagents == {}
+            assert forwarder._read_subagent_forward_state(bridge_dir) == rejected
+            assert not (bridge_dir / "dead_letter.jsonl").exists()
+            server_requires_tool_id = False
         state = await forwarder._forward_available_subagents(
             client=client,
             parent_session_id="conv_root",
             bridge_dir=bridge_dir,
             transcript_path=transcript_path,
-            state=forwarder.SubagentForwardState(subagents={}),
+            state=forwarder._read_subagent_forward_state(bridge_dir),
             agent_name="claude-native-ui",
             start_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
             item_retry_tracker=forwarder._PostRetryTracker(base_delay_s=0.0),
@@ -280,6 +348,35 @@ async def test_subagent_watcher_preserves_nested_parent_graph_across_restart(
 
     assert start_paths["b-grandchild"] == "/v1/sessions/conv_a-child/events"
     assert restarted.subagents["b-grandchild"].parent_subagent_id == "a-child"
+
+
+@pytest.mark.parametrize(
+    ("lineage", "accepted"),
+    [
+        ({"spawnDepth": 1}, True),
+        ({"parentAgentId": "parent", "spawnDepth": 2}, True),
+        ({"parentAgentId": "parent"}, True),
+        ({"toolUseId": "toolu_spawn"}, True),
+        ({}, False),
+        ({"spawnDepth": 2}, False),
+        ({"spawnDepth": True}, False),
+        ({"spawnDepth": 1, "toolUseId": None}, False),
+        ({"spawnDepth": 1, "toolUseId": ""}, False),
+        ({"parentAgentId": ""}, False),
+        ({"parentAgentId": "worker"}, False),
+        ({"parentAgentId": "parent", "spawnDepth": 1}, False),
+    ],
+)
+def test_subagent_metadata_requires_a_spawn_call_or_explicit_lineage(
+    tmp_path: Path, lineage: dict[str, Any], accepted: bool
+) -> None:
+    """A missing tool call is valid only when native metadata proves the parent."""
+    meta_path = tmp_path / "agent-worker.meta.json"
+    meta_path.write_text(
+        json.dumps({"agentType": "general-purpose", "description": "/code-review", **lineage}),
+        encoding="utf-8",
+    )
+    assert (forwarder._read_subagent_meta(meta_path) is not None) is accepted
 
 
 async def test_subagent_watcher_parks_child_of_a_parked_parent(
@@ -494,6 +591,21 @@ async def test_subagent_watcher_defers_and_logs_when_no_transcript_owns_the_spaw
     assert "toolu_missing" in caplog.text
 
 
+def _batch_safe_handler(
+    response_for: Callable[[dict[str, Any]], dict[str, Any]],
+) -> Callable[[httpx.Request], httpx.Response]:
+    """Mock transport that answers single events and event-array batches alike."""
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        body = json.loads(request.content) if request.content else {}
+        response = (
+            [response_for(item) for item in body] if isinstance(body, list) else response_for(body)
+        )
+        return httpx.Response(202, json=response)
+
+    return handler
+
+
 def _observe_subagent_scans(
     monkeypatch: pytest.MonkeyPatch,
     response_for: Callable[[dict[str, Any]], dict[str, Any]],
@@ -511,12 +623,7 @@ def _observe_subagent_scans(
             completed.set()
         return state
 
-    def handler(request: httpx.Request) -> httpx.Response:
-        body = json.loads(request.content) if request.content else {}
-        response = (
-            [response_for(item) for item in body] if isinstance(body, list) else response_for(body)
-        )
-        return httpx.Response(202, json=response)
+    handler = _batch_safe_handler(response_for)
 
     @contextlib.asynccontextmanager
     async def open_mock_client(*_args: Any, **_kwargs: Any) -> Any:
@@ -700,13 +807,12 @@ async def test_subagent_watcher_preserves_parked_sentinel_across_restart(
     assert starts == [], f"forwarder retried a parked sub-agent after restart: {starts!r}"
 
 
-def _inherited_spawn_record(tool_use_id: str, description: str) -> dict[str, Any]:
-    """A fork's own transcript row: a sidechain copy of the Agent record that
-    spawned it, inherited when the fork cloned the parent conversation."""
+def _spawn_record(tool_use_id: str, description: str, *, sidechain: bool) -> dict[str, Any]:
+    """An assistant transcript row carrying one Agent spawn ``tool_use`` block."""
     return {
-        "isSidechain": True,
+        "isSidechain": sidechain,
         "type": "assistant",
-        "uuid": f"inherited-spawn-{tool_use_id}",
+        "uuid": f"spawn-{tool_use_id}",
         "message": {
             "role": "assistant",
             "content": [
@@ -719,6 +825,12 @@ def _inherited_spawn_record(tool_use_id: str, description: str) -> dict[str, Any
             ],
         },
     }
+
+
+def _inherited_spawn_record(tool_use_id: str, description: str) -> dict[str, Any]:
+    """A fork's own transcript row: a sidechain copy of the Agent record that
+    spawned it, inherited when the fork cloned the parent conversation."""
+    return _spawn_record(tool_use_id, description, sidechain=True)
 
 
 def test_fork_inherited_spawn_record_resolves_to_the_real_parent(
@@ -805,3 +917,168 @@ async def test_fork_subagent_inheriting_its_own_spawn_record_registers(
     assert start_paths == {"a-fork": "/v1/sessions/conv_root/events"}
     assert state.subagents["a-fork"].child_conversation_id == "conv_a-fork"
     assert state.subagents["a-fork"].parent_subagent_id is None
+
+
+@pytest.mark.parametrize("spawn_owner", ["root", "helper"])
+async def test_spawn_record_landing_after_idle_polls_registers_the_subagent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    spawn_owner: str,
+) -> None:
+    """Idle polls reuse unchanged transcripts; a later root or helper spawn registers."""
+    bridge_dir = tmp_path / "bridge"
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    helper_path = _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-finished",
+        agent_type="general-purpose",
+        description="finished helper",
+        tool_use_id="toolu_finished",
+    )
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    (subagents_dir / "agent-a-late.meta.json").write_text(
+        json.dumps(
+            {
+                "agentType": "general-purpose",
+                "description": "spawn record lands later",
+                "toolUseId": "toolu_late",
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def response_for(item: dict[str, Any]) -> dict[str, Any]:
+        if item.get("type") != "external_subagent_start":
+            return {"item_id": "ack"}
+        return {"queued": False, "child_session_id": f"conv_{item['data']['subagent_id']}"}
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(_batch_safe_handler(response_for)),
+        base_url="http://ap",
+    ) as client:
+        poll_kwargs: dict[str, Any] = {
+            "client": client,
+            "parent_session_id": "conv_root",
+            "bridge_dir": bridge_dir,
+            "transcript_path": transcript_path,
+            "agent_name": "claude-native-ui",
+            "start_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+            "item_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+            "status_retry_tracker": forwarder._PostRetryTracker(base_delay_s=0.0),
+        }
+        scans = _count_transcript_scans(monkeypatch)
+        state = await forwarder._forward_available_subagents(
+            state=forwarder.SubagentForwardState(subagents={}), **poll_kwargs
+        )
+        assert state.subagents["a-finished"].child_conversation_id == "conv_a-finished"
+        assert scans == [transcript_path, helper_path]
+        scans.clear()
+        for _ in range(3):
+            state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
+            assert set(state.subagents) == {"a-finished"}
+        assert scans == [], "idle polls re-scanned unchanged transcripts"
+
+        spawn_path = transcript_path if spawn_owner == "root" else helper_path
+        with spawn_path.open("a", encoding="utf-8") as handle:
+            record = _spawn_record(
+                "toolu_late", "spawn record lands later", sidechain=spawn_owner == "helper"
+            )
+            handle.write(json.dumps(record) + "\n")
+        state = await forwarder._forward_available_subagents(state=state, **poll_kwargs)
+
+    assert scans == [spawn_path], "only the changed transcript should be re-scanned"
+    late = state.subagents["a-late"]
+    assert late.child_conversation_id == "conv_a-late"
+    assert late.parent_subagent_id == (None if spawn_owner == "root" else "a-finished")
+
+
+def test_spawn_id_memo_rescans_only_changed_files_and_stays_bounded(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unchanged transcript is served from the memo; a hit refreshes its recency;
+    the least recently used entry is evicted past the cap; a vanished file is forgotten."""
+    scans = _count_transcript_scans(monkeypatch)
+    monkeypatch.setattr(forwarder, "_SPAWN_TOOL_USE_ID_CACHE_MAX_ENTRIES", 2)
+    paths = []
+    for index in range(3):
+        path = tmp_path / f"transcript-{index}.jsonl"
+        path.write_text(
+            json.dumps(_spawn_record(f"toolu_{index}", "spawn", sidechain=False)) + "\n",
+            encoding="utf-8",
+        )
+        paths.append(path)
+
+    first = forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False)
+    assert first == {"toolu_0"}
+    assert forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False) == first
+    assert scans == [paths[0]], "an unchanged transcript was rescanned"
+
+    with paths[0].open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(_spawn_record("toolu_0b", "spawn", sidechain=False)) + "\n")
+    assert forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False) == {
+        "toolu_0",
+        "toolu_0b",
+    }
+    assert scans == [paths[0], paths[0]]
+
+    # A same-size rewrite moves only the mtime, which must still invalidate the memo.
+    before = paths[0].stat()
+    paths[0].write_text(
+        paths[0].read_text(encoding="utf-8").replace("toolu_0b", "toolu_0c"), encoding="utf-8"
+    )
+    os.utime(paths[0], ns=(before.st_atime_ns, before.st_mtime_ns + 1_000_000))
+    assert paths[0].stat().st_size == before.st_size
+    assert forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False) == {
+        "toolu_0",
+        "toolu_0c",
+    }
+    assert scans == [paths[0]] * 3
+
+    forwarder._spawn_tool_use_ids_cached(paths[1], include_sidechains=False)
+    # Hitting the older entry makes it the most recently used, so the cap evicts
+    # the untouched one instead.
+    forwarder._spawn_tool_use_ids_cached(paths[0], include_sidechains=False)
+    forwarder._spawn_tool_use_ids_cached(paths[2], include_sidechains=False)
+    assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[0], paths[2]}, (
+        "the least recently used entry was not the one evicted past the cap"
+    )
+    assert scans == [paths[0]] * 3 + [paths[1], paths[2]]
+
+    paths[2].unlink()
+    assert forwarder._spawn_tool_use_ids_cached(paths[2], include_sidechains=False) == frozenset()
+    assert set(forwarder._SPAWN_TOOL_USE_ID_CACHE) == {paths[0]}
+
+
+def test_transient_read_failure_is_not_memoized_as_an_empty_scan(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A read that fails after a successful stat must not be remembered as a
+    transcript without spawns; the next poll re-reads the unchanged file and
+    finds the parent."""
+    transcript_path = tmp_path / "session.jsonl"
+    transcript_path.write_text("", encoding="utf-8")
+    _seed_subagent_on_disk(
+        transcript_path=transcript_path,
+        subagent_id="a-child",
+        agent_type="general-purpose",
+        description="child whose parent read fails once",
+        tool_use_id="toolu_child",
+    )
+    subagents_dir = transcript_path.parent / transcript_path.stem / "subagents"
+    real_read_text = Path.read_text
+    failures_left = [1]
+
+    def flaky_read_text(self: Path, *args: Any, **kwargs: Any) -> str:
+        if self == transcript_path and failures_left[0]:
+            failures_left[0] -= 1
+            raise OSError(errno.EIO, "transient read failure")
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", flaky_read_text)
+
+    assert forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir) == {}
+    assert transcript_path not in forwarder._SPAWN_TOOL_USE_ID_CACHE
+    assert forwarder._subagent_parents_by_tool_use(transcript_path, subagents_dir) == {
+        "toolu_child": None
+    }

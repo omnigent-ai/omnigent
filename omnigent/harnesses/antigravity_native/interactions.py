@@ -35,15 +35,11 @@ Seam design (so the timeout logic is unit-testable without a live agy):
 * ``deliver`` — defaults to :func:`_deliver_via_rpc`, which offloads the blocking
   :func:`omnigent.harnesses.antigravity_native.rpc.handle_user_interaction` to a worker
   thread (the function is synchronous); injectable so tests don't need a live agy.
-* ``inject_tui`` — defaults to :func:`_inject_via_tui`, which types the verdict's
-  key sequence into the agy TUI pane AFTER the RPC delivery. The attended agy TUI
-  keeps its OWN permission/question prompt open in parallel with the RPC step
-  (live-verified — ``docs/claude/antigravity-rpc-spike-notes.md`` §"attended
-  TUI"): the RPC flips the backend step to DONE, but the TUI prompt lingers, so a
-  web Approve/Reject would not advance the terminal (and the next typed turn would
-  fold into the stale prompt's buffer) without this keystroke (#1200). Injectable
-  so tests assert the key sequence without a live pane; mirrors cursor-native's
-  ``send_cursor_pane_keys`` approval drive.
+* ``inject_tui`` — defaults to :func:`_inject_via_tui`. Persistent approvals
+  use ONLY this channel: the native menu both records the rule and answers the
+  step. An RPC approval cannot save rules and can close the menu before its
+  selection arrives. Other verdicts retain the RPC delivery followed by a
+  best-effort keystroke to dismiss prompts left open by older agy versions.
 
 The deterministic elicitation id is derived from
 ``(cascade_id, trajectory_id, step_index)`` (mirrors
@@ -175,9 +171,8 @@ async def _inject_via_tui(keys: list[str]) -> None:
     worker thread — the same pattern :func:`_deliver_via_rpc` uses for the RPC —
     so the async bridge does not stall the event loop.
 
-    A missing tmux target / exited pane raises ``RuntimeError`` from the bridge
-    primitive; the caller logs it and proceeds (the RPC delivery already advanced
-    the backend step — the keystroke is the belt-and-braces TUI dismissal).
+    A missing tmux target / exited pane raises ``RuntimeError``. Persistent
+    approvals have no RPC fallback; other verdicts have already been delivered.
 
     :param keys: Ordered tmux key arguments (e.g. ``["1", "Enter"]`` to approve).
     :returns: None.
@@ -311,8 +306,7 @@ def _waiting_step_at(
     Pins verdict delivery to the step the elicitation was surfaced for rather than
     the freshest WAITING step (which could be a different gate that appeared
     meanwhile). Returns ``None`` when that step is no longer WAITING (timed out or
-    answered), letting the caller fall back to ``_freshest_waiting`` for agy's
-    same-gate timeout-retry.
+    answered), letting the caller inspect ``_freshest_waiting`` for a retry.
 
     :param steps: Trajectory steps snapshot.
     :param trajectory_id: The surfaced step's trajectory id.
@@ -350,9 +344,10 @@ async def bridge_interaction(
     2. If the verdict is ``None`` (the human timed out or cancelled), **returns
        without delivering** — agy's own WAITING timeout handles the dangling step;
        forcing a deny here is out of scope.
-    3. **Re-reads the freshest WAITING step** and delivers against THAT step's
-       ids (never the captured ones — they may be stale because agy timed out and
-       retried while the human deliberated). If no WAITING step remains, returns.
+    3. Re-reads the WAITING step, preferring the captured ids. A retry at new
+       ids may reuse the answer only when its kind and spec are unchanged;
+       a changed prompt requires a new elicitation. If no WAITING step remains,
+       returns without delivering.
     4. On the overloaded ``"input not registered"`` error (the targeted step
        timed out before delivery), re-reads for a NEW higher-index WAITING step;
        if found, re-surfaces the elicitation against it (next iteration). Any
@@ -373,13 +368,10 @@ async def bridge_interaction(
         :func:`_deliver_via_rpc`, which offloads the blocking
         :func:`omnigent.harnesses.antigravity_native.rpc.handle_user_interaction` to a
         worker thread.
-    :param inject_tui: Types the verdict's key sequence into the agy TUI pane to
-        dismiss its in-process prompt AFTER a successful RPC delivery; defaults to
-        :func:`_inject_via_tui` (offloads ``send-keys`` to a worker thread). The
-        RPC flips the backend step, but the attended TUI keeps its own prompt open
-        in parallel — so the keystroke is required to actually advance the
-        terminal (#1200). A failure here is logged, not raised: the backend step
-        is already answered, so the turn proceeds regardless.
+    :param inject_tui: Types the verdict into the native menu. This is the sole
+        delivery channel for persistent approvals; other verdicts use it after
+        RPC delivery to dismiss legacy prompts. Failures are logged without
+        retrying or falling back to RPC, since keys may have partially arrived.
     :param max_retries: Upper bound on detect→deliver iterations.
     :returns: None. Never raises on the expected timeout/cancel/RPC-error paths —
         all are logged and end the loop so the long-lived caller stays alive.
@@ -407,12 +399,8 @@ async def bridge_interaction(
             )
             return
 
-        # Re-read the steps BEFORE delivering: the captured ids may be stale if agy
-        # timed out + retried while the human deliberated. PIN to the step we
-        # surfaced if it is STILL WAITING — deliver THIS verdict to THAT gate, never
-        # to a different higher-index gate that appeared meanwhile (#1472 review).
-        # Only when our captured step is gone (timed out → ERROR) do we fall back to
-        # the freshest WAITING, which is agy's same-gate timeout-retry (§2.1).
+        # Prefer the surfaced step. A timed-out step may have a newer retry,
+        # but being the same kind alone does not make it the same prompt.
         steps = await get_steps()
         fresh = _waiting_step_at(
             steps, trajectory_id=current["trajectory_id"], step_index=current["step_index"]
@@ -428,7 +416,48 @@ async def bridge_interaction(
             )
             return
 
-        payload = to_interaction_payload(current["kind"], result, current["spec"])
+        if fresh["kind"] != current["kind"] or fresh["spec"] != current["spec"]:
+            if (fresh["trajectory_id"], fresh["step_index"]) == (
+                current["trajectory_id"],
+                current["step_index"],
+            ):
+                # Reusing this id could replay the old cached verdict.
+                _logger.warning(
+                    "agy interaction changed under elicitation %s; not delivering", eid
+                )
+                return
+            _logger.info(
+                "agy interaction changed after elicitation %s; requesting fresh consent "
+                "(cascade=%s, step=%d)",
+                eid,
+                cascade_id,
+                fresh["step_index"],
+            )
+            current = fresh
+            continue
+
+        keys = to_tui_selection_keys(fresh["kind"], result, fresh["spec"])
+        if (
+            fresh["kind"] == "permission"
+            and result.action == "accept"
+            and result.meta is not None
+            and result.meta.get("persist") in ("session", "always")
+        ):
+            # The native menu saves the rule and answers the step. RPC approval
+            # first can close that menu, turning the selection into a chat message.
+            try:
+                await inject_tui(keys)
+            except Exception as exc:
+                _logger.warning(
+                    "agy persistent approval TUI delivery failed; not falling back to RPC "
+                    "(cascade=%s, step=%d): %r",
+                    cascade_id,
+                    fresh["step_index"],
+                    exc,
+                )
+            return
+
+        payload = to_interaction_payload(fresh["kind"], result, fresh["spec"])
         try:
             await deliver(
                 port,
@@ -437,14 +466,7 @@ async def bridge_interaction(
                 step_index=fresh["step_index"],
                 payload=payload,
             )
-            # The RPC flipped the backend trajectory step, but the attended agy
-            # TUI keeps its OWN permission/question prompt open in parallel
-            # (live-verified — see the module note / spike doc). Type the verdict's
-            # selection into the pane so the terminal actually advances (#1200) and
-            # the next typed turn does not land in the stale prompt's buffer. The
-            # backend is already answered, so a TUI-typing failure is logged, not
-            # raised — never undo a delivered verdict over a flaky pane.
-            keys = to_tui_selection_keys(current["kind"], result, current["spec"])
+            # Older agy versions can leave the attended prompt open after RPC.
             if keys:
                 try:
                     await inject_tui(keys)

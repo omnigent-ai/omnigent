@@ -218,8 +218,24 @@ async def test_forwarder_uses_auth_to_refresh_token_per_request(tmp_path: Path) 
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("status_code", "response_body", "rejection_reason"),
+    [
+        (
+            422,
+            {"detail": "event batch exceeds count or size limit"},
+            "event batch exceeds count or size limit",
+        ),
+        (400, {"detail": "invalid_input"}, "invalid_input"),
+        (422, {"detail": [{"input": "private transcript content"}]}, None),
+        (422, {"detail": "private transcript content"}, None),
+    ],
+)
 async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     tmp_path: Path,
+    status_code: int,
+    response_body: dict[str, Any],
+    rejection_reason: str | None,
 ) -> None:
     """
     Permanent item rejections eventually advance the transcript cursor.
@@ -267,7 +283,7 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
         assert isinstance(payload, dict)
         requests.append(payload)
         if payload["type"] == "external_conversation_item":
-            return httpx.Response(422, json={"error": "bad item"})
+            return httpx.Response(status_code, json=response_body)
         return httpx.Response(202, json={})
 
     transport = httpx.MockTransport(_handle_request)
@@ -307,6 +323,12 @@ async def test_forwarder_drops_poison_item_after_bounded_permanent_retries(
     context = requests[-1]["data"].pop("failure_context")
     assert context["failure_source"] == "forwarder_delivery"
     assert context["detail_source"] == "forwarder_delivery_error"
+    assert context["http_status"] == status_code
+    assert context.get("forwarder_rejection_reason") == rejection_reason
+    attributes = forwarder.failure_log_attributes(context)
+    assert attributes["http_status"] == str(status_code)
+    assert attributes.get("forwarder_rejection_reason") == rejection_reason
+    assert "private transcript content" not in json.dumps(attributes)
     assert context["failure_id"]
     assert "poison-item:0:message" in context["forwarder_source_id"]
     assert requests[-1]["data"] == {

@@ -28,9 +28,11 @@ def create_session(client, *, guardrails=None):
 
 
 @pytest.fixture
-def setup_app(tmp_path, monkeypatch):
+def setup_app(tmp_path, monkeypatch, request):
     import omnigent.server.app as app_module
 
+    # Tests add API routes after create_app; the SPA catch-all would hide them.
+    monkeypatch.setattr(app_module, "_WEB_UI_DIST", tmp_path / "no-web-ui")
     captured = {}
     original = app_module.create_app
 
@@ -42,6 +44,18 @@ def setup_app(tmp_path, monkeypatch):
         kwargs["scheduled_task_store"] = SqlAlchemyScheduledTaskStore(
             str(kwargs["account_store"]._engine.url)
         )
+        if getattr(request, "param", False):
+            from unittest.mock import AsyncMock
+
+            from omnigent.server.feature_flags import resolve_feature_flags
+            from omnigent.server.scheduled.dispatch_scheduler import ScheduledTaskDispatchHooks
+
+            kwargs["feature_flags"] = resolve_feature_flags(
+                {"OMNIGENT_FEATURES": "automations_v2"}
+            )
+            kwargs["scheduled_task_dispatch"] = ScheduledTaskDispatchHooks(
+                AsyncMock(), AsyncMock(return_value=None)
+            )
         captured.update(kwargs)
         return original(**kwargs)
 
@@ -63,7 +77,8 @@ def setup_app(tmp_path, monkeypatch):
         yield_from.close()
 
 
-def test_login_cannot_issue_refresh_after_delete(setup_app, monkeypatch):
+@pytest.mark.parametrize("revocation", ["delete", "reset"])
+def test_login_cannot_issue_refresh_after_revocation(setup_app, monkeypatch, revocation):
     import omnigent.server.routes.device_auth as device_auth
 
     admin, alice, stores, _ = setup_app
@@ -84,14 +99,19 @@ def test_login_cannot_issue_refresh_after_delete(setup_app, monkeypatch):
         )
         try:
             assert reached.wait(15)
-            assert admin.delete("/auth/users/alice").status_code == 204
-            assert stores["account_store"].get_user("alice") is None
+            if revocation == "delete":
+                assert admin.delete("/auth/users/alice").status_code == 204
+                assert stores["account_store"].get_user("alice") is None
+            else:
+                assert admin.post("/auth/users/alice/reset").status_code == 200
         finally:
             resume.set()
         login = pending.result(timeout=15)
     assert login.status_code == 401, login.text
-    assert "refresh_token" not in login.json()
-    assert stores["account_store"].get_user("alice") is None
+    assert "refresh_token" not in login.json() and "token" not in login.json()
+    assert "set-cookie" not in login.headers
+    if revocation == "delete":
+        assert stores["account_store"].get_user("alice") is None
     assert create_session(alice).status_code == 401
 
 
@@ -133,7 +153,187 @@ def test_reset_provisions_shared_user_credentials(setup_app):
     generation = accounts.get_user("new-member").account_generation
     assert generation is not None
     assert admin.post("/auth/users/new-member/reset").status_code == 200
-    assert accounts.get_user("new-member").account_generation == generation
+    assert accounts.get_user("new-member").account_generation not in (None, generation)
+    assert member.get("/auth/me").status_code == 401
+
+
+def _redeem_path(redeem_url: str) -> str:
+    from urllib.parse import urlsplit
+
+    parts = urlsplit(redeem_url)
+    return f"{parts.path}?{parts.query}"
+
+
+@pytest.mark.parametrize("revocation", ["change", "reset"])
+def test_password_rotation_revokes_issued_credentials_and_keeps_work(setup_app, revocation):
+    import uuid
+
+    from omnigent.runner.identity import RUNNER_TUNNEL_TOKEN_HEADER, token_bound_runner_id
+
+    admin, alice, stores, _ = setup_app
+    accounts, tasks, hosts = (
+        stores["account_store"],
+        stores["scheduled_task_store"],
+        stores["host_store"],
+    )
+    cli = alice.post(
+        "/auth/login",
+        json={"username": "alice", "password": "alice-pw-1234", "issue_refresh": True},
+    ).json()
+    copied = TestClient(alice.app)
+    copied.headers["Authorization"] = f"Bearer {cli['token']}"
+    assert copied.get("/auth/me").status_code == 200
+    magic_path = _redeem_path(alice.post("/auth/magic").json()["redeem_url"])
+    task = tasks.create(
+        uuid.uuid4().hex, "nightly", "do it", "FREQ=DAILY", "alice", uuid.uuid4().hex, "UTC"
+    )
+    session_id = create_session(alice).json()["session_id"]
+    host_id = uuid.uuid4().hex
+    hosts.upsert_on_connect(host_id, "laptop", "alice")
+    binding = "revocation-runner-binding"
+    stores["conversation_store"].set_host_id(session_id, host_id, workspace="/tmp/workspace")
+    stores["conversation_store"].replace_runner_id(session_id, token_bound_runner_id(binding))
+    runner = TestClient(alice.app)
+
+    def mint_runner_token():
+        return runner.post(
+            f"/v1/runners/{token_bound_runner_id(binding)}/token",
+            headers={RUNNER_TUNNEL_TOKEN_HEADER: binding},
+        )
+
+    issued = mint_runner_token()
+    assert issued.status_code == 200, issued.text
+
+    if revocation == "change":
+        response = alice.post(
+            "/auth/users/me/password",
+            json={"old_password": "alice-pw-1234", "new_password": "alice-new-pw-1234"},
+        )
+    else:
+        response = admin.post("/auth/users/alice/reset")
+    assert response.status_code in (200, 204), response.text
+
+    assert copied.get("/auth/me").status_code == 401
+    refresh = copied.post(
+        "/oauth/token", data={"grant_type": "refresh_token", "refresh_token": cli["refresh_token"]}
+    )
+    assert refresh.json()["error"] == "invalid_grant"
+    stale_runner = TestClient(alice.app)
+    stale_runner.headers["Authorization"] = f"Bearer {issued.json()['token']}"
+    assert stale_runner.get("/auth/me").status_code == 401
+    browser = TestClient(alice.app)
+    redeemed = browser.get(magic_path, follow_redirects=False)
+    assert redeemed.status_code == 302
+    assert redeemed.headers["location"].endswith("/login?magic=expired")
+    assert "set-cookie" not in redeemed.headers
+    assert browser.get("/auth/me").status_code == 401
+    # Only the session that proved the old password stays signed in.
+    assert alice.get("/auth/me").status_code == (200 if revocation == "change" else 401)
+    if revocation == "reset":
+        _login(alice, "alice", response.json()["new_password"])
+
+    generation = accounts.get_user("alice").account_generation
+    assert tasks.get(task.id).account_generation == generation
+    assert hosts.get_host(host_id).account_generation == generation
+    assert alice.get(f"/v1/scheduled-tasks/{task.id}").status_code == 200
+    assert create_session(alice).status_code == 201
+    assert mint_runner_token().status_code == 200
+
+
+def test_admin_self_reset_keeps_admin_signed_in(setup_app):
+    admin, _alice, _stores, _ = setup_app
+    copied = TestClient(admin.app)
+    copied.cookies.update(admin.cookies)
+    reset = admin.post("/auth/users/admin/reset")
+    assert reset.status_code == 200, reset.text
+    assert admin.get("/auth/users").status_code == 200
+    assert copied.get("/auth/me").status_code == 401
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("credential", ["user", "launch_token"])
+async def test_connected_host_cannot_launch_after_reset_until_it_reconnects(setup_app, credential):
+    import asyncio
+    import time
+    import uuid
+
+    from asgiref.testing import ApplicationCommunicator
+
+    from omnigent.errors import OmnigentError
+    from tests.server.integration.test_host_tunnel_route import (
+        _make_hello,
+        _managed_scope,
+        _wait_registered,
+        _websocket_scope,
+    )
+
+    admin, alice, stores, _ = setup_app
+    session_id = (await asyncio.to_thread(create_session, alice)).json()["session_id"]
+    host_id = uuid.uuid4().hex
+    path = f"/v1/hosts/{host_id}/tunnel"
+    if credential == "user":
+        scope = _websocket_scope(path)
+        cookie = "; ".join(f"{key}={value}" for key, value in alice.cookies.items())
+        scope["headers"] = [(b"cookie", cookie.encode())]
+    else:
+        token = uuid.uuid4().hex
+        stores["host_store"].register_managed_host(
+            host_id=host_id,
+            name="managed",
+            user_id="alice",
+            token=token,
+            provider="modal",
+            sandbox_id="sandbox",
+            token_expires_at=int(time.time()) + 3600,
+        )
+        scope = _managed_scope(path, token)
+    registry = admin.app.state.host_registry
+
+    async def connect() -> ApplicationCommunicator:
+        connection = ApplicationCommunicator(admin.app, dict(scope))
+        await connection.send_input({"type": "websocket.connect"})
+        return connection
+
+    async def register(connection: ApplicationCommunicator) -> None:
+        response = await connection.receive_output(timeout=5)
+        assert response["type"] == "websocket.accept", response
+        await connection.send_input({"type": "websocket.receive", "text": _make_hello()})
+        await asyncio.wait_for(_wait_registered(registry, host_id), timeout=5)
+
+    async def disconnect(connection: ApplicationCommunicator) -> None:
+        await connection.send_input({"type": "websocket.disconnect", "code": 1000})
+        await connection.wait(timeout=5)
+
+    connection = await connect()
+    try:
+        await register(connection)
+        reset = await asyncio.to_thread(admin.post, "/auth/users/alice/reset")
+        assert reset.status_code == 200, reset.text
+        # Still registered, but its handshake generation no longer authorizes launches.
+        conn = registry.get(host_id)
+        assert conn is not None
+        current = stores["account_store"].get_user("alice").account_generation
+        assert conn.account_generation != current
+        with pytest.raises(OmnigentError, match="revoked"):
+            await registry.admit_launch(conn, session_id)
+    finally:
+        await disconnect(connection)
+
+    reconnected = await connect()
+    if credential == "user":
+        response = await reconnected.receive_output(timeout=5)
+        assert response["type"] == "websocket.close", response
+        await reconnected.wait(timeout=5)
+        return
+    # A launch token is not a user credential, so the host reconnects with
+    # the generation its row moved to.
+    try:
+        await register(reconnected)
+        conn = registry.get(host_id)
+        assert conn is not None and conn.account_generation == current
+        await registry.admit_launch(conn, session_id, allow_unbound=True)
+    finally:
+        await disconnect(reconnected)
 
 
 @pytest.mark.parametrize("operation", ["cost", "approval"])
@@ -463,6 +663,51 @@ async def test_late_schedule_registration_stops_after_account_deletion(setup_app
     assert tasks.list_runs(task_id)[0] == []
 
 
+@pytest.mark.parametrize("setup_app", [True], indirect=True)
+def test_account_deletion_prevents_future_persistent_dispatch(setup_app, monkeypatch):
+    from unittest.mock import Mock
+
+    from omnigent.server.scheduled.dispatch_scheduler import PersistentTaskScheduler
+    from tests.server.scheduled.test_scheduler import FakeClock
+
+    admin, alice, stores, _ = setup_app
+    scheduler = admin.app.state.scheduled_task_scheduler
+    assert isinstance(scheduler, PersistentTaskScheduler)
+    assert admin.portal is not None
+    # Control polling and time while keeping the real flag-enabled app and routes.
+    admin.portal.call(scheduler.stop)
+    agent_id = create_session(alice).json()["agent_id"]
+    created = alice.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "revoked schedule",
+            "prompt": "hello",
+            "rrule": "FREQ=DAILY;BYHOUR=9",
+            "agent_id": agent_id,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200, created.text
+    tasks = stores["scheduled_task_store"]
+    task = tasks.get(created.json()["id"])
+    assert task.next_run_at is not None
+    clock = FakeClock(task.next_run_at + 1)
+    dispatch = stores["scheduled_task_dispatch"]
+    scheduler = PersistentTaskScheduler(
+        tasks, dispatch.on_fire, dispatch.on_expired, owns_host=dispatch.owns_host, now=clock.now
+    )
+    list_tasks = Mock(wraps=tasks.list)
+    monkeypatch.setattr(tasks, "list", list_tasks)
+    deleted = admin.delete("/auth/users/alice")
+    assert deleted.status_code == 204, deleted.text
+    list_tasks.assert_not_called()
+    assert tasks.list_due_tasks(int(clock.now())) == []
+    admin.portal.call(scheduler.poll_once)
+    admin.portal.call(scheduler.stop)
+    stores["scheduled_task_dispatch"].on_fire.assert_not_awaited()
+    assert tasks.list_runs(task.id)[0] == []
+
+
 def test_replica_cache_cannot_restore_account(setup_app):
     from omnigent.server.auth import create_auth_provider
 
@@ -730,7 +975,9 @@ async def test_scheduled_dispatch_obeys_revocation_boundary(setup_app, monkeypat
         assert tasks.get(task.id).state == "deleted"
         resume.set()
         if admitted:
-            frame = json.loads(await asyncio.wait_for(conn.outbound_queue.get(), timeout=10))
+            frame = json.loads(
+                (await asyncio.wait_for(conn.outbound_queue.get(), timeout=10)).data
+            )
             assert frame["kind"] == "host.launch_runner"
             conn.pending_launches.pop(frame["request_id"]).set_result(
                 {"status": "failed", "error": "test transport: runner was not started"}
@@ -925,6 +1172,7 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
         ),
         prefix="/v1",
     )
+    tasks.configure_dispatch(True)
     task = tasks.create(
         uuid.uuid4().hex,
         "private task",
@@ -941,10 +1189,12 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
         status="succeeded",
         scheduled_at=100,
     )
+    assert task.next_run_at is not None
     path = f"/v1/scheduled-tasks/{task.id}"
     assert alice.get(path).status_code == 200
     assert alice.get(path + "/runs").status_code == 200
     assert admin.delete("/auth/users/alice").status_code == 204
+    assert tasks.get(task.id).next_run_at is None
     invite = admin.post("/auth/invite", json={}).json()["token"]
     replacement = TestClient(admin.app)
     assert (
@@ -958,6 +1208,10 @@ def test_replacement_account_cannot_read_predecessor_tasks(setup_app):
     assert listing.status_code == 200 and listing.json()["scheduled_tasks"] == []
     assert replacement.get(path).status_code == 404
     assert replacement.get(path + "/runs").status_code == 404
+    cursor = tasks.purge_deleted_tasks(limit=1)
+    while cursor is not None:
+        cursor = tasks.purge_deleted_tasks(after=cursor, limit=1)
+    assert tasks.get(task.id) is None
 
 
 @pytest.mark.parametrize("launch_kind", ["initial", "inline", "transfer", "admin_relaunch"])
@@ -1233,3 +1487,61 @@ def test_target_write_cannot_cross_registration(setup_app, monkeypatch, operatio
         == 200
     )
     assert stores["permission_store"].get("alice", session_id) is None
+
+
+@pytest.mark.parametrize("startup_phase", ["unavailable", "loading"])
+def test_account_deletion_before_legacy_startup_finishes(setup_app, monkeypatch, startup_phase):
+    from unittest.mock import Mock
+
+    admin, alice, stores, _ = setup_app
+    scheduler = admin.app.state.scheduled_task_scheduler
+    assert admin.portal is not None
+    admin.portal.call(scheduler.stop)
+    monkeypatch.setattr(admin.app.state, "scheduled_task_scheduler", None)
+    agent_id = create_session(alice).json()["agent_id"]
+    created = alice.post(
+        "/v1/scheduled-tasks",
+        json={
+            "name": "created during outage",
+            "prompt": "hello",
+            "rrule": "FREQ=DAILY",
+            "agent_id": agent_id,
+            "timezone": "UTC",
+        },
+    )
+    assert created.status_code == 200, created.text
+    tasks = stores["scheduled_task_store"]
+    list_tasks = Mock(wraps=tasks.list)
+    monkeypatch.setattr(tasks, "list", list_tasks)
+    snapshot_taken, release = Event(), Event()
+    load = tasks.list_active_all_workspaces
+
+    def blocked_load():
+        snapshot = load()
+        snapshot_taken.set()
+        assert release.wait(10), "Startup snapshot was never released"
+        return snapshot
+
+    loading = None
+    try:
+        if startup_phase == "loading":
+            monkeypatch.setattr(tasks, "list_active_all_workspaces", blocked_load)
+            monkeypatch.setattr(admin.app.state, "scheduled_task_scheduler", scheduler)
+            loading = admin.portal.start_task_soon(scheduler.start)
+            assert snapshot_taken.wait(10)
+        deleted = admin.delete("/auth/users/alice")
+        assert deleted.status_code == 204, deleted.text
+        if startup_phase == "loading":
+            list_tasks.assert_called_once_with(owner_user_id="alice")
+        else:
+            list_tasks.assert_not_called()
+        assert tasks.get(created.json()["id"]).state == "deleted"
+    finally:
+        release.set()
+        if loading is not None:
+            loading.result(timeout=10)
+    if loading is None:
+        admin.portal.call(scheduler.start)
+    assert scheduler.is_started
+    assert scheduler.job_count == 0
+    assert tasks.list_runs(created.json()["id"])[0] == []

@@ -14,9 +14,41 @@ This is opt-in per sandbox target: a nonempty
 `sandbox.host_config.inference.harnesses` mapping enables it. Ordinary hosts and
 sandbox targets without bindings retain their existing authentication, provider
 defaults, and model selection. `/v1/info` advertises `inference_models` only for
-configured targets; other targets do not request preview catalogs or wait on
-discovery. The new credential-reference restrictions apply to saved inference
-profiles and explicitly configured discovery credentials, not legacy host configs.
+configured targets; unbound targets can opt into default model options below.
+The new credential-reference restrictions apply to saved inference profiles and
+explicitly configured discovery credentials, not legacy host configs.
+
+### Default model options
+
+A target without bindings can offer a default catalog when no host-specific
+catalog is available. `/v1/info` advertises this capability as `default_models`.
+`ManagedSandboxConfig.default_model_options` supplies request-scoped choices for
+the selected harness and authenticated user. "Default" describes the source of
+these choices; it does not select a default model or bind an inference profile.
+The catalog is advisory: an empty or failed listing keeps "Default" launchable.
+A provider that is certain no model can serve the harness raises
+`NoReachableModels`; the preview then reports `unsupported` with the provider's
+reason, and the picker blocks launch for that harness and disables its harness
+row once the preview is known (the picker prefetches the harness rows it shows).
+Agent rows are never disabled; selecting one that has no models blocks launch.
+A failed or timed-out request never blocks: only a successful `unsupported`
+answer does. Picker previews stay fresh for 5 minutes and the selected agent
+polls every 15 seconds, so a harness whose access an admin removes mid-visit can
+be submitted until its next poll, and one whose access is restored can stay
+grayed out until the picker reopens with stale data.
+
+An unbound gateway configured through `sandbox.model_discovery` and
+`sandbox.host_config.providers` also enables this capability. The preview
+endpoint lists that gateway's harness-compatible models with
+`configured: false`: no snapshot or revision is saved, no row is marked default,
+"Default" stays selectable, and a discovery failure reports
+`unavailable` while leaving the default launch usable. The sandbox keeps
+resolving its own inference credential; the server uses only the discovery
+credential. Among several discoverable gateways, the provider marked `default`
+for the harness's family wins, otherwise the first configured one. Explicit
+choices travel as `model_override` and `reasoning_effort` without catalog
+validation, so the harness still validates them at launch, and efforts appear
+only when the listing itself reports reasoning metadata.
 
 ## Configuration
 

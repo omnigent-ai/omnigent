@@ -782,6 +782,65 @@ def test_old_cli_refusal_text_does_not_override_other_classifications() -> None:
     assert unrelated.code == "RuntimeError"
     assert unrelated.title is None
     assert unrelated.cause is None
+    assert unrelated.remediation is None
+
+
+# The provider's model-not-found text as it reaches the adapter from the SDK.
+_MODEL_NOT_FOUND = (
+    "There's an issue with the selected model (anthropic/claude-opus-4-8). "
+    "It may not exist or you may not have access to it."
+)
+
+
+@pytest.mark.parametrize("undelivered", [False, True])
+def test_build_error_detail_adds_model_unavailable_recovery_hint(undelivered: bool) -> None:
+    """
+    A claude-sdk turn ending on a model-not-found refusal reaches the adapter as
+    a bare ``RuntimeError``; the detail gains a recovery hint while keeping the
+    generic ``RuntimeError`` code (so the web shows the agent-turn-error
+    headline) and the original message with its model id.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    message = f"inner executor error: {_MODEL_NOT_FOUND}"
+    error = (
+        InnerExecutorError(message, code=None, undelivered=True)
+        if undelivered
+        else RuntimeError(message)
+    )
+
+    detail = adapter._build_error_detail(error)
+
+    assert detail.code == "RuntimeError"
+    assert detail.undelivered is (True if undelivered else None)
+    assert detail.message == str(error)
+    # No title/cause so the web keeps the agent-named turn-error headline and the
+    # original provider message, matching the already-covered native card.
+    assert detail.title is None
+    assert detail.cause is None
+    assert "anthropic/claude-opus-4-8" in detail.message
+    assert detail.remediation is not None
+    assert "model picker" in detail.remediation
+    assert "/model" in detail.remediation
+
+
+def test_model_unavailable_hint_does_not_override_other_classifications() -> None:
+    """The hint is a last-resort text check: a coded or SDK-typed failure keeps
+    its code and gains no spurious remediation."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter, InnerExecutorError
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+
+    named = adapter._build_error_detail(
+        InnerExecutorError(_MODEL_NOT_FOUND, code="databricks_sign_in_pending")
+    )
+    assert named.code == "databricks_sign_in_pending"
+    assert named.remediation is None
+
+    typed = adapter._build_error_detail(httpx.ConnectError(_MODEL_NOT_FOUND))
+    assert typed.code == "connection_error"
+    assert typed.remediation is None
 
 
 def test_classify_openai_exception_maps_known_types() -> None:
@@ -1274,6 +1333,71 @@ def test_translate_input_to_messages_drops_empty_message_blocks() -> None:
     assert [m["role"] for m in messages] == ["user", "user"]
 
 
+def test_translate_input_to_messages_carries_tool_history() -> None:
+    """
+    Tool items are dropped unless the executor opts in. Opted in, each call appears
+    once (live history repeats it per status), a nameless call is dropped, bad
+    arguments become ``{}``, and outputs are image-stripped and capped for replay.
+    """
+    from omnigent.runtime.harnesses._executor_adapter import (
+        _REPLAYED_TOOL_OUTPUT_MAX_BYTES,
+        _translate_input_to_messages,
+    )
+
+    greet = {
+        "type": "function_call",
+        "call_id": "call_1",
+        "name": "greet",
+        "arguments": '{"name": "Ada"}',
+    }
+    image_output = json.dumps(
+        [
+            {
+                "type": "image",
+                "source": {"type": "base64", "media_type": "image/png", "data": "QUJD" * 64},
+            }
+        ]
+    )
+    input_value = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "greet the new hire"}],
+        },
+        {"type": "function_call", "call_id": "call_0", "arguments": "{}"},
+        greet,
+        {"type": "function_call", "call_id": "call_2", "name": "read", "arguments": "not json"},
+        {"type": "function_call", "call_id": "call_3", "name": "read", "arguments": "{}"},
+        greet,
+        {"type": "function_call_output", "call_id": "call_1", "output": "Hello, Ada!"},
+        {"type": "function_call_output", "call_id": "call_2", "output": "x" * 100_000},
+        {"type": "function_call_output", "call_id": "call_3", "output": image_output},
+        {
+            "type": "message",
+            "role": "assistant",
+            "content": [{"type": "output_text", "text": "Done."}],
+        },
+    ]
+
+    assert [m["role"] for m in _translate_input_to_messages(input_value)] == ["user", "assistant"]
+    messages = _translate_input_to_messages(input_value, include_tool_history=True)
+
+    roles = [m["role"] for m in messages]
+    assert roles == ["user", *["tool_call"] * 3, *["tool_result"] * 3, "assistant"]
+    assert messages[1]["content"] == {"tool": "greet", "args": {"name": "Ada"}}
+    assert messages[1]["metadata"] == {"call_id": "call_1"}
+    assert messages[2]["content"] == {"tool": "read", "args": {}}
+    assert messages[4] == {
+        "role": "tool_result",
+        "content": "Hello, Ada!",
+        "metadata": {"call_id": "call_1"},
+    }
+    capped = messages[5]["content"]
+    assert len(capped.encode()) < _REPLAYED_TOOL_OUTPUT_MAX_BYTES + 200
+    assert "[output truncated by omnigent:" in capped
+    assert "QUJD" not in messages[6]["content"]
+
+
 # ── MCP tool-call observed/dispatch correlation ──────────
 #
 # These unit tests pin the queue mechanic that fixes the tool-call
@@ -1680,6 +1804,37 @@ def test_internally_executed_tool_bypasses_dispatch_correlation_queue() -> None:
         ("function_call", "completed"),
         ("function_call_output", None),
     ]
+
+
+def test_claude_native_tool_before_mcp_call_keeps_dispatch_ids_aligned() -> None:
+    """Keep Claude Code's own ``Skill`` call from shifting later dispatch ids.
+
+    claude-sdk's MCP callback carries no call id, so ``_stable_tool_executor``
+    pops the oldest queued id. A ``Skill`` (or ``ToolSearch``) call runs inside
+    the CLI and is never dispatched; queued, its id would be popped by the next
+    Omnigent tool's dispatch, and from then on every call in the turn would pair
+    with the previous call's id and be recorded twice.
+    """
+    from types import SimpleNamespace
+
+    from omnigent.inner.claude_sdk_executor import _tool_call_metadata
+    from omnigent.inner.executor import ToolCallRequest
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _RecordingTurnContext()
+    for name, call_id, args in (
+        ("Skill", "toolu_skill", {"skill": "agent:scout"}),
+        ("mcp__omnigent__sys_os_shell", "toolu_shell", {"command": "pwd"}),
+    ):
+        block = SimpleNamespace(id=call_id, name=name, input=args)
+        adapter._translate_event(
+            ToolCallRequest(name=name, args=args, metadata=_tool_call_metadata(block)),  # type: ignore[arg-type]
+            ctx,  # type: ignore[arg-type]
+        )
+
+    # The shell dispatch pops its own id, not the Skill's.
+    assert list(adapter._pending_mcp_call_ids) == ["toolu_shell"]
 
 
 def test_translate_event_request_without_tool_use_id_does_not_queue() -> None:
@@ -2167,6 +2322,90 @@ async def test_watch_injections_emits_consumed_marker_on_accept() -> None:
     assert marker.injection_id == "inj_x"
 
 
+class _ScriptedInjectionExecutor:
+    """Inner executor stub whose enqueue_session_message returns or raises a scripted outcome."""
+
+    def __init__(self, outcome: bool | BaseException) -> None:
+        """Hold the outcome to return or raise.
+
+        :param outcome: ``True``/``False`` to return, or an exception to raise.
+        """
+        self.outcome = outcome
+
+    async def enqueue_session_message(self, session_key: str, content: Any) -> bool:
+        """Return or raise the scripted outcome.
+
+        :param session_key: Adapter session key.
+        :param content: The injected user text.
+        :returns: The scripted boolean.
+        """
+        del session_key, content
+        if isinstance(self.outcome, BaseException):
+            raise self.outcome
+        return self.outcome
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "consumed", "logged"),
+    [
+        (True, True, "executor_accepted"),
+        (False, False, "executor_refused"),
+        (None, True, "executor_ambiguous"),
+        (RuntimeError("socket closed before sending"), False, "error"),
+    ],
+    ids=["accepted", "refused", "ambiguous", "error"],
+)
+async def test_watch_injections_marks_ambiguous_delivery_consumed(
+    outcome: bool | BaseException | None,
+    consumed: bool,
+    logged: str,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An injection the harness may already hold is marked consumed, so it is never resent."""
+    import asyncio as _aio
+    import logging
+
+    from omnigent.inner.executor import InjectionDeliveryAmbiguous
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+
+    executor = _ScriptedInjectionExecutor(
+        InjectionDeliveryAmbiguous("reply lost") if outcome is None else outcome
+    )
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="sk")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(
+            model="m", input="steer me", injection_id="inj_x", input_stable_id="a" * 32
+        )
+    )
+
+    caplog.set_level(logging.INFO)
+    task = _aio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        for _ in range(200):
+            if any(
+                getattr(record, "event_name", None) == "native_input_steering_finished"
+                for record in caplog.records
+            ):
+                break
+            await _aio.sleep(0.01)
+        await _aio.sleep(0.01)
+    finally:
+        task.cancel()
+        with contextlib.suppress(_aio.CancelledError):
+            await task
+
+    finished = [
+        record.attributes["outcome"]
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "native_input_steering_finished"
+    ]
+    assert finished == [logged]
+    markers = [event for event in ctx.emitted if isinstance(event, InjectionConsumedEvent)]
+    assert [marker.injection_id for marker in markers] == (["inj_x"] if consumed else [])
+
+
 @pytest.mark.asyncio
 async def test_watch_injections_drops_injection_when_turn_cancelled() -> None:
     """A queued injection is dropped if the turn was interrupted.
@@ -2638,26 +2877,20 @@ async def test_elicitation_choice_handler_declines_without_a_turn() -> None:
 
 
 @pytest.mark.asyncio
-async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> None:
-    """The choice bridge reaches executors that accept it, and only those.
-
-    Bridges are installed by attribute, so a rename on either side would leave the
-    feature silently inert — the card would quietly stay Approve/Reject. Executors
-    that don't offer the agent's own options must not grow the attribute.
-    """
+@pytest.mark.parametrize("bridge", ["_elicitation_choice_handler", "_form_elicitation_handler"])
+@pytest.mark.parametrize("supported", [False, True])
+async def test_run_turn_installs_optional_bridges_only_where_supported(
+    bridge: str,
+    supported: bool,
+) -> None:
     import asyncio
 
-    from omnigent.inner.executor import Executor, ExecutorConfig, Message, ToolSpec, TurnComplete
+    from omnigent.inner.executor import ExecutorConfig, Message, ToolSpec, TurnComplete
     from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
     from omnigent.runtime.harnesses._scaffold import TurnContext
     from omnigent.server.schemas import CreateResponseRequest
 
-    class _ChoiceCapableExecutor(Executor):
-        """Declares the attribute, as :class:`AcpExecutor` does."""
-
-        def __init__(self) -> None:
-            self._elicitation_choice_handler = None
-
+    class TurnExecutor(Executor):
         async def run_turn(
             self,
             messages: list[Message],
@@ -2667,29 +2900,30 @@ async def test_run_turn_installs_the_choice_bridge_only_where_supported() -> Non
         ):
             yield TurnComplete(response="ok")
 
-    class _BinaryOnlyExecutor(Executor):
-        """Declares no choice attribute — e.g. the SDK harnesses."""
+    executor = TurnExecutor()
+    if supported:
+        setattr(executor, bridge, None)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+    ctx = TurnContext("resp_bridge", asyncio.Queue(), asyncio.Event())
+    await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+    assert (getattr(executor, bridge, None) is not None) is supported
+    assert getattr(executor, "_elicitation_handler", None) is not None
 
-        async def run_turn(
-            self,
-            messages: list[Message],
-            tools: list[ToolSpec],
-            system_prompt: str,
-            config: ExecutorConfig | None = None,
-        ):
-            yield TurnComplete(response="ok")
 
-    for executor, expected in ((_ChoiceCapableExecutor(), True), (_BinaryOnlyExecutor(), False)):
-        adapter = ExecutorAdapter(executor_factory=lambda e=executor: e)  # type: ignore[misc]
-        ctx = TurnContext(
-            response_id="resp_bridge", event_queue=asyncio.Queue(), cancelled=asyncio.Event()
-        )
-        await adapter.run_turn(CreateResponseRequest(model="agent", input="hi"), ctx)
+@pytest.mark.asyncio
+async def test_form_elicitation_handler_decline_does_not_cancel_the_turn() -> None:
+    """Form dialogs return the declined verdict without killing the session."""
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
-        installed = getattr(executor, "_elicitation_choice_handler", None) is not None
-        assert installed is expected, type(executor).__name__
-        # The yes/no bridge is installed on both — the choice bridge is additive.
-        assert getattr(executor, "_elicitation_handler", None) is not None
+    adapter = ExecutorAdapter(executor_factory=lambda: _StubExecutor())
+    ctx = _ElicitingTurnContext(ElicitationResult(action="decline"))
+    adapter._current_ctx = ctx  # type: ignore[assignment]
+    params = ElicitationRequestParams(mode="form", message="Continue?")
+    result = await adapter._stable_form_elicitation_handler("form-id", params)
+    assert result.action == "decline"
+    assert not ctx.cancelled.was_set
+    assert ctx.seen[0][0] == "form-id"
 
 
 def test_translate_event_emits_subagent_started() -> None:

@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import contextlib
 import json
+import subprocess
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -22,7 +24,7 @@ from omnigent.native.input_diagnostics import input_delivery_scope
         ("blank_line", "unverified", "returned"),
         ("retry", "draft_absent", "returned"),
         ("timeout", "draft_still_present", "error"),
-        ("empty_capture", "inconclusive_capture", "returned"),
+        ("empty_capture", "inconclusive_capture", "error"),
         ("missing_glyph", "inconclusive_capture", "returned"),
         ("transport_error", "not_started", "error"),
         ("observation_error", "not_started", "returned"),
@@ -74,6 +76,10 @@ def test_delivery_diagnostics(
             getattr(record, "event_name", "").startswith("claude_native_")
             for record in caplog.records
         )
+        if args[-1] == "Space":
+            pane = "──────\n❯ \n──────\n"
+        elif args[0] == "send-keys" and "-l" in args:
+            pane = "❯ "
         if args[0] == "paste-buffer":
             if scenario == "transport_error":
                 raise RuntimeError(secret)
@@ -135,7 +141,8 @@ def test_delivery_diagnostics(
             expected = bridge.ClaudeInjectionCancelled if scenario == "cancelled" else RuntimeError
             if scenario.startswith("pending_"):
                 expected = bridge.ClaudeUserPromptPending
-            with pytest.raises(expected):
+            match = "capture is unavailable" if scenario == "empty_capture" else None
+            with pytest.raises(expected, match=match):
                 bridge.inject_user_message(tmp_path, content=content)
 
     records = [
@@ -179,19 +186,32 @@ def test_delivery_diagnostics(
         assert all(attempt["submit_sent"] for attempt in attempts)
         assert all(attempt["verification"] == "draft_absent" for attempt in attempts)
 
+    assert attrs["content_leading_char"] == (
+        "slash" if scenario == "unknown_command" else "letter"
+    )
+    assert attrs["content_word_count"] == len(secret.split())
+    assert attrs["content_non_ascii"] is False
+    assert "claude_code_version" not in attrs
+
     if scenario in {"normal", "empty_capture"}:
+        assert attrs["draft_queued_placeholder_visible"] is False
+        assert attrs["draft_prompt_row_framed"] is False
         assert attrs["draft_polls"] == 1
         assert attrs["draft_empty_captures"] == 0
         assert attrs["draft_wait_ms"] == 0
         assert attrs["draft_pane_rows"] == 1
         assert attrs["draft_pane_max_columns"] == len("❯ " + secret)
-        assert attrs["submit_polls"] == 1
-        assert attrs["submit_wait_ms"] == 10
+        assert attrs["submit_polls"] == (6 if scenario == "empty_capture" else 1)
+        assert attrs["submit_wait_ms"] == (60 if scenario == "empty_capture" else 10)
         assert attrs["submit_pane_rows"] == (0 if scenario == "empty_capture" else 1)
         assert attrs["submit_pane_max_columns"] == (0 if scenario == "empty_capture" else 2)
         assert attrs["submit_capture_empty"] == (scenario == "empty_capture")
-        assert attrs["stage_verifying_submit_ms"] == 10
-        assert attrs["elapsed_ms"] == 30
+        assert attrs["stage_verifying_submit_ms"] == (60 if scenario == "empty_capture" else 10)
+        assert attrs["elapsed_ms"] == (80 if scenario == "empty_capture" else 30)
+        if scenario == "empty_capture":
+            assert attrs["submit_sent"] is True
+            assert attrs["error_type"] == "RuntimeError"
+            assert enters == 1
 
     if scenario == "blank_line":
         assert attrs["draft_seen"] is False
@@ -276,3 +296,231 @@ def test_trace_setup_failure_preserves_delivery_outcome(
             assert deliver(tmp_path, content="test prompt") == "delivered"
     assert delivered
     assert delivery_diagnostics._prompt_delivery_trace.get() is None
+
+
+@pytest.mark.parametrize("failure", ["exit", "timeout", "os_error"])
+@pytest.mark.parametrize("operation", ["send-keys", "private-operation"])
+def test_tmux_failure_diagnostics_are_content_free(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure: str,
+    operation: str,
+) -> None:
+    private = "private argument and stderr sentinel"
+
+    def run(*_args: object, **_kwargs: object) -> SimpleNamespace:
+        if failure == "timeout":
+            raise subprocess.TimeoutExpired(private, 10)
+        if failure == "os_error":
+            raise FileNotFoundError(2, private, private)
+        return SimpleNamespace(returncode=1, stderr=private, stdout="")
+
+    monkeypatch.setattr("subprocess.run", run)
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: "owned-session",
+        cancelled_error=bridge.ClaudeInjectionCancelled,
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> None:
+        bridge._run_tmux(private, operation, private)
+
+    with caplog.at_level("WARNING", logger=delivery_diagnostics.__name__):
+        with pytest.raises((RuntimeError, FileNotFoundError)):
+            deliver(tmp_path, content=private)
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+    ]
+    row = record_to_row(record, source="runner")
+    attrs = row["attributes"]
+    assert attrs["tmux_operation"] == ("send-keys" if operation == "send-keys" else "other")
+    assert attrs["outcome"] == "error"
+    assert private not in json.dumps(row)
+    key, value = {
+        "exit": ("tmux_returncode", "1"),
+        "timeout": ("tmux_timeout_s", "10.0"),
+        "os_error": ("tmux_os_errno", "2"),
+    }[failure]
+    assert attrs[key] == value
+
+
+def test_tmux_cleanup_failure_preserves_first_operation(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    failures = iter(
+        [
+            SimpleNamespace(returncode=1, stderr="delivery failed", stdout=""),
+            SimpleNamespace(returncode=2, stderr="cleanup failed", stdout=""),
+        ]
+    )
+    monkeypatch.setattr("subprocess.run", lambda *args, **kwargs: next(failures))
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: None, cancelled_error=bridge.ClaudeInjectionCancelled
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> None:
+        try:
+            bridge._run_tmux("owned-socket", "paste-buffer")
+        finally:
+            with contextlib.suppress(RuntimeError):
+                bridge._run_tmux("owned-socket", "kill-session")
+
+    with caplog.at_level("WARNING", logger=delivery_diagnostics.__name__):
+        with pytest.raises(RuntimeError, match="delivery failed"):
+            deliver(tmp_path, content="prompt")
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+    ]
+    attrs = record_to_row(record, source="runner")["attributes"]
+    assert attrs["tmux_operation"] == "paste-buffer"
+    assert attrs["tmux_returncode"] == "1"
+
+
+_RULE = "─" * 40
+
+
+@pytest.mark.parametrize(
+    ("content", "leading"),
+    [
+        ("fix the bug", "letter"),
+        ("42 more", "digit"),
+        ("/review now", "slash"),
+        ("!git status", "bang"),
+        ("@notes.md", "at"),
+        ("# remember", "hash"),
+        ("? keys", "question"),
+        ("\u00e9t\u00e9", "non_ascii"),
+        ("- item", "other"),
+        ("  \n ", "none"),
+    ],
+)
+def test_content_shape_names_only_the_leading_character_class(content: str, leading: str) -> None:
+    shape = delivery_diagnostics._content_shape(content)
+    assert shape["content_leading_char"] == leading
+    assert shape["content_word_count"] == len(content.split())
+    assert shape["content_non_ascii"] is (not content.isascii())
+
+
+def test_delivery_summary_reports_a_queued_submit_and_the_claude_version(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A message Claude queued behind a busy turn, and the build that queued it, are visible."""
+    (tmp_path / "context.json").write_text(
+        json.dumps({"context_window_size": 200000, "claude_code_version": "2.1.299"})
+    )
+    private = "!d\u00e9j\u00e0 vu again"
+    queued_pane = (
+        f"{_RULE}\n\u276f\u00a0Press up to edit queued messages\n{_RULE}\n  esc to interrupt\n"
+    )
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: "owned-session",
+        cancelled_error=bridge.ClaudeInjectionCancelled,
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> None:
+        delivery_diagnostics.start_attempt()
+        delivery_diagnostics.record_verification(
+            draft_still_present=False,
+            pane=queued_pane,
+            needle=content,
+            prompt_glyph="\u276f",
+            start=0.0,
+            retries=0,
+            polls=1,
+        )
+
+    with caplog.at_level("INFO", logger=delivery_diagnostics.__name__):
+        deliver(tmp_path, content=private)
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+    ]
+    attrs = record.attributes
+    assert attrs["submit_queued_placeholder_visible"] is True
+    assert attrs["submit_prompt_row_framed"] is True
+    assert attrs["claude_code_version"] == "2.1.299"
+    assert attrs["content_leading_char"] == "bang"
+    assert attrs["content_word_count"] == 3
+    assert attrs["content_non_ascii"] is True
+    assert "vu again" not in json.dumps(record_to_row(record, "harness"))
+
+
+@pytest.mark.parametrize("context", [None, "not json", '["a list"]', '{"claude_code_version": 7}'])
+def test_unreadable_status_snapshot_omits_the_claude_version(
+    context: str | None, tmp_path: Path
+) -> None:
+    if context is not None:
+        (tmp_path / "context.json").write_text(context)
+    assert delivery_diagnostics._claude_code_version(tmp_path) == {}
+
+
+@pytest.mark.parametrize(
+    ("pane", "expected"),
+    [
+        (
+            "scrollback\n──────\n❯ private draft\n  private second row\n──────\n  footer\n",
+            {
+                "composer_box_rows": "2",
+                "composer_box_framed": "True",
+                "composer_box_blank_rows": "0",
+                "composer_first_row_glyph_only": "False",
+                "composer_pane_rows": "6",
+                "composer_pane_max_columns": "20",
+                "composer_rule_rows": "2",
+            },
+        ),
+        (
+            "scrollback\n──────\n❯\n",
+            {
+                "composer_box_rows": "1",
+                "composer_box_framed": "False",
+                "composer_box_blank_rows": "0",
+                "composer_first_row_glyph_only": "True",
+                "composer_pane_rows": "3",
+                "composer_pane_max_columns": "10",
+                "composer_rule_rows": "1",
+            },
+        ),
+    ],
+    ids=["two-row-draft", "clipped-glyph-row"],
+)
+def test_an_uncleared_composer_logs_its_shape_without_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    pane: str,
+    expected: dict[str, str],
+) -> None:
+    """A refused clear records the box's shape, so the failing layout can be named later."""
+    monkeypatch.setattr(bridge, "_capture_pane", lambda *_args, **_kwargs: pane)
+    monkeypatch.setattr(bridge, "_run_tmux", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(bridge.time, "sleep", lambda _s: None)
+
+    @delivery_diagnostics.trace_delivery(
+        session_id_reader=lambda _: "owned-session",
+        cancelled_error=bridge.ClaudeInjectionCancelled,
+    )
+    def deliver(bridge_dir: Path, *, content: str) -> None:
+        delivery_diagnostics.start_attempt()
+        bridge._clear_composer("/tmp/sock", "main")
+
+    with caplog.at_level("INFO", logger=delivery_diagnostics.__name__):
+        with pytest.raises(bridge.ClaudeComposerNotCleared):
+            deliver(tmp_path, content="hello")
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "claude_native_delivery_finished"
+    ]
+    row = record_to_row(record, source="runner")
+    attrs = row["attributes"]
+    assert {key: attrs[key] for key in expected} == expected
+    assert attrs["composer_box_found"] == "True"
+    assert attrs["composer_capture_empty"] == "False"
+    assert attrs["error_type"] == "ClaudeComposerNotCleared"
+    assert "private" not in json.dumps(row)

@@ -75,6 +75,10 @@ _MCP_ELICITATION_TYPE: str = "mcp_elicitation"
 _COMPACT_TYPE: str = "compact"
 
 
+# Starts a fresh context in a native session's own terminal (the vendor /clear).
+_CLEAR_TYPE: str = "clear"
+
+
 _SLASH_COMMAND_TYPE: str = "slash_command"
 
 
@@ -250,10 +254,11 @@ _CLAUDE_NATIVE_PERMISSION_MODES: frozenset[str] = frozenset(
     {"default", "acceptEdits", "plan", "auto"}
 )
 # Modes the forwarder can read off the pane footer. A session launched into
-# ``bypassPermissions`` reports it so the label and picker show the real mode;
-# it is still not a PATCH target.
+# ``bypassPermissions`` or ``dontAsk`` reports it so the label and picker show
+# the real mode; neither is a PATCH target.
 _CLAUDE_NATIVE_READABLE_PERMISSION_MODES: frozenset[str] = _CLAUDE_NATIVE_PERMISSION_MODES | {
-    "bypassPermissions"
+    "bypassPermissions",
+    "dontAsk",
 }
 
 
@@ -317,6 +322,12 @@ _LAST_TASK_ERROR_REMEDIATION_LABEL_KEY: str = "omnigent.last_task_error_remediat
 # whose POST answer was lost can tell its own refused send from another message's
 # rejection when the snapshot comes back. Empty for failures without an item.
 _LAST_TASK_ERROR_ITEM_ID_LABEL_KEY: str = "omnigent.last_task_error_item_id"
+
+
+# The runner bound when this failure was recorded, so a later exit from a
+# different runner attempt surfaces its own startup failure instead of hiding
+# behind this stale cause. Empty when unknown (treated as the current runner's).
+_LAST_TASK_ERROR_RUNNER_ID_LABEL_KEY: str = "omnigent.last_task_error_runner_id"
 
 
 _LABEL_VALUE_MAX_LEN: int = LABEL_VALUE_MAX_LEN
@@ -496,6 +507,9 @@ _CURSOR_NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 _NATIVE_PERMISSION_HOOK_TIMEOUT_S = 86400.0
 
 
+_PI_EXTENSION_UI_HOOK_TIMEOUT_S = 86400.0
+
+
 _HARNESS_PRE_RESOLVED_ELICITATION_TTL_S = 300.0
 
 
@@ -550,6 +564,7 @@ _ALLOWED_EVENT_TYPES: frozenset[str] = frozenset(ITEM_TYPE_TO_DATA_CLS.keys()) |
     _APPROVAL_TYPE,
     _MCP_ELICITATION_TYPE,
     _COMPACT_TYPE,
+    _CLEAR_TYPE,
     _STOP_SESSION_TYPE,
     _RETRY_SESSION_TYPE,
     _EXTERNAL_ASSISTANT_MESSAGE_TYPE,
@@ -777,6 +792,7 @@ class _PendingPolicyAskWrites:
         (e.g. ``INCREMENT`` state updates for cost-budget counters).
     :param reviewed_arguments: Original MCP arguments shown for approval.
     :param transformed_arguments: Policy transform stored with that approval.
+    :param mcp_call_identity: Session, tool, policy actor and credential user.
     """
 
     state_updates: list[StateUpdate] | None
@@ -784,6 +800,7 @@ class _PendingPolicyAskWrites:
     from_mcp: bool = False
     reviewed_arguments: dict[str, Any] | None = None
     transformed_arguments: dict[str, Any] | None = None
+    mcp_call_identity: tuple[str, str, str | None, str | None] | None = None
 
 
 # Workspace-scoped: keyed by a harness elicitation id, which can be
@@ -897,6 +914,11 @@ _SUBAGENT_FORWARD_RECONNECT_WAIT_S = 5.0
 
 # custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
 _managed_launch_tasks: set[asyncio.Task[None]] = set()
+# The subset not yet bound to their host. Shutdown waits for these: once a
+# session is bound, whichever replica its host tunnels to finishes the launch.
+# custom-lint: disable-next=workspace-scoped-cache -- set of Task objects
+_unbound_managed_launch_tasks: set[asyncio.Task[Any]] = set()
+_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S = 5.0
 
 
 _RUNNER_SESSION_INIT_TIMEOUT_S = 10.0
@@ -1087,6 +1109,7 @@ __all__ = [
     "_CLAUDE_NATIVE_UI_LABEL_VALUE",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_KEY",
     "_CLAUDE_NATIVE_WRAPPER_LABEL_VALUE",
+    "_CLEAR_TYPE",
     "_CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY",
     "_CODEX_NATIVE_COLLABORATION_MODES",
     "_CODEX_NATIVE_COLLABORATION_MODE_LABEL_KEY",
@@ -1167,6 +1190,7 @@ __all__ = [
     "_LAST_TASK_ERROR_MESSAGE_LABEL_KEY",
     "_LAST_TASK_ERROR_REMEDIATION_LABEL_KEY",
     "_LAST_TASK_ERROR_TITLE_LABEL_KEY",
+    "_MANAGED_LAUNCH_FAILURE_RECORD_TIMEOUT_S",
     "_MANAGED_RESUMABLE_TUNNEL_STALE_S",
     "_MAX_TERMINAL_LAUNCH_ARGS",
     "_MAX_TERMINAL_LAUNCH_ARG_LEN",
@@ -1179,6 +1203,7 @@ __all__ = [
     "_NATIVE_TERMINAL_ENSURE_FAILED_CODE",
     "_NATIVE_TERMINAL_START_FAILED_CODE",
     "_OPENCODE_NATIVE_WRAPPER_LABEL_VALUE",
+    "_PI_EXTENSION_UI_HOOK_TIMEOUT_S",
     "_PI_NATIVE_WRAPPER_LABEL_VALUE",
     "_RACE_TASK_REAP_TIMEOUT_S",
     "_RETRY_SESSION_TYPE",
@@ -1244,6 +1269,7 @@ __all__ = [
     "_session_sandbox_status_cache",
     "_session_status_cache",
     "_session_terminal_pending_cache",
+    "_unbound_managed_launch_tasks",
     "get_server_host_registry",
     "get_server_runner_router",
     "host_interactive_shells_for_request",

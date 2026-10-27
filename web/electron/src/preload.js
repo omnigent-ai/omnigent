@@ -14,7 +14,19 @@
 
 "use strict";
 
-const { contextBridge, ipcRenderer } = require("electron");
+const { contextBridge, ipcRenderer, webFrame } = require("electron");
+
+// Native window controls stay in window pixels while the page zooms.
+if (process.platform === "darwin") {
+  const syncTitlebarZoom = () => {
+    document.documentElement.style.setProperty(
+      "--omnigent-electron-zoom",
+      String(webFrame.getZoomFactor()),
+    );
+  };
+  window.addEventListener("DOMContentLoaded", syncTitlebarZoom, { once: true });
+  window.addEventListener("resize", syncTitlebarZoom);
+}
 
 // Collapse the update states the in-page UpdateBanner renders on
 // (available / downloading / downloaded / error-security) to `idle` so the server page can
@@ -133,6 +145,15 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * process. Resolves a `{ ok, error?, authError? }` result.
    */
   connectArcaHost: () => ipcRenderer.invoke("omnigent:arca-connect"),
+  /** Extend the local Arca instance with one of the main process's approved modes. */
+  extendArca: (mode) => ipcRenderer.invoke("omnigent:arca-extend", mode),
+  /**
+   * Renew this machine's dbcert (Databricks-internal); Arca Companion copies
+   * it to the user's Arcas and Arclets. Resolves a `{ ok, error? }` result.
+   */
+  refreshDbcert: (options) => ipcRenderer.invoke("omnigent:dbcert-refresh", options),
+  /** Check the laptop's dbcert without starting sign-in. */
+  checkDbcert: () => ipcRenderer.invoke("omnigent:dbcert-check"),
 
   /**
    * Subscribe to host status-change pings. Fired only on real events (a host
@@ -206,7 +227,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
   // The relay hook (web/src/hooks/useBrowserAgentRelay.ts) drives a native
   // WebContentsView per conversation through these; all args/results are
   // structured-clone-safe. SECURITY: no generic agent `evaluate` is exposed —
-  // `browserExecute` runs relay templates only (see README).
+  // `browserPerformAction` accepts fixed actions only (see README).
 
   /**
    * Open (create-if-absent) or navigate a conversation's view. `opts.force`
@@ -215,7 +236,7 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    * @param {string} conversationId
    * @param {string} url
    * @param {{x:number,y:number,width:number,height:number,devicePixelRatio?:number}} [bounds]
-   * @param {{force?: boolean, agent?: boolean}} [opts]
+   * @param {{force?: boolean, agent?: boolean, sourceHostId?: string, rememberedArcaHostId?: string}} [opts]
    */
   browserOpenOrNavigate: (conversationId, url, bounds, opts) =>
     ipcRenderer.invoke("omnigent:browser-open-or-navigate", { conversationId, url, bounds, opts }),
@@ -247,14 +268,10 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   browserScreenshot: (conversationId) =>
     ipcRenderer.invoke("omnigent:browser-screenshot", { conversationId }),
-  /**
-   * Run a relay-template JS string in the conversation's view. PRIVATE to the
-   * relay's fixed templates (snapshot / click / type) — never an agent-facing
-   * generic evaluate.
-   * @param {string} conversationId
-   * @param {string} js
-   * @returns {Promise<{ ok: boolean, result?: string, error?: string }>}
-   */
+  /** Perform a fixed snapshot, click or type action in the conversation's view. */
+  browserPerformAction: (conversationId, action, params) =>
+    ipcRenderer.invoke("omnigent:browser-perform-action", { conversationId, action, params }),
+  /** @deprecated Until v0.21: main translates only recognized v0.18 action templates. */
   browserExecute: (conversationId, js) =>
     ipcRenderer.invoke("omnigent:browser-execute", { conversationId, js }),
   /**
@@ -358,6 +375,33 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   openBrowserDevTools: (conversationId) =>
     ipcRenderer.invoke("omnigent:open-browser-devtools", { conversationId }),
+  /**
+   * Inspect the user's local Google Chrome profiles for cookies in the site
+   * tree the conversation's view is currently on. Metadata only (profile name +
+   * per-scope counts): no Keychain access and no cookie values. macOS only.
+   * @param {string} conversationId
+   * @returns {Promise<{ ok: boolean, host?: string, scopes?: string[], profiles?: Array<{ id: string, name: string, cookieCount: number, scopes?: Array<{ host: string, cookieCount: number }> }>, error?: string }>}
+   */
+  browserChromeCookiePreview: (conversationId) =>
+    ipcRenderer.invoke("omnigent:browser-chrome-cookie-preview", { conversationId }),
+  /**
+   * Copy ONLY that site's cookies out of one Chrome profile into the
+   * conversation's own (in-memory) session. Decrypts via the Keychain, so the
+   * first import shows a system approval prompt. `expectedHost` must still match
+   * the view's site.
+   * @param {string} conversationId
+   * `scope` is the site tree to copy (the page's host or a parent domain); main
+   * rejects anything that isn't an ancestor of the page.
+   * @param {{ profileId: string, expectedHost: string, scope?: string }} args
+   * @returns {Promise<{ ok: boolean, imported?: number, skipped?: number, failed?: number, error?: string }>}
+   */
+  browserChromeCookieImport: (conversationId, args) =>
+    ipcRenderer.invoke("omnigent:browser-chrome-cookie-import", {
+      conversationId,
+      profileId: args?.profileId,
+      expectedHost: args?.expectedHost,
+      scope: args?.scope,
+    }),
   /**
    * Subscribe to the real url of a view as it navigates (redirects, links,
    * back/forward) so the URL bar stays honest. Returns an unsubscribe.

@@ -60,6 +60,7 @@ import {
   MoonIcon,
   PanelRightCloseIcon,
   PanelRightIcon,
+  PinIcon,
   PlusIcon,
   SunIcon,
   SquareCheckIcon,
@@ -75,6 +76,7 @@ import { useTheme } from "next-themes";
 import { PageScroll } from "@/components/PageScroll";
 import { SettingsGroup } from "@/components/SettingsGroup";
 import { SettingsLabel } from "@/components/SettingsLabel";
+import { McpRegistryConnections } from "@/components/McpRegistry";
 import { ThemeColorPicker } from "@/components/theme/ThemeColorPicker";
 import { CardRadioGroup } from "@/components/theme/CardRadioGroup";
 import { IconSegmentedControl } from "@/components/theme/IconSegmentedControl";
@@ -192,9 +194,19 @@ import {
   type TranscriptViewDefault,
 } from "@/lib/transcriptViewPreferences";
 import {
+  DEFAULT_FOLD_ASSISTANT_NARRATION,
+  FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
+  useFoldAssistantNarration,
+  writeFoldAssistantNarration,
+} from "@/lib/foldNarrationPreferences";
+import {
   DEFAULT_WORKSPACE_TAB,
+  defaultWorkspaceTabs,
+  PINNED_WORKSPACE_TABS_STORAGE_KEY,
   readDefaultWorkspaceTab,
+  readPinnedWorkspaceTabs,
   writeDefaultWorkspaceTab,
+  writePinnedWorkspaceTabs,
   type DefaultWorkspaceTab,
 } from "@/lib/workspaceTabPreferences";
 import { readDefaultBaseBranch, writeDefaultBaseBranch } from "@/lib/baseBranchPreferences";
@@ -340,6 +352,19 @@ export function SettingsPage() {
       {section === "custom-agents" && <SettingsCustomAgentsSection />}
       {section === "git" && <GitSection />}
       {section === "integrations" && <IntegrationsSection />}
+      {section === "mcp" && (
+        <Section title="MCP">
+          {info !== "loading" && info.enabled_connections?.includes("mcp") ? (
+            <McpRegistryConnections />
+          ) : (
+            <p className="text-sm text-muted-foreground">
+              {info === "loading"
+                ? "Loading MCP services…"
+                : "MCP services are not configured on this server."}
+            </p>
+          )}
+        </Section>
+      )}
       {section === "shortcuts" && <ShortcutsSection />}
       {section === "import" && <ImportSection />}
       {section === "account" && hasAuthSession && <AccountSection />}
@@ -578,33 +603,121 @@ function WorkspacePanelDefaultControl() {
   );
 }
 
-/** Fallback tab for sessions without a remembered Workspace tab. */
-function WorkspaceTabDefaultControl() {
+/** Pinned pages and the first tab for sessions without a remembered selection. */
+function WorkspaceTabsControl() {
   const [value, setValue] = useState(() => readDefaultWorkspaceTab());
+  const [pinned, setPinned] = useState(() => readPinnedWorkspaceTabs());
   const labelId = useId();
+  const pinnedLabelId = useId();
+  const pinnedCards = workspaceTabCards.filter((card) => pinned.includes(card.value));
+  const firstTab = pinnedCards.find((card) => card.value === value) ?? pinnedCards[0];
+  const previewTabs = firstTab
+    ? [firstTab, ...pinnedCards.filter((card) => card !== firstTab)]
+    : [];
   const choose = useCallback((next: DefaultWorkspaceTab) => {
     setValue(next);
     writeDefaultWorkspaceTab(next);
   }, []);
+  const togglePin = (tab: DefaultWorkspaceTab, checked: boolean) => {
+    const next = defaultWorkspaceTabs.filter((item) =>
+      item === tab ? checked : pinned.includes(item),
+    );
+    setPinned(next);
+    writePinnedWorkspaceTabs(next);
+  };
   return (
-    <ThemeSubsection
-      labelId={labelId}
-      title="Default Workspace tab"
-      helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
-    >
-      <CardRadioGroup<DefaultWorkspaceTab>
-        labelledBy={labelId}
-        value={value}
-        onSelect={choose}
-        className="grid grid-cols-2 gap-3 sm:grid-cols-4"
-        cardClassName="items-center gap-2 p-4"
-        items={workspaceTabCards.map((card) => ({
-          value: card.value,
-          testId: `workspace-tab-default-${card.value}`,
-          body: iconCardBody(card.icon, card.label),
-        }))}
-      />
-    </ThemeSubsection>
+    <div className="flex flex-col gap-4">
+      <ThemeSubsection
+        labelId={pinnedLabelId}
+        title="Sidebar tabs"
+        helper="Pin the pages you use most. Everything else stays in the + menu."
+      >
+        <div
+          role="img"
+          aria-label={`Sidebar preview: ${previewTabs.length ? `${previewTabs.map((tab) => tab.label).join(", ")} pinned` : "all pages in the + menu"}.`}
+          className="flex flex-wrap items-center justify-between gap-3 rounded-lg border border-border bg-muted/25 px-3 py-2.5"
+        >
+          <span className="text-sm text-muted-foreground">Sidebar preview</span>
+          <div aria-hidden="true" className="flex shrink-0 items-center gap-1">
+            {previewTabs.map(({ value: tab, icon: Icon }) => (
+              <span
+                key={tab}
+                className={cn(
+                  "flex size-7 items-center justify-center rounded-md text-muted-foreground",
+                  tab === firstTab?.value && "bg-background text-foreground shadow-xs",
+                )}
+              >
+                <Icon className="size-4" />
+              </span>
+            ))}
+            {previewTabs.length > 0 && <span className="mx-1 h-4 w-px bg-border" />}
+            <span className="flex size-7 items-center justify-center text-muted-foreground">
+              <PlusIcon className="size-4" />
+            </span>
+          </div>
+        </div>
+        <div role="group" aria-labelledby={pinnedLabelId} className="divide-y divide-border">
+          {workspaceTabCards.map(({ value: tab, label, icon: Icon }) => {
+            const isPinned = pinned.includes(tab);
+            return (
+              <div key={tab} className="flex items-center gap-3 py-2.5">
+                <Icon aria-hidden="true" className="size-4 shrink-0 text-muted-foreground" />
+                <span className="flex-1 text-ui">{label}</span>
+                <Button
+                  type="button"
+                  variant="ghost"
+                  size="sm"
+                  aria-label={`Pin ${label}`}
+                  aria-pressed={isPinned}
+                  title={`${isPinned ? "Unpin" : "Pin"} ${label}`}
+                  onClick={() => togglePin(tab, !isPinned)}
+                  className={cn(
+                    "min-w-24",
+                    isPinned
+                      ? "bg-primary/8 text-primary hover:bg-primary/12"
+                      : "text-muted-foreground",
+                  )}
+                  componentId={`settings.appearance.pin_workspace_${tab}`}
+                >
+                  <PinIcon
+                    aria-hidden="true"
+                    className={cn("size-3.5", isPinned && "fill-current")}
+                  />
+                  {isPinned ? "Pinned" : "Pin"}
+                </Button>
+              </div>
+            );
+          })}
+        </div>
+      </ThemeSubsection>
+      {firstTab && (
+        <div className="border-t border-border pt-4">
+          <ThemeSubsection
+            labelId={labelId}
+            title="Default Workspace tab"
+            helper="Shown first in Workspace. Changing this also updates existing chats when reopened or refreshed. Later tab choices are remembered. File links still open the linked file."
+          >
+            <CardRadioGroup<DefaultWorkspaceTab>
+              labelledBy={labelId}
+              value={firstTab.value}
+              onSelect={choose}
+              className={cn(
+                "grid gap-3",
+                pinnedCards.length > 1 && "grid-cols-2",
+                pinnedCards.length === 3 && "sm:grid-cols-3",
+                pinnedCards.length === 4 && "sm:grid-cols-4",
+              )}
+              cardClassName="items-center gap-2 p-4"
+              items={pinnedCards.map((card) => ({
+                value: card.value,
+                testId: `workspace-tab-default-${card.value}`,
+                body: iconCardBody(card.icon, card.label),
+              }))}
+            />
+          </ThemeSubsection>
+        </div>
+      )}
+    </div>
   );
 }
 
@@ -810,6 +923,29 @@ function HideUnconfiguredHarnessesControl() {
   );
 }
 
+/** Opt-in: fold a finished turn's earlier messages so only the last shows. */
+function FoldAssistantNarrationControl() {
+  const enabled = useFoldAssistantNarration();
+  const labelId = useId();
+  return (
+    <div className="flex items-start justify-between gap-6">
+      <SettingsLabel
+        label="Show only the final answer"
+        labelId={labelId}
+        description="Once a turn finishes, fold its progress messages into the Worked row. The last message stays visible as the answer."
+      />
+      <Switch
+        aria-labelledby={labelId}
+        checked={enabled}
+        onCheckedChange={writeFoldAssistantNarration}
+        data-testid="fold-assistant-narration-toggle"
+        className="mt-0.5 shrink-0"
+        componentId="settings.appearance.fold_assistant_narration"
+      />
+    </div>
+  );
+}
+
 function AppearanceSection() {
   // Embedded: the host owns light/dark, so the Mode picker would be a no-op —
   // replace it with a note (plus a link to the host's own theme settings when
@@ -842,8 +978,10 @@ function AppearanceSection() {
     writeWorkspacePanelDefault(WORKSPACE_PANEL_DEFAULT);
 
     writeDefaultWorkspaceTab(DEFAULT_WORKSPACE_TAB);
+    writePinnedWorkspaceTabs(defaultWorkspaceTabs);
 
     writeHideUnconfiguredHarnesses(DEFAULT_HIDE_UNCONFIGURED_HARNESSES);
+    writeFoldAssistantNarration(DEFAULT_FOLD_ASSISTANT_NARRATION);
 
     applyUiFontFamily(UI_FONT_FAMILY_DEFAULT);
 
@@ -869,7 +1007,9 @@ function AppearanceSection() {
           "omnigent:default-transcript-view",
           "omnigent:default-workspace-panel",
           "omnigent:default-workspace-tab",
+          PINNED_WORKSPACE_TABS_STORAGE_KEY,
           "omnigent:hide-unconfigured-harnesses",
+          FOLD_ASSISTANT_NARRATION_STORAGE_KEY,
         ]) {
           window.localStorage.removeItem(key);
         }
@@ -975,13 +1115,17 @@ function AppearanceSection() {
           <SettingsGroup title="Chat defaults" testId="settings-group-chat">
             <TranscriptViewDefaultControl />
             <div className="mt-4 border-t border-border pt-4">
-              <WorkspacePanelDefaultControl />
-            </div>
-            <div className="mt-4 border-t border-border pt-4">
-              <WorkspaceTabDefaultControl />
-            </div>
-            <div className="mt-4 border-t border-border pt-4">
               <HideUnconfiguredHarnessesControl />
+            </div>
+            <div className="mt-4 border-t border-border pt-4">
+              <FoldAssistantNarrationControl />
+            </div>
+          </SettingsGroup>
+
+          <SettingsGroup title="Workspace" testId="settings-group-workspace">
+            <WorkspacePanelDefaultControl />
+            <div className="mt-4 border-t border-border pt-4">
+              <WorkspaceTabsControl />
             </div>
           </SettingsGroup>
 
@@ -1141,7 +1285,6 @@ function GithubMark({ className }: { className?: string }) {
 }
 
 /**
-/**
  * Which panel connects/disconnects each provider. The server's
  * ``enabled_connections`` list says WHICH panels to show; this map says HOW to
  * render each. Adding a provider is one entry here plus one string server-side.
@@ -1154,7 +1297,7 @@ const CONNECTION_PANELS: Record<string, ComponentType> = {
 /**
  * Sandbox Integrations settings. Renders one connect/disconnect panel per
  * provider the server reports in ``enabled_connections``, in that order. The
- * nav hides the section entirely when the list is empty.
+ * MCP accounts have their own page; the nav hides this section without other providers.
  */
 function IntegrationsSection() {
   const info = useServerInfo();

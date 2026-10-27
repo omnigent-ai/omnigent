@@ -6,10 +6,13 @@ import asyncio
 import base64
 import json
 import logging
+from collections.abc import Callable
+from dataclasses import replace
 from pathlib import Path
 from typing import Any
 
 import pytest
+from websockets.asyncio.server import ServerConnection, serve
 from websockets.exceptions import ConnectionClosedError, InvalidMessage
 
 import omnigent.inner.codex_native_executor as codex_native_executor
@@ -25,7 +28,12 @@ from omnigent.harnesses.codex_native.bridge import (
     write_bridge_state,
 )
 from omnigent.inner.codex_native_executor import CodexNativeExecutor
-from omnigent.inner.executor import ExecutorConfig, ExecutorError, TurnComplete
+from omnigent.inner.executor import (
+    ExecutorConfig,
+    ExecutorError,
+    InjectionDeliveryAmbiguous,
+    TurnComplete,
+)
 from omnigent.inner.native_attachments import attachment_cache_dir
 from omnigent.native.input_diagnostics import input_delivery_scope
 
@@ -154,6 +162,645 @@ def _collect_turn_events(executor: CodexNativeExecutor, text: str) -> list[Any]:
         return events
 
     return asyncio.run(run())
+
+
+@pytest.fixture
+def draining_client(monkeypatch: pytest.MonkeyPatch):
+    # The external RPC peer is scripted; the executor and bridge files stay real.
+    class _DrainingClient(_FakeCodexNativeClient):
+        requests = []
+        created = []
+        next_turn = 1
+        connections = 0
+        closes = 0
+        accepted_inputs: list[object] = []
+        delivery_errors: list[BaseException] = [
+            CodexAppServerResponseError(
+                {"code": -32600, "message": "Server is draining; retry after reconnecting"}
+            )
+        ]
+        connect_errors: list[BaseException | None] = []
+        on_reconnect: Callable[[], None] | None = None
+        on_refusal: Callable[[], None] | None = None
+
+        async def connect(self) -> None:
+            type(self).connections += 1
+            if type(self).connections > 1 and type(self).on_reconnect is not None:
+                type(self).on_reconnect()
+            if type(self).connect_errors:
+                error = type(self).connect_errors.pop(0)
+                if error is not None:
+                    raise error
+            await super().connect()
+
+        async def close(self) -> None:
+            type(self).closes += 1
+            await super().close()
+
+        async def request(self, method: str, params: dict[str, Any]) -> dict[str, Any]:
+            if method in {"turn/start", "turn/steer"} and type(self).delivery_errors:
+                error = type(self).delivery_errors.pop(0)
+                if isinstance(error, _ReplyLost):
+                    await super().request(method, params)
+                    type(self).accepted_inputs.append(params["input"])
+                else:
+                    type(self).requests.append((method, params))
+                if type(self).on_refusal is not None:
+                    type(self).on_refusal()
+                raise error
+            result = await super().request(method, params)
+            if method in {"turn/start", "turn/steer"}:
+                type(self).accepted_inputs.append(params["input"])
+            return result
+
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server.CodexAppServerClient", _DrainingClient
+    )
+    return _DrainingClient
+
+
+class _ReplyLost(ConnectionResetError):
+    """Codex accepted the request, then the connection dropped before its reply."""
+
+
+def _compact_steer_refusal() -> CodexAppServerResponseError:
+    return CodexAppServerResponseError(
+        {
+            "code": -32600,
+            "message": "cannot steer a compact turn",
+            "data": {"codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "compact"}}},
+        }
+    )
+
+
+@pytest.mark.parametrize("next_turn_id", [None, "turn_new"], ids=["completed", "superseded"])
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
+async def test_compact_steer_waits_for_settlement_before_delivering_once(
+    draining_client,
+    next_turn_id: str | None,
+    live_injection: bool,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    refused = asyncio.Event()
+    draining_client.delivery_errors = [_compact_steer_refusal()]
+    draining_client.on_refusal = refused.set
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    async def send():
+        if live_injection:
+            return await executor.enqueue_session_message("main", "queued input")
+        return [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "queued input"}], [], ""
+            )
+        ]
+
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
+    with input_delivery_scope({"input_stable_id": "a" * 32}, response_id="resp_delivery"):
+        delivery = asyncio.create_task(send())
+    try:
+        await asyncio.wait_for(refused.wait(), 2)
+        await asyncio.sleep(0)
+        assert not delivery.done(), "a temporary compaction refusal must keep the input pending"
+        assert len(draining_client.requests) == 1
+        write_bridge_state(tmp_path, replace(state, active_turn_id=next_turn_id))
+        result = await asyncio.wait_for(delivery, 2)
+        if live_injection:
+            assert result is True
+        else:
+            assert [type(event) for event in result] == [TurnComplete]
+    finally:
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+
+    assert draining_client.accepted_inputs == [[{"type": "text", "text": "queued input"}]]
+    assert [method for method, _params in draining_client.requests] == [
+        "turn/steer",
+        "turn/start" if next_turn_id is None else "turn/steer",
+    ]
+    if next_turn_id is not None:
+        assert draining_client.requests[-1][1]["expectedTurnId"] == next_turn_id
+    assert draining_client.connections == 1
+    records = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None)
+        in {"codex_native_compaction_wait", "codex_native_delivery_finished"}
+    ]
+    assert [record.attributes["outcome"] for record in records] == [
+        "rpc_rejected_compacting",
+        "waiting",
+        "settled",
+        "rpc_accepted",
+    ]
+    assert all(record.attributes["input_stable_id"] == "a" * 32 for record in records)
+    assert all(record.attributes["response_id"] == "resp_delivery" for record in records)
+    assert all("queued input" not in repr(record.attributes) for record in records)
+
+
+def test_compact_steer_timeout_keeps_input_undelivered_and_bridge_turn(
+    draining_client, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    draining_client.delivery_errors = [_compact_steer_refusal()]
+    monkeypatch.setattr(
+        codex_native_executor, "_COMPACTION_WAIT_TIMEOUT_SECONDS", 0.01, raising=False
+    )
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "queued input")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == "codex_compacting"
+    assert len(draining_client.requests) == 1
+    assert draining_client.accepted_inputs == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None and state.active_turn_id == "turn_compact"
+
+
+@pytest.mark.parametrize("changed_field", ["session_id", "thread_id", "socket_path", "missing"])
+def test_compact_steer_never_resends_after_bridge_owner_change(
+    draining_client, changed_field: str, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    draining_client.delivery_errors = [_compact_steer_refusal()]
+
+    def rotate_bridge() -> None:
+        if changed_field == "missing":
+            (tmp_path / "state.json").unlink()
+        else:
+            write_bridge_state(
+                tmp_path, replace(state, active_turn_id=None, **{changed_field: "replacement"})
+            )
+
+    draining_client.on_refusal = rotate_bridge
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "queued input")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert "changed" in failure.message
+    assert len(draining_client.requests) == 1
+    assert draining_client.accepted_inputs == []
+
+
+async def test_compact_steer_wait_cancellation_propagates_without_resubmission(
+    draining_client, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    refused = asyncio.Event()
+    draining_client.delivery_errors = [_compact_steer_refusal()]
+    draining_client.on_refusal = refused.set
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    delivery = asyncio.create_task(executor.enqueue_session_message("main", "queued input"))
+    try:
+        await asyncio.wait_for(refused.wait(), 2)
+        await asyncio.sleep(0)
+        assert not delivery.done()
+        delivery.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await delivery
+    finally:
+        delivery.cancel()
+        await asyncio.gather(delivery, return_exceptions=True)
+    assert len(draining_client.requests) == 1
+    assert draining_client.closes == 1
+
+
+@pytest.mark.parametrize("reply_lost", [True, False], ids=["reply-lost", "refused-again"])
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
+async def test_compact_steer_second_submission_failure_is_bounded(
+    draining_client, reply_lost: bool, live_injection: bool, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    second = _ReplyLost("reply lost") if reply_lost else _compact_steer_refusal()
+    draining_client.delivery_errors = [_compact_steer_refusal(), second]
+    draining_client.on_refusal = lambda: write_bridge_state(
+        tmp_path, replace(state, active_turn_id="turn_new")
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    if live_injection and reply_lost:
+        # The runner must not resend input Codex may already hold.
+        with pytest.raises(InjectionDeliveryAmbiguous):
+            await executor.enqueue_session_message("main", "queued input")
+    elif live_injection:
+        assert await executor.enqueue_session_message("main", "queued input") is False
+    else:
+        [failure] = [
+            event
+            async for event in executor.run_turn(
+                [{"role": "user", "content": "queued input"}], [], ""
+            )
+        ]
+        assert isinstance(failure, ExecutorError)
+        assert failure.undelivered is not reply_lost
+
+    assert len(draining_client.requests) == 2
+    assert draining_client.accepted_inputs == (
+        [[{"type": "text", "text": "queued input"}]] if reply_lost else []
+    )
+
+
+class _OneInjectionCtx:
+    """Turn context that hands the adapter one live injection and records what it emits."""
+
+    def __init__(self, injection: Any) -> None:
+        self._injection: Any = injection
+        self.emitted: list[Any] = []
+        self.response_id = "resp_injection"
+        self.session_id = "session_injection"
+        self.cancelled = asyncio.Event()
+
+    async def next_injection(self, timeout: float | None = None) -> Any:
+        del timeout
+        if self._injection is None:
+            await asyncio.sleep(3600)
+        injection, self._injection = self._injection, None
+        return injection
+
+    def emit(self, event: Any) -> None:
+        self.emitted.append(event)
+
+
+async def test_live_resubmission_with_lost_reply_is_consumed_not_resent(
+    draining_client, tmp_path: Path
+) -> None:
+    from omnigent.runtime.harnesses._executor_adapter import ExecutorAdapter
+    from omnigent.server.schemas import CreateResponseRequest, InjectionConsumedEvent
+
+    _seed_bridge(tmp_path, active_turn_id="turn_compact")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    draining_client.delivery_errors = [_compact_steer_refusal(), _ReplyLost("reply lost")]
+    draining_client.on_refusal = lambda: write_bridge_state(
+        tmp_path, replace(state, active_turn_id="turn_new")
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    adapter = ExecutorAdapter(executor_factory=lambda: executor, session_key="main")
+    ctx = _OneInjectionCtx(
+        CreateResponseRequest(model="m", input="queued input", injection_id="inj_compact")
+    )
+
+    watcher = asyncio.create_task(adapter._watch_injections(ctx, executor))  # type: ignore[arg-type]
+    try:
+        for _ in range(200):
+            if ctx.emitted:
+                break
+            await asyncio.sleep(0.01)
+    finally:
+        watcher.cancel()
+        await asyncio.gather(watcher, return_exceptions=True)
+
+    # The consumed marker makes the runner drop its buffered copy instead of resending it.
+    assert [type(event) for event in ctx.emitted] == [InjectionConsumedEvent]
+    assert ctx.emitted[0].injection_id == "inj_compact"
+    assert draining_client.accepted_inputs == [[{"type": "text", "text": "queued input"}]]
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "live_injection"),
+    [(None, False), ("turn_existing", False), ("turn_existing", True)],
+    ids=["start", "steer", "live-steer"],
+)
+def test_draining_delivery_reconnects_and_accepts_input_once(
+    draining_client,
+    active_turn_id: str | None,
+    live_injection: bool,
+    tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
+
+    with input_delivery_scope({"input_stable_id": "a" * 32}):
+        if live_injection:
+            assert asyncio.run(executor.enqueue_session_message("main", "synthetic input"))
+        else:
+            events = _collect_turn_events(executor, "synthetic input")
+            assert [type(event) for event in events] == [TurnComplete]
+
+    assert draining_client.accepted_inputs == [[{"type": "text", "text": "synthetic input"}]]
+    assert draining_client.connections == 2
+    assert draining_client.closes == 2
+    assert len(draining_client.requests) == 2
+    assert draining_client.requests[0] == draining_client.requests[1]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == ("turn_steered" if active_turn_id else "turn_1")
+    outcomes = [
+        record.attributes
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "codex_native_delivery_finished"
+    ]
+    assert [attrs["outcome"] for attrs in outcomes] == ["rpc_rejected_draining", "rpc_accepted"]
+    assert len({attrs["native_rpc_attempt_id"] for attrs in outcomes}) == 2
+    assert all(attrs["input_stable_id"] == "a" * 32 for attrs in outcomes)
+    assert all(
+        "synthetic input" not in repr(getattr(record, "attributes", {}))
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_persistent_draining_delivery_is_bounded_and_keeps_input_undelivered(
+    draining_client, active_turn_id: str | None, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    draining_client.delivery_errors *= 3
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "keep this input")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == CODEX_APP_SERVER_STOPPED.code
+    assert draining_client.accepted_inputs == []
+    assert draining_client.connections == 2
+    assert len(draining_client.requests) == 2
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == active_turn_id
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ConnectionResetError("reply lost"), id="ambiguous-socket-loss"),
+        pytest.param(
+            CodexAppServerResponseError({"code": -32603, "message": "failed to submit input"}),
+            id="unrelated-rpc-error",
+        ),
+    ],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_error_after_draining_retry_stays_ambiguous(
+    draining_client, error: BaseException, active_turn_id: str | None, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    draining_client.delivery_errors.append(error)
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "do not duplicate")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is False
+    assert failure.code is None
+    assert draining_client.connections == 2
+    assert len(draining_client.requests) == 2
+    assert draining_client.accepted_inputs == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(
+            CodexAppServerResponseError(
+                {"code": -32603, "message": "Server is draining; retry after reconnecting"}
+            ),
+            id="different-rpc-code",
+        ),
+        pytest.param(
+            CodexAppServerResponseError({"code": -32600, "message": "Server is draining"}),
+            id="different-rpc-message",
+        ),
+        pytest.param(
+            RuntimeError("Server is draining; retry after reconnecting"), id="unstructured-error"
+        ),
+    ],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_similar_draining_errors_are_not_retried(
+    draining_client, error: BaseException, active_turn_id: str | None, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    draining_client.delivery_errors = [error]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "do not duplicate")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is False
+    assert draining_client.connections == 1
+    assert len(draining_client.requests) == 1
+    assert draining_client.accepted_inputs == []
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(ConnectionRefusedError("server stopped"), id="refused-connection"),
+        pytest.param(RuntimeError("initialize rejected"), id="initialize-error"),
+    ],
+)
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_draining_reconnect_failure_preserves_input(
+    draining_client, error: BaseException, active_turn_id: str | None, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    draining_client.connect_errors = [None, error]
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "keep this input")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert failure.code == CODEX_APP_SERVER_STOPPED.code
+    assert draining_client.connections == 2
+    assert draining_client.closes == 2
+    assert len(draining_client.requests) == 1
+    assert draining_client.accepted_inputs == []
+
+
+@pytest.mark.parametrize("changed_field", ["session_id", "thread_id", "socket_path", "missing"])
+@pytest.mark.parametrize("active_turn_id", [None, "turn_existing"], ids=["start", "steer"])
+def test_draining_reconnect_does_not_resend_after_bridge_change(
+    draining_client, active_turn_id: str | None, changed_field: str, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+
+    def rotate_bridge() -> None:
+        if changed_field == "missing":
+            (tmp_path / "state.json").unlink()
+        else:
+            write_bridge_state(tmp_path, replace(state, **{changed_field: "replacement"}))
+
+    draining_client.on_reconnect = rotate_bridge
+
+    [failure] = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "keep this input")
+
+    assert isinstance(failure, ExecutorError)
+    assert failure.undelivered is True
+    assert "changed" in failure.message
+    assert draining_client.connections == 2
+    assert len(draining_client.requests) == 1
+    assert draining_client.accepted_inputs == []
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "live_injection"),
+    [(None, False), ("turn_existing", False), ("turn_existing", True)],
+    ids=["start", "steer", "live-steer"],
+)
+def test_initialize_draining_preserves_input_without_sending_a_turn(
+    draining_client, active_turn_id: str | None, live_injection: bool, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+    draining_client.connect_errors = [draining_client.delivery_errors[0]]
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    if live_injection:
+        assert asyncio.run(executor.enqueue_session_message("main", "keep this input")) is False
+    else:
+        [failure] = _collect_turn_events(executor, "keep this input")
+        assert isinstance(failure, ExecutorError)
+        assert failure.undelivered is True
+        assert failure.code == CODEX_APP_SERVER_STOPPED.code
+    assert draining_client.connections == 1
+    assert draining_client.closes == 1
+    assert draining_client.requests == []
+    assert draining_client.accepted_inputs == []
+
+
+def test_cancellation_during_draining_reconnect_propagates_and_closes_client(
+    draining_client, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path)
+    draining_client.connect_errors = [None, asyncio.CancelledError()]
+
+    with pytest.raises(asyncio.CancelledError):
+        _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "keep this input")
+
+    assert draining_client.connections == 2
+    assert draining_client.closes == 2
+    assert len(draining_client.requests) == 1
+    assert draining_client.accepted_inputs == []
+
+
+@pytest.mark.parametrize("new_turn_id", [None, "turn_new"], ids=["completed", "superseded"])
+@pytest.mark.parametrize("live_injection", [False, True], ids=["run-turn", "live-steer"])
+def test_draining_retry_preserves_stale_steer_recovery(
+    draining_client, new_turn_id: str | None, live_injection: bool, tmp_path: Path
+) -> None:
+    _seed_bridge(tmp_path, active_turn_id="turn_old")
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    draining_client.on_reconnect = lambda: write_bridge_state(
+        tmp_path, replace(state, active_turn_id=new_turn_id)
+    )
+    message = (
+        "no active turn to steer"
+        if new_turn_id is None
+        else "expected active turn id `turn_old` but found `turn_new`"
+    )
+    draining_client.delivery_errors.append(
+        CodexAppServerResponseError({"code": -32600, "message": message})
+    )
+    executor = CodexNativeExecutor(bridge_dir=tmp_path)
+
+    if live_injection:
+        assert asyncio.run(executor.enqueue_session_message("main", "synthetic input"))
+    else:
+        events = _collect_turn_events(executor, "synthetic input")
+        assert [type(event) for event in events] == [TurnComplete]
+
+    assert draining_client.accepted_inputs == [[{"type": "text", "text": "synthetic input"}]]
+    assert [method for method, _params in draining_client.requests] == [
+        "turn/steer",
+        "turn/steer",
+        "turn/start" if new_turn_id is None else "turn/steer",
+    ]
+    if new_turn_id is not None:
+        assert draining_client.requests[-1][1]["expectedTurnId"] == new_turn_id
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == ("turn_1" if new_turn_id is None else "turn_steered")
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "refusal_kind"),
+    [(None, "draining"), ("turn_existing", "draining"), ("turn_compact", "compacting")],
+    ids=["start-draining", "steer-draining", "steer-compacting"],
+)
+async def test_native_refusal_recovers_with_real_client(
+    active_turn_id: str | None, refusal_kind: str, tmp_path: Path
+) -> None:
+    """Exercise the executor and real RPC client against a rejecting network peer."""
+    connections = 0
+    requests: list[tuple[int, dict[str, Any]]] = []
+    accepted_inputs: list[object] = []
+
+    async def handle(websocket: ServerConnection) -> None:
+        nonlocal connections
+        connections += 1
+        connection_number = connections
+        async for raw in websocket:
+            request = json.loads(raw)
+            if "id" not in request:
+                continue
+            response: dict[str, Any] = {"id": request["id"], "result": {}}
+            if request["method"] in {"turn/start", "turn/steer"}:
+                requests.append((connection_number, request))
+                if len(requests) == 1:
+                    response = {
+                        "id": request["id"],
+                        "error": _compact_steer_refusal().error
+                        if refusal_kind == "compacting"
+                        else {
+                            "code": -32600,
+                            "message": "Server is draining; retry after reconnecting",
+                        },
+                    }
+                    if refusal_kind == "compacting":
+                        current = read_bridge_state(tmp_path)
+                        assert current is not None
+                        write_bridge_state(tmp_path, replace(current, active_turn_id=None))
+                else:
+                    accepted_inputs.append(request["params"]["input"])
+                    response["result"] = (
+                        {"turn": {"id": "turn_accepted"}}
+                        if request["method"] == "turn/start"
+                        else {"turnId": "turn_accepted"}
+                    )
+            await websocket.send(json.dumps(response))
+
+    async with serve(handle, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        _seed_bridge(tmp_path, active_turn_id=active_turn_id)
+        state = read_bridge_state(tmp_path)
+        assert state is not None
+        write_bridge_state(tmp_path, replace(state, socket_path=f"ws://127.0.0.1:{port}"))
+        executor = CodexNativeExecutor(bridge_dir=tmp_path)
+        async with asyncio.timeout(5):
+            events = [
+                event
+                async for event in executor.run_turn(
+                    [{"role": "user", "content": "synthetic input"}], [], ""
+                )
+            ]
+
+    assert [type(event) for event in events] == [TurnComplete]
+    assert connections == (1 if refusal_kind == "compacting" else 2)
+    assert [number for number, _request in requests] == [
+        1,
+        1 if refusal_kind == "compacting" else 2,
+    ]
+    if refusal_kind == "compacting":
+        assert [request["method"] for _number, request in requests] == ["turn/steer", "turn/start"]
+    else:
+        assert requests[0][1]["params"] == requests[1][1]["params"]
+    assert accepted_inputs == [[{"type": "text", "text": "synthetic input"}]]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_accepted"
 
 
 @pytest.mark.parametrize("active_turn_id", [None, "turn_existing"])
@@ -811,6 +1458,35 @@ def test_zip_submitted_as_an_image_block_still_uses_a_file_reference(
     assert list(workspace.iterdir()) == []
 
 
+@pytest.mark.parametrize(
+    ("block_type", "data_key", "mime", "filename"),
+    [
+        # A text type delivered as a file must not be pasted into the turn.
+        ("input_file", "file_data", "text/plain", "server.log"),
+        ("input_image", "image_url", "image/png", "trace.gz"),
+    ],
+)
+def test_recorded_filesystem_delivery_uses_a_file_reference(
+    tmp_path: Path, block_type: str, data_key: str, mime: str, filename: str
+) -> None:
+    """A block the server delivers as a file reaches Codex by path, whatever its type."""
+    from omnigent.inner.codex_native_executor import _content_to_input_items
+
+    payload = b"line one\nline two\n"
+    block = {
+        "type": block_type,
+        data_key: f"data:{mime};base64," + base64.b64encode(payload).decode(),
+        "filename": filename,
+        "delivery": "filesystem",
+    }
+
+    items = _content_to_input_items([block], tmp_path)
+
+    expected = attachment_cache_dir(tmp_path) / filename
+    assert items == [{"type": "text", "text": f"[Attached: {expected}]"}]
+    assert expected.read_bytes() == payload
+
+
 def test_input_file_zip_is_materialized_without_workspace(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1035,6 +1711,56 @@ def test_stale_completed_turn_steer_retries_once_as_new_turn(
             CodexAppServerResponseError({"code": -32600, "message": "invalid turn id"}),
             id="other-json-rpc-error",
         ),
+        pytest.param(
+            CodexAppServerResponseError(
+                {"code": -32600, "message": "cannot steer a compact turn"}
+            ),
+            id="compaction-missing-structure",
+        ),
+        pytest.param(
+            CodexAppServerResponseError(
+                {
+                    "code": -32603,
+                    "message": "cannot steer a compact turn",
+                    "data": {
+                        "codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "compact"}}
+                    },
+                }
+            ),
+            id="compaction-wrong-code",
+        ),
+        pytest.param(
+            CodexAppServerResponseError(
+                {
+                    "code": -32600,
+                    "message": "cannot steer a review turn",
+                    "data": {
+                        "codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "compact"}}
+                    },
+                }
+            ),
+            id="compaction-wrong-message",
+        ),
+        pytest.param(
+            CodexAppServerResponseError(
+                {
+                    "code": -32600,
+                    "message": "cannot steer a compact turn",
+                    "data": {"codexErrorInfo": {"activeTurnNotSteerable": {"turnKind": "review"}}},
+                }
+            ),
+            id="compaction-wrong-kind",
+        ),
+        pytest.param(
+            CodexAppServerResponseError(
+                {
+                    "code": -32600,
+                    "message": "cannot steer a compact turn",
+                    "data": [],
+                }
+            ),
+            id="compaction-malformed-data",
+        ),
         pytest.param(asyncio.CancelledError(), id="cancelled"),
     ],
 )
@@ -1046,7 +1772,7 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     caplog: pytest.LogCaptureFixture,
     live_injection: bool,
 ) -> None:
-    """Only Codex's explicit idle semantic is safe to retry."""
+    """Ambiguous errors and lookalike refusals cannot authorize resubmission."""
 
     class _FailingSteerClient(_FakeCodexNativeClient):
         """Raise the parameterized failure for every steer."""
@@ -1136,7 +1862,7 @@ def test_steer_does_not_retry_ambiguous_or_unrelated_errors(
     assert attrs["response_id"] == "resp_delivery"
     assert attrs["outcome"] == "error"
     if isinstance(error, CodexAppServerResponseError):
-        assert attrs["rpc_error_code"] == "-32600"
+        assert attrs["rpc_error_code"] == str(error.code)
     else:
         assert "rpc_error_code" not in attrs
     assert "do not duplicate" not in json.dumps(attrs)
@@ -1859,6 +2585,7 @@ def test_run_turn_surfaces_recorded_startup_error(
 def test_run_turn_surfaces_coded_startup_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A startup record with a semantic code is surfaced as written, with its
@@ -1879,6 +2606,7 @@ def test_run_turn_surfaces_coded_startup_failure(
     )
     executor = CodexNativeExecutor(bridge_dir=tmp_path)
 
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
     events = _collect_turn_events(executor, "hello")
 
     assert len(events) == 1
@@ -1891,6 +2619,16 @@ def test_run_turn_surfaces_coded_startup_failure(
     assert "HQ7M-2KPD" in error.remediation
     # The message never reached Codex: the sender's queued copy is the record.
     assert error.undelivered is True
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "codex_bridge_state_unavailable"
+    ]
+    assert record.attributes["startup_error_present"] is True
+    assert record.attributes["startup_failure_coded"] is True
+    assert record.attributes["wait_sleep_ms"] == 0
+    assert "signin.example.com" not in str(record.attributes)
+    assert "HQ7M-2KPD" not in str(record.attributes)
 
 
 class _UnreachableClient(_FakeCodexNativeClient):
@@ -2242,9 +2980,23 @@ async def test_cancelled_bridge_polling_wait_exits_cleanly(tmp_path: Path) -> No
         await task
 
 
+@pytest.mark.parametrize(
+    ("state_bytes", "status"),
+    [
+        pytest.param(None, "missing", id="missing"),
+        pytest.param(b"\xff", "invalid_encoding", id="invalid-utf8"),
+        pytest.param(b"{", "invalid_json", id="invalid-json"),
+        pytest.param(
+            b'{"session_id":"private-state-content"}', "invalid_state", id="missing-fields"
+        ),
+    ],
+)
 def test_run_turn_without_marker_keeps_bounded_legacy_wait(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
+    caplog: pytest.LogCaptureFixture,
+    state_bytes: bytes | None,
+    status: str,
 ) -> None:
     """The ordinary path retains the existing 60-second nominal bound."""
     sleep_delays: list[float] = []
@@ -2252,13 +3004,32 @@ def test_run_turn_without_marker_keeps_bounded_legacy_wait(
     async def _count_sleep(seconds: float) -> None:
         sleep_delays.append(seconds)
 
+    if state_bytes is not None:
+        (tmp_path / "state.json").write_bytes(state_bytes)
     monkeypatch.setattr(asyncio, "sleep", _count_sleep)
+    caplog.set_level(logging.INFO, logger=codex_native_executor.__name__)
     events = _collect_turn_events(CodexNativeExecutor(bridge_dir=tmp_path), "hello")
 
     assert sum(sleep_delays) == pytest.approx(60.0)
     assert set(sleep_delays) == {0.05, 0.25}
     assert len(events) == 1
     assert isinstance(events[0], ExecutorError)
+    assert events[0].message == "Codex native bridge state is missing"
+    assert events[0].undelivered is True
+    [record] = [
+        r
+        for r in caplog.records
+        if getattr(r, "event_name", None) == "codex_bridge_state_unavailable"
+    ]
+    attrs = record.attributes
+    assert record.levelno == logging.INFO
+    assert attrs["bridge_state_status"] == status
+    assert attrs["wait_sleep_ms"] == 60000
+    assert attrs["wait_budget_ms"] == 60000
+    assert attrs["startup_wait_extended"] is False
+    assert attrs["startup_error_present"] is False
+    assert "private-state-content" not in str(attrs)
+    assert str(tmp_path) not in str(attrs)
 
 
 @pytest.mark.asyncio

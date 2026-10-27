@@ -9,11 +9,17 @@ import {
   dedupeConversationsById,
   filterConversations,
   getConversationIconKind,
+  groupConversations,
   getConversationAgentType,
   migratePinnedConversationIds,
   orderByPinnedTimestamp,
   pinOrderWrites,
   resolveSidebarDrop,
+  sessionsListAcceptsDrop,
+  sortConversations,
+  STATUS_BUCKETS,
+  statusBucket,
+  dateBucket,
 } from "./sidebarNav";
 
 function conversation(
@@ -672,4 +678,116 @@ describe("resolveSidebarDrop", () => {
     expect(resolveSidebarDrop(src(), null)).toEqual({ kind: "none" });
     expect(resolveSidebarDrop(src({ isPinned: true }), null)).toEqual({ kind: "none" });
   });
+});
+
+describe("statusBucket", () => {
+  const base = conversation("a", "A", new Date(2026, 0, 1));
+  it("puts approvals and failures ahead of everything else", () => {
+    expect(
+      statusBucket({ ...base, status: "running", pending_elicitations_count: 1 }, true, true),
+    ).toBe("Needs attention");
+    expect(statusBucket({ ...base, status: "failed" }, true, true)).toBe("Needs attention");
+  });
+  it("ranks working, then unread, then draft, then done", () => {
+    expect(statusBucket({ ...base, status: "running" }, false, true)).toBe("Working");
+    expect(statusBucket({ ...base, status: "idle" }, true, true)).toBe("Unread");
+    expect(statusBucket({ ...base, status: "idle" }, false, true)).toBe("Draft");
+    expect(statusBucket({ ...base, status: "idle" }, false, false)).toBe("Done");
+  });
+});
+
+describe("dateBucket", () => {
+  const now = new Date(2026, 8, 30, 10, 0);
+  const at = (date: Date) => date.getTime() / 1000;
+  it("buckets by local calendar day", () => {
+    expect(dateBucket(at(new Date(2026, 8, 30, 0, 0)), now)).toBe("today");
+    expect(dateBucket(at(new Date(2026, 8, 29, 23, 59)), now)).toBe("yesterday");
+    expect(dateBucket(at(new Date(2026, 8, 29, 0, 0)), now)).toBe("yesterday");
+    expect(dateBucket(at(new Date(2026, 8, 28, 23, 59)), now)).toBe("in the last 7 days");
+    expect(dateBucket(at(new Date(2026, 8, 23, 0, 0)), now)).toBe("in the last 7 days");
+    expect(dateBucket(at(new Date(2026, 8, 22, 23, 59)), now)).toBe("in the last 30 days");
+    expect(dateBucket(at(new Date(2026, 7, 31, 0, 0)), now)).toBe("in the last 30 days");
+    expect(dateBucket(at(new Date(2026, 7, 30, 23, 59)), now)).toBe("earlier");
+  });
+});
+
+describe("groupConversations", () => {
+  it("returns non-empty groups in bucket order, keeping row order", () => {
+    const rows = ["a", "b", "c", "d"].map((id) => conversation(id, id, new Date(2026, 0, 1)));
+    const keys: Record<string, (typeof STATUS_BUCKETS)[number]> = {
+      a: "Done",
+      b: "Working",
+      c: "Done",
+      d: "Working",
+    };
+    const groups = groupConversations(rows, (c) => keys[c.id], STATUS_BUCKETS);
+    expect(groups.map((g) => [g.title, g.conversations.map((c) => c.id)])).toEqual([
+      ["Working", ["b", "d"]],
+      ["Done", ["a", "c"]],
+    ]);
+  });
+
+  it("puts a row with no key in the last group instead of dropping it", () => {
+    const rows = ["a", "b"].map((id) => conversation(id, id, new Date(2026, 0, 1)));
+    const groups = groupConversations(rows, (c) => (c.id === "a" ? "Working" : undefined), [
+      "Working",
+      "Done",
+    ]);
+    expect(groups.map((g) => [g.title, g.conversations.map((c) => c.id)])).toEqual([
+      ["Working", ["a"]],
+      ["Done", ["b"]],
+    ]);
+  });
+
+  it("retains an empty Working group in status order", () => {
+    const done = conversation("done", "Done", new Date(2026, 0, 1));
+    expect(groupConversations([done], () => "Done", STATUS_BUCKETS, "Working")).toEqual([
+      { title: "Working", conversations: [] },
+      { title: "Done", conversations: [done] },
+    ]);
+  });
+});
+
+describe("sessionsListAcceptsDrop", () => {
+  const drag = (project: string | null, isPinned: boolean) => ({ id: "s", project, isPinned });
+  it("ungroups or unpins in the default view", () => {
+    expect(sessionsListAcceptsDrop(drag("Customer X", false), false)).toBe(true);
+    expect(sessionsListAcceptsDrop(drag(null, true), false)).toBe(true);
+    expect(sessionsListAcceptsDrop(drag(null, false), false)).toBe(false);
+  });
+  it("never removes a session from its project in a grouped view", () => {
+    expect(sessionsListAcceptsDrop(drag("Customer X", false), true)).toBe(false);
+    expect(sessionsListAcceptsDrop(drag("Customer X", true), true)).toBe(false);
+    expect(sessionsListAcceptsDrop(drag(null, true), true)).toBe(true);
+  });
+});
+
+it("keeps Created stable across updates, active-row overrides, and hover freezes", () => {
+  const old = { ...conversation("a", "old", new Date(1000)), created_at: 1, updated_at: 300 };
+  const newer = { ...conversation("b", "new", new Date(2000)), created_at: 2, updated_at: 100 };
+  const sameSecond = { ...newer, id: "c" };
+  const frozen = new Map([
+    [old.id, 999],
+    [newer.id, 1],
+  ]);
+  const active = { id: newer.id, updatedAt: 500 };
+  const ids = (rows: Conversation[]) =>
+    sortConversations(rows, active, frozen, "created_at").map((row) => row.id);
+  expect(ids([old, newer, sameSecond])).toEqual(["c", "b", "a"]);
+  expect(ids([{ ...old, updated_at: 1000 }, sameSecond, newer])).toEqual(["c", "b", "a"]);
+  expect(sortConversations([old, newer], null).map((row) => row.id)).toEqual(["a", "b"]);
+});
+
+it("orders equal-updated_at rows by id whether or not the order is frozen", () => {
+  const same = new Date("2026-10-14T10:00:00Z");
+  const a = conversation("a", "A", same);
+  const b = conversation("b", "B", same);
+  const c = conversation("c", "C", same);
+  const frozen = new Map<string, number>();
+  const first = sortConversations([a, b, c], null, frozen).map((row) => row.id);
+  // A refresh can hand the same rows back in another order while the pointer is inside.
+  expect(sortConversations([c, a, b], null, frozen).map((row) => row.id)).toEqual(first);
+  // With the pointer outside, arrival order still must not show through.
+  expect(first).toEqual(["c", "b", "a"]);
+  expect(sortConversations([c, a, b], null).map((row) => row.id)).toEqual(["c", "b", "a"]);
 });

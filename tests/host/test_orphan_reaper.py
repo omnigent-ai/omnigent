@@ -130,7 +130,9 @@ async def test_watcher_releases_exited_runner_and_keeps_crash_report(
         assert proc.returncode == exit_code
         if exit_code:
             assert set(host._unreported_exits) == {"runner_exited"}
-            assert "code 42" in host._unreported_exits["runner_exited"]
+            report = host._unreported_exits["runner_exited"]
+            assert "code 42" in report.error
+            assert report.had_connected is None
         else:
             assert host._unreported_exits == {}
 
@@ -312,7 +314,9 @@ async def test_worker_poll_between_snapshot_and_sweep_preserves_crash_report(
             _assert_reaped(orphan)
             assert "runner_racing" not in host._runners
             assert set(host._unreported_exits) == {"runner_racing"}
-            assert "code 42" in host._unreported_exits["runner_racing"]
+            report = host._unreported_exits["runner_racing"]
+            assert "code 42" in report.error
+            assert report.had_connected is None
         finally:
             release.set()
             await asyncio.gather(watcher, return_exceptions=True)
@@ -369,7 +373,9 @@ async def test_discovery_rechecks_ownership_before_reaping(
             if owner_kind == "runner":
                 assert "runner_registered" in host._runners
                 await asyncio.wait_for(host._watch_runner("runner_registered"), timeout=5.0)
-                assert "code 42" in host._unreported_exits["runner_registered"]
+                report = host._unreported_exits["runner_registered"]
+                assert "code 42" in report.error
+                assert report.had_connected is None
         finally:
             resume.set()
             reaper.cancel()

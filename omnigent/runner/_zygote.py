@@ -14,6 +14,10 @@ multithreaded async process would deadlock the child). It is single-threaded,
 holds no event loop and no network sockets, and blocks on one ``AF_UNIX``
 control socket handed to it by the daemon.
 
+If optional deferred preload starts a thread, the zygote refuses new forks
+while preserving existing children's parent and poll/reap service. New
+launches use the callers' direct-exec fallback.
+
 Protocol (newline-delimited JSON, one request → one response):
 
   {"cmd": "ping"}                          -> {"pong": true}
@@ -476,6 +480,7 @@ class _ZygoteServer:
         self._control_socks: set[socket.socket] = {control_sock}
         self._buffers: dict[int, bytearray] = {}
         self._deferred_imported = False
+        self._forking_disabled = False
         self._sel.register(control_sock, selectors.EVENT_READ, "daemon")
         self._buffers[control_sock.fileno()] = bytearray()
 
@@ -504,7 +509,14 @@ class _ZygoteServer:
         self._deferred_imported = True
         _import_deferred_graph()
         gc.freeze()
-        _exit_unless_single_threaded()
+        try:
+            _exit_unless_single_threaded()
+        except SystemExit as exc:
+            if exc.code != 2:
+                raise
+            # Children may already depend on this parent. Keep their status
+            # service alive and send new launches through the exec fallback.
+            self._forking_disabled = True
 
     def _reap(self) -> None:
         """Non-blocking reap of any exited children into ``exit_codes``.
@@ -685,6 +697,9 @@ class _ZygoteServer:
         :param conn: The daemon socket to answer on.
         :param request: The ``fork`` request (``env`` + optional ``log_path``).
         """
+        if self._forking_disabled:
+            _send(conn, {"error": "zygote is not single-threaded; refusing to fork a runner"})
+            return
         if self._refuse_if_upgraded(conn, "runner"):
             return
         try:
@@ -722,6 +737,9 @@ class _ZygoteServer:
         :param conn: The runner socket to answer on.
         :param request: The ``fork_harness`` request (``argv`` + ``env``).
         """
+        if self._forking_disabled:
+            _send(conn, {"error": "zygote is not single-threaded; refusing to fork a harness"})
+            return
         if self._refuse_if_upgraded(conn, "harness"):
             return
         try:

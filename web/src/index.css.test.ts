@@ -519,6 +519,8 @@ describe("index.css native safe-area layout on the rendered WorkspacePanel", () 
           handleProps: { tabIndex: 0 },
           rightRailTab: "files",
           onRightRailTabChange: () => {},
+          openPanels: [],
+          onClosePanel: () => {},
           showFilesPanel: true,
           showGithubTab: false,
           showBrowserTab: false,
@@ -996,7 +998,7 @@ describe("index.css electron-mac window drag region", () => {
 
   it("covers the full width and height of the desktop header", () => {
     expect(dragRule).toContain("inset: 0 0 auto 0");
-    expect(dragRule).toContain("height: 3rem");
+    expect(dragRule).toContain("height: var(--mac-titlebar-height)");
     expect(dragRule).toContain("-webkit-app-region: drag");
   });
 
@@ -1153,7 +1155,7 @@ describe("index.css electron-mac sidebar header", () => {
   });
 
   it("reserves the entire drag band before the sidebar content", () => {
-    expect(headerRowRule).toContain("height: 3rem");
+    expect(headerRowRule).toContain("height: var(--mac-titlebar-height)");
   });
 
   it("hides the sidebar's own cluster in favour of the title-bar copy", () => {
@@ -1193,7 +1195,7 @@ describe("index.css electron-mac sidebar header", () => {
   });
 
   it("floats the peek card below the title-bar controls", () => {
-    expect(peekCardRule).toContain("top: 3.5rem");
+    expect(peekCardRule).toContain("top: calc(var(--mac-titlebar-height) + 0.5rem)");
   });
 
   it("drops the header row inside the peek card", () => {
@@ -1211,7 +1213,20 @@ describe("index.css electron-mac sidebar header", () => {
   it("pushes the settings sidebar's Back row below the lights", () => {
     // /settings swaps the header row out entirely; without this its Back row
     // would sit underneath the window controls.
-    expect(settingsHeaderRule).toContain("padding-top: 3.5rem");
+    expect(settingsHeaderRule).toContain("padding-top: calc(var(--mac-titlebar-height) + 0.5rem)");
+  });
+
+  it("hands the phone layout's headers the lights' corner below md", () => {
+    // Electron's 720px minimum is below md, where the drawer and chat header
+    // carry their own controls; a fixed rem pad would drift with zoom.
+    const narrowBlock = cssSource.match(
+      /@media \(width < 48rem\) \{(?=\s*html\[data-electron-mac\] \.electron-sidebar-header-actions \{)(?:[^{}]|\{[^{}]*\})*\}/,
+    )?.[0];
+    expect(narrowBlock, "expected the macOS sub-md header block").toBeDefined();
+    expect(narrowBlock).toMatch(/\.electron-sidebar-header-actions \{\s*display: none;/);
+    expect(narrowBlock).toMatch(
+      /\.traffic-light-clearance,\s*html\[data-electron-mac\] \.sidebar-header-row \{\s*padding-left: var\(--mac-traffic-light-width\);/,
+    );
   });
 
   it("keeps every header rule scoped to the desktop shell", () => {
@@ -1284,7 +1299,7 @@ describe("index.css maximized workspace rail traffic-light clearance", () => {
 
   it("has the clearance rule this test exists to protect", () => {
     expect(rule, "the maximized rail tab-strip padding rule is gone from index.css").toBeDefined();
-    expect(rule).toMatch(/padding-left:\s*10\.5rem/);
+    expect(rule).toContain("padding-left: calc(var(--mac-traffic-light-width) + 5rem)");
   });
 
   it("clears the lights on the mac shell while the sidebar is collapsed", () => {

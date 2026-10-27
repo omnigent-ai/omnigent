@@ -65,6 +65,7 @@ checks, or changes when its API failed:
 | --------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------- |
 | `info.warnings: string[]`         | Show lookup problems above the details; keep polling. A null `pr` with warnings is unavailable, rather than a successful empty lookup. |
 | `pr.checks.partial: true`         | Qualify check counts as incomplete; keep any loaded checks.                                                                            |
+| `pr.checks_supported: false`      | The token cannot read check runs (GitHub refuses them to fine-grained PATs); say so in the Checks area instead of showing counts.      |
 | `pr.comments_partial: true`       | Mark comments incomplete; retain loaded comments and display a `+` with their count.                                                   |
 | Changed files `has_more: true`    | Mark the file list incomplete.                                                                                                         |
 | Changed files `warning: string`   | Show the provider's explanation, including a failed file-list lookup.                                                                  |
@@ -91,7 +92,7 @@ change a tool's result or prevent another provider from recording requests.
 Run the existing GitHub resource and tracking suites together with provider
 dispatcher tests, then the shared panel, composer, and canvas frontend tests.
 For a manual check, open a GitHub session's Pull Requests tab, select a linked
-request, inspect Summary and Changes, and confirm the same link appears in the
-composer and canvas. Repeat with the installed provider, including signed-out
-and partial-data responses. Existing GitHub account and base-remote selectors
-must continue to work.
+request, inspect Summary, Comments, and Changes, and confirm the same link
+appears in the composer and canvas. Repeat with the installed provider,
+including signed-out and partial-data responses. Existing GitHub account and
+base-remote selectors must continue to work.

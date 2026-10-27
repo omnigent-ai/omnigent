@@ -66,11 +66,13 @@ impl Pod {
         Ok(pod)
     }
 
+    /// The pod server's SQLite database.
+    pub fn chat_db(&self) -> PathBuf {
+        self.dir.join("data/omnigent/chat.db")
+    }
+
     pub fn db_uri(&self) -> String {
-        format!(
-            "sqlite:///{}",
-            self.dir.join("data/omnigent/chat.db").display()
-        )
+        format!("sqlite:///{}", self.chat_db().display())
     }
 
     pub fn artifacts_dir(&self) -> PathBuf {

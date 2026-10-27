@@ -66,6 +66,23 @@ describe("useApproveHotkey", () => {
     expect(submitApproval).not.toHaveBeenCalled();
   });
 
+  it.each(["sending", "unconfirmed", "ready"])(
+    "only considers the newest pending approval when its delivery is %s",
+    (state) => {
+      blocks = [
+        { ...pending, elicitationId: "older", nativeDelivery: { state: "ready" } },
+        { ...pending, elicitationId: "newer", nativeDelivery: { state } },
+      ];
+      renderHook(() => useApproveHotkey(true));
+      press();
+      if (state === "ready") {
+        expect(submitApproval).toHaveBeenCalledExactlyOnceWith("newer", "accept");
+      } else {
+        expect(submitApproval).not.toHaveBeenCalled();
+      }
+    },
+  );
+
   it("still accepts a bare consent prompt that names no fields", () => {
     blocks = [{ ...pending, requestedSchema: { type: "object" } }];
     renderHook(() => useApproveHotkey(true));

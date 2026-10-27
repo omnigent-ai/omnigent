@@ -32,6 +32,7 @@
 //      on `POST /v1/sessions/{id}/elicitations/{eid}/resolve`,
 //   3. rolls back to "pending" on network error.
 
+import type { NativePermissionDelivery } from "@/lib/nativePermissionDelivery";
 import { useContext } from "react";
 import {
   CheckIcon,
@@ -58,7 +59,7 @@ import { formatPreview } from "@/lib/previewFormat";
 import type { RenderItem } from "@/lib/renderItems";
 import { Link, useLocation } from "@/lib/routing";
 import { sessionNavigationSearch } from "@/lib/sessionNavigation";
-import type { CodexPersistMode, RememberScope } from "@/lib/types";
+import type { AgyPermission, CodexPersistMode, RememberScope } from "@/lib/types";
 import { cn } from "@/lib/utils";
 import { childPrimaryLabel } from "@/shell/subagentLabel";
 import { useChatStore } from "@/store/chatStore";
@@ -109,7 +110,7 @@ function extractOptionLabels(schema: Record<string, unknown>): string[] {
  */
 export type SubmitApprovalFn = (
   elicitationId: string,
-  action: "accept" | "decline",
+  action: "accept" | "decline" | "cancel",
   content?: Record<string, unknown>,
   meta?: Record<string, unknown>,
 ) => void;
@@ -147,6 +148,7 @@ function SubagentRequesterLine({ sessionId, ancestorSessionId }: SubagentRequest
 }
 
 interface ApprovalCardProps {
+  nativeDelivery?: NativePermissionDelivery;
   elicitationId: string;
   message: string;
   phase: string;
@@ -209,6 +211,8 @@ interface ApprovalCardProps {
    * automatically. Absent/false where the switch was never offered.
    */
   allowAutoMode?: boolean;
+  /** Exact native directory scope offered for the rest of this session. */
+  permissionDirectories?: string[];
   /**
    * Claude-native non-edit tool prompts only: when set, the binary
    * approve/reject card also offers an "Approve & don't ask again for
@@ -222,6 +226,8 @@ interface ApprovalCardProps {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP persistence scopes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /** Antigravity prompt details (see {@link AgyPermission}); null outside agy permission requests. */
+  agyPermission?: AgyPermission | null;
   /**
    * Verdict submitter override. Defaults to `chatStore.submitApproval`
    * (the in-chat path: optimistic block flip + resolve POST + rollback).
@@ -238,6 +244,7 @@ interface ApprovalCardProps {
 const EMPTY_CODEX_PERSIST_MODES: CodexPersistMode[] = [];
 
 export function ApprovalCard({
+  nativeDelivery,
   elicitationId,
   message,
   phase,
@@ -252,8 +259,10 @@ export function ApprovalCard({
   codexCommand,
   allowAllEdits,
   allowAutoMode,
+  permissionDirectories,
   rememberScope,
   codexPersistModes = EMPTY_CODEX_PERSIST_MODES,
+  agyPermission,
   onSubmit,
   requester,
   className,
@@ -262,7 +271,7 @@ export function ApprovalCard({
   // the child's elicitation rather than the main conversation's. null (the main
   // transcript) leaves submitApproval on its active-conversation default.
   const scopedConversationId = useContext(ConversationScopeContext);
-  const submit: SubmitApprovalFn =
+  const submitVerdict: SubmitApprovalFn =
     onSubmit ??
     ((id, action, content, meta) => {
       const store = useChatStore.getState();
@@ -276,6 +285,14 @@ export function ApprovalCard({
         void store.submitApproval(id, action, content, meta);
       }
     });
+  const submit: SubmitApprovalFn = (...args) => {
+    if (!nativeDelivery) return submitVerdict(...args);
+    const [id, action, content, meta] = args;
+    submitVerdict(id, action, content, {
+      ...meta,
+      native_delivery_attempt: nativeDelivery.attempt,
+    });
+  };
   const submitBinary = (action: "accept" | "decline") => {
     submit(elicitationId, action);
   };
@@ -317,7 +334,8 @@ export function ApprovalCard({
     // permission update back to the PermissionRequest hook.
     submit(elicitationId, "accept", { remember: true });
   };
-  const submitCodexPersist = (mode: CodexPersistMode) => {
+  // Codex MCP and agy persist accepts share the `_meta.persist` verdict shape.
+  const submitPersist = (mode: CodexPersistMode) => {
     submit(elicitationId, "accept", undefined, { persist: mode });
   };
   const submitPlanRejection = (feedback: string) => {
@@ -372,7 +390,9 @@ export function ApprovalCard({
         ? "Codex needs input"
         : policyName.startsWith("cursor_") || phase.startsWith("cursor_")
           ? "Cursor has questions"
-          : "Claude has questions";
+          : policyName.startsWith("pi_") || phase.startsWith("pi_")
+            ? "Pi needs your input"
+            : "Claude has questions";
 
   // Hide the raw JSON preview for AskUserQuestion (the form already
   // renders the questions + options structurally) and for option-
@@ -393,8 +413,25 @@ export function ApprovalCard({
   const acceptedAllEdits = response?.content?.allow_all_edits === true;
   const acceptedAutoMode =
     response?.action === "accept" && response.content?.allow_auto_mode === true;
+  const hasPermissionDirectories = Boolean(permissionDirectories?.length);
+  const acceptedDirectories =
+    hasPermissionDirectories &&
+    response?.action === "accept" &&
+    response.content?.allow_directories === true;
+  const directoryScope = hasPermissionDirectories ? (
+    <div className="flex flex-col gap-1 text-sm">
+      <span>{acceptedDirectories ? "Allowed directories:" : "Requested directory access:"}</span>
+      <ul className="flex flex-col gap-1">
+        {permissionDirectories!.map((directory) => (
+          <li key={directory}>
+            <code className="font-mono whitespace-pre-wrap break-all">{directory}</code>
+          </li>
+        ))}
+      </ul>
+    </div>
+  ) : null;
   const acceptedRemember = response?.content?.remember === true;
-  const acceptedCodexPersist = response?.["_meta"]?.persist;
+  const acceptedPersist = response?.["_meta"]?.persist;
   // Persistent "don't ask again" affordance: label by the WebFetch
   // domain when present, else the tool name. Drives the third binary
   // button and the responded-state pill.
@@ -413,11 +450,50 @@ export function ApprovalCard({
         <CheckIcon className="mr-1 size-3.5" />
         Approve
       </Button>
+      {agyPermission?.alwaysAllowPattern && (
+        <>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-auto max-w-full whitespace-normal text-left"
+            onClick={() => submitPersist("session")}
+            title={`Ask Antigravity to allow commands starting with “${agyPermission.alwaysAllowPattern}” for this conversation`}
+            data-testid="approval-card-agy-session-allow"
+            componentId="approval.approve_session_agy"
+          >
+            <CheckIcon className="mr-1 size-3.5 shrink-0" />
+            <span className="min-w-0">
+              Allow commands starting with{" "}
+              <code className="break-all rounded bg-muted px-1 font-mono">
+                {agyPermission.alwaysAllowPattern}
+              </code>{" "}
+              for this session
+            </span>
+          </Button>
+          <Button
+            size="sm"
+            variant="outline"
+            className="h-auto max-w-full whitespace-normal text-left"
+            onClick={() => submitPersist("always")}
+            title={`Ask Antigravity to save a rule allowing commands starting with “${agyPermission.alwaysAllowPattern}” for this Omnigent session`}
+            data-testid="approval-card-agy-always-allow"
+            componentId="approval.approve_always_agy"
+          >
+            <CheckIcon className="mr-1 size-3.5 shrink-0" />
+            <span className="min-w-0">
+              Always allow commands starting with{" "}
+              <code className="break-all rounded bg-muted px-1 font-mono">
+                {agyPermission.alwaysAllowPattern}
+              </code>
+            </span>
+          </Button>
+        </>
+      )}
       {codexPersistModes.includes("session") && (
         <Button
           size="sm"
           variant="outline"
-          onClick={() => submitCodexPersist("session")}
+          onClick={() => submitPersist("session")}
           componentId="approval.approve_session"
         >
           <CheckIcon className="mr-1 size-3.5" />
@@ -428,14 +504,26 @@ export function ApprovalCard({
         <Button
           size="sm"
           variant="outline"
-          onClick={() => submitCodexPersist("always")}
+          onClick={() => submitPersist("always")}
           componentId="approval.approve_always"
         >
           <CheckIcon className="mr-1 size-3.5" />
           Always allow
         </Button>
       )}
-      {allowAutoMode && (
+      {hasPermissionDirectories && (
+        <Button
+          size="sm"
+          variant="outline"
+          className="h-auto min-h-8 whitespace-normal text-left"
+          onClick={() => submit(elicitationId, "accept", { allow_directories: true })}
+          componentId="approval.approve_directories"
+        >
+          <CheckIcon className="mr-1 size-3.5 shrink-0" />
+          Approve &amp; allow directories for this session
+        </Button>
+      )}
+      {!hasPermissionDirectories && allowAutoMode && (
         <Button
           size="sm"
           variant="outline"
@@ -447,7 +535,7 @@ export function ApprovalCard({
           Approve &amp; switch to auto mode
         </Button>
       )}
-      {allowAllEdits && (
+      {!hasPermissionDirectories && allowAllEdits && (
         <Button
           size="sm"
           variant="outline"
@@ -458,7 +546,7 @@ export function ApprovalCard({
           Accept & allow all edits
         </Button>
       )}
-      {rememberTarget && (
+      {!hasPermissionDirectories && rememberTarget && (
         <Button
           size="sm"
           variant="outline"
@@ -511,6 +599,46 @@ export function ApprovalCard({
   );
 
   const requesterLine = requester ? <SubagentRequesterLine {...requester} /> : null;
+
+  if (status === "pending" && nativeDelivery && nativeDelivery.state !== "ready") {
+    const unconfirmed = nativeDelivery.state === "unconfirmed";
+    return (
+      <Alert
+        data-testid="approval-card"
+        data-state={nativeDelivery.state}
+        className={cn("flex flex-col gap-2", className)}
+      >
+        <AlertTitle className="flex items-center gap-2 text-ui">
+          <ClockIcon className="size-4 text-muted-foreground" />
+          {unconfirmed ? "Approval delivery unconfirmed" : "Waiting for Kiro to confirm"}
+        </AlertTitle>
+        <AlertDescription className="flex flex-col gap-2 text-sm">
+          {requesterLine}
+          <span>
+            {unconfirmed
+              ? "Kiro hasn't confirmed your decision. The previous attempt may still be pending."
+              : "This request stays pending until Kiro confirms your decision."}
+          </span>
+          {formattedPreview && (
+            <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
+              {formattedPreview}
+            </pre>
+          )}
+          {unconfirmed && nativeDelivery.action && (
+            <div className="flex flex-wrap gap-2">
+              <Button
+                size="sm"
+                onClick={() => submit(elicitationId, nativeDelivery.action!, undefined)}
+                componentId="approval.retry_delivery"
+              >
+                Retry sending {nativeDelivery.action === "accept" ? "approval" : "rejection"}
+              </Button>
+            </div>
+          )}
+        </AlertDescription>
+      </Alert>
+    );
+  }
 
   if (status === "responded" && response) {
     const autoResolved = response.action === "auto_resolved";
@@ -565,7 +693,7 @@ export function ApprovalCard({
           <TooltipContent className="max-w-72">{AUTO_RESOLVED_DETAIL}</TooltipContent>
         </Tooltip>
       );
-      label = "Resolved elsewhere";
+      label = nativeDelivery ? "Resolved in Kiro" : "Resolved elsewhere";
     } else if (response.action === "cancel") {
       // Dismissed without deciding — neither approved nor rejected.
       icon = <InfoIcon className="size-4 text-muted-foreground" />;
@@ -579,6 +707,9 @@ export function ApprovalCard({
     } else if (acceptedWithExecPolicy) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved and remembered";
+    } else if (acceptedDirectories) {
+      icon = <CheckIcon className="size-4 text-success" />;
+      label = "Approved · directory access for this session";
     } else if (acceptedAutoMode) {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved · auto mode";
@@ -590,10 +721,16 @@ export function ApprovalCard({
       label = rememberTarget
         ? `Approved · won't ask again for ${rememberTarget}`
         : "Approved · won't ask again";
-    } else if (acceptedCodexPersist === "session") {
+    } else if (
+      phase === "agy_permission" &&
+      (acceptedPersist === "session" || acceptedPersist === "always")
+    ) {
+      icon = <InfoIcon className="size-4 text-muted-foreground" />;
+      label = acceptedPersist === "session" ? "Session allow requested" : "Always allow requested";
+    } else if (acceptedPersist === "session") {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Approved for this session";
-    } else if (acceptedCodexPersist === "always") {
+    } else if (acceptedPersist === "always") {
       icon = <CheckIcon className="size-4 text-success" />;
       label = "Always allowed";
     } else if (accepted) {
@@ -646,8 +783,19 @@ export function ApprovalCard({
                 )}
               </>
             ) : showGatingMessage ? (
-              <ElicitationMessage message={message} />
+              <>
+                <ElicitationMessage message={message} className="whitespace-pre-line" />
+                {agyPermission?.actionDescription && (
+                  <span
+                    className="text-sm text-muted-foreground"
+                    data-testid="agy-action-description"
+                  >
+                    {agyPermission.actionDescription}
+                  </span>
+                )}
+              </>
             ) : null}
+            {acceptedDirectories && directoryScope}
             {submittedAnswers !== null && (
               <ul className="flex flex-col gap-0.5">
                 {Object.entries(submittedAnswers).map(([q, ans]) => (
@@ -742,12 +890,24 @@ export function ApprovalCard({
           </>
         ) : (
           <>
-            <ElicitationMessage message={message} />
+            <ElicitationMessage message={message} className="whitespace-pre-line" />
+            {agyPermission?.actionDescription && (
+              <span className="text-sm text-muted-foreground" data-testid="agy-action-description">
+                {agyPermission.actionDescription}
+              </span>
+            )}
+            {agyPermission?.alwaysAllowPattern && (
+              <span className="text-sm text-muted-foreground">
+                Always allow saves a rule for this Omnigent session. New sessions have separate
+                rules.
+              </span>
+            )}
             {formattedPreview && (
               <pre className="max-h-64 overflow-y-auto rounded bg-muted px-2 py-1 font-mono text-sm whitespace-pre-wrap break-words">
                 {formattedPreview}
               </pre>
             )}
+            {directoryScope}
             {isExternalUrl ? (
               <div className="flex flex-wrap gap-2 pt-1">
                 <Button size="sm" asChild>
@@ -810,6 +970,7 @@ export function ElicitationCard({
   return (
     <ApprovalCard
       elicitationId={item.elicitationId}
+      nativeDelivery={item.nativeDelivery}
       message={item.message}
       phase={item.phase}
       policyName={item.policyName}
@@ -823,8 +984,10 @@ export function ElicitationCard({
       codexCommand={item.codexCommand}
       allowAllEdits={item.allowAllEdits}
       allowAutoMode={item.allowAutoMode}
+      permissionDirectories={item.permissionDirectories}
       rememberScope={item.rememberScope}
       codexPersistModes={item.codexPersistModes}
+      agyPermission={item.agyPermission}
       onSubmit={onSubmit}
       requester={requester}
     />

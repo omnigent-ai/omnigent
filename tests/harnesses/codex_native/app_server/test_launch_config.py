@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import sys
 from pathlib import Path
 from typing import Any
@@ -16,10 +17,13 @@ try:
     import tomllib
 except ImportError:  # pragma: no cover - Python < 3.11
     import tomli as tomllib  # type: ignore[no-redef]
+from omnigent.errors import ErrorCategory, ErrorImpact, classify_exception
 from omnigent.harnesses.codex_native.app_server import (
+    CodexDatabricksProfileMissingError,
     build_codex_native_server,
     codex_terminal_env,
 )
+from omnigent.runner.native.orchestration import _native_terminal_start_error_payload
 from tests.harnesses.codex_native.app_server._support import (
     _disable_codex_startup_rpc,
     _test_app_server,
@@ -48,7 +52,7 @@ def test_build_codex_native_server_profile_error_names_profile(
     )
     monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(tmp_path / "missing-databrickscfg"))
 
-    with pytest.raises(OSError, match="profile 'oss'"):
+    with pytest.raises(OSError, match="profile 'oss'") as caught:
         build_codex_native_server(
             socket_path=tmp_path / "codex.sock",
             codex_home=tmp_path / "codex-home",
@@ -59,6 +63,15 @@ def test_build_codex_native_server_profile_error_names_profile(
             ap_server_url=None,
             ap_auth_headers={},
         )
+
+    # The person must fix the profile, so the failure is attributed to config
+    # and its message names the fix.
+    assert isinstance(caught.value, CodexDatabricksProfileMissingError)
+    assert classify_exception(caught.value) == (ErrorCategory.CONFIG, ErrorImpact.BLOCKING)
+    assert "databricks auth login --profile oss" in str(caught.value)
+    payload = _native_terminal_start_error_payload(caught.value, "Codex", session_id="conv_1")
+    assert str(caught.value) in payload["message"]
+    assert "see the runner log" not in payload["message"]
 
 
 def test_build_codex_native_server_uses_profile_host_without_static_token(
@@ -116,6 +129,233 @@ def test_build_codex_native_server_uses_profile_host_without_static_token(
 
     overrides = "\n".join(app_server.config_overrides)
     assert "https://example.cloud.databricks.com/ai-gateway/codex/v1" in overrides
+    assert 'databricks auth token --profile \\"oss\\"' in overrides
+
+
+_UCODE_HOST = "https://example.cloud.databricks.com"
+# Differs from the profile-derived gateway so the tests tell the two routes apart.
+_UCODE_BASE_URL = "https://ucode-gateway.example.com/codex/v1"
+_UCODE_AUTH = f"ug auth-token --host {_UCODE_HOST} --profile ug-oauth-example"
+
+
+def _ucode_codex_overrides(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, codex: dict[str, Any] | None
+) -> str:
+    """
+    Build a native Codex server for the ``oss`` profile with *codex* as ucode's entry.
+
+    :param tmp_path: Per-test directory for the profile file and ucode state.
+    :param monkeypatch: Fixture used to isolate the profile, ucode state, and discovery.
+    :param codex: ucode's ``codex`` agent entry for the profile host, or ``None``
+        for no ucode state at all.
+    :returns: The server's config overrides joined by newlines.
+    """
+    monkeypatch.setattr(
+        "omnigent.harnesses.codex_native.app_server._find_codex_cli",
+        lambda: sys.executable,
+    )
+    cfg_path = tmp_path / "databrickscfg"
+    cfg_path.write_text(
+        f"[oss]\nhost = {_UCODE_HOST}\nauth_type = databricks-cli\n", encoding="utf-8"
+    )
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(cfg_path))
+    state_path = tmp_path / "ucode-state.json"
+    if codex is not None:
+        state = {"workspaces": {_UCODE_HOST: {"agents": {"codex": codex}}}}
+        state_path.write_text(json.dumps(state), encoding="utf-8")
+    monkeypatch.setattr("omnigent.onboarding.ucode_state._STATE_PATH", state_path)
+
+    def _discovery_offline(_profile: str | None) -> object:
+        raise RuntimeError("model discovery is offline in this test")
+
+    monkeypatch.setattr(
+        "omnigent.runtime.credentials.databricks.resolve_databricks_workspace",
+        _discovery_offline,
+    )
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path,
+        model="test-model",
+        profile="oss",
+        bridge_dir=tmp_path / "bridge",
+        ap_server_url=None,
+        ap_auth_headers={},
+    )
+    return "\n".join(app_server.config_overrides)
+
+
+def test_build_codex_native_server_takes_gateway_and_auth_from_ucode_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    ucode's ``codex`` entry supplies the gateway, auth command, and refresh cadence.
+
+    ucode is the source of truth for Databricks routing, as it already is for
+    native Claude, so a profile whose workspace ucode configured uses ucode's
+    gateway and login instead of ``databricks auth token --profile``.
+    """
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {
+            "base_url": _UCODE_BASE_URL,
+            "auth_command": _UCODE_AUTH,
+            # ucode writes Codex's cadence inside its ``auth`` table.
+            "auth": {"refresh_interval_ms": 60000},
+        },
+    )
+
+    assert json.dumps(_UCODE_BASE_URL) in overrides
+    assert json.dumps(_UCODE_AUTH) in overrides
+    assert "refresh_interval_ms=60000" in overrides
+    assert "databricks auth token" not in overrides
+
+
+def test_build_codex_native_server_defaults_cadence_without_one_in_ucode_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ucode entry without a refresh cadence keeps the default cadence."""
+    overrides = _ucode_codex_overrides(
+        tmp_path, monkeypatch, {"base_url": _UCODE_BASE_URL, "auth_command": _UCODE_AUTH}
+    )
+
+    assert json.dumps(_UCODE_AUTH) in overrides
+    assert "refresh_interval_ms=900000" in overrides
+
+
+def test_build_codex_native_server_preserves_structured_ucode_auth(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The native launch retains ucode's direct argv and OAuth refresh deadline."""
+    auth = {
+        "command": "/opt/tools with spaces/ug",
+        "args": ["auth-token", "--profile", 'gateway "profile"', "--host", _UCODE_HOST],
+        "timeout_ms": 180000,
+        "refresh_interval_ms": 60000,
+    }
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": _UCODE_AUTH, "auth": auth},
+    )
+    provider = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]
+    assert provider["auth"] == auth
+    assert provider["base_url"] == _UCODE_BASE_URL
+
+
+def test_build_codex_native_server_preserves_legacy_auth_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A legacy shell helper can also supply its own refresh deadline."""
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {
+            "base_url": _UCODE_BASE_URL,
+            "auth_command": _UCODE_AUTH,
+            "auth": {"timeout_ms": 180000},
+        },
+    )
+    auth = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]["auth"]
+    assert auth == {
+        "command": "sh",
+        "args": ["-c", _UCODE_AUTH],
+        "timeout_ms": 180000,
+        "refresh_interval_ms": 900000,
+    }
+
+
+@pytest.mark.parametrize("timeout", [None, 0, -1, True, "180000", 1.5])
+def test_build_codex_native_server_defaults_invalid_ucode_auth_timeout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, timeout: object
+) -> None:
+    """Malformed state cannot emit an invalid Codex auth deadline."""
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {
+            "base_url": _UCODE_BASE_URL,
+            "auth_command": _UCODE_AUTH,
+            "auth": {"timeout_ms": timeout},
+        },
+    )
+    auth = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]["auth"]
+    assert auth["timeout_ms"] == 15000
+
+
+@pytest.mark.parametrize(
+    "structured",
+    [
+        {"command": "", "args": []},
+        {"command": 1, "args": []},
+        {"command": "ug", "args": "auth-token"},
+        {"command": "ug", "args": ["auth-token", None]},
+    ],
+)
+def test_build_codex_native_server_falls_back_from_malformed_auth_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, structured: dict[str, object]
+) -> None:
+    """An invalid structured command keeps the working legacy shell helper."""
+    overrides = _ucode_codex_overrides(
+        tmp_path,
+        monkeypatch,
+        {"base_url": _UCODE_BASE_URL, "auth_command": _UCODE_AUTH, "auth": structured},
+    )
+    auth = tomllib.loads(overrides)["model_providers"]["omnigent_databricks"]["auth"]
+    assert auth["command"] == "sh"
+    assert auth["args"] == ["-c", _UCODE_AUTH]
+
+
+def test_build_codex_native_server_keeps_profile_path_when_ucode_state_is_unreadable(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """An unreadable ucode state file falls back to the profile path without a traceback."""
+
+    def _unreadable(_workspace_url: str) -> object:
+        raise UnicodeDecodeError("utf-8", b"\xff", 0, 1, "invalid start byte")
+
+    monkeypatch.setattr("omnigent.onboarding.ucode_state.read_ucode_state", _unreadable)
+    with caplog.at_level(logging.INFO, logger="omnigent.harnesses.codex_native.app_server"):
+        overrides = _ucode_codex_overrides(tmp_path, monkeypatch, None)
+
+    assert f"{_UCODE_HOST}/ai-gateway/codex/v1" in overrides
+    assert 'databricks auth token --profile \\"oss\\"' in overrides
+    # The gateway lookup's warning names the host; discovery's own fallback names the profile.
+    warnings = [
+        r
+        for r in caplog.records
+        if f"could not read ucode state for {_UCODE_HOST!r}" in r.getMessage()
+    ]
+    assert warnings
+    assert not any(r.exc_info for r in warnings)
+
+
+@pytest.mark.parametrize(
+    "codex",
+    [None, {}, {"base_url": _UCODE_BASE_URL}, {"auth_command": _UCODE_AUTH}],
+    ids=["no-state", "empty-entry", "base-url-only", "auth-only"],
+)
+def test_build_codex_native_server_keeps_profile_path_without_usable_ucode_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    codex: dict[str, Any] | None,
+) -> None:
+    """
+    Without a ucode entry naming both a base URL and auth, the profile path is kept.
+
+    A half-written entry would pair one workspace's gateway with another login,
+    so it never overrides the profile-derived gateway and auth.
+    """
+    overrides = _ucode_codex_overrides(tmp_path, monkeypatch, codex)
+
+    assert f"{_UCODE_HOST}/ai-gateway/codex/v1" in overrides
+    assert _UCODE_BASE_URL not in overrides
+    assert "ug auth-token" not in overrides
     assert 'databricks auth token --profile \\"oss\\"' in overrides
 
 
@@ -274,6 +514,8 @@ def test_build_codex_native_server_pins_profile_resolved_model(
         # Subscription: an explicit pick and a catalog-resolved Default.
         ("gpt-5.5", None, ['model_provider="openai"']),
         ("gpt-5.6-terra", None, ['model_provider="openai"']),
+        ("system.ai.gpt-6-1-sol", None, ['model_provider="openai"']),
+        ("databricks-gpt-5-6-sol", None, None),
         # cli-config: the user's own provider table rides the config copy.
         ("gpt-5.5", None, ['model_provider="Databricks"']),
         # Databricks profile: Default and an explicit pick.
@@ -342,6 +584,7 @@ def test_launch_argv_and_config_pin_name_the_same_model(
     assert comparable_model_id(argv_model) == comparable_model_id(pinned)
     if profile is None:
         assert argv_model == pinned
+        assert pinned == model
 
 
 async def test_start_pins_reasoning_effort_in_config(
@@ -373,6 +616,54 @@ async def test_start_pins_reasoning_effort_in_config(
     rendered = (codex_home / "config.toml").read_text(encoding="utf-8")
     assert tomllib.loads(rendered)["model_reasoning_effort"] == "ultra"
     assert rendered.count("model_reasoning_effort") == 1
+    assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
+
+
+def test_build_codex_native_server_owns_add_dir_roots(tmp_path: Path) -> None:
+    """``--add-dir`` roots resolve against the workspace, as Codex resolves them."""
+    app_server = build_codex_native_server(
+        socket_path=tmp_path / "codex.sock",
+        codex_home=tmp_path / "codex-home",
+        cwd=tmp_path / "workspace",
+        model=None,
+        profile=None,
+        bridge_dir=tmp_path / "bridge",
+        codex_path="/opt/codex/bin/codex",
+        terminal_launch_args=("--add-dir", "attachments", "--add-dir=/shared"),
+    )
+
+    assert app_server.writable_roots == (str(tmp_path / "workspace" / "attachments"), "/shared")
+
+
+async def test_start_writes_add_dir_roots_for_remote_threads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Startup appends ``--add-dir`` roots to the private workspace-write roots.
+
+    The ``--remote`` TUI cannot pass them, and the thread it starts takes its
+    writable roots from this config. The user's own roots stay first.
+    """
+    real_codex_home = tmp_path / "real-codex-home"
+    real_codex_home.mkdir()
+    original = '[sandbox_workspace_write]\nwritable_roots = ["/configured"]\n'
+    (real_codex_home / "config.toml").write_text(original, encoding="utf-8")
+    codex_home = tmp_path / "codex-home"
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(real_codex_home))
+    _disable_codex_startup_rpc(monkeypatch)
+
+    server = _test_app_server(tmp_path, codex_home, tmp_path / "bridge", workspace)
+    server.writable_roots = (str(tmp_path / "attachments"), "/configured")
+    await server.start()
+    await server.close()
+
+    rendered = tomllib.loads((codex_home / "config.toml").read_text(encoding="utf-8"))
+    assert rendered["sandbox_workspace_write"]["writable_roots"] == [
+        "/configured",
+        str(tmp_path / "attachments"),
+    ]
     assert (real_codex_home / "config.toml").read_text(encoding="utf-8") == original
 
 

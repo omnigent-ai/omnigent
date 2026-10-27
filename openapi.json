@@ -48,6 +48,160 @@
         "title": "AddCommentRequest",
         "type": "object"
       },
+      "AgentConfigObject": {
+        "description": "Owner-only configuration read and PATCH result.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
+          "id": {
+            "title": "Id",
+            "type": "string"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "mcp_servers": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/AgentMCPConfig"
+            },
+            "title": "Mcp Servers",
+            "type": "object"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          },
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "version": {
+            "format": "int64",
+            "title": "Version",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "id",
+          "name",
+          "version"
+        ],
+        "title": "AgentConfigObject",
+        "type": "object"
+      },
+      "AgentConfigPatch": {
+        "additionalProperties": false,
+        "description": "Merge-style update of an owned agent, with immutable identity.",
+        "properties": {
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 4096,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Harness"
+          },
+          "instructions": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Instructions"
+          },
+          "mcp_servers": {
+            "anyOf": [
+              {
+                "patternProperties": {
+                  "^[A-Za-z0-9_-][A-Za-z0-9_.-]{0,127}$": {
+                    "anyOf": [
+                      {
+                        "$ref": "#/components/schemas/MCPServerPatch"
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Mcp Servers"
+          },
+          "model": {
+            "anyOf": [
+              {
+                "minLength": 1,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model"
+          }
+        },
+        "title": "AgentConfigPatch",
+        "type": "object"
+      },
       "AgentDetailObject": {
         "description": "Agent summary with caller ownership for management actions.",
         "properties": {
@@ -86,6 +240,11 @@
           "id": {
             "title": "Id",
             "type": "string"
+          },
+          "mcp_registry_editable": {
+            "default": false,
+            "title": "Mcp Registry Editable",
+            "type": "boolean"
           },
           "mcp_servers": {
             "items": {
@@ -161,6 +320,79 @@
         "title": "AgentDetailObject",
         "type": "object"
       },
+      "AgentMCPConfig": {
+        "description": "Editable MCP projection without credential values.",
+        "properties": {
+          "args": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Args",
+            "type": "array"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "configured_env_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Configured Env Names",
+            "type": "array"
+          },
+          "configured_header_names": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Configured Header Names",
+            "type": "array"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "editable": {
+            "default": true,
+            "title": "Editable",
+            "type": "boolean"
+          },
+          "transport": {
+            "title": "Transport",
+            "type": "string"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "required": [
+          "transport"
+        ],
+        "title": "AgentMCPConfig",
+        "type": "object"
+      },
       "AgentObject": {
         "description": "API representation of a registered agent.",
         "properties": {
@@ -204,6 +436,12 @@
             "description": "Unique agent identifier, e.g. `\"ag_abc123\"`.",
             "title": "Id",
             "type": "string"
+          },
+          "mcp_registry_editable": {
+            "default": false,
+            "description": "Whether this caller owns the session and can select managed MCP services independently of agent ownership.",
+            "title": "Mcp Registry Editable",
+            "type": "boolean"
           },
           "mcp_servers": {
             "description": "MCP servers the agent is connected to (secret fields omitted). Empty list when the spec declares no MCP servers or when the bundle cannot be loaded.",
@@ -435,6 +673,25 @@
           "file"
         ],
         "title": "Body_upload_session_file_v1_sessions__session_id__resources_files_post",
+        "type": "object"
+      },
+      "Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post": {
+        "properties": {
+          "file": {
+            "contentMediaType": "application/octet-stream",
+            "title": "File",
+            "type": "string"
+          },
+          "pr_url": {
+            "title": "Pr Url",
+            "type": "string"
+          }
+        },
+        "required": [
+          "pr_url",
+          "file"
+        ],
+        "title": "Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post",
         "type": "object"
       },
       "BrandingInfo": {
@@ -2637,6 +2894,28 @@
         "title": "FailedResponseObject",
         "type": "object"
       },
+      "FilesystemAttachmentsInfo": {
+        "description": "Which uploads native sessions receive as files, for client-side checks.",
+        "properties": {
+          "all_types": {
+            "title": "All Types",
+            "type": "boolean"
+          },
+          "extensions": {
+            "items": {
+              "type": "string"
+            },
+            "title": "Extensions",
+            "type": "array"
+          }
+        },
+        "required": [
+          "extensions",
+          "all_types"
+        ],
+        "title": "FilesystemAttachmentsInfo",
+        "type": "object"
+      },
       "FunctionCallData": {
         "description": "Data for a function_call item.\n\n**Parameters**\n\n- `agent` \u2014 Agent name. Serialized as `\"model\"` in JSON.",
         "properties": {
@@ -3384,6 +3663,120 @@
         "title": "LocalImportResponse",
         "type": "object"
       },
+      "MCPServerPatch": {
+        "additionalProperties": false,
+        "description": "Partial MCP declaration; omitted fields and credential keys are preserved.",
+        "properties": {
+          "args": {
+            "anyOf": [
+              {
+                "items": {
+                  "type": "string"
+                },
+                "maxItems": 64,
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Args"
+          },
+          "command": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Command"
+          },
+          "description": {
+            "anyOf": [
+              {
+                "maxLength": 512,
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Description"
+          },
+          "env": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Env"
+          },
+          "headers": {
+            "anyOf": [
+              {
+                "additionalProperties": {
+                  "anyOf": [
+                    {
+                      "type": "string"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "type": "object"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Headers"
+          },
+          "transport": {
+            "anyOf": [
+              {
+                "enum": [
+                  "http",
+                  "stdio"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Transport"
+          },
+          "url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Url"
+          }
+        },
+        "title": "MCPServerPatch",
+        "type": "object"
+      },
       "MCPServerSummary": {
         "description": "Safe subset of an MCP server's configuration for API exposure.\n\nHeader values are redacted (`\"[REDACTED]\"`) so callers can see\nwhich headers are configured without leaking the actual secrets.\n`env` is still fully excluded.",
         "properties": {
@@ -3493,10 +3886,32 @@
       "McpServerSummary": {
         "description": "An MCP server a harness loads on the host, without secrets.",
         "properties": {
+          "auth_status": {
+            "anyOf": [
+              {
+                "enum": [
+                  "connected",
+                  "sign_in_required"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Account state reported by the host's sign-in manager: `connected` or `sign_in_required`; `None` when nothing reports one.",
+            "title": "Auth Status"
+          },
           "harness": {
             "description": "Harness family that loads it: `claude`, `codex`, or `cursor`.",
             "title": "Harness",
             "type": "string"
+          },
+          "managed": {
+            "default": false,
+            "description": "Whether an organization pins this server for every user on the host (Claude Code's enterprise MCP config), so it is not the user's to edit.",
+            "title": "Managed",
+            "type": "boolean"
           },
           "name": {
             "description": "Server name as configured, e.g. `\"github\"`.",
@@ -3520,6 +3935,18 @@
             "description": "Config scope; always `user` today.",
             "title": "Scope",
             "type": "string"
+          },
+          "sign_in_url": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Where the user finishes signing in; only with `sign_in_required`, and only an http(s) URL carrying no credentials.",
+            "title": "Sign In Url"
           },
           "source_id": {
             "anyOf": [
@@ -3732,6 +4159,16 @@
             ],
             "title": "Role",
             "type": "string"
+          },
+          "startup_options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupInputOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "stream_message_id": {
             "anyOf": [
@@ -3962,6 +4399,80 @@
           "item"
         ],
         "title": "NativeToolData",
+        "type": "object"
+      },
+      "NativeUsageBaseline": {
+        "description": "Own-session cumulative usage for resuming a native usage reporter.\n\nExcludes spawned sessions. Input includes cache reads, matching the native\nusage event contract rather than the display's separate token buckets.",
+        "properties": {
+          "cumulative_cache_read_input_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Cumulative Cache Read Input Tokens",
+            "type": "integer"
+          },
+          "cumulative_cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cumulative Cost Usd"
+          },
+          "cumulative_input_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Cumulative Input Tokens",
+            "type": "integer"
+          },
+          "cumulative_output_tokens": {
+            "default": 0,
+            "format": "int64",
+            "minimum": 0.0,
+            "title": "Cumulative Output Tokens",
+            "type": "integer"
+          }
+        },
+        "title": "NativeUsageBaseline",
+        "type": "object"
+      },
+      "OpenFileRequest": {
+        "additionalProperties": false,
+        "description": "A workspace-relative file to show, without reading or modifying it.",
+        "properties": {
+          "path": {
+            "description": "Workspace-relative file path.",
+            "maxLength": 4096,
+            "minLength": 1,
+            "title": "Path",
+            "type": "string"
+          }
+        },
+        "required": [
+          "path"
+        ],
+        "title": "OpenFileRequest",
+        "type": "object"
+      },
+      "OpenFileResponse": {
+        "description": "Delivery to live streams is not an acknowledgement from a file viewer.",
+        "properties": {
+          "subscribers": {
+            "format": "int64",
+            "title": "Subscribers",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "subscribers"
+        ],
+        "title": "OpenFileResponse",
         "type": "object"
       },
       "OutputFileDoneEvent": {
@@ -5242,6 +5753,18 @@
       "SandboxStatus": {
         "description": "Managed-sandbox launch progress for a `host_type=\"managed\"` session.\n\nCarried on the session snapshot only while the session's\nbackground sandbox launch is in flight or has failed; `None`\nfor sessions without a managed launch and once the launch\nsucceeds (the session then looks like any host-bound session).",
         "properties": {
+          "details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "What the user needs to do when `stage == \"action_required\"`, e.g. `\"Sign in on your laptop.\"`. `None` otherwise.",
+            "title": "Details"
+          },
           "error": {
             "anyOf": [
               {
@@ -5254,10 +5777,23 @@
             "description": "Failure detail when `stage == \"failed\"`, e.g. `\"managed sandbox launch failed: spend limit reached\"`. `None` otherwise.",
             "title": "Error"
           },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Sandbox provider being launched, e.g. `\"arclet\"`, or `None` when unknown.",
+            "title": "Provider"
+          },
           "stage": {
-            "description": "Current launch stage, e.g. `\"provisioning\"` \u2014 one of `SandboxLaunchStage`, in pipeline order: `provisioning` (creating the sandbox) \u2192 `cloning` (cloning the repository workspace; skipped when the session has none) \u2192 `starting` (starting the in-sandbox host) \u2192 `connecting` (launching the agent runner) \u2192 `ready` / `failed`.",
+            "description": "Current launch stage, e.g. `\"provisioning\"` \u2014 one of `SandboxLaunchStage`, in pipeline order: `provisioning` (creating the sandbox; `action_required` while it also needs the user to act) \u2192 `cloning` (cloning the repository workspace; skipped when the session has none) \u2192 `starting` (starting the in-sandbox host) \u2192 `connecting` (launching the agent runner) \u2192 `ready` / `failed`.",
             "enum": [
               "provisioning",
+              "action_required",
               "cloning",
               "starting",
               "connecting",
@@ -5310,6 +5846,11 @@
             "title": "Accounts Enabled",
             "type": "boolean"
           },
+          "agent_config_edit": {
+            "default": false,
+            "title": "Agent Config Edit",
+            "type": "boolean"
+          },
           "agent_detail": {
             "default": false,
             "title": "Agent Detail",
@@ -5336,6 +5877,11 @@
             "title": "Dictation Available",
             "type": "boolean"
           },
+          "durable_initial_input": {
+            "default": false,
+            "title": "Durable Initial Input",
+            "type": "boolean"
+          },
           "enabled_connections": {
             "items": {
               "type": "string"
@@ -5349,6 +5895,16 @@
             },
             "title": "Features",
             "type": "object"
+          },
+          "filesystem_attachments": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/FilesystemAttachmentsInfo"
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "harness_install_enabled": {
             "title": "Harness Install Enabled",
@@ -5393,6 +5949,11 @@
             "title": "Public Sharing Max Level",
             "type": "string"
           },
+          "request_managed_sandbox_host_id": {
+            "default": true,
+            "title": "Request Managed Sandbox Host Id",
+            "type": "boolean"
+          },
           "sandbox_provider": {
             "anyOf": [
               {
@@ -5425,6 +5986,11 @@
           "server_version": {
             "title": "Server Version",
             "type": "string"
+          },
+          "session_search_scope": {
+            "default": true,
+            "title": "Session Search Scope",
+            "type": "boolean"
           },
           "sharing_mode": {
             "enum": [
@@ -5529,7 +6095,8 @@
             "turn.cancelled": "#/components/schemas/TurnCancelledEvent",
             "turn.completed": "#/components/schemas/TurnCompletedEvent",
             "turn.failed": "#/components/schemas/TurnFailedEvent",
-            "turn.started": "#/components/schemas/TurnStartedEvent"
+            "turn.started": "#/components/schemas/TurnStartedEvent",
+            "ui.open_file": "#/components/schemas/UiOpenFileEvent"
           },
           "propertyName": "type"
         },
@@ -5644,6 +6211,9 @@
           },
           {
             "$ref": "#/components/schemas/BrowserActionRequestEvent"
+          },
+          {
+            "$ref": "#/components/schemas/UiOpenFileEvent"
           },
           {
             "$ref": "#/components/schemas/PolicyDeniedEvent"
@@ -6060,6 +6630,18 @@
             "description": "Opt-in for the DANGEROUS codex-native full-bypass (`--dangerously-bypass-approvals-and-sandbox`) on the fork. The source's bypass label is ALWAYS dropped on a fork (a bypass-armed source can never silently re-arm its clone), so this is the only way a fork enables it \u2014 an explicit, banner-gated opt-in from the dialog, mirroring the new-session approval selector. `True` stamps `omnigent.codex_native.bypass_sandbox` on the fork; `False` / omitted leaves the fork in Codex's normal approval/sandbox stance. Only meaningful for a codex-native target; ignored otherwise.",
             "title": "Codex Bypass Sandbox",
             "type": "boolean"
+          },
+          "host_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Id for the fork's new sandbox host, with the same shape, capability gate, label and `409` as a managed create's `host_id`. `None` lets the server mint one. Only valid with `host_type: \"managed\"`.",
+            "title": "Host Id"
           },
           "host_type": {
             "default": "external",
@@ -6545,6 +7127,18 @@
             ],
             "description": "Git branch checked out in the session's worktree, e.g. `\"feature/login\"`. Set only when the session was created with a server-created git worktree; `None` otherwise. The Web UI uses a non-`None` value to offer the \"delete local branch\" cleanup checkbox on session delete. See designs/SESSION_GIT_WORKTREE.md.",
             "title": "Git Branch"
+          },
+          "harness": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Canonical effective harness, including per-session overrides.",
+            "title": "Harness"
           },
           "host_id": {
             "anyOf": [
@@ -7521,6 +8115,17 @@
             "description": "Per-session LLM model override, e.g. `\"claude-opus-4-7\"`. `None` means no override is active (the agent's `llm_model` applies). Set via `PATCH /v1/sessions/{id}` or the REPL's `/model` command; both write the same column so the web UI and the TUI stay in sync.",
             "title": "Model Override"
           },
+          "native_usage_baseline": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/NativeUsageBaseline"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Pi's own cumulative token baseline, excluding descendants. Available even when display usage aggregation is skipped; `None` for other harnesses or older servers."
+          },
           "parent_session_id": {
             "anyOf": [
               {
@@ -7543,7 +8148,7 @@
             "type": "array"
           },
           "pending_inputs": {
-            "description": "Un-consumed web-composer user messages on native-terminal (claude-native / codex-native) sessions at snapshot time, each `{\"pending_id\", \"content\"}`. Native sessions don't persist a web message at POST time (the transcript forwarder is the single writer), so a client that posted then navigated away / rebound would lose its optimistic bubble; replaying these re-hydrates it. Empty list otherwise. Sourced from the in-memory `omnigent.runtime.pending_inputs` index.",
+            "description": "Accepted messages awaiting consumption, each `{\"pending_id\", \"content\"}`. Includes durable managed-startup inputs and native messages awaiting a transcript receipt. Clients restore their pending bubbles from this list after reconnecting. Ordinary native sends use the in-memory `omnigent.runtime.pending_inputs` index; startup inputs also survive server restart in the conversation store.",
             "items": {
               "additionalProperties": true,
               "type": "object"
@@ -7794,6 +8399,19 @@
             "title": "Conversation Id",
             "type": "string"
           },
+          "details": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "What the user needs to do when `stage == \"action_required\"`, e.g. `\"Sign in on your laptop.\"`. `None` otherwise.",
+            "title": "Details"
+          },
           "error": {
             "anyOf": [
               {
@@ -7806,6 +8424,19 @@
             "default": null,
             "description": "Failure detail when `stage == \"failed\"`, e.g. `\"managed sandbox launch failed: spend limit reached\"`. `None` otherwise. Category: **transient** (SSE-only). On reconnect, clients seed the progress indicator from the session snapshot's `sandbox_status` field, which is populated by `_session_sandbox_status_cache` at snapshot build time.",
             "title": "Error"
+          },
+          "provider": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Sandbox provider being launched, e.g. `\"arclet\"`, or `None` when unknown.",
+            "title": "Provider"
           },
           "sequence_number": {
             "anyOf": [
@@ -7824,6 +8455,7 @@
             "description": "The launch stage just entered, e.g. `\"provisioning\"` \u2014 see `SandboxStatus` for the full pipeline order.",
             "enum": [
               "provisioning",
+              "action_required",
               "cloning",
               "starting",
               "connecting",
@@ -8597,6 +9229,16 @@
             ],
             "description": "`<local-command-stdout>` text when present, else `None` (the common case \u2014 Skills act via the next assistant turn, not stdout).",
             "title": "Output"
+          },
+          "startup_options": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/StartupInputOptions"
+              },
+              {
+                "type": "null"
+              }
+            ]
           }
         },
         "required": [
@@ -8623,6 +9265,44 @@
           "oss"
         ],
         "title": "SmartRoutingSourcesInfo",
+        "type": "object"
+      },
+      "StartupInputOptions": {
+        "description": "Request options retained only while a startup input awaits delivery.",
+        "properties": {
+          "background_titles_enabled": {
+            "default": false,
+            "title": "Background Titles Enabled",
+            "type": "boolean"
+          },
+          "model_override": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Model Override"
+          },
+          "tools": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": true,
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Tools"
+          }
+        },
+        "title": "StartupInputOptions",
         "type": "object"
       },
       "StoreHarnessCredentialRequest": {
@@ -8942,6 +9622,39 @@
         "title": "TurnStartedEvent",
         "type": "object"
       },
+      "UiOpenFileEvent": {
+        "description": "Ask current session viewers to open a workspace-relative file; never replayed.",
+        "properties": {
+          "path": {
+            "title": "Path",
+            "type": "string"
+          },
+          "sequence_number": {
+            "anyOf": [
+              {
+                "format": "int64",
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Sequence Number"
+          },
+          "type": {
+            "const": "ui.open_file",
+            "title": "Type",
+            "type": "string"
+          }
+        },
+        "required": [
+          "type",
+          "path"
+        ],
+        "title": "UiOpenFileEvent",
+        "type": "object"
+      },
       "UpdateCodexGoalStatusRequest": {
         "additionalProperties": false,
         "description": "Request body for `PATCH /v1/sessions/{id}/codex_goal/status`.\n\nCodex app-server represents pause/resume as `thread/goal/set` status\nupdates. Omnigent exposes the two user-driven transitions explicitly:\n`\"paused\"` pauses an active goal, and `\"active\"` resumes a paused,\nblocked, or usage-limited goal.",
@@ -9220,7 +9933,7 @@
                 "type": "null"
               }
             ],
-            "description": "Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
+            "description": "Owner-only Claude-native permission mode to switch a running session to, e.g. `\"auto\"`. Only the modes Claude Code's shift+tab cycle can reach are accepted (`default`, `acceptEdits`, `plan`, `auto`) \u2014 `dontAsk` and `bypassPermissions` are launch-only. Only valid for sessions stamped with the claude-native wrapper label. Unlike the other fields here the switch is applied by the live TUI, so a failure to reach the mode is surfaced as an error rather than persisted. Omitted leaves unchanged.",
             "title": "Permission Mode"
           },
           "project_id": {
@@ -9301,7 +10014,7 @@
                 "type": "null"
               }
             ],
-            "description": "Per-session native-terminal pass-through args, e.g. `[\"--dangerously-skip-permissions\"]`. A list (including `[]`) replaces the stored value wholesale \u2014 resume is last-write-wins, never an append. Bounds (count / length) are validated server-side. `None` leaves unchanged.",
+            "description": "Per-session native-terminal pass-through args, e.g. `[\"--dangerously-skip-permissions\"]`. Updating this field requires session ownership. A list (including `[]`) replaces the stored value wholesale \u2014 resume is last-write-wins, never an append. Bounds (count / length) are validated server-side. `None` leaves unchanged.",
             "title": "Terminal Launch Args"
           },
           "title": {
@@ -9379,7 +10092,8 @@
           "transport": {
             "enum": [
               "http",
-              "stdio"
+              "stdio",
+              "registry"
             ],
             "title": "Transport",
             "type": "string"
@@ -9626,7 +10340,7 @@
   "paths": {
     "/.well-known/omnigent.json": {
       "get": {
-        "description": "Version manifest for NON-BROWSER clients \u2014 chiefly the desktop shell.\n\nThe desktop shell ships and updates on its own cadence, so any\ninstalled build can meet any server version. The shell is the side\nthat must adapt (the user may not update it for months), and to adapt\nit first has to know what it is talking to. This endpoint is that\nanswer, fetched BEFORE the SPA loads \u2014 unlike `/v1/info`, which the\nSPA reads after boot and which is therefore useless to the shell when\ndeciding how to open a window in the first place.\n\nContract, in the order a client should apply it:\n\n1. `manifest_version` (int) versions this ENVELOPE. Clients gate on\n   `>=`, never `==`, so a newer server keeps working with an older\n   shell. See `WELL_KNOWN_MANIFEST_VERSION` for when it bumps \u2014\n   adding a field never does.\n2. `server_version` (str) is the installed omnigent package version,\n   the same value as `/api/version` and `/v1/info.server_version`.\n   Informational: for display and bug reports, NOT for gating. Gate on\n   the fields below, which state capability directly rather than making\n   every client hardcode \"which release added X\".\n3. `min_desktop_version` (str | null) is the oldest desktop build this\n   server still supports. Null means no floor \u2014 the overwhelmingly\n   common case, and what every shipped shell must treat as \"fine\".\n   A server sets it only to signal a genuinely breaking change.\n4. Everything else is additive detail an older client may ignore\n   wholesale. `ui` describes where server-driven chrome lives, so a\n   shell can place its own window furniture without guessing from the\n   version number: `server_picker` is `\"sidebar\"` on builds that\n   dock the picker at the sidebar's bottom (it was `\"titlebar\"`,\n   centered in the macOS title-bar strip, before this).\n5. `auth` tells a native client how this server signs users in,\n   before it loads anything. `mode` is `\"oidc\"`, `\"accounts\"`,\n   `\"header\"`, `\"custom\"` (an embedding app's own provider), or\n   `\"none\"`. `\"oidc\"` also promises the native loopback sign-in\n   (`/auth/login` native parameters + `POST /auth/native-token`).\n   `session_cookie` names the session cookie for `oidc` and\n   `accounts` and is `null` otherwise. `native_redirect_uris`\n   lists the private-use-scheme redirects (e.g. the iOS app's\n   `ai.omnigent.ios:/oauth/callback`) the native sign-in accepts\n   besides loopback, sorted, for `oidc`; `null` otherwise. The\n   iOS app gates on its URI being listed, because servers that only\n   support loopback answer the custom scheme with 400. A missing\n   `auth` (older servers) means \"sign in as before\".\n6. `server_name` (str | null) is the operator's display name for\n   this deployment (`branding.server_name`), for clients that list\n   several servers. Self-asserted by the server, so clients show it\n   for display only and keep the host in any trust decision. Null\n   when unset; it never falls back to `branding.app_name`.\n\nUnknown fields MUST be ignored, and a missing manifest (404 \u2014 every\nserver older than this route) MUST be treated as the pre-manifest\nbaseline, not an error: the shell falls back to its current behavior.\nThat is what makes an old shell + new server and a new shell + old\nserver both work.\n\nAuthentication: intentionally UNAUTHED, like `/v1/info`. A client\nmust be able to read this before it holds a session cookie \u2014 the whole\npoint is to consult it before loading the app. It exposes only the\nversion already public via `/api/version`, coarse UI-shape\nstrings, and the sign-in mode and cookie name any visitor already\nlearns from `/v1/info` and the login redirect, so there is\nnothing here to leak.\n\nServed under `/.well-known/` (RFC 8615) so it sits at a fixed,\nguessable path that never collides with an SPA client route.\n\n**Returns:** The manifest described above.",
+        "description": "Version manifest for NON-BROWSER clients \u2014 chiefly the desktop shell.\n\nThe desktop shell ships and updates on its own cadence, so any\ninstalled build can meet any server version. The shell is the side\nthat must adapt (the user may not update it for months), and to adapt\nit first has to know what it is talking to. This endpoint is that\nanswer, fetched BEFORE the SPA loads \u2014 unlike `/v1/info`, which the\nSPA reads after boot and which is therefore useless to the shell when\ndeciding how to open a window in the first place.\n\nContract, in the order a client should apply it:\n\n1. `manifest_version` (int) versions this ENVELOPE. Clients gate on\n   `>=`, never `==`, so a newer server keeps working with an older\n   shell. See `WELL_KNOWN_MANIFEST_VERSION` for when it bumps \u2014\n   adding a field never does.\n2. `server_version` (str) is the installed omnigent package version,\n   the same value as `/api/version` and `/v1/info.server_version`.\n   Informational: for display and bug reports, NOT for gating. Gate on\n   the fields below, which state capability directly rather than making\n   every client hardcode \"which release added X\".\n3. `min_desktop_version` (str | null) is the oldest desktop build this\n   server still supports. Null means no floor \u2014 the overwhelmingly\n   common case, and what every shipped shell must treat as \"fine\".\n   A server sets it only to signal a genuinely breaking change.\n4. Everything else is additive detail an older client may ignore\n   wholesale. `ui` describes where server-driven chrome lives, so a\n   shell can place its own window furniture without guessing from the\n   version number: `server_picker` is `\"sidebar\"` on builds that\n   dock the picker at the sidebar's bottom (it was `\"titlebar\"`,\n   centered in the macOS title-bar strip, before this).\n5. `auth` tells a native client how this server signs users in,\n   before it loads anything. `mode` is `\"oidc\"`, `\"accounts\"`,\n   `\"header\"`, `\"custom\"` (an embedding app's own provider), or\n   `\"none\"`. `\"oidc\"` also promises the native loopback sign-in\n   (`/auth/login` native parameters + `POST /auth/native-token`).\n   `session_cookie` names the session cookie for `oidc` and\n   `accounts` and is `null` otherwise. `native_redirect_uris`\n   lists the private-use-scheme redirects (the iOS and Android apps'\n   `ai.omnigent.ios:/oauth/callback` and\n   `ai.omnigent.android:/oauth/callback`) the native sign-in accepts\n   besides loopback, sorted, for `oidc`; `null` otherwise. Each\n   app gates on its own URI being listed, because servers that don't\n   accept it answer that redirect with 400. A missing\n   `auth` (older servers) means \"sign in as before\".\n6. `server_name` (str | null) is the operator's display name for\n   this deployment (`branding.server_name`), for clients that list\n   several servers. Self-asserted by the server, so clients show it\n   for display only and keep the host in any trust decision. Null\n   when unset; it never falls back to `branding.app_name`.\n\nUnknown fields MUST be ignored, and a missing manifest (404 \u2014 every\nserver older than this route) MUST be treated as the pre-manifest\nbaseline, not an error: the shell falls back to its current behavior.\nThat is what makes an old shell + new server and a new shell + old\nserver both work.\n\nAuthentication: intentionally UNAUTHED, like `/v1/info`. A client\nmust be able to read this before it holds a session cookie \u2014 the whole\npoint is to consult it before loading the app. It exposes only the\nversion already public via `/api/version`, coarse UI-shape\nstrings, and the sign-in mode and cookie name any visitor already\nlearns from `/v1/info` and the login redirect, so there is\nnothing here to leak.\n\nServed under `/.well-known/` (RFC 8615) so it sits at a fixed,\nguessable path that never collides with an SPA client route.\n\n**Returns:** The manifest described above.",
         "operationId": "well_known_manifest__well_known_omnigent_json_get",
         "responses": {
           "200": {
@@ -9964,6 +10678,200 @@
           }
         },
         "summary": "Get Agent",
+        "tags": [
+          "agents"
+        ]
+      },
+      "patch": {
+        "description": "Patch only supplied fields; optionally check the ETag from GET /agents/{id}/config.",
+        "operationId": "patch_agent_config_v1_agents__agent_id__patch",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "if-match",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "If-Match"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AgentConfigPatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentConfigObject"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid If-Match header"
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Configuration cannot be edited"
+          },
+          "412": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Agent changed; reload before saving"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Request or bundle exceeds the size limit"
+          },
+          "415": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "A JSON request body is required"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Invalid partial configuration"
+          }
+        },
+        "summary": "Patch Agent Config",
+        "tags": [
+          "agents"
+        ]
+      }
+    },
+    "/v1/agents/{agent_id}/config": {
+      "get": {
+        "description": "Read owned configuration and its ETag; credential values are never returned.",
+        "operationId": "get_agent_config_v1_agents__agent_id__config_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "agent_id",
+            "required": true,
+            "schema": {
+              "title": "Agent Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/AgentConfigObject"
+                }
+              }
+            },
+            "description": "Successful Response",
+            "headers": {
+              "ETag": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Bundle format cannot be edited"
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponse"
+                }
+              }
+            },
+            "description": "Agent bundle exceeds the size limit"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Agent Config",
         "tags": [
           "agents"
         ]
@@ -10665,6 +11573,96 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/harnesses/accounts/refresh": {
+      "post": {
+        "description": "Probe non-secret harness accounts, using a recent connection result.",
+        "operationId": "refresh_host_harness_accounts_v1_hosts__host_id__harnesses_accounts_refresh_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Refresh Host Harness Accounts V1 Hosts  Host Id  Harnesses Accounts Refresh Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Host Harness Accounts",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/refresh": {
+      "post": {
+        "description": "Force an immediate full harness-readiness probe on a host.",
+        "operationId": "refresh_host_harnesses_v1_hosts__host_id__harnesses_refresh_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Refresh Host Harnesses V1 Hosts  Host Id  Harnesses Refresh Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Host Harnesses",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/harnesses/{harness}/credential": {
       "post": {
         "description": "Write a harness provider credential onto a connected host.\n\nBacks the Web UI setup dialog's \"Add a credential\" action so a user can\nconfigure a Claude / Codex / Pi credential on a connected host without a\nterminal. Owner-scoped, allowlisted, and gated behind\n`harness_install` release feature exactly like the install route\n(404 when disabled). The host daemon does the write with the same\nnon-interactive core the `omnigent setup` wizard uses.\n\nSecurity: the server is an authz'd pass-through \u2014 it validates\nownership + the allowlist and forwards the secret over the (TLS) tunnel;\nit never persists the secret or logs it. The secret rides in the request\nbody (not the URL), and the frame field is redaction-named so it never\nlands on a telemetry span.\n\n**Parameters**\n\n- `body` \u2014 The credential payload (kind + secret / gateway / adopt).\n\n**Returns:** `{\"object\": \"harness_credential\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 refreshed readiness so the UI can flip the badge without a reconnect, plus the refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when disabled or host unknown, 400 when the harness isn't UI-configurable or the body is invalid, 403 when not the owner, 409 when offline or the host daemon is too old to store credentials, 502 on host-side failure, 504 on timeout.",
@@ -10733,7 +11731,7 @@
     },
     "/v1/hosts/{host_id}/harnesses/{harness}/install": {
       "post": {
-        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline or its daemon is too old to install harnesses, 502 on a host-side install failure, 504 on host timeout.",
+        "description": "Install a missing, npm-installable harness CLI onto a host.\n\nBacks the Web UI's New Chat dialog \"Install\" action so a user can\ninstall a harness the connected host is missing without dropping to a\nterminal. Owner-scoped like the other host actions: only the host owner\nmay install onto it. Scoped to the UI-installable allowlist (claude,\ncodex, pi, opencode, qwen) \u2014 curl/brew and interactive-auth harnesses\nare refused. The whole route is gated behind\n`harness_install` in `OMNIGENT_FEATURES` (default off): when\ndisabled it returns 404 so the feature is invisible until opted in.\n\nConcurrent requests for the same (host, harness) coalesce onto one\nin-flight install so a double-click can't fire two global npm installs.\n\n**Returns:** `{\"object\": \"harness_install\", \"harness\": ..., \"configured_harnesses\": {...}, \"version\": str | None, \"gateway_inference\": {...} | None}` \u2014 the host's refreshed readiness map so the UI can flip the badge without a reconnect, plus its refreshed gateway-inference map (`None` when the host didn't report one).\n\n**Raises**\n\n- `HTTPException` \u2014 404 when the feature is disabled or the host is unknown, 400 when the harness is not UI-installable, 403 when the caller is not the host owner, 409 when the host is offline or its daemon is too old to install harnesses, 502 on a host-side install failure, 504 on host timeout.",
         "operationId": "install_host_harness_v1_hosts__host_id__harnesses__harness__install_post",
         "parameters": [
           {
@@ -10782,6 +11780,238 @@
           }
         },
         "summary": "Install Host Harness",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/login": {
+      "post": {
+        "description": "Start a Codex device-code login on a connected host.",
+        "operationId": "start_host_harness_login_v1_hosts__host_id__harnesses__harness__login_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Host Harness Login V1 Hosts  Host Id  Harnesses  Harness  Login Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Host Harness Login",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/login/{login_id}": {
+      "delete": {
+        "description": "Cancel an active device login.",
+        "operationId": "cancel_host_harness_login_v1_hosts__host_id__harnesses__harness__login__login_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "login_id",
+            "required": true,
+            "schema": {
+              "title": "Login Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Host Harness Login V1 Hosts  Host Id  Harnesses  Harness  Login  Login Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Host Harness Login",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "get": {
+        "description": "Return the current device-login status without exposing its code.",
+        "operationId": "get_host_harness_login_v1_hosts__host_id__harnesses__harness__login__login_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "login_id",
+            "required": true,
+            "schema": {
+              "title": "Login Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Host Harness Login V1 Hosts  Host Id  Harnesses  Harness  Login  Login Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Harness Login",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/logout": {
+      "post": {
+        "description": "Log Codex or Claude out and return freshly probed account state.",
+        "operationId": "logout_host_harness_v1_hosts__host_id__harnesses__harness__logout_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Logout Host Harness V1 Hosts  Host Id  Harnesses  Harness  Logout Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Host Harness",
         "tags": [
           "hosts"
         ]
@@ -11362,6 +12592,57 @@
         "summary": "Info",
         "tags": [
           "system"
+        ]
+      }
+    },
+    "/v1/mcp/{service_id}": {
+      "post": {
+        "operationId": "gateway_v1_mcp__service_id__post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "service_id",
+            "required": true,
+            "schema": {
+              "title": "Service Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "header",
+            "name": "X-Omnigent-Session-Id",
+            "required": true,
+            "schema": {
+              "maxLength": 128,
+              "minLength": 1,
+              "title": "X-Omnigent-Session-Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Gateway",
+        "tags": [
+          "mcp_gateway"
         ]
       }
     },
@@ -12225,6 +13506,18 @@
                 }
               ],
               "title": "Search Query"
+            }
+          },
+          {
+            "description": "Which `search_query` matches to return. `\"all\"` (default) returns title or content matches. `\"title\"` returns only title matches. `\"content\"` returns content matches whose title does not match; `title` and `content` never overlap. Ignored without a `search_query`.",
+            "in": "query",
+            "name": "search_scope",
+            "required": false,
+            "schema": {
+              "default": "all",
+              "pattern": "^(all|title|content)$",
+              "title": "Search Scope",
+              "type": "string"
             }
           },
           {
@@ -14662,6 +15955,122 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/environments/{environment_id}/content-search": {
+      "get": {
+        "description": "Search the session workspace with the same access gate as file reads.",
+        "operationId": "search_environment_content_v1_sessions__session_id__resources_environments__environment_id__content_search_get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "environment_id",
+            "required": true,
+            "schema": {
+              "title": "Environment Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "q",
+            "required": true,
+            "schema": {
+              "maxLength": 4096,
+              "minLength": 1,
+              "pattern": ".*\\S.*",
+              "title": "Q",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "case_sensitive",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Case Sensitive",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "regex",
+            "required": false,
+            "schema": {
+              "default": false,
+              "title": "Regex",
+              "type": "boolean"
+            }
+          },
+          {
+            "in": "query",
+            "name": "include",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 4096,
+              "title": "Include",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "exclude",
+            "required": false,
+            "schema": {
+              "default": "",
+              "maxLength": 4096,
+              "title": "Exclude",
+              "type": "string"
+            }
+          },
+          {
+            "in": "query",
+            "name": "limit",
+            "required": false,
+            "schema": {
+              "default": 500,
+              "maximum": 500,
+              "minimum": 1,
+              "title": "Limit",
+              "type": "integer"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Search Environment Content",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/environments/{environment_id}/filesystem": {
       "get": {
         "description": "List root directory of an environment.\n\n**Returns:** PaginatedList of filesystem entries.",
@@ -15790,6 +17199,58 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/resources/github/attachments": {
+      "post": {
+        "description": "Upload an image or video to embed in the selected PR's description.\n\nThe file goes to the provider without being kept by Omnigent, and the PR\nis unchanged until a description that links it is saved. Falls back to\nthe host tunnel when the runner is offline.\n\n**Parameters**\n\n- `pr_url` \u2014 The selected PR, which must be tracked by the session.\n- `file` \u2014 The image or video.\n\n**Returns:** A `session.github.pr_attachment` with the `url` to embed.",
+        "operationId": "upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "$ref": "#/components/schemas/Body_upload_session_github_attachment_v1_sessions__session_id__resources_github_attachments_post"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Upload Session Github Attachment",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
     "/v1/sessions/{session_id}/resources/github/changes": {
       "get": {
         "description": "List the PR's changed files (empty when the branch has no PR).\n\n**Returns:** Flat list of changed files with `status` and line counts.",
@@ -15843,6 +17304,317 @@
           }
         },
         "summary": "List Session Github Changes",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/comments": {
+      "post": {
+        "description": "Post a top-level comment using the host's selected GitHub account.",
+        "operationId": "create_session_github_comment_v1_sessions__session_id__resources_github_comments_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Create Session Github Comment",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/details": {
+      "post": {
+        "description": "Replace the selected PR's title and/or description.\n\nUses the host's provider account; served by the runner when it's online,\nelse by the host over its tunnel.\n\n**Returns:** A `session.github.pr_details` with the PR's resulting title and body.",
+        "operationId": "update_session_github_details_v1_sessions__session_id__resources_github_details_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Details",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/disable-auto-merge": {
+      "post": {
+        "description": "Turn off the selected PR's auto-merge with the host's provider account.\n\nServed by the runner when it's online, else by the host over its tunnel.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "disable_session_github_auto_merge_v1_sessions__session_id__resources_github_disable_auto_merge_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Disable Session Github Auto Merge",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/labels": {
+      "get": {
+        "description": "List the labels the selected PR's repository offers, for the label picker.\n\nRequires edit access, like the label edit it feeds. Falls back to the\nhost tunnel when the runner is offline.\n\n**Returns:** A list of `{name, color, description}` with `has_more`.",
+        "operationId": "list_session_github_labels_v1_sessions__session_id__resources_github_labels_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The selected PR, which must be tracked by the session.",
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Labels",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "post": {
+        "description": "Add and remove labels on the selected PR with the host's provider account.\n\nServed by the runner when it's online, else by the host over its tunnel.\n\n**Returns:** A `session.github.pr_labels` with the PR's resulting labels.",
+        "operationId": "update_session_github_labels_v1_sessions__session_id__resources_github_labels_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Labels",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/merge": {
+      "post": {
+        "description": "Merge the selected PR with the host's provider account.\n\nThe merge applies only while the PR's head is `expected_head`. Served by\nthe runner when it's online, else by the host over its tunnel.\n\n**Returns:** A `session.github.pr_merge`.",
+        "operationId": "merge_session_github_pr_v1_sessions__session_id__resources_github_merge_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Merge Session Github Pr",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/merge-options": {
+      "get": {
+        "description": "List the merge methods the selected PR's repository allows, for the merge dialog.\n\nRequires edit access, like the merge it feeds. Falls back to the host\ntunnel when the runner is offline.\n\n**Returns:** A `session.github.merge_options` with `methods` and `default`.",
+        "operationId": "get_session_github_merge_options_v1_sessions__session_id__resources_github_merge_options_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The selected PR, which must be tracked by the session.",
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Session Github Merge Options",
         "tags": [
           "session_resources"
         ]
@@ -15925,6 +17697,98 @@
           }
         },
         "summary": "Update Session Github Pr",
+        "tags": [
+          "session_resources"
+        ]
+      }
+    },
+    "/v1/sessions/{session_id}/resources/github/reviewers": {
+      "get": {
+        "description": "List the users and teams a review of the selected PR can be requested from.\n\nRequires edit access, like the reviewer edit it feeds. Falls back to the\nhost tunnel when the runner is offline.\n\n**Returns:** A list of `{login, kind, name}` with `has_more`.",
+        "operationId": "list_session_github_reviewers_v1_sessions__session_id__resources_github_reviewers_get",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          },
+          {
+            "description": "The selected PR, which must be tracked by the session.",
+            "in": "query",
+            "name": "pr_url",
+            "required": true,
+            "schema": {
+              "title": "Pr Url",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "List Session Github Reviewers",
+        "tags": [
+          "session_resources"
+        ]
+      },
+      "post": {
+        "description": "Request reviews on the selected PR and withdraw pending requests.\n\nUses the host's provider account; served by the runner when it's online,\nelse by the host over its tunnel.\n\n**Returns:** A `session.github.pr_reviewers` with the PR's resulting reviewers.",
+        "operationId": "update_session_github_reviewers_v1_sessions__session_id__resources_github_reviewers_post",
+        "parameters": [
+          {
+            "description": "Session/conversation identifier.",
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Update Session Github Reviewers",
         "tags": [
           "session_resources"
         ]
@@ -16266,9 +18130,62 @@
         ]
       }
     },
+    "/v1/sessions/{session_id}/ui/open-file": {
+      "post": {
+        "description": "Ask current viewers to open a workspace-relative file.\n\nRequires session edit access. Requests are transient and never replayed.\nThe subscriber count measures stream delivery, not successful display:\nbackground subscribers may ignore the request, and the viewer retains\nits normal filesystem permissions, error handling and unsaved-edit guard.",
+        "operationId": "open_file_v1_sessions__session_id__ui_open_file_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "session_id",
+            "required": true,
+            "schema": {
+              "title": "Session Id",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/OpenFileRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "202": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OpenFileResponse"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Open File",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
     "/v1/sessions/{source_id}/fork": {
       "post": {
-        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured.",
+        "description": "Fork an existing session into a new session.\n\nDeep-copies the source session's conversation items and\nclones the agent into a new session. When `body.agent_id`\nis set, the fork binds that agent instead of the\nsource's \u2014 switching harness (e.g. Claude-SDK \u2192 Claude Code,\nor Claude \u2192 Codex). The source's model settings carry over\nonly within the same provider family; a same-family native\ntarget also carries conversation history (the runner rebuilds\nits transcript). The REPL/CLI binds the fork to its runner via\n`PATCH /v1/sessions/{id}` after creation.\n\nWhen `body.up_to_response_id` is set, only history up to and\nincluding that response is copied into the fork (a \"fork from\nthis response\"); a native target then rebuilds its transcript\nfrom the truncated items instead of resuming the source's full\nnative transcript.\n\nThe dialog's run-config picks (`body.model_override`,\n`body.reasoning_effort`, `body.terminal_launch_args` \u2014 the\npermission-/approval-mode selector) override what the fork would\notherwise inherit. Each is opt-in: a field omitted from the request\nkeeps the inherited value (model/effort within the same provider\nfamily; launch args on a same-agent fork), while a field present\nwins \u2014 a clear alias (`\"default\"`) resets to the bound agent's\ndefault, and an explicit launch-args list also drops the source's\ncopied permission-mode / codex-bypass labels so they can't shadow\nthe freshly chosen mode.\n\nA sub-agent source is allowed, which is how a sub-agent is\npromoted to a session of its own: the fork is always a fresh\ntop-level conversation (no parent, its own spawn-tree root, its\nown owner grant), so it appears in the sidebar and outlives the\nparent. The source keeps running under its parent untouched,\nand the fork does not adopt the source's own children.\n\n`body.host_type: \"managed\"` gives the fork its own\nserver-provisioned sandbox instead of leaving it unbound for the\ncaller to bind a host to. It schedules the same background launch\na managed create does \u2014 this POST returns before the sandbox\nexists \u2014 and the sandbox is registered to the FORKING caller, not\nto the source session's owner. The fork's workspace is the\nrepository named by `body.workspace`, or the one the source\nrecorded when that field is omitted. `body.host_id` names the\nfork's new sandbox host, as on a managed create.\n\n**Parameters**\n\n- `body` \u2014 The validated `SessionForkRequest`.\n\n**Returns:** A `SessionResponse` describing the newly created fork (status `\"idle\"`).\n\n**Raises**\n\n- `OmnigentError` \u2014 404 if *source_id* does not exist or `body.agent_id` names no agent; 403/404 if the caller lacks read access on the source, or on the session that owns a session-scoped `body.agent_id`; 400 if the source has no agent binding, `body.up_to_response_id` names no response in the source session, or a managed fork asks for a sandbox this server has not configured; 409 if `body.host_id` is already in use; 410 if the source's agent was removed or a required bundle copy finds its source missing.",
         "operationId": "fork_session_v1_sessions__source_id__fork_post",
         "parameters": [
           {

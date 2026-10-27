@@ -8,6 +8,7 @@ import pytest
 
 from omnigent.host.frames import (
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
+    LAUNCH_HANDLER_FAILED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostConnectionErrorFrame,
     HostCreateDirFrame,
@@ -19,6 +20,13 @@ from omnigent.host.frames import (
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
+    HostHarnessLoginCancelFrame,
+    HostHarnessLoginCancelResultFrame,
+    HostHarnessLoginCompletedFrame,
+    HostHarnessLoginFrame,
+    HostHarnessLoginResultFrame,
+    HostHarnessLogoutFrame,
+    HostHarnessLogoutResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
@@ -44,6 +52,10 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostProbeAccountsFrame,
+    HostProbeAccountsResultFrame,
+    HostRefreshHarnessesFrame,
+    HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
     HostRemoveWorktreeResultFrame,
     HostRunnerExitedFrame,
@@ -263,6 +275,139 @@ def test_mcp_servers_frames_round_trip(
     frame: HostMcpServersFrame | HostMcpServersResultFrame,
 ) -> None:
     assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+def test_a_managed_server_still_reads_as_user_scope_for_an_older_server() -> None:
+    """``scope`` is a closed set on the server side, so managed-ness travels beside it.
+
+    An older server pins ``scope`` to ``"user"`` and would reject the whole inventory
+    for any other value, hiding every server on an upgraded host.
+    """
+    from typing import Literal
+
+    from pydantic import BaseModel
+
+    class OldMcpServerSummary(BaseModel):
+        """The model as it stands on a server that predates this field."""
+
+        name: str
+        harness: str
+        transport: Literal["stdio", "http"]
+        scope: Literal["user"]
+        plugin: str | None = None
+        source_id: str | None = None
+        url_host: str | None = None
+
+    wire = {
+        "name": "linear",
+        "harness": "claude",
+        "transport": "http",
+        "scope": "user",
+        "managed": "true",
+    }
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.mcp_servers_result",
+                "request_id": "r",
+                "status": "ok",
+                "mcp_servers": [wire],
+            }
+        )
+    )
+    assert isinstance(frame, HostMcpServersResultFrame)
+    assert frame.mcp_servers == [wire]
+    # The extra key is ignored rather than fatal, because Pydantic ignores unknown fields.
+    assert OldMcpServerSummary.model_validate(frame.mcp_servers[0]).scope == "user"
+
+
+def test_mcp_servers_result_carries_account_state_through_the_tunnel() -> None:
+    """Account state must survive encode/decode, or `/mcp` never sees it."""
+    frame = HostMcpServersResultFrame(
+        "r",
+        "ok",
+        mcp_servers=[
+            {
+                "name": "linear",
+                "harness": "claude",
+                "transport": "http",
+                "scope": "user",
+                "auth_status": "sign_in_required",
+                "sign_in_url": "https://auth.example.com/start?state=abc",
+            }
+        ],
+    )
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+
+
+@pytest.mark.parametrize(
+    "reported,expected",
+    [
+        ({"auth_status": "connected"}, {"auth_status": "connected"}),
+        # A URL is only passed on while sign-in is due, and only when a browser opens it.
+        (
+            {"auth_status": "connected", "sign_in_url": "https://a.b/go"},
+            {"auth_status": "connected"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "javascript:alert(1)"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "//auth.example.com/go"},
+            {"auth_status": "sign_in_required"},
+        ),
+        # Credentials in the URL would be published to the browser and sit in the DOM.
+        (
+            {
+                "auth_status": "sign_in_required",
+                "sign_in_url": "https://user:pw@auth.example.com/go",
+            },
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "https:// auth.example.com/go"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "https://auth.example.com/go\n"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "https:///go"},
+            {"auth_status": "sign_in_required"},
+        ),
+        # urlsplit raises on an unclosed IPv6 literal; that must not reject the frame.
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": "http://[::1"},
+            {"auth_status": "sign_in_required"},
+        ),
+        (
+            {"auth_status": "sign_in_required", "sign_in_url": 7},
+            {"auth_status": "sign_in_required"},
+        ),
+        # A state this build does not know degrades to "nothing reported".
+        ({"auth_status": "expired", "sign_in_url": "https://a.b/go"}, {}),
+        ({"auth_status": None}, {}),
+        ({}, {}),
+    ],
+)
+def test_mcp_servers_result_validates_reported_account_state(
+    reported: dict[str, object], expected: dict[str, str]
+) -> None:
+    server = {"name": "linear", "harness": "claude", "transport": "http", "scope": "user"}
+    frame = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.mcp_servers_result",
+                "request_id": "r",
+                "status": "ok",
+                "mcp_servers": [{**server, **reported}],
+            }
+        )
+    )
+    assert isinstance(frame, HostMcpServersResultFrame)
+    assert frame.mcp_servers == [{**server, **expected}]
 
 
 def test_mcp_servers_result_keeps_only_allow_listed_fields() -> None:
@@ -679,6 +824,7 @@ def test_hello_frame_round_trip() -> None:
         name="corey-laptop",
         runners=["runner_token_aaa", "runner_token_bbb"],
         interactive_shells=["zsh", "bash"],
+        connection_id="host-connection-1",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -687,6 +833,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.name == "corey-laptop"
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.interactive_shells == ["zsh", "bash"]
+    assert decoded.connection_id == "host-connection-1"
 
 
 def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
@@ -706,6 +853,7 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     # An older host advertises no capabilities — the server must read this as an
     # empty set (feature unsupported), not choke on the missing key.
     assert decoded.capabilities == []
+    assert decoded.connection_id is None
 
 
 def test_hello_frame_capabilities_round_trip() -> None:
@@ -758,6 +906,24 @@ def test_launch_runner_frame_round_trip() -> None:
     assert decoded.binding_token == "secret_token_xyz"
     assert decoded.workspace == "/Users/corey/projects/frontend"
     assert decoded.session_id == "conv_abc123"
+
+
+def test_launch_runner_superseded_runner_ids_round_trip() -> None:
+    """Named, empty, and absent supersession lists stay distinct on the wire."""
+    for ids in (("runner_old",), ()):
+        frame = HostLaunchRunnerFrame(
+            request_id="req_s",
+            binding_token="tok",
+            workspace="/w",
+            session_id="conv_s",
+            superseded_runner_ids=ids,
+        )
+        assert decode_host_frame(encode_host_frame(frame)) == frame
+    legacy = HostLaunchRunnerFrame(request_id="req_l", binding_token="tok", workspace="/w")
+    assert "superseded_runner_ids" not in encode_host_frame(legacy)
+    decoded = decode_host_frame(encode_host_frame(legacy))
+    assert isinstance(decoded, HostLaunchRunnerFrame)
+    assert decoded.superseded_runner_ids is None
 
 
 def test_launch_runner_preserves_the_full_saved_inference_profile() -> None:
@@ -877,6 +1043,88 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
+
+
+def test_hello_and_readiness_frames_round_trip_harness_accounts() -> None:
+    accounts = {
+        "codex": {
+            "kind": "chatgpt",
+            "email": "person@example.test",
+            "plan": "pro",
+            "expired": False,
+        }
+    }
+    hello = decode_host_frame(
+        encode_host_frame(
+            HostHelloFrame(
+                version="0.1.0",
+                frame_protocol_version=1,
+                name="laptop",
+                configured_harnesses={"codex": True},
+                harness_accounts=accounts,
+            )
+        )
+    )
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.harness_accounts == accounts
+
+    readiness = decode_host_frame(
+        encode_host_frame(
+            HostHarnessReadinessFrame(
+                configured_harnesses={"codex": True},
+                harness_accounts=accounts,
+            )
+        )
+    )
+    assert isinstance(readiness, HostHarnessReadinessFrame)
+    assert readiness.harness_accounts == accounts
+
+
+def test_legacy_hello_without_harness_accounts_decodes_to_none() -> None:
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "old-host",
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.harness_accounts is None
+
+
+def test_harness_login_frames_round_trip() -> None:
+    frames = [
+        HostHarnessLoginFrame(request_id="start-1", harness="codex", login_id="login-1"),
+        HostHarnessLoginResultFrame(
+            request_id="start-1",
+            status="ok",
+            login_id="login-1",
+            verification_url="https://example.test/device",
+            user_code="ABCD-EFGH",
+            expires_at=1234,
+        ),
+        HostHarnessLoginCancelFrame(request_id="cancel-1", login_id="login-1"),
+        HostHarnessLoginCancelResultFrame(request_id="cancel-1", status="ok"),
+        HostHarnessLoginCompletedFrame(
+            login_id="login-1",
+            success=True,
+            expired=False,
+            configured_harnesses={"codex": True},
+            harness_accounts={"codex": {"kind": "chatgpt", "expired": False}},
+        ),
+        HostHarnessLogoutFrame(request_id="logout-1", harness="codex"),
+        HostHarnessLogoutResultFrame(
+            request_id="logout-1",
+            status="ok",
+            configured_harnesses={"codex": "needs-auth"},
+            harness_accounts={"codex": {"kind": "unknown", "expired": True}},
+        ),
+    ]
+
+    assert [decode_host_frame(encode_host_frame(frame)) for frame in frames] == frames
 
 
 def test_connection_error_frame_round_trip() -> None:
@@ -1167,7 +1415,8 @@ def test_stop_runner_result_frame_round_trip() -> None:
     assert decoded.error is None
 
 
-def test_runner_exited_frame_round_trip() -> None:
+@pytest.mark.parametrize("had_connected", [None, False, True])
+def test_runner_exited_frame_round_trip(had_connected: bool | None) -> None:
     """
     Verify HostRunnerExitedFrame survives encode → decode.
 
@@ -1178,6 +1427,7 @@ def test_runner_exited_frame_round_trip() -> None:
     """
     original = HostRunnerExitedFrame(
         runner_id="runner_abc123",
+        had_connected=had_connected,
         error=(
             "runner process exited with code 1 (log on host: ~/x.log)\n"
             "--- runner log tail ---\nRuntimeError: boom"
@@ -1188,6 +1438,7 @@ def test_runner_exited_frame_round_trip() -> None:
     assert decoded.runner_id == "runner_abc123"
     # The multi-line error (including the log tail) must survive intact.
     assert decoded.error == original.error
+    assert decoded.had_connected is had_connected
 
 
 def test_runner_exited_frame_missing_error_raises() -> None:
@@ -1928,6 +2179,7 @@ def test_install_harness_result_success_round_trip() -> None:
         request_id="req_install_2",
         status="ok",
         configured_harnesses={"claude-native": True, "codex-native": "needs-auth"},
+        version="2.1.295",
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostInstallHarnessResultFrame)
@@ -1936,6 +2188,7 @@ def test_install_harness_result_success_round_trip() -> None:
         "claude-native": True,
         "codex-native": "needs-auth",
     }
+    assert decoded.version == "2.1.295"
     assert decoded.error is None
 
 
@@ -1957,8 +2210,53 @@ def test_install_harness_result_failure_round_trip() -> None:
     assert isinstance(decoded, HostInstallHarnessResultFrame)
     assert decoded.status == "failed"
     assert decoded.configured_harnesses is None
+    assert decoded.version is None
     assert decoded.gateway_inference is None
     assert decoded.error == "npm not found"
+
+
+def test_refresh_harnesses_frames_round_trip() -> None:
+    request = decode_host_frame(
+        encode_host_frame(HostRefreshHarnessesFrame(request_id="refresh-1"))
+    )
+    assert isinstance(request, HostRefreshHarnessesFrame)
+    assert request.request_id == "refresh-1"
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostRefreshHarnessesResultFrame(
+                request_id="refresh-1",
+                status="ok",
+                configured_harnesses={"codex-native": True},
+                gateway_inference={"codex-native": False},
+            )
+        )
+    )
+    assert isinstance(result, HostRefreshHarnessesResultFrame)
+    assert result.configured_harnesses == {"codex-native": True}
+    assert result.gateway_inference == {"codex-native": False}
+
+
+def test_probe_harness_accounts_frames_round_trip() -> None:
+    request = decode_host_frame(
+        encode_host_frame(HostProbeAccountsFrame(request_id="accounts-1", refresh_codex=True))
+    )
+    assert request == HostProbeAccountsFrame(request_id="accounts-1", refresh_codex=True)
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostProbeAccountsResultFrame(
+                request_id="accounts-1",
+                status="ok",
+                harness_accounts={"codex": {"kind": "chatgpt"}},
+            )
+        )
+    )
+    assert result == HostProbeAccountsResultFrame(
+        request_id="accounts-1",
+        status="ok",
+        harness_accounts={"codex": {"kind": "chatgpt"}},
+    )
 
 
 def test_result_frames_round_trip_gateway_inference() -> None:
@@ -2269,6 +2567,9 @@ def test_fs_result_null_payload_round_trip() -> None:
         (None, "runner exited with code 1", None),
         (None, None, None),
         ("some_future_code", "any text", None),
+        # A launch-handler fault is a generic failure: the server cannot
+        # describe its cause, so the host's text must not be surfaced.
+        (LAUNCH_HANDLER_FAILED_ERROR_CODE, "host failed to handle the launch request: x", None),
     ],
 )
 def test_classify_launch_refusal(
@@ -2423,3 +2724,28 @@ def test_mcp_tools_allow_list_and_correlated_malformed_result():
     frame = decode_host_frame(json.dumps(payload))
     assert isinstance(frame, HostMcpToolsResultFrame)
     assert (frame.request_id, frame.status, frame.tools) == ("m", "failed", [])
+
+
+def test_legacy_runner_exit_has_unknown_connection_history() -> None:
+    """An old host's exit report remains valid without connection evidence."""
+    frame = decode_host_frame(
+        '{"kind":"host.runner_exited","runner_id":"runner_old","error":"exited"}'
+    )
+    assert isinstance(frame, HostRunnerExitedFrame)
+    assert frame.had_connected is None
+
+
+@pytest.mark.parametrize("invalid", ["true", "false", 0, 1, [], {}])
+def test_runner_exit_rejects_non_boolean_connection_evidence(invalid: object) -> None:
+    """Malformed evidence cannot turn a failed launch into a harmless idle exit."""
+    with pytest.raises(ValueError, match="required bool field"):
+        decode_host_frame(
+            json.dumps(
+                {
+                    "kind": "host.runner_exited",
+                    "runner_id": "runner_bad",
+                    "error": "exited",
+                    "had_connected": invalid,
+                }
+            )
+        )

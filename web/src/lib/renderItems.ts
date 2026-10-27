@@ -1,3 +1,4 @@
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Block walker — converts a flat `AnyBlock[]` into a list of bubble
 // groups for the JSX layer to map over.
 //
@@ -35,7 +36,7 @@ import {
   routingExtras,
 } from "./routingDecision";
 import { isSystemUserContent } from "./systemMessage";
-import type { CodexPersistMode, RememberScope } from "./types";
+import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
 
 /**
@@ -97,6 +98,7 @@ export type RenderItem =
       label: string;
       data: Record<string, unknown>;
     }
+  | { kind: "subagent_activity"; itemId: string | null; data: Record<string, unknown> }
   | {
       kind: "slash_command";
       itemId: string | null;
@@ -130,6 +132,7 @@ export type RenderItem =
     }
   | {
       kind: "elicitation";
+      nativeDelivery?: NativePermissionDelivery;
       itemId: string | null;
       elicitationId: string;
       targetSessionId?: string | null;
@@ -155,8 +158,10 @@ export type RenderItem =
       } | null;
       allowAllEdits?: boolean;
       allowAutoMode?: boolean;
+      permissionDirectories?: string[];
       rememberScope?: RememberScope | null;
       codexPersistModes?: CodexPersistMode[];
+      agyPermission?: AgyPermission | null;
     };
 
 /** A bubble cluster. The page maps over these. */
@@ -166,6 +171,8 @@ export type Bubble =
       itemId: string;
       /** Queued input that does not yet have a persisted transcript item. */
       pending?: boolean;
+      /** Pending input sent mid-turn that the agent hasn't read yet. */
+      awaitingAgent?: boolean;
       content: MessageContentBlock[];
       /** Shell input is literal command text, not Markdown or attachment markers. */
       shellCommand?: string;
@@ -833,15 +840,23 @@ function walkBubbles(
       continue;
     }
 
-    if (isSubagentActivityBlock(b)) {
+    // A sub-agent notice joins the assistant work beside it so it folds with
+    // that work. With no work after it yet it stands alone, and the run is one
+    // re-walk region so all of it can join the work that arrives next.
+    if (isSubagentActivityBlock(b) && workBesideNotice(blocks, i, 1) === undefined) {
       lastBubbleStart = i;
-      lastBubbleCount = 1;
-      bubbles.push({
-        kind: "subagent_activity",
-        itemId: b.ctx.itemId ?? `subagent_activity_${i}`,
-        data: b.data,
-      });
-      i += 1;
+      lastBubbleCount = 0;
+      for (; i < blocks.length && isNoticeTransparent(blocks[i]!); i += 1) {
+        const notice = blocks[i]!;
+        if (isNonRenderingBlock(notice)) expandNextAssistantResponseId = null;
+        if (!isSubagentActivityBlock(notice)) continue;
+        bubbles.push({
+          kind: "subagent_activity",
+          itemId: notice.ctx.itemId ?? `subagent_activity_${i}`,
+          data: notice.data,
+        });
+        lastBubbleCount += 1;
+      }
       continue;
     }
 
@@ -986,7 +1001,7 @@ function walkBubbles(
     // Question/plan cards split the turn on their own (see
     // `isUserInputElicitationBlock`) — they carry the turn's id, but the
     // user answering one is a boundary, not a step of the work.
-    let groupResponseId = b.ctx.responseId;
+    let groupResponseId = isSubagentActivityBlock(b) ? "" : b.ctx.responseId; // never a notice's own id
     const groupStart = i;
     // Sentinel-headed groups never absorb a different turn's blocks, in
     // either direction (see the id-change handling below).
@@ -1006,8 +1021,7 @@ function walkBubbles(
         isTerminalCommandInput(cur) ||
         cur.type === "compaction" ||
         cur.type === "compaction_loading" ||
-        cur.type === "routing_decision" ||
-        isSubagentActivityBlock(cur)
+        cur.type === "routing_decision"
       )
         break;
       if (isNonRenderingBlock(cur)) {
@@ -1018,6 +1032,19 @@ function walkBubbles(
       // breaks: the work before it and the work after the answer are
       // separate stretches, each folding under its own "Worked for".
       if (i > groupStart && (groupOpenedOnUserInput || isUserInputElicitationBlock(cur))) break;
+      if (isSubagentActivityBlock(cur)) {
+        // A notice stays in its turn's bubble until committed work from another
+        // response follows it, then opens that response's bubble: a native fold
+        // that has shown never reopens to show the new response streaming.
+        if (
+          i > groupStart &&
+          (groupOpenedOnSentinel || noticeSeparatesResponses(blocks, groupStart, i))
+        ) {
+          break;
+        }
+        i += 1;
+        continue;
+      }
       // A bare tool_result never renders standalone (it folds into its
       // call's card by callId) — don't let a backdated one split the
       // open bubble. Anonymous blocks never carry turn identity.
@@ -1064,8 +1091,10 @@ function walkBubbles(
 
     lastBubbleStart = groupStart;
     lastBubbleCount = 1;
-    const workedForS = turnWorkedForS(groupBlocks);
-    const lastActivityAtS = turnLastActivityAtS(groupBlocks);
+    // A notice is stamped when the sub-agent reported, not when this turn worked.
+    const workBlocks = groupBlocks.filter((bk) => !isSubagentActivityBlock(bk));
+    const workedForS = turnWorkedForS(workBlocks);
+    const lastActivityAtS = turnLastActivityAtS(workBlocks);
     // Freshest stamp in the group — server stamp on cold load, client
     // stamp while live, either clock display-only. The max tracks latest
     // activity and never jumps back for a backdated tail block.
@@ -1080,7 +1109,7 @@ function walkBubbles(
         }
       }
     }
-    const groupCreatedAtS = groupBlocks
+    const groupCreatedAtS = workBlocks
       .filter(
         (bk) =>
           bk.type !== "tool_result" || localResultKeys.has(`${bk.ctx.responseId}:${bk.callId}`),
@@ -1426,10 +1455,70 @@ function isSubagentActivityBlock(
   return b.type === "native_tool" && b.toolType === "subagent_activity";
 }
 
+/**
+ * What a notice looks past to find the work beside it: other notices, and
+ * blocks that never render on their own.
+ */
+function isNoticeTransparent(b: AnyBlock): boolean {
+  return (
+    isSubagentActivityBlock(b) ||
+    isNonRenderingBlock(b) ||
+    b.type === "tool_result" ||
+    b.type === "file"
+  );
+}
+
+/**
+ * The nearest assistant work beside the notice at `index`, stepping `step` and
+ * never below `floor`; `undefined` when a bubble boundary (or nothing) comes
+ * first. `committedOnly` skips streaming blocks to find a server item.
+ */
+function workBesideNotice(
+  blocks: AnyBlock[],
+  index: number,
+  step: 1 | -1,
+  committedOnly = false,
+  floor = 0,
+): AnyBlock | undefined {
+  for (let k = index + step; k >= floor && k < blocks.length; k += step) {
+    const b = blocks[k]!;
+    if (isNoticeTransparent(b)) continue;
+    if (
+      !isAssistantSideBlock(b) ||
+      isStandaloneSentinelBlock(b) ||
+      isUserInputElicitationBlock(b)
+    ) {
+      return undefined;
+    }
+    if (!committedOnly || isCommittedBlock(b)) return b;
+  }
+  return undefined;
+}
+
+/**
+ * A server item, whose response id is the same live and on reload. Live deltas
+ * carry the active response's id instead, and previews carry none.
+ */
+function isCommittedBlock(b: AnyBlock): boolean {
+  const { itemId, responseId } = b.ctx;
+  return itemId !== null && !itemId.startsWith(LIVE_ITEM_PREFIX) && !isAnonymousRid(responseId);
+}
+
+/**
+ * Whether the committed work on either side of the notice at `index` belongs to
+ * different responses: one stopped, and the next started after the notice.
+ */
+function noticeSeparatesResponses(blocks: AnyBlock[], groupStart: number, index: number): boolean {
+  const before = workBesideNotice(blocks, index, -1, true, groupStart);
+  const after = workBesideNotice(blocks, index, 1, true);
+  return (
+    before !== undefined && after !== undefined && before.ctx.responseId !== after.ctx.responseId
+  );
+}
+
 /** Filter to blocks that participate in assistant rendering. */
 function isAssistantSideBlock(b: AnyBlock): boolean {
   return (
-    !isSubagentActivityBlock(b) &&
     b.type !== "user_message" &&
     !isTerminalCommandInput(b) &&
     b.type !== "compaction" &&
@@ -1575,6 +1664,12 @@ function buildAssistantItems(
       continue;
     }
 
+    if (isSubagentActivityBlock(b)) {
+      items.push({ kind: "subagent_activity", itemId: b.ctx.itemId, data: b.data });
+      i += 1;
+      continue;
+    }
+
     if (b.type === "native_tool") {
       items.push({
         kind: "native_tool",
@@ -1657,6 +1752,7 @@ function buildAssistantItems(
     if (b.type === "elicitation") {
       items.push({
         kind: "elicitation",
+        ...(b.nativeDelivery ? { nativeDelivery: b.nativeDelivery } : {}),
         itemId: b.ctx.itemId,
         elicitationId: b.elicitationId,
         targetSessionId: b.targetSessionId,
@@ -1673,8 +1769,10 @@ function buildAssistantItems(
         codexCommand: b.codexCommand,
         allowAllEdits: b.allowAllEdits,
         allowAutoMode: b.allowAutoMode,
+        permissionDirectories: b.permissionDirectories,
         rememberScope: b.rememberScope,
         codexPersistModes: b.codexPersistModes,
+        agyPermission: b.agyPermission,
       });
       i += 1;
       continue;
@@ -1859,6 +1957,7 @@ export function bubblesEqual(a: Bubble, b: Bubble): boolean {
     if (
       a.itemId !== b.itemId ||
       Boolean(a.pending) !== Boolean(b.pending) ||
+      Boolean(a.awaitingAgent) !== Boolean(b.awaitingAgent) ||
       a.createdBy !== b.createdBy ||
       a.createdAtS !== b.createdAtS ||
       a.stableKey !== b.stableKey ||

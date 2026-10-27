@@ -1,4 +1,4 @@
-import type { Conversation } from "@/hooks/useConversations";
+import type { Conversation, SessionSortBy } from "@/hooks/useConversations";
 import { nativeCodingAgentForWrapper, WRAPPER_LABEL_KEY } from "@/lib/nativeCodingAgents";
 import { getOptimisticTitle } from "@/lib/optimisticTitles";
 import { PROJECT_LABEL_KEY, PINNED_LABEL_KEY } from "@/lib/sessionListCache";
@@ -211,38 +211,81 @@ export function filterConversations(
   });
 }
 
-// Sort by `updated_at` desc so the order matches the row's relative-time
-// pill. The active chat uses its frozen snapshot from
-// `activeOverride` instead of its live `updated_at`, so sending a message
-// in the chat you're already viewing doesn't move it.
-//
-// `frozenKeys` (when non-null) pins EVERY row's sort key at its
-// first-seen value: a row's key is read from the map, or captured into it
-// on first sight. The sidebar passes its map while the pointer is inside
-// the list, so background `updated_at` bumps can't slide rows under the
-// cursor — a mid-interaction reorder sends clicks, right-clicks, and the
-// renames they trigger to the wrong session. Rows first seen while frozen
-// (a folder expanding, a page loading) capture their key on entry, and
-// the caller clears the map when the pointer leaves so the order snaps
-// back to reality.
-export function sortByUpdatedAtDesc(
+// Newest first; equal timestamps fall back to id, so arrival order never shows.
+// Freeze update timestamps for the active chat and hovered list; creation
+// timestamps stay immutable, including when the selected order changes.
+export function sortConversations(
   conversations: Conversation[],
   activeOverride: ActiveChatOverride | null,
   frozenKeys?: Map<string, number> | null,
+  sortBy: SessionSortBy = "updated_at",
 ): Conversation[] {
   const effective = (c: Conversation): number => {
-    if (frozenKeys) {
-      const frozen = frozenKeys.get(c.id);
-      if (frozen !== undefined) return frozen;
-      // Capture the override value for the active row so dropping the
-      // override mid-hover (navigating to another chat) can't move it.
-      const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
-      frozenKeys.set(c.id, live);
-      return live;
-    }
-    return activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const live = activeOverride?.id === c.id ? activeOverride.updatedAt : c.updated_at;
+    const updatedAt = frozenKeys?.get(c.id) ?? live;
+    frozenKeys?.set(c.id, updatedAt);
+    return sortBy === "created_at" ? c.created_at : updatedAt;
   };
-  return [...conversations].sort((a, b) => effective(b) - effective(a));
+  return [...conversations].sort((a, b) => effective(b) - effective(a) || b.id.localeCompare(a.id));
+}
+
+/** Status groups, in the order the grouped sidebar renders them. */
+export const STATUS_BUCKETS = ["Needs attention", "Unread", "Working", "Draft", "Done"] as const;
+export type StatusBucket = (typeof STATUS_BUCKETS)[number];
+
+/** What a session needs from the viewer. `unseen` / `hasDraft` come from client stores. */
+export function statusBucket(c: Conversation, unseen: boolean, hasDraft: boolean): StatusBucket {
+  if ((c.pending_elicitations_count ?? 0) > 0 || c.status === "failed") return "Needs attention";
+  if (c.status === "running") return "Working";
+  if (unseen) return "Unread";
+  if (hasDraft) return "Draft";
+  return "Done";
+}
+
+export const DATE_BUCKETS = [
+  "today",
+  "yesterday",
+  "in the last 7 days",
+  "in the last 30 days",
+  "earlier",
+] as const;
+export type DateBucket = (typeof DATE_BUCKETS)[number];
+
+/** Bucket a timestamp (unix seconds) by local calendar day relative to `now`. */
+export function dateBucket(timestamp: number, now: Date): DateBucket {
+  // Local midnights via the Date constructor, so DST days aren't an hour off.
+  const midnight = (daysAgo: number) =>
+    new Date(now.getFullYear(), now.getMonth(), now.getDate() - daysAgo).getTime();
+  const at = timestamp * 1000;
+  if (at >= midnight(0)) return "today";
+  if (at >= midnight(1)) return "yesterday";
+  if (at >= midnight(7)) return "in the last 7 days";
+  if (at >= midnight(30)) return "in the last 30 days";
+  return "earlier";
+}
+
+/**
+ * Split `rows` into groups in `order`, keeping input order within each
+ * group. A row with no key (or one outside `order`) lands in the last group
+ * rather than vanishing.
+ */
+export function groupConversations<K extends string>(
+  rows: readonly Conversation[],
+  keyOf: (c: Conversation) => K | undefined,
+  order: readonly K[],
+  keepEmpty?: K,
+): { title: K; conversations: Conversation[] }[] {
+  const byKey = new Map<K, Conversation[]>(order.map((key) => [key, []]));
+  const fallback = byKey.get(order[order.length - 1]);
+  for (const row of rows) {
+    const key = keyOf(row);
+    const bucket = (key !== undefined && byKey.get(key)) || fallback;
+    bucket?.push(row);
+  }
+  return order.flatMap((title) => {
+    const conversations = byKey.get(title) ?? [];
+    return conversations.length > 0 || title === keepEmpty ? [{ title, conversations }] : [];
+  });
 }
 
 // Decide the next `activeOverride` value given the current route and
@@ -463,4 +506,13 @@ export function resolveSidebarDrop(
   if (source.project) return { kind: "ungroup", project: source.project, unpin: source.isPinned };
   // No project label: only meaningful if pinned (unpin → it drops into Chats).
   return source.isPinned ? { kind: "unpin" } : { kind: "none" };
+}
+
+/**
+ * Whether the Sessions list accepts a dragged session: a filed one (ungroup) or
+ * a pinned one (unpin). Grouped views already list filed sessions in place, so
+ * there it only unpins a pin that has no project to lose.
+ */
+export function sessionsListAcceptsDrop(source: SidebarDragSource, grouped: boolean): boolean {
+  return grouped ? source.isPinned && !source.project : !!source.project || source.isPinned;
 }

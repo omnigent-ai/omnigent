@@ -1,4 +1,4 @@
-"""Owned static model tables for Smart Routing and background titles.
+"""Owned static model tables for routing, background titles and Pi compatibility.
 
 Pre-launch picker listings carry no static stand-ins anymore — the live
 harness probes (see ``omnigent.host.connect``) are their source of truth.
@@ -22,6 +22,45 @@ class StaticModelFallback:
     owner: str
     provenance: str
     discovery_gap: str
+
+
+# The gateway catalog does not yet describe whether thinking can be disabled.
+PI_ANTHROPIC_THINKING_REQUIRED = StaticModelFallback(
+    model_ids=("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Measured Databricks Anthropic endpoints rejecting thinking.type.disabled",
+    discovery_gap="model listings advertise reasoning but not the supported thinking levels",
+)
+
+
+# Custom providers do not inherit Pi's built-in per-model compatibility flags.
+# On Pi upgrades, refresh adaptive/budget entries from pi-ai/dist/providers/data/anthropic.json.
+# Keep the thinking-required list above limited to gateway-verified restrictions.
+PI_ANTHROPIC_ADAPTIVE_THINKING = StaticModelFallback(
+    model_ids=(
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
+        "claude-fable-5",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+    ),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Pi 1.0.4 Anthropic catalog forceAdaptiveThinking entries",
+    discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
+)
+
+
+PI_ANTHROPIC_BUDGET_THINKING = StaticModelFallback(
+    model_ids=("claude-haiku-4-5", "claude-opus-4-5", "claude-sonnet-4-5"),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Pi 1.0.4 Anthropic catalog reasoning entries without forceAdaptiveThinking",
+    discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
+)
 
 
 #: Curated preference ORDER for codex's current arms — a ranking hint only
@@ -162,6 +201,12 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
         provenance="probed: pi's own gateway 400s on each of these",
         discovery_gap="a gateway listing advertises these without pi's request-shape limits",
     ),
+    "codex_native_excluded": StaticModelFallback(
+        model_ids=("databricks-gpt-5-4-nano", "system.ai.databricks-gpt-5-4-nano"),
+        owner="Native Codex Smart Routing",
+        provenance="the model rejects native tool_search input with invalid_request_error",
+        discovery_gap="model availability listings omit native tool-search compatibility",
+    ),
     "codex_catalog_clone_source": StaticModelFallback(
         model_ids=("gpt-5.6-luna",),
         owner="Codex extended catalog (omnigent.inner.codex_executor)",
@@ -194,6 +239,9 @@ SMART_ROUTING_FAMILY_FALLBACKS = _SMART_ROUTING_FALLBACKS["family_fallbacks"].mo
 
 #: Models pi's own gateway rejects, so the router may not pick them under pi.
 SMART_ROUTING_PI_EXCLUDED = _SMART_ROUTING_FALLBACKS["pi_excluded"].model_ids
+
+#: Models incompatible with native Codex's deferred tool-search requests and history.
+SMART_ROUTING_CODEX_NATIVE_EXCLUDED = _SMART_ROUTING_FALLBACKS["codex_native_excluded"].model_ids
 
 #: The codex catalog entry a gateway-only arm is cloned from.
 CODEX_CATALOG_CLONE_SOURCE_SLUG = _SMART_ROUTING_FALLBACKS["codex_catalog_clone_source"].model_ids[

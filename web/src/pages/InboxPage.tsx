@@ -41,6 +41,8 @@
  * what clears an approval.
  */
 
+import type { Query } from "@tanstack/react-query";
+import type { Session } from "@/lib/types";
 import { useEffect, useRef, useState, type ReactNode } from "react";
 import { useQueries, useQueryClient } from "@tanstack/react-query";
 import {
@@ -95,9 +97,10 @@ import { conversationDisplayLabel, getConversationAgentType } from "@/shell/side
 type RespondedMap = Record<
   string,
   {
-    action: "accept" | "decline";
+    action: "accept" | "decline" | "cancel";
     content?: Record<string, unknown>;
     _meta?: Record<string, unknown>;
+    attempt?: string;
   }
 >;
 
@@ -154,6 +157,7 @@ export function InboxPage() {
   } = useSidebarData();
   const [filter, setFilter] = useState<InboxFilter>(readInboxFilter);
   const [responded, setResponded] = useState<RespondedMap>({});
+  const pendingSubmissions = useRef(new Map<string, RespondedMap[string]>());
   // Manual expand/collapse toggles keyed by entry key. Anything not in
   // the map falls back to the default: expanded only for the newest
   // approval. Keying by id (not index) keeps a user's explicit toggles
@@ -174,6 +178,15 @@ export function InboxPage() {
       queryKey: ["inbox-elicitations", row.id, row.pending_elicitations_count, row.updated_at],
       queryFn: () => getSession(row.id),
       retry: 1,
+      // The count and snapshot can disagree briefly while a native request re-parks.
+      refetchInterval: (query: Query<Session>) =>
+        query.state.data?.pendingElicitations?.length === 0 ||
+        query.state.data?.pendingElicitations?.some((event) => {
+          const params = event.params as Record<string, unknown> | undefined;
+          return params?.native_delivery !== undefined;
+        })
+          ? 1000
+          : false,
     })),
   });
 
@@ -246,13 +259,8 @@ export function InboxPage() {
   ]);
   const defaultExpandedKey = items[0] && `approval:${items[0].elicitation.elicitationId}`;
 
-  // Clear stale optimistic verdicts when snapshot data refreshes.
-  // If a hook retry re-parks the same elicitation id after the user
-  // approved the previous attempt, the local `responded` entry would
-  // otherwise keep the card stuck on "Approved" indefinitely. When
-  // any snapshot query delivers fresh data (dataUpdatedAt advances),
-  // sweep verdicts whose id is still pending on the server — those
-  // approvals were consumed and the server re-parked the prompt.
+  // A newer delivery attempt supersedes optimistic sending, even if the
+  // old POST is still in flight. Other prompts retain their refresh behavior.
   const snapshotVersionKey = snapshotQueries.map((q) => q.dataUpdatedAt ?? 0).join(",");
   const isFirstRender = useRef(true);
   useEffect(() => {
@@ -263,10 +271,19 @@ export function InboxPage() {
     }
     setResponded((prev) => {
       if (Object.keys(prev).length === 0) return prev;
-      const pendingIds = new Set(items.map((i) => i.elicitation.elicitationId));
-      const stale = Object.keys(prev).filter((id) => pendingIds.has(id));
+      const stale = items
+        .filter(({ elicitation }) => {
+          const verdict = prev[elicitation.elicitationId];
+          return (
+            verdict &&
+            (elicitation.nativeDelivery
+              ? verdict.attempt !== elicitation.nativeDelivery.attempt
+              : !pendingSubmissions.current.has(elicitation.elicitationId))
+          );
+        })
+        .map(({ elicitation }) => elicitation.elicitationId);
       if (stale.length === 0) return prev;
-      return Object.fromEntries(Object.entries(prev).filter(([id]) => !pendingIds.has(id)));
+      return Object.fromEntries(Object.entries(prev).filter(([id]) => !stale.includes(id)));
     });
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [snapshotVersionKey]);
@@ -290,26 +307,40 @@ export function InboxPage() {
   // count (and the sidebar badge) drop without waiting for the socket.
   const makeSubmit = (item: InboxItem): SubmitApprovalFn => {
     return (elicitationId, action, content, meta) => {
-      setResponded((prev) => ({
-        ...prev,
-        [elicitationId]: {
-          action,
-          ...(content === undefined ? {} : { content }),
-          ...(meta === undefined ? {} : { _meta: meta }),
-        },
-      }));
+      const attempt = item.elicitation.nativeDelivery?.attempt;
+      const previous = pendingSubmissions.current.get(elicitationId);
+      if (previous && previous.attempt === attempt) return;
+      const verdict = {
+        action,
+        attempt,
+        ...(content === undefined ? {} : { content }),
+        ...(meta === undefined ? {} : { _meta: meta }),
+      };
+      pendingSubmissions.current.set(elicitationId, verdict);
+      setResponded((prev) => ({ ...prev, [elicitationId]: verdict }));
       void approve(item.resolveSessionId, elicitationId, {
         action,
         ...(content === undefined ? {} : { content }),
         ...(meta === undefined ? {} : { _meta: meta }),
       }).then(
         () => {
+          if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
+          pendingSubmissions.current.delete(elicitationId);
           void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+          if (item.elicitation.nativeDelivery) {
+            const queryKey = ["inbox-elicitations", item.row.id];
+            void queryClient
+              .cancelQueries({ queryKey })
+              .then(() => queryClient.invalidateQueries({ queryKey }));
+          }
         },
         () => {
+          if (pendingSubmissions.current.get(elicitationId) !== verdict) return;
+          pendingSubmissions.current.delete(elicitationId);
           // Roll back to pending so the buttons reappear and the user
           // can retry — same recovery the chat store uses.
           setResponded((prev) => {
+            if (prev[elicitationId] !== verdict) return prev;
             const { [elicitationId]: _respondedVerdict, ...pendingVerdicts } = prev;
             return pendingVerdicts;
           });
@@ -329,7 +360,9 @@ export function InboxPage() {
     if (entry.kind === "approval") {
       const { item } = entry;
       const elicitationId = item.elicitation.elicitationId;
-      const verdict = responded[elicitationId];
+      const optimistic = responded[elicitationId];
+      const verdict =
+        optimistic?.attempt === item.elicitation.nativeDelivery?.attempt ? optimistic : undefined;
       // Same display mapping the sidebar uses: native-wrapper sessions read
       // "Claude Code" / "Codex", never the internal agent name. Hidden when
       // it would just repeat the title (untitled native sessions).
@@ -360,15 +393,26 @@ export function InboxPage() {
             contentPreview={item.elicitation.contentPreview}
             requestedSchema={item.elicitation.requestedSchema}
             url={item.elicitation.url}
-            status={verdict ? "responded" : "pending"}
+            nativeDelivery={
+              verdict && item.elicitation.nativeDelivery
+                ? {
+                    ...item.elicitation.nativeDelivery,
+                    state: "sending",
+                    action: verdict.action,
+                  }
+                : item.elicitation.nativeDelivery
+            }
+            status={verdict && !item.elicitation.nativeDelivery ? "responded" : "pending"}
             response={verdict ?? null}
             askUserQuestion={item.elicitation.askUserQuestion}
             exitPlanMode={item.elicitation.exitPlanMode}
             codexCommand={item.elicitation.codexCommand}
             allowAllEdits={item.elicitation.allowAllEdits}
             allowAutoMode={item.elicitation.allowAutoMode}
+            permissionDirectories={item.elicitation.permissionDirectories}
             rememberScope={item.elicitation.rememberScope}
             codexPersistModes={item.elicitation.codexPersistModes}
+            agyPermission={item.elicitation.agyPermission}
             onSubmit={makeSubmit(item)}
             requester={
               item.resolveSessionId !== item.row.id

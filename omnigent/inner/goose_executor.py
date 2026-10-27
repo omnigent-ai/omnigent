@@ -377,7 +377,7 @@ class GooseExecutor(Executor):
             if not sandbox.active:
                 return self._goose_path
             # goose must read its own install tree and write its config/state
-            # dirs (~/.config/goose, ~/.local/share/goose) and /tmp, or it can't
+            # dirs (~/.config/goose, ~/.local/share/goose), or it can't
             # start inside the jail.
             goose_bin = Path(self._goose_path)
             if goose_bin.parent != Path("."):
@@ -387,7 +387,6 @@ class GooseExecutor(Executor):
                 [
                     Path.home() / ".config" / "goose",
                     Path.home() / ".local" / "share" / "goose",
-                    Path("/tmp"),
                 ],
             )
             sandbox = with_additional_read_roots(sandbox, [Path.home() / ".config" / "goose"])
@@ -486,7 +485,7 @@ class GooseExecutor(Executor):
         await self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(req_id, None)
             raise
 
@@ -1222,7 +1221,7 @@ class GooseExecutor(Executor):
                 notification = await asyncio.wait_for(
                     self._queue.get(), timeout=min(remaining, 2.0)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
             method = notification.get("method", "")

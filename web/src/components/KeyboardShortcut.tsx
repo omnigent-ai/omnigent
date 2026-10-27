@@ -3,6 +3,7 @@ import type { ReactNode } from "react";
 export { CompactKbd, CompactShortcutKeys } from "@/components/ui/kbd";
 import { TooltipContent } from "@/components/ui/tooltip";
 import { isMacPlatform } from "@/lib/hotkeys";
+import { isNativeShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
 
 const IS_MAC = isMacPlatform();
@@ -16,6 +17,14 @@ export const ENTER_KEY = "↵";
 export const SHIFT_KEY = "⇧";
 export const ARIA_MOD_KEY = IS_MAC ? "Meta" : "Control";
 export const VIEW_MODE_TOGGLE_KEYS = [MOD_KEY, ALT_KEY, "\\"] as const;
+
+export function newSessionShortcutKeys(native = isNativeShell()): string[] {
+  return native ? [MOD_KEY, ALT_KEY, "N"] : [MOD_KEY, IS_MAC ? SHIFT_KEY : "Shift", "O"];
+}
+
+export function newSessionAriaShortcut(native = isNativeShell()): string {
+  return `${ARIA_MOD_KEY}+${native ? "Alt+N" : "Shift+O"}`;
+}
 
 export function composerSendShortcutKeys(submitWithModEnter: boolean): string[] {
   return submitWithModEnter ? [MOD_KEY, ENTER_KEY] : [ENTER_KEY];

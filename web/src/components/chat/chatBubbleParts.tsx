@@ -15,6 +15,7 @@ import {
 import {
   ArrowUpIcon,
   CheckIcon,
+  ClockIcon,
   CopyIcon,
   FileTextIcon,
   FolderIcon,
@@ -54,10 +55,11 @@ import { Button } from "@/components/ui/button";
 import { BrandLogo } from "@/components/BrandLogo";
 import { cn } from "@/lib/utils";
 import { mentionItemPath, type MentionItem } from "@/lib/composerMentions";
-import type { ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
+import type { AnyBlock, ImageContentBlock, MessageContentBlock } from "@/lib/blocks";
 import {
   attachmentLabel,
   ELICITATION_RESPONSE_PREFIX,
+  hasPendingOwnElicitation,
   imagePreview,
   isTextBlock,
   keyedAttachments,
@@ -77,6 +79,7 @@ import { useStickToBottomContext } from "use-stick-to-bottom";
 import { isSessionScopedDecision, showsRoutingDecisionChip } from "@/lib/routingDecision";
 import { useWorkingLabelTick } from "@/hooks/useWorkingLabelTick";
 import { useForkDialog } from "@/shell/ForkDialogContext";
+import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import { DisabledActionTooltip } from "@/components/DisabledActionTooltip";
 import { InlineImage, SessionImage } from "@/components/SessionImage";
 import { buildMessageDeepLink } from "@/lib/messageDeepLink";
@@ -84,6 +87,7 @@ import { copyText } from "@/lib/clipboard";
 import { copyMarkdown } from "@/lib/copyMarkdown";
 import { showToast } from "@/components/ui/toast";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useFoldAssistantNarration } from "@/lib/foldNarrationPreferences";
 import type { SessionStatus } from "@/lib/types";
 import {
   TRANSCRIPT_SCROLLBAR_DRAG_EVENT,
@@ -93,7 +97,7 @@ import {
 // Matches both wordings the native executors emit: "[Attached: <path>]"
 // (claude/pi/cursor) and "[Attached file: <path>]" (codex). Capturing group
 // is the path. Global so all markers in a message are found / stripped.
-const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\]\s*/g;
+const ATTACHED_RE = /\[Attached(?: file)?:\s*([^\]]*)\][ \t]*(?:\r?\n)*/g;
 
 const COLLAPSE_THRESHOLD = 12000;
 
@@ -112,7 +116,7 @@ export function extractUserText(content: MessageContentBlock[]): string {
     .map((c) => c.text)
     .join("")
     .replace(ATTACHED_RE, "")
-    .trim();
+    .trimEnd();
 }
 
 // An absolute filesystem path in any form a native executor might materialize
@@ -218,6 +222,7 @@ export function buildPendingBubbles(
       // No server item id yet; tempId keeps React keys stable until promotion.
       itemId: p.tempId,
       pending: true,
+      ...(p.sentMidTurn ? { awaitingAgent: true } : {}),
       content: p.content,
       ...(author !== null ? { createdBy: author } : {}),
       // Stamped once at send time; absent for snapshot-replayed entries,
@@ -410,19 +415,36 @@ function useAgentTurnActive(): boolean {
   return computeIsTurnActive(sessionStatus, localSending);
 }
 
+/** Whether any elicitation card is still awaiting the user's answer. */
+function hasPendingElicitationBlock(blocks: readonly AnyBlock[]): boolean {
+  return blocks.some((b) => b.type === "elicitation" && b.status === "pending");
+}
+
 /**
  * The label shown next to the working shimmer. When the agent is parked on a
  * dialog (`blockedOn`) it says so; otherwise it rotates through
  * `WORKING_MESSAGES` by wall-clock `tick`.
+ *
+ * @param options.answerableInChat - A pending chat card can answer the block.
+ * @param options.terminalView - The Chat/Terminal toggle reaches the agent's terminal.
  */
-export function workingIndicatorLabel(tick = 0, blockedOn: string | null = null): string {
+export function workingIndicatorLabel(
+  tick = 0,
+  blockedOn: string | null = null,
+  { answerableInChat = false, terminalView = false } = {},
+): string {
   if (blockedOn) {
     // A "dialog open" block lives only in the terminal tab, so point the user
     // there to respond rather than leaving the session looking hung.
     if (blockedOn === "dialog open") {
       return "Waiting on a dialog in the terminal. Open the terminal tab to respond.";
     }
-    return `Blocked on: ${blockedOn}`;
+    if (answerableInChat) return `Blocked on: ${blockedOn}`;
+    const waiting =
+      blockedOn === "permission prompt"
+        ? "Waiting for your approval in the agent's terminal."
+        : `Waiting for you in the agent's terminal (${blockedOn}).`;
+    return terminalView ? `${waiting} Open the Terminal view to respond.` : waiting;
   }
   return WORKING_MESSAGES[tick % WORKING_MESSAGES.length]!;
 }
@@ -432,9 +454,16 @@ export function WorkingIndicator() {
   const scopedState = useConversationEntryState(scopedConversationId);
   const rootBgCount = useChatStore((s) => s.backgroundTaskCount);
   const rootBlockedOn = useChatStore((s) => s.blockedOn);
+  const rootHasOwnPendingElicitation = useChatStore((s) =>
+    hasPendingOwnElicitation(s.blocks, s.conversationId),
+  );
   const rootAgentWorking = useAgentTurnActive();
+  const terminalFirst = useTerminalFirst();
   const bgCount = scopedConversationId ? scopedState.backgroundTaskCount : rootBgCount;
   const blockedOn = scopedConversationId ? scopedState.blockedOn : rootBlockedOn;
+  const hasOwnPendingElicitation = scopedConversationId
+    ? hasPendingOwnElicitation(scopedState.blocks, scopedConversationId)
+    : rootHasOwnPendingElicitation;
   const agentWorking = scopedConversationId
     ? computeIsTurnActive(scopedState.sessionStatus, scopedState.status === "streaming")
     : rootAgentWorking;
@@ -443,15 +472,17 @@ export function WorkingIndicator() {
   // the state and the shimmer stays off (it would misread as the agent still
   // thinking). While the turn is active the shimmer shows, with the pill beside it.
   if (isBackgroundTasksOnly(bgCount, blockedOn, agentWorking)) return null;
-  const label = workingIndicatorLabel(tick, blockedOn);
+  const label = workingIndicatorLabel(tick, blockedOn, {
+    answerableInChat: hasOwnPendingElicitation,
+    // The toggle switches to the root session's terminal, not a side chat's.
+    terminalView: !scopedConversationId && (terminalFirst?.isTerminalFirst ?? false),
+  });
   return (
     <>
-      {/* Sole aria-live region for the working state. A stable "Working…" (not
-          the rotating label) so screen readers announce the turn once, without
-          re-announcing every few seconds; the visible shimmer below stays
-          aria-hidden. */}
+      {/* Sole aria-live region: a stable "Working…" or block reason, so the rotating
+          label isn't re-announced. The visible shimmer below stays aria-hidden. */}
       <span role="status" aria-live="polite" className="sr-only">
-        Working…
+        {blockedOn ? label : "Working…"}
       </span>
       <Message from="assistant" data-testid="working-indicator" aria-hidden="true">
         <MessageContent>
@@ -908,6 +939,16 @@ function UserBubble({ bubble }: { bubble: Extract<Bubble, { kind: "user" }> }) {
             )}
           </MessageContent>
         </div>
+        {/* Always visible: a mid-turn message can wait minutes behind a long tool call. */}
+        {bubble.pending && bubble.awaitingAgent && (
+          <div
+            className="flex items-center gap-1 pt-1 text-[11px] leading-4 text-muted-foreground"
+            data-testid="message-awaiting-agent"
+          >
+            <ClockIcon size={12} aria-hidden />
+            The agent will read this after its current step
+          </div>
+        )}
         {/* 40%-visible on touch, hover/focus-reveal on desktop. */}
         <div className="flex items-center justify-end gap-3 py-1 opacity-40 transition-opacity md:opacity-0 md:group-hover:opacity-100 md:group-focus-within:opacity-100">
           {ts && (
@@ -971,14 +1012,12 @@ function AssistantBubble({
   const activeConversationId = useChatStore((s) => s.conversationId);
   const conversationId = scopedConversationId ?? activeConversationId;
   const rootSessionStatus = useChatStore((s) => s.sessionStatus);
-  const rootHasPendingElicitation = useChatStore((s) =>
-    s.blocks.some((b) => b.type === "elicitation" && b.status === "pending"),
-  );
+  const rootHasPendingElicitation = useChatStore((s) => hasPendingElicitationBlock(s.blocks));
   const sessionStatus = scopedConversationId ? scopedState.sessionStatus : rootSessionStatus;
   // A pending elicitation means the turn is parked awaiting the user — still in
   // flight even when its lifecycle or the session status reads settled.
   const hasPendingElicitation = scopedConversationId
-    ? scopedState.blocks.some((b) => b.type === "elicitation" && b.status === "pending")
+    ? hasPendingElicitationBlock(scopedState.blocks)
     : rootHasPendingElicitation;
   // Getter computes the markdown lazily at click time.
   const { isCopied, handleCopy } = useCopyMessage(
@@ -987,6 +1026,7 @@ function AssistantBubble({
   );
   const { isLinkCopied, handleCopyLink } = useCopyMessageLink(bubble.responseId);
   const flashing = useChatStore((s) => s.flashItemId === bubble.responseId);
+  const foldNarration = useFoldAssistantNarration();
   // null outside AppShell's provider (isolated tests) → hide the action.
   const forkDialog = useForkDialog();
   const queryClient = useContext(QueryClientContext);
@@ -1051,6 +1091,7 @@ function AssistantBubble({
     hasPendingElicitation,
     showsWorking,
     defaultExpanded: bubble.defaultExpanded,
+    foldNarration,
   });
 
   // Elicitation cards want full chat-column width to match the composer.
@@ -1065,25 +1106,27 @@ function AssistantBubble({
   // A bubble carrying an error but no prose stands alone as a thread-level
   // element — the hover footer belongs to assistant text, not to the error.
   const errorOnly = hasError && !markdownText;
+  // A bubble whose items are all errors (e.g. an undelivered-message notice) is a
+  // thread-level card, not an assistant reply, so it takes the "error" role; a
+  // failed turn that still produced tool or reasoning output keeps the assistant role.
+  const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
   const spansFullColumn = isWide || hasError;
+  const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
 
   return (
     <>
       <Message
         from="assistant"
         data-testid="message-bubble"
-        data-role="assistant"
+        data-role={errorNotice ? "error" : "assistant"}
         data-response-stable-id={bubble.stableId}
         data-message-id={bubble.responseId}
-        className={
-          spansFullColumn ? "max-w-full" : "max-w-3xl min-[2561px]:max-w-[clamp(56rem,30vw,64rem)]"
-        }
+        className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
       >
-        {/* A fold-only bubble takes w-full at the ordinary max-w-3xl cap rather
-            than shrink-wrapping to the summary row's ~110px. */}
+        {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
-            (spansFullColumn || foldOnly) && "w-full",
+            (spansFullColumn || foldOnly || hasSubagentNotice) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
         >
@@ -1098,6 +1141,7 @@ function AssistantBubble({
             lastActivityAtS={bubble.lastActivityAtS}
             showsWorking={showsWorking}
             defaultExpanded={bubble.defaultExpanded}
+            foldNarration={foldNarration}
             onRetryError={recoveryDisabled ? undefined : handleRetryError}
           />
         </MessageContent>
@@ -1671,7 +1715,7 @@ export function LatestTurnSpacer({
   // Bounded rAF retries for capturing the anchor when committed blocks exist but
   // their rows haven't mounted yet (windowed transcript, published a frame
   // before the virtualizer fills its window). A resize we could observe isn't
-  // guaranteed — the wrapper height is fixed to the estimate — so we drive the
+  // guaranteed — the wrapper's height tracks the estimate — so we drive the
   // retry ourselves rather than wait for one. When the budget runs out (e.g. a
   // tool-only trailing turn that never has an anchor) capture settles to `null`.
   const captureFrameRef = useRef(0);

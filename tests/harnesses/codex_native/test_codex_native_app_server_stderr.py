@@ -168,3 +168,33 @@ sys.stderr.flush()
     assert server.certificate_failure.expired is True
     assert "SSLV3_ALERT_CERTIFICATE_EXPIRED" in server.certificate_failure.evidence
     assert read_certificate_failure(tmp_path) == server.certificate_failure
+
+
+@pytest.mark.parametrize(
+    ("line", "recorded"),
+    [
+        (
+            "2026-10-16T12:00:00.000000Z  WARN codex_mcp::rmcp_client: failed to connect MCP "
+            "server `docs`: error sending request: invalid peer certificate: Expired",
+            False,
+        ),
+        (
+            "2026-10-16T12:00:00.000000Z ERROR codex_core::client: error sending request for url "
+            "(https://model.example/v1/responses): invalid peer certificate: Expired",
+            True,
+        ),
+    ],
+    ids=["mcp-client", "model-client"],
+)
+async def test_stderr_certificate_failure_is_recorded_only_for_the_model_client(
+    server: CodexNativeAppServer, tmp_path: Path, line: str, recorded: bool
+) -> None:
+    """An MCP server's expired certificate must not be mirrored as a model-egress failure."""
+    stderr = asyncio.StreamReader()
+    stderr.feed_data(f"{line}\n".encode())
+    stderr.feed_eof()
+    server.proc = cast(asyncio.subprocess.Process, SimpleNamespace(stderr=stderr, pid=4242))
+    await asyncio.wait_for(server._stderr_loop(), 5)
+
+    assert (server.certificate_failure is not None) is recorded
+    assert (read_certificate_failure(tmp_path) is not None) is recorded

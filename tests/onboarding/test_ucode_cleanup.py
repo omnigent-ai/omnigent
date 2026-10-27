@@ -10,11 +10,11 @@ from __future__ import annotations
 
 import json
 import textwrap
+import tomllib
 from collections.abc import Callable
 from pathlib import Path
 
 import pytest
-import tomllib
 
 from omnigent.errors import OmnigentError
 from omnigent.onboarding.ucode_cleanup import (

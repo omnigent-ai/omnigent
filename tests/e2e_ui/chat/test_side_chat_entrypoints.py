@@ -14,7 +14,7 @@ from collections.abc import Iterator
 
 import httpx
 import pytest
-from playwright.sync_api import Page, Route, expect
+from playwright.sync_api import Locator, Page, Route, expect
 
 from tests.e2e.conftest import get_mock_requests
 from tests.e2e_ui.conftest import configure_mock_llm, fetch_with_retry, open_right_rail
@@ -67,6 +67,35 @@ def _send_parent(page: Page, question: str, reply: str) -> None:
     expect(page.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
 
 
+def _paste_image(target: Locator, filename: str) -> None:
+    target.evaluate(
+        """async (target, filename) => {
+            const canvas = document.createElement("canvas");
+            canvas.width = 80;
+            canvas.height = 60;
+            canvas.getContext("2d").fillRect(0, 0, 80, 60);
+            const png = await new Promise(resolve => canvas.toBlob(resolve, "image/png"));
+            const transfer = new DataTransfer();
+            transfer.items.add(new File([png], filename, { type: "image/png" }));
+            target.dispatchEvent(new ClipboardEvent("paste", {
+                clipboardData: transfer, bubbles: true, cancelable: true,
+            }));
+        }""",
+        filename,
+    )
+
+
+def _wait_for_blocked_reply(page: Page, mock_url: str, who: str) -> None:
+    deadline = time.monotonic() + 30.0
+    while time.monotonic() < deadline:
+        response = httpx.get(f"{mock_url}/gate/pending", timeout=5.0)
+        response.raise_for_status()
+        if response.json()["pending"]:
+            return
+        page.wait_for_timeout(50)
+    pytest.fail(f"{who} never reached the blocked LLM response")
+
+
 def _start_side_chat(page: Page, entrypoint: str, question: str) -> None:
     if entrypoint == "slash":
         page.get_by_placeholder("Send a message…").fill(f"/side {question}")
@@ -100,7 +129,7 @@ def test_composer_add_tray_offers_a_side_chat(
     runner_id: str,
     mock_llm_server_url: str,
 ) -> None:
-    """The composer ``+`` tray starts a working chat on the parent's runner."""
+    """The ``+`` tray starts a working side chat whose composer also opens the slash menu."""
     base_url, session_id = seeded_session
     question = f"tray-side-{session_id}: answer in the side chat"
     reply = "The add tray started a side chat."
@@ -119,6 +148,13 @@ def test_composer_add_tray_offers_a_side_chat(
     response = httpx.get(f"{base_url}/v1/sessions/{side_chat_forks[0]}", timeout=10.0)
     response.raise_for_status()
     assert response.json()["runner_id"] == runner_id
+
+    # The live side chat shares the main composer's slash menu; /help is the
+    # built-in offered on every non-native harness, so it proves the menu opened.
+    side_input = page.get_by_test_id("side-chat-input")
+    expect(side_input).to_be_enabled(timeout=30_000)
+    side_input.fill("/")
+    expect(page.get_by_test_id("slash-menu-item-help")).to_be_visible(timeout=10_000)
 
 
 def test_rail_new_tab_menu_offers_a_side_chat(page: Page, seeded_session: tuple[str, str]) -> None:
@@ -208,6 +244,7 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert child.json()["runner_id"] == runner_id
     expect(pane.get_by_text(parent_reply, exact=True)).to_have_count(0)
 
+    expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     page.get_by_test_id("side-chat-input").fill(followup)
     expect(page.get_by_test_id("side-chat-send")).to_be_enabled(timeout=30_000)
     page.get_by_test_id("side-chat-send").click()
@@ -334,7 +371,8 @@ def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
     page.get_by_role("button", name="Ask in side chat", exact=True).click()
     expect(rail.get_by_role("tab", name=re.compile(r"^Side chat "))).to_have_count(1)
     expect(pane.get_by_test_id("composer-reply-quote")).to_have_count(2)
-    expect(page.get_by_test_id("side-chat-input")).to_have_value(question)
+    expect(pane.get_by_role("textbox", name="Reply text before quote 2")).to_have_value(question)
+    expect(page.get_by_test_id("side-chat-input")).to_have_value("")
     assert side_chat_forks == []
     page.get_by_test_id("side-chat-send").click()
     expect(pane.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
@@ -371,10 +409,40 @@ def test_ask_in_side_chat_opens_a_quoted_side_chat_tab(
     expect(rail.get_by_role("tab", name=re.compile(r"^Side chat "))).to_have_count(1)
     reply_question = question + " explain this reply"
     page.get_by_test_id("side-chat-input").fill(reply_question)
-    page.get_by_test_id("side-chat-send").click()
+    pane.locator(_ASSISTANT).get_by_text(side_reply, exact=True).select_text()
+    page.get_by_role("button", name="Reply ↵", exact=True).click()
+    expect(pane.get_by_test_id("composer-reply-quote")).to_have_count(2)
+    earlier_reply = pane.get_by_role("textbox", name="Reply text before quote 2")
+    expect(earlier_reply).to_have_value(reply_question)
+    expect(page.get_by_test_id("side-chat-input")).to_have_value("")
+    edited_reply = reply_question + " in more detail"
+    earlier_reply.fill(edited_reply)
+    final_reply = "And explain how long to wait."
+    page.get_by_test_id("side-chat-input").fill(final_reply)
+    _paste_image(page.get_by_test_id("side-chat-input"), "side-chat.png")
+    expect(pane.get_by_role("button", name="Remove side-chat.png", exact=True)).to_be_visible()
+    expect(earlier_reply).to_have_value(edited_reply)
+    expect(page.get_by_test_id("side-chat-input")).to_have_value(final_reply)
+    expected_text = f"> {followup_reply}\n\n{edited_reply}\n\n> {side_reply}\n\n{final_reply}"
+    parent_items = _items(base_url, session_id)
+    with page.expect_request(re.compile(r"/v1/sessions/[^/]+/events$")) as sent_request:
+        page.get_by_test_id("side-chat-send").click()
+    request = sent_request.value
+    assert request.url == f"{base_url}/v1/sessions/{side_chat_forks[0]}/events"
+    content = request.post_data_json["data"]["content"]
+    assert content == [
+        {"type": "input_image", "file_id": content[0]["file_id"], "filename": "side-chat.png"},
+        {"type": "input_text", "text": expected_text},
+    ]
     expect(pane.locator(_ASSISTANT).filter(has_text=reply_answer)).to_be_visible(timeout=30_000)
-    assert f"> {followup_reply}" in str(_items(base_url, side_chat_forks[0]))
-    assert reply_question not in str(_items(base_url, session_id))
+    user_messages = [
+        item
+        for item in _items(base_url, side_chat_forks[0])
+        if item.get("type") == "message" and item.get("role") == "user"
+    ]
+    for persisted, sent in zip(user_messages[-1]["content"], content, strict=True):
+        assert sent.items() <= persisted.items()
+    assert _items(base_url, session_id) == parent_items
 
 
 def test_side_chat_opens_in_a_drawer_on_mobile(
@@ -387,6 +455,7 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     base_url, session_id = seeded_session
     parent_reply = "Retry the upload with exponential backoff."
     side_reply = "Backoff spreads the retries out so the server can recover."
+    side_detail = "Increase the delay after each failed attempt."
     followup_reply = "The mobile side chat received the quoted reply."
     question = f"mobile-side-{session_id}: why backoff?"
     configure_mock_llm(
@@ -397,7 +466,7 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     )
     configure_mock_llm(
         mock_llm_server_url,
-        [{"text": side_reply}, {"text": followup_reply}],
+        [{"text": f"{side_reply}\n\n{side_detail}"}, {"text": followup_reply}],
         key=f"mobile-side-{session_id}",
         match=f"mobile-side-{session_id}",
     )
@@ -414,6 +483,7 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     drawer.get_by_test_id("side-chat-input").fill(question)
     drawer.get_by_test_id("side-chat-send").click()
     expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
+    expect(drawer.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     assert len(side_chat_forks) == 1
 
     drawer.locator(_ASSISTANT).get_by_text(side_reply, exact=True).select_text()
@@ -427,13 +497,50 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     reply_popup.click()
     expect(drawer.get_by_test_id("composer-reply-quote")).to_contain_text(side_reply)
     expect(drawer.get_by_test_id("side-chat-input")).to_be_focused()
-    drawer.get_by_test_id("side-chat-input").fill(question + " explain this reply")
-    drawer.get_by_test_id("side-chat-send").click()
+    first_reply = question + " explain this reply"
+    drawer.get_by_test_id("side-chat-input").fill(first_reply)
+    drawer.locator(_ASSISTANT).get_by_text(side_detail, exact=True).select_text()
+    page.get_by_role("button", name="Reply ↵", exact=True).click()
+    expect(drawer.get_by_test_id("composer-reply-quote")).to_have_count(2)
+    earlier_reply = drawer.get_by_role("textbox", name="Reply text before quote 2")
+    expect(earlier_reply).to_have_value(first_reply)
+    expect(drawer.get_by_test_id("side-chat-input")).to_have_value("")
+    edited_reply = first_reply + " in more detail"
+    earlier_reply.fill(edited_reply)
+    _paste_image(earlier_reply, "mobile-side-chat.png")
+    expect(
+        drawer.get_by_role("button", name="Remove mobile-side-chat.png", exact=True)
+    ).to_be_visible()
+    expect(earlier_reply).to_have_value(edited_reply)
+    final_reply = "And explain when to stop retrying."
+    drawer.get_by_test_id("side-chat-input").fill(final_reply)
+    expected_text = f"> {side_reply}\n\n{edited_reply}\n\n> {side_detail}\n\n{final_reply}"
+    parent_items = _items(base_url, session_id)
+    with page.expect_request(re.compile(r"/v1/sessions/[^/]+/events$")) as sent_request:
+        drawer.get_by_test_id("side-chat-send").click()
+    request = sent_request.value
+    assert request.url == f"{base_url}/v1/sessions/{side_chat_forks[0]}/events"
+    content = request.post_data_json["data"]["content"]
+    assert content == [
+        {
+            "type": "input_image",
+            "file_id": content[0]["file_id"],
+            "filename": "mobile-side-chat.png",
+        },
+        {"type": "input_text", "text": expected_text},
+    ]
     expect(drawer.locator(_ASSISTANT).filter(has_text=followup_reply)).to_be_visible(
         timeout=30_000
     )
     assert len(side_chat_forks) == 1
-    assert f"> {side_reply}" in str(_items(base_url, side_chat_forks[0]))
+    user_messages = [
+        item
+        for item in _items(base_url, side_chat_forks[0])
+        if item.get("type") == "message" and item.get("role") == "user"
+    ]
+    for persisted, sent in zip(user_messages[-1]["content"], content, strict=True):
+        assert sent.items() <= persisted.items()
+    assert _items(base_url, session_id) == parent_items
 
     # Closing the drawer keeps the side chat; the header menu brings it back.
     drawer.get_by_role("button", name="Close", exact=True).click()
@@ -539,20 +646,15 @@ def test_side_chat_interrupt_allows_followup_without_stopping_parent(
         assert len(side_chat_forks) == 1
         child_id = side_chat_forks[0]
 
-        deadline = time.monotonic() + 30.0
-        while time.monotonic() < deadline:
-            response = httpx.get(f"{mock_llm_server_url}/gate/pending", timeout=5.0)
-            response.raise_for_status()
-            if response.json()["pending"]:
-                break
-            page.wait_for_timeout(50)
-        else:
-            pytest.fail("The side chat never reached the blocked LLM response")
+        _wait_for_blocked_reply(page, mock_llm_server_url, "The side chat")
 
         parent_items = _items(base_url, session_id)
-        page.get_by_test_id("side-chat-input").fill(followup)
+        side_input = page.get_by_test_id("side-chat-input")
+        side_input.fill(followup)
+        # A draft swaps Interrupt for Send, so Escape interrupts as in the main composer.
+        expect(interrupt).to_have_count(0)
         with page.expect_response(f"**/v1/sessions/{child_id}/events") as interrupted:
-            interrupt.click()
+            side_input.press("Escape")
         assert interrupted.value.ok
         assert interrupted.value.request.post_data_json["type"] == "interrupt"
         expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
@@ -573,6 +675,60 @@ def test_side_chat_interrupt_allows_followup_without_stopping_parent(
         assert followup in str(_items(base_url, child_id))
         assert question not in str(_items(base_url, session_id))
         expect(page).to_have_url(f"{base_url}/c/{session_id}")
+    finally:
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+
+
+def test_side_chat_opened_while_parent_runs_answers_only_its_question(
+    page: Page,
+    seeded_session: tuple[str, str],
+    side_chat_forks: list[str],
+    mock_llm_server_url: str,
+) -> None:
+    """A side chat forked mid-turn must not run the parent's unanswered message itself."""
+    base_url, session_id = seeded_session
+    parent_question = f"main-task-{session_id}: keep working on the main task"
+    question = f"side-task-{session_id}: answer this side question"
+    parent_reply = "The main task is done."
+    repeated_parent_reply = "Answering the main task again."
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": parent_reply, "block": True}, {"text": repeated_parent_reply}],
+        key=f"main-task-{session_id}",
+        match=f"main-task-{session_id}",
+    )
+    configure_mock_llm(
+        mock_llm_server_url,
+        [{"text": "The side answer."}],
+        key=f"side-task-{session_id}",
+        match=f"side-task-{session_id}",
+    )
+
+    try:
+        page.goto(f"{base_url}/c/{session_id}")
+        page.get_by_placeholder("Send a message…").fill(parent_question)
+        page.get_by_role("button", name="Send", exact=True).click()
+        _wait_for_blocked_reply(page, mock_llm_server_url, "The parent")
+        _start_side_chat(page, "panel", question)
+
+        pane = page.locator(".side-chat-backdrop")
+        expect(pane.locator(_ASSISTANT).filter(has_text="The side answer.")).to_be_visible(
+            timeout=30_000
+        )
+        expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
+        assert len(side_chat_forks) == 1
+        assert repeated_parent_reply not in str(_items(base_url, side_chat_forks[0]))
+        expect(pane.get_by_text(repeated_parent_reply, exact=True)).to_have_count(0)
+
+        httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
+        expect(page.locator(_ASSISTANT).filter(has_text=parent_reply)).to_be_visible(
+            timeout=30_000
+        )
+        model_inputs = [
+            json.dumps(request.get("input", []))
+            for request in get_mock_requests(mock_llm_server_url, key="gpt-4o-mini")
+        ]
+        assert sum(parent_question in text and question not in text for text in model_inputs) == 1
     finally:
         httpx.post(f"{mock_llm_server_url}/gate/release", timeout=5.0).raise_for_status()
 

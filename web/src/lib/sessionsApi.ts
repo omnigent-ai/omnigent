@@ -15,7 +15,7 @@ import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
 import { isAndroidShell, isElectronShell, isIOSShell } from "@/lib/nativeBridge";
-import { setSessionHost, setSessionParent } from "./sessionHost";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "./sessionHost";
 import { backgroundSessionTitlesRequestHeaders } from "./backgroundSessionTitlesPreferences";
 import { parseBackgroundTasks } from "./sse";
 import type {
@@ -152,6 +152,7 @@ interface SessionResponseWire {
    */
   title?: string | null;
   labels?: Record<string, string>;
+  project_id?: string | null;
   /** Canonical working directory; ``null`` when unbound. */
   workspace?: string | null;
   /**
@@ -316,7 +317,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
   // Record the session's host so slice-key routing (turn dispatch, terminal
   // attach) can pin to the replica holding that host's runner tunnel; a
   // sub-agent child inherits its parent's through the recorded parent link.
-  setSessionHost(wire.id, wire.host_id);
+  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
@@ -334,6 +335,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     createdAt: wire.created_at,
     title: wire.title ?? null,
     labels: wire.labels,
+    projectId: wire.project_id ?? null,
     workspace: wire.workspace ?? null,
     terminalLaunchArgs: wire.terminal_launch_args ?? null,
     gitBranch: wire.git_branch ?? null,
@@ -742,6 +744,7 @@ export async function createBundledSession(
     labels?: Record<string, string>;
     terminal_launch_args?: string[];
     git?: { branch_name: string; base_branch?: string };
+    mcp_registry_services?: string[];
   } = {},
 ): Promise<{ id: string }> {
   const form = new FormData();
@@ -806,7 +809,8 @@ export async function createBundledSession(
  *   (`null` takes its first). `workspace` is a `<url>[#<branch>]`
  *   repository the server clones into the sandbox; `null` gives the fork an
  *   empty sandbox, and leaving the key off inherits the repository the
- *   source session recorded.
+ *   source session recorded. `hostId` names the new sandbox host, as on a
+ *   managed create; omitted, the server mints one.
  */
 export async function forkSession(
   sourceId: string,
@@ -820,7 +824,7 @@ export async function forkSession(
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
-    sandbox?: { provider?: string | null; workspace?: string | null };
+    sandbox?: { provider?: string | null; workspace?: string | null; hostId?: string };
     /** Mark the fork as a side chat (hidden from the left sidebar). */
     sideChat?: boolean;
   } = {},
@@ -836,6 +840,7 @@ export async function forkSession(
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
     sandbox_provider?: string;
+    host_id?: string;
     workspace?: string | null;
     side_chat?: boolean;
   } = {};
@@ -875,6 +880,9 @@ export async function forkSession(
     // sandbox", while omitting it inherits the source's repository.
     if (sandbox.workspace !== undefined) {
       body.workspace = sandbox.workspace;
+    }
+    if (sandbox.hostId !== undefined) {
+      body.host_id = sandbox.hostId;
     }
   }
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sourceId)}/fork`, {
@@ -1371,6 +1379,12 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
   return "data" in item && typeof (item as NestedSessionItem).data === "object";
 }
 
+/** The server's ErrorCode.HOST_OFFLINE: a held send whose host is offline. */
+export const HOST_OFFLINE_CODE = "host_offline";
+
+/** Tells the server this client resends a message once its offline host reconnects. */
+const HOST_OFFLINE_HOLD_HEADER = "x-omnigent-hold-when-host-offline";
+
 /**
  * Submit a single event to a session. Validated server-side per the
  * `type` discriminator (`message`, `function_call_output`,
@@ -1381,12 +1395,14 @@ function isNestedSessionItem(item: SessionItem): item is NestedSessionItem {
 export async function postEvent(
   sessionId: string,
   event: SessionEventInput,
+  opts?: { holdWhenHostOffline?: boolean },
 ): Promise<PostEventResponse> {
   const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(sessionId)}/events`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
       ...backgroundSessionTitlesRequestHeaders(),
+      ...(opts?.holdWhenHostOffline ? { [HOST_OFFLINE_HOLD_HEADER]: "on" } : {}),
     },
     body: JSON.stringify(event),
   });

@@ -30,6 +30,7 @@ import pytest
 from playwright.sync_api import Browser, Page, expect
 
 from omnigent.runner.identity import token_bound_runner_id
+from tests._helpers.browser import user_page
 from tests._helpers.session import post_session_bundle
 from tests.e2e_ui.collaboration._multi_user_server import (
     ADMIN_EMAIL,
@@ -187,33 +188,19 @@ def _open_share_modal(page: Page) -> None:
     expect(page.get_by_text("Share this session")).to_be_visible()
 
 
-def _install_clipboard_stub(page: Page) -> None:
-    """Provide async clipboard on the public loopback alias.
+def _read_clipboard(page: Page, secure_url: str) -> str:
+    """Read the browser clipboard through a page on the loopback origin.
 
-    Chromium exposes real clipboard access on localhost, but not on the
+    Chromium exposes async clipboard on localhost, but not on the
     public-looking plain-HTTP alias this test uses to keep Share enabled.
     """
-    page.add_init_script(
-        """
-        (() => {
-          let text = "";
-          Object.defineProperty(Navigator.prototype, "clipboard", {
-            configurable: true,
-            get() {
-              return {
-                writeText(value) {
-                  text = String(value);
-                  return Promise.resolve();
-                },
-                readText() {
-                  return Promise.resolve(text);
-                },
-              };
-            },
-          });
-        })();
-        """
-    )
+    page.context.grant_permissions(["clipboard-read"], origin=secure_url)
+    reader = page.context.new_page()
+    try:
+        reader.goto(f"{secure_url}/v1/info")
+        return reader.evaluate("() => navigator.clipboard.readText()")
+    finally:
+        reader.close()
 
 
 def test_single_user_hides_share_button(
@@ -253,7 +240,6 @@ def test_permissions_modal_controls_drive_server_state(
     session_id = multi_user_server.session_id
     grantee = "alice@ui.test"
     page = _admin_page(browser)
-    _install_clipboard_stub(page)
     page.goto(f"{multi_user_server.public_url}/c/{session_id}")
 
     _open_share_modal(page)
@@ -270,9 +256,11 @@ def test_permissions_modal_controls_drive_server_state(
     _wait_for(lambda: _permissions(base_url, session_id).get(_PUBLIC_USER) == _LEVEL_READ)
 
     # ── Copy link: writes a shareable, session-scoped URL ────────────
+    # Plain HTTP has no async clipboard, so this exercises the fallback copy.
+    assert page.evaluate("() => navigator.clipboard === undefined")
     dialog.get_by_role("button", name="Copy link").click()
     expect(dialog.get_by_role("button", name="Copied!")).to_be_visible()
-    clipboard = page.evaluate("() => navigator.clipboard.readText()")
+    clipboard = _read_clipboard(page, base_url)
     assert session_id in clipboard, f"clipboard URL {clipboard!r} missing session id"
     assert re.search(rf"/c/{re.escape(session_id)}\b", clipboard), (
         f"clipboard URL {clipboard!r} is not a /c/<id> session link"
@@ -363,20 +351,22 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         json={"runner_id": runner_id},
         timeout=30,
     ).raise_for_status()
-    admin_context = browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        extra_http_headers=admin_headers,
-        record_video_dir=str(tmp_path / "video"),
-        record_video_size={"width": 1280, "height": 900},
-    )
-    member_context = browser.new_context(
-        viewport={"width": 1280, "height": 900},
-        extra_http_headers=member_headers,
-        record_video_dir=str(tmp_path / "video"),
-        record_video_size={"width": 1280, "height": 900},
-    )
-    try:
-        page = admin_context.new_page()
+    with (
+        user_page(
+            browser,
+            headers=admin_headers,
+            viewport={"width": 1280, "height": 900},
+            record_video_dir=str(tmp_path / "video"),
+            record_video_size={"width": 1280, "height": 900},
+        ) as page,
+        user_page(
+            browser,
+            headers=member_headers,
+            viewport={"width": 1280, "height": 900},
+            record_video_dir=str(tmp_path / "video"),
+            record_video_size={"width": 1280, "height": 900},
+        ) as member,
+    ):
         page.goto(f"{multi_user_server.public_url}/settings/sharing")
         ceiling = page.get_by_role("combobox", name="Maximum public permission")
         expect(ceiling).to_have_text("Read", timeout=30_000)
@@ -400,7 +390,6 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         )
         page.screenshot(path=str(tmp_path / "public-sharing-desktop.png"))
 
-        member = member_context.new_page()
         member.goto(f"{multi_user_server.public_url}/c/{session_id}")
         composer = member.get_by_placeholder("Send a message…")
         expect(composer).to_be_enabled(timeout=30_000)
@@ -464,9 +453,6 @@ def test_public_edit_ceiling_grant_downgrade_revoke(
         ) as snapshot:
             member.reload()
         assert snapshot.value.status == 404
-    finally:
-        admin_context.close()
-        member_context.close()
 
 
 def test_multi_user_shows_enabled_share_button(

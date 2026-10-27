@@ -3,24 +3,39 @@
 from __future__ import annotations
 
 import json
+import logging
+import os
+import shlex
+import shutil
 import stat
+import subprocess
+import sys
+import time
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import httpx
 import pytest
 
+from omnigent.harnesses.pi_native import auth_command
 from omnigent.harnesses.pi_native import credentials as creds
+from omnigent.inner._proc import process_alive
+from omnigent.onboarding.providers import ModelInfo
+from tests._helpers.pi_native import seed_pi_own_login_catalog
 
 
 @pytest.fixture(autouse=True)
-def _stub_catalog_default(monkeypatch: pytest.MonkeyPatch) -> None:
+def _isolate_host_defaults(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     monkeypatch.setattr(
         "omnigent.models.model_catalog.resolve_catalog_model",
         lambda provider_name, *, family, **kwargs: SimpleNamespace(
             model_id=f"catalog-{provider_name}-{family}-default"
         ),
     )
+    # The resolver consults Pi's own login catalog (~/.pi/agent by default);
+    # point it at an empty dir so a developer's real login can't flip outcomes.
+    monkeypatch.setenv(creds.PI_CODING_AGENT_DIR_ENV_VAR, str(tmp_path / "pi-agent"))
 
 
 def _databricks_config() -> dict[str, object]:
@@ -46,6 +61,7 @@ def test_resolves_databricks_default_to_anthropic_gateway(monkeypatch: pytest.Mo
         return "https://wkspc.example.com/"
 
     monkeypatch.setattr(databricks_executor, "_read_databrickscfg_host", _host)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -90,6 +106,7 @@ def test_databricks_unresolvable_credentials_sets_warning(
         raise OSError("refresh token is invalid")
 
     monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
 
@@ -97,6 +114,49 @@ def test_databricks_unresolvable_credentials_sets_warning(
     assert provider.credential_warning is not None
     assert "demo-staging" in provider.credential_warning
     assert "databricks auth login" in provider.credential_warning
+
+
+def test_databricks_sdk_probe_failure_with_working_auth_command_has_no_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """SDK probe fails but Pi's apiKey command mints a token -> no false warning.
+
+    The SDK rejects a ``databricks`` wrapper shim on PATH that the apiKey
+    command runs fine, so the command decides whether the session works.
+    """
+    from omnigent.inner import databricks_executor
+
+    monkeypatch.setattr(
+        databricks_executor,
+        "_read_databrickscfg_host",
+        lambda profile: "https://wkspc.example.com/",
+    )
+
+    def _boom(profile: str | None):
+        raise OSError("databricks-sdk could not mint a token")
+
+    monkeypatch.setattr(creds, "resolve_databricks_workspace", _boom)
+    commands: list[str] = []
+
+    def _auth(command: str) -> str:
+        commands.append(command)
+        return "cmd-tok"
+
+    monkeypatch.setattr(creds, "_run_auth_command", _auth)
+    fetched: list[tuple[str, str]] = []
+
+    def _fetch(host: str, token: str):
+        fetched.append((host, token))
+        return [], [], [], []
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _fetch)
+
+    provider = creds.resolve_pi_native_provider(config_loader=_databricks_config)
+
+    assert provider is not None
+    assert provider.credential_warning is None
+    assert commands == [provider.api_key.removeprefix("!")]
+    assert fetched == [("https://wkspc.example.com", "cmd-tok")]
 
 
 def test_databricks_model_list_failure_has_no_warning(
@@ -726,6 +786,153 @@ def test_managed_picker_prefix_is_not_part_of_provider_model() -> None:
     assert provider.model == "claude-opus-4-7"
 
 
+def _openrouter_default_pi_config() -> dict[str, object]:
+    return {
+        "providers": {
+            "openrouter": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://openrouter.ai/api/v1",
+                    "api_key": "sk-or-testkey",
+                    "wire_api": "chat",
+                },
+            }
+        }
+    }
+
+
+def test_pi_own_login_reference_classification(tmp_path: Path) -> None:
+    seed_pi_own_login_catalog(tmp_path, "openai-codex", ["gpt-5.6-sol"])
+
+    assert creds.pi_own_login_serves_reference("openai-codex/gpt-5.6-sol", tmp_path)
+    assert not creds.pi_own_login_serves_reference("anthropic/claude-opus-5", tmp_path)
+    assert not creds.pi_own_login_serves_reference("openai-codex/gpt-4o", tmp_path)
+    assert not creds.pi_own_login_serves_reference("gpt-5.6-sol", tmp_path)
+    assert not creds.pi_own_login_serves_reference("/gpt-5.6-sol", tmp_path)
+    assert not creds.pi_own_login_serves_reference("openai-codex/", tmp_path)
+    assert not creds.pi_own_login_serves_reference(None, tmp_path)
+    assert not creds.pi_own_login_serves_reference("", tmp_path)
+
+
+def test_pi_own_login_reference_matches_slash_bearing_model_id(tmp_path: Path) -> None:
+    seed_pi_own_login_catalog(tmp_path, "openrouter", ["qwen/qwen3-coder"])
+
+    assert creds.pi_own_login_serves_reference("openrouter/qwen/qwen3-coder", tmp_path)
+    assert not creds.pi_own_login_serves_reference("openrouter/qwen", tmp_path)
+
+
+@pytest.mark.parametrize("curated", [False, True])
+@pytest.mark.parametrize(
+    ("provider_id", "model_id"),
+    [("openai-codex", "gpt-5.6-sol"), ("openai", "gpt-4o"), ("local-gateway", "custom-model")],
+)
+def test_resolve_prefers_pi_own_login_for_served_reference(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, curated: bool, provider_id: str, model_id: str
+) -> None:
+    selected = f"{provider_id}/{model_id}"
+    alternative = f"{provider_id}/picker-model"
+    if provider_id == "local-gateway":
+        (tmp_path / "models.json").write_text(
+            json.dumps(
+                {
+                    "providers": {
+                        provider_id: {
+                            "apiKey": "synthetic",
+                            "models": [{"id": model_id}, {"id": "picker-model"}],
+                        }
+                    }
+                }
+            )
+        )
+    else:
+        seed_pi_own_login_catalog(tmp_path, provider_id, [model_id, "picker-model"])
+    if curated:
+        (tmp_path / "settings.json").write_text(json.dumps({"enabledModels": [alternative]}))
+        # Resolver grammar has real-Pi coverage; this checks inventory versus picker use.
+        monkeypatch.setattr(
+            creds,
+            "scope_models",
+            lambda patterns, entries: [creds.ScopableModel(provider_id, "picker-model")],
+        )
+        assert [o["id"] for o in creds.pi_own_login_model_options(tmp_path)] == [alternative]
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model=selected, config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is None
+
+
+def test_resolve_keeps_gateway_routing_for_unserved_slash_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model="openai/gpt-4o-mini", config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is not None
+    assert provider.model == "openai/gpt-4o-mini"
+
+
+def test_resolve_pi_own_login_collision_with_gateway_default_warns(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A slash id served by both Pi's login and the gateway default goes to Pi's login.
+
+    ``openai/gpt-4o-mini`` is also an OpenRouter id, so the host login decides
+    the routing; the resolver must say so at WARNING level.
+    """
+    seed_pi_own_login_catalog(tmp_path, "openai", ["gpt-4o-mini"])
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    with caplog.at_level(logging.WARNING, logger="omnigent.harnesses.pi_native.credentials"):
+        provider = creds.resolve_pi_native_provider(
+            model="openai/gpt-4o-mini", config_loader=_openrouter_default_pi_config
+        )
+
+    assert provider is None
+    assert any(
+        rec.levelno == logging.WARNING and "openai/gpt-4o-mini" in rec.getMessage()
+        for rec in caplog.records
+    )
+
+
+def test_resolve_configured_provider_prefix_wins_over_pi_own_login(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seed_pi_own_login_catalog(tmp_path, "openrouter", ["gpt-4o-mini"])
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model="openrouter/gpt-4o-mini", config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is not None
+    assert provider.model == "gpt-4o-mini"
+
+
+@pytest.mark.parametrize(
+    ("provider_id", "model_id"), [("openai-codex", "gpt-5.6-sol"), ("openai", "gpt-4o")]
+)
+def test_resolve_managed_selection_stays_managed_despite_pi_own_login_collision(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, provider_id: str, model_id: str
+) -> None:
+    """An explicit managed pick keeps managed routing even if Pi's login serves the same id."""
+    seed_pi_own_login_catalog(tmp_path, provider_id, [model_id])
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
+
+    provider = creds.resolve_pi_native_provider(
+        model=f"omnigent/{provider_id}/{model_id}", config_loader=_openrouter_default_pi_config
+    )
+
+    assert provider is not None
+    assert provider.model == f"{provider_id}/{model_id}"
+
+
 def test_subscription_default_returns_none() -> None:
     """A subscription (CLI-login) default isn't reusable by Pi → None."""
     config = {"providers": {"claude": {"kind": "subscription", "default": True, "cli": "claude"}}}
@@ -801,7 +1008,54 @@ def test_to_models_config_shape() -> None:
     assert entry["api"] == "anthropic-messages"
     assert entry["apiKey"] == "!get-token"
     assert entry["authHeader"] is True
-    assert entry["models"] == [{"id": "databricks-claude-sonnet-4-6", "reasoning": True}]
+    assert entry["models"] == [
+        {
+            "id": "databricks-claude-sonnet-4-6",
+            "reasoning": True,
+            "compat": {"forceAdaptiveThinking": True},
+        }
+    ]
+
+
+def test_to_models_config_attributes_unity_gateway_providers() -> None:
+    """Gateway providers name Pi and Omnigent (plus ug for ug's own headers)."""
+    ug_provider: creds._PiProviderPayload = {
+        "baseUrl": "https://dbc-1.cloud.databricks.com/ai-gateway/codex/v1",
+        "apiKey": "!get-token",
+        "api": "openai-responses",
+        "models": [{"id": "system.ai.gpt-5-5"}],
+        "headers": {"User-Agent": "ucode/0.1.0 pi/0.80.0"},
+    }
+    other_provider: creds._PiProviderPayload = {
+        "baseUrl": "https://openrouter.ai/api/v1",
+        "apiKey": "sk-test",
+        "api": "openai-completions",
+        "models": [{"id": "qwen/qwen3"}],
+    }
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="https://dbc-1.cloud.databricks.com/ai-gateway/anthropic",
+        api="anthropic-messages",
+        model="system.ai.claude-sonnet-5",
+        api_key="!get-token",
+        auth_header=True,
+        additional_providers={"ug-openai": ug_provider, "other": other_provider},
+    )
+
+    providers = provider.to_models_config()["providers"]
+
+    assert providers["omnigent"]["headers"] == {
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent",
+    }
+    assert providers["ug-openai"]["headers"] == {
+        "User-Agent": "ucode/0.1.0 pi/0.80.0",
+        "Databricks-Custom-Coding-Agent": "pi",
+        "Databricks-Custom-Client-Surfaces": "omnigent, ug",
+    }
+    assert "headers" not in providers["other"]
+    # The configured payload is shared across renders, so it stays unstamped.
+    assert ug_provider["headers"] == {"User-Agent": "ucode/0.1.0 pi/0.80.0"}
 
 
 def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
@@ -822,6 +1076,59 @@ def test_write_models_config_is_owner_only(tmp_path: Path) -> None:
     assert stat.S_IMODE(agent_dir.stat().st_mode) == 0o700
     written = json.loads(path.read_text(encoding="utf-8"))
     assert written["providers"]["omnigent"]["apiKey"] == "sk-secret"
+
+
+@pytest.mark.parametrize(
+    ("command", "kind", "token"),
+    [
+        ("printf 'private-token' | tr a-z A-Z", "ok", "PRIVATE-TOKEN"),
+        ("printf private-token; echo private-error >&2; exit 7", "failed_exit", ""),
+        ("printf '  '", "empty", ""),
+        ("printf '\\377'", "invalid_output", ""),
+        ("sleep 20", "timeout", ""),
+        ("", "invalid_command", ""),
+    ],
+)
+def test_generated_token_command_reports_only_safe_results(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, command: str, kind: str, token: str
+) -> None:
+    if os.name != "posix" or shutil.which("node") is None:
+        pytest.skip("the native Pi token wrapper requires POSIX and Node")
+    if kind == "timeout":
+        monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 500)
+    provider = creds.PiProviderConfig(
+        provider_id="omnigent",
+        base_url="http://localhost/v1",
+        api="openai-completions",
+        model="mock-auth",
+        api_key="!" + command,
+        auth_header=True,
+    )
+    rendered = provider.to_models_config()
+    agent = tmp_path / "agent with spaces"
+    written = json.loads(creds.write_pi_models_config(agent, provider, rendered).read_text())
+    assert rendered["providers"]["omnigent"]["apiKey"] == "!" + command
+    wrapped = written["providers"]["omnigent"]["apiKey"]
+    assert "private-token" not in wrapped
+    result = subprocess.run(
+        wrapped[1:],
+        shell=True,
+        capture_output=True,
+        text=True,
+        timeout=12,
+        env={**os.environ, "OMNIGENT_PI_NATIVE_PID": "123"},
+    )
+    assert result.returncode == (0 if kind == "ok" else 1)
+    assert result.stdout == token
+    assert result.stderr == ""
+    auth_dir = agent / auth_command.AUTH_DIR_NAME
+    status = next(auth_dir.glob("*.result.json"))
+    payload = json.loads(status.read_text())
+    assert payload["kind"] == kind
+    assert payload["piPid"] == 123
+    assert "private-" not in status.read_text()
+    for file in auth_dir.iterdir():
+        assert stat.S_IMODE(file.stat().st_mode) == 0o600
 
 
 def test_provider_launch_returns_env_and_args(tmp_path: Path) -> None:
@@ -882,26 +1189,29 @@ def test_provider_launch_effort_edge_values(
     assert warning is None
 
 
-def test_provider_launch_gateway_routed_model_keeps_thinking_off(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+@pytest.mark.parametrize(
+    ("effort", "expected"),
+    [
+        ("high", ["--thinking", "high"]),
+        ("none", ["--thinking", "off"]),
+        ("default", []),
+        (None, []),
+    ],
+)
+def test_provider_launch_gateway_routed_model_preserves_effort(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, effort: str | None, expected: list[str]
 ) -> None:
-    """The gateway-routed pin wins over the user's effort, with a warning.
-
-    Those models' ``reasoning_tokens`` break pi's completions handler so text
-    never surfaces; honouring the effort would reintroduce that.
-    """
+    """Secondary providers use the same effort mapping as the primary."""
     provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
     monkeypatch.setattr(
         "omnigent.inner.pi_settings.prepare_managed_pi_agent_dir",
         lambda *_args, **_kwargs: None,
     )
 
-    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, "high")
+    _env, args, warning = creds.pi_native_provider_launch(tmp_path / "pi-agent", provider, effort)
 
-    assert args.count("--thinking") == 1
-    assert args[-2:] == ["--thinking", "off"]
-    assert warning is not None
-    assert "databricks-glm-5-2" in warning
+    assert args[4:] == expected
+    assert warning is None
 
 
 def test_pi_native_provider_launch_namespaced_model_uses_qualified_arg(
@@ -961,8 +1271,6 @@ def test_provider_launch_accepts_provider_qualified_selection(tmp_path: Path) ->
         "omnigent-openai",
         "--model",
         "gpt-5.6-sol",
-        "--thinking",
-        "off",
     ]
 
 
@@ -1008,15 +1316,10 @@ def test_inline_databricks_gateway_selection_follows_the_model_across_discovery(
     assert args[:4] == ["--provider", expected_provider, "--model", "system.ai.gpt-5"]
 
 
-def test_inline_databricks_gateway_default_launches_with_thinking_off(
+def test_inline_databricks_gateway_default_preserves_requested_thinking(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    """After enumeration the GPT default is gateway-routed, so effort is dropped with a notice.
-
-    The default now lives in the generated OpenAI provider rather than the
-    primary, so the launch takes the same gateway-routed branch as the
-    databricks-kind path: thinking off, and a warning when an effort was set.
-    """
+    """A GPT default retains its effort after routing to a secondary provider."""
     monkeypatch.setattr(
         creds,
         "_fetch_pi_model_lists",
@@ -1040,10 +1343,9 @@ def test_inline_databricks_gateway_default_launches_with_thinking_off(
         "--model",
         "system.ai.gpt-5",
         "--thinking",
-        "off",
+        "high",
     ]
-    assert effort_warning is not None
-    assert "system.ai.gpt-5" in effort_warning
+    assert effort_warning is None
 
 
 def test_provider_launch_rejects_unavailable_qualified_selection(tmp_path: Path) -> None:
@@ -1786,6 +2088,7 @@ def test_model_override_beats_databricks_default(monkeypatch: pytest.MonkeyPatch
         "_read_databrickscfg_host",
         lambda profile: "https://wkspc.example.com/",
     )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(
         model="databricks-claude-opus-4-7", config_loader=_databricks_config
@@ -2117,18 +2420,26 @@ def test_provider_qualified_override_split_to_configured_provider() -> None:
     # Prefix split; the gateway-kind provider keeps the id verbatim.
     assert provider.model == "databricks-claude-fable-5-1"
     assert provider.credential_warning is None
+    assert provider.model_notice is None
     cfg = provider.to_models_config()
     ids = [m["id"] for prov in cfg["providers"].values() for m in prov["models"]]
     assert not [mid for mid in ids if "/" in mid]
 
 
-def test_override_qualified_by_other_configured_provider_warns() -> None:
-    """Naming a configured provider other than the serving one warns.
+@pytest.mark.parametrize("pi_login_serves_reference", [False, True])
+def test_override_qualified_by_other_configured_provider_notifies(
+    pi_login_serves_reference: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured provider prefix takes precedence and leaves a model notice.
 
     The session is served by the pi-default provider, so a model picked from
     another configured provider is requested from the default instead — say
-    so rather than silently reinterpreting the value.
+    so rather than silently reinterpreting the value. The configured prefix
+    keeps precedence even when Pi's own login serves the same reference.
     """
+    if pi_login_serves_reference:
+        seed_pi_own_login_catalog(tmp_path, "other-gw", ["databricks-claude-fable-5-1"])
+        monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path))
     config = _rpw_fable_anthropic_gateway()
     config["providers"]["other-gw"] = {
         "kind": "gateway",
@@ -2143,9 +2454,10 @@ def test_override_qualified_by_other_configured_provider_warns() -> None:
     )
     assert provider is not None
     assert provider.model == "databricks-claude-fable-5-1"
-    assert provider.credential_warning is not None
-    assert "other-gw" in provider.credential_warning
-    assert "rpw-fable" in provider.credential_warning
+    assert provider.credential_warning is None
+    assert provider.model_notice is not None
+    assert "other-gw" in provider.model_notice
+    assert "rpw-fable" in provider.model_notice
 
 
 @pytest.mark.parametrize(
@@ -2265,11 +2577,7 @@ def test_local_kind_override_passes_through_verbatim() -> None:
 
 
 def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A Databricks profile provider includes an OpenAI Completions provider for GPT models.
-
-    The ``omnigent-openai`` provider targets ``/serving-endpoints`` so Pi's
-    /model command exposes GPT models returned by the live serving-endpoints API.
-    """
+    """A Databricks profile exposes cataloged GPT models on their declared protocols."""
     from omnigent.inner import databricks_executor
 
     monkeypatch.setattr(
@@ -2305,10 +2613,12 @@ def test_databricks_profile_registers_gpt_provider(monkeypatch: pytest.MonkeyPat
     )
     assert openai_entry["baseUrl"] == "https://wkspc.example.com/ai-gateway/codex/v1"
     assert openai_entry["api"] == "openai-responses"
+    assert "supportsReasoningEffort" not in openai_entry["compat"]
     assert any(m["id"] == "databricks-gpt-5-5" for m in openai_entry["models"])
     completions_entry = cfg["providers"].get("omnigent-completions")
     assert completions_entry is not None, "omnigent-completions provider missing from models.json"
     assert completions_entry["api"] == "openai-completions"
+    assert "supportsReasoningEffort" not in completions_entry["compat"]
     assert any(m["id"] == "databricks-gpt-5-4" for m in completions_entry["models"])
 
 
@@ -2915,8 +3225,7 @@ def test_uncataloged_model_launch_arg_matches_rendered_provider(
     """``--provider`` must name the provider models.json registered the model on.
 
     The launch resolves the provider from the rendered config, so a model placed
-    by the family fallback is selectable — and gets ``--thinking off``, without
-    which the gateway 400s on ``reasoning_effort``.
+    by the family fallback is selectable without forcing a thinking level.
     """
     provider = _databricks_provider_without_catalog(monkeypatch, "databricks-glm-5-2")
     monkeypatch.setattr(
@@ -2931,8 +3240,6 @@ def test_uncataloged_model_launch_arg_matches_rendered_provider(
         "omnigent-completions",
         "--model",
         "databricks-glm-5-2",
-        "--thinking",
-        "off",
     ]
     cfg = json.loads((tmp_path / "pi-agent" / "models.json").read_text())
     registered = cfg["providers"]["omnigent-completions"]["models"]
@@ -3351,6 +3658,36 @@ def test_cli_config_pi_provider_discovery_failure_falls_back_to_catalog_default(
     )
 
 
+_PI_CUSTOM_PROVIDERS = {
+    "ollama": {
+        "baseUrl": "http://127.0.0.1:11434/v1",
+        "apiKey": "ollama-local",
+        "api": "openai-completions",
+        "models": [{"id": "llama3.1:8b", "name": "Llama 3.1 8B"}, {"id": "qwen2.5-coder:7b"}],
+    },
+    # Overrides a built-in provider without declaring models: contributes nothing.
+    "openai": {"baseUrl": "http://127.0.0.1:8080/v1"},
+}
+_PI_CUSTOM_OPTIONS = [
+    {
+        "id": "ollama/llama3.1:8b",
+        "model": "ollama/llama3.1:8b",
+        "displayName": "Llama 3.1 8B",
+    },
+    {
+        "id": "ollama/qwen2.5-coder:7b",
+        "model": "ollama/qwen2.5-coder:7b",
+        "displayName": "qwen2.5-coder:7b",
+    },
+]
+
+
+def _seed_pi_custom_providers(agent_dir: Path) -> None:
+    """Seed Pi's ``models.json`` with a keyed custom provider (Pi lists its models)."""
+    agent_dir.mkdir(parents=True, exist_ok=True)
+    (agent_dir / "models.json").write_text(json.dumps({"providers": _PI_CUSTOM_PROVIDERS}))
+
+
 def _seed_pi_own_login(agent_dir: Path) -> None:
     """Seed a Pi agent dir logged into anthropic, with an extra stale catalog."""
     agent_dir.mkdir(parents=True, exist_ok=True)
@@ -3402,8 +3739,98 @@ def test_model_options_fall_back_to_pi_own_login(
     ]
 
 
+def test_pi_own_login_options_skip_custom_providers_without_a_credential(
+    tmp_path: Path,
+) -> None:
+    """A models.json provider with neither a stored login nor its own apiKey is left out."""
+    _seed_pi_own_login(tmp_path)
+    (tmp_path / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    **_PI_CUSTOM_PROVIDERS,
+                    "keyless": {
+                        "baseUrl": "http://localhost:8080/v1",
+                        "api": "openai-completions",
+                        "models": [{"id": "local-model"}],
+                    },
+                }
+            }
+        )
+    )
+
+    options = creds.pi_own_login_model_options(agent_dir=tmp_path)
+
+    assert [option["id"] for option in options] == [
+        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-sonnet-4-5",
+        "ollama/llama3.1:8b",
+        "ollama/qwen2.5-coder:7b",
+    ]
+
+
+def test_pi_own_login_options_skip_providers_reusing_managed_ids(tmp_path: Path) -> None:
+    """Exclude reserved provider IDs: own-login launch would strip their prefixes."""
+    (tmp_path / "auth.json").write_text(
+        json.dumps({creds._PI_PROVIDER_ID: {"type": "api_key", "key": "sk-shadow"}})
+    )
+    (tmp_path / "models-store.json").write_text(
+        json.dumps({creds._PI_PROVIDER_ID: {"models": [{"id": "cached-model"}]}})
+    )
+    (tmp_path / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    creds._PI_OPENAI_PROVIDER_ID: {
+                        "baseUrl": "http://127.0.0.1:9000/v1",
+                        "api": "openai-completions",
+                        "apiKey": "shadow",
+                        "models": [{"id": "organization/custom-model"}],
+                    }
+                }
+            }
+        )
+    )
+
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
+    assert creds.pi_own_login_model_arg(f"{creds._PI_PROVIDER_ID}/cached-model") == "cached-model"
+    assert (
+        creds.pi_own_login_model_arg(f"{creds._PI_OPENAI_PROVIDER_ID}/organization/custom-model")
+        is None
+    )
+
+
+def test_pi_own_login_options_merge_declared_models_of_a_logged_in_provider(
+    tmp_path: Path,
+) -> None:
+    """A logged-in provider's models.json entries extend its cached catalog; declared names win."""
+    (tmp_path / "auth.json").write_text(json.dumps({"openai": {"type": "api_key", "key": "sk"}}))
+    (tmp_path / "models-store.json").write_text(
+        json.dumps({"openai": {"models": [{"id": "gpt-5.2", "name": "GPT 5.2"}]}})
+    )
+    (tmp_path / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openai": {
+                        "baseUrl": "https://proxy.example.com/v1",
+                        "models": [
+                            {"id": "gpt-5.2", "name": "GPT 5.2 (proxy)"},
+                            {"id": "ft:gpt-5.2"},
+                        ],
+                    }
+                }
+            }
+        )
+    )
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == [
+        {"id": "openai/ft:gpt-5.2", "model": "openai/ft:gpt-5.2", "displayName": "ft:gpt-5.2"},
+        {"id": "openai/gpt-5.2", "model": "openai/gpt-5.2", "displayName": "GPT 5.2 (proxy)"},
+    ]
+
+
 def test_pi_own_login_options_empty_without_login(tmp_path: Path) -> None:
-    """No (or an empty) ``auth.json`` means nothing Pi can drive: empty catalog."""
+    """Without a login or declared custom providers nothing is drivable: empty catalog."""
     assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
     (tmp_path / "auth.json").write_text("{}")
     (tmp_path / "models-store.json").write_text(
@@ -3412,11 +3839,127 @@ def test_pi_own_login_options_empty_without_login(tmp_path: Path) -> None:
     assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
 
 
+def test_pi_own_login_options_include_models_json_custom_providers(tmp_path: Path) -> None:
+    """Include keyed custom models even without auth.json or models-store.json entries."""
+    _seed_pi_own_login(tmp_path)
+    _seed_pi_custom_providers(tmp_path)
+
+    options = creds.pi_own_login_model_options(agent_dir=tmp_path)
+
+    assert [option["id"] for option in options] == [
+        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-sonnet-4-5",
+        "ollama/llama3.1:8b",
+        "ollama/qwen2.5-coder:7b",
+    ]
+    assert [
+        option for option in options if option["id"].startswith("ollama/")
+    ] == _PI_CUSTOM_OPTIONS
+
+
+def test_pi_own_login_options_list_models_json_providers_without_login(tmp_path: Path) -> None:
+    """A host with only ``models.json`` custom providers has no ``auth.json`` but a catalog."""
+    _seed_pi_custom_providers(tmp_path)
+
+    assert creds.pi_own_login_model_options(agent_dir=tmp_path) == _PI_CUSTOM_OPTIONS
+
+
 def test_pi_own_login_options_tolerate_malformed_files(tmp_path: Path) -> None:
     """Malformed auth/models-store files degrade to an empty catalog, never raise."""
     (tmp_path / "auth.json").write_text("{not json")
     (tmp_path / "models-store.json").write_text("[]")
     assert creds.pi_own_login_model_options(agent_dir=tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("patterns", "selected", "calls"),
+    [
+        (["anthropic/claude-sonnet-4-5"], True, 1),
+        (["missing/*"], False, 1),
+        ("anthropic", False, 0),
+        ([42, "", "  "], False, 0),
+    ],
+)
+def test_pi_own_login_options_apply_scope_or_keep_catalog(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    patterns: object,
+    selected: bool,
+    calls: int,
+) -> None:
+    (tmp_path / "auth.json").write_text(
+        json.dumps(
+            {provider: {"type": "api_key", "key": "test-only"} for provider in ("anthropic",)}
+        )
+    )
+    (tmp_path / "models-store.json").write_text(
+        json.dumps(
+            {
+                "anthropic": {"models": [{"id": "claude-sonnet-4-5", "name": "Sonnet"}]},
+            }
+        )
+    )
+    (tmp_path / "models.json").write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "openrouter": {
+                        "apiKey": "test-only",
+                        "models": [
+                            {"id": "ai21/jamba-large-1.7", "name": "Jamba"},
+                        ],
+                    },
+                }
+            }
+        )
+    )
+    (tmp_path / "settings.json").write_text(json.dumps({"enabledModels": patterns}))
+    resolver = Mock(side_effect=lambda _patterns, models: models[:1] if selected else [])
+    monkeypatch.setattr(creds, "scope_models", resolver)
+    options = creds.pi_own_login_model_options(agent_dir=tmp_path)
+    expected = [
+        {
+            "id": "anthropic/claude-sonnet-4-5",
+            "model": "anthropic/claude-sonnet-4-5",
+            "displayName": "Sonnet",
+        }
+    ]
+    if not selected:
+        expected.append(
+            {
+                "id": "openrouter/ai21/jamba-large-1.7",
+                "model": "openrouter/ai21/jamba-large-1.7",
+                "displayName": "Jamba",
+            }
+        )
+    assert options == expected
+    assert resolver.call_count == calls
+    if calls:
+        assert resolver.call_args.args[0] == patterns
+        assert [entry.reference for entry in resolver.call_args.args[1]] == [
+            "anthropic/claude-sonnet-4-5",
+            "openrouter/ai21/jamba-large-1.7",
+        ]
+
+
+@pytest.mark.parametrize(
+    "models_json",
+    ["{not json", json.dumps({"providers": ["ollama"]})],
+    ids=["invalid-json", "providers-not-an-object"],
+)
+def test_pi_own_login_options_keep_cached_catalog_when_models_json_is_malformed(
+    tmp_path: Path, models_json: str
+) -> None:
+    """A broken ``models.json`` drops only its own rows; the logged-in catalog survives."""
+    _seed_pi_own_login(tmp_path)
+    (tmp_path / "models.json").write_text(models_json)
+
+    options = creds.pi_own_login_model_options(agent_dir=tmp_path)
+
+    assert [option["id"] for option in options] == [
+        "anthropic/claude-haiku-4-5",
+        "anthropic/claude-sonnet-4-5",
+    ]
 
 
 def test_pi_own_login_model_arg_strips_managed_prefix_only() -> None:
@@ -3475,6 +4018,7 @@ def test_connect_broker_managed_host_resolves_without_configured_provider(
             agent=lambda name: SimpleNamespace(model="system.ai.claude-sonnet-4-6")
         ),
     )
+    monkeypatch.setattr(creds, "_run_auth_command", lambda command: None)
 
     provider = creds.resolve_pi_native_provider(config_loader=lambda: {"providers": {}})
 
@@ -3810,3 +4354,147 @@ def test_curated_tier_alias_resolves_before_bracket_strip() -> None:
     assert provider is not None
     assert provider.model == "GLM-5.3"
     assert [entry["id"] for entry in provider.extra_models] == ["GLM-5.3", "GLM-5.3-Flash"]
+
+
+def test_fetch_pi_model_lists_marks_catalog_reasoning_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Catalog-reasoning GPT (Responses) and Gemini (MLflow) entries get ``reasoning: true``."""
+    import unittest.mock
+
+    from omnigent.models import model_catalog
+    from omnigent.models.model_metadata import ModelCapability, ModelMetadata
+
+    def _service(name: str, api_types: list[str]) -> dict[str, object]:
+        return {"name": f"model-services/{name}", "supported_api_types": api_types}
+
+    payload = {
+        "model_services": [
+            _service("system.ai.claude-fable-5-1", ["anthropic/v1/messages"]),
+            _service(
+                "system.ai.gpt-6-luna", ["openai/v1/responses", "openai/v1/chat/completions"]
+            ),
+            _service("system.ai.gemini-3-8-flash", ["openai/v1/chat/completions"]),
+            _service("system.ai.deepseek-v4", ["openai/v1/chat/completions"]),
+            _service("system.ai.llama-4-maverick", ["openai/v1/chat/completions"]),
+        ]
+    }
+    reasoning = frozenset({ModelCapability.REASONING})
+
+    def _catalog(provider_name: str) -> tuple[model_catalog.ModelEntry, ...]:
+        assert provider_name == "databricks"
+        capable = ModelMetadata(supported_capabilities=reasoning)
+        return (
+            model_catalog.ModelEntry(
+                id="databricks-claude-fable-5-1", family="claude", metadata=capable
+            ),
+            model_catalog.ModelEntry(
+                id="databricks-gemini-3-8-flash", family="other", metadata=capable
+            ),
+            model_catalog.ModelEntry(
+                id="databricks-deepseek-v4", family="other", metadata=capable
+            ),
+            model_catalog.ModelEntry(
+                id="databricks-llama-4-maverick",
+                family="other",
+                metadata=ModelMetadata(unsupported_capabilities=reasoning),
+            ),
+        )
+
+    monkeypatch.setattr(model_catalog, "catalog_model_entries", _catalog)
+    monkeypatch.setattr(
+        "omnigent.onboarding.providers.get_models",
+        lambda provider: (
+            [ModelInfo(name="gpt-6-luna", provider="openai", supports_reasoning=True)]
+            if provider == "openai"
+            else []
+        ),
+    )
+
+    class _MockTransport(httpx.BaseTransport):
+        def handle_request(self, request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=json.dumps(payload).encode())
+
+    _real_client = httpx.Client
+    with unittest.mock.patch(
+        "httpx.Client",
+        lambda *args, **kwargs: _real_client(transport=_MockTransport()),
+    ):
+        claude, gpt, _completions, mlflow = creds._fetch_pi_model_lists(
+            "https://wkspc.example.com", "tok"
+        )
+
+    by_id = {m["id"]: m for m in claude + gpt + mlflow}
+    assert by_id["system.ai.claude-fable-5-1"].get("reasoning") is True
+    assert by_id["system.ai.deepseek-v4"].get("reasoning") is True
+    assert by_id["system.ai.gpt-6-luna"].get("reasoning") is True
+    assert by_id["system.ai.gemini-3-8-flash"].get("reasoning") is True
+    assert "reasoning" not in by_id["system.ai.llama-4-maverick"]
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "cancelled", "shell_parent", "output_limit", "ok"])
+def test_native_token_helper_reaps_its_process_group(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    if os.name == "nt" or shutil.which("node") is None:
+        pytest.skip("POSIX process-group cleanup requires Node")
+    if outcome in ("timeout", "shell_parent"):
+        monkeypatch.setattr(auth_command, "AUTH_TIMEOUT_MS", 2_000)
+    pid_file = tmp_path / "descendant.pid"
+    # Publish only a complete PID before cancellation can terminate the helper.
+    helper = (
+        "import os,sys,time; from pathlib import Path; pid_file = Path(sys.argv[1]); "
+        "pending = pid_file.with_suffix('.pending'); "
+        "pending.write_text(str(os.getpid())); pending.replace(pid_file); time.sleep(30)"
+    )
+    if outcome == "output_limit":
+        helper = helper.replace(
+            "time.sleep(30)",
+            "sys.stdout.write('x' * (1024 * 1024 + 1)); sys.stdout.flush(); time.sleep(30)",
+        )
+    command = shlex.join([sys.executable, "-c", helper, str(pid_file)])
+    if outcome == "ok":
+        command += (
+            f" >/dev/null & while [ ! -f {shlex.quote(str(pid_file))} ]; do sleep 0.02; done;"
+            " printf private-token"
+        )
+    else:
+        command += "; true"
+    wrapped = auth_command.wrap_auth_command(tmp_path, "omnigent", command)
+    status = next((tmp_path / auth_command.AUTH_DIR_NAME).glob("auth-*.json"))
+    status = status.with_name(status.name + ".result.json")
+    status.write_text(json.dumps({"kind": "stale"}))
+    if outcome == "shell_parent":
+        process = subprocess.Popen(wrapped[1:] + "; true", shell=True, stdout=subprocess.PIPE)
+    else:
+        process = subprocess.Popen(shlex.split(wrapped[1:]), stdout=subprocess.PIPE)
+    started = time.monotonic()
+    try:
+        deadline = time.monotonic() + 4
+        while not pid_file.exists() and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert pid_file.exists()
+        if outcome in ("cancelled", "shell_parent"):
+            assert not status.exists(), "a running helper must clear the previous result"
+            process.terminate()
+        stdout, _ = process.communicate(timeout=12)
+        if outcome == "shell_parent":
+            assert process.returncode != 0
+            assert time.monotonic() - started < 6
+        else:
+            assert process.returncode == (0 if outcome == "ok" else 1)
+        assert stdout == (b"private-token" if outcome == "ok" else b"")
+        pid = int(pid_file.read_text())
+        deadline = time.monotonic() + 2
+        while process_alive(pid) and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert not process_alive(pid)
+        kind = json.loads(status.read_text())["kind"]
+        if outcome == "shell_parent":
+            assert kind in ("timeout", "cancelled")
+        else:
+            assert kind == outcome
+    finally:
+        if process.poll() is None:
+            process.terminate()
+            process.wait(timeout=4)

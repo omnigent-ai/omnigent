@@ -2,15 +2,13 @@
 //
 // The xterm + WebSocket lifecycle lives in `TerminalSession` (plain
 // JS, outside React). This component is a thin shell: a callback ref
-// constructs the session when its container node attaches and
-// returns a cleanup that disposes the session when the node detaches
-// (or any of the addressing inputs change). React 19 calls the
-// returned cleanup directly — no `useEffect` + `useRef` dance, no
-// guard against a missing `ref.current`.
+// constructs the session when its container node attaches, and a
+// layout effect disposes it on unmount (React 18 never calls a ref's
+// returned cleanup).
 
 import { Loader2Icon } from "lucide-react";
 import { useCallback, useEffect, useLayoutEffect, useRef, useState } from "react";
-import { useResolvedThemeMode } from "@/components/theme/useResolvedThemeMode";
+import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Button } from "@/components/ui/button";
 import { toast } from "sonner";
 import {
@@ -33,12 +31,6 @@ import {
 import { subscribeCodeFont } from "@/lib/codeFontPreferences";
 import { useFileViewer, useWorkspacePaths } from "@/shell/FileViewerContext";
 import { resolveInitialAttachUrl, watchDirectUpgrade, withAttachParams } from "@/lib/terminals";
-import {
-  readTerminalThemeMode,
-  resolveTerminalIsDark,
-  subscribeTerminalTheme,
-  type TerminalThemeMode,
-} from "@/lib/terminalThemePreferences";
 import { getSessionHost, markHostKeyless, isHostKeyless } from "@/lib/sessionHost";
 import {
   TerminalClipboardPrompt,
@@ -130,6 +122,11 @@ interface TerminalViewProps {
   onInput?: TerminalInputListener;
   /** Optional action shown beside the closed-bridge message. */
   onResume?: () => void | Promise<void>;
+  /**
+   * What that action resumes, named in its label and errors: "sandbox" when
+   * the sandbox itself is offline.
+   */
+  resumeTarget?: "session" | "sandbox";
   /** Whether the optional resume action is currently in flight. */
   resumePending?: boolean;
   /**
@@ -168,6 +165,7 @@ export function TerminalView({
   onActivity,
   onInput,
   onResume,
+  resumeTarget = "session",
   resumePending = false,
   active = true,
   focusOnConnect = active,
@@ -183,7 +181,10 @@ export function TerminalView({
     const target = resolveTerminalWorkspaceFileLink(uri, current.root, current.home);
     if (target === null) return false;
     if (target.line === null) current.openFile(target.path);
-    else current.openFile(target.path, { line: target.line });
+    else {
+      const { line, endLine } = target;
+      current.openFile(target.path, { line, ...(endLine ? { endLine } : {}) });
+    }
     return true;
   }, []);
   const [state, setState] = useState<ConnectionState>({ kind: "connecting" });
@@ -268,16 +269,8 @@ export function TerminalView({
   // Lets the close handler tell "stable connection finally dropped"
   // (reset the budget) from "re-dial died straight away" (burn it).
   const connectedAtRef = useRef<number | null>(null);
-  const resolvedMode = useResolvedThemeMode();
-  // Terminal theme is independent of the app theme: "auto" follows the app's
-  // resolved appearance, while "light"/"dark" pin the terminal. Reading the
-  // pref as state (seeded at mount, updated via the pub/sub) lets a Settings
-  // change re-theme a live terminal through the existing setTheme effect below.
-  const [terminalMode, setTerminalMode] = useState<TerminalThemeMode>(() =>
-    readTerminalThemeMode(),
-  );
-  useEffect(() => subscribeTerminalTheme(setTerminalMode), []);
-  const isDark = resolveTerminalIsDark(terminalMode, resolvedMode === "dark");
+  // A Settings change re-themes a live terminal through the setTheme effect below.
+  const isDark = useTerminalIsDark();
   const terminalBackground = terminalTheme(isDark).background;
   // Stable ref so the theme-update effect can reach the live session
   // without adding isDark to the attachSession deps (which would
@@ -307,6 +300,7 @@ export function TerminalView({
   // Abort handle for the outgoing attach's direct-upgrade probe, which
   // otherwise holds a loopback socket open for its full timeout.
   const upgradeCtlRef = useRef<AbortController | null>(null);
+  const mountedRef = useRef(false);
 
   useEffect(() => {
     clipboardMountedRef.current = true;
@@ -496,6 +490,22 @@ export function TerminalView({
     sessionRef.current = null;
   }, []);
 
+  useLayoutEffect(() => {
+    mountedRef.current = true;
+    onStateChangeRef.current?.(stateRef.current);
+    return () => {
+      mountedRef.current = false;
+      // Synchronous so a same-id successor's first report lands after it.
+      onStateChangeRef.current?.(null);
+      // Deferred so StrictMode's dev-only remount keeps the live attach.
+      queueMicrotask(() => {
+        if (mountedRef.current) return;
+        upgradeCtlRef.current?.abort();
+        disposeActiveSession();
+      });
+    };
+  }, [disposeActiveSession]);
+
   const handleResume = useCallback(async () => {
     if (!onResume) return;
     setResumeError(null);
@@ -504,9 +514,9 @@ export function TerminalView({
       disposeActiveSession();
       setConnectAttempt((attempt) => attempt + 1);
     } catch (error) {
-      setResumeError(resumeErrorText(error));
+      setResumeError(resumeErrorText(error, resumeTarget));
     }
-  }, [onResume, disposeActiveSession]);
+  }, [onResume, disposeActiveSession, resumeTarget]);
 
   const attachSession = useCallback(
     (node: HTMLDivElement | null) => {
@@ -542,9 +552,10 @@ export function TerminalView({
       let cancelled = false;
       const upgradeCtl = new AbortController();
       upgradeCtlRef.current = upgradeCtl;
-      // Superseded by a later attach on this node? React 18 never calls
-      // the ref cleanup, so `cancelled` alone can't catch that case.
-      const superseded = () => cancelled || attachGenerationRef.current !== generation;
+      // Superseded by a later attach on this node, or unmounted (checked
+      // only after the first await)? React 18 never calls the ref cleanup.
+      const superseded = () =>
+        cancelled || attachGenerationRef.current !== generation || !mountedRef.current;
       void (async () => {
         // The awaited microtask preserves the StrictMode-collapse
         // behavior queueMicrotask provided; the URL resolution (when a
@@ -769,6 +780,7 @@ export function TerminalView({
             state={state}
             reconnectPending={reconnectPending}
             onResume={onResume ? handleResume : undefined}
+            resumeTarget={resumeTarget}
             resumePending={resumePending}
             resumeError={resumeError}
           />
@@ -782,6 +794,7 @@ function StatusOverlay({
   state,
   reconnectPending,
   onResume,
+  resumeTarget,
   resumePending,
   resumeError,
 }: {
@@ -789,6 +802,7 @@ function StatusOverlay({
   /** True while an automatic re-dial is scheduled for a closed bridge. */
   reconnectPending: boolean;
   onResume?: () => void | Promise<void>;
+  resumeTarget: "session" | "sandbox";
   resumePending: boolean;
   resumeError: string | null;
 }) {
@@ -823,7 +837,7 @@ function StatusOverlay({
               className="border-zinc-500/50 bg-zinc-100 text-zinc-950 hover:bg-white"
               componentId="diagnostics.terminal.resume"
             >
-              {resumePending ? "Resuming…" : "Resume session"}
+              {resumePending ? "Resuming…" : `Resume ${resumeTarget}`}
             </Button>
           )}
           {resumeError && (
@@ -836,9 +850,9 @@ function StatusOverlay({
   );
 }
 
-function resumeErrorText(error: unknown): string {
-  if (error instanceof Error && error.message) return `Couldn't resume session: ${error.message}`;
-  return "Couldn't resume session.";
+function resumeErrorText(error: unknown, target: string): string {
+  if (error instanceof Error && error.message) return `Couldn't resume ${target}: ${error.message}`;
+  return `Couldn't resume ${target}.`;
 }
 
 /**

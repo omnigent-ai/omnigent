@@ -127,16 +127,16 @@ class SubagentBlockNotifier:
         self._wake_dispatch = wake_dispatch
         self._loop = loop
         self._lock = threading.Lock()
-        # Debounce: armed ids (one wake per block), cleared + re-armed on resolve.
-        self._notified: set[str] = set()
+        # Each re-arm gets an identity so an old handler cannot act on its replacement.
+        self._notified: dict[tuple[str, str], object] = {}
         # Per-block resolve signal, registered by the handler before it
         # dispatches a wake so a resolve racing the in-flight wake is never
         # missed; observe() sets it on the resolved event.
-        self._resolution_signals: dict[str, asyncio.Event] = {}
+        self._resolution_signals: dict[tuple[str, str], asyncio.Event] = {}
         # Verdict captured off the resolved event ("accept"/"decline"/"cancel"),
         # stored only while a handler waits on the matching signal so entries
         # never outlive the notice they inform.
-        self._verdicts: dict[str, str] = {}
+        self._verdicts: dict[asyncio.Event, str] = {}
         # Strong refs so scheduled wake futures aren't GC'd mid-flight; close() cancels them.
         self._inflight: set[concurrent.futures.Future[None]] = set()
 
@@ -160,14 +160,18 @@ class SubagentBlockNotifier:
         # No id → can't be matched by its resolve, so never arm.
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
+        key = (conversation_id, elicitation_id)
         event_type = event.get("type")
         if event_type == _RESOLVED_TYPE:
             with self._lock:
-                self._notified.discard(elicitation_id)
-                signal = self._resolution_signals.get(elicitation_id)
+                # Only the conversation that armed this block may resolve it.
+                if key not in self._notified:
+                    return
+                self._notified.pop(key)
+                signal = self._resolution_signals.get(key)
                 action = _resolution_action(event)
                 if signal is not None and action is not None:
-                    self._verdicts[elicitation_id] = action
+                    self._verdicts[signal] = action
             if signal is not None:
                 # Event.set is not thread-safe; hop onto the loop. A gone
                 # loop (shutdown) means the waiting handler dies with it.
@@ -177,18 +181,22 @@ class SubagentBlockNotifier:
         if event_type != _REQUEST_TYPE:
             return
         with self._lock:
-            if elicitation_id in self._notified:
+            if key in self._notified:
                 return  # already armed for this block — debounce
-            self._notified.add(elicitation_id)
+            # A replacement may resolve before its handler registers a signal.
+            self._resolution_signals.pop(key, None)
+            arm = object()
+            self._notified[key] = arm
         try:
             future = asyncio.run_coroutine_threadsafe(
-                self.handle_request(conversation_id, event),
+                self.handle_request(conversation_id, event, arm=arm),
                 self._loop,
             )
         except RuntimeError:
             # Loop gone (shutdown): release the arm so a later block isn't wrongly debounced.
             with self._lock:
-                self._notified.discard(elicitation_id)
+                if self._notified.get(key) is arm:
+                    self._notified.pop(key)
             _logger.debug(
                 "subagent block notifier: loop unavailable, dropping wake for %s",
                 conversation_id,
@@ -243,6 +251,8 @@ class SubagentBlockNotifier:
         self,
         conversation_id: str,
         event: dict[str, Any],
+        *,
+        arm: object | None = None,
     ) -> None:
         """
         Escalate one unanswered block to the parent, then close the loop.
@@ -270,9 +280,15 @@ class SubagentBlockNotifier:
         elicitation_id = event.get("elicitation_id")
         if not isinstance(elicitation_id, str) or not elicitation_id:
             return
+        key = (conversation_id, elicitation_id)
+        with self._lock:
+            if arm is None:
+                arm = self._notified.get(key)
+            if arm is None:
+                return
         await _escalation_sleep(_BLOCK_WAKE_ESCALATION_DELAY_S)
         with self._lock:
-            if elicitation_id not in self._notified:
+            if self._notified.get(key) is not arm:
                 return  # answered within the grace — the parent never needs to know
         child = await asyncio.to_thread(
             self._conversation_store.get_conversation,
@@ -288,31 +304,34 @@ class SubagentBlockNotifier:
         # and registration share one critical section, so a resolve landing
         # earlier makes this return instead of registering.
         with self._lock:
-            if elicitation_id not in self._notified:
+            if self._notified.get(key) is not arm:
                 return
             signal = asyncio.Event()
-            self._resolution_signals[elicitation_id] = signal
+            self._resolution_signals[key] = signal
         try:
-            outcome = await self._deliver_with_retry(
-                parent_id, child, notice, armed_id=elicitation_id
-            )
+            outcome = await self._deliver_with_retry(parent_id, child, notice, armed_id=(key, arm))
             if outcome is _WakeOutcome.FAILED:
                 # Release the arm so a later publish of this id can retry.
                 with self._lock:
-                    self._notified.discard(elicitation_id)
+                    if self._notified.get(key) is arm:
+                        self._notified.pop(key)
                 return
             if outcome is _WakeOutcome.MOOT:
                 return
             await signal.wait()
             with self._lock:
-                verdict = self._verdicts.pop(elicitation_id, None)
+                # A retried prompt may already be pending again under this id.
+                if key in self._notified or self._resolution_signals.get(key) is not signal:
+                    return
+                verdict = self._verdicts.pop(signal, None)
             await self._deliver_with_retry(
                 parent_id, child, _format_resolution_notice(child, verdict), armed_id=None
             )
         finally:
             with self._lock:
-                self._resolution_signals.pop(elicitation_id, None)
-                self._verdicts.pop(elicitation_id, None)
+                if self._resolution_signals.get(key) is signal:
+                    self._resolution_signals.pop(key, None)
+                self._verdicts.pop(signal, None)
 
     async def _deliver_with_retry(
         self,
@@ -320,7 +339,7 @@ class SubagentBlockNotifier:
         child: Conversation,
         notice: str,
         *,
-        armed_id: str | None,
+        armed_id: tuple[tuple[str, str], object] | None,
     ) -> _WakeOutcome:
         """
         Attempt one notice dispatch with a bounded retry.
@@ -339,14 +358,15 @@ class SubagentBlockNotifier:
         :param parent_id: Parent session id to wake, e.g. ``"conv_parent123"``.
         :param child: The blocked child :class:`Conversation`.
         :param notice: Pre-formatted ``[System: …]`` notice text.
-        :param armed_id: Correlation id whose arm gates the dispatch, or
+        :param armed_id: Conversation/elicitation key and request arm gating dispatch, or
             ``None`` to dispatch unconditionally.
         :returns: The :class:`_WakeOutcome` of the delivery.
         """
         for attempt in range(1 + _WAKE_RETRIES):
             if armed_id is not None:
                 with self._lock:
-                    if armed_id not in self._notified:
+                    key, arm = armed_id
+                    if self._notified.get(key) is not arm:
                         # Resolved during the grace/backoff — block's gone, the
                         # slot is already clear; nothing (stale) to wake.
                         return _WakeOutcome.MOOT

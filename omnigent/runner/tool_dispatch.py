@@ -64,7 +64,6 @@ from omnigent.models.model_override import (
     validate_model_override,
 )
 from omnigent.native.native_coding_agents import public_agent_name
-from omnigent.runtime import pending_elicitations
 from omnigent.runtime.mcp_tool_result import encode_mcp_image_result, native_image_payload
 from omnigent.tools import ToolManager
 from omnigent.tools.base import Tool, ToolContext
@@ -85,6 +84,7 @@ from omnigent.tools.builtins.os_env import (
     SysOsShellTool,
     SysOsWriteTool,
 )
+from omnigent.tools.builtins.session_message import SysSessionMessageTool
 from omnigent.tools.builtins.session_rename import SysSessionRenameTool
 from omnigent.tools.builtins.spawn import (
     # Shared contract values with the in-process sys_session_* tools. Imported
@@ -113,6 +113,7 @@ from omnigent.tools.builtins.timer import (
     # schema advertises.
     validate_timer_set_args,
 )
+from omnigent.tools.builtins.ui import OpenFileRequest, UiOpenFileTool
 from omnigent.tools.builtins.update_comment import UpdateCommentTool
 from omnigent.tools.builtins.upload_file import UploadFileTool, safe_resolve
 from omnigent.util.session_lifecycle import (
@@ -153,6 +154,18 @@ def _string_object_dict(value: object) -> _JsonObject | None:
     if not isinstance(value, dict) or not all(isinstance(key, str) for key in value):
         return None
     return cast("_JsonObject", value)
+
+
+def _route_identifier(value: object, kind: str) -> str:
+    """Keep one identifier in one URL segment, including legacy prefixed IDs."""
+    if not isinstance(value, str) or not re.fullmatch(r"[A-Za-z0-9_-]{1,128}", value):
+        raise ValueError(f"{kind} id must contain only letters, digits, underscores or hyphens")
+    return value
+
+
+def _session_url(session_id: object) -> str:
+    """Build a session URL from one identifier, retaining legacy prefixed ids."""
+    return f"/v1/sessions/{_route_identifier(session_id, 'Session')}"
 
 
 def _optional_string(value: object) -> str | None:
@@ -308,6 +321,7 @@ _SESSION_QUERY_TOOLS = frozenset(
 )
 
 _SESSION_SELF_WRITE_TOOLS = frozenset({SysSessionRenameTool.name()})
+_UI_TOOLS = frozenset({UiOpenFileTool.name()})
 
 # The title bound the rename tool advertises to the LLM — read once from the
 # tool schema so the dispatcher can never drift from the published contract.
@@ -463,9 +477,11 @@ _BROWSER_TIMEOUT_ERROR = (
 # unconditionally for policy enforcement (independent of the spec's
 # ``os_env`` gate), so the native relay assembles them separately.
 _NATIVE_RELAY_BUILTIN_TOOLS = (
-    _COMMENT_TOOLS
+    {SysSessionMessageTool.name()}
+    | _COMMENT_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _UI_TOOLS
     | _ASYNC_INBOX_TOOLS
     | _SUBAGENT_TOOLS
     | _LIST_MODELS_TOOLS
@@ -479,9 +495,8 @@ _NATIVE_RELAY_BUILTIN_TOOLS = (
     # ``browser_*`` must ride the native relay: the Omnigent desktop app
     # runs native (claude/codex/pi) sessions, which ignore ``request.tools``
     # and see ONLY this relay surface — without this union member the
-    # feature is dead for its real target. ToolManager auto-registers these
-    # framework-owned schemas for every spec, so the native relay surface is
-    # session-static and always includes them.
+    # feature is dead for its real target. The relay filters ToolManager's
+    # schemas, so they appear unless the spec sets ``tool_groups.browser: false``.
     | _BROWSER_TOOLS
     # Memory builtins are relayed to native harnesses too — unlike web_search,
     # native harnesses have no built-in long-term memory of their own.
@@ -587,6 +602,8 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
             SysSessionGetHistoryTool,
             SysSessionGetInfoTool,
             SysSessionRenameTool,
+            SysSessionMessageTool,
+            UiOpenFileTool,
             SysAgentGetTool,
             SysAgentListTool,
             SysAgentDownloadTool,
@@ -853,7 +870,8 @@ def _bounded_discovery_result(
 
 # Union of all locally-dispatched tools.
 _ALL_LOCAL_TOOLS = (
-    _OS_ENV_TOOLS
+    {SysSessionMessageTool.name()}
+    | _OS_ENV_TOOLS
     | _REST_TOOLS
     | _FILE_TOOLS
     | _TERMINAL_TOOLS
@@ -864,6 +882,7 @@ _ALL_LOCAL_TOOLS = (
     | _SESSION_CREATE_TOOLS
     | _SESSION_QUERY_TOOLS
     | _SESSION_SELF_WRITE_TOOLS
+    | _UI_TOOLS
     | _WEB_FETCH_TOOLS
     | _WEB_SEARCH_TOOLS
     | _WEB_READ_TOOLS
@@ -1359,7 +1378,7 @@ async def _list_child_sessions(
         params["tool"] = tool
         params["session_name"] = session_name
     resp = await server_client.get(
-        f"/v1/sessions/{conversation_id}/child_sessions",
+        f"{_session_url(conversation_id)}/child_sessions",
         params=params,
         timeout=30.0,
     )
@@ -1449,8 +1468,8 @@ async def _session_turn_actor(
 ) -> str | None:
     """Return the parent turn actor label for runner-originated callbacks."""
     try:
-        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
-    except (httpx.HTTPError, RuntimeError):
+        resp = await server_client.get(f"{_session_url(conversation_id)}", timeout=10.0)
+    except (httpx.HTTPError, ValueError, RuntimeError):
         return None
     if resp.status_code != 200:
         return None
@@ -1477,11 +1496,11 @@ async def _patch_subagent_label(
     """
     try:
         resp = await server_client.patch(
-            f"/v1/sessions/{child_session_id}",
+            f"{_session_url(child_session_id)}",
             json={"labels": {key: value}},
             timeout=30.0,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return f"{type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
         return f"{resp.status_code} {resp.text[:200]}"
@@ -1537,7 +1556,7 @@ async def _post_child_message_event(
         }
 
     resp = await server_client.post(
-        f"/v1/sessions/{session_id}/events",
+        f"{_session_url(session_id)}/events",
         json=_payload(created_by),
         # This message is gated at the recipient's REQUEST phase, which can
         # PARK on a human ASK (e.g. session_cost_budget) up to the policy's
@@ -1554,7 +1573,7 @@ async def _post_child_message_event(
         session_id,
     )
     return await server_client.post(
-        f"/v1/sessions/{session_id}/events",
+        f"{_session_url(session_id)}/events",
         json=_payload(None),
         timeout=_ASK_GATE_DELIVERY_TIMEOUT,
     )
@@ -1782,8 +1801,8 @@ async def _inherited_parent_model(
     if not harness_supports_model_override(child_harness):
         return None
     try:
-        resp = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=10.0)
-    except (httpx.HTTPError, RuntimeError):
+        resp = await server_client.get(f"{_session_url(conversation_id)}", timeout=10.0)
+    except (httpx.HTTPError, ValueError, RuntimeError):
         return None
     if resp.status_code != 200:
         return None
@@ -1947,10 +1966,10 @@ async def _teardown_failed_child(
     for attempt in range(2):
         try:
             resp = await server_client.delete(
-                f"/v1/sessions/{child_session_id}",
+                f"{_session_url(child_session_id)}",
                 timeout=30.0,
             )
-        except httpx.HTTPError as exc:
+        except (httpx.HTTPError, ValueError) as exc:
             last_error = f"{type(exc).__name__}: {exc}"
         else:
             if resp.status_code < 400:
@@ -2030,11 +2049,11 @@ async def _build_subagent_message_content(
 
     try:
         copy_resp = await server_client.post(
-            f"/v1/sessions/{child_session_id}/resources/files:copy",
+            f"{_session_url(child_session_id)}/resources/files:copy",
             json={"source_session_id": parent_session_id, "file_ids": file_ids},
             timeout=30.0,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return CopyResult(
             error=f"Error: failed to copy files to child: {type(exc).__name__}: {exc}"
         )
@@ -2606,7 +2625,7 @@ async def _execute_subagent_tool(
     if parent_agent_id is None:
         try:
             sess_resp = await server_client.get(
-                f"/v1/sessions/{conversation_id}",
+                f"{_session_url(conversation_id)}",
                 timeout=10.0,
             )
             if sess_resp.status_code == 200:
@@ -2970,7 +2989,7 @@ async def _execute_subagent_tool(
             }
             try:
                 pol_resp = await server_client.post(
-                    f"/v1/sessions/{child_session_id}/policies",
+                    f"{_session_url(child_session_id)}/policies",
                     json=policy_body,
                     timeout=10.0,
                 )
@@ -3172,7 +3191,7 @@ async def _send_to_existing_session(
     from omnigent.runner import subagent_work as _subagent_work
 
     try:
-        snap = await server_client.get(f"/v1/sessions/{target_session_id}", timeout=30.0)
+        snap = await server_client.get(f"{_session_url(target_session_id)}", timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return f"Error: sys_session_send failed to look up session: {exc}"
     if snap.status_code == 404:
@@ -3313,9 +3332,8 @@ def _build_session_create_body(
     """
     Build the JSON ``POST /v1/sessions`` body for ``sys_session_create``.
 
-    ``parent_session_id`` is hard-forced to ``conversation_id`` — this is
-    what makes the write child-only (an orchestrator cannot create a
-    top-level or sibling session). A non-empty ``title``, ``message``,
+    ``parent_session_id`` defaults to ``conversation_id``; independent
+    placements remove it before using the gated endpoint. A non-empty ``title``, ``message``,
     ``model``, and ``reasoning_effort`` are included when provided; the
     message becomes the child's first queued user turn via
     ``initial_items``.
@@ -3431,7 +3449,7 @@ async def _execute_session_create(
     runner_workspace: Path | None = None,
 ) -> str:
     """
-    Create a child session (``sys_session_create``).
+    Create a child or an independent session (``sys_session_create``).
 
     Two modes, split on the provided argument (exactly one required):
 
@@ -3442,8 +3460,9 @@ async def _execute_session_create(
       inside the caller's working directory) via the multipart
       ``POST /v1/sessions`` create.
 
-    Both modes force ``parent_session_id`` to the caller (child-only).
-    The child inherits the caller's runner (server-side affinity), so a
+    The default placement forces ``parent_session_id`` to the caller.
+    Independent placements use the server's gated orchestration endpoint.
+    A child inherits the caller's runner (server-side affinity), so a
     queued initial message starts a turn immediately. Returns a handle
     the orchestrator can monitor (``sys_session_get_history`` /
     ``sys_session_get_info``) or drive (``sys_session_send`` by
@@ -3486,6 +3505,15 @@ async def _execute_session_create(
                 )
             }
         )
+    placement = args.get("placement", "child")
+    if placement not in ("child", "same_host", "managed"):
+        return json.dumps({"error": "placement must be child, same_host or managed"})
+    if placement != "child" and has_config_path:
+        return json.dumps({"error": "Independent sessions require agent_id"})
+    message = args.get("message")
+    if placement != "child" and message is not None:
+        if not isinstance(message, str) or not message.strip() or len(message) > 8000:
+            return json.dumps({"error": "Provide an initial message of 1–8000 characters"})
     if has_config_path:
         # The multipart create carries only the config bundle, so an effort
         # passed here would never reach the child. Refuse instead of dropping it.
@@ -3512,25 +3540,123 @@ async def _execute_session_create(
         str(agent_id),
         conversation_id,
         args.get("title"),
-        args.get("message"),
+        message,
         model=args.get("model"),
         reasoning_effort=args.get("reasoning_effort"),
     )
+    headers: dict[str, str] = {}
+    if placement != "child":
+        from omnigent.runner.identity import ORCHESTRATION_SOURCE_HEADER
+
+        body.pop("parent_session_id")
+        # The server derives the same host/workspace from this bound source.
+        headers[ORCHESTRATION_SOURCE_HEADER] = conversation_id
+        if placement == "managed":
+            body["host_type"] = "managed"
+            initial_items = body.pop("initial_items", None)
+            if isinstance(initial_items, list) and initial_items:
+                body["initial_input"] = initial_items[0]
+        else:
+            body.pop("initial_items", None)
+    unconfirmed_creation = {
+        "error": "Session creation could not be confirmed; "
+        "inspect your sessions before creating another. Use sys_session_list's sessions "
+        "results, then sys_session_get_info with a discovered session_id; "
+        "do not automatically retry",
+        "agent_id": agent_id,
+        "title": args.get("title"),
+    }
+    create_requested = False
     try:
-        resp = await server_client.post("/v1/sessions", json=body, timeout=30.0)
+        endpoint = "/v1/sessions" if placement == "child" else "/v1/sessions/orchestrated"
+        if placement == "managed":
+            from omnigent.runner.session_requests import post_on_host
+
+            info = await server_client.get("/v1/info")
+            info.raise_for_status()
+            host_id = (
+                uuid.uuid4().hex if info.json().get("request_managed_sandbox_host_id") else None
+            )
+            if host_id is not None:
+                body["host_id"] = host_id
+                unconfirmed_creation["host_id"] = host_id
+            create_requested = True
+            resp = await post_on_host(
+                server_client, endpoint, host_id=host_id, json=body, headers=headers, timeout=30.0
+            )
+        else:
+            create_requested = True
+            resp = await server_client.post(endpoint, json=body, headers=headers, timeout=30.0)
     except Exception as exc:  # noqa: BLE001
+        if placement != "child" and create_requested:
+            return json.dumps(unconfirmed_creation)
         return json.dumps({"error": f"sys_session_create failed: {exc}"})
+    if placement != "child" and (resp.status_code >= 500 or resp.status_code in (408, 429)):
+        return json.dumps(unconfirmed_creation)
+    if placement == "same_host":
+        from omnigent.runner.session_requests import is_wrong_replica
+
+        # Host loss can be reported before persistence or during the later launch.
+        if is_wrong_replica(resp) or resp.status_code == 409:
+            return json.dumps(unconfirmed_creation)
+    if placement != "child" and resp.status_code in (404, 405):
+        return json.dumps(
+            {
+                "error": "Independent session creation is unavailable on this server "
+                "or the agent was not found",
+            }
+        )
     if resp.status_code == 404:
         return json.dumps({"error": "agent_not_found", "agent_id": agent_id})
     if resp.status_code in (401, 403):
-        return json.dumps({"error": "access_denied", "agent_id": agent_id})
+        denied = {"error": "access_denied", "agent_id": agent_id}
+        if placement != "child":
+            denied["detail"] = resp.text[:1000]
+        return json.dumps(denied)
     if resp.status_code >= 400:
         return json.dumps(
             {"error": f"sys_session_create returned {resp.status_code}", "detail": resp.text[:200]}
         )
-    data = resp.json()
-    if not isinstance(data.get("id"), str) or not data["id"]:
+    try:
+        data = resp.json()
+        if not isinstance(data, dict):
+            raise ValueError("Expected a session object")
+    except ValueError:
+        if placement != "child":
+            return json.dumps(unconfirmed_creation)
         return json.dumps({"error": "server did not return a child session id"})
+    if not isinstance(data.get("id"), str) or not data["id"]:
+        if placement != "child":
+            return json.dumps(unconfirmed_creation)
+        return json.dumps({"error": "server did not return a child session id"})
+    if placement != "child":
+        handle: dict[str, object] = {
+            "conversation_id": data["id"],
+            "kind": "default",
+            "status": data.get("status") or "created",
+            "agent_id": data.get("agent_id") or agent_id,
+            "title": data.get("title") or args.get("title"),
+        }
+        if placement == "same_host" and args.get("message"):
+            from omnigent.runner.session_message import execute_message_tool
+
+            initial_message = json.loads(
+                await execute_message_tool(
+                    {"session_id": data["id"], "message": args["message"]},
+                    server_client,
+                    conversation_id,
+                )
+            )
+            handle["initial_message"] = initial_message
+            if initial_message.get("error"):
+                handle["status"] = "created_initial_message_failed"
+                handle["error"] = (
+                    f"Session created, but its first task was refused or not confirmed "
+                    f"({initial_message['error']}); "
+                    "inspect this session before continuing. Do not create a replacement; "
+                    "do not automatically resend the task."
+                )
+        return json.dumps(handle)
     return _finalize_created_session(
         data,
         conversation_id=conversation_id,
@@ -3603,7 +3729,7 @@ async def _post_child_first_message(
     """
     try:
         msg_resp = await server_client.post(
-            f"/v1/sessions/{child_session_id}/events",
+            f"{_session_url(child_session_id)}/events",
             json={
                 "type": "message",
                 "data": {
@@ -4271,7 +4397,7 @@ async def _timer_loop(
                 text += f"\nnote: {note!r}"
             try:
                 resp = await server_client.post(
-                    f"/v1/sessions/{conversation_id}/events",
+                    f"{_session_url(conversation_id)}/events",
                     json={
                         "type": "message",
                         "data": {
@@ -4285,7 +4411,7 @@ async def _timer_loop(
                 # httpx does not raise on 4xx/5xx by default; treat those
                 # as delivery failures so they share the warning path below.
                 resp.raise_for_status()
-            except (httpx.HTTPError, asyncio.TimeoutError):
+            except (TimeoutError, httpx.HTTPError, ValueError):
                 _logger.warning(
                     "Timer %s firing persist failed for %s",
                     timer_id,
@@ -4357,7 +4483,7 @@ async def _execute_comment_tool(
         args: _JsonObject = json.loads(arguments) if arguments.strip() else {}
     except json.JSONDecodeError:
         return json.dumps({"error": f"{tool_name}: malformed JSON arguments"})
-    base = f"/v1/sessions/{conversation_id}/comments"
+    base = f"{_session_url(conversation_id)}/comments"
 
     if tool_name == ListCommentsTool.name():
         params: dict[str, str] = {}
@@ -4392,7 +4518,7 @@ async def _execute_comment_tool(
         )
     try:
         resp = await server_client.patch(
-            f"{base}/{comment_id}",
+            f"{base}/{_route_identifier(comment_id, 'Comment')}",
             json={"status": status},
             timeout=30.0,
         )
@@ -4450,7 +4576,7 @@ async def _execute_browser_tool(
     action = tool_name[len("browser_") :]
     try:
         resp = await server_client.post(
-            f"/v1/sessions/{conversation_id}/browser/action_request",
+            f"{_session_url(conversation_id)}/browser/action_request",
             json={"action": action, "args": args},
             timeout=_BROWSER_ACTION_TIMEOUT,
         )
@@ -4459,7 +4585,7 @@ async def _execute_browser_tool(
         # fires (read(60) > server await(30)); this is the belt-and-suspenders
         # path if the server itself stalls.
         return _BROWSER_TIMEOUT_ERROR
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return json.dumps({"error": f"{tool_name} failed: {type(exc).__name__}: {exc}"})
     if resp.status_code >= 400:
         return json.dumps({"error": f"{tool_name} returned {resp.status_code}: {resp.text[:200]}"})
@@ -4594,7 +4720,7 @@ async def _execute_add_policy(
 
     try:
         resp = await server_client.post(
-            f"/v1/sessions/{conversation_id}/policies",
+            f"{_session_url(conversation_id)}/policies",
             json=payload,
             timeout=30.0,
         )
@@ -5030,7 +5156,7 @@ async def _session_get_info_via_rest(
         )
     try:
         resp = await server_client.get(
-            f"/v1/sessions/{raw_target}",
+            f"{_session_url(raw_target)}",
             params={"include_items": "false", "include_liveness": "false"},
             timeout=30.0,
         )
@@ -5206,7 +5332,7 @@ async def _session_share_via_rest(
         )
     try:
         resp = await server_client.put(
-            f"/v1/sessions/{target}/permissions",
+            f"{_session_url(target)}/permissions",
             json={"user_id": user_id, "level": level_by_name[level_name]},
             timeout=30.0,
         )
@@ -5325,7 +5451,7 @@ async def _agent_get_via_rest(
     :returns: JSON agent-metadata object, or a JSON error object.
     """
     try:
-        resp = await server_client.get(f"/v1/sessions/{session_id}/agent", timeout=30.0)
+        resp = await server_client.get(f"{_session_url(session_id)}/agent", timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_agent_get failed: {exc}"})
     if resp.status_code == 404:
@@ -5422,7 +5548,7 @@ async def _agent_download_via_rest(
         or a JSON error object.
     """
     try:
-        resp = await server_client.get(f"/v1/sessions/{session_id}/agent/contents", timeout=60.0)
+        resp = await server_client.get(f"{_session_url(session_id)}/agent/contents", timeout=60.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_agent_download failed: {exc}"})
     if resp.status_code == 404:
@@ -5602,7 +5728,7 @@ async def _spawn_family(
         return _spawn_family_cache[conversation_id]
     try:
         resp = await server_client.get(
-            f"/v1/sessions/{conversation_id}",
+            f"{_session_url(conversation_id)}",
             # Only the routing fields are read, so skip the history and
             # runner-liveness work the full snapshot would do.
             params={"include_items": "false", "include_liveness": "false"},
@@ -5682,7 +5808,7 @@ async def _agent_list_host_readiness(
                     return None
                 seen.add(conversation_id)
                 response = await server_client.get(
-                    f"/v1/sessions/{conversation_id}",
+                    f"{_session_url(conversation_id)}",
                     params={"include_items": "false", "include_liveness": "false"},
                     timeout=_AGENT_READINESS_TIMEOUT_S,
                 )
@@ -5907,6 +6033,30 @@ async def _session_list_via_rest(
     )
 
 
+async def _open_file_via_rest(
+    args: _JsonObject,
+    conversation_id: str | None,
+    server_client: httpx.AsyncClient | None,
+) -> str:
+    """Validate and forward a UI request using only the calling session's identity."""
+    if server_client is None or not conversation_id:
+        return json.dumps({"error": "ui_open_file requires server access and a session id"})
+    try:
+        body = OpenFileRequest.model_validate(args)
+        response = await server_client.post(
+            f"/v1/sessions/{conversation_id}/ui/open-file",
+            json=body.model_dump(),
+            timeout=30.0,
+        )
+        response.raise_for_status()
+        result = response.json()
+        if not isinstance(result, dict) or type(result.get("subscribers")) is not int:
+            return json.dumps({"error": "ui_open_file returned an invalid delivery response"})
+        return json.dumps(result)
+    except (httpx.HTTPError, ValueError) as exc:
+        return json.dumps({"error": f"ui_open_file failed: {exc}"})
+
+
 async def _rename_current_session_via_rest(
     args: _JsonObject,
     conversation_id: str | None,
@@ -5940,7 +6090,7 @@ async def _rename_current_session_via_rest(
     # the old seed-gated endpoint's response for child sessions.
     try:
         info_response = await server_client.get(
-            f"/v1/sessions/{conversation_id}",
+            f"{_session_url(conversation_id)}",
             # Skip the transcript and the runner/host liveness lookup — the
             # probe only needs parent_session_id.
             params={"include_items": "false", "include_liveness": "false"},
@@ -5977,7 +6127,7 @@ async def _rename_current_session_via_rest(
         )
     try:
         response = await server_client.post(
-            f"/v1/sessions/{conversation_id}/agent-title",
+            f"{_session_url(conversation_id)}/agent-title",
             json={"title": normalized_title},
             timeout=90.0,
         )
@@ -6025,7 +6175,7 @@ async def _collect_sub_agents(
     """
     try:
         resp = await server_client.get(
-            f"/v1/sessions/{conversation_id}/child_sessions",
+            f"{_session_url(conversation_id)}/child_sessions",
             params={"limit": 100},
             timeout=30.0,
         )
@@ -6041,7 +6191,7 @@ async def _collect_sub_agents(
         result.append({"agent": "main", "title": None, "conversation_id": parent_id})
         try:
             sib_resp = await server_client.get(
-                f"/v1/sessions/{parent_id}/child_sessions",
+                f"{_session_url(parent_id)}/child_sessions",
                 params={"limit": 100},
                 timeout=30.0,
             )
@@ -6050,7 +6200,7 @@ async def _collect_sub_agents(
                     # Exclude the caller itself from its own sibling list.
                     if entry["conversation_id"] != conversation_id:
                         result.append(entry)
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.debug(
                 "sys_session_list sibling enrichment failed for parent %s",
                 parent_id,
@@ -6204,7 +6354,7 @@ async def _session_parent_id(
     :returns: The parent session id, or ``None``.
     """
     try:
-        snap = await server_client.get(f"/v1/sessions/{conversation_id}", timeout=30.0)
+        snap = await server_client.get(f"{_session_url(conversation_id)}", timeout=30.0)
     except Exception:  # noqa: BLE001
         return None
     if snap.status_code != 200:
@@ -6256,7 +6406,7 @@ async def _session_get_history_via_rest(
         return content_offset_chars
     try:
         resp = await server_client.get(
-            f"/v1/sessions/{target_id}/items",
+            f"{_session_url(target_id)}/items",
             params={"limit": tail_items, "order": "desc"},
             timeout=30.0,
         )
@@ -6276,6 +6426,9 @@ async def _session_get_history_via_rest(
         for it in reversed(data)
     ]
     meta = await _fetch_peek_meta(target_id, server_client)
+    # Load the server's pending-index helpers only when a history tool needs them.
+    from omnigent.runtime import pending_elicitations
+
     # A parked elicitation never lands in the conversation store (it
     # lives only in the Omnigent server's pending-elicitations index, replayed
     # on the snapshot), so append the snapshot's outstanding prompts
@@ -6308,7 +6461,7 @@ async def _fetch_close_target(
         otherwise) suitable for returning verbatim to the LLM.
     """
     try:
-        snap = await server_client.get(f"/v1/sessions/{target_id}", timeout=30.0)
+        snap = await server_client.get(f"{_session_url(target_id)}", timeout=30.0)
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_close failed: {exc}"})
     if snap.status_code == 404:
@@ -6354,7 +6507,7 @@ async def _close_tree_scope_error(
     """
     try:
         caller_snap = await server_client.get(
-            f"/v1/sessions/{caller_conversation_id}", timeout=30.0
+            f"{_session_url(caller_conversation_id)}", timeout=30.0
         )
     except Exception as exc:  # noqa: BLE001
         return json.dumps({"error": f"sys_session_close failed: {exc}"})
@@ -6428,7 +6581,7 @@ async def _session_close_via_rest(
     new_title = f"{parsed.agent}:{parsed.title}{_CLOSED_TITLE_INFIX}{target_id}"
     try:
         patch = await server_client.patch(
-            f"/v1/sessions/{target_id}",
+            f"{_session_url(target_id)}",
             json={
                 "title": new_title,
                 "labels": {CLOSED_LABEL_KEY: CLOSED_LABEL_VALUE},
@@ -6493,7 +6646,7 @@ async def _fetch_peek_meta(
         payloads (all empty/``None`` on any miss).
     """
     try:
-        snap = await server_client.get(f"/v1/sessions/{target_id}", timeout=30.0)
+        snap = await server_client.get(f"{_session_url(target_id)}", timeout=30.0)
     except Exception:  # noqa: BLE001
         return _PeekMeta(agent=None, title=None, pending_elicitations=[])
     if snap.status_code != 200:
@@ -6520,7 +6673,7 @@ async def execute_tool(
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
-    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
+    local_tool_workdir: Path | _UnsetLocalToolWorkdir | None = _UNSET_LOCAL_TOOL_WORKDIR,
     mcp_manager: RunnerMcpManager | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
@@ -6669,6 +6822,10 @@ async def execute_tool(
             )
         elif tool_name in _LIST_MODELS_TOOLS:
             output = await _execute_list_models_tool(agent_spec=agent_spec)
+        elif tool_name == SysSessionMessageTool.name():
+            from omnigent.runner.session_message import execute_message_tool
+
+            output = await execute_message_tool(args, server_client, conversation_id)
         elif tool_name in _SESSION_CREATE_TOOLS:
             output = await _execute_session_create(
                 args,
@@ -6678,6 +6835,8 @@ async def execute_tool(
                 agent_spec=agent_spec,
                 runner_workspace=runner_workspace,
             )
+        elif tool_name in _UI_TOOLS:
+            output = await _open_file_via_rest(args, conversation_id, server_client)
         elif tool_name in _SESSION_SELF_WRITE_TOOLS:
             output = await _rename_current_session_via_rest(
                 args,
@@ -6918,7 +7077,7 @@ async def dispatch_tool_locally(
     agent_id: str | None = None,
     agent_name: str | None = None,
     runner_workspace: Path | None = None,
-    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
+    local_tool_workdir: Path | _UnsetLocalToolWorkdir | None = _UNSET_LOCAL_TOOL_WORKDIR,
     mcp_manager: RunnerMcpManager | None = None,
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
     session_async_tasks: dict[str, tuple[asyncio.Task[str], asyncio.Event]] | None = None,
@@ -6991,7 +7150,7 @@ async def dispatch_tool_locally(
     for attempt in range(2):
         try:
             resp = await harness_client.post(
-                f"/v1/sessions/{conversation_id}/events",
+                f"{_session_url(conversation_id)}/events",
                 json={"type": "tool_result", "call_id": call_id, "output": output},
                 timeout=30.0,
             )
@@ -7054,6 +7213,7 @@ def _clone_os_env_spec(spec: OSEnvSpec) -> OSEnvSpec:
                 list(sandbox.env_passthrough) if sandbox.env_passthrough is not None else None
             ),
             egress_rules=list(sandbox.egress_rules) if sandbox.egress_rules is not None else None,
+            git_ssh=list(sandbox.git_ssh) if sandbox.git_ssh is not None else None,
         )
     return dataclasses.replace(spec, sandbox=sandbox_copy)
 
@@ -7345,18 +7505,18 @@ async def _execute_rest_tool(
             if conversation_id is not None:
                 try:
                     parent_resp = await server_client.get(
-                        f"/v1/sessions/{conversation_id}",
+                        f"{_session_url(conversation_id)}",
                         timeout=10.0,
                     )
                     if parent_resp.status_code == 200:
                         parent_runner = parent_resp.json().get("runner_id")
                         if parent_runner:
                             await server_client.patch(
-                                f"/v1/sessions/{session_id}",
+                                f"{_session_url(session_id)}",
                                 json={"runner_id": parent_runner},
                                 timeout=10.0,
                             )
-                except httpx.HTTPError:
+                except (httpx.HTTPError, ValueError):
                     _logger.debug(
                         "sys_call_async: failed to bind runner for child session %s",
                         session_id,
@@ -7375,7 +7535,7 @@ async def _execute_rest_tool(
                 },
             }
             event_resp = await server_client.post(
-                f"/v1/sessions/{session_id}/events",
+                f"{_session_url(session_id)}/events",
                 json=event_body,
                 timeout=30.0,
             )
@@ -7400,7 +7560,7 @@ async def _execute_rest_tool(
         handle_id = args.get("handle_id") or args.get("task_id", "")
         try:
             resp = await server_client.post(
-                f"/v1/sessions/{handle_id}/events",
+                f"{_session_url(handle_id)}/events",
                 json={"type": "interrupt", "data": {}},
                 timeout=30.0,
             )
@@ -7447,7 +7607,7 @@ async def _execute_file_tool(
         return f"Error: {tool_name} requires server access"
     if conversation_id is None:
         return f"Error: {tool_name} requires a session id"
-    files_path = f"/v1/sessions/{conversation_id}/resources/files"
+    files_path = f"{_session_url(conversation_id)}/resources/files"
 
     if tool_name == UploadFileTool.name():
         path = args.get("path")
@@ -7487,7 +7647,7 @@ async def _execute_file_tool(
         file_id = args.get("file_id", "")
         try:
             resp = await server_client.get(
-                f"{files_path}/{file_id}/content",
+                f"{files_path}/{_route_identifier(file_id, 'File')}/content",
                 timeout=30.0,
             )
             if resp.status_code == 200:
@@ -7815,7 +7975,7 @@ async def _execute_async_inbox_tool(
     agent_id: str | None,
     agent_name: str | None,
     runner_workspace: Path | None,
-    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir,
+    local_tool_workdir: Path | _UnsetLocalToolWorkdir | None,
     mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
     harness_client: httpx.AsyncClient | None = None,
@@ -8071,11 +8231,11 @@ async def _post_subagent_policy_verdict(
     """
     try:
         resp = await server_client.post(
-            f"/v1/sessions/{conversation_id}/policies/evaluate",
+            f"{_session_url(conversation_id)}/policies/evaluate",
             json=_subagent_tool_result_policy_request(payload, output),
             timeout=30.0,
         )
-    except httpx.HTTPError:
+    except (httpx.HTTPError, ValueError):
         _logger.exception(
             "Sub-agent inbox TOOL_RESULT policy evaluation failed for parent=%s child=%s",
             conversation_id,
@@ -8323,7 +8483,7 @@ async def _evaluate_async_tool_call_policy(
         except (json.JSONDecodeError, ValueError):
             arguments_dict = {}
         resp = await server_client.post(
-            f"/v1/sessions/{conversation_id}/policies/evaluate",
+            f"{_session_url(conversation_id)}/policies/evaluate",
             json={
                 "event": {"type": phase, "data": {"name": tool_name, "arguments": arguments_dict}}
             },
@@ -8341,7 +8501,7 @@ async def _evaluate_async_tool_call_policy(
             evaluation_id,
             extra={"session_id": conversation_id},
         )
-    except Exception:  # noqa: BLE001
+    except Exception:
         _logger.warning(
             "async PHASE_TOOL_CALL policy evaluate failed for %s; denying",
             evaluation_id,
@@ -8367,7 +8527,7 @@ def _spawn_async_tool(
     runner_workspace: Path | None,
     mcp_manager: RunnerMcpManager | None,
     filesystem_registry: FilesystemRegistry | None = None,
-    local_tool_workdir: Path | None | _UnsetLocalToolWorkdir = _UNSET_LOCAL_TOOL_WORKDIR,
+    local_tool_workdir: Path | _UnsetLocalToolWorkdir | None = _UNSET_LOCAL_TOOL_WORKDIR,
     effective_harness: str | None = None,
 ) -> str:
     """
@@ -8734,11 +8894,11 @@ async def _post_session_stop(
     """
     try:
         resp = await server_client.post(
-            f"/v1/sessions/{task_id}/events",
+            f"{_session_url(task_id)}/events",
             json={"type": "stop_session", "data": {}},
             timeout=30.0,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return None, f"Error: sys_cancel_task stop_session failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
         return resp.status_code, (
@@ -8765,8 +8925,8 @@ async def _cancel_evicted_native_subagent(
     if server_client is None:
         return "Error: sys_cancel_task requires server access for sub-agent tasks"
     try:
-        resp = await server_client.get(f"/v1/sessions/{task_id}", timeout=10.0)
-    except httpx.HTTPError as exc:
+        resp = await server_client.get(f"{_session_url(task_id)}", timeout=10.0)
+    except (httpx.HTTPError, ValueError) as exc:
         return f"Error: sys_cancel_task lookup failed: {type(exc).__name__}: {exc}"
     if resp.status_code != 200:
         return f"Error: no in-flight task with task_id {task_id}"
@@ -8863,12 +9023,12 @@ async def _cancel_subagent_task(
 
     try:
         resp = await server_client.post(
-            f"/v1/sessions/{task_id}/events",
+            f"{_session_url(task_id)}/events",
             # Bare control events 422 on servers that require body.data.
             json={"type": event_type, "data": {}},
             timeout=30.0,
         )
-    except httpx.HTTPError as exc:
+    except (httpx.HTTPError, ValueError) as exc:
         return f"Error: sys_cancel_task {event_type} failed: {type(exc).__name__}: {exc}"
     if resp.status_code >= 400:
         if capability == "stop" and resp.status_code == 503:

@@ -141,7 +141,7 @@ def test_codex_native_launch_handles_config_fetch_timeouts(
         assert f"Failed to auto-create codex terminal for {session_id}" not in log, (
             f"launch logged an auto-create failure; runner log:\n{log[-4000:]}"
         )
-        retried = "Transient Codex launch-config fetch error" in log
+        retried = "Transient Codex launch-config fetch " in log
         assert retried == (not use_envelope), log[-4000:]
 
         # Opening the terminal must return the resource created during startup.

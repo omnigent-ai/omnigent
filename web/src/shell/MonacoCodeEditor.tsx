@@ -1,4 +1,4 @@
-// Monaco-based viewer/editor for non-markdown files in the file viewer.
+// Monaco-based source viewer/editor, including large Markdown files.
 //
 // One component serves both modes, switched by permission:
 //   • read-only (no edit permission) → Monaco with readOnly:true; selection,
@@ -87,6 +87,7 @@ interface MonacoCodeEditorProps extends CommentProps {
    * on the visible prefix stay available.
    */
   truncated?: boolean;
+  largeMarkdown?: boolean;
   /** Reports unsaved-edit state up to FileViewer (navigation guard, etc.). */
   onDirtyChange?: (isDirty: boolean) => void;
   /** Reports the auto-save lifecycle up to FileViewer's toolbar status chip. */
@@ -97,6 +98,11 @@ interface MonacoCodeEditorProps extends CommentProps {
    * still loading isn't dropped): true opens find, false closes it.
    */
   searchOpen?: boolean;
+  /**
+   * Bumped on every Cmd+F. Re-running Monaco's find action while the widget is
+   * already open refocuses its input, which `searchOpen` alone can't trigger.
+   */
+  searchFocusNonce?: number;
   /**
    * Called when the find widget is closed from within Monaco (Escape or the
    * widget's ✕) so the parent can reset the toggle and keep the toolbar button
@@ -111,7 +117,7 @@ interface MonacoCodeEditorProps extends CommentProps {
  * and feeds same-file external updates in through `setContentRef`.
  *
  * @param props See {@link MonacoCodeEditorProps}.
- * @returns The Monaco code editor for non-markdown files.
+ * @returns The Monaco source editor.
  */
 export function MonacoCodeEditor({
   position,
@@ -120,9 +126,11 @@ export function MonacoCodeEditor({
   path,
   isSettled,
   truncated = false,
+  largeMarkdown = false,
   onDirtyChange,
   onSaveStatusChange,
   searchOpen,
+  searchFocusNonce,
   onSearchHandled,
   comments,
   activeSelection,
@@ -156,6 +164,7 @@ export function MonacoCodeEditor({
       path={path}
       canEdit={canEdit}
       truncated={truncated}
+      largeMarkdown={largeMarkdown}
       isDirty={isDirty}
       setDirty={setDirty}
       hasExternalUpdate={hasExternalUpdate}
@@ -166,6 +175,7 @@ export function MonacoCodeEditor({
       setContentRef={setContentRef}
       onSaveStatusChange={onSaveStatusChange}
       searchOpen={searchOpen}
+      searchFocusNonce={searchFocusNonce}
       onSearchHandled={onSearchHandled}
       comments={comments}
       activeSelection={activeSelection}
@@ -182,6 +192,7 @@ interface InnerProps extends CommentProps {
   path: string;
   canEdit: boolean;
   truncated: boolean;
+  largeMarkdown: boolean;
   isDirty: boolean;
   setDirty: (dirty: boolean) => void;
   hasExternalUpdate: boolean;
@@ -192,6 +203,7 @@ interface InnerProps extends CommentProps {
   setContentRef: React.RefObject<((content: string) => void) | null>;
   onSaveStatusChange?: (status: SaveStatus) => void;
   searchOpen?: boolean;
+  searchFocusNonce?: number;
   onSearchHandled?: () => void;
 }
 
@@ -210,6 +222,7 @@ function MonacoCodeEditorInner({
   path,
   canEdit,
   truncated,
+  largeMarkdown,
   isDirty,
   setDirty,
   hasExternalUpdate,
@@ -220,6 +233,7 @@ function MonacoCodeEditorInner({
   setContentRef,
   onSaveStatusChange,
   searchOpen,
+  searchFocusNonce,
   onSearchHandled,
   comments,
   activeSelection,
@@ -368,13 +382,9 @@ function MonacoCodeEditorInner({
     [setContentRef],
   );
 
-  // Mirror Monaco's native find widget to the toolbar toggle. Gated on `mounted`
-  // so a Find pressed while the lazy chunk was still loading isn't dropped — when
-  // the editor mounts, `mounted` flips and this re-runs with the current flag.
-  // `searchOpen` true opens find; false closes it (so re-clicking the toolbar
-  // button, which toggles the flag, hides the widget). The controller drives the
-  // close directly rather than the open action so it's a real toggle, not a
-  // second open.
+  // Mirror Monaco's find widget to the toolbar toggle once `mounted` (so a Find
+  // pressed during the lazy load isn't dropped): `searchOpen` opens/closes it via
+  // the controller; a bumped `searchFocusNonce` re-runs find to refocus its input.
   useEffect(() => {
     if (!mounted) return;
     const editor = editorInstanceRef.current;
@@ -385,7 +395,7 @@ function MonacoCodeEditorInner({
       const controller = editor.getContribution<FindController>(FIND_CONTROLLER_ID);
       if (controller?.getState().isRevealed) controller.closeFindWidget();
     }
-  }, [mounted, searchOpen]);
+  }, [mounted, searchOpen, searchFocusNonce]);
 
   // Reflect a find close initiated inside Monaco (Escape or the widget's ✕) back
   // to the toolbar toggle, so its state matches the visible widget and the next
@@ -502,6 +512,11 @@ function MonacoCodeEditorInner({
 
   return (
     <div className="flex h-full flex-col">
+      {largeMarkdown && (
+        <div className="shrink-0 border-b border-border bg-muted/50 px-4 py-2 text-sm text-muted-foreground">
+          Large Markdown file opened as source to keep the viewer responsive.
+        </div>
+      )}
       {truncated && <TruncatedBanner />}
       {canEdit &&
         isDirty &&

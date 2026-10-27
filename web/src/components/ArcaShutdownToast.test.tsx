@@ -9,7 +9,6 @@ import { useArcaShutdownBanner } from "@/hooks/useArcaShutdownBanner";
 import {
   isDismissedToday,
   isWarnedToday,
-  optOut,
   resetArcaWarningStorageForTests,
 } from "@/lib/arcaShutdownWarning";
 import { copyText } from "@/lib/clipboard";
@@ -75,12 +74,14 @@ beforeEach(() => {
   state.toastCalls = 0;
   vi.mocked(copyText).mockReset().mockResolvedValue(undefined);
   toast.dismiss();
+  delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
 });
 afterEach(() => {
   toast.dismiss();
   cleanup();
   vi.restoreAllMocks();
   vi.useRealTimers();
+  delete (window as unknown as { omnigentDesktop?: unknown }).omnigentDesktop;
 });
 
 describe("ArcaShutdownToast", () => {
@@ -106,6 +107,35 @@ describe("ArcaShutdownToast", () => {
     expect(isWarnedToday(state.now)).toBe(true);
   });
 
+  it("offers desktop extend actions and hides copy until failure", async () => {
+    const extendArca = vi.fn().mockResolvedValue({ ok: false, error: "Instance unavailable" });
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      extendArca,
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: true }),
+    };
+    render(<ToastPage />);
+    expect(await screen.findByRole("button", { name: "Keep running tonight" })).toBeInTheDocument();
+    expect(screen.getByRole("button", { name: "Keep running this week" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Copy command" })).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Keep running this week" }));
+    expect(extendArca).toHaveBeenCalledWith("workweek");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Instance unavailable");
+    expect(screen.getByRole("button", { name: "Copy arca extend workweek" })).toBeInTheDocument();
+  });
+
+  it("offers copy commands when the desktop gate is disabled", async () => {
+    (window as unknown as { omnigentDesktop: unknown }).omnigentDesktop = {
+      kind: "electron",
+      extendArca: vi.fn(),
+      getDesktopFeatures: vi.fn().mockResolvedValue({ canExtendArca: false }),
+    };
+    render(<ToastPage />);
+    expect(await screen.findByRole("button", { name: "Copy command" })).toBeInTheDocument();
+    expect(screen.queryByRole("button", { name: "Keep running tonight" })).toBeNull();
+    expect(screen.getByText(/on your laptop to keep it running/)).toBeInTheDocument();
+  });
+
   it("dismisses a shown toast when the host goes offline", async () => {
     const view = render(<ToastPage />);
     expect(await screen.findByText("Arca shuts down at about 6 PM")).toBeInTheDocument();
@@ -116,16 +146,8 @@ describe("ArcaShutdownToast", () => {
     );
   });
 
-  it("dismisses on opt-out and cross-tab Not now", async () => {
+  it("dismisses on cross-tab Not now", async () => {
     const view = render(<ToastPage />);
-    expect(await screen.findByText("Arca shuts down at about 6 PM")).toBeInTheDocument();
-    act(() => optOut());
-    await waitFor(() =>
-      expect(screen.queryByText("Arca shuts down at about 6 PM")).not.toBeInTheDocument(),
-    );
-    localStorage.removeItem("omnigent:arca-shutdown:opted-out");
-    localStorage.removeItem("omnigent:arca-shutdown:warned");
-    view.rerender(<ToastPage />);
     expect(await screen.findByText("Arca shuts down at about 6 PM")).toBeInTheDocument();
     act(() => {
       localStorage.setItem("omnigent:arca-shutdown:dismissed", "2026-10-05");
@@ -136,6 +158,16 @@ describe("ArcaShutdownToast", () => {
     await waitFor(() =>
       expect(screen.queryByText("Arca shuts down at about 6 PM")).not.toBeInTheDocument(),
     );
+    view.rerender(<ToastPage showBanner />);
+    expect(screen.queryByText(/Your Arca will shut down/)).not.toBeInTheDocument();
+  });
+
+  it("hides the banner for today when the toast's Not now is clicked", async () => {
+    const view = render(<ToastPage />);
+    fireEvent.click(await screen.findByRole("button", { name: "Not now" }));
+    expect(isDismissedToday(MON_5PM)).toBe(true);
+    view.rerender(<ToastPage showBanner />);
+    expect(screen.queryByText(/Your Arca will shut down/)).not.toBeInTheDocument();
   });
 
   it("keeps the toast when copying fails", async () => {
@@ -232,14 +264,12 @@ describe("ArcaShutdownToast", () => {
   });
 
   it.each([
-    ["before 17:00", MON_459PM, "online", false],
-    ["on weekends", SAT_5PM, "online", false],
-    ["with no online Arca host", MON_5PM, "offline", false],
-    ["after opting out", MON_5PM, "online", true],
-  ] as const)("does not show %s", (_name, now, status, optedOut) => {
+    ["before 17:00", MON_459PM, "online"],
+    ["on weekends", SAT_5PM, "online"],
+    ["with no online Arca host", MON_5PM, "offline"],
+  ] as const)("does not show %s", (_name, now, status) => {
     state.now = now;
     state.hosts = [{ ...state.hosts[0], status }];
-    if (optedOut) localStorage.setItem("omnigent:arca-shutdown:opted-out", "true");
     render(<ToastPage />);
     expect(state.toastCalls).toBe(0);
   });

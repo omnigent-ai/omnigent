@@ -42,7 +42,7 @@ const path = require("node:path");
 const { pathToFileURL } = require("node:url");
 const { omnigentBuild } = require("../package.json");
 const { execFile } = require("node:child_process");
-const { registerLocalhostCors } = require("./localhost_cors");
+const { isLocalhostUrl, registerLocalhostCors } = require("./localhost_cors");
 const {
   registerBrowserPermissions,
   createBrowserPermissionStore,
@@ -118,6 +118,7 @@ const {
 } = require("./settingsNavigation");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
+const { diagnostics } = require("./diagnostics");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -379,9 +380,10 @@ let arcaProbe = null;
  *
  * @returns {Promise<string | null>}
  */
-function refreshArcaBinary() {
-  // Only auto-connect uses the cached binary; with the feature off, don't probe.
-  if (!arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
+function refreshArcaBinary({ previewRecoveryRequested = false } = {}) {
+  // With auto-connect off, wait to probe until a preview explicitly requests
+  // recovery; that request is the demand signal, not consent to run anything.
+  if (!previewRecoveryRequested && !arcaAutoConnectFeatureEnabled()) return Promise.resolve(null);
   if (cachedArcaPath.path && arca.isExecutableFile(cachedArcaPath.path)) {
     return Promise.resolve(cachedArcaPath.path);
   }
@@ -439,6 +441,10 @@ const arcaAutoConnect = createArcaAutoConnect({
   },
   log: (message) => console.log(`[omnigent] ${message}`),
 });
+/** Agent retry bursts after a deliberate decline should not reopen the prompt immediately. */
+const ARCA_PREVIEW_DECLINE_COOLDOWN_MS = 10 * 1000;
+const arcaPreviewRecoveries = new Set();
+const arcaPreviewDeclinedUntil = new Map();
 
 /**
  * The auto-connect opt-in shared by overlapping onboarding connects: how many
@@ -578,8 +584,8 @@ let reconnectSlowDelayMs = 60_000;
  * Electron asks the embedder (us) rather than showing Chrome's own prompt.
  * With NO handler wired, Chromium denies by default — which surfaces as a
  * `not-allowed` error the instant `recognition.start()` runs, i.e. "the
- * dictation button does nothing." We grant only the audio-related set and
- * deny everything else.
+ * dictation button does nothing." Grants require an allow-listed permission
+ * from the pinned server's top-level page.
  *
  * NOTE: this clears the FIRST of two gates. Web Speech `SpeechRecognition`
  * also relies on Google's cloud speech backend keyed to official Chrome
@@ -594,12 +600,15 @@ let reconnectSlowDelayMs = 60_000;
  * denies when a permission-check handler is wired and returns false).
  * Sanitized write only lets the page PUT text on the clipboard from a
  * user gesture; ``clipboard-read`` stays denied.
+ * ``fullscreen`` lets recordings use native fullscreen controls on the
+ * pinned server's top-level page.
  */
 const GRANTED_PERMISSIONS = new Set([
   "media",
   "audioCapture",
   "mediaKeySystem",
   "clipboard-sanitized-write",
+  "fullscreen",
 ]);
 
 /**
@@ -919,9 +928,11 @@ function cancelReconnect(win) {
   reconnectOverlay.hide(win);
 }
 
-/** Setup page for a connection that failed; `url` pre-fills the form. */
+/** Return to setup with a pre-filled server and an optional error message. */
 function showConnectFailure(win, url, message) {
-  const params = new URLSearchParams({ error: message, url });
+  const params = new URLSearchParams({ url });
+  if (message) params.set("error", message);
+  else params.set("step", "server");
   if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
   pinWindow(win, null); // back on the setup page → no trusted origin
   void loadSetupPage(win, params.toString());
@@ -1041,6 +1052,13 @@ const UNAVAILABLE_HINT = "Databricks isn't responding.";
 
 function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedReturnUrl } = {}) {
   if (win.isDestroyed()) return;
+  diagnostics.record("auth_required", {
+    origin: originOf(failedUrl),
+    phase: "databricks",
+    code: error.errorCode,
+    status: error.status,
+    requestId: error.requestId,
+  });
   console.warn("[omnigent] databricks auth: connection requires sign-in", {
     origin: originOf(failedUrl),
     phase: error.phase ?? "authentication",
@@ -1061,7 +1079,10 @@ function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedRe
     mounted && (!failedReturnUrl || failedReturnUrl === failedUrl) ? mounted : failedReturnUrl;
   const blocked = error.errorCode === IP_ACL_BLOCKED;
   const unreachable = transient && (error.status == null || blocked);
-  let message = "Couldn't sign in to Databricks. Please try again.";
+  let message =
+    error.errorCode === "NO_STORED_TOKEN"
+      ? null
+      : "Couldn't sign in to Databricks. Please try again.";
   if (expired) message = "Session expired. Connect to sign in again.";
   else if (unreachable) message = unreachableMessage(serverUrl, blocked);
   // The page stays under the overlay, but no longer trusted or allowed to navigate.
@@ -1102,7 +1123,7 @@ function oidcSignInMessage(serverUrl, error, serverName) {
   const server = serverDisplayName(serverUrl, serverName);
   switch (error?.code) {
     case "SIGNED_OUT":
-      return `You're signed out of ${server}.`;
+      return null;
     case "SIGN_OUT_INCOMPLETE":
       return signOutIncompleteMessage(server);
     case "expired_token":
@@ -1133,14 +1154,18 @@ function oidcSignInMessage(serverUrl, error, serverName) {
 /** Return an OIDC window to the connect screen, explaining why. */
 function showOidcAuthRequired(win, serverUrl, error, serverName = null) {
   if (win.isDestroyed()) return;
+  diagnostics.record("auth_required", {
+    origin: originOf(serverUrl),
+    phase: "oidc",
+    code: error?.code,
+  });
   console.warn("[omnigent] oidc auth: connection requires sign-in", {
     origin: originOf(serverUrl),
     code: error?.code,
   });
-  const params = new URLSearchParams({
-    error: oidcSignInMessage(serverUrl, error, serverName),
-    url: serverUrl,
-  });
+  const params = new URLSearchParams({ url: serverUrl });
+  const message = oidcSignInMessage(serverUrl, error, serverName);
+  if (message) params.set("error", message);
   if (windows.get(win)?.ephemeral) params.set("ephemeral", "1");
   oidcAuth?.detach(win);
   pinWindow(win, null);
@@ -2098,6 +2123,7 @@ async function loadServerUrl(
   { interactive = false, loadUrl, attempt = beginConnectionAttempt(win) } = {},
 ) {
   const signal = attempt.controller.signal;
+  let serverUrl = requestedServerUrl;
   const current = () =>
     !signal.aborted && !win.isDestroyed() && connectionAttempts.get(win) === attempt;
   const assertCurrent = () => {
@@ -2106,7 +2132,7 @@ async function loadServerUrl(
   };
   try {
     assertCurrent();
-    let serverUrl = requestedServerUrl;
+    diagnostics.record("connection_start", { origin: originOf(serverUrl), interactive });
     databricksAuth?.reset(win);
     oidcAuth?.detach(win);
     pinWindow(win, originOf(serverUrl), attempt);
@@ -2124,6 +2150,7 @@ async function loadServerUrl(
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     let manifest = null;
     if (usesBrowserAuth(serverUrl)) {
+      diagnostics.record("auth_mode", { origin: originOf(serverUrl), phase: "databricks" });
       reportConnectionProgress(win, attempt, "authenticating");
       const auth = getDatabricksAuth();
       win.webContents.stop();
@@ -2203,6 +2230,7 @@ async function loadServerUrl(
       assertCurrent();
       const cookieName = oidcSessionCookie(serverUrl, manifest, windowState?.ephemeral);
       if (cookieName) {
+        diagnostics.record("auth_mode", { origin: originOf(serverUrl), phase: "oidc" });
         if (windowState) {
           windowState.authKind = "oidc";
           windowState.oidcCookie = cookieName;
@@ -2247,6 +2275,7 @@ async function loadServerUrl(
     if (!reconnectOverlay.isShown(win)) connectionLoading.show(win, attempt, "Opening Omnigent…");
     await win.loadURL(target);
     assertCurrent();
+    diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
     // Loaded: any reconnect this window was waiting on is over.
     cancelReconnect(win);
     // Only a manifest that was actually read can say the name went away.
@@ -2256,6 +2285,14 @@ async function loadServerUrl(
     const arcaServerUrl = windowArcaServerUrl(win);
     void refreshArcaBinary().then(() => arcaAutoConnect.ensure(arcaServerUrl));
     return serverUrl;
+  } catch (error) {
+    diagnostics.record("connection_result", {
+      origin: originOf(serverUrl),
+      outcome: error?.name === "AbortError" ? "cancelled" : "failed",
+      code: error?.code ?? error?.errorCode,
+      status: error?.status,
+    });
+    throw error;
   } finally {
     connectionLoading.hide(win, attempt);
     attempt.pending = false;
@@ -2307,6 +2344,10 @@ function registerNavigationFallbacks(win) {
       // not yank the window off its new destination.
       const failedOrigin = originOf(validatedURL ?? "");
       if (failedOrigin !== windows.get(win)?.origin) return;
+      diagnostics.record("navigation_failed", {
+        origin: failedOrigin,
+        code: `net_${Math.abs(errorCode)}`,
+      });
       let error = `${errorDescription || "load failed"} (${errorCode})`;
       const serverUrl = windows.get(win)?.serverUrl;
       const reconnectable =
@@ -2346,6 +2387,7 @@ function registerNavigationFallbacks(win) {
     const state = windows.get(win);
     const failedOrigin = originOf(url ?? "");
     if (failedOrigin !== state?.origin) return;
+    diagnostics.record("navigation_failed", { origin: failedOrigin, status: httpResponseCode });
     const status = httpStatusText
       ? `${httpResponseCode} ${httpStatusText}`
       : `HTTP ${httpResponseCode}`;
@@ -2415,12 +2457,8 @@ function createWindow(targetUrl, opts = {}) {
     ...(process.platform === "darwin"
       ? {
           titleBarStyle: "hiddenInset",
-          // Drop the native traffic lights ~4px from their hiddenInset default so
-          // they center in the 2.25rem (36px) title-bar strip, level with the
-          // Search/Settings/toggle cluster and the chat-header icons (both
-          // centered there — see the [data-electron-mac] rules in index.css).
-          // x:19 preserves hiddenInset's horizontal inset; y centers the ~14px
-          // controls ((36-14)/2 ≈ 11). Adjust y by ±1 if it reads off on device.
+          // Center the ~14px native controls at y=24px in the 48px title bar.
+          // Keep the web layer's macOS clearance in index.css aligned with this.
           trafficLightPosition: { x: 16, y: 17 },
         }
       : {}),
@@ -2757,13 +2795,15 @@ function openFindBar(target) {
   });
   bar.on("closed", () => {
     findBars.delete(target);
-    if (!target.isDestroyed()) {
-      target.removeListener("resize", reposition);
-      target.removeListener("move", reposition);
-      target.webContents.removeListener("found-in-page", onFound);
-      target.webContents.stopFindInPage("clearSelection");
-      target.focus();
-    }
+    if (target.isDestroyed()) return;
+    target.removeListener("resize", reposition);
+    target.removeListener("move", reposition);
+    target.webContents.removeListener("found-in-page", onFound);
+    // Closing the parent (Cmd+W) destroys its webContents before this child's
+    // "closed" fires, while the parent window itself is not yet destroyed.
+    if (target.webContents.isDestroyed()) return;
+    target.webContents.stopFindInPage("clearSelection");
+    target.focus();
   });
 }
 
@@ -2958,11 +2998,8 @@ async function signOutOfDatabricks(origin) {
     // A reconnect may have re-pinned the window while sign-out waited.
     pinWindow(w, null);
     setWindowServerUrl(w, null);
-    const server = serverDisplayName(serverUrl);
-    const params = new URLSearchParams({
-      error: complete ? `You're signed out of ${server}.` : signOutIncompleteMessage(server),
-      url: serverUrl,
-    });
+    const params = new URLSearchParams({ url: serverUrl });
+    if (!complete) params.set("error", signOutIncompleteMessage(serverDisplayName(serverUrl)));
     if (ephemeral) params.set("ephemeral", "1");
     void loadSetupPage(w, params.toString());
   }
@@ -3344,6 +3381,32 @@ function changeServer() {
 // roles kills those shortcuts inside webview text fields.
 // ---------------------------------------------------------------------------
 
+async function exportDiagnostics() {
+  const parent = activeWindow();
+  try {
+    const options = {
+      title: "Export Omnigent Desktop Diagnostics",
+      defaultPath: `Omnigent-desktop-diagnostics-${new Date().toISOString().slice(0, 10)}.jsonl`,
+      filters: [{ name: "Diagnostic logs", extensions: ["jsonl"] }],
+    };
+    const { canceled, filePath } = parent
+      ? await dialog.showSaveDialog(parent, options)
+      : await dialog.showSaveDialog(options);
+    if (canceled || !filePath) return;
+    diagnostics.exportTo(filePath);
+  } catch (error) {
+    const options = {
+      type: "error",
+      title: "Could not export diagnostics",
+      message: "Omnigent could not save the desktop diagnostics.",
+      detail: error?.message ?? "Check that the destination is writable and try again.",
+      buttons: ["OK"],
+    };
+    if (parent && !parent.isDestroyed()) await dialog.showMessageBox(parent, options);
+    else await dialog.showMessageBox(options);
+  }
+}
+
 function buildMenu() {
   const isMac = process.platform === "darwin";
   const aboutItem = aboutMenuItem("Omnigent", () => {
@@ -3406,6 +3469,11 @@ function buildMenu() {
       },
     },
     { type: "separator" },
+    {
+      id: "export_diagnostics",
+      label: "Export Diagnostics…",
+      click: () => void exportDiagnostics(),
+    },
     // Keep update checks in the shell-owned About modal so the menu, update
     // prompt, and About item all converge on one status/progress surface.
     {
@@ -3676,6 +3744,112 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
   });
 }
 
+// Electron keeps one webRequest listener per event per session, and a
+// conversation's tabs share one partition, so install once per session and let
+// the registry attribute each request to its view.
+const guardedAgentSessions = new WeakSet();
+
+/** Enforce the agent navigation policy on document requests at the network layer. */
+function guardAgentPartitionRequests(partition, registry) {
+  const ses = session.fromPartition(partition);
+  if (guardedAgentSessions.has(ses)) return;
+  guardedAgentSessions.add(ses);
+  // Documents only: frames plus <object>/<embed> content, which also renders.
+  const filter = {
+    urls: ["http://*/*", "https://*/*"],
+    types: ["mainFrame", "subFrame", "object"],
+  };
+  const answer = (decision, callback) =>
+    decision.then(
+      (cancel) => callback({ cancel }),
+      () => callback({ cancel: true }),
+    );
+  ses.webRequest.onBeforeRequest(filter, (details, callback) =>
+    answer(registry.shouldCancelAgentRequest(details), callback),
+  );
+  ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
+    callback(registry.agentRequestHeaders(details)),
+  );
+  ses.webRequest.onHeadersReceived(filter, (details, callback) =>
+    answer(registry.shouldCancelAgentResponse(details), callback),
+  );
+}
+
+/**
+ * Main-owned recovery scope for a loopback preview request, excluding the
+ * renderer-supplied host match that decides whether this session may ask.
+ */
+function arcaPreviewRecoveryTargetForEvent(event, url) {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  if (
+    !isLocalhostUrl(url) ||
+    !isPinnedOriginSender(event) ||
+    !win ||
+    win.isDestroyed() ||
+    !databricksInternalFeaturesEnabled()
+  ) {
+    return null;
+  }
+  const target = arcaTarget(windowArcaServerUrl(win));
+  if (
+    !isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) ||
+    !isDatabricksManagedServerUrl(target) ||
+    arcaIdentities.get(target)
+  ) {
+    return null;
+  }
+  return { win, target };
+}
+
+/** A mismatched remembered host additionally requires renderer identification as Arca. */
+function arcaPreviewRecoveryContextForEvent(
+  event,
+  url,
+  sourceHostId,
+  rememberedArcaHostId,
+  sourceIsArcaHost,
+) {
+  const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
+  if (
+    !targetContext ||
+    typeof sourceHostId !== "string" ||
+    typeof rememberedArcaHostId !== "string" ||
+    (sourceHostId !== rememberedArcaHostId && sourceIsArcaHost !== true)
+  ) {
+    return null;
+  }
+  return {
+    ...targetContext,
+    sourceHostId,
+    rememberedMatchesSource: sourceHostId === rememberedArcaHostId,
+  };
+}
+
+/** Open one shared consent flow and let the requesting agent retry afterward. */
+function startArcaPreviewConsentRecovery({ win, target, sourceHostId }) {
+  if (arcaPreviewRecoveries.has(target)) return;
+  arcaPreviewRecoveries.add(target);
+  void arcaConnectFlow
+    .run(win, target, { reason: "preview-reconnect" })
+    .then((result) => {
+      if (result?.canceled) {
+        arcaPreviewDeclinedUntil.set(target, Date.now() + ARCA_PREVIEW_DECLINE_COOLDOWN_MS);
+      }
+      const captured = arcaIdentities.get(target);
+      if (result?.ok && captured?.hostId !== sourceHostId) {
+        console.warn("[omnigent] Arca preview recovery captured a different host identity");
+      }
+      return result;
+    })
+    .catch((error) => {
+      console.warn(`[omnigent] Arca preview recovery failed: ${String(error)}`);
+      return { ok: false, error: String(error) };
+    })
+    .finally(() => {
+      arcaPreviewRecoveries.delete(target);
+    });
+}
+
 /**
  * Build the per-conversation WebContentsView registry for a shell window
  * (positions child views in `win.contentView`, pings back via `win.webContents`).
@@ -3698,8 +3872,16 @@ function createBrowserRegistryForWindow(win) {
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
+      guardAgentPartitionRequests(opts.webPreferences.partition, registry);
       return view;
     },
+    // Resolve and look up proxies through the view's own Chromium session, so
+    // the agent checks see what its navigation will use.
+    resolveHost: async (hostname, partition) => {
+      const { endpoints } = await session.fromPartition(partition).resolveHost(hostname);
+      return endpoints.map((endpoint) => endpoint.address);
+    },
+    resolveProxy: (url, partition) => session.fromPartition(partition).resolveProxy(url),
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
@@ -4648,14 +4830,23 @@ function registerIpc() {
   // (a workspace mount or a Databricks App) — internal features must not
   // light up against arbitrary self-hosted servers. Read fresh per call so
   // applying/removing the profile takes effect without a restart.
+  const canExtendArca = (event) =>
+    databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event));
+
   ipcMain.handle("omnigent:get-desktop-features", (event) => {
     if (!isPinnedOriginSender(event)) {
       console.warn("[omnigent] get-desktop-features from untrusted sender dropped");
       return null;
     }
+    const enabled = canExtendArca(event);
     return {
-      databricksInternalFeatures:
-        databricksInternalFeaturesEnabled() && isDatabricksManagedServerUrl(senderServerUrl(event)),
+      databricksInternalFeatures: enabled,
+      canExtendArca: enabled,
+      canRefreshDbcert: enabled,
+      arcaPreviewRecovery: true,
+      // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
+      // v10 values); the SPA hides the toolbar button everywhere else.
+      chromeCookieImport: process.platform === "darwin",
     };
   });
 
@@ -4714,6 +4905,88 @@ function registerIpc() {
     return arcaConnectFlow.run(win, arcaServerUrl);
   });
 
+  let arcaExtendInFlight = false;
+  ipcMain.handle("omnigent:arca-extend", async (event, mode) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("arca-extend is only available to a connected server page");
+    }
+    if (!canExtendArca(event)) {
+      return { ok: false, error: "Arca support is not enabled for this server." };
+    }
+    if (!arca.ARCA_EXTEND_MODES.includes(mode)) {
+      return { ok: false, error: "Unsupported arca extend mode." };
+    }
+    if (arcaExtendInFlight) return { ok: false, error: "Arca extension is already in progress." };
+    arcaExtendInFlight = true;
+    try {
+      return await arca.runArcaExtend(mode);
+    } finally {
+      arcaExtendInFlight = false;
+    }
+  });
+
+  // SPA → renew this machine's dbcert from the expired-dbcert banner; Arca
+  // Companion then copies it to the user's boxes. Same gates as arca-extend.
+  // Clicks from several windows share one sign-in.
+  let dbcertPreflight = null;
+  let dbcertGeneration = 0;
+  let dbcertRefresh = null;
+  ipcMain.handle("omnigent:dbcert-refresh", async (event, options) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("dbcert-refresh is only available to a connected server page");
+    }
+    if (!canExtendArca(event)) {
+      return { ok: false, error: "dbcert refresh is not enabled for this server." };
+    }
+    if (!dbcertRefresh) {
+      const refresh = {
+        renewal: arca.runDbcertRefresh({ skipArcaSync: true }).then((result) => {
+          if (result.ok) {
+            dbcertGeneration += 1;
+            dbcertPreflight = null;
+          }
+          return result;
+        }),
+        sync: null,
+      };
+      refresh.renewal = refresh.renewal.finally(() => {
+        if (!refresh.sync && dbcertRefresh === refresh) dbcertRefresh = null;
+      });
+      dbcertRefresh = refresh;
+    }
+    const refresh = dbcertRefresh;
+    if (options?.skipArcaSync === true) return refresh.renewal;
+    refresh.sync ??= refresh.renewal
+      .then((result) => (result.ok ? arca.runDbcertArcaSync() : result))
+      .finally(() => {
+        if (dbcertRefresh === refresh) dbcertRefresh = null;
+      });
+    return refresh.sync;
+  });
+
+  const checkCurrentDbcert = () => {
+    if (!dbcertPreflight) {
+      const generation = dbcertGeneration;
+      const pending = arca
+        .checkDbcert()
+        .then((result) => (generation === dbcertGeneration ? result : checkCurrentDbcert()))
+        .finally(() => {
+          if (dbcertPreflight === pending) dbcertPreflight = null;
+        });
+      dbcertPreflight = pending;
+    }
+    return dbcertPreflight;
+  };
+  ipcMain.handle("omnigent:dbcert-check", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("dbcert-check is only available to a connected server page");
+    }
+    if (!canExtendArca(event)) {
+      return { ok: false, error: "dbcert checks are not enabled for this server." };
+    }
+    return checkCurrentDbcert();
+  });
+
   // Push a status ping when a host child connects or exits on its own (no
   // polling) — the server-management module owns the subprocess and reports
   // lifecycle changes here.
@@ -4725,33 +4998,79 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
+    getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
     getAgentContextForEvent: (event, sourceHostId) => ({
       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
     }),
-    getAgentNavigationHintForEvent: (event, url) => {
-      const win = BrowserWindow.fromWebContents(event.sender);
-      const target = windowArcaServerUrl(win);
-      if (
-        !databricksInternalFeaturesEnabled() ||
-        !isDatabricksManagedServerUrl(windows.get(win)?.serverUrl) ||
-        !isDatabricksManagedServerUrl(target) ||
-        arcaIdentities.get(target)
-      ) {
-        return null;
-      }
+    recoverAgentNavigationForEvent: async (
+      event,
+      url,
+      sourceHostId,
+      rememberedArcaHostId,
+      sourceIsArcaHost,
+    ) => {
+      const context = arcaPreviewRecoveryContextForEvent(
+        event,
+        url,
+        sourceHostId,
+        rememberedArcaHostId,
+        sourceIsArcaHost,
+      );
+      if (!context) return false;
+      const { target } = context;
+      if (arcaPreviewRecoveries.has(target)) return false;
+      const declinedUntil = arcaPreviewDeclinedUntil.get(target) ?? 0;
+      if (declinedUntil > Date.now()) return false;
+      arcaPreviewDeclinedUntil.delete(target);
       try {
-        const parsed = new URL(url);
-        if (
-          ["http:", "https:"].includes(parsed.protocol) &&
-          ["localhost", "127.0.0.1", "[::1]"].includes(parsed.hostname)
-        ) {
-          return "If this session runs on Arca, open New session > Host > Run on Arca, complete the connect flow, then return to this session and retry. Other hosts remain ineligible.";
+        if ((await refreshArcaBinary({ previewRecoveryRequested: true })) === null) return false;
+        if (context.win.isDestroyed()) return false;
+        if (!arcaAutoConnectFeatureEnabled() || !context.rememberedMatchesSource) {
+          startArcaPreviewConsentRecovery(context);
+          return false;
         }
-      } catch {
-        // Invalid URLs keep the policy's original error.
+        const current = arcaAutoConnect.getStatus(target);
+        const status =
+          current.state === "failed"
+            ? await arcaAutoConnect.retry(target)
+            : await arcaAutoConnect.ensure(target);
+        return status.state === "online" && arcaIdentities.get(target)?.hostId === sourceHostId;
+      } catch (error) {
+        console.warn(`[omnigent] Arca preview recovery failed: ${String(error)}`);
+        return false;
       }
-      return null;
+    },
+    getAgentNavigationHintForEvent: (
+      event,
+      url,
+      sourceHostId,
+      rememberedArcaHostId,
+      sourceIsArcaHost,
+    ) => {
+      const targetContext = arcaPreviewRecoveryTargetForEvent(event, url);
+      if (!targetContext) return null;
+      if (typeof rememberedArcaHostId !== "string") {
+        return "Open New session > Host > Run on Arca to restore its connection details, then retry the preview.";
+      }
+      const context = arcaPreviewRecoveryContextForEvent(
+        event,
+        url,
+        sourceHostId,
+        rememberedArcaHostId,
+        sourceIsArcaHost,
+      );
+      if (!context) {
+        return "This session's host can't be verified as Arca, so its localhost preview remains unavailable.";
+      }
+      const { target } = context;
+      if ((arcaPreviewDeclinedUntil.get(target) ?? 0) > Date.now()) {
+        return "Reconnect was declined. Wait a moment, then retry the preview to show the prompt again.";
+      }
+      if (arcaPreviewRecoveries.has(target)) {
+        return "Finish the Arca reconnect in Omnigent, then retry the preview.";
+      }
+      return "Omnigent couldn't restore the Arca connection details. Retry the preview to reconnect.";
     },
   });
 }
@@ -4919,10 +5238,10 @@ let deepLinkInFlight = false;
  */
 function enqueueDeepLink(raw) {
   if (!parseOmnigentDeepLink(raw)) {
-    console.log(`[omnigent] deep-link: ignored unrecognized URL ${String(raw)}`);
+    console.log("[omnigent] deep-link: ignored unrecognized URL");
     return;
   }
-  console.log(`[omnigent] deep-link: queued ${raw} (ready=${app.isReady()})`);
+  console.log(`[omnigent] deep-link: queued (ready=${app.isReady()})`);
   pendingDeepLinks.push(raw);
   drainPendingDeepLinks();
 }
@@ -5117,6 +5436,7 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    diagnostics.initialize(app);
     // App User Model ID so Windows attributes notifications/taskbar correctly.
     if (process.platform === "win32")
       app.setAppUserModelId(isDevBuild ? DEV_DOMAIN : "ai.omnigent.desktop");

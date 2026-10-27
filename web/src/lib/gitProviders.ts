@@ -39,6 +39,8 @@ export interface GitProviderCopy {
   signInWithoutCli?: boolean;
   /** Hint when the upstream repo can't be reached; `authHint` when absent. */
   repoUnresolvedHint?: string;
+  /** Shown in the Checks area when the signed-in token cannot read check runs. */
+  checksUnavailableHint?: string;
 }
 
 const GITHUB: GitProviderCopy = {
@@ -53,6 +55,8 @@ const GITHUB: GitProviderCopy = {
   cliLabel: "GitHub CLI",
   repoUnresolvedHint:
     "Pick the account to use, or run `gh auth status` on the host to confirm the GitHub CLI is signed in.",
+  checksUnavailableHint:
+    "Checks can’t be read with this GitHub token. Fine-grained personal access tokens can’t read check runs; use a classic token or a GitHub App.",
 };
 
 /** Shown while no provider is known: no payload yet, or none serves the workspace. */

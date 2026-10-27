@@ -121,6 +121,7 @@ def test_child_guardrail_policies_join_the_subagent_engine(
     names = [p.spec.name for p in engine.policies]
     assert "child_tool_limit" in names, f"child guardrail dropped; got {names}"
     assert "parent_tool_limit" in names, f"parent guardrail dropped; got {names}"
+    assert names.count("__ask_on_scheduled_task_change") == 1
 
 
 def test_top_level_session_does_not_pick_up_child_policies(

@@ -395,11 +395,11 @@ class QwenExecutor(Executor):
             if not sandbox.active:
                 return self._qwen_path
             # qwen is an npm CLI: it must read its own install + node_modules
-            # and write its config dir (~/.qwen) and /tmp, or it can't start
+            # and write its config dir (~/.qwen), or it can't start
             # inside the jail.
             qwen_dir = Path(self._qwen_path).resolve().parent.parent
             sandbox = with_additional_read_roots(sandbox, [qwen_dir])
-            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen", Path("/tmp")])
+            sandbox = with_additional_write_roots(sandbox, [Path.home() / ".qwen"])
             sandbox = with_spawn_env_allowlist(sandbox, spawn_env_names)
             return create_exec_launcher(self._qwen_path, sandbox)
         except (OSError, ImportError, NotImplementedError) as exc:
@@ -593,7 +593,7 @@ class QwenExecutor(Executor):
         await self._send(request)
         try:
             return await asyncio.wait_for(fut, timeout=timeout)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             self._pending.pop(req_id, None)
             raise
 
@@ -1480,7 +1480,7 @@ class QwenExecutor(Executor):
                 notification = await asyncio.wait_for(
                     self._queue.get(), timeout=min(remaining, 2.0)
                 )
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 continue
 
             method = notification.get("method", "")

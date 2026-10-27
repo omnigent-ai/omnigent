@@ -16,6 +16,12 @@ its base/head and tested contents still match, all required checks passed, and
 `uncovered_boundaries` is empty. Otherwise follow its blocked/partial verdict
 rules; do not approve or call the PR fully verified.
 
+Check the final test diff against the coverage selection in `test_audit` and the product
+checkout's `tests/_helpers/README.md` (or nearby fixtures if absent). Settle
+avoidable copied setup; use `test_audit` to explain a helper mismatch or distinct
+E2E boundary. Preserve necessary coverage and the original reproduction evidence;
+do not request a second test layer merely because the first is small.
+
 **Gate: the after-fix clip is present, or its absence is named — no silent skip.**
 Before you tag anyone, confirm the deliverable carries the before/after proof
 (2B.5 / 2A.3): the PR's **Demo** section shows the `after` clip (and the `before`

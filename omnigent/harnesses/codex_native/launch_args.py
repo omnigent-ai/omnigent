@@ -14,6 +14,8 @@ from urllib.parse import urlsplit, urlunsplit
 import tomlkit
 from tomlkit.exceptions import ParseError, TOMLKitError
 
+from omnigent.errors import ErrorCode, OmnigentError
+
 _CODEX_CONFIG_PATHS = (
     "agents.*.config_file",
     "experimental_compact_prompt_file",
@@ -111,6 +113,9 @@ _CODEX_VALUE_FLAGS = frozenset(
         "--local-provider",
         "--enable",
         "--disable",
+        # Names an env var holding the remote auth token; unlike the reserved
+        # ``--remote`` transport flag it takes a value and is caller-settable.
+        "--remote-auth-token-env",
     }
 )
 
@@ -125,16 +130,15 @@ _RESERVED_CODEX_TRANSPORT_TOKENS = frozenset(
 )
 
 
-def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
-    """Reject pass-through Codex args that select or attach the runner-owned transport.
+def reserved_codex_transport_arg(args: Sequence[str]) -> str | None:
+    """Return the first pass-through Codex arg that selects or attaches the runner-owned transport.
 
     Scoped to Codex (the runner owns ``app-server``/``--listen``/``--remote``);
     option *values* are never flagged (``--model app-server`` passes), and tokens
     after a ``--`` prompt separator are left alone.
 
     :param args: Caller pass-through Codex CLI args (``terminal_launch_args``).
-    :raises ValueError: when a reserved transport token appears as a standalone
-        flag or subcommand.
+    :returns: The reserved token, e.g. ``"app-server"``, or ``None``.
     """
     index = 0
     while index < len(args):
@@ -145,13 +149,35 @@ def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
             # Skip the option and its value (an attached ``=`` form carries its own).
             index += 1 if "=" in arg else 2
             continue
-        if arg in _RESERVED_CODEX_TRANSPORT_TOKENS:
-            raise ValueError(
-                f"terminal_launch_args may not contain the runner-owned Codex transport "
-                f"token {arg!r}: the runner starts the app-server and appends the TUI "
-                "attach itself"
-            )
+        token = arg.split("=", 1)[0]
+        if token in _RESERVED_CODEX_TRANSPORT_TOKENS:
+            return token
         index += 1
+    return None
+
+
+class CodexTransportArgsError(OmnigentError, ValueError):
+    """Saved launch arguments conflict with the transport Omnigent manages."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__(
+            f"terminal_launch_args may not contain the runner-owned Codex transport "
+            f"token {token!r}. Start a new Codex session without that argument; "
+            "Omnigent starts the app-server and attaches the terminal automatically.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
+
+
+def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
+    """Reject pass-through Codex args that select or attach the runner-owned transport.
+
+    :param args: Caller pass-through Codex CLI args (``terminal_launch_args``).
+    :raises ValueError: when :func:`reserved_codex_transport_arg` finds a
+        reserved token.
+    """
+    token = reserved_codex_transport_arg(args)
+    if token is not None:
+        raise CodexTransportArgsError(token)
 
 
 def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:
@@ -202,26 +228,7 @@ def codex_config_profile(args: Sequence[str]) -> str | None:
             profile = canonical[index + 1]
             if not re.fullmatch(r"[A-Za-z0-9_-]+", profile):
                 raise ValueError("Invalid Codex config profile name")
-        if arg in {
-            "-c",
-            "--config",
-            "-s",
-            "--sandbox",
-            "-a",
-            "--ask-for-approval",
-            "-p",
-            "--profile",
-            "--add-dir",
-            "-m",
-            "--model",
-            "-C",
-            "--cd",
-            "-i",
-            "--image",
-            "--local-provider",
-            "--enable",
-            "--disable",
-        }:
+        if arg in _CODEX_VALUE_FLAGS:
             index += 1
         index += 1
     return profile
@@ -236,6 +243,75 @@ def without_codex_config_profile(args: Sequence[str]) -> list[str]:
         if arg in {"--profile", "-p"} and canonical[index + 1] == profile:
             return [*canonical[:index], *canonical[index + 2 :]]
     return canonical
+
+
+def codex_workspace_roots(args: Sequence[str], cwd: Path) -> tuple[Path, list[str]]:
+    """Resolve the working directory and ``--add-dir`` roots Codex derives from *args*.
+
+    :param args: Codex CLI args, e.g. ``["--cd", "app", "--add-dir", "../shared"]``.
+    :param cwd: Directory the launch starts in.
+    :returns: The effective working directory and the absolute ``--add-dir`` roots.
+    :raises ValueError: When ``--add-dir``, ``--cd`` or ``-C`` has no directory.
+    """
+    canonical = canonical_codex_launch_args(args)
+    effective_cwd = cwd
+    roots: list[str] = []
+    index = 0
+    while index < len(canonical):
+        arg = canonical[index]
+        if arg == "--":
+            break
+        if arg in {"--add-dir", "--cd", "-C"}:
+            if index + 1 == len(canonical) or canonical[index + 1].startswith("-"):
+                raise ValueError(f"Codex requires a directory for {arg}")
+            if arg == "--add-dir":
+                roots.append(canonical[index + 1])
+            else:
+                effective_cwd = Path(absolute_codex_path(canonical[index + 1], effective_cwd))
+        if arg in _CODEX_VALUE_FLAGS:
+            index += 1
+        index += 1
+    return effective_cwd, [absolute_codex_path(root, effective_cwd) for root in roots]
+
+
+def without_codex_add_dirs(args: Sequence[str]) -> list[str]:
+    """Drop ``--add-dir`` options, which Codex refuses on a ``--remote`` TUI."""
+    canonical = canonical_codex_launch_args(args)
+    stripped: list[str] = []
+    index = 0
+    while index < len(canonical):
+        arg = canonical[index]
+        if arg == "--":
+            stripped.extend(canonical[index:])
+            break
+        if arg == "--add-dir":
+            index += 2
+            continue
+        stripped.append(arg)
+        if arg in _CODEX_VALUE_FLAGS and index + 1 < len(canonical):
+            index += 1
+            stripped.append(canonical[index])
+        index += 1
+    return stripped
+
+
+def without_codex_positional_prompt(args: Sequence[str]) -> list[str]:
+    """Drop the ``[PROMPT]`` positional and any ``--`` tail; options keep their values."""
+    canonical = canonical_codex_launch_args(args)
+    kept: list[str] = []
+    index = 0
+    while index < len(canonical):
+        arg = canonical[index]
+        if arg == "--":
+            break
+        if arg in _CODEX_VALUE_FLAGS:
+            kept.extend(canonical[index : index + 2])
+            index += 2
+            continue
+        if arg.startswith("-") and arg != "-":
+            kept.append(arg)
+        index += 1
+    return kept
 
 
 def _merge_tables(base: dict[str, Any], overlay: dict[str, Any]) -> None:

@@ -30,7 +30,8 @@ import contextlib
 import json
 import threading
 from types import SimpleNamespace
-from typing import Any
+from typing import Any, cast
+from unittest.mock import AsyncMock
 
 import httpx
 import pytest
@@ -43,6 +44,7 @@ from omnigent.server._elicitation_registry import (
     _harness_pre_resolved_elicitations,
     _PreResolvedHarnessElicitation,
 )
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.routes import sessions as sessions_route
 from tests.server.helpers import create_session_for_agent as _create_session
 from tests.server.helpers import create_test_agent, start_session_stream_collector
@@ -88,6 +90,7 @@ async def _post_approval(
     elicitation_id: str,
     action: str,
     content: dict[str, Any] | None = None,
+    meta: dict[str, Any] | None = None,
 ) -> httpx.Response:
     """
     Resolve a published elicitation through the session event API.
@@ -99,11 +102,15 @@ async def _post_approval(
     :param action: MCP ``ElicitResult.action`` literal,
         e.g. ``"accept"`` or ``"decline"``.
     :param content: Optional MCP ``ElicitResult.content`` payload.
+    :param meta: Optional MCP ``_meta`` payload, e.g. a persistence
+        choice ``{"persist": "always"}``.
     :returns: The HTTP response from the session event route.
     """
     data: dict[str, Any] = {"elicitation_id": elicitation_id, "action": action}
     if content is not None:
         data["content"] = content
+    if meta is not None:
+        data["_meta"] = meta
     return await client.post(
         f"/v1/sessions/{session_id}/events",
         json={
@@ -211,6 +218,9 @@ async def test_permission_request_hook_preserves_native_verdict(
     session_id = await _create_session(client, agent["id"])
     elicitation_id = f"elicit_{vendor}_" + "0" * 32
     payload = await _claude_permission_payload(tool_name)
+    payload["permission_suggestions"] = [
+        {"type": "addDirectories", "directories": ["/tmp/project"], "destination": "session"}
+    ]
     if supplies_id:
         payload["_omnigent_elicitation_id"] = elicitation_id
     if tool_name == "AskUserQuestion":
@@ -243,6 +253,7 @@ async def test_permission_request_hook_preserves_native_verdict(
         "allow_auto_mode",
         "allow_all_edits",
         "remember_scope",
+        "permission_directories",
         "ask_user_question",
         "exit_plan_mode",
     ):
@@ -252,7 +263,13 @@ async def test_permission_request_hook_preserves_native_verdict(
         session_id,
         elicitation_id,
         action,
-        {"allow_auto_mode": True, "allow_all_edits": True, "remember": True, "feedback": "Wait"},
+        {
+            "allow_auto_mode": True,
+            "allow_all_edits": True,
+            "remember": True,
+            "allow_directories": True,
+            "feedback": "Wait",
+        },
     )
     assert verdict.status_code == 202, verdict.text
     resp = await hook_task
@@ -583,6 +600,7 @@ async def test_top_level_elicitations_route_is_not_mounted(
 
 async def test_permission_request_hook_deny_round_trip(
     client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     """
     UI declines Claude's permission request → endpoint returns
@@ -606,13 +624,166 @@ async def test_permission_request_hook_deny_round_trip(
     )
 
     event = await drain_task
-    verdict = await _post_approval(client, session_id, event["elicitation_id"], "decline")
+    from omnigent.runner import create_runner_app
+    from tests.runner.conftest import _FakeProcessManager, _ScriptedHarnessClient
+    from tests.runner.helpers import NullServerClient
+
+    harness = _ScriptedHarnessClient([])
+    runner = create_runner_app(
+        process_manager=cast(Any, _FakeProcessManager(harness)),
+        server_client=cast(Any, NullServerClient()),
+    )
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=runner), base_url="http://runner"
+    ) as runner_client:
+        monkeypatch.setattr(
+            sessions_route, "_get_runner_client", AsyncMock(return_value=runner_client)
+        )
+        verdict = await _post_approval(client, session_id, event["elicitation_id"], "decline")
+    assert [item["type"] for item in harness.patched_events] == ["interrupt", "approval"]
     assert verdict.status_code == 202, verdict.text
 
     resp = await hook_task
     assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body["hookSpecificOutput"]["decision"]["behavior"] == "deny"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "permission_mode", "standalone"),
+    [
+        ("Edit", "auto", False),
+        ("Edit", "acceptEdits", False),
+        ("Write", "default", True),
+        ("Bash", "default", False),
+    ],
+)
+async def test_permission_request_hook_directory_grant_round_trip(
+    client: httpx.AsyncClient, tool_name: str, permission_mode: str, standalone: bool
+) -> None:
+    """Offer both symlink spellings and grant only that scope without changing modes."""
+    agent = await create_test_agent(client, "test-permission-directories")
+    session_id = await _create_session(client, agent["id"])
+    directories = ["/home/test/worktrees/branch", "/mnt/worktrees/branch"]
+    update = {"type": "addDirectories", "directories": directories, "destination": "session"}
+    payload = await _claude_permission_payload(tool_name)
+    payload.update(
+        permission_mode=permission_mode,
+        agent_id="native-child",
+        tool_input=(
+            {"command": f"cd {directories[0]} && pwd"}
+            if tool_name == "Bash"
+            else {"file_path": directories[0] + "/fixture.txt"}
+        ),
+        permission_suggestions=[
+            {"type": "setMode", "mode": "acceptEdits", "destination": "session"},
+            update,
+        ],
+    )
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert event["params"]["permission_directories"] == directories
+    assert not {"allow_auto_mode", "allow_all_edits", "remember_scope"} & event["params"].keys()
+    elicitation_url = f"/v1/sessions/{session_id}/elicitations/{event['elicitation_id']}"
+    pending = await client.get(elicitation_url)
+    assert pending.status_code == 200, pending.text
+    assert pending.json()["permission_directories"] == directories
+    content = {
+        "allow_directories": True,
+        "permission_directories": ["/"],
+        "directories": ["/"],
+        "allow_auto_mode": True,
+        "allow_all_edits": True,
+        "remember": True,
+    }
+    if standalone:
+        verdict = await client.post(
+            elicitation_url + "/resolve", json={"action": "accept", "content": content}
+        )
+    else:
+        verdict = await _post_approval(
+            client, session_id, event["elicitation_id"], "accept", content
+        )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow",
+        "updatedPermissions": [update],
+    }
+
+
+@pytest.mark.parametrize(
+    ("action", "content"),
+    [
+        ("accept", None),
+        ("accept", {"allow_auto_mode": True, "allow_all_edits": True, "remember": True}),
+        ("accept", {"allow_directories": "true"}),
+        ("accept", {"allow_directories": 1}),
+        ("decline", {"allow_directories": True}),
+    ],
+)
+async def test_permission_request_hook_directory_grant_requires_explicit_accept(
+    client: httpx.AsyncClient, action: str, content: dict[str, Any] | None
+) -> None:
+    """Neither a one-shot verdict nor other approval controls install directory grants."""
+    agent = await create_test_agent(client, "test-permission-directories-explicit")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("Edit")
+    payload["permission_suggestions"] = [
+        {"type": "addDirectories", "directories": ["/mnt/project"], "destination": "session"}
+    ]
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    verdict = await _post_approval(client, session_id, event["elicitation_id"], action, content)
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"] == {
+        "behavior": "allow" if action == "accept" else "deny"
+    }
+
+
+@pytest.mark.parametrize("read_suggestion", [False, True])
+async def test_permission_request_hook_directory_grant_cannot_be_forged(
+    client: httpx.AsyncClient, read_suggestion: bool
+) -> None:
+    """A read rule or absent suggestions cannot become a directory grant from client input."""
+    agent = await create_test_agent(client, "test-permission-directories-forged")
+    session_id = await _create_session(client, agent["id"])
+    payload = await _claude_permission_payload("Read" if read_suggestion else "Edit")
+    if read_suggestion:
+        payload["permission_suggestions"] = [
+            {
+                "type": "addRules",
+                "rules": [{"toolName": "Read", "ruleContent": "/mnt/project/**"}],
+                "behavior": "allow",
+                "destination": "session",
+            }
+        ]
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/permission-request", json=payload)
+    )
+    event = await drain_task
+    assert "permission_directories" not in event["params"]
+    verdict = await _post_approval(
+        client,
+        session_id,
+        event["elicitation_id"],
+        "accept",
+        {"allow_directories": True, "permission_directories": ["/"]},
+    )
+    assert verdict.status_code == 202, verdict.text
+    response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json()["hookSpecificOutput"]["decision"] == {"behavior": "allow"}
 
 
 @pytest.mark.parametrize(
@@ -3324,7 +3495,7 @@ async def _subscribe_into(
         async with asyncio.timeout(timeout_s):
             async for event in session_stream.subscribe(session_id):
                 sink.append(event)
-    except asyncio.TimeoutError:
+    except TimeoutError:
         return
 
 
@@ -3911,30 +4082,19 @@ _CODEX_REPARK_PAYLOAD: dict[str, Any] = {
 }
 
 
-async def test_codex_hook_repark_after_disconnect_keeps_card_pending(
+@pytest.mark.parametrize("harness", ["codex", "pi"])
+async def test_harness_hook_repark_after_disconnect_keeps_card_pending(
     client: httpx.AsyncClient,
     monkeypatch: pytest.MonkeyPatch,
+    harness: str,
 ) -> None:
-    """
-    A re-POSTed codex envelope re-parks the SAME elicitation after a cut.
-
-    Codex ids are deterministic per (session, method, rpc id), so the
-    forwarder's retry needs no payload changes — this pins the server
-    half of that contract: the deferred clear no-ops on the re-park,
-    the card stays pending, and the verdict resolves the retried poll
-    in Codex's JSON-RPC result shape.
-    """
+    """A reconnect keeps one pending card and returns the hook-specific verdict."""
     from omnigent.runtime import pending_elicitations
 
     disconnect_calls = 0
 
     async def _disconnect_first_call_only(_request: Any) -> None:
-        """
-        Sever the first hook long-poll; park every later one.
-
-        :param _request: Ignored FastAPI request.
-        :returns: None when simulating the first call's disconnect.
-        """
+        """Sever the first poll; keep later requests connected."""
         nonlocal disconnect_calls
         disconnect_calls += 1
         if disconnect_calls == 1:
@@ -3954,43 +4114,48 @@ async def test_codex_hook_repark_after_disconnect_keeps_card_pending(
         1.0,
     )
     pending_elicitations.reset_for_tests()
-    agent = await create_test_agent(client, "test-codex-repark")
+    agent = await create_test_agent(client, "test-harness-repark")
     session_id = await _create_session(client, agent["id"])
 
+    hook = "codex-elicitation-request" if harness == "codex" else "pi-extension-ui"
+    payload = (
+        _CODEX_REPARK_PAYLOAD
+        if harness == "codex"
+        else {
+            "elicitation_id": "elicit_pi_aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "request": {"method": "confirm", "title": "Continue?"},
+        }
+    )
     first = await client.post(
-        f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
-        json=_CODEX_REPARK_PAYLOAD,
+        f"/v1/sessions/{session_id}/hooks/{hook}",
+        json=payload,
     )
     assert first.status_code == 200, first.text
-    assert first.content == b"", f"severed poll should fail-ask, got {first.content!r}"
+    if harness == "codex":
+        assert first.content == b"", f"severed poll should fail-ask, got {first.content!r}"
+    else:
+        assert first.json() == {"type": "extension_ui_response", "id": "", "confirmed": False}
     deferred_tasks = set(sessions_route._deferred_elicitation_clear_tasks)
-    assert len(deferred_tasks) == 1, (
-        f"expected one deferred clear after the severed poll, got "
-        f"{len(deferred_tasks)} — disconnect regressed to immediate wipe, or leaked tasks."
-    )
+    assert len(deferred_tasks) == 1
 
     drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
     await asyncio.sleep(0.05)
     hook_task = asyncio.create_task(
         client.post(
-            f"/v1/sessions/{session_id}/hooks/codex-elicitation-request",
-            json=_CODEX_REPARK_PAYLOAD,
+            f"/v1/sessions/{session_id}/hooks/{hook}",
+            json=payload,
         )
     )
     event = await drain_task
-    # Same envelope → same deterministic id → the SAME elicitation
-    # re-parks instead of minting a second card.
-    assert event["params"]["codex_request_id"] == 12
+    if harness == "codex":
+        assert event["params"]["codex_request_id"] == 12
+    else:
+        assert event["elicitation_id"] == payload["elicitation_id"]
 
     # Run the deferred clear to completion: it must see the re-park and no-op.
     for task in deferred_tasks:
         await asyncio.wait_for(task, timeout=5.0)
-    # 1 = the card survived the severed long-poll. 0 = the deferred
-    # clear ignored the re-park and wiped the live prompt.
-    assert pending_elicitations.count_for(session_id) == 1, (
-        f"re-parked codex elicitation should stay pending, got "
-        f"{pending_elicitations.count_for(session_id)!r}"
-    )
+    assert pending_elicitations.count_for(session_id) == 1
 
     verdict = await _post_approval(
         client,
@@ -4002,9 +4167,11 @@ async def test_codex_hook_repark_after_disconnect_keeps_card_pending(
     assert verdict.status_code == 202, verdict.text
     resp = await hook_task
     assert resp.status_code == 200, resp.text
-    # The retried poll carries the verdict in Codex's result shape —
-    # exactly what the forwarder relays back over JSON-RPC.
-    assert resp.json() == {"action": "accept", "content": {"ok": "yes"}, "_meta": None}
+    assert resp.json() == (
+        {"action": "accept", "content": {"ok": "yes"}, "_meta": None}
+        if harness == "codex"
+        else {"type": "extension_ui_response", "id": "", "confirmed": True}
+    )
     pending_elicitations.reset_for_tests()
 
 
@@ -4154,6 +4321,60 @@ async def test_antigravity_elicitation_hook_accept_round_trip(
     }
 
 
+async def test_antigravity_elicitation_hook_accept_persist_round_trip(
+    client: httpx.AsyncClient,
+) -> None:
+    """
+    Antigravity elicitation hook: an always-allow accept keeps ``_meta.persist``.
+
+    When a web approver picks one of agy's always-allow entries, the verdict
+    carries ``_meta.persist``. The hook must return that metadata verbatim so
+    the bridge types agy's persist menu entry rather than a one-time approve.
+
+    :param client: Test HTTP client.
+    :returns: None.
+    """
+    agent = await create_test_agent(client, "test-agy-elicit-persist")
+    session_id = await _create_session(client, agent["id"])
+    elicitation_id = "elicit_agy_00000000000000000000000000000003"
+    params_body = {
+        "mode": "form",
+        "message": "Antigravity wants to run a command",
+        "phase": "agy_permission",
+        "policy_name": "agy_native_permission",
+    }
+
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(
+            f"/v1/sessions/{session_id}/hooks/antigravity-elicitation-request",
+            json={"elicitation_id": elicitation_id, "params": params_body},
+        )
+    )
+
+    event = await drain_task
+    assert event["elicitation_id"] == elicitation_id
+    assert event["params"]["phase"] == "agy_permission"
+
+    verdict = await _post_approval(
+        client,
+        session_id,
+        elicitation_id,
+        "accept",
+        meta={"persist": "always"},
+    )
+    assert verdict.status_code == 202, verdict.text
+
+    resp = await hook_task
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {
+        "action": "accept",
+        "content": None,
+        "_meta": {"persist": "always"},
+    }
+
+
 async def test_antigravity_elicitation_hook_decline_round_trip(
     client: httpx.AsyncClient,
 ) -> None:
@@ -4294,3 +4515,141 @@ async def test_antigravity_elicitation_hook_rejects_non_dict_body(
         json=["not", "a", "dict"],
     )
     assert resp.status_code == 400, resp.text
+
+
+@pytest.mark.parametrize(
+    "method, action, content, expected",
+    [
+        ("confirm", "accept", None, {"confirmed": True}),
+        ("confirm", "decline", None, {"confirmed": False}),
+        ("select", "accept", {"0": "Allow"}, {"value": "Allow"}),
+        ("input", None, None, {"cancelled": True}),
+    ],
+)
+async def test_pi_extension_ui_hook_round_trip(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    method: str,
+    action: str | None,
+    content: dict | None,
+    expected: dict,
+) -> None:
+    forwarded = AsyncMock()
+    if action is None:
+        monkeypatch.setattr(sessions_route, "_PI_EXTENSION_UI_HOOK_TIMEOUT_S", 2.0)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_hooks._forward_session_change_to_runner",
+        forwarded,
+    )
+    agent = await create_test_agent(client, "test-pi-extension-ui")
+    session_id = await _create_session(client, agent["id"])
+    payload = {
+        "elicitation_id": "elicit_pi_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "request": {
+            "id": "dialog",
+            "timeout": 50 if action is None else 10000,
+            "method": method,
+            "title": "Continue?",
+            "options": ["Allow", "Block"],
+        },
+    }
+    drain_task = asyncio.create_task(_drain_until_elicitation(session_id))
+    await asyncio.sleep(0.05)
+    hook_task = asyncio.create_task(
+        client.post(f"/v1/sessions/{session_id}/hooks/pi-extension-ui", json=payload)
+    )
+    event = await drain_task
+    assert event["elicitation_id"] == payload["elicitation_id"]
+    assert event["params"]["phase"] == "pi_extension_ui"
+    if action is not None:
+        verdict = await _post_approval(
+            client, session_id, event["elicitation_id"], action, content
+        )
+        assert verdict.status_code == 202, verdict.text
+    async with asyncio.timeout(1.0):
+        response = await hook_task
+    assert response.status_code == 200, response.text
+    assert response.json() == {"type": "extension_ui_response", "id": "dialog", **expected}
+    forwarded.assert_not_awaited()
+
+
+@pytest.mark.parametrize("level", [LEVEL_READ, LEVEL_EDIT])
+async def test_pi_extension_ui_hook_requires_edit_access(
+    auth_client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, level: int
+) -> None:
+    from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
+    from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+
+    session = SqlAlchemyConversationStore(db_uri).create_conversation()
+    permissions = SqlAlchemyPermissionStore(db_uri)
+    user = "collaborator@example.test"
+    permissions.ensure_user(user)
+    permissions.grant(user, session.id, level)
+    publish = AsyncMock(return_value=None)
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.routes_hooks._publish_and_wait_for_harness_elicitation",
+        publish,
+    )
+    response = await auth_client.post(
+        f"/v1/sessions/{session.id}/hooks/pi-extension-ui",
+        headers={"X-Forwarded-Email": user},
+        json={
+            "elicitation_id": "elicit_pi_cccccccccccccccccccccccccccccccc",
+            "request": {"method": "confirm", "timeout": 10**12},
+        },
+    )
+    assert response.status_code == (403 if level == LEVEL_READ else 200), response.text
+    if level == LEVEL_READ:
+        publish.assert_not_awaited()
+    else:
+        publish.assert_awaited_once()
+        assert (
+            publish.call_args.kwargs["timeout_s"] == sessions_route._PI_EXTENSION_UI_HOOK_TIMEOUT_S
+        )
+
+
+async def test_pi_extension_ui_hook_malformed_body_400(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Missing elicitation_id / request / unknown method are 400s."""
+    agent = await create_test_agent(client, "test-pi-extension-ui-400")
+    session_id = await _create_session(client, agent["id"])
+    url = f"/v1/sessions/{session_id}/hooks/pi-extension-ui"
+
+    monkeypatch.setattr(sessions_route, "_PI_EXTENSION_UI_HOOK_TIMEOUT_S", 0.01)
+    missing_id = await client.post(url, json={"request": {"method": "confirm", "title": "x"}})
+    assert missing_id.status_code == 400, missing_id.text
+
+    missing_request = await client.post(
+        url, json={"elicitation_id": "elicit_pi_dddddddddddddddddddddddddddddddd"}
+    )
+    assert missing_request.status_code == 400, missing_request.text
+
+    unknown = await client.post(
+        url,
+        json={
+            "elicitation_id": "elicit_pi_dddddddddddddddddddddddddddddddd",
+            "request": {"method": "notify", "message": "hi"},
+        },
+    )
+    assert unknown.status_code == 400, unknown.text
+
+    for elicitation_id in [
+        "elicit_pi_",
+        "elicit_pi_x",
+        "elicit_pi_" + "g" * 32,
+        "elicit_pi_" + "a" * 4096,
+        "elicit_codex_" + "a" * 32,
+        "elicit_pi_" + "e" * 32,
+    ]:
+        if elicitation_id == "elicit_pi_" + "e" * 32:
+            monkeypatch.setitem(
+                sessions_route._harness_elicitation_owners, elicitation_id, "another_session"
+            )
+        response = await client.post(
+            url, json={"elicitation_id": elicitation_id, "request": {"method": "confirm"}}
+        )
+        assert response.status_code == 400, response.text
+        if elicitation_id == "elicit_pi_" + "e" * 32:
+            assert sessions_route._harness_elicitation_owners[elicitation_id] == "another_session"

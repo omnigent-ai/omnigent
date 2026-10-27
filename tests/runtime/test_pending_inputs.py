@@ -90,6 +90,96 @@ def test_delivery_identity_and_original_enqueue_time_survive_retry_and_restore(
     assert redrained is not None and redrained.interrupted is interrupted
 
 
+def test_completed_lifecycle_classifies_a_later_skip_by_stable_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    now = 100.0
+    monkeypatch.setattr(
+        pending_inputs, "time", SimpleNamespace(time=lambda: now, monotonic=lambda: now)
+    )
+    first = pending_inputs.record("conv", [_text_block("first")], stable_id="a" * 32)
+    pending_inputs.mark_lifecycle(
+        "conv",
+        "a" * 32,
+        stage="native_turn_completed",
+        reason_code="response_completed",
+        lifecycle_response_id="resp_first",
+    )
+    pending_inputs.mark_delivery_stage("conv", first, "forward_accepted")
+    now = 105.0
+    pending_inputs.record("conv", [_text_block("second")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "second")
+    [skipped] = match.skipped
+    classified = pending_inputs.classify_missing_native_record(skipped)
+
+    assert classified.pending_id == first
+    assert pending_inputs.delivery_attributes(classified) == {
+        "input_stable_id": "a" * 32,
+        "pending_id": first,
+        "delivery_attempt_id": skipped.delivery_attempt_id,
+        "input_enqueued_at_ms": skipped.input_enqueued_at_ms,
+        "last_delivery_stage": "native_turn_completed",
+        "pending_age_ms": 5000,
+        "cause_class": "accepted_missing_native_record",
+        "reason_code": "completed_without_native_record",
+        "lifecycle_response_id": "resp_first",
+    }
+
+
+def test_cancelled_lifecycle_is_drained_as_interrupted_not_missing() -> None:
+    first = pending_inputs.record("conv", [_text_block("first")], stable_id="a" * 32)
+    assert (
+        pending_inputs.mark_lifecycle(
+            "conv",
+            "a" * 32,
+            stage="native_turn_cancelled",
+            cause_class="interrupted_or_lifecycle",
+            reason_code="response_cancelled",
+        )
+        == first
+    )
+    pending_inputs.mark_interrupted("conv", [first])
+    pending_inputs.record("conv", [_text_block("second")], stable_id="b" * 32)
+
+    match = pending_inputs.resolve_matching_text("conv", "second")
+
+    assert match.skipped == []
+    [interrupted] = match.uncertain
+    assert interrupted.pending_id == first
+    assert interrupted.cause_class == "interrupted_or_lifecycle"
+    assert interrupted.reason_code == "response_cancelled"
+
+
+@pytest.mark.parametrize("mismatch", [None, "session", "pending", "attempt", "stable", "missing"])
+def test_lifecycle_without_client_id_requires_its_exact_delivery_attempt(
+    mismatch: str | None,
+) -> None:
+    first = pending_inputs.record("conv", [_text_block("first")])
+    second = pending_inputs.record("conv", [_text_block("second")])
+    identity = pending_inputs.delivery_attributes_for("conv", first)
+    attempt = str(identity["delivery_attempt_id"])
+
+    matched = pending_inputs.mark_lifecycle(
+        "other" if mismatch == "session" else "conv",
+        "a" * 32 if mismatch == "stable" else None,
+        pending_id=second if mismatch == "pending" else first,
+        delivery_attempt_id=(
+            "b" * 32 if mismatch == "attempt" else None if mismatch == "missing" else attempt
+        ),
+        stage="native_turn_completed",
+    )
+
+    assert matched == (first if mismatch is None else None)
+    assert pending_inputs.delivery_attributes_for("conv", first)["last_delivery_stage"] == (
+        "native_turn_completed" if mismatch is None else "server_queued"
+    )
+    assert (
+        pending_inputs.delivery_attributes_for("conv", second)["last_delivery_stage"]
+        == "server_queued"
+    )
+
+
 @pytest.fixture(autouse=True)
 def _clean_pending_inputs_index() -> Iterator[None]:
     """

@@ -79,7 +79,6 @@ describe(
       const home = path.join(tmpDir, "home");
       fs.mkdirSync(home, { recursive: true });
       const userDataDir = path.join(tmpDir, "user-data");
-      const host = new URL(server.serverUrl).host;
       const windowUrls = [];
       const saved = [];
 
@@ -141,13 +140,12 @@ describe(
         assert.deepEqual(await browserOpens(app.electronApp), []);
         assert.equal(idp.authorizeRequests.length, 1);
 
-        // 4. Sign out from the app: the connect screen says so, and it sticks.
+        // 4. Sign out from the app: return to a clean connect screen and stay signed out.
         await app.window.evaluate(() => {
           window.location.href = "/auth/logout";
         });
-        const message = app.window.locator("#err");
-        await message.waitFor({ state: "visible", timeout: 15_000 });
-        assert.equal(await message.textContent(), `You're signed out of ${host}.`);
+        await app.window.locator("#connect").waitFor({ state: "visible", timeout: 15_000 });
+        assert.equal(await app.window.locator("#err").textContent(), "");
         assert.equal(await sessionCookie(app.electronApp, server.serverUrl), null);
         const tokens = JSON.parse(
           fs.readFileSync(path.join(home, ".omnigent", "oidc_tokens.json"), "utf8"),

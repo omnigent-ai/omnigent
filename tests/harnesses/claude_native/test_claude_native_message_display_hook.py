@@ -326,3 +326,24 @@ def test_hook_entrypoints_stay_import_light(module: str, allowed: frozenset[str]
     """
     loaded = _heavy_imports_after(f"import {module}")
     assert set(loaded) <= allowed, f"{module} newly imports {sorted(set(loaded) - allowed)}"
+
+
+def test_policy_hook_skips_the_httpx_command_line_client() -> None:
+    """
+    The ``evaluate-policy`` path loads httpx but not its command-line client.
+
+    Claude Code waits on this hook twice per tool call, and httpx's CLI pulls
+    in click, pygments and rich, none of which the hook runs.
+    """
+    statements = "\n".join(
+        (
+            "import io",
+            "from omnigent.harnesses.claude_native import hook",
+            "sys.stdin = io.StringIO('{}')",
+            "assert hook.main(['evaluate-policy', '--bridge-dir', '/nonexistent/bridge']) == 0",
+            "assert 'httpx' in sys.modules",
+            "cli = sorted({'click', 'pygments', 'rich'} & set(sys.modules))",
+            "assert not cli, cli",
+        )
+    )
+    _heavy_imports_after(statements)  # the child's asserts are the test

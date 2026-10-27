@@ -32,6 +32,7 @@ from omnigent.inner.executor import (
     ExecutorConfig,
     ExecutorError,
     ExecutorEvent,
+    InjectionDeliveryAmbiguous,
     Message,
     ReasoningChunk,
     SubAgentCompleted,
@@ -52,10 +53,12 @@ from omnigent.native.input_diagnostics import (
 )
 from omnigent.policies.types import FAIL_CLOSED_PHASES
 from omnigent.runtime.harnesses._scaffold import HarnessApp, PolicyVerdictPayload, TurnContext
+from omnigent.runtime.prompt import dedupe_tool_output_images
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.server.schemas import (
     CreateResponseRequest,
     ElicitationRequestParams,
+    ElicitationResult,
     InjectionConsumedEvent,
     OutputItemDoneEvent,
     OutputTextDeltaEvent,
@@ -239,7 +242,9 @@ class ExecutorAdapter(HarnessApp):
         instance. Installs stable tool/elicitation/policy bridges once on first use.
         """
         executor = self._ensure_executor()
-        messages = _translate_input_to_messages(request.input)
+        messages = _translate_input_to_messages(
+            request.input, include_tool_history=executor.replays_tool_history()
+        )
         # Stamp session_key on every message so the inner executor keys its client consistently,
         # matching the key used by enqueue_session_message (steering delivery depends on this).
         for message in messages:
@@ -269,6 +274,15 @@ class ExecutorAdapter(HarnessApp):
         ):
             executor._elicitation_choice_handler = (  # type: ignore[attr-defined]
                 self._stable_elicitation_choice_handler
+            )
+        # PiExecutor parks ``ctx.ui`` dialogs as form elicitations. Decline must
+        # not abort the turn (unlike the binary permission card).
+        if (
+            hasattr(executor, "_form_elicitation_handler")
+            and executor._form_elicitation_handler is None  # type: ignore[attr-defined]
+        ):
+            executor._form_elicitation_handler = (  # type: ignore[attr-defined]
+                self._stable_form_elicitation_handler
             )
         if getattr(executor, "_policy_evaluator", None) is None:
             executor._policy_evaluator = self._stable_policy_evaluator  # type: ignore[attr-defined]
@@ -724,6 +738,10 @@ class ExecutorAdapter(HarnessApp):
                     )
                     try:
                         accepted = await executor.enqueue_session_message(self._session_key, text)
+                        outcome = "executor_accepted" if accepted else "executor_refused"
+                    except InjectionDeliveryAmbiguous:
+                        # The harness may already hold the message; resending could duplicate it.
+                        accepted, outcome = True, "executor_ambiguous"
                     except BaseException as exc:
                         log_input_event(
                             _logger,
@@ -739,7 +757,7 @@ class ExecutorAdapter(HarnessApp):
                         _logger,
                         "native_input_steering_finished",
                         session_id=ctx.session_id,
-                        outcome="executor_accepted" if accepted else "executor_refused",
+                        outcome=outcome,
                     )
             except Exception:
                 _logger.exception(
@@ -919,6 +937,21 @@ class ExecutorAdapter(HarnessApp):
             return None
         answer = (result.content or {}).get("answer")
         return answer if isinstance(answer, str) else None
+
+    async def _stable_form_elicitation_handler(
+        self,
+        elicitation_id: str,
+        params: ElicitationRequestParams,
+    ) -> ElicitationResult:
+        """Forward a form without treating a decline as turn cancellation."""
+        ctx = self._current_ctx
+        if ctx is None:
+            _logger.error(
+                "form elicitation callback fired with no active turn context; cancelling"
+            )
+            return ElicitationResult(action="cancel")
+
+        return await ctx.elicit(elicitation_id, params)
 
     async def _stable_policy_evaluator(
         self,
@@ -1171,7 +1204,10 @@ class ExecutorAdapter(HarnessApp):
         """
         from omnigent.errors import OmnigentError
         from omnigent.inner.model_auth import ProviderAuthRequired
-        from omnigent.runner.launch_failure import diagnose_client_update_required
+        from omnigent.runner.launch_failure import (
+            diagnose_client_update_required,
+            diagnose_model_unavailable,
+        )
         from omnigent.server.schemas import ErrorDetail
 
         if isinstance(exception, ProviderAuthRequired):
@@ -1213,6 +1249,12 @@ class ExecutorAdapter(HarnessApp):
                 cause=diagnosis.cause,
                 remediation=diagnosis.remediation,
             )
+
+        # Preserve the failure metadata; add only the recovery guidance.
+        model_diagnosis = diagnose_model_unavailable(message)
+        if model_diagnosis is not None:
+            detail = super()._build_error_detail(exception)
+            return detail.model_copy(update={"remediation": model_diagnosis.remediation})
 
         return super()._build_error_detail(exception)
 
@@ -1449,16 +1491,21 @@ def _extract_user_text(
 
 def _translate_input_to_messages(
     input_value: str | list[dict[str, Any]],
+    *,
+    include_tool_history: bool = False,
 ) -> list[Message]:
     """Convert a CreateResponseRequest input to inner Message list.
 
-    Accepts conversation-history shape (role-keyed messages; tool items dropped) and
-    single-turn fallback shape (plain string or content blocks, collapsed to one user message).
+    Accepts conversation-history shape (role-keyed messages, plus tool history when
+    *include_tool_history*) and single-turn fallback shape (plain string or content
+    blocks, collapsed to one user message).
     """
     if isinstance(input_value, str):
         return [{"role": "user", "content": input_value}]
 
-    history_messages = _extract_role_keyed_messages(input_value)
+    history_messages = _extract_role_keyed_messages(
+        input_value, include_tool_history=include_tool_history
+    )
     if history_messages:
         return history_messages
 
@@ -1468,17 +1515,37 @@ def _translate_input_to_messages(
 
 def _extract_role_keyed_messages(
     input_value: list[dict[str, Any]],
+    *,
+    include_tool_history: bool,
 ) -> list[Message]:
-    """Extract role-keyed message items from an Omnigent input list.
+    """Extract role-keyed messages from an Omnigent input list.
 
-    Tool-call items (function_call, function_call_output, etc.) are skipped — the inner SDK
-    reconstructs its own tool state. Returns an empty list for non-history inputs.
+    With *include_tool_history*, ``function_call`` / ``function_call_output`` items
+    become ``tool_call`` / ``tool_result`` messages for an executor that replays them
+    into a fresh inner session (a fork or restart). Returns an empty list for
+    non-history inputs.
     """
     messages: list[Message] = []
+    seen_call_ids: set[str] = set()
     for item in input_value:
         if not isinstance(item, dict):
             continue
-        if item.get("type") != "message" or "role" not in item:
+        item_type = item.get("type")
+        if include_tool_history and item_type == "function_call":
+            # Live history repeats a call once per status update; keep the first.
+            call_id = item.get("call_id")
+            if isinstance(call_id, str) and call_id in seen_call_ids:
+                continue
+            tool_call = _tool_call_message(item)
+            if tool_call is not None:
+                messages.append(tool_call)
+                if isinstance(call_id, str):
+                    seen_call_ids.add(call_id)
+            continue
+        if include_tool_history and item_type == "function_call_output":
+            messages.append(_tool_result_message(item))
+            continue
+        if item_type != "message" or "role" not in item:
             continue
         role = item["role"]
         content = _normalize_message_content(item.get("content"))
@@ -1486,6 +1553,50 @@ def _extract_role_keyed_messages(
             continue
         messages.append({"role": role, "content": content})
     return messages
+
+
+# Per-output budget for replayed tool history: a fresh session gets the gist of
+# each result without one large read crowding out the conversation.
+_REPLAYED_TOOL_OUTPUT_MAX_BYTES = 16 * 1024
+
+
+def _tool_call_message(item: dict[str, Any]) -> Message | None:
+    """Translate a ``function_call`` input item into a ``tool_call`` history message.
+
+    Returns ``None`` when the item carries no tool name (nothing replayable).
+    """
+    name = item.get("name")
+    if not isinstance(name, str) or not name:
+        return None
+    args: Any = item.get("arguments")
+    if isinstance(args, str):
+        with contextlib.suppress(TypeError, json.JSONDecodeError):
+            args = json.loads(args)
+    if not isinstance(args, dict):
+        args = {}
+    message: Message = {"role": "tool_call", "content": {"tool": name, "args": args}}
+    call_id = item.get("call_id")
+    if isinstance(call_id, str) and call_id:
+        message["metadata"] = {"call_id": call_id}
+    return message
+
+
+def _tool_result_message(item: dict[str, Any]) -> Message:
+    """Translate a ``function_call_output`` input item into a ``tool_result`` message.
+
+    The output is image-stripped and capped: a fresh session replays every one.
+    """
+    output = item.get("output")
+    if not isinstance(output, str):
+        output = "" if output is None else json.dumps(output)
+    output = cap_tool_output(
+        dedupe_tool_output_images(output), max_bytes=_REPLAYED_TOOL_OUTPUT_MAX_BYTES
+    )
+    message: Message = {"role": "tool_result", "content": output}
+    call_id = item.get("call_id")
+    if isinstance(call_id, str) and call_id:
+        message["metadata"] = {"call_id": call_id}
+    return message
 
 
 _MULTIMODAL_BLOCK_TYPES: frozenset[str] = frozenset({"input_image", "input_file", "input_audio"})

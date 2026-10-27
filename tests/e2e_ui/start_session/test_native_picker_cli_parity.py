@@ -28,7 +28,6 @@ import copy
 import json
 import os
 import shutil
-import socket
 import subprocess
 import sys
 import time
@@ -40,6 +39,8 @@ import httpx
 import pytest
 from playwright.sync_api import Error as PlaywrightError
 from playwright.sync_api import Page, expect
+
+from tests._helpers.live_server import find_free_port
 
 _REPO_ROOT = Path(__file__).resolve().parents[3]
 
@@ -172,12 +173,6 @@ if "-p" in ARGS:
 print("stub claude: unsupported invocation: " + " ".join(ARGS), file=sys.stderr)
 raise SystemExit(1)
 '''
-
-
-def _free_port() -> int:
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
-        sock.bind(("127.0.0.1", 0))
-        return int(sock.getsockname()[1])
 
 
 def _wait_for(predicate: Callable[[], object], timeout_s: float, what: str) -> object:
@@ -360,7 +355,7 @@ def picker_rig(
         hidden_default=hidden_default,
     )
 
-    port = _free_port()
+    port = find_free_port()
     base_url = f"http://127.0.0.1:{port}"
     server_log = root / "server.log"
     host_log = root / "host.log"
@@ -490,7 +485,7 @@ def picker_rig(
 
 _MODEL_ROW_PREFIX = "new-chat-landing-agent-model-"
 # Non-catalog controls sharing the row testid prefix: the smart-routing
-# toggle, the "Harness default" sentinel, the search box, and the trigger's
+# toggle, the "Default" sentinel, the search box, and the trigger's
 # current-model label (`…-agent-model-value`).
 _MODEL_ROW_SENTINELS = ("smart-routing", "default", "search", "value")
 
@@ -639,10 +634,10 @@ def test_codex_picker_offers_the_clis_catalog_and_default(
         expect(picker).to_have_attribute("aria-label", "Codex, Model Default")
         expect(picker).to_contain_text("Default")
         expect(picker).not_to_contain_text("Models unavailable")
-        harness_default = page.get_by_test_id(_MODELS_SECTION_TESTID).get_by_role(
-            "menuitemcheckbox", name="Harness default", exact=True
+        default_row = page.get_by_test_id(_MODELS_SECTION_TESTID).get_by_role(
+            "menuitemcheckbox", name="Default", exact=True
         )
-        expect(harness_default).to_have_attribute("aria-checked", "true")
+        expect(default_row).to_have_attribute("aria-checked", "true")
         assert checked == []
     else:
         assert checked == [picker_rig.codex_default], (

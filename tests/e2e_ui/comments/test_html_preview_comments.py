@@ -444,7 +444,7 @@ def test_clicking_comment_scrolls_highlight_into_view(
     # Open the comments panel via the toolbar (the seeded comment isn't shown
     # until the panel is open).
     file_viewer.get_by_role("button", name="Show comments").click()
-    file_viewer.get_by_role("button", name=re.compile("Addressed")).click()
+    file_viewer.get_by_role("button", name=re.compile("Sent")).click()
     expect(file_viewer.get_by_text("deep comment")).to_be_visible()
     page.wait_for_timeout(200)
     assert _highlight_count(preview) == 0, "addressed anchors stay hidden until activated"

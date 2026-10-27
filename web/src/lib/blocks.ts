@@ -1,3 +1,4 @@
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
 // Hand-ported. When _blocks.py changes, update this file and the
@@ -12,7 +13,7 @@ import { capitalizeAgentName } from "./agentLabels";
 import { agentRootName } from "./forkHarness";
 import { nativeCodingAgentForAgentName } from "./nativeCodingAgents";
 import type { RoutingDecisionExtras } from "./routingDecision";
-import type { CodexPersistMode, RememberScope, Response } from "./types";
+import type { AgyPermission, CodexPersistMode, RememberScope, Response } from "./types";
 
 /**
  * Metadata attached to every stream block.
@@ -460,6 +461,12 @@ export interface ErrorBlock {
   cause?: string;
   /** Optional concrete next step to fix it, e.g. a command to run. */
   remediation?: string;
+  /**
+   * The send behind a client-only card whose POST got no answer: the message
+   * may still arrive, and its commit retracts the card. `text` is set on a
+   * native terminal, whose mirrored message carries no stable id.
+   */
+  unansweredSend?: { stableId: string; text?: string };
 }
 
 /**
@@ -603,6 +610,9 @@ export interface ResponseEndBlock {
  * dictates as the next stream events.
  */
 export interface ElicitationBlock {
+  nativeDelivery?: NativePermissionDelivery;
+  /** Positive native resolution evidence; snapshot absence alone is insufficient. */
+  nativeDeliveryResolved?: boolean;
   type: "elicitation";
   ctx: BlockContext;
   elicitationId: string;
@@ -696,6 +706,8 @@ export interface ElicitationBlock {
    * ``setMode(auto)``). Absent/false for all other elicitations.
    */
   allowAutoMode?: boolean;
+  /** Native directories the user may explicitly allow for this session. */
+  permissionDirectories?: string[];
   /**
    * Claude-native non-edit tool prompts only: present when the card
    * should render an "Approve & don't ask again for <host|tool>" button
@@ -707,6 +719,12 @@ export interface ElicitationBlock {
   rememberScope?: RememberScope | null;
   /** Codex-native MCP approval persistence modes advertised by the request. */
   codexPersistModes?: CodexPersistMode[];
+  /**
+   * Agy-native permission prompts only: the action description and
+   * advertised always-allow persist pattern agy's own prompt shows, so
+   * the card can render them. Null for every other elicitation.
+   */
+  agyPermission?: AgyPermission | null;
 }
 
 /** Union of all block types. */
@@ -732,6 +750,19 @@ export type AnyBlock =
   | ElicitationBlock
   | PolicyDeniedBlock
   | ResponseEndBlock;
+
+/** Whether a pending card answers `sessionId`'s own prompt, not a mirrored sub-agent's. */
+export function hasPendingOwnElicitation(
+  blocks: readonly AnyBlock[],
+  sessionId: string | null,
+): boolean {
+  return blocks.some(
+    (b) =>
+      b.type === "elicitation" &&
+      b.status === "pending" &&
+      (b.targetSessionId == null || b.targetSessionId === sessionId),
+  );
+}
 
 /**
  * Item-id prefix marking a provisional, in-flight assistant-text block —

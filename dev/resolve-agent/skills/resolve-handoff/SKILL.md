@@ -49,7 +49,7 @@ the message. Same discipline as repro-agent:
     {"surface": "web", "kind": "before", "path": "recordings/1234/before-picker.webm", "format": "webm",
      "capture_mode": "playwright_ui",
      "caption": "open the model picker → select the catalog → picker shows raw IDs"},
-    {"surface": "web", "kind": "after", "path": "recordings/1234/after-picker.webm", "format": "webm",
+    {"surface": "web", "kind": "after", "path": "recordings/1234/after-picker.mp4", "format": "mp4",
      "capture_mode": "playwright_ui",
      "caption": "open the model picker → select the catalog → picker now shows friendly names"}
   ],
@@ -148,6 +148,18 @@ readiness; name pending publication/review steps in `remaining_work`.
   components. If the test assumes the suspected cause, retain it as a hypothesis
   and carry the missing proof into the outcome and `remaining_work`, following
   `resolve-investigate`. State missing evidence plainly; never include credentials.
+  When the incident cause is unverified, start `root_cause` with that fact. Describe
+  the tested mechanism separately from the hypothesis that it caused the incident;
+  do not claim that incident link elsewhere in the summary. In `test_audit`, include
+  the governing-definition citation and real configured-path observation requested
+  by `resolve-investigate`, or the specific missing evidence; do not defer a
+  feasible check merely to finish.
+  Before finalizing `test_audit`, verify an actual defining-source read and the
+  file, symbol and value for each governing shared definition. If none exists,
+  record the bounded search; a filename or caller reference alone is insufficient.
+  Execute missing feasible reads and keep unresolved definition gaps explicit.
+  Distinguish observed effects from expected downstream behavior: unexercised
+  reconnect or recovery paths remain unverified in every summary field.
 - `review_body` — the PR-facing review text from Step 2A. Fill it in for
   `reviewed_existing_pr`, including workflow-owned publication; use `""` in
   other modes. State the verdict and reason first, then separate the proof and
@@ -174,6 +186,9 @@ readiness; name pending publication/review steps in `remaining_work`.
   its retention status; identify pending uploads and unresolved retention.
 - `recordings` — your after-fix clips (`kind: "after"`) and any recovered
   before-clips, using `{surface, kind, path, format, capture_mode, caption}`.
+  Point each new clip's `path` at the inspected MP4 with timed captions burned
+  in using `dev/caption_recording.py` per `dev/recording-lanes.md`. If captioning
+  was blocked, retain the usable clip and disclose the blocker in `evidence`.
   Follow the recording rules in Step 2B.5 on both author and review runs; in
   review mode, record the reviewed PR head. Keep recovered before-clips and
   captions unchanged. Each after-clip's caption lists the actions shown, ending

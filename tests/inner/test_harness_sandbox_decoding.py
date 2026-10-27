@@ -17,6 +17,7 @@ from omnigent.inner.datamodel import (
     CredentialSourceSpec,
     DatabricksProfileBinding,
     DatabricksProxySpec,
+    GitSshBinding,
     OSEnvSandboxSpec,
     OSEnvSpec,
 )
@@ -130,6 +131,22 @@ def test_harness_preserves_absent_and_empty_credential_proxy(
     proxy: CredentialProxySpec | None,
 ) -> None:
     sandbox = OSEnvSandboxSpec(type="linux_bwrap", credential_proxy=proxy)
+    assert decode_sandbox(sandbox) == sandbox
+
+
+def test_harness_preserves_git_ssh_binding(
+    decode_sandbox: Callable[[OSEnvSandboxSpec], OSEnvSandboxSpec], tmp_path: Path
+) -> None:
+    binding = GitSshBinding(
+        host="git.example.test",
+        port=22,
+        username="git",
+        repository="org/repo.git",
+        operations=frozenset({"fetch"}),
+        identity_file=str(tmp_path / "key"),
+        known_hosts_file=str(tmp_path / "known_hosts"),
+    )
+    sandbox = OSEnvSandboxSpec(type="linux_bwrap", git_ssh=[binding])
     assert decode_sandbox(sandbox) == sandbox
 
 

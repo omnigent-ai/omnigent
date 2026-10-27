@@ -51,128 +51,50 @@ jobs:
   # scan; trusted authors / non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
+
+  scope:
+    name: CI coverage scope
+    needs: gate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      dependency: ${{ steps.scope.outputs.dependency }}
+      backend: ${{ steps.scope.outputs.backend }}
+      database: ${{ steps.scope.outputs.database }}
+      python_matrix: ${{ steps.scope.outputs.python_matrix }}
+      omnidev: ${{ steps.scope.outputs.omnidev }}
+      sidecar: ${{ steps.scope.outputs.sidecar }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          fetch-depth: 2
+          sparse-checkout: |
+            .github/scripts/ci
+            .github/actions/dependency-ci-scope
+          persist-credentials: false
+      - id: scope
+        uses: ./.github/actions/dependency-ci-scope
 
   pytest:
     name: Pytest (${{ matrix.group }})
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
+    # coreutils on ubuntu-26.04 differs from what host env-wrapper tests compare against; keep 24.04 until tests are updated.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - group: runtime-harnesses
-            paths: tests/runtime/harnesses
-            dist: worksteal
-          - group: runtime-policies
-            paths: tests/runtime/policies
-          - group: runtime-core
-            paths: >-
-              tests/runtime
-              --ignore=tests/runtime/harnesses
-              --ignore=tests/runtime/policies
-            dist: worksteal
-          - group: inner-rest
-            paths: tests/inner
-          - group: tools
-            paths: tests/tools tests/test_errors.py
-          - group: repl-sdk
-            paths: tests/frontends tests/repl tests/terminals
-          # Isolates the park-on-future elicitation/permission/policy files so a
-          # wedge there stalls one small job, not the whole server shard.
-          - group: server-approvals
-            paths: >-
-              tests/server/integration/test_sessions_permission_request_hook.py
-              tests/server/integration/test_sessions_elicitation_resolve_url.py
-              tests/server/integration/test_sessions_policy_evaluate.py
-            workers: "4"
-          # worksteal: the biggest file would otherwise pin one worker past the
-          # shard's balanced wall time. server/conftest fixtures are function-scoped.
-          - group: server-integration
-            paths: >-
-              tests/server/integration
-              --ignore=tests/server/integration/test_sessions_permission_request_hook.py
-              --ignore=tests/server/integration/test_sessions_elicitation_resolve_url.py
-              --ignore=tests/server/integration/test_sessions_policy_evaluate.py
-            workers: "4"
-            dist: worksteal
-          # Historical name; stays in merge-ready's REQUIRED list.
-          - group: server-rest
-            paths: tests/server --ignore=tests/server/integration tests/onboarding
-            workers: "4"
-          - group: spec-llms
-            paths: tests/spec tests/llms
-          # Integration journey tests with mock LLM (no API key).
-          # workers=0 (serial): session-scoped live_server + mock_llm_server
-          # fixtures spawn subprocesses that must share one mock server;
-          # xdist workers would each create their own session fixtures.
-          - group: integration-mock
-            paths: tests/integration
-            workers: "0"
-          # Carved out of misc: runner + stores were ~68% of misc's cpu and
-          # under loadfile a single 500s+ file (test_app_sessions_native) pinned
-          # one worker and set the whole misc wall time. worksteal fans each
-          # dir's tests across workers (biggest single test is ~40s / ~5s, so
-          # the floor drops from ~500s to ~100s). Both dirs' conftests are
-          # function-scoped, so splitting a file across workers is safe.
-          - group: runner-app
-            paths: tests/runner
-            dist: worksteal
-          - group: stores
-            paths: tests/stores
-            dist: worksteal
-          # Catch-all so new top-level tests/<dir>/ are covered automatically.
-          # worksteal keeps the biggest remaining file (the benchmark smoke
-          # test, ~58s) from re-pinning one worker as this catch-all grows.
-          - group: misc
-            paths: >-
-              tests
-              --ignore=tests/e2e
-              --ignore=tests/integration
-              --ignore=tests/runtime
-              --ignore=tests/inner
-              --ignore=tests/tools
-              --ignore=tests/test_errors.py
-              --ignore=tests/frontends
-              --ignore=tests/repl
-              --ignore=tests/terminals
-              --ignore=tests/server
-              --ignore=tests/onboarding
-              --ignore=tests/spec
-              --ignore=tests/llms
-              --ignore=tests/codex_parity
-              --ignore=tests/runner
-              --ignore=tests/stores
-            dist: worksteal
-          # Databricks-coupled tests (Lakebase token engine, psycopg, the
-          # router's ambient workspace-credential chain). This is the only lane
-          # that installs the `databricks` extra; the @pytest.mark.databricks
-          # marker keeps these tests off the lean lanes (which run
-          # -m "not databricks") and selects them here. Paths carrying marked
-          # tests must be listed here or those tests run nowhere.
-          - group: databricks
-            paths: tests/db tests/deploy tests/server/test_smart_routing.py
-            extra: databricks
-            markexpr: databricks
-          # Slack integration (integrations/slack). Its tests live outside the
-          # top-level tests/ tree and import the decoupled `omnigent_slack`
-          # package, so this lane installs the `slack` extra to pull it in. The
-          # tests are run from the repo root on purpose: they rely on the root
-          # pyproject's `asyncio_mode = auto` (rootdir resolution), and
-          # coverage of the omnigent package is a no-op here (the code under
-          # test is omnigent_slack, not omnigent) — harmless, kept for a
-          # uniform pytest step.
-          - group: slack
-            paths: integrations/slack/tests
-            extra: slack
+      matrix: ${{ fromJSON(needs.scope.outputs.python_matrix) }}
 
     steps:
       - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -181,11 +103,25 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Set up Node.js for local relay tests
-        if: matrix.group == 'misc'
-        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4
+      - name: Set up Node.js for local relay and harness CLI tests
+        if: matrix.group == 'misc' || matrix.group == 'inner-rest'
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+
+      # Tests that exercise a real harness CLI skip without it; install the
+      # pinned CLI only in the lanes that run them.
+      - name: Install Codex CLI
+        if: matrix.group == 'misc'
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
+        with:
+          harness: codex
+
+      - name: Install Pi CLI
+        if: matrix.group == 'inner-rest'
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
+        with:
+          harness: pi
 
       - name: Install test system dependencies
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
@@ -201,7 +137,7 @@ jobs:
           sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
 
       - name: Cache virtualenv
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
@@ -209,12 +145,27 @@ jobs:
       - name: Install dependencies
         # matrix.extra (e.g. "databricks") adds an extra for lanes that need it;
         # empty for the default lanes.
-        run: uv sync --locked --extra all --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+
+      - name: Check installed sandbox SDK consumers
+        if: matrix.group == 'server-rest'
+        run: |
+          uv run python - <<'PYTHON'
+          from openshell import ExecChunk, ExecResult, SandboxClient, SandboxError
+          from openshell._proto import openshell_pb2, openshell_pb2_grpc
+          from kubernetes import client, config
+          from kubernetes.stream import stream
+          from omnigent.onboarding.sandboxes import kubernetes, openshell
+
+          openshell._ensure_sdk()
+          kubernetes._ensure_sdk()
+          PYTHON
 
       - name: Run pytest
         shell: bash
         env:
           PYTHONFAULTHANDLER: "1"
+          DEPENDENCY: ${{ needs.scope.outputs.dependency }}
           PYTEST_PROGRESS_LOG_DIR: artifacts/progress
           OMNIGENT_TOKEN_USAGE_JSON: artifacts/tokens-${{ matrix.group }}.json
           # Outside the repo: coverage.py's transient `.coverage.*` files
@@ -237,11 +188,11 @@ jobs:
               -m "${{ matrix.markexpr || 'not databricks' }}" \
               -n ${{ matrix.workers || '8' }} \
               --dist=${{ matrix.dist || 'loadfile' }} \
-              --timeout=${{ matrix.timeout || '300' }} \
+              --timeout=300 \
               --junitxml=artifacts/pytest-${{ matrix.group }}.xml \
               --cov=omnigent --cov-report= \
               -v --tb=long --showlocals --log-level=INFO -r a \
-              || { rc=$?; [ "$rc" -eq 5 ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
+              || { rc=$?; [ "$rc" -eq 5 ] && [ "$DEPENDENCY" != "true" ] && echo "::notice::No tests collected in this shard; treating as a pass." || exit "$rc"; }
 
       - name: Stage coverage data for upload
         if: always()
@@ -256,7 +207,7 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-${{ matrix.group }}-${{ github.run_id }}
           # A retry must replace the failed attempt's partial coverage.
@@ -267,9 +218,9 @@ jobs:
 
   stores-postgres:
     name: Pytest (stores-postgres)
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       postgres:
@@ -285,8 +236,8 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version-file: ".python-version"
       - uses: ./.github/actions/setup-uv
@@ -305,7 +256,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-postgres.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-stores-postgres-${{ github.run_id }}
           path: artifacts/
@@ -315,9 +266,9 @@ jobs:
   # postgres/mysql lanes. The full version matrix runs locally via `just crdb-test`.
   stores-cockroachdb:
     name: Pytest (stores-crdb-${{ matrix.crdb_version }})
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -327,8 +278,8 @@ jobs:
             crdb_service: crdb-23-2-28
             crdb_port: 26323
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version-file: ".python-version"
       - uses: ./.github/actions/setup-uv
@@ -356,7 +307,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-crdb.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-stores-crdb-${{ matrix.crdb_version }}-${{ github.run_id }}
           path: artifacts/
@@ -364,9 +315,9 @@ jobs:
 
   stores-mysql:
     name: Pytest (stores-mysql)
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       mysql:
@@ -382,8 +333,8 @@ jobs:
           --health-timeout 5s
           --health-retries 10
     steps:
-      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version-file: ".python-version"
       - uses: ./.github/actions/setup-uv
@@ -404,24 +355,46 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-mysql.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-stores-mysql-${{ github.run_id }}
           path: artifacts/
           retention-days: 14
 
+  omnidev:
+    name: Rust tests (omnidev)
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.omnidev == 'true' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8
+        with:
+          toolchain: stable
+      - id: rustc
+        run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with:
+          path: |
+            ~/.cargo/registry
+            dev/omnidev/target
+          key: omnidev-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('dev/omnidev/**', '!dev/omnidev/target/**') }}
+      - name: Test omnidev
+        run: cargo test --locked --manifest-path dev/omnidev/Cargo.toml
+
   codex-parity:
     name: Pytest (codex-parity)
-    needs: gate
-    if: ${{ !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    needs: scope
+    if: ${{ !github.event.pull_request.draft && needs.scope.outputs.sidecar == 'true' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -439,16 +412,13 @@ jobs:
         id: rustc
         run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
 
-      # The sidecar source is frozen and its deps are rev-pinned, so the binary is
-      # a pure function of sidecar/** + the toolchain. Cache the built binary (not
-      # the 1.6 GB target dir) and skip the ~3 min compile below on a hit; the key
-      # self-invalidates when the source, Cargo.lock, or rustc changes.
-      - name: Cache parity sidecar binary
+      # Cache compiled dependencies and test binaries, but execute tests on every run.
+      - name: Cache parity sidecar build
         id: sidecar-cache
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-bin-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+          path: .tmp-codex-parity-target
+          key: codex-parity-tests-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
       - name: Set up pnpm
         # This job never runs pnpm install, so caching the (empty) pnpm store
@@ -458,12 +428,12 @@ jobs:
           cache: ""
 
       - name: Install codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@aa5736c38f5c1258ee29452c6825d75033b952d7
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
         with:
           harness: codex
 
       - name: Cache virtualenv
-        uses: actions/cache@27d5ce7f107fe9357f9df03efb73ab90386fccae  # v4
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
@@ -471,10 +441,16 @@ jobs:
       - name: Install dependencies
         run: uv sync --locked --extra all --group test
 
+      - name: Test parity sidecar
+        run: |
+          cargo test --locked \
+            --manifest-path tests/codex_parity/sidecar/Cargo.toml \
+            --target-dir .tmp-codex-parity-target
+
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'
         run: |
-          cargo build \
+          cargo build --locked \
             --manifest-path tests/codex_parity/sidecar/Cargo.toml \
             --target-dir .tmp-codex-parity-target
 
@@ -496,11 +472,32 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-codex-parity-${{ github.run_id }}
           path: artifacts/
           retention-days: 14
+
+  result:
+    name: CI result
+    if: always()
+    needs: [scope, pytest, stores-postgres, stores-cockroachdb, stores-mysql, omnidev, codex-parity]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Require successful test selection
+        env:
+          SELECTION_RESULT: ${{ needs.scope.result }}
+        run: test "$SELECTION_RESULT" = success
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          sparse-checkout: .github/scripts/ci
+          persist-credentials: false
+      - name: Require selected consumer results
+        env:
+          NEEDS: ${{ toJSON(needs) }}
+          IS_DRAFT: ${{ github.event.pull_request.draft }}
+        run: python3 .github/scripts/ci/require_results.py ci
 
   coverage-report:
     name: Coverage report
@@ -511,18 +508,18 @@ jobs:
     # Only runs when every pytest shard passed: a failed shard drops its covered
     # lines from the combine, so coverage off partial data would be misleading —
     # and a red run gets re-run anyway, re-triggering this.
-    needs: pytest
-    if: ${{ success() && !github.event.pull_request.draft }}
-    runs-on: ubuntu-latest
+    needs: [pytest, scope]
+    if: ${{ success() && !github.event.pull_request.draft && needs.scope.outputs.dependency != 'true' }}
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check out repo
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -530,7 +527,7 @@ jobs:
         run: pip install "coverage>=7"
 
       - name: Download shard coverage data
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: pytest-*
           path: covdata
@@ -557,7 +554,7 @@ jobs:
 
       - name: Upload coverage summary
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: coverage-summary-${{ github.run_id }}
           # The status workflow must consume the recomputed summary on retries.

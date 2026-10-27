@@ -719,6 +719,21 @@ def harness_setup_hint(harness: str | None) -> str:
         login`"`` for native Cursor, or the ``omni setup`` hint otherwise.
     """
     spec = required_cli_for_harness(harness or "")
+    if spec is not None and spec.binary == "agy":
+        from omnigent.errors import ErrorCode, OmnigentError
+        from omnigent.harnesses.antigravity_native.credentials import (
+            resolve_antigravity_credentials,
+        )
+
+        try:
+            resolve_antigravity_credentials()
+        except OmnigentError as exc:
+            if exc.code == ErrorCode.INVALID_INPUT:
+                return (
+                    exc.message + " Run omni setup on the host to repair the Gemini configuration."
+                )
+        except (OSError, ValueError):
+            pass
     if spec is not None and spec.package is None and spec.install_hint:
         login = ""
         if spec.login_args:
@@ -783,21 +798,46 @@ def _parse_harness_cli_version(text: str) -> str | None:
 _DEFAULT_CLI_PROBE_TIMEOUT_S = 30.0
 READINESS_CLI_PROBE_TIMEOUT_S = 10.0
 
-# Probe caches damping the ambient readiness storm: every readiness refresh
-# on every host daemon execs vendor CLIs (``--version`` / ``auth status``)
-# whose answers change only when the binary is swapped or a login flips —
-# with a few dozen idle hosts that compounds into a constant machine-wide
-# subprocess churn. ``--version`` output is a pure function of the binary
-# bytes, so successful parses are cached against the binary's
-# ``(path, mtime_ns, size)`` signature; login state can flip without the
-# binary changing, so only positive verdicts are cached and they expire
-# after a short TTL — a cached "not logged in" would blind the setup
-# wizard's confirmation right after a successful login.
-_VERSION_PROBE_CACHE: dict[tuple[str, int, int], str] = {}
+# Cache successful probes to limit subprocess churn during readiness checks.
+# Launchers can delegate to an updated executable without changing themselves.
+_VERSION_PROBE_CACHE: dict[tuple[str, int, int], tuple[str, float]] = {}
 _LOGIN_PROBE_CACHE: dict[tuple[str, str], float] = {}
 _PROBE_CACHE_LOCK = threading.Lock()
+# ponytail: a 60s TTL bounds staleness without tracking launcher dependencies.
+_VERSION_PROBE_CACHE_TTL_S = 60.0
 _LOGIN_PROBE_CACHE_TTL_S = 120.0
 _PROBE_CACHE_MAX_ENTRIES = 64
+
+
+def _cli_probe_cwd() -> str | None:
+    """Return a stable cwd for a harness CLI probe, or ``None`` to inherit it.
+
+    A long-lived daemon can outlive the directory it was started from (a temp
+    checkout or a removed git worktree). A probe subprocess inherits that
+    deleted cwd, where ``claude`` exits non-zero, so a present CLI reads as
+    unavailable. Return ``None`` while the cwd is intact; once it is gone, fall
+    back to the home directory, else the filesystem root.
+    """
+    try:
+        os.getcwd()
+        return None
+    except OSError:
+        pass
+    try:
+        # Path.home() raises RuntimeError, not OSError, when HOME is unset.
+        home = Path.home()
+        if home.is_dir():
+            return str(home)
+    except (OSError, RuntimeError):
+        pass
+    return os.path.abspath(os.sep)
+
+
+def invalidate_harness_probe_caches() -> None:
+    """Force fresh CLI version and login probes after refresh or installation."""
+    with _PROBE_CACHE_LOCK:
+        _VERSION_PROBE_CACHE.clear()
+        _LOGIN_PROBE_CACHE.clear()
 
 
 def _binary_signature(binary: str) -> tuple[str, int, int] | None:
@@ -873,6 +913,19 @@ def harness_install_spec(key: str) -> HarnessInstallSpec | None:
     return _all_harness_install().get(key)
 
 
+def harness_cli_binary(key: str) -> str | None:
+    """Resolve the CLI selected for an install key, including Pi's path override."""
+    spec = harness_install_spec(key)
+    if spec is None:
+        return None
+    command = spec.binary
+    if key == PI_KEY:
+        from omnigent.harness_startup_config import resolve_harness_path
+
+        command = resolve_harness_path("pi") or command
+    return resolve_cli_binary(command)
+
+
 def harness_cli_version_satisfies(key: str) -> bool:
     """Return whether the installed CLI for *key* satisfies its version range.
 
@@ -888,7 +941,7 @@ def harness_cli_version_satisfies(key: str) -> bool:
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary)
@@ -916,7 +969,7 @@ def harness_cli_installed(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     spec = harness_install_spec(key)
     if spec is None:
         return False
-    binary = resolve_cli_binary(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return False
     return _harness_cli_version_satisfies(spec, binary, timeout)
@@ -939,7 +992,7 @@ def harness_cli_version(key: str) -> tuple[str | None, str | None]:
     spec = harness_install_spec(key)
     if spec is None:
         return None, None
-    binary = resolve_cli_binary(spec.binary)
+    binary = harness_cli_binary(key)
     if binary is None:
         return None, None
     version = _harness_cli_version_string(spec, binary)
@@ -966,20 +1019,25 @@ def _harness_cli_version_string(
 ) -> str | None:
     """Return the parsed, normalized version string from *binary* ``--version``.
 
-    Successful parses are cached against the binary's ``(path, mtime_ns,
-    size)`` signature — the output cannot change until the binary does.
-    Failed probes (missing/hung binary, unparseable output) are never
-    cached, so a flaky state keeps re-probing like before.
+    Successful parses are cached briefly against ``(path, mtime_ns, size)``.
+    Expiration catches updates behind an unchanged launcher. Failed probes
+    (missing/hung binary, unparseable output) are never cached.
 
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
+    probe_cwd = _cli_probe_cwd()
+    if probe_cwd is not None and not os.path.isabs(binary):
+        # The daemon's starting cwd is gone, so the probe would run under a
+        # fallback dir; a relative discovered path re-resolves there to a
+        # different executable, so report unverifiable instead of probing it.
+        return None
     sig = _binary_signature(binary)
     if sig is not None:
         with _PROBE_CACHE_LOCK:
             cached = _VERSION_PROBE_CACHE.get(sig)
-        if cached is not None:
-            return cached
+        if cached is not None and time.monotonic() < cached[1]:
+            return cached[0]
     try:
         completed = subprocess.run(
             [binary, "--version"],
@@ -988,6 +1046,7 @@ def _harness_cli_version_string(
             text=True,
             timeout=timeout,
             check=False,
+            cwd=probe_cwd,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1001,7 +1060,7 @@ def _harness_cli_version_string(
         with _PROBE_CACHE_LOCK:
             if len(_VERSION_PROBE_CACHE) >= _PROBE_CACHE_MAX_ENTRIES:
                 _VERSION_PROBE_CACHE.clear()
-            _VERSION_PROBE_CACHE[sig] = version
+            _VERSION_PROBE_CACHE[sig] = (version, time.monotonic() + _VERSION_PROBE_CACHE_TTL_S)
     return version
 
 
@@ -1093,6 +1152,7 @@ def try_install_harness_cli(key: str) -> HarnessInstallResult:
         return HarnessInstallResult(False, "install timed out after 300s")
     except OSError as exc:
         return HarnessInstallResult(False, f"install command failed to run: {exc}")
+    invalidate_harness_probe_caches()
     # harness_install_command would have raised for a spec-less key, so spec is
     # non-None past this point.
     assert spec is not None
@@ -1173,6 +1233,12 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
     if binary is None:
         return False
+    probe_cwd = _cli_probe_cwd()
+    if probe_cwd is not None and not os.path.isabs(binary):
+        # The daemon's starting cwd is gone, so the probe would run under a
+        # fallback dir; a relative discovered path re-resolves there to a
+        # different executable, so report not-logged-in instead of probing it.
+        return False
     # Positive verdicts are TTL-cached (see the cache block above): logins
     # are sticky, and the readiness loop re-probing a logged-in CLI every
     # refresh is the ambient storm. Negatives always re-probe so a login
@@ -1181,16 +1247,16 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     with _PROBE_CACHE_LOCK:
         if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
             return True
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     try:
         result = subprocess.run(
-            [argv_binary, *spec.status_args],
+            [binary, *spec.status_args],
             check=False,
             timeout=timeout,
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            cwd=probe_cwd,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False

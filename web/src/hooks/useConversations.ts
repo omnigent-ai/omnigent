@@ -57,7 +57,7 @@ import {
 } from "@/shell/sidebarNav";
 import { apiErrorFromResponse, stopSession } from "@/lib/sessionsApi";
 import { isStaleCursorError, useRestartOnStaleCursor } from "@/lib/staleCursor";
-import { setSessionHost, setSessionParent } from "@/lib/sessionHost";
+import { sessionRoutingHostId, setSessionHost, setSessionParent } from "@/lib/sessionHost";
 import {
   createProject as apiCreateProject,
   deleteProject as apiDeleteProject,
@@ -112,7 +112,12 @@ function isAbortTimeout(error: unknown): boolean {
  */
 const ARCHIVED_PROJECT_NAMES_KEY = ["archived-project-names"] as const;
 
+export type SessionSortBy = "updated_at" | "created_at";
+/** `?search_scope=`: `title` and `content` are disjoint groups of one search. */
+export type SessionSearchScope = "all" | "title" | "content";
+
 export interface UseConversationsOptions {
+  sortBy?: SessionSortBy;
   refreshIntervalMs?: number | false;
   snapshot?: boolean;
   reconcileWhileConnected?: boolean;
@@ -169,6 +174,8 @@ export interface Conversation {
   agent_id?: string;
   /** Human-readable name of the bound agent, e.g. ``"research-agent"``. */
   agent_name?: string | null;
+  /** Effective harness, including any per-session override. */
+  harness?: string | null;
   /** Outstanding approval prompts — powers the sidebar "needs attention" badge. */
   pending_elicitations_count?: number;
   status?: "idle" | "running" | "failed";
@@ -478,7 +485,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
   // enter client state only through here, and terminal-attach / session-scoped
   // requests key their slice off this map — so record the host before returning
   // the row, or those requests fall back to the modal and can miss the replica.
-  setSessionHost(wire.id, wire.host_id);
+  setSessionHost(wire.id, sessionRoutingHostId(wire.host_id, wire.labels));
   setSessionParent(wire.id, wire.parent_session_id, wire.labels);
   return {
     id: wire.id,
@@ -494,6 +501,7 @@ export async function fetchConversationById(id: string): Promise<Conversation | 
     workspace: wire.workspace ?? null,
     agent_id: wire.agent_id,
     agent_name: wire.agent_name ?? null,
+    harness: wire.harness ?? null,
     pending_elicitations_count: wire.pending_elicitations_count ?? 0,
     status: wire.status ?? "idle",
     runner_online: wire.runner_online ?? undefined,
@@ -512,27 +520,30 @@ export async function fetchConversationsPage({
   queryClient,
   signal: requestSignal,
   limit = sidebarConfig.sessionPageSize,
+  sortBy = "updated_at",
+  searchScope = "all",
 }: {
   after?: string;
   searchQuery: string;
+  searchScope?: SessionSearchScope;
   includeArchived: boolean;
   project?: string;
   visibility?: "mine" | "shared" | "archived";
   queryClient: QueryClient;
   signal?: AbortSignal;
   limit?: number;
+  sortBy?: SessionSortBy;
 }): Promise<ConversationsPage> {
-  // `updated_at` matches the sidebar's sort, which keeps server
-  // pagination consistent with the visible order as the user scrolls.
-  // See sidebarNav.ts.
+  // Match the visible order so pagination selects the same session window.
   const params = new URLSearchParams({
     order: "desc",
-    sort_by: "updated_at",
+    sort_by: sortBy,
     limit: String(limit),
     visibility: visibility ?? "all",
   });
   if (after) params.set("after", after);
   if (searchQuery) params.set("search_query", searchQuery);
+  if (searchQuery && searchScope !== "all") params.set("search_scope", searchScope);
   // Only request archived rows when the toggle is on, so the default
   // sidebar never pays to fetch them. The server excludes archived
   // sessions unless include_archived=true.
@@ -562,7 +573,7 @@ export async function fetchConversationsPage({
   // falling back to the modal. host_id is fixed for a session's life, so this
   // can't seed a stale value; a hostless row clears any prior mapping.
   for (const row of page.data) {
-    setSessionHost(row.id, row.host_id);
+    setSessionHost(row.id, sessionRoutingHostId(row.host_id, row.labels));
     setSessionParent(row.id, row.parent_session_id, row.labels);
   }
   return applySessionTombstones(
@@ -649,11 +660,15 @@ export function useConversations(
   // append `project` for a concrete name; append `visibility` only when set so
   // the "mine"/"shared" tab queries get their own cache entries without
   // disturbing the existing all-sessions key used by every other caller.
-  const queryKey = visibility
-    ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
-    : project
-      ? ["conversations", searchQuery, includeArchived, project]
-      : ["conversations", searchQuery, includeArchived];
+  const sortBy = options.sortBy ?? "updated_at";
+  const queryKey =
+    sortBy === "created_at"
+      ? ["conversations", searchQuery, includeArchived, project ?? null, visibility, sortBy]
+      : visibility
+        ? ["conversations", searchQuery, includeArchived, project ?? null, visibility]
+        : project
+          ? ["conversations", searchQuery, includeArchived, project]
+          : ["conversations", searchQuery, includeArchived];
   const query = useInfiniteQuery({
     queryKey,
     queryFn: async ({ pageParam }) => {
@@ -666,6 +681,7 @@ export function useConversations(
           visibility,
           queryClient,
           limit: sessionPageSize,
+          sortBy,
         });
       return timeInitialConversationLoad(pageParam, visibility, fetchPage);
     },
@@ -715,6 +731,41 @@ export function useConversations(
   });
   // A session deleted between two scroll pages kills the cursor; reload the
   // list from page 1 rather than replacing the sidebar with the raw 400.
+  useRestartOnStaleCursor(queryKey);
+  return query;
+}
+
+/**
+ * One palette search group; keyed outside `["conversations"]`, which patches rows
+ * live. Dropped once unobserved, so a later search never shows a stale row.
+ */
+export function useSessionSearch(
+  searchQuery: string,
+  searchScope: SessionSearchScope,
+  { enabled = true, limit = 10 }: { enabled?: boolean; limit?: number } = {},
+) {
+  const queryClient = useQueryClient();
+  const queryKey = ["session-search", searchQuery, searchScope, limit];
+  const query = useInfiniteQuery({
+    queryKey,
+    queryFn: ({ pageParam }) =>
+      fetchConversationsPage({
+        after: pageParam,
+        searchQuery,
+        searchScope,
+        includeArchived: false,
+        queryClient,
+        limit,
+      }),
+    initialPageParam: undefined as string | undefined,
+    getNextPageParam: (lastPage) =>
+      lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,
+    staleTime: 0,
+    gcTime: 0,
+    retry: (failureCount, error) =>
+      !isAbortTimeout(error) && !isStaleCursorError(error) && failureCount < 3,
+    enabled: enabled && searchQuery !== "",
+  });
   useRestartOnStaleCursor(queryKey);
   return query;
 }
@@ -1778,6 +1829,7 @@ function cachedSessionRow(queryClient: QueryClient, id: string): Conversation | 
     labels: session.labels ?? {},
     permission_level: session.permissionLevel,
     agent_id: session.agentId,
+    harness: session.harness,
     archived: session.archived,
   };
 }
@@ -2305,7 +2357,8 @@ export function useMoveToProject() {
     const itemsById = new Map<string, SessionListWireItem>([
       [id, { id, project_id: projectId, labels }],
     ]);
-    let inWindow = false;
+    // Each sort has its own loaded window; the inactive sort may hold different rows.
+    const windowSorts = new Set<SessionSortBy>();
     for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
       queryKey: ["conversations"],
     })) {
@@ -2315,16 +2368,18 @@ export function useMoveToProject() {
         filtersFromConversationQueryKey(key),
         undefined,
       );
-      if (found.has(id)) inWindow = true;
+      if (found.has(id)) windowSorts.add(key[5] === "created_at" ? "created_at" : "updated_at");
       if (next !== data) queryClient.setQueryData(key, next);
     }
     // Target folder cache: overlay the row's fields if already present, and
     // insert a deep row (outside the flat window) into the first page.
-    let visibleOutsideOldFolders = inWindow;
+    const visibleSorts = new Set(windowSorts);
     if (targetProjectName !== null) {
-      const targetKey = ["project-sessions", targetProjectName];
-      const targetData = queryClient.getQueryData<ConversationsInfiniteData>(targetKey);
-      if (targetData) {
+      for (const [targetKey, targetData] of queryClient.getQueriesData<ConversationsInfiniteData>({
+        queryKey: ["project-sessions", targetProjectName],
+      })) {
+        if (!targetData) continue;
+        const sortBy = targetKey[2] === "created_at" ? "created_at" : "updated_at";
         const { data: merged, found } = mergeItemsIntoPages(
           targetData,
           itemsById,
@@ -2333,7 +2388,7 @@ export function useMoveToProject() {
         );
         let next = merged ?? targetData;
         const [first, ...rest] = next.pages;
-        if (!found.has(id) && !inWindow && first) {
+        if (!found.has(id) && !windowSorts.has(sortBy) && first) {
           next = {
             ...next,
             pages: [
@@ -2343,17 +2398,16 @@ export function useMoveToProject() {
           };
         }
         if (next !== targetData) queryClient.setQueryData(targetKey, next);
-        if (found.has(id) || first !== undefined) visibleOutsideOldFolders = true;
+        if (found.has(id) || first !== undefined) visibleSorts.add(sortBy);
       }
     }
-    if (visibleOutsideOldFolders) {
-      for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
-        queryKey: ["project-sessions"],
-      })) {
-        if (key[1] === targetProjectName) continue;
-        const { data: next, removed } = removeIdsFromPages(data, new Set([id]));
-        if (removed) queryClient.setQueryData(key, next);
-      }
+    for (const [key, data] of queryClient.getQueriesData<ConversationsInfiniteData>({
+      queryKey: ["project-sessions"],
+    })) {
+      const sortBy = key[2] === "created_at" ? "created_at" : "updated_at";
+      if (key[1] === targetProjectName || !visibleSorts.has(sortBy)) continue;
+      const { data: next, removed } = removeIdsFromPages(data, new Set([id]));
+      if (removed) queryClient.setQueryData(key, next);
     }
     queryClient.setQueryData<Conversation | null>(["conversation-backfill", id], (old) =>
       old ? { ...old, project_id: projectId, labels } : old,
@@ -2499,10 +2553,11 @@ async function fetchProjectSessionsPage(
   project: string,
   after?: string,
   limit = 20,
+  sortBy: SessionSortBy = "updated_at",
 ): Promise<ConversationsPage> {
   const params = new URLSearchParams({
     order: "desc",
-    sort_by: "updated_at",
+    sort_by: sortBy,
     limit: String(limit),
     visibility: "mine",
     project,
@@ -2524,11 +2579,16 @@ async function fetchProjectSessionsPage(
  * Folders keep their own 20-row pages and infinite-scroll sentinel,
  * independently of the global list's configured page size.
  */
-export function useProjectSessions(project: string, enabled: boolean) {
-  const queryKey = ["project-sessions", project];
+export function useProjectSessions(
+  project: string,
+  enabled: boolean,
+  sortBy: SessionSortBy = "updated_at",
+) {
+  const queryKey = ["project-sessions", project, ...(sortBy === "created_at" ? [sortBy] : [])];
   const query = useInfiniteQuery({
     queryKey,
-    queryFn: ({ pageParam }) => fetchProjectSessionsPage(project, pageParam as string | undefined),
+    queryFn: ({ pageParam }) =>
+      fetchProjectSessionsPage(project, pageParam as string | undefined, 20, sortBy),
     initialPageParam: undefined as string | undefined,
     getNextPageParam: (lastPage) =>
       lastPage.has_more ? (lastPage.last_id ?? undefined) : undefined,

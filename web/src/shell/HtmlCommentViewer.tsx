@@ -10,6 +10,7 @@
 // trust model.
 
 import { createPortal } from "react-dom";
+import { ADD_COMMENT_BUTTON_CLASS_NAME } from "./addCommentButtonStyles";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { MessageSquarePlusIcon } from "lucide-react";
 import type { Comment } from "@/hooks/useComments";
@@ -296,7 +297,7 @@ export function HtmlCommentViewer({
           <button
             data-add-comment-btn
             type="button"
-            className="fixed z-50 flex items-center gap-1.5 rounded-md border border-border bg-popover backdrop-blur-xl backdrop-saturate-150 px-2.5 py-1 text-sm font-medium text-foreground shadow-md hover:bg-secondary transition-colors"
+            className={`fixed z-50 ${ADD_COMMENT_BUTTON_CLASS_NAME}`}
             style={{ left: floating.x, top: floating.y, transform: "translateY(-100%)" }}
             onClick={() => {
               onSetActiveSelection({

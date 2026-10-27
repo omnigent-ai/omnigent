@@ -116,8 +116,12 @@ describe("RecentWorkspaceList", () => {
       .mockResolvedValueOnce(
         new Response(JSON.stringify({ message: "not a git repository" }), { status: 400 }),
       )
-      .mockRejectedValueOnce(new Error("host offline"));
-    const { client } = renderList();
+      .mockRejectedValue(new Error("host offline"));
+    // An unreachable host is retried before the query settles in error.
+    const { client } = renderList(
+      {},
+      new QueryClient({ defaultOptions: { queries: { retryDelay: 0 } } }),
+    );
 
     await waitFor(() => {
       expect(client.getQueryState(["host-worktrees", "host_1", "/one"])?.status).toBe("success");

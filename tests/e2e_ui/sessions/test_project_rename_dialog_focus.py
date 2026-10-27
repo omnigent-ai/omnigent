@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import uuid
 
+import pytest
 from playwright.sync_api import Locator, Page, expect
 
 
@@ -27,7 +28,13 @@ def _folder_header(page: Page, project: str) -> Locator:
     return page.locator('button[data-slot="context-menu-trigger"]').filter(has_text=project)
 
 
-def _open_rename_dialog(page: Page, seeded_session: tuple[str, str]) -> Locator:
+def _open_rename_dialog(
+    page: Page,
+    seeded_session: tuple[str, str],
+    menu_kind: str = "context",
+    *,
+    pause_menu_close: bool = False,
+) -> Locator:
     """Open the rename dialog for a fresh project and return its name input."""
     base_url, session_id = seeded_session
     project = f"Repro-{uuid.uuid4().hex[:6]}"
@@ -35,7 +42,16 @@ def _open_rename_dialog(page: Page, seeded_session: tuple[str, str]) -> Locator:
     _create_project(page, project)
     header = _folder_header(page, project)
     expect(header).to_be_visible()
-    header.click(button="right")
+    if menu_kind == "context":
+        header.click(button="right")
+    else:
+        page.get_by_role("button", name=f"Project actions for {project}", exact=True).click()
+    if pause_menu_close:
+        # Hold the exit animation so typing straddles the menu's focus restoration.
+        page.add_style_tag(
+            content='[role="menu"][data-state="closed"] '
+            "{ animation-play-state: paused !important; }"
+        )
     page.get_by_test_id("rename-project").click()
     dialog = page.get_by_role("dialog")
     expect(dialog).to_be_visible()
@@ -53,16 +69,30 @@ def test_rename_dialog_focuses_name_input(
     expect(name_input).to_be_focused()
 
 
+@pytest.mark.parametrize("menu_kind", ["context", "dropdown"])
 def test_rename_dialog_preselects_name_so_typing_replaces(
     page: Page,
     seeded_session: tuple[str, str],
+    menu_kind: str,
 ) -> None:
     """The current name opens fully selected, so typing replaces it."""
-    name_input = _open_rename_dialog(page, seeded_session)
+    name_input = _open_rename_dialog(page, seeded_session, menu_kind, pause_menu_close=True)
     old_name = name_input.input_value()
     expect(name_input).to_be_focused()
     expect(name_input).to_have_js_property("selectionStart", 0)
     expect(name_input).to_have_js_property("selectionEnd", len(old_name))
     new_name = f"Renamed-{uuid.uuid4().hex[:6]}"
-    page.keyboard.type(new_name)
+    page.keyboard.type(new_name[:4])
+    menu = page.locator('[role="menu"][data-state="closed"]')
+    # Wait for Radix's deferred close-focus event, including its default action.
+    menu.evaluate("""async menu => {
+        const closed = new Promise(resolve => {
+            menu.addEventListener('focusScope.autoFocusOnUnmount', () => {
+                queueMicrotask(resolve);
+            }, { once: true });
+        });
+        menu.getAnimations().forEach(animation => animation.finish());
+        await closed;
+    }""")
+    page.keyboard.type(new_name[4:])
     expect(name_input).to_have_value(new_name)

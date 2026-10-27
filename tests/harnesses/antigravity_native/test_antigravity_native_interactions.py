@@ -40,7 +40,7 @@ from omnigent.harnesses.antigravity_native.interactions import (
     bridge_interaction,
 )
 from omnigent.harnesses.antigravity_native.rpc import AntigravityRpcError
-from omnigent.harnesses.antigravity_native.steps import PendingInteraction
+from omnigent.harnesses.antigravity_native.steps import PendingInteraction, pending_interaction
 from omnigent.server.schemas import ElicitationRequestParams, ElicitationResult
 
 _CASCADE = "test-cascade-id"
@@ -53,7 +53,10 @@ _TRAJ = "test-trajectory-id"
 
 
 def _question_step(
-    *, step_index: int, status: str = "CORTEX_STEP_STATUS_WAITING"
+    *,
+    step_index: int,
+    status: str = "CORTEX_STEP_STATUS_WAITING",
+    options: list[dict[str, str]] | None = None,
 ) -> dict[str, Any]:
     """
     Build a WAITING ask_question step dict at a given trajectory index.
@@ -65,6 +68,9 @@ def _question_step(
 
     :param step_index: Trajectory ``stepIndex`` for this step.
     :param status: Step status; defaults to WAITING.
+    :param options: Option id/text dicts; defaults to First=1, Second=2. A
+        fallback gate can supply a different id/text map to prove the keys and
+        the RPC payload stay bound to the same spec.
     :returns: A step dict suitable for ``pending_interaction``.
     """
     return {
@@ -75,7 +81,8 @@ def _question_step(
                 "questions": [
                     {
                         "question": "Pick one",
-                        "options": [
+                        "options": options
+                        or [
                             {"id": "1", "text": "First"},
                             {"id": "2", "text": "Second"},
                         ],
@@ -93,22 +100,26 @@ def _question_step(
     }
 
 
-def _permission_step(*, step_index: int) -> dict[str, Any]:
+def _permission_step(*, step_index: int, persist_pattern: str | None = None) -> dict[str, Any]:
     """
     Build a WAITING command-permission step dict at a given trajectory index.
 
     :param step_index: Trajectory ``stepIndex`` for this step.
+    :param persist_pattern: When set, the spec advertises agy's always-allow
+        persist choice for this pattern.
     :returns: A step dict carrying ``requestedInteraction.permission``.
     """
+    permission: dict[str, Any] = {
+        "resource": {"action": "command", "target": "ls -la"},
+        "actionDescription": "List files",
+    }
+    if persist_pattern is not None:
+        permission["persistSuggestionType"] = "PERSIST_SUGGESTION_TYPE_SUGGESTED"
+        permission["suggestedPersistPattern"] = persist_pattern
     return {
         "type": "CORTEX_STEP_TYPE_RUN_COMMAND",
         "status": "CORTEX_STEP_STATUS_WAITING",
-        "requestedInteraction": {
-            "permission": {
-                "resource": {"action": "command", "target": "ls -la"},
-                "actionDescription": "List files",
-            }
-        },
+        "requestedInteraction": {"permission": permission},
         "metadata": {
             "sourceTrajectoryStepInfo": {
                 "trajectoryId": _TRAJ,
@@ -126,37 +137,27 @@ def _pending_question(*, step_index: int) -> PendingInteraction:
     :param step_index: The captured ``step_index`` (may be stale by delivery).
     :returns: A ``PendingInteraction`` of kind ``"ask_question"``.
     """
-    return PendingInteraction(
-        kind="ask_question",
-        trajectory_id=_TRAJ,
-        step_index=step_index,
-        spec={
-            "questions": [
-                {
-                    "question": "Pick one",
-                    "options": [
-                        {"id": "1", "text": "First"},
-                        {"id": "2", "text": "Second"},
-                    ],
-                }
-            ]
-        },
-    )
+    pending = pending_interaction(_question_step(step_index=step_index))
+    assert pending is not None
+    return pending
 
 
-def _pending_permission(*, step_index: int) -> PendingInteraction:
+def _pending_permission(
+    *, step_index: int, persist_pattern: str | None = None
+) -> PendingInteraction:
     """
     Build a captured permission :class:`PendingInteraction` at an index.
 
     :param step_index: The captured ``step_index``.
+    :param persist_pattern: When set, the captured spec advertises agy's
+        always-allow persist choice for this pattern.
     :returns: A ``PendingInteraction`` of kind ``"permission"``.
     """
-    return PendingInteraction(
-        kind="permission",
-        trajectory_id=_TRAJ,
-        step_index=step_index,
-        spec={"resource": {"action": "command", "target": "ls -la"}},
+    pending = pending_interaction(
+        _permission_step(step_index=step_index, persist_pattern=persist_pattern)
     )
+    assert pending is not None
+    return pending
 
 
 class _DeliverRecorder:
@@ -310,6 +311,41 @@ async def test_happy_path_delivers_selected_option_to_fresh_step() -> None:
     assert inject_tui.calls == [["2", "Enter"]]
 
 
+@pytest.mark.asyncio
+async def test_changed_fallback_question_requires_a_new_answer() -> None:
+    """Do not reuse an answer when the question's option meanings change."""
+    pending = _pending_question(step_index=3)
+    fallback = _question_step(
+        step_index=4,
+        options=[{"id": "1", "text": "Second"}, {"id": "2", "text": "Third"}],
+    )
+    request, elicit_calls = _elicitation_returner(
+        ElicitationResult(action="accept", content={"0": "Second"}),
+        ElicitationResult(action="accept", content={"0": "Second"}),
+    )
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([fallback]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert [call[0] for call in elicit_calls] == [
+        agy_elicitation_id(_CASCADE, _TRAJ, 3),
+        agy_elicitation_id(_CASCADE, _TRAJ, 4),
+    ]
+    assert len(deliver.calls) == 1
+    assert deliver.calls[0]["step_index"] == 4
+    assert deliver.calls[0]["payload"]["askQuestion"]["responses"][0]["selectedOptionIds"] == ["1"]
+    assert inject_tui.calls == [["1", "Enter"]]
+
+
 # ---------------------------------------------------------------------------
 # (b) timeout / re-read path
 # ---------------------------------------------------------------------------
@@ -442,6 +478,155 @@ async def test_permission_reject_delivers_allow_false_and_types_no() -> None:
     assert deliver.calls[0]["payload"] == {"permission": {"allow": False}}
     # #1200: Reject drives agy's TUI prompt to option 4 ("No") + Enter.
     assert inject_tui.calls == [["4", "Enter"]]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist,digit", [("session", "2"), ("always", "3")])
+@pytest.mark.parametrize("tui_fails", [False, True])
+async def test_persist_accept_uses_only_the_native_menu(
+    persist: str, digit: str, tui_fails: bool, caplog: pytest.LogCaptureFixture
+) -> None:
+    """RPC must not close the menu before saving, even as a delivery fallback."""
+    pending = _pending_permission(step_index=2, persist_pattern="ls")
+    waiting = _permission_step(step_index=2, persist_pattern="ls")
+    result = ElicitationResult.model_validate({"action": "accept", "_meta": {"persist": persist}})
+    request, _ = _elicitation_returner(result)
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder(error=RuntimeError("pane exited") if tui_fails else None)
+
+    async def inject(keys: list[str]) -> None:
+        assert deliver.calls == [], "RPC would close the native permission menu"
+        await inject_tui(keys)
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([waiting]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject,
+    )
+
+    assert deliver.calls == []
+    assert inject_tui.calls == [[digit, "Enter"]]
+    if tui_fails:
+        assert "not falling back to RPC" in caplog.text
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("persist", [None, "session", "always"])
+@pytest.mark.parametrize("changed", ["command", "pattern", "no_persist"])
+async def test_changed_permission_requires_fresh_consent(
+    persist: str | None, changed: str
+) -> None:
+    """An old approval must never authorize a changed prompt, even once."""
+    pending = _pending_permission(step_index=2, persist_pattern="ls")
+    fallback = _permission_step(
+        step_index=3,
+        persist_pattern=None
+        if changed == "no_persist"
+        else "rm"
+        if changed == "pattern"
+        else "ls",
+    )
+    if changed == "command":
+        fallback["requestedInteraction"]["permission"]["resource"]["target"] = "ls /private"
+    result = ElicitationResult.model_validate(
+        {"action": "accept", **({"_meta": {"persist": persist}} if persist else {})}
+    )
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+    elicit_calls: list[str] = []
+
+    async def request(eid: str, params: ElicitationRequestParams) -> ElicitationResult:
+        elicit_calls.append(eid)
+        # Neither channel may consume the old approval before the new answer.
+        assert deliver.calls == []
+        assert inject_tui.calls == []
+        if len(elicit_calls) == 1:
+            return result
+        assert params.model_extra is not None
+        assert (
+            params.model_extra["command"]
+            == fallback["requestedInteraction"]["permission"]["resource"]["target"]
+        )
+        return ElicitationResult(action="decline")
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([fallback]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert elicit_calls == [
+        agy_elicitation_id(_CASCADE, _TRAJ, 2),
+        agy_elicitation_id(_CASCADE, _TRAJ, 3),
+    ]
+    assert len(deliver.calls) == 1
+    assert deliver.calls[0]["step_index"] == 3
+    assert deliver.calls[0]["payload"] == {"permission": {"allow": False}}
+    assert inject_tui.calls == [["4", "Enter"]]
+
+
+@pytest.mark.asyncio
+async def test_changed_prompt_reusing_step_ids_does_not_deliver() -> None:
+    """A changed prompt cannot inherit the verdict cached under the same ids."""
+    pending = _pending_permission(step_index=2, persist_pattern="ls")
+    changed = _permission_step(step_index=2, persist_pattern="rm")
+    request, calls = _elicitation_returner(ElicitationResult(action="accept"))
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([changed]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert len(calls) == 1
+    assert deliver.calls == []
+    assert inject_tui.calls == []
+
+
+@pytest.mark.asyncio
+async def test_fallback_gate_with_matching_pattern_still_types_persist_entry() -> None:
+    """agy's own same-gate timeout-retry still honors the persist choice.
+
+    The surfaced gate timed out and agy re-asked the SAME command with the SAME
+    persist pattern at a new index. The on-screen menu offers the pattern the
+    user consented to, so a persist accept must still type the always-allow
+    entry rather than being needlessly downgraded.
+    """
+    pending = _pending_permission(step_index=2, persist_pattern="ls")
+    fallback = _permission_step(step_index=3, persist_pattern="ls")
+    result = ElicitationResult.model_validate(
+        {"action": "accept", "_meta": {"persist": "session"}}
+    )
+    request, _ = _elicitation_returner(result)
+    deliver = _DeliverRecorder()
+    inject_tui = _InjectTuiRecorder()
+
+    await bridge_interaction(
+        _CASCADE,
+        pending,
+        port=52548,
+        get_steps=_steps_returner([fallback]),
+        request_elicitation=request,
+        deliver=deliver,
+        inject_tui=inject_tui,
+    )
+
+    assert deliver.calls == []
+    assert inject_tui.calls == [["2", "Enter"]]
 
 
 @pytest.mark.asyncio
