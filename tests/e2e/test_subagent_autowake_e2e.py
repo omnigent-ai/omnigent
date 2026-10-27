@@ -160,6 +160,7 @@ def _configure_dispatch_flow(
     researcher_model: str,
     title: str = "auth",
     child_args: str = "Research auth patterns",
+    child_session_id: str | None = None,
 ) -> None:
     """Configure mock queues for a single dispatch-and-autowake flow.
 
@@ -176,7 +177,15 @@ def _configure_dispatch_flow(
         [
             {
                 "tool_calls": [
-                    _sys_session_send_tool_call("researcher", title, child_args),
+                    {
+                        "call_id": "call_1",
+                        "name": "sys_session_send",
+                        "arguments": json.dumps(
+                            {"session_id": child_session_id, "args": child_args}
+                        ),
+                    }
+                    if child_session_id
+                    else _sys_session_send_tool_call("researcher", title, child_args),
                 ],
             },
             {"text": "Dispatched researcher, waiting for result."},
@@ -195,11 +204,13 @@ def _configure_dispatch_flow(
 # ─── Tests ───────────────────────────────────────────────────
 
 
+@pytest.mark.parametrize("by_id", [False, True], ids=["named", "session-id"])
 def test_subagent_completion_auto_wakes_idle_parent(
     http_client: httpx.Client,
     live_runner_id: str,
     autowake_test_agent: tuple[str, str, str],
     mock_llm_server_url: str,
+    by_id: bool,
 ) -> None:
     """Dispatching a sub-agent then sending nothing else still surfaces its
     result, because the parent is auto-woken when the sub-agent completes.
@@ -211,17 +222,31 @@ def test_subagent_completion_auto_wakes_idle_parent(
        posts the wake notice, and the parent takes a continuation turn.
     """
     parent_name, parent_model, researcher_model = autowake_test_agent
+    session_id = create_runner_bound_session(
+        http_client,
+        agent_name=parent_name,
+        runner_id=live_runner_id,
+    )
+    child_session_id = None
+    if by_id:
+        parent = http_client.get(f"/v1/sessions/{session_id}").json()
+        child = http_client.post(
+            "/v1/sessions",
+            json={
+                "agent_id": parent["agent_id"],
+                "parent_session_id": session_id,
+                "sub_agent_name": "researcher",
+                "title": "researcher:auth",
+            },
+        )
+        child.raise_for_status()
+        child_session_id = child.json()["id"]
     reset_mock_llm(mock_llm_server_url)
     _configure_dispatch_flow(
         mock_llm_server_url,
         parent_model=parent_model,
         researcher_model=researcher_model,
-    )
-
-    session_id = create_runner_bound_session(
-        http_client,
-        agent_name=parent_name,
-        runner_id=live_runner_id,
+        child_session_id=child_session_id,
     )
     dispatch_response_id = send_user_message_to_session(
         http_client,

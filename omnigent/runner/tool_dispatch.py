@@ -595,7 +595,9 @@ def build_native_relay_tool_schemas(spec: AgentSpec | None) -> list[_JsonObject]
                 _append(function)
     else:
         from omnigent.tools.builtins.policy import SysAddPolicyTool, SysPolicyRegistryTool
+        from omnigent.tools.builtins.spawn import SysSessionSendTool
 
+        _append(SysSessionSendTool(sub_specs={}).get_schema()["function"])
         for _cls in (
             ListCommentsTool,
             UpdateCommentTool,
@@ -2475,7 +2477,10 @@ async def _execute_subagent_tool(
     session_inbox: asyncio.Queue[_JsonObject] | None = None,
 ) -> str:
     """
-    Dispatch a sub-agent tool call (``sys_session_send``).
+    Dispatch ``sys_session_send`` to a child or an owned peer session.
+
+    Non-child targets use the orchestration gate and return an acknowledgement;
+    callers poll their history for results. No child work is registered for peers.
 
     Creates or reuses a child session on the server, registers a
     runner-local launch entry, posts the child message, and returns a
@@ -2511,11 +2516,6 @@ async def _execute_subagent_tool(
         return "Error: sys_session_send requires server_client"
     if conversation_id is None:
         return "Error: sys_session_send requires conversation_id"
-    if session_inbox is not None:
-        _subagent_work._session_inboxes_ref.setdefault(conversation_id, session_inbox)
-    elif conversation_id not in _subagent_work._session_inboxes_ref:
-        return "Error: sys_session_send requires parent session inbox"
-
     try:
         model = _subagent_model_from_args(args)
     except ValueError as exc:
@@ -2541,7 +2541,7 @@ async def _execute_subagent_tool(
     except (ValueError, TypeError) as exc:
         return f"Error: sys_session_send invalid 'cost_budget': {exc}"
 
-    # By-session-id mode: post to an existing direct child instead of
+    # By-session-id mode: post to an existing session instead of
     # spawning/continuing a named (agent, title) sub-agent.
     target_session_id = args.get("session_id")
     if isinstance(target_session_id, str) and target_session_id:
@@ -2586,20 +2586,20 @@ async def _execute_subagent_tool(
                 "existing session. Re-send without 'cost_budget' to continue "
                 f"session {target_session_id!r}."
             )
-        dispatch_created_by = await _session_turn_actor(
-            server_client=server_client,
-            conversation_id=conversation_id,
-        )
         return await _send_to_existing_session(
             target_session_id,
             message,
             server_client=server_client,
             conversation_id=conversation_id,
             publish_event=publish_event,
-            created_by=dispatch_created_by,
+            session_inbox=session_inbox,
         )
 
     # Named mode: (agent, title) spawn-or-continue.
+    if session_inbox is not None:
+        _subagent_work._session_inboxes_ref.setdefault(conversation_id, session_inbox)
+    elif conversation_id not in _subagent_work._session_inboxes_ref:
+        return "Error: sys_session_send requires parent session inbox"
     sub_agent_name = args.get("agent")
     llm_title_hint = args.get("title")
     if not isinstance(sub_agent_name, str) or not sub_agent_name:
@@ -3164,21 +3164,14 @@ async def _send_to_existing_session(
     server_client: httpx.AsyncClient,
     conversation_id: str,
     publish_event: Callable[[str, _JsonObject], None] | None = None,
-    created_by: str | None = None,
+    session_inbox: asyncio.Queue[_JsonObject] | None = None,
 ) -> str:
     """
-    Post a message to an existing direct-child session, return a handle.
+    Send to a direct child with tracked completion, or to a gated peer.
 
-    The by-session-id mode of ``sys_session_send``. **Child-only**: the
-    target must be a direct child of the caller (its
-    ``parent_session_id`` equals ``conversation_id``), so a caller can
-    only drive sessions inside its own subtree — never a sibling or an
-    unrelated session it merely has access to. Looks the target up to
-    verify parentage (404 → ``session_not_found``; wrong parent or
-    denied read → ``session_out_of_tree``), registers the child→parent
-    fan-out and work mappings, posts the message, and returns a
-    ``running`` handle immediately — the completion lands in the parent's
-    ``sys_read_inbox`` queue, matching named-mode send.
+    Parentage selects delivery semantics, not peer authorization. Non-children
+    go through the same server gate as ``sys_session_message`` and never receive
+    an ordinary child message or register work in the caller's inbox.
 
     The child's ``(agent, title)`` identity, carried by the handle, the
     launching tool result, and the completion wake notice, comes from
@@ -3186,13 +3179,13 @@ async def _send_to_existing_session(
     the snapshot's ``sub_agent_name`` / ``agent_name`` with the verbatim
     title, so a ``sys_session_create`` child is named like a named one.
 
-    :param target_session_id: The existing child session id, e.g.
+    :param target_session_id: The existing session id, e.g.
         ``"conv_abc123"``.
     :param message: The user message text to post.
     :param server_client: HTTP client pointed at the Omnigent server.
-    :param conversation_id: The caller's own session id — the required
-        parent of the target.
-    :returns: JSON handle on success; a JSON/text error otherwise.
+    :param conversation_id: The caller's own session id.
+    :param session_inbox: Parent inbox, required only for child sends.
+    :returns: Child handle, peer acknowledgement, or a JSON/text error.
     """
     from omnigent.runner import subagent_work as _subagent_work
 
@@ -3208,16 +3201,33 @@ async def _send_to_existing_session(
         return f"Error: sys_session_send lookup returned {snap.status_code}"
     snap_data = snap.json()
     if snap_data.get("parent_session_id") != conversation_id:
-        return json.dumps(
-            {
-                "error": "session_out_of_tree",
-                "conversation_id": target_session_id,
-                "message": (
-                    "target is not a direct child of the calling session; "
-                    "sys_session_send by session_id is child-only."
-                ),
-            }
+        from omnigent.runner.session_message import execute_message_tool
+
+        result = json.loads(
+            await execute_message_tool(
+                {"session_id": target_session_id, "message": message},
+                server_client,
+                conversation_id,
+            )
         )
+        if "error" not in result:
+            result.update(
+                reply_mode="poll",
+                message=(
+                    "No automatic reply or inbox completion for this session. "
+                    "Use sys_session_get_info/sys_session_get_history to check results. "
+                    "Acceptance does not confirm execution."
+                ),
+            )
+        return json.dumps(result)
+    if session_inbox is not None:
+        _subagent_work._session_inboxes_ref.setdefault(conversation_id, session_inbox)
+    elif conversation_id not in _subagent_work._session_inboxes_ref:
+        return "Error: sys_session_send requires parent session inbox"
+    created_by = await _session_turn_actor(
+        server_client=server_client,
+        conversation_id=conversation_id,
+    )
     if is_session_closed(snap_data.get("labels"), snap_data.get("title")):
         return json.dumps(
             {

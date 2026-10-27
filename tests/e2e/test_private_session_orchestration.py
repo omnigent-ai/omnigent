@@ -77,7 +77,7 @@ def test_private_manager_launch_send_read_and_sharing(
                         responses,
                         match=marker,
                         required_tools=[
-                            "mcp__omnigent" if harness == "codex-native" else "sys_session_message"
+                            "mcp__omnigent" if harness == "codex-native" else "sys_session_send"
                         ],
                     )
 
@@ -198,8 +198,8 @@ def test_private_manager_launch_send_read_and_sharing(
                     agent = client.get(f"/v1/sessions/{worker}").json()["agent_id"]
                     calls = [
                         tool(
-                            "sys_session_message",
-                            {"session_id": worker, "message": "MUST_NOT_DELIVER"},
+                            "sys_session_send",
+                            {"session_id": worker, "args": "MUST_NOT_DELIVER"},
                             "disabled-message",
                         ),
                         tool(
@@ -243,8 +243,8 @@ def test_private_manager_launch_send_read_and_sharing(
                         {
                             "tool_calls": [
                                 tool(
-                                    "sys_session_message",
-                                    {"session_id": worker, "message": "WORKER_TASK"},
+                                    "sys_session_send",
+                                    {"session_id": worker, "args": "WORKER_TASK"},
                                     "send",
                                 )
                             ]
@@ -254,6 +254,8 @@ def test_private_manager_launch_send_read_and_sharing(
                 )
                 send(manager, "MANAGER_SEND")
                 wait_text(manager, "MANAGER_SENT")
+                assert "reply_mode" in json.dumps(tool_results("send"))
+                assert "poll" in json.dumps(tool_results("send"))
                 wait_text(worker, "WORKER_RESULT")
                 assert "WORKER_RESULT" not in json.dumps(items(manager)), (
                     "No automatic reply forwarding"
@@ -395,8 +397,8 @@ def test_private_manager_launch_send_read_and_sharing(
                         {
                             "tool_calls": [
                                 tool(
-                                    "sys_session_message",
-                                    {"session_id": worker, "message": "MUST_NOT_DELIVER"},
+                                    "sys_session_send",
+                                    {"session_id": worker, "args": "MUST_NOT_DELIVER"},
                                     "blocked",
                                 )
                             ]
@@ -415,10 +417,10 @@ def test_private_manager_launch_send_read_and_sharing(
                         {
                             "tool_calls": [
                                 tool(
-                                    "sys_session_message",
+                                    "sys_session_send",
                                     {
                                         "session_id": worker,
-                                        "message": "SCHEDULED_DELIVERED",
+                                        "args": "SCHEDULED_DELIVERED",
                                     },
                                     "scheduled-message",
                                 )
@@ -494,10 +496,10 @@ def test_private_manager_launch_send_read_and_sharing(
                         {
                             "tool_calls": [
                                 tool(
-                                    "sys_session_message",
+                                    "sys_session_send",
                                     {
                                         "session_id": worker,
-                                        "message": "SIDE_CHAT_MUST_NOT_DELIVER",
+                                        "args": "SIDE_CHAT_MUST_NOT_DELIVER",
                                     },
                                     "side-chat-message",
                                 )

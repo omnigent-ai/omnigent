@@ -433,23 +433,23 @@ class ToolManager:
         ``tools.agents`` (declared sub-agents) or the top-level
         ``spawn: true`` flag:
 
-        - ``tools.agents`` registers ``sys_session_send`` (named
-          ``(agent, title)`` mode limited to the declared-type enum,
-          plus ``session_id`` mode for driving existing children),
+        - ``tools.agents`` adds the named ``(agent, title)`` mode to
+          ``sys_session_send``, limited to the declared-type enum, plus
           ``sys_session_close``, and ``sys_list_models`` (per-worker
           model availability for picking a valid ``args.model``) — the
           agent may spawn THE SPECIFIED LIST of sub-agents, nothing else.
         - ``spawn: true`` additionally registers ``sys_session_create``
           — launching arbitrary children from an existing agent_id or a
           custom locally-authored bundle (``config_path``). It also
-          registers send/close (an agent must be able to drive and
+          registers close (an agent must be able to drive and
           tombstone the children it creates); without declared
           sub-agents, send's schema omits the named-mode parameters.
 
-        Send/close remain child-only. Create also supports independent
-        placements behind the orchestration gate. ``sys_session_message``
-        is always advertised; the deployment flag and server ownership/privacy
-        checks authorize peer sends. Sharing retains its separate opt-in.
+        Send by ID and its peer-only compatibility tool ``sys_session_message``
+        are always advertised. Direct-child sends retain tracked completion;
+        other sends use the deployment flag and server ownership/privacy checks.
+        Close remains child-only; create supports gated independent placements.
+        Sharing retains its separate opt-in.
         Spec opt-ins control advertisement, not server authority.
         (Cancellation uses the unified ``sys_cancel_task``; inspection
         is via inbox auto-delivery.)
@@ -457,6 +457,12 @@ class ToolManager:
         from omnigent.tools.builtins.session_message import SysSessionMessageTool
 
         self._tools[SysSessionMessageTool.name()] = SysSessionMessageTool()
+        sub_specs = (
+            {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}
+            if self._spec.tools.agents or self._spec.spawn
+            else {}
+        )
+        self._tools[SysSessionSendTool.name()] = SysSessionSendTool(sub_specs=sub_specs)
         # Read-only discovery tools: always available.
         self._tools[SysSessionListTool.name()] = SysSessionListTool()
         self._tools[SysSessionGetHistoryTool.name()] = SysSessionGetHistoryTool()
@@ -476,14 +482,10 @@ class ToolManager:
                 allow_public=self._spec.agent_session_sharing is SharePolicy.PUBLIC,
             )
 
-        # send + close: opt-in via declared sub-agents or spawn: true.
+        # Spawn lifecycle: opt-in via declared sub-agents or spawn: true.
         if not (self._spec.tools.agents or self._spec.spawn):
             return
 
-        sub_specs = {sa.name: sa for sa in self._spec.sub_agents if sa.name is not None}
-        self._tools[SysSessionSendTool.name()] = SysSessionSendTool(
-            sub_specs=sub_specs,
-        )
         self._tools[SysSessionCloseTool.name()] = SysSessionCloseTool()
         # Model awareness pairs with the dispatch grant: the per-worker
         # listing exists to pick a valid ``args.model`` for send.

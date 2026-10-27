@@ -13,7 +13,10 @@ class SysSessionMessageTool(Tool):
     @classmethod
     def description(cls) -> str:
         return (
-            "Send work to another session owned by the same user. Requires session "
+            "Compatibility tool for peer delivery. Prefer sys_session_send(session_id, args), "
+            "which also tracks direct-child replies. This tool keeps peer semantics even "
+            "for children: no automatic reply. Send work to another session owned by the "
+            "same user. Requires session "
             "orchestration enabled and a private sending session, including "
             "its side-chat source chain. The receiver "
             "may be shared: its readers will see your message. It uses normal queue/steering "

@@ -17,6 +17,9 @@ def test_native_message_schema(spec):
     schemas = build_native_relay_tool_schemas(spec)
     schema = next(s for s in schemas if s["name"] == "sys_session_message")
     assert schema["parameters"]["required"] == ["session_id", "message"]
+    send = next(s for s in schemas if s["name"] == "sys_session_send")
+    assert set(send["parameters"]["properties"]) == {"session_id", "args"}
+    assert "reply_mode='poll'" in send["description"]
 
 
 @pytest.mark.asyncio
@@ -114,7 +117,8 @@ async def test_independent_creation_does_not_fall_back_on_unsupported_server(pla
     "failure", ["timeout", "non_json", "null", "list", "empty", "non_bool", 408, 429, 503]
 )
 @pytest.mark.parametrize("after_routing", [False, True])
-async def test_message_timeout_is_not_retried(failure, after_routing):
+@pytest.mark.parametrize("tool_name", ["sys_session_send", "sys_session_message"])
+async def test_message_timeout_is_not_retried(failure, after_routing, tool_name):
     requests = []
 
     def timeout(request):
@@ -137,8 +141,13 @@ async def test_message_timeout_is_not_retried(failure, after_routing):
         transport=httpx.MockTransport(timeout), base_url="http://server"
     ) as client:
         result = await execute_tool(
-            tool_name="sys_session_message",
-            arguments=json.dumps({"session_id": uuid4().hex, "message": "Work"}),
+            tool_name=tool_name,
+            arguments=json.dumps(
+                {
+                    "session_id": uuid4().hex,
+                    "args" if tool_name == "sys_session_send" else "message": "Work",
+                }
+            ),
             server_client=client,
             conversation_id="manager",
         )

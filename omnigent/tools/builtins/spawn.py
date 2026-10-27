@@ -64,7 +64,7 @@ _CLOSED_TITLE_INFIX = CLOSED_TITLE_INFIX
 
 class SysSessionSendTool(Tool):
     """
-    Send a message to a named sub-agent — auto-create-or-continue.
+    Send work to an existing session, or spawn-or-continue a named child.
 
     Sub-agent sessions are separate Omnigent agent sessions (own
     conversation, visible in the session tree) — distinct from any
@@ -77,16 +77,14 @@ class SysSessionSendTool(Tool):
       subsequent calls with the same pair continue it (the
       sub-agent sees its full prior history plus the new ``args``).
     - **By session id** — pass ``session_id`` to post to an
-      **existing** child session (e.g. one returned by
-      ``sys_session_create``). This is a child-only write: the
-      target must be a direct child of the caller
-      (``parent_session_id == caller``), so an orchestrator can
-      only drive sessions inside its own subtree.
+      **existing** session. Direct children keep tracked completion;
+      other sessions use the owner orchestration gate and require polling.
 
     Exactly one of ``(agent + title)`` or ``session_id`` must be
     given, always with ``args``.
 
-    Returns a JSON handle in the same shape as
+    For peers, returns a delivery acknowledgement with ``reply_mode: "poll"``.
+    For direct children, returns a JSON handle in the same shape as
     :class:`omnigent.runtime.workflow._AsyncToolHandle`:
     ``{task_id, kind: "sub_agent", agent, title, conversation_id,
     status, message}``. The result auto-delivers via the unified
@@ -125,38 +123,21 @@ class SysSessionSendTool(Tool):
     def description(cls) -> str:
         """:returns: Human-readable description of the tool."""
         return (
-            "Send a message to a sub-agent session. Sub-agent sessions "
-            "are separate Omnigent agent sessions (own conversation, "
-            "visible in the session tree) — distinct from any built-in "
-            "subagent/Task tool your harness provides. Two modes: pass "
-            "(agent, title) to spawn-or-continue a named sub-agent (the "
-            "first call with a pair creates it, later calls continue "
-            "it); or pass session_id to post to an existing child "
-            "session you created (e.g. via sys_session_create) — this "
-            "is confined to your direct children. Provide exactly one "
-            "of (agent + title) or session_id, always with args. "
-            "Returns the child's output when its turn completes. To run "
-            "multiple sessions in parallel, emit multiple "
-            "sys_session_send tool_calls in the same response with a "
-            "distinct task-based title for each independent session — "
-            "they dispatch concurrently. Reusing a title continues the "
-            "same session rather than starting a second concurrent turn: if "
-            "its turn is idle this starts a new turn; if a turn is still "
-            "running the message is delivered into that turn and consumed at "
-            "its next step boundary (so you can nudge a running sub-agent), "
-            "but a turn wedged inside a single long-running step won't see it "
-            "until it yields — cancel with sys_cancel_task if you need to "
-            "stop such a turn. Either way the reply arrives once via "
-            "sys_read_inbox; don't resend to await it. "
-            "To attach previously-uploaded files, "
-            "pass their file ids via the object args form's 'file_ids' "
-            "list on the first named (agent, title) send only; file_ids "
-            "cannot be used with session_id or when continuing an existing "
-            "named session. When a dispatched child finishes, the Omnigent "
-            f"runtime posts `{SUBAGENT_WAKE_NOTICE_SHAPE}` into this session "
-            "as a new message, starting a turn for you if you are idle. That "
-            "notice comes from the runtime, not from a person; respond by "
-            "calling sys_read_inbox to collect the result."
+            "Send work to an existing Omnigent session by session_id, always with args. "
+            "These are separate conversations, distinct from your harness's built-in Task tool. "
+            "Direct children return a tracked task handle: their result arrives once via "
+            "sys_read_inbox, and sys_cancel_task can interrupt them. When a child finishes, "
+            f"the runtime posts `{SUBAGENT_WAKE_NOTICE_SHAPE}` to wake you if idle; "
+            "that notice is not from a person. Call sys_read_inbox to collect its result. "
+            "Other sessions must have the same owner; sending requires orchestration enabled "
+            "and a private sender, including its side-chat source chain. "
+            "The receiver may be shared: its readers see your message. Peer messages are "
+            "limited to 1–8000 characters and return reply_mode='poll': no automatic reply, "
+            "inbox completion or cancellation handle. Read sys_session_get_info/"
+            "sys_session_get_history for results. Acceptance does not confirm execution; "
+            "destination policy may still deny queued work during startup. "
+            "Do not automatically retry uncertain delivery. Sending steers a running session "
+            "at its next step boundary or starts a turn when idle."
         )
 
     def __init__(self, sub_specs: dict[str, AgentSpec]) -> None:
@@ -258,22 +239,14 @@ def _build_sys_session_send_schema(
                 ),
             },
         }
-    description = (
-        SysSessionSendTool.description()
-        if sub_specs
-        else (
-            "Send a message to an existing child session you created "
-            "(e.g. via sys_session_create), identified by session_id. "
-            "Child sessions are separate Omnigent agent sessions (own "
-            "conversation, visible in the session tree) — not your "
-            "harness's built-in subagent/Task tool, which remains the "
-            "right choice for quick in-context delegation. "
-            "Confined to your direct children. Returns the child's "
-            "output when its turn completes. To run multiple sessions "
-            "in parallel, emit multiple sys_session_send tool_calls in "
-            "the same response — they dispatch concurrently."
+    description = SysSessionSendTool.description()
+    if sub_specs:
+        description += (
+            " Alternatively pass (agent, title) to spawn-or-continue a declared sub-agent. "
+            "Use exactly one addressing mode. Reusing a title continues the same child. "
+            "For parallel work, emit multiple calls with distinct task-based titles. "
+            "Optional args.file_ids attach uploaded files on the first named send only."
         )
-    )
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
     # at least one declared sub-agent opts in via
     # ``executor.config.allowed_harnesses``. Specs without the opt-in keep the
@@ -303,8 +276,7 @@ def _build_sys_session_send_schema(
     )
     args_description = (
         (
-            "The user-input message to send to the sub-agent. The sub-agent "
-            "treats this as the first user turn in its conversation. Pass a "
+            "The message to send. Pass a "
             "plain string for the normal contract, or pass "
             "{input, purpose, model, harness, cost_budget} when a spec-level "
             "policy requires explicit dispatch metadata, a per-dispatch model "
@@ -313,8 +285,7 @@ def _build_sys_session_send_schema(
         )
         if harness_opt_in
         else (
-            "The user-input message to send to the sub-agent. The sub-agent "
-            "treats this as the first user turn in its conversation. Pass a "
+            "The message to send. Pass a "
             "plain string for the normal contract, or pass "
             "{input, purpose, model, cost_budget} when a spec-level policy "
             "requires explicit dispatch metadata, a per-dispatch model "
@@ -333,11 +304,9 @@ def _build_sys_session_send_schema(
                     "session_id": {
                         "type": "string",
                         "description": (
-                            "By-session-id mode: post to an existing "
-                            "child session (e.g. one returned by "
-                            "sys_session_create), e.g. 'conv_abc123'. "
-                            "Must be a direct child of the calling "
-                            "session. Use instead of agent + title."
+                            "Existing destination session ID. Direct children reply via inbox; "
+                            "other owned sessions require polling their history. "
+                            "Use instead of agent + title."
                         ),
                     },
                     "args": {
@@ -543,7 +512,7 @@ class SysSessionListTool(Tool):
             "created_by_session_id (creation origin for independent workers). "
             "Match that field to your session ID to find workers you created. "
             "Inspect via sys_agent_get / sys_session_get_info; use sys_session_send "
-            "for children or sys_session_message for independent sessions. "
+            "for both children and other owned sessions. "
             "Pass agent_name to filter the global list to "
             "sessions running that agent, and include_archived to also list "
             "archived sessions (marked archived). Calls without pagination keep "
@@ -903,7 +872,7 @@ class SysSessionCreateTool(Tool):
     Returns a handle ``{conversation_id, agent_id, title, status}``. The
     session runs asynchronously — use ``sys_session_get_history`` /
     ``sys_session_get_info`` to monitor it. Use ``sys_session_send`` for
-    further child work and ``sys_session_message`` for independent sessions.
+    further work in either placement.
     """
 
     @classmethod
@@ -942,11 +911,11 @@ class SysSessionCreateTool(Tool):
             "An independent worker's optional "
             "first message must contain 1–8000 characters. "
             "Independent sessions do not forward replies: "
-            "read their status/history, and use sys_session_message for subsequent work. "
+            "read their status/history, and use sys_session_send for subsequent work. "
             "Returns {conversation_id, agent_id, title, status}; the "
             "session runs asynchronously — monitor it with "
             "sys_session_get_history / sys_session_get_info or drive it "
-            "with sys_session_send for children or sys_session_message for independent sessions."
+            "with sys_session_send for both children and other owned sessions."
         )
 
     def get_schema(self) -> dict[str, Any]:
