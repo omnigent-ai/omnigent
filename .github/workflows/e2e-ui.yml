@@ -76,7 +76,7 @@ jobs:
   setup:
     name: UI coverage scope
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -115,7 +115,7 @@ jobs:
     name: build codex-parity sidecar
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -159,7 +159,6 @@ jobs:
     # omits the server, runner, harness CLIs, bubblewrap, tmux, and sidecar.
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}' && (needs.setup.outputs.ui == 'full' || needs.setup.outputs.ui == 'dependency')
-    # Playwright 1.60 cannot install Chromium on ubuntu-26.04, ubuntu-latest's new image.
     runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
@@ -243,7 +242,6 @@ jobs:
     # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: [setup, build-sidecar]
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    # Playwright 1.60 cannot install Chromium on ubuntu-26.04, ubuntu-latest's new image.
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -369,7 +367,7 @@ jobs:
         run: |
           # Always exclude @visual: the UI diff snapshot runs in its own
           # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
-          # comparison environment; on this unpinned ubuntu-latest it would
+          # comparison environment; on this standard runner image it would
           # flake on font drift. Add the nightly exclusion for PR/push runs.
           MARKER="not visual"
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
@@ -506,7 +504,7 @@ jobs:
     name: E2E UI result
     if: always()
     needs: [setup, build-sidecar, browser-contract, e2e-ui]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require successful test selection
