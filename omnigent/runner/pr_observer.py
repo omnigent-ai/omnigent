@@ -22,6 +22,7 @@ from omnigent.policies.builtins._shell import (
     real_invocation_tokens,
     unwrap_shell_command,
 )
+from omnigent.runner import pr_reports
 from omnigent.runner.git_providers import PullRequestFacet, ShellPrOp, ShellSegment
 from omnigent.runner.git_providers.tool_output import output_text, pr_reference, result_objects
 from omnigent.runner.session_prs import PullRequestRef, SessionPrRegistry, observation_key
@@ -342,6 +343,7 @@ def _record_resolved_prs(
             source=source,
             observation_id=observation_id,
         )
+        pr_reports.notify(session_id)
     except Exception:  # noqa: BLE001 — optional lookups must never affect tool execution
         _log_provider_failure(provider_id, "resolve_result")
     finally:
@@ -370,6 +372,8 @@ def observe_tool_completion(
             source=source,
             observation_id=observation_key(source, call_id, [tool_name, arguments, result]),
         )
+        if references:
+            pr_reports.notify(session_id)
         if not _failed(result):
             for index, (provider_id, op) in enumerate(
                 _shell_operations(tool_name, arguments, _facets())

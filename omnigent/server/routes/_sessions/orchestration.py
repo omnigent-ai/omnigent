@@ -85,6 +85,7 @@ from omnigent.native.native_coding_agents import (
     native_coding_agent_for_harness,
     native_coding_agent_for_wrapper_label,
 )
+from omnigent.onboarding.provider_config import harness_owns_its_credential
 from omnigent.policies.types import (
     ElicitationRequest,
     EvaluationContext,
@@ -149,6 +150,7 @@ from omnigent.server.bundles import (
     validate_agent_bundle,
 )
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
+from omnigent.server.failed_status_diagnostics import failed_status_intake_attributes
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.managed_hosts import (
     MANAGED_REPO_LABEL_KEY,
@@ -380,6 +382,7 @@ from omnigent.server.schemas import (
     SessionEventInput,
     SessionListItem,
     SessionModelEvent,
+    SessionPullRequestSummary,
     SessionResponse,
     SessionStatusEvent,
     SessionUsageEvent,
@@ -403,6 +406,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
@@ -1182,6 +1186,8 @@ def _build_session_list_item(
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
     harness: str | None = None,
+    pull_request: SessionPullRequestSummary | None = None,
+    pull_requests_synced: bool | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -1224,6 +1230,10 @@ def _build_session_list_item(
         ``comments_updated_at=None`` so the two states look identical
         on the wire.
     :param harness: Resolved session harness from the batch's cached agent specs.
+    :param pull_request: The conversation's first linked pull request,
+        from the server's PR store; ``None`` when it has none.
+    :param pull_requests_synced: Whether the server has imported the
+        conversation's PRs, or ``None`` without PR storage.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -1285,6 +1295,8 @@ def _build_session_list_item(
         search_snippet=conv.search_snippet,
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
+        pull_request=pull_request,
+        pull_requests_synced=pull_requests_synced,
     )
 
 
@@ -4581,6 +4593,8 @@ async def _bind_and_launch_managed_runner(
     # From here a shutdown may cancel the launch: the host's replica finishes it.
     if (launch_task := asyncio.current_task()) is not None:
         _unbound_managed_launch_tasks.discard(launch_task)
+    if (launch := tracker.get(session_id)) is not None:
+        launch.bound.set()
     if relaunch_host is not None:
         await _note_workspace_reset_on_recreate(session_id, conversation_store)
     # Host bound; what remains is launching the runner and waiting
@@ -9223,6 +9237,18 @@ async def _relay_runner_stream_once(
                                     else None
                                 ),
                                 failure_origin="relayed_runner_status",
+                                failure_intake=(
+                                    failed_status_intake_attributes(
+                                        event,
+                                        runner_id=runner_id,
+                                        connection=getattr(resp, "extensions", {}).get(
+                                            "omnigent_runner_connection"
+                                        ),
+                                        source="relay_stream",
+                                    )
+                                    if status == "failed"
+                                    else None
+                                ),
                                 failure_context=event.get("failure_context"),
                                 blocked_on=(
                                     raw_blocked_on
@@ -11236,6 +11262,7 @@ async def _create_session_from_existing_agent(
     artifact_store: ArtifactStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     project_store: ProjectStore | None = None,
+    created_by_session_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -11265,6 +11292,7 @@ async def _create_session_from_existing_agent(
         ``file_id`` references in ``initial_items`` before forwarding
         to the runner.
     :param artifact_store: Optional binary content store for the same.
+    :param created_by_session_id: Server-authorized source of an independent worker.
     :returns: The newly created session snapshot and its conversation row.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -11805,6 +11833,8 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    if created_by_session_id is not None:
+        initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
     initial_labels.update(registry_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (
@@ -13444,6 +13474,7 @@ async def _get_session_snapshot(
     llm_model: str | None = None
     context_window: int | None = None
     agent_name: str | None = None
+    harness_owns_model = False
     if agent_store is not None and agent_cache is not None and conv.agent_id is not None:
         try:
             agent = await asyncio.to_thread(agent_store.get, conv.agent_id)
@@ -13480,6 +13511,11 @@ async def _get_session_snapshot(
                         else:
                             resolved_spec = _sub_spec
                     if resolved_spec is not None:
+                        # A self-authenticated harness (own-auth ACP) picks its
+                        # own model: the spec's pin is not what the session
+                        # runs, so claim neither it nor its context window.
+                        effective_harness = conv.harness_override or _spec_harness(resolved_spec)
+                        harness_owns_model = harness_owns_its_credential(effective_harness)
                         # Prefer the spec's name over the agent row's: a
                         # switch-created session-scoped clone is named
                         # "<builtin> (switch ag_…)" for row disambiguation,
@@ -13487,12 +13523,12 @@ async def _get_session_snapshot(
                         # carries the clean identity (e.g. "claude-native-ui").
                         if resolved_spec.name:
                             agent_name = resolved_spec.name
-                        llm_model = resolved_spec.executor.model
+                        llm_model = None if harness_owns_model else resolved_spec.executor.model
 
                         # Offload: may fetch a provider catalog (blocking IO).
                         context_window = await asyncio.to_thread(
                             resolve_effective_context_window,
-                            resolved_spec.executor.context_window,
+                            None if harness_owns_model else resolved_spec.executor.context_window,
                             llm_model,
                             model_override=conv.model_override,
                         )

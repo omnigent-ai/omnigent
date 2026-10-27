@@ -181,6 +181,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     pi: "Pi",
     antigravity: "Antigravity",
     copilot: "Copilot",
+    grok: "Grok Build",
   }),
 }));
 vi.mock("@/lib/goalApi", async (importOriginal) => ({
@@ -712,6 +713,8 @@ describe("Composer send shortcut", () => {
     const tooltip = await screen.findByRole("tooltip");
 
     expect(within(tooltip).getByText("Send")).toBeInTheDocument();
+    expect(tooltip).toHaveClass("menu-surface", "bg-popover", "text-popover-foreground");
+    expect(tooltip).not.toHaveClass("bg-slate-900", "text-slate-100");
     expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
   });
 
@@ -1036,6 +1039,52 @@ describe("Composer slash-command menu", () => {
     expect(props.onSend).not.toHaveBeenCalled();
   });
 
+  function renderClearComposer(
+    harness: "claude-native" | "codex-native",
+    advertised: Partial<typeof FALLBACK_SERVER_INFO> | "loading",
+  ) {
+    const { sessionHarness } = useChatStore.getState();
+    onTestFinished(() => useChatStore.setState({ sessionHarness }));
+    useChatStore.setState({ sessionHarness: harness });
+    const clearContext = vi.spyOn(useChatStore.getState(), "clearContext").mockResolvedValue();
+    const props = composerProps({ isNativeWrapper: true });
+    render(
+      <CapabilitiesProvider
+        info={advertised === "loading" ? "loading" : { ...FALLBACK_SERVER_INFO, ...advertised }}
+      >
+        <Composer {...props} />
+      </CapabilitiesProvider>,
+    );
+    fireEvent.change(textarea(), { target: { value: "/cle" } });
+    return { clearContext, onSend: props.onSend };
+  }
+
+  it.each(["claude-native", "codex-native"] as const)(
+    "%s /clear runs the clear control when the server accepts it",
+    (harness) => {
+      const { clearContext, onSend } = renderClearComposer(harness, {
+        session_event_types: ["message", "clear"],
+      });
+      fireEvent.click(screen.getByTestId("slash-menu-item-clear"));
+      expect(clearContext).toHaveBeenCalledOnce();
+      expect(onSend).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ["claude-native", {}],
+    ["claude-native", { session_event_types: ["message"] }],
+    ["codex-native", {}],
+    ["claude-native", "loading"],
+  ] as const)("%s sends a typed /clear as text when server info is %o", (harness, advertised) => {
+    const { clearContext, onSend } = renderClearComposer(harness, advertised);
+    expect(screen.queryByTestId("slash-menu-item-clear")).toBeNull();
+    fireEvent.change(textarea(), { target: { value: "/clear" } });
+    fireEvent.keyDown(textarea(), { key: "Enter" });
+    expect(clearContext).not.toHaveBeenCalled();
+    expect(onSend).toHaveBeenCalledExactlyOnceWith("/clear", undefined);
+  });
+
   it("Tab completes a match found only mid-name (exercises menuMatches, not just the render filter)", () => {
     render(<Composer {...composerProps()} />);
     const ta = textarea();
@@ -1261,10 +1310,13 @@ describe("Composer slash-command submit routing", () => {
     useChatStore.setState({ sessionHarness: "claude-native", clearContext });
     try {
       const onShowReconnectHelp = vi.fn();
+      const info = { ...FALLBACK_SERVER_INFO, session_event_types: ["clear"] };
       const { rerender } = render(
-        <Composer
-          {...composerProps({ onShowReconnectHelp, unreachable: true, sendReconnectsArca: true })}
-        />,
+        <CapabilitiesProvider info={info}>
+          <Composer
+            {...composerProps({ onShowReconnectHelp, unreachable: true, sendReconnectsArca: true })}
+          />
+        </CapabilitiesProvider>,
       );
       fireEvent.change(textarea(), { target: { value: "/clear" } });
       fireEvent.keyDown(textarea(), { key: "Enter" });
@@ -1274,7 +1326,11 @@ describe("Composer slash-command submit routing", () => {
       // The menu completes the command, so it stays ready to send.
       expect(textarea().value.trim()).toBe("/clear");
 
-      rerender(<Composer {...composerProps({ onShowReconnectHelp })} />);
+      rerender(
+        <CapabilitiesProvider info={info}>
+          <Composer {...composerProps({ onShowReconnectHelp })} />
+        </CapabilitiesProvider>,
+      );
       fireEvent.keyDown(textarea(), { key: "Enter" });
       expect(clearContext).toHaveBeenCalledOnce();
     } finally {
@@ -2322,6 +2378,30 @@ describe("Composer model/effort label", () => {
       />,
     );
     expect(label()).toHaveTextContent("Polly (Pi)");
+  });
+
+  it("shows the harness identity, not the spec pin, for an own-auth ACP session", () => {
+    // Grok Build runs its own model, so the snapshot leaves llmModel null until
+    // the agent reports one. The spec's pinned model must not appear.
+    useChatStore.setState({
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
+      llmModel: null,
+      sessionHarness: "grok",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "pinned" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Grok Build");
+    expect(label()).not.toHaveTextContent("gpt-4o-mini");
   });
 
   it("names the vendor, not the Task subagent_type, on a Claude Code sub-agent", () => {

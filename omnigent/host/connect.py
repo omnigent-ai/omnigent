@@ -26,6 +26,7 @@ import uuid
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass
+from dataclasses import field as dataclass_field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, SupportsIndex, SupportsInt, TypeVar, cast
 
@@ -61,6 +62,7 @@ from omnigent.gateway_inference import gateway_inference_map
 from omnigent.harness_accounts import HarnessAccount, HarnessAccounts
 from omnigent.harness_aliases import (
     canonicalize_harness,
+    harness_account_key,
     is_claude_sdk_harness_name,
 )
 from omnigent.harness_availability import HARNESS_BINARY_MISSING, HarnessAvailability
@@ -83,6 +85,13 @@ from omnigent.host.frames import (
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
+    HostHarnessLoginCancelFrame,
+    HostHarnessLoginCancelResultFrame,
+    HostHarnessLoginCompletedFrame,
+    HostHarnessLoginFrame,
+    HostHarnessLoginResultFrame,
+    HostHarnessLogoutFrame,
+    HostHarnessLogoutResultFrame,
     HostHarnessReadinessFrame,
     HostHarnessStartupFrame,
     HostHarnessStartupResultFrame,
@@ -160,6 +169,11 @@ from omnigent.onboarding.harness_install import (
     try_install_harness_cli,
     ui_install_key,
 )
+from omnigent.onboarding.harness_login import (
+    CodexLoginSession,
+    claude_logout,
+    codex_logout,
+)
 from omnigent.onboarding.harness_readiness import (
     configured_harness_map,
     harness_is_configured,
@@ -236,6 +250,45 @@ _logger = logging.getLogger(__name__)
 _T = TypeVar("_T")
 
 
+def _print_host_status(
+    message: str,
+    *,
+    stderr: bool = False,
+    runner_id: str | None = None,
+    session_id: str | None = None,
+) -> None:
+    """A detached console must not interrupt host work or replace its failure cause."""
+    stream = sys.stderr if stderr else sys.stdout
+    try:
+        print(message, file=stream, flush=True)
+    except (OSError, ValueError) as exc:
+        if (
+            isinstance(exc, BrokenPipeError)
+            and (stream is sys.__stdout__ or stream is sys.__stderr__)
+            and stream is not None
+        ):
+            # Python retries buffered output at shutdown and can replace the exit code.
+            # Confirm the real stream is broken before redirecting its descriptor.
+            with contextlib.suppress(OSError, ValueError):
+                try:
+                    stream.flush()
+                except BrokenPipeError:
+                    with open(os.devnull, "w") as sink:
+                        os.dup2(sink.fileno(), stream.fileno())
+        # A log handler may share the detached console.
+        with contextlib.suppress(OSError, ValueError):
+            _logger.warning(
+                "Host console output is unavailable",
+                extra=debug_event(
+                    "host_console_write_failed",
+                    runner_id=runner_id,
+                    session_id=session_id,
+                    exception_type=type(exc).__name__,
+                    stream="stderr" if stderr else "stdout",
+                ),
+            )
+
+
 def _coerce_int(value: object) -> int:
     """Convert a validated JSON scalar with the standard ``int`` semantics."""
     return int(cast(str | bytes | bytearray | SupportsInt | SupportsIndex, value))
@@ -250,6 +303,8 @@ HARNESS_READINESS_REFRESH_INTERVAL_S = 5.0
 # Auth changes and removals need the full, potentially expensive readiness map.
 HARNESS_READINESS_FULL_REFRESH_INTERVAL_S = 60.0
 HARNESS_ACCOUNT_PROBE_TIMEOUT_S = 7.0
+HARNESS_LOGIN_START_TIMEOUT_S = 20.0
+HARNESS_LOGIN_COMPLETION_TIMEOUT_S = 15 * 60.0
 # How long a quick-probe verdict stays cached. New-CLI installs surface within
 # this window (a minute of badge staleness is invisible); the quick probe's
 # 5s cadence re-uses the cached verdict for free. Matches the full-refresh
@@ -1158,6 +1213,18 @@ class _HostFrameFailureContext:
     runner_id: str | None = None
 
 
+@dataclass
+class _ActiveHarnessLogin:
+    """One Codex device login owned by the live host tunnel."""
+
+    login_id: str
+    session: CodexLoginSession
+    task: asyncio.Task[object]
+    vendor_login_id: str | None = None
+    cancel_requested: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
+    teardown_complete: asyncio.Event = dataclass_field(default_factory=asyncio.Event)
+
+
 def _host_frame_failure_context(raw: str) -> _HostFrameFailureContext:
     """Decode only correlation metadata for a failure diagnostic.
 
@@ -1277,8 +1344,9 @@ class HostProcess:
         # mutated only on the event loop, so no cross-thread lock is needed.
         self._capability_generation = 0
         # Account probes have their own generation so metadata refreshes neither
-        # discard readiness nor overwrite a newer requested probe result.
+        # discard readiness nor overwrite a newer login/logout result.
         self._account_generation = 0
+        self._active_harness_logins: dict[str, _ActiveHarnessLogin] = {}
         # Consecutive login-page redirects; reset by a successful upgrade.
         self._login_redirect_streak = 0
         # Reset by a successful upgrade or non-auth error; bounds fresh-host refresh retries.
@@ -1407,6 +1475,11 @@ class HostProcess:
         zygote_pid = self._zygote.unreaped_pid if self._zygote is not None else None
         if zygote_pid is not None:
             pids.add(zygote_pid)
+        pids.update(
+            pid
+            for active in self._active_harness_logins.values()
+            if (pid := active.session.pid) is not None
+        )
         return pids
 
     @staticmethod
@@ -1628,11 +1701,10 @@ class HostProcess:
                 # terminal — print once per redirect streak so a foreground
                 # `omnigent host` shows the auth problem and its fix instead
                 # of sitting silent while it retries.
-                print(
+                _print_host_status(
                     f"⚠ {cause} Retrying — this also happens briefly while "
                     f"the server restarts. {self._credentials_fix_hint()}",
-                    file=sys.stderr,
-                    flush=True,
+                    stderr=True,
                 )
             return None
         # Carry the upgrade response's body through so a refusal that names its
@@ -1694,19 +1766,18 @@ class HostProcess:
                         "host. Still retrying."
                     )
                     _logger.warning("%s", escalated)
-                    print(f"⚠ {escalated}", file=sys.stderr, flush=True)
+                    _print_host_status(f"⚠ {escalated}", stderr=True)
                 else:
                     _logger.warning("%s Retrying — check your VPN/network.", cause)
                     if self._auth_retry_streak == 1:
                         # The warning above lands only in the CLI log file;
                         # print once per outage so a foreground `omnigent host`
                         # isn't silent.
-                        print(
+                        _print_host_status(
                             f"⚠ {cause} Retrying — this usually means the VPN or "
                             "network dropped. It will reconnect automatically "
                             "once connectivity returns.",
-                            file=sys.stderr,
-                            flush=True,
+                            stderr=True,
                         )
                 return None
         if status == 401:
@@ -1818,12 +1889,11 @@ class HostProcess:
                 error_phase=mapped_phase.value,
             ),
         )
-        print(
+        _print_host_status(
             "  ! Runner launch failed\n"
             f"    session: {session_id!r}\n"
             f"    workspace: {frame.workspace!r}\n"
             f"    reason: {diagnostic!r}",
-            flush=True,
         )
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
@@ -1872,18 +1942,17 @@ class HostProcess:
                     "deployment. Still retrying."
                 )
                 _logger.warning("%s", escalated)
-                print(f"⚠ {escalated}", file=sys.stderr, flush=True)
+                _print_host_status(f"⚠ {escalated}", stderr=True)
             else:
                 _logger.warning("%s Retrying.", cause)
                 if self._transient_404_streak == 1:
                     # The warning lands in the CLI log file — print once per
                     # restart window so a foreground `omnigent host` isn't
                     # silent while it rides the 404s out.
-                    print(
+                    _print_host_status(
                         f"⚠ {cause} Retrying — it will reconnect automatically "
                         "once the server is back.",
-                        file=sys.stderr,
-                        flush=True,
+                        stderr=True,
                     )
             return None
         return HostConnectError(
@@ -1983,11 +2052,42 @@ class HostProcess:
             )
 
         workspace = Path(frame.workspace).expanduser()
+        workspace_recreated = False
         if not workspace.is_dir():
-            return self._launch_failed(
-                frame,
-                workspace_missing_message(workspace),
-                error_code=WORKSPACE_MISSING_ERROR_CODE,
+            # Recreate a vanished leaf (pruned worktree, an agent's rm -rf) so the
+            # session keeps working; a missing *parent* signals a stale path or an
+            # unmounted volume, so refuse rather than build on the wrong filesystem.
+            try:
+                await asyncio.to_thread(workspace.mkdir, exist_ok=True)
+            except OSError as exc:
+                _logger.warning(
+                    "Cannot recreate missing workspace %r for session %r: %s",
+                    str(workspace),
+                    frame.session_id or "<unknown>",
+                    exc,
+                )
+                return self._launch_failed(
+                    frame,
+                    workspace_missing_message(workspace),
+                    error_code=WORKSPACE_MISSING_ERROR_CODE,
+                )
+            workspace_recreated = True
+            _logger.warning(
+                "Recreated missing workspace %r for session %r",
+                str(workspace),
+                frame.session_id or "<unknown>",
+                extra=debug_event(
+                    "workspace_recreated",
+                    session_id=frame.session_id,
+                    host_request_id=frame.request_id,
+                    stage="runner_launch",
+                ),
+            )
+            print(
+                "  ! Recreated missing workspace\n"
+                f"    session: {frame.session_id or '<unknown>'!r}\n"
+                f"    workspace: {str(workspace)!r}",
+                flush=True,
             )
 
         runner_id = token_bound_runner_id(frame.binding_token)
@@ -2144,16 +2244,18 @@ class HostProcess:
         # host's own terminal shows lifecycle lines, but the runner's real
         # output — the agent turn, tracebacks — lands only in this file.
         session_line = f"\n    session: {frame.session_id}" if frame.session_id else ""
-        print(
+        _print_host_status(
             f"  ↑ Runner started: {runner_id} (pid={proc.pid})\n"
             f"    log: {display_log_path(log_path)}"
             f"{session_line}",
-            flush=True,
+            runner_id=runner_id,
+            session_id=frame.session_id,
         )
         return HostLaunchRunnerResultFrame(
             request_id=frame.request_id,
             status="launched",
             runner_id=runner_id,
+            workspace_recreated=workspace_recreated,
         )
 
     def _ensure_zygote_started(self) -> ZygoteManager | None:
@@ -2343,9 +2445,10 @@ class HostProcess:
         # freeze the daemon's control handler.
         await self._stop_runner_and_trigger(handle.proc, "runner_stopped")
         _logger.info("Stopped runner %s", frame.runner_id)
-        print(
+        _print_host_status(
             f"  ↓ Runner stopped: {frame.runner_id}",
-            flush=True,
+            runner_id=frame.runner_id,
+            session_id=handle.session_id,
         )
         return HostStopRunnerResultFrame(
             request_id=frame.request_id,
@@ -3184,6 +3287,268 @@ class HostProcess:
             harness_accounts=self._harness_accounts,
         )
 
+    async def _handle_harness_login(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        frame: HostHarnessLoginFrame,
+    ) -> HostHarnessLoginResultFrame:
+        """Start Codex device login and retain its app-server until completion."""
+        harness = harness_account_key(frame.harness)
+        if harness != "codex":
+            return HostHarnessLoginResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="only codex supports device login",
+            )
+        if harness in self._active_harness_logins:
+            active = self._active_harness_logins[harness]
+            return HostHarnessLoginResultFrame(
+                request_id=frame.request_id,
+                status="busy",
+                login_id=active.login_id,
+                error="a codex login is already active",
+            )
+        session = CodexLoginSession()
+        task = cast("asyncio.Task[object]", asyncio.current_task())
+        active = _ActiveHarnessLogin(
+            login_id=frame.login_id,
+            session=session,
+            task=task,
+        )
+        self._active_harness_logins[harness] = active
+        self._owned_subprocess_ops += 1
+        start_task = asyncio.create_task(session.start(), name="host-codex-login-start")
+        cancel_wait = asyncio.create_task(
+            active.cancel_requested.wait(), name="host-codex-login-cancel-wait"
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {start_task, cancel_wait},
+                timeout=HARNESS_LOGIN_START_TIMEOUT_S,
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if cancel_wait in done:
+                start_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await start_task
+                return HostHarnessLoginResultFrame(
+                    request_id=frame.request_id,
+                    status="cancelled",
+                    login_id=frame.login_id,
+                    error="login cancelled",
+                )
+            if start_task not in done:
+                start_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await start_task
+                raise TimeoutError
+            login = start_task.result()
+            active.vendor_login_id = login.login_id
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001 - vendor failures become protocol errors
+            return HostHarnessLoginResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                login_id=frame.login_id,
+                error=f"could not start codex login: {exc}",
+            )
+        finally:
+            cancel_wait.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await cancel_wait
+            if not start_task.done():
+                start_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await start_task
+            self._owned_subprocess_ops -= 1
+            if active.vendor_login_id is None:
+                current = self._active_harness_logins.get(harness)
+                if current is active:
+                    self._active_harness_logins.pop(harness, None)
+                await session.close()
+                active.teardown_complete.set()
+        expires_at = int(time.time() + HARNESS_LOGIN_COMPLETION_TIMEOUT_S)
+        watcher = asyncio.create_task(
+            self._watch_harness_login(
+                ws,
+                harness,
+                frame.login_id,
+                login.login_id,
+                session,
+            ),
+            name="host-codex-login",
+        )
+        active.task = cast("asyncio.Task[object]", watcher)
+        return HostHarnessLoginResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            login_id=frame.login_id,
+            verification_url=login.verification_url,
+            user_code=login.user_code,
+            expires_at=expires_at,
+        )
+
+    async def _watch_harness_login(
+        self,
+        ws: websockets.asyncio.client.ClientConnection,
+        harness: str,
+        login_id: str,
+        vendor_login_id: str,
+        session: CodexLoginSession,
+    ) -> None:
+        """Publish the terminal outcome and clean up the login subprocess."""
+        try:
+            expired = False
+            try:
+                success, error = await asyncio.wait_for(
+                    session.wait_completed(vendor_login_id),
+                    timeout=HARNESS_LOGIN_COMPLETION_TIMEOUT_S,
+                )
+            except TimeoutError:
+                expired = True
+                success, error = False, "login expired"
+                with contextlib.suppress(Exception):
+                    await session.cancel(vendor_login_id)
+            configured = await self._probe_configured_harnesses(startup=False)
+            accounts = await self._probe_harness_accounts(explicit_refresh=False)
+            self._replace_capabilities(configured, self._gateway_inference, accounts)
+            await self._send_text(
+                ws,
+                encode_host_frame(
+                    HostHarnessLoginCompletedFrame(
+                        login_id=login_id,
+                        success=success,
+                        expired=expired,
+                        error=error,
+                        configured_harnesses=configured,
+                        harness_accounts=accounts,
+                    )
+                ),
+            )
+        except (asyncio.CancelledError, ConnectionClosed):
+            raise
+        except Exception:
+            _logger.exception("Could not publish completion for harness login %s", login_id)
+            with contextlib.suppress(Exception):
+                await self._send_text(
+                    ws,
+                    encode_host_frame(
+                        HostHarnessLoginCompletedFrame(
+                            login_id=login_id,
+                            success=False,
+                            error="could not finalize harness login",
+                        )
+                    ),
+                )
+        finally:
+            active = self._active_harness_logins.get(harness)
+            if active is not None and active.login_id == login_id:
+                self._active_harness_logins.pop(harness, None)
+            await session.close()
+            if active is not None and active.login_id == login_id:
+                active.teardown_complete.set()
+
+    async def _handle_harness_login_cancel(
+        self, frame: HostHarnessLoginCancelFrame
+    ) -> HostHarnessLoginCancelResultFrame:
+        """Cancel a login by its server-assigned login id."""
+        active_pair = next(
+            (
+                (harness, active)
+                for harness, active in self._active_harness_logins.items()
+                if active.login_id == frame.login_id
+            ),
+            None,
+        )
+        if active_pair is None:
+            return HostHarnessLoginCancelResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="login not found",
+            )
+        harness, active = active_pair
+        if active.vendor_login_id is None:
+            active.cancel_requested.set()
+            await active.teardown_complete.wait()
+            return HostHarnessLoginCancelResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+            )
+        cancel_error: Exception | None = None
+        try:
+            if active.vendor_login_id is not None:
+                await active.session.cancel(active.vendor_login_id)
+        except Exception as exc:  # noqa: BLE001 - vendor failures become protocol errors
+            cancel_error = exc
+        finally:
+            active.task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await active.task
+            await active.session.close()
+            current = self._active_harness_logins.get(harness)
+            if current is active:
+                self._active_harness_logins.pop(harness, None)
+        if cancel_error is not None:
+            return HostHarnessLoginCancelResultFrame(
+                request_id=frame.request_id,
+                status="ok",
+                error=f"could not cancel login: {cancel_error}",
+            )
+        return HostHarnessLoginCancelResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+        )
+
+    async def _handle_harness_logout(
+        self, frame: HostHarnessLogoutFrame
+    ) -> HostHarnessLogoutResultFrame:
+        """Log Codex or Claude out, then return freshly probed account state."""
+        harness = harness_account_key(frame.harness)
+        if harness not in {"codex", "claude"}:
+            return HostHarnessLogoutResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error="logout is supported only for codex and claude",
+            )
+        self._owned_subprocess_ops += 1
+        try:
+            if harness == "codex":
+                await codex_logout()
+            else:
+                await claude_logout()
+        except Exception as exc:  # noqa: BLE001 - vendor failures become protocol errors
+            return HostHarnessLogoutResultFrame(
+                request_id=frame.request_id,
+                status="failed",
+                error=f"{harness} logout failed: {exc}",
+            )
+        finally:
+            self._owned_subprocess_ops -= 1
+        configured = await self._probe_configured_harnesses(startup=False)
+        accounts = await self._probe_harness_accounts(explicit_refresh=False)
+        self._replace_capabilities(configured, self._gateway_inference, accounts)
+        return HostHarnessLogoutResultFrame(
+            request_id=frame.request_id,
+            status="ok",
+            configured_harnesses=configured,
+            harness_accounts=accounts,
+        )
+
+    async def _cancel_all_harness_logins(self) -> None:
+        """Terminate device-login processes when their owning tunnel ends."""
+        active_logins = list(self._active_harness_logins.values())
+        self._active_harness_logins.clear()
+        for active in active_logins:
+            if active.vendor_login_id is not None:
+                with contextlib.suppress(Exception):
+                    await active.session.cancel(active.vendor_login_id)
+            active.task.cancel()
+        for active in active_logins:
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await active.task
+            await active.session.close()
+
     @staticmethod
     def _fresh_harness_state() -> tuple[dict[str, HarnessAvailability], None]:
         """Return readiness immediately; account probes are async and bounded."""
@@ -3366,8 +3731,13 @@ class HostProcess:
             self._fs_readers.move_to_end(expanded)
             reader = cached[1]
         params = frame.params or {}
+        from omnigent.runner import pr_resource
+
         try:
-            payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
+            with pr_resource.server_tracking(
+                params.get("server_tracked"), params.get("default_pr_url")
+            ):
+                payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
         except WorkspaceReaderError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3440,8 +3810,26 @@ class HostProcess:
                 session_id=frame.session_id,
                 agent_id=frame.agent_id,
             )
-        except Exception:
-            _logger.exception("Skill discovery failed for %r", frame.harness)
+        except Exception as exc:
+            _logger.exception(
+                "Skill discovery failed for %r",
+                frame.harness,
+                extra=debug_event(
+                    "host_skill_discovery_failed",
+                    session_id=frame.session_id,
+                    request_id=frame.request_id,
+                    host_id=self._identity.host_id,
+                    harness=frame.harness,
+                    discovery_scope="session" if frame.session_id is not None else "directory",
+                    error_type=type(exc).__name__,
+                    http_status=(
+                        exc.response.status_code
+                        if isinstance(exc, httpx.HTTPStatusError)
+                        else None
+                    ),
+                    errno=exc.errno if isinstance(exc, OSError) else None,
+                ),
+            )
             return HostSkillsResultFrame(
                 request_id=frame.request_id,
                 status="failed",
@@ -3855,10 +4243,14 @@ class HostProcess:
                 error_code="not_found",
                 error="workspace directory does not exist on host",
             )
+        params = {**(frame.params or {}), "session_id": frame.session_id}
+        from omnigent.runner import pr_resource
+
         try:
-            payload = self._dispatch_fs_write_op(
-                expanded, frame.op, {**(frame.params or {}), "session_id": frame.session_id}
-            )
+            with pr_resource.server_tracking(
+                params.get("server_tracked"), params.get("default_pr_url")
+            ):
+                payload = self._dispatch_fs_write_op(expanded, frame.op, params)
         except ValueError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -4130,11 +4522,10 @@ class HostProcess:
         except Exception as exc:
             _logger.exception("Host harness readiness probe failed")
             if startup:
-                print(
+                _print_host_status(
                     "⚠ Could not inspect installed harnesses; the host will "
                     f"connect with harness readiness unknown: {exc}",
-                    file=sys.stderr,
-                    flush=True,
+                    stderr=True,
                 )
             return None
 
@@ -4215,11 +4606,10 @@ class HostProcess:
         except Exception as exc:
             _logger.exception("Host gateway-inference probe failed")
             if startup:
-                print(
+                _print_host_status(
                     "⚠ Could not inspect gateway inference; the host will "
                     f"connect with gateway backing unknown: {exc}",
-                    file=sys.stderr,
-                    flush=True,
+                    stderr=True,
                 )
             return None
 
@@ -4242,10 +4632,9 @@ class HostProcess:
                 "Host capability discovery exceeded %.0fs; continuing with unknown metadata",
                 _HOST_CAPABILITY_INIT_TIMEOUT_S,
             )
-            print(
+            _print_host_status(
                 "⚠ Host capability discovery timed out; connecting with readiness unknown.",
-                file=sys.stderr,
-                flush=True,
+                stderr=True,
             )
         if self._capability_generation == generation:
             self._replace_capabilities(configured, gateway)
@@ -4485,12 +4874,11 @@ class HostProcess:
                                 "reconnecting on slow backoff until it responds.",
                                 cause,
                             )
-                            print(
+                            _print_host_status(
                                 f"⚠ {cause} The server may be unhealthy. "
                                 "Retrying on a slower cadence — this recovers "
                                 "automatically once the server responds.",
-                                file=sys.stderr,
-                                flush=True,
+                                stderr=True,
                             )
                     else:
                         self._silent_connect_streak = 0
@@ -5056,11 +5444,10 @@ class HostProcess:
                 await self._report_runner_exit(
                     runner_id, report.error, had_connected=report.had_connected
                 )
-            print(
+            _print_host_status(
                 f"✓ Connected as {self._identity.name!r} "
                 f"({self._identity.host_id}), {len(hello.runners)} live runner(s). "
                 "Listening for sessions — Ctrl-C to disconnect.",
-                flush=True,
             )
 
             # Readiness refresh runs in its own task, never on this receive loop:
@@ -5094,6 +5481,7 @@ class HostProcess:
             readiness_task.cancel()
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await readiness_task
+            await self._cancel_all_harness_logins()
 
     async def _harness_readiness_loop(
         self,
@@ -5381,6 +5769,21 @@ class HostProcess:
                     refresh_result.gateway_inference,
                 )
             await self._send_text(ws, encode_host_frame(refresh_result))
+        elif isinstance(frame, HostHarnessLoginFrame):
+            await self._send_text(
+                ws,
+                encode_host_frame(await self._handle_harness_login(ws, frame)),
+            )
+        elif isinstance(frame, HostHarnessLoginCancelFrame):
+            await self._send_text(
+                ws,
+                encode_host_frame(await self._handle_harness_login_cancel(frame)),
+            )
+        elif isinstance(frame, HostHarnessLogoutFrame):
+            await self._send_text(
+                ws,
+                encode_host_frame(await self._handle_harness_logout(frame)),
+            )
         elif isinstance(frame, HostStoreSecretFrame):
             # The credential write touches the OS keychain / config file, so run
             # it off the event loop and reply when it completes.
@@ -5664,21 +6067,20 @@ def _serve_host_until_exit(
         crash_reporting.report_host_exit(
             "identity_error", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
         )
-        print(
+        _print_host_status(
             f"\n✗ Could not start host.\n{exc}",
-            file=sys.stderr,
-            flush=True,
+            stderr=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from None
     crash_reporting.set_host_exit_context(host_id=identity.host_id)
     crash_reporting.log_host_started()
     if not path.exists():
-        print(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
+        _print_host_status(f"Auto-generated {path} ({identity.host_id}, name: {identity.name})")
     # User-facing: the display form (workspace /omnigent URL with ?o= when
     # known) — the API mount is an implementation detail.
     from omnigent.util.server_url import display_server_url
 
-    print(
+    _print_host_status(
         f"Connecting to {display_server_url(server_url)} as {identity.name!r} ({identity.host_id})"
     )
     # Tell the user where logs land up front — `omnigent host` used to run
@@ -5686,13 +6088,13 @@ def _serve_host_until_exit(
     # work goes to per-runner files under the runner dir (the exact
     # file is printed when each runner launches). The host process's
     # own diagnostics go to the host destination.
-    print(f"Session logs: {display_log_path(_runner_log_dir())}/")
-    print(f"This host's log: {display_log_path(host_log_path)}")
+    _print_host_status(f"Session logs: {display_log_path(_runner_log_dir())}/")
+    _print_host_status(f"This host's log: {display_log_path(host_log_path)}")
     from omnigent.cli_diagnostics import current_cli_log_path
 
     _cli_log = current_cli_log_path()
     if _cli_log is not None and _cli_log != host_log_path:
-        print(f"CLI diagnostics: {display_log_path(_cli_log)}")
+        _print_host_status(f"CLI diagnostics: {display_log_path(_cli_log)}")
 
     # Executor-agnostic GitHub setup: point git at the server's credential
     # broker and attribute commits to the owner. Best-effort; the host runs in
@@ -5743,10 +6145,9 @@ def _serve_host_until_exit(
         crash_reporting.report_host_exit(
             "fatal_connect", exit_code=HOST_FATAL_EXIT_CODE, error=str(exc)
         )
-        print(
+        _print_host_status(
             f"\n✗ Could not connect to {display_server_url(server_url)}.\n{exc}",
-            file=sys.stderr,
-            flush=True,
+            stderr=True,
         )
         raise SystemExit(HOST_FATAL_EXIT_CODE) from exc
     return host.lifecycle_lost

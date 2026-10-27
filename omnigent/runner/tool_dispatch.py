@@ -35,6 +35,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Protocol, cast
 
+from omnigent.stores.conversation_store import CREATED_BY_SESSION_LABEL_KEY
 from omnigent.util.json_serialization import json_dumps_transport_safe
 from omnigent.util.json_types import JsonObject as _JsonObject
 
@@ -5199,6 +5200,9 @@ async def _session_get_info_via_rest(
             "host_id": snap.get("host_id"),
             "configured_harnesses": configured_harnesses,
             "parent_session_id": snap.get("parent_session_id"),
+            "created_by_session_id": (_string_mapping(snap.get("labels")) or {}).get(
+                CREATED_BY_SESSION_LABEL_KEY
+            ),
             "sub_agent_name": snap.get("sub_agent_name"),
             "reasoning_effort": snap.get("reasoning_effort"),
             # Effective model: a per-session override wins over the
@@ -6301,6 +6305,9 @@ async def _collect_global_sessions(
                 "runner_id": r.get("runner_id"),
                 "runner_online": online.get(_optional_string(r.get("runner_id")) or ""),
                 "parent_session_id": r.get("parent_session_id"),
+                "created_by_session_id": (_string_mapping(r.get("labels")) or {}).get(
+                    CREATED_BY_SESSION_LABEL_KEY
+                ),
             }
             for r in rows
         ],

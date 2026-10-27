@@ -13,7 +13,7 @@ import pytest
 
 from omnigent import harness_accounts as account_types
 from omnigent.inner import _proc
-from omnigent.onboarding import harness_accounts
+from omnigent.onboarding import harness_accounts, harness_login
 from omnigent.onboarding.opencode_auth import OpenCodeAuthSummary
 from tests._helpers.polling import poll_until
 
@@ -50,6 +50,97 @@ for line in sys.stdin:
             "plan": "pro",
         }
     }
+
+
+@pytest.mark.asyncio
+async def test_codex_login_and_logout_use_app_server(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _executable(
+        bin_dir / "codex",
+        """import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    method = message.get('method')
+    if method == 'initialize':
+        print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
+    elif method == 'account/login/start':
+        print(json.dumps({'id': message['id'], 'result': {
+            'type': 'chatgptDeviceCode', 'loginId': 'login-1',
+            'userCode': 'ABCD-EFGH',
+            'verificationUrl': 'https://example.test/device'
+        }}), flush=True)
+        print(json.dumps({'method': 'account/login/completed', 'params': {
+            'loginId': 'login-1', 'success': True
+        }}), flush=True)
+    elif method == 'account/logout':
+        print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
+""",
+    )
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    session = harness_login.CodexLoginSession()
+    try:
+        login = await session.start()
+        assert login == harness_login.CodexDeviceLogin(
+            login_id="login-1",
+            verification_url="https://example.test/device",
+            user_code="ABCD-EFGH",
+        )
+        assert await session.wait_completed(login.login_id) == (True, None)
+    finally:
+        await session.close()
+
+    await harness_login.codex_logout()
+
+
+@pytest.mark.asyncio
+async def test_codex_login_rejects_non_https_verification_url(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _executable(
+        bin_dir / "codex",
+        """import json, sys
+for line in sys.stdin:
+    message = json.loads(line)
+    if message.get('method') == 'initialize':
+        print(json.dumps({'id': message['id'], 'result': {}}), flush=True)
+    elif message.get('method') == 'account/login/start':
+        print(json.dumps({'id': message['id'], 'result': {
+            'loginId': 'login-1', 'userCode': 'ABCD-EFGH',
+            'verificationUrl': 'javascript:alert(1)'
+        }}), flush=True)
+""",
+    )
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    session = harness_login.CodexLoginSession()
+    try:
+        with pytest.raises(RuntimeError, match="invalid device login URL"):
+            await session.start()
+    finally:
+        await session.close()
+
+
+@pytest.mark.asyncio
+async def test_claude_logout_uses_supported_cli(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bin_dir = tmp_path / "bin"
+    bin_dir.mkdir()
+    _executable(
+        bin_dir / "claude",
+        """import sys
+raise SystemExit(0 if sys.argv[1:] == ['auth', 'logout'] else 2)
+""",
+    )
+    monkeypatch.setenv("PATH", str(bin_dir))
+
+    await harness_login.claude_logout()
 
 
 def test_claude_and_pi_probes_use_supported_json_commands(

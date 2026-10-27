@@ -1646,7 +1646,7 @@ export function AgentInfoButton({ agent, sessionId, permissionLevel }: AgentInfo
       </Tooltip>
       <PopoverContent
         align="end"
-        className="w-80"
+        className="menu-surface w-80 rounded-[12px] ring-0"
         data-testid="agent-info-panel"
         onPointerEnter={cancelCloseOnEnter}
         onPointerLeave={scheduleCloseOnLeave}

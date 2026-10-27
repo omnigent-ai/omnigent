@@ -42,6 +42,7 @@ from omnigent.server.auth import (
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.sessions import _ancestor_session_ids, create_sessions_router
 from omnigent.server.schemas import SessionEventInput
+from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from tests._helpers.polling import poll_until_async
 from tests.budgets import budget
@@ -507,8 +508,11 @@ def runner_globals_reset() -> Iterator[None]:
 @pytest.fixture
 def app(runner_globals_reset: None) -> FastAPI:
     del runner_globals_reset
+    return _sessions_app(_ConversationStore())
+
+
+def _sessions_app(conversation_store: _ConversationStore, **router_options: Any) -> FastAPI:
     app = FastAPI()
-    conversation_store = _ConversationStore()
     host_registry = HostRegistry()
     app.state.test_conversation_store = conversation_store
     app.state.test_host_registry = host_registry
@@ -539,6 +543,7 @@ def app(runner_globals_reset: None) -> FastAPI:
             conversation_store,  # type: ignore[arg-type]
             _StubAgentStore(),  # type: ignore[arg-type]
             host_registry=host_registry,
+            **router_options,
         ),
         prefix="/v1",
     )
@@ -3252,6 +3257,296 @@ async def test_github_info_proxies_to_runner(client: httpx.AsyncClient) -> None:
         "GET",
         "/v1/sessions/79b22ebd2309e48fdeb450c65611d51b/resources/github",
     ) in fake_runner.calls
+
+
+def _pr_app(db_uri: str, **router_options: Any) -> FastAPI:
+    """App whose sessions keep their pull requests in a real SQLite store."""
+    SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)
+    conversation_store = _ConversationStore()
+    conversation_store.storage_location = db_uri  # type: ignore[attr-defined]
+    return _sessions_app(conversation_store, **router_options)
+
+
+@pytest.fixture
+async def pr_client(runner_globals_reset: None, db_uri: str) -> AsyncIterator[httpx.AsyncClient]:
+    del runner_globals_reset
+    transport = httpx.ASGITransport(app=_pr_app(db_uri))
+    async with httpx.AsyncClient(transport=transport, base_url="http://server") as c:
+        yield c
+
+
+def _reported_pr(url: str, number: int, relationship: str) -> dict[str, object]:
+    return {
+        "url": url,
+        "provider": "github",
+        "host": "github.com",
+        "repository": url.removeprefix("https://github.com/").split("/pull/")[0],
+        "number": number,
+        "relationship": relationship,
+        "source": "native_hook",
+        "first_seen_at": 100.0,
+        "last_seen_at": 100.0,
+        "title": None,
+        "title_checked_at": 0,
+        "title_lookup_timed_out": False,
+    }
+
+
+_PR_SESSION = "79b22ebd2309e48fdeb450c65611d51b"
+_FIRST_PR = "https://github.com/example/one/pull/42"
+_SECOND_PR = "https://github.com/example/two/pull/7"
+
+
+def _pr_info(selected: str = _FIRST_PR) -> dict[str, object]:
+    return {
+        "object": "session.github.info",
+        "available": True,
+        "tracking_available": True,
+        "prs": [
+            _reported_pr(_FIRST_PR, 42, "created"),
+            _reported_pr(_SECOND_PR, 7, "inferred"),
+        ],
+        "selected_pr_url": selected,
+        "pr": {"number": 42, "title": "Ship it", "state": "OPEN", "url": _FIRST_PR},
+    }
+
+
+class _WrongReplicaRunnerClient:
+    """Runner client on a sharded deployment whose tunnel is on another replica."""
+
+    async def post(self, url: str, **_kwargs: Any) -> Any:
+        raise OmnigentError(f"runner is on another replica ({url})", code=ErrorCode.WRONG_REPLICA)
+
+
+@pytest.mark.asyncio
+async def test_session_pull_requests_stay_listed_and_unlinkable_offline(
+    pr_client: httpx.AsyncClient,
+) -> None:
+    """The server keeps what the runner reports, so the tab still works while it sleeps."""
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=_pr_info())))  # type: ignore[arg-type]
+    live = await pr_client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
+    assert live.status_code == 200, live.text
+    assert [pr["url"] for pr in live.json()["prs"]] == [_FIRST_PR, _SECOND_PR]
+    assert live.json()["prs"][0]["state"] == "OPEN"
+
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+    assert (await pr_client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")).status_code == 503
+    listed = await pr_client.get(f"/v1/sessions/{_PR_SESSION}/pull-requests")
+    assert [pr["url"] for pr in listed.json()["data"]] == [_FIRST_PR, _SECOND_PR]
+    assert (listed.json()["data"][0]["title"], listed.json()["data"][0]["state"]) == (
+        "Ship it",
+        "OPEN",
+    )
+    unlinked = await pr_client.delete(
+        f"/v1/sessions/{_PR_SESSION}/pull-requests", params={"url": _FIRST_PR}
+    )
+    assert unlinked.status_code == 200, unlinked.text
+    assert [pr["url"] for pr in unlinked.json()["data"]] == [_SECOND_PR]
+
+
+@pytest.mark.asyncio
+async def test_the_server_vouches_for_its_prs_and_owns_unlinks(
+    pr_client: httpx.AsyncClient,
+) -> None:
+    runner = _FakeRunnerClient(payload=_pr_info())
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    path = f"/v1/sessions/{_PR_SESSION}/resources/github"
+    # The first read imports the host's list; until then the host's own list decides.
+    await pr_client.get(path)
+    assert runner.get_params[-1] is None
+
+    # Unlinked offline, the PR stays unlinked though the host still reports and selects it.
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+    await pr_client.delete(f"/v1/sessions/{_PR_SESSION}/pull-requests", params={"url": _FIRST_PR})
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    refreshed = await pr_client.get(path)
+    assert runner.get_params[-1] == {"server_tracked": True, "default_pr_url": _SECOND_PR}
+    assert [pr["url"] for pr in refreshed.json()["prs"]] == [_SECOND_PR]
+    assert "selected_pr_url" not in refreshed.json()
+
+    # A PR the session doesn't link is refused before the host is asked.
+    asked = len(runner.get_params)
+    refused = await pr_client.get(path, params={"pr_url": _FIRST_PR})
+    assert refused.status_code == 400
+    assert len(runner.get_params) == asked
+
+    # Relinking clears the unlink, and later requests vouch for the PR.
+    linked = await pr_client.post(f"{path}/prs", json={"url": _FIRST_PR, "action": "attach"})
+    assert linked.status_code == 200, linked.text
+    assert [pr["url"] for pr in linked.json()["prs"]] == [_FIRST_PR, _SECOND_PR]
+    await pr_client.get(path, params={"pr_url": _FIRST_PR})
+    assert runner.get_params[-1] == {"pr_url": _FIRST_PR, "server_tracked": True}
+    labels = await pr_client.get(f"{path}/labels", params={"pr_url": _FIRST_PR})
+    assert labels.status_code == 200, labels.text
+    assert runner.get_params[-1] == {"pr_url": _FIRST_PR, "server_tracked": True}
+
+    # Online, an unlink also reaches the runner, so its own list stops reporting the PR.
+    await pr_client.delete(f"/v1/sessions/{_PR_SESSION}/pull-requests", params={"url": _FIRST_PR})
+    assert runner.post_json_calls[-1][1]["action"] == "remove"
+
+
+@pytest.mark.asyncio
+async def test_linking_checks_the_session_limit_before_asking_the_host(
+    pr_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.stores import session_pull_request_store
+
+    monkeypatch.setattr(session_pull_request_store, "MAX_PRS_PER_SESSION", 2)
+    runner = _FakeRunnerClient(payload=_pr_info())
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    path = f"/v1/sessions/{_PR_SESSION}/resources/github"
+    await pr_client.get(path)
+
+    response = await pr_client.post(
+        f"{path}/prs", json={"url": "https://github.com/example/three/pull/1", "action": "attach"}
+    )
+    assert response.status_code == 409
+    assert runner.post_json_calls == []
+
+
+@pytest.mark.asyncio
+async def test_a_legacy_unlink_is_stored_once_the_host_accepts_it(
+    pr_client: httpx.AsyncClient,
+) -> None:
+    """Web clients that predate stored PRs unlink through the host, as before."""
+    runner = _FakeRunnerClient(payload=_pr_info())
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    path = f"/v1/sessions/{_PR_SESSION}/resources/github"
+    listed = f"/v1/sessions/{_PR_SESSION}/pull-requests"
+    await pr_client.get(path)
+    body = {"url": _FIRST_PR, "action": "remove"}
+
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+    assert (await pr_client.post(f"{path}/prs", json=body)).status_code == 503
+    assert len((await pr_client.get(listed)).json()["data"]) == 2
+
+    set_runner_router(_FakeRunnerRouter(runner))  # type: ignore[arg-type]
+    unlinked = await pr_client.post(f"{path}/prs", json=body)
+    assert unlinked.status_code == 200, unlinked.text
+    assert [pr["url"] for pr in unlinked.json()["prs"]] == [_SECOND_PR]
+    assert [pr["url"] for pr in (await pr_client.get(listed)).json()["data"]] == [_SECOND_PR]
+
+
+class _OnlineRunnerRouter(_FakeRunnerRouter):
+    """Routes to a runner whose tunnel is on this replica."""
+
+    def runner_is_online(self, runner_id: str) -> bool:
+        return runner_id == "runner_pr"
+
+
+@pytest.mark.asyncio
+async def test_a_listed_session_is_imported_from_its_runner_in_the_background(
+    runner_globals_reset: None, db_uri: str
+) -> None:
+    """An idle session's PRs reach the server without anyone opening the session."""
+    from omnigent.server.session_pull_requests import PullRequestRefresher
+
+    del runner_globals_reset
+    SqlAlchemyConversationStore(db_uri).create_conversation(conversation_id=_PR_SESSION)
+    conversation_store = _ConversationStore()
+    conversation_store.storage_location = db_uri  # type: ignore[attr-defined]
+    conversation_store._conversations[_PR_SESSION].runner_id = "runner_pr"
+    refresher = PullRequestRefresher()
+    app = _sessions_app(conversation_store, pull_request_refresher=refresher)
+    set_runner_router(_OnlineRunnerRouter(_FakeRunnerClient(payload=_pr_info())))  # type: ignore[arg-type]
+    listed = f"/v1/sessions/{_PR_SESSION}/pull-requests"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        before = (await client.get(listed)).json()
+        refresher.request(_PR_SESSION)
+        await asyncio.sleep(0)
+        while refresher._running:
+            await asyncio.gather(*refresher._running.values())
+        after = (await client.get(listed)).json()
+    assert (before["data"], before["synced"]) == ([], False)
+    assert [pr["url"] for pr in after["data"]] == [_FIRST_PR, _SECOND_PR]
+    assert (after["synced"], after["data"][0]["state"]) == (True, "OPEN")
+
+
+@pytest.mark.asyncio
+async def test_pull_request_list_pages_by_url(pr_client: httpx.AsyncClient) -> None:
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=_pr_info())))  # type: ignore[arg-type]
+    await pr_client.get(f"/v1/sessions/{_PR_SESSION}/resources/github")
+    path = f"/v1/sessions/{_PR_SESSION}/pull-requests"
+
+    first = (await pr_client.get(path, params={"limit": 1})).json()
+    assert ([pr["url"] for pr in first["data"]], first["has_more"]) == ([_FIRST_PR], True)
+    assert first["first_id"] == first["last_id"] == _FIRST_PR
+    rest = (await pr_client.get(path, params={"limit": 1, "after": first["last_id"]})).json()
+    assert ([pr["url"] for pr in rest["data"]], rest["has_more"]) == ([_SECOND_PR], False)
+
+    unknown = await pr_client.get(path, params={"after": "https://github.com/example/x/pull/1"})
+    assert unknown.status_code == 400
+    too_long = await pr_client.delete(path, params={"url": "https://e.com/" + "x" * 2048})
+    assert too_long.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_github_routes_keep_working_when_pull_request_storage_fails(
+    pr_client: httpx.AsyncClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.stores.session_pull_request_store import SessionPullRequestStore
+
+    def unavailable(*_args: object, **_kwargs: object) -> None:
+        raise RuntimeError("no such column: pull_requests")
+
+    for method in ("read", "apply_report", "check_room", "attach", "remove"):
+        monkeypatch.setattr(SessionPullRequestStore, method, unavailable)
+    set_runner_router(_FakeRunnerRouter(_FakeRunnerClient(payload=_pr_info())))  # type: ignore[arg-type]
+    path = f"/v1/sessions/{_PR_SESSION}/resources/github"
+    for suffix in ("", "/changes"):
+        response = await pr_client.get(f"{path}{suffix}")
+        assert response.status_code == 200, (suffix, response.text)
+    assert response.json()["selected_pr_url"] == _FIRST_PR
+    for action in ("attach", "remove"):
+        response = await pr_client.post(f"{path}/prs", json={"url": _SECOND_PR, "action": action})
+        assert response.status_code == 200, (action, response.text)
+
+
+@pytest.mark.asyncio
+async def test_unlink_on_the_wrong_replica_asks_the_client_to_re_address(
+    pr_client: httpx.AsyncClient,
+) -> None:
+    set_runner_router(_FakeRunnerRouter(_WrongReplicaRunnerClient()))  # type: ignore[arg-type]
+    response = await pr_client.delete(
+        f"/v1/sessions/{_PR_SESSION}/pull-requests", params={"url": _FIRST_PR}
+    )
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == ErrorCode.WRONG_REPLICA
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("level", "list_status", "unlink_status"),
+    # Without a grant the session reads as missing.
+    [(None, 404, 404), (LEVEL_READ, 200, 403), (LEVEL_EDIT, 200, 200)],
+)
+async def test_stored_pull_request_routes_check_session_access(
+    runner_globals_reset: None,
+    db_uri: str,
+    level: str | None,
+    list_status: int,
+    unlink_status: int,
+) -> None:
+    del runner_globals_reset
+    permissions = _StubPermissionStore()
+    if level is not None:
+        permissions.add_grant("alice@example.com", _PR_SESSION, level)
+    app = _pr_app(
+        db_uri,
+        auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+        permission_store=permissions,
+    )
+    set_runner_router(_FakeRunnerRouter(_OfflineRunnerClient()))  # type: ignore[arg-type]
+    path = f"/v1/sessions/{_PR_SESSION}/pull-requests"
+    headers = {"X-Forwarded-Email": "alice@example.com"}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://server"
+    ) as client:
+        assert (await client.get(path, headers=headers)).status_code == list_status
+        unlink = await client.delete(path, params={"url": _FIRST_PR}, headers=headers)
+        assert unlink.status_code == unlink_status
 
 
 @pytest.mark.asyncio

@@ -54,6 +54,7 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
+from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -75,7 +76,7 @@ from omnigent.server.background_session_titles import (
 )
 from omnigent.server.bundles import agent_needs_own_copy, copy_agent_bundle, validate_agent_bundle
 from omnigent.server.creation_logging import creation_metadata, creation_stage, session_created
-from omnigent.server.host_registry import HostRegistry, RunnerExitReports
+from omnigent.server.host_registry import HostLaunchResult, HostRegistry, RunnerExitReports
 from omnigent.server.permissions import check_session_access
 from omnigent.server.routes._auth_helpers import (
     get_permission_level as _get_permission_level,
@@ -205,6 +206,7 @@ from omnigent.server.schemas import (
     SessionList,
     SessionListItem,
     SessionProjectSummary,
+    SessionPullRequestSummary,
     SessionResponse,
     UpdateSessionRequest,
 )
@@ -419,6 +421,7 @@ def register_core_routes(
     host_registry: HostRegistry | None = None,
     project_store: ProjectStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
+    pull_request_refresher: server_prs.PullRequestRefresher | None = None,
 ) -> None:
     """Register the core session routes on router."""
 
@@ -787,7 +790,7 @@ def register_core_routes(
             ),
         )
         request_id = secrets.token_hex(8)
-        future: asyncio.Future[dict[str, str | None]] = asyncio.get_running_loop().create_future()
+        future: asyncio.Future[HostLaunchResult] = asyncio.get_running_loop().create_future()
         conn.pending_launches[request_id] = future
         if workspace is None:  # pragma: no cover — schema guards
             raise OmnigentError(
@@ -815,6 +818,7 @@ def register_core_routes(
             )
         )
         launch_timeout_s = resolve_launch_timeout_s()
+        launch_result: HostLaunchResult
         try:
             host_registry.send_text(conn, launch_frame)
             launch_result = await asyncio.wait_for(future, timeout=launch_timeout_s)
@@ -967,6 +971,7 @@ def register_core_routes(
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
         orchestration_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        source = None
         if orchestration_source is not None:
             source = await asyncio.to_thread(
                 require_orchestration_source,
@@ -1059,6 +1064,7 @@ def register_core_routes(
             artifact_store=artifact_store,
             background_title_coordinator=background_title_coordinator,
             project_store=project_store,
+            created_by_session_id=source.id if source is not None else None,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.
@@ -1938,6 +1944,7 @@ def register_core_routes(
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
         comments_fingerprints = await _comments_fingerprints_for(conv_ids)
+        pull_requests = await _pull_requests_for(conv_ids)
         # ── Lazy-on-read backstop for orphaned "running" sessions. ────────
         # A session whose persisted live_status is still running/waiting but
         # whose runner is confirmed gone — a replica that restarted and
@@ -2009,6 +2016,8 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                pull_request=pull_requests.get(conv.id, (None, None))[0],
+                pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
             )
             for conv in page.data
             if conv.agent_id is not None
@@ -2049,6 +2058,46 @@ def register_core_routes(
         if comment_store is None or not conv_ids:
             return {}
         return await asyncio.to_thread(comment_store.get_comments_fingerprints, conv_ids)
+
+    pull_request_store = server_prs.open_store(conversation_store)
+
+    async def _pull_requests_for(
+        conv_ids: list[str],
+    ) -> dict[str, tuple[SessionPullRequestSummary | None, bool]]:
+        """
+        Batch-fetch each session's first linked pull request in one query.
+
+        Shared by the ``GET /v1/sessions`` page builder and
+        ``WS /v1/sessions/updates``, so a PR the host reports reaches the
+        sidebar and canvas through the stream's diff. Listed sessions the
+        server hasn't imported, or whose first open PR is stale, are
+        refreshed from their runner or host in the background.
+
+        :param conv_ids: Session ids to summarize, e.g. ``["conv_abc123"]``.
+        :returns: Map from session id to its first PR (or ``None``) and whether
+            it is synced; the map is empty without PR storage.
+        """
+        if pull_request_store is None or not conv_ids:
+            return {}
+        try:
+            summaries = await asyncio.to_thread(pull_request_store.summaries, conv_ids)
+        except Exception:  # The list must load even if PR storage fails.
+            _logger.warning("Could not load session pull requests", exc_info=True)
+            return {}
+        now = time.time()
+        if pull_request_refresher is not None:
+            for conv_id, summary in summaries.items():
+                if server_prs.needs_refresh(summary, now=now):
+                    pull_request_refresher.request(conv_id)
+        return {
+            conv_id: (
+                SessionPullRequestSummary(**server_prs.primary_summary(summary.primary))
+                if summary.primary is not None
+                else None,
+                summary.synced,
+            )
+            for conv_id, summary in summaries.items()
+        }
 
     # ── WS /sessions/updates ────────────────────────────────────
 
@@ -2119,13 +2168,19 @@ def register_core_routes(
         if not convs:
             return []
         conv_ids = [c.id for c in convs]
-        agent_metadata, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
+        (
+            agent_metadata,
+            child_ids_by_parent,
+            comments_fingerprints,
+            pull_requests,
+        ) = await asyncio.gather(
             asyncio.to_thread(_session_agent_metadata, convs),
             asyncio.to_thread(
                 conversation_store.list_child_conversation_ids_by_parent,
                 conv_ids,
             ),
             _comments_fingerprints_for(conv_ids),
+            _pull_requests_for(conv_ids),
         )
         agent_names_by_id, harnesses_by_id = agent_metadata
         pending_counts = pending_elicitations.counts_for(conv_ids)
@@ -2141,6 +2196,8 @@ def register_core_routes(
                 pending_count=pending_counts.get(conv.id, 0),
                 child_session_ids=child_ids_by_parent[conv.id],
                 comments_fingerprint=comments_fingerprints.get(conv.id),
+                pull_request=pull_requests.get(conv.id, (None, None))[0],
+                pull_requests_synced=pull_requests.get(conv.id, (None, None))[1],
             )
             for conv in convs
         ]

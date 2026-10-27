@@ -77,7 +77,12 @@ from omnigent.runtime import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.harnesses.process_manager import HarnessProcessManager
-from omnigent.server import managed_host_keepalive, session_live_state, shutdown_state
+from omnigent.server import (
+    managed_host_keepalive,
+    session_live_state,
+    session_pull_requests,
+    shutdown_state,
+)
 from omnigent.server.auth import (
     AuthProvider,
     SharingMode,
@@ -125,6 +130,7 @@ from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
+    CLIENT_SESSION_EVENT_TYPES,
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
@@ -242,6 +248,11 @@ class ServerInfoResponse(BaseModel):
     agent_detail: bool = False
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
+    # Client event types POST /v1/sessions/{id}/events accepts; empty on older servers.
+    session_event_types: list[str] = []
+    # GET/DELETE /v1/sessions/{id}/pull-requests and SessionListItem.pull_request;
+    # absent on older servers, which clients treat as unsupported.
+    session_pull_requests: bool = False
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     branding: BrandingInfo
@@ -1434,8 +1445,9 @@ def create_app(
         active task and fires the injected ``on_fire`` callback on
         schedule. ``None`` disables the scheduler entirely.
     :param preference_store: Optional shared-preference API; no launcher adoption.
-    :param scheduled_task_dispatch: Claimed-run execution and recovery callbacks;
-        required only when automations_v2 is enabled.
+    :param scheduled_task_dispatch: Overrides for automations_v2: host ownership,
+        the owner identity fires act under, or a replacement executor. ``None``
+        uses the built-in executor with every host owned by this replica.
     :param scheduled_task_scheduler_config: Overrides the server config's
         scheduled_task_scheduler section. With automations_v2 off, only
         startup_retry_seconds applies. Changes require restarting the app.
@@ -1592,12 +1604,6 @@ def create_app(
                 "automations_v2 requires a scheduled task store. Pass scheduled_task_store "
                 "to create_app(), or leave automations_v2 disabled until scheduling is configured."
             )
-        if scheduled_task_dispatch is None:
-            raise ValueError(
-                "automations_v2 requires callbacks to start runs and recover interrupted "
-                "startups. Pass scheduled_task_dispatch to create_app(), or disable "
-                "automations_v2 to use the existing scheduler."
-            )
         if not isinstance(scheduled_task_store, ScheduledTaskDispatchStore):
             raise TypeError(
                 "The configured scheduled task store does not implement the operations needed "
@@ -1694,6 +1700,7 @@ def create_app(
         RunnerBackgroundTitleGenerator(runner_router),
         additional_instructions=title_instructions,
     )
+    pull_request_refresher = session_pull_requests.PullRequestRefresher()
     # Shared between the host tunnel (which records ``host.runner_exited``
     # reports from daemons) and the runner status endpoint (which surfaces
     # them to clients waiting for a launched runner to connect).
@@ -1855,7 +1862,12 @@ def create_app(
         scheduler_start_retry: asyncio.Task[None] | None = None
         scheduled_task_scheduler: ScheduledTaskScheduler | PersistentTaskScheduler | None = None
         if scheduled_task_store is not None:
-            from omnigent.server.scheduled.fire import FireDeps, build_on_fire, build_run_now
+            from omnigent.server.scheduled.fire import (
+                ClaimedRunExecutor,
+                FireDeps,
+                build_on_fire,
+                build_run_now,
+            )
 
             fire_deps = FireDeps(
                 scheduled_task_store=scheduled_task_store,
@@ -1878,25 +1890,25 @@ def create_app(
                 startup_inputs=app_inst.state.startup_inputs,
                 app_state=app_inst.state,
             )
-            on_fire = build_on_fire(fire_deps)
-            # The manual "run now" trigger reuses the same fire path (dispatch /
-            # preflight / in-flight guard) as the scheduler; it only differs in
-            # allowing a paused task to fire. Exposed on app.state for the
-            # POST /v1/scheduled-tasks/{id}/run route.
-            app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
             if not automations_v2_enabled:
+                # Legacy Run now uses this fire path, including for paused tasks.
+                # The database scheduler handles Run now itself.
+                app_inst.state.scheduled_task_run_now = build_run_now(fire_deps)
                 scheduled_task_scheduler = ScheduledTaskScheduler(
                     store=scheduled_task_store,
-                    on_fire=on_fire,
+                    on_fire=build_on_fire(fire_deps),
                 )
             else:
-                assert scheduled_task_dispatch is not None
                 assert isinstance(scheduled_task_store, ScheduledTaskDispatchStore)
+                dispatch_hooks = scheduled_task_dispatch or ScheduledTaskDispatchHooks()
+                executor = ClaimedRunExecutor(
+                    fire_deps, fire_identity=dispatch_hooks.fire_identity
+                )
                 scheduled_task_scheduler = PersistentTaskScheduler(
                     store=scheduled_task_store,
-                    on_fire=scheduled_task_dispatch.on_fire,
-                    on_expired=scheduled_task_dispatch.on_expired,
-                    owns_host=scheduled_task_dispatch.owns_host,
+                    on_fire=dispatch_hooks.on_fire or executor.fire,
+                    on_expired=dispatch_hooks.on_expired or executor.recover,
+                    owned_hosts=dispatch_hooks.owned_hosts,
                     poll_seconds=dispatch_config.poll_seconds,
                     renewal_seconds=dispatch_config.renewal_seconds,
                     lease_seconds=dispatch_config.lease_seconds,
@@ -1974,10 +1986,13 @@ def create_app(
                 app_inst.state.managed_sandbox_reaper = managed_sandbox_reaper
                 await managed_sandbox_reaper.start()
 
+        session_pull_requests.install_refresher(pull_request_refresher)
         try:
             with monitor_event_loop():
                 yield
         finally:
+            session_pull_requests.install_refresher(None)
+            await pull_request_refresher.aclose()
             if scheduler_start_retry is not None:
                 scheduler_start_retry.cancel()
                 with suppress(asyncio.CancelledError):
@@ -3373,6 +3388,9 @@ def create_app(
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
+                "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
+                "session_pull_requests": session_pull_requests.open_store(conversation_store)
+                is not None,
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,
@@ -3497,6 +3515,7 @@ def create_app(
             # files a session into a project (owner-private membership).
             project_store=project_store,
             background_title_coordinator=background_title_coordinator,
+            pull_request_refresher=pull_request_refresher,
             register_startup_dispatch=lambda handler: (
                 setattr(startup_inputs, "dispatch", handler)
                 if startup_inputs is not None

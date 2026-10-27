@@ -214,6 +214,7 @@ describe("HarnessPicker", () => {
       const other = screen.getByTestId("other");
       fireEvent.click(other);
       const submenu = screen.getByTestId("other-menu");
+      expect(submenu).toHaveClass("menu-surface");
       // Mirror the diagonal path for flyouts flipped by viewport collisions.
       vi.spyOn(submenu, "getBoundingClientRect").mockReturnValue(
         new DOMRect(side === "right" ? 200 : 0, 0, 100, 300),
@@ -268,7 +269,12 @@ describe("HarnessPicker", () => {
   it.each([false, true])("shares row geometry and config navigation on mobile=%s", (mobile) => {
     render(<PickerFixture mobile={mobile} />);
     fireEvent.pointerDown(screen.getByRole("button", { name: "Harness" }), { button: 0 });
-    expect(screen.getByTestId("menu")).toHaveClass("w-[17.5rem]", "min-w-[17.5rem]", "p-2");
+    expect(screen.getByTestId("menu")).toHaveClass(
+      "menu-surface",
+      "w-[17.5rem]",
+      "min-w-[17.5rem]",
+      "p-2",
+    );
     expect(screen.getByTestId("entry").closest("[data-harness-menu-row]")).toHaveClass("min-h-8");
     expect(screen.getByTestId("entry")).toHaveAttribute("data-active", "true");
     expect(screen.getByTestId("model")).toHaveClass("text-right");

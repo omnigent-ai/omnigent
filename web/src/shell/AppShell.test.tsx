@@ -1950,7 +1950,7 @@ describe("Workspace rail maximize", () => {
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
   });
 
-  it("reflects the docked sidebar's open state on the app shell for CSS to key off", () => {
+  it("reflects the docked sidebar state and width on the app shell", () => {
     // The maximized rail's traffic-light clearance (index.css) must drop when
     // the sidebar is reopened over it — the sidebar then covers the window
     // corner, so there are no lights to clear. That CSS keys off
@@ -1965,11 +1965,14 @@ describe("Workspace rail maximize", () => {
     // `:not([data-sidebar-open])` matches and the clearance still applies.
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "false");
     expect(shell?.hasAttribute("data-sidebar-open")).toBe(false);
+    expect((shell as HTMLElement).style.getPropertyValue("--app-sidebar-width")).toBe("0px");
 
-    // Reopen the sidebar: the attribute appears, dropping the clearance.
+    // Reopen the sidebar: the attribute appears, dropping the clearance, and
+    // the background reservation expands to the live sidebar width.
     fireEvent.click(screen.getByRole("button", { name: /open sidebar/i }));
     expect(screen.getByTestId("sidebar")).toHaveAttribute("data-open", "true");
     expect(shell).toHaveAttribute("data-sidebar-open", "true");
+    expect((shell as HTMLElement).style.getPropertyValue("--app-sidebar-width")).toBe("320px");
   });
 
   it.each([
@@ -4311,6 +4314,56 @@ describe("AppShell clone/fork action", () => {
       expect(forkSessionMock).not.toHaveBeenCalled();
     },
   );
+
+  it("disables directory recovery for an Arclet session that forks only onto a new Arclet", async () => {
+    mockConversations([{ id: "conv_arclet", permission_level: 4 }]);
+    useSessionMock.mockReturnValue({
+      session: sessionSnapshot({
+        id: "conv_arclet",
+        workspace: "/missing/repo",
+        hostId: "host_arclet",
+        labels: { "omnigent.host_type": "managed" },
+      }),
+      isLoading: false,
+      error: null,
+    });
+    useHostsMock.mockReturnValue({
+      data: [
+        {
+          host_id: "host_arclet",
+          name: "Arclet",
+          owner: "owner",
+          status: "online",
+          sandbox_provider: "arclet",
+        },
+      ],
+    } as ReturnType<typeof useHosts>);
+    const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
+    render(
+      <CapabilitiesProvider
+        info={serverInfo({ managed_sandboxes_enabled: true, sandbox_providers: ["arclet"] })}
+      >
+        {sessionShellTree(
+          client,
+          "/c/conv_arclet",
+          <ConversationScopeContext.Provider value="conv_arclet">
+            <ErrorBanner message="Missing directory" source="execution" code="workspace_missing" />
+          </ConversationScopeContext.Provider>,
+        )}
+      </CapabilitiesProvider>,
+    );
+
+    const recover = screen.getByRole("button", { name: "Continue in another directory…" });
+    expect(recover).toBeDisabled();
+    fireEvent.focus(screen.getByRole("group", { name: "Continue in another directory…" }));
+    await waitFor(() =>
+      expect(screen.getByRole("tooltip")).toHaveTextContent(
+        "This sandbox session can only be cloned onto a new sandbox.",
+      ),
+    );
+    fireEvent.click(recover);
+    expect(screen.queryByTestId("fork-session-dialog")).not.toBeInTheDocument();
+  });
 
   it("opens workspace recovery and resets it before a later normal fork", async () => {
     const source = sessionSnapshot({

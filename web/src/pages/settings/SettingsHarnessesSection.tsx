@@ -194,7 +194,7 @@ export const SettingsHarnessesSection = () => {
       ) : (
         <>
           <div className="flex flex-wrap items-center justify-between gap-4 pb-6">
-            <h1 className="settings-page-title text-2xl font-semibold">Harnesses</h1>
+            <h1 className="settings-page-title text-2xl font-medium">Harnesses</h1>
             <HostSelect hosts={sortedHosts} selected={selectedHost} onSelect={setSelectedHostId} />
           </div>
           <div className="mb-6 flex items-center gap-2">
@@ -457,6 +457,16 @@ function configuredAccountLabel(host: Host | null, harness: string): string | un
   return [account.email, account.plan].filter(Boolean).join(" · ") || undefined;
 }
 
+function canSwitchHarnessAccount(host: Host | null, harness: string): boolean {
+  if (host?.harness_login_supported !== true) return false;
+  const accountKey = harnessAccountKey(harness);
+  const kind = host.harness_accounts?.[accountKey]?.kind;
+  return (
+    (accountKey === "codex" && kind === "chatgpt") ||
+    (accountKey === "claude" && kind === "subscription")
+  );
+}
+
 function reconfigurationReason(reason: string | null) {
   if (reason === "needs-auth") return "Missing credentials";
   if (reason === "version-too-low") return "Out of date";
@@ -688,7 +698,7 @@ function HarnessDetail({
         <div className="flex min-w-0 items-center gap-3">
           <HarnessIcon entry={entry} />
           <div className="flex min-w-0 flex-col">
-            <h1 className="settings-page-title truncate text-2xl font-semibold">{entry.name}</h1>
+            <h1 className="settings-page-title truncate text-2xl font-medium">{entry.name}</h1>
             <HarnessStatusText
               status={status}
               enhanced={canSetup}
@@ -729,9 +739,13 @@ function HarnessDetail({
           : "Needs reconfiguration"
       }
       action={
-        credentialProblem && canFix
-          ? { label: "Reconfigure", onClick: () => onFix(mode) }
-          : undefined
+        status.ready && canFix && canSwitchHarnessAccount(host, entry.harness)
+          ? { label: "Switch account", onClick: () => onFix("switch") }
+          : status.reason === "needs-auth" && account?.expired && canFix
+            ? { label: "Sign in again", onClick: () => onFix(mode) }
+            : credentialProblem && canFix
+              ? { label: "Reconfigure", onClick: () => onFix(mode) }
+              : undefined
       }
     />
   );
