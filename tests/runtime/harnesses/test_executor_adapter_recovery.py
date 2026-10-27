@@ -946,3 +946,93 @@ async def test_safe_interrupt_unexpected_failure_still_errors(
     records = [rec for rec in caplog.records if rec.name == _ADAPTER_LOGGER]
     assert [rec.levelno for rec in records] == [logging.ERROR]
     assert "failed or timed out" in records[0].getMessage()
+
+
+@pytest.mark.parametrize("preserve_session", [True, False])
+async def test_antigravity_gate_timeout_does_not_cancel_the_native_cascade(
+    preserve_session: bool,
+) -> None:
+    """
+    REGRESSION: a native completion-gate timeout must not cancel the agy cascade.
+
+    The antigravity-native gate stops WAITING on a turn agy may still be running
+    out of process. It signals that by setting ``preserve_session`` on its
+    ``ExecutorError`` so the adapter treats the exit as clean and schedules no
+    abnormal-exit interrupt — otherwise ``_safe_interrupt`` reaches into agy and
+    cancels the live cascade mid-turn. A gate failure WITHOUT ``preserve_session``
+    is a genuine abnormal exit and must still be interrupted.
+    """
+    gate_failure = ExecutorError(
+        message="Antigravity native turn ...; its work is NOT confirmed",
+        retryable=True,
+        preserve_session=preserve_session,
+    )
+    executor = _FakeExecutor(events=[gate_failure])
+    adapter = ExecutorAdapter(executor_factory=lambda: executor)
+
+    with pytest.raises(RuntimeError, match="NOT confirmed"):
+        await adapter.run_turn(_request(), _ctx("resp_gate_timeout"))
+    # Drain any detached abnormal-exit interrupt scheduled in the finally.
+    await adapter.on_shutdown()
+    if preserve_session:
+        assert executor.interrupt_calls == []
+    else:
+        assert executor.interrupt_calls == [adapter._session_key]
+    assert not adapter._bg_tasks
+
+
+@pytest.mark.parametrize("gate_returns_before_watchdog", [True, False])
+async def test_silent_gate_injects_once_only_when_it_beats_the_idle_watchdog(
+    monkeypatch: pytest.MonkeyPatch, gate_returns_before_watchdog: bool
+) -> None:
+    """
+    REGRESSION: a silent completion gate must return before the idle watchdog.
+
+    The antigravity-native gate makes progress by POLLING agy, not by emitting
+    scaffold events, so ``_guarded_run_turn``'s idle watchdog is never reset
+    while the gate waits. If the gate OUTLIVES that watchdog the scaffold treats
+    the turn as wedged and REPLAYS it — re-typing the prompt into the agy TUI a
+    second time. A gate that reconciles with the configured watchdog returns
+    first, so the turn is delivered exactly once; a silent turn that overruns it
+    is injected twice before the watchdog finally fails it.
+    """
+    from omnigent.runtime.harnesses import _scaffold
+
+    monkeypatch.setattr(_scaffold, "_TURN_IDLE_TIMEOUT_S", 0.05)
+    monkeypatch.setattr(_scaffold, "_TURN_ABSOLUTE_TIMEOUT_S", 10)
+
+    injections = 0
+    release = asyncio.Event()
+
+    class _SilentGateExecutor(_FakeExecutor):
+        async def run_turn(
+            self,
+            messages: list[Message],
+            tools: list[ToolSpec],
+            system_prompt: str,
+            config: ExecutorConfig | None = None,
+        ) -> AsyncIterator[ExecutorEvent]:
+            nonlocal injections
+            injections += 1  # one TUI delivery per run_turn entry
+            if gate_returns_before_watchdog:
+                yield TurnComplete(response="done")
+                return
+            # Reader-only progress: the gate polls silently and emits nothing,
+            # so the scaffold's idle watchdog is never reset.
+            await release.wait()
+            yield TurnComplete(response="done")
+
+    adapter = ExecutorAdapter(executor_factory=lambda: _SilentGateExecutor())
+    ctx = _ctx("resp_silent_gate")
+    try:
+        if gate_returns_before_watchdog:
+            await adapter._guarded_run_turn(_request(), ctx)
+            assert injections == 1
+        else:
+            with pytest.raises(RuntimeError, match="idle watchdog"):
+                await adapter._guarded_run_turn(_request(), ctx)
+            # The silent, overrunning turn was replayed: typed into the TUI twice.
+            assert injections == 2
+    finally:
+        release.set()
+        await adapter.on_shutdown()

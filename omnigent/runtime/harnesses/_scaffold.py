@@ -135,6 +135,16 @@ _TURN_IDLE_TIMEOUT_S = float(
     os.environ.get("HARNESS_TURN_TIMEOUT_S", _DEFAULT_TURN_IDLE_TIMEOUT_S)
 )
 
+
+def turn_idle_timeout_s() -> float:
+    """The per-turn idle-watchdog budget in seconds (``<= 0`` disables it).
+
+    Exposed so a caller in another layer — the antigravity-native completion
+    gate — can honour the same knob without reaching into a private attribute.
+    """
+    return _TURN_IDLE_TIMEOUT_S
+
+
 # Absolute per-turn ceiling on TOTAL turn duration. Progress-aware when
 # the idle watchdog is enabled: every real progress event extends the
 # ceiling to at least one idle window past now, so a turn that keeps

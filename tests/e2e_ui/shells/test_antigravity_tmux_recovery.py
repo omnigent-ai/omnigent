@@ -83,13 +83,17 @@ def antigravity_model(
                 return
             request = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
             reply = "Ready."
+            delay_s = 0.0
             for content in reversed(request.get("contents", [])):
                 if content.get("role") != "user":
                     continue
                 text = "\n".join(part.get("text", "") for part in content.get("parts", []))
-                matches = re.findall(r"Reply (agy-e2e-[0-9a-f]{8})\.", text)
+                matches = re.findall(
+                    r"Reply (agy-e2e-[0-9a-f]{8})(?: after (\d+) seconds)?\.", text
+                )
                 if matches:
-                    reply = matches[-1]
+                    reply, delay = matches[-1]
+                    delay_s = float(delay or 0)
                     replies.append(reply)
                     break
             response = {
@@ -110,6 +114,10 @@ def antigravity_model(
             )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
+            self.wfile.flush()
+            # Holding the body back keeps agy's model turn open for the delay.
+            if delay_s:
+                time.sleep(delay_s)
             self.wfile.write(body)
 
     home = tmp_path / "model-home"
