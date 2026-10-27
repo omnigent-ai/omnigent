@@ -336,6 +336,7 @@ def _build_app_with_stub_stores() -> Any:
 
     from omnigent.runtime.agent_cache import AgentCache
     from omnigent.server.app import create_app
+    from omnigent.server.feature_flags import Feature, FeatureFlags
     from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
     from omnigent.stores.artifact_store.local import LocalArtifactStore
     from omnigent.stores.comment_store.sqlalchemy_store import SqlAlchemyCommentStore
@@ -346,6 +347,7 @@ def _build_app_with_stub_stores() -> Any:
     from omnigent.stores.host_store import HostStore
     from omnigent.stores.policy_store.sqlalchemy_store import SqlAlchemyPolicyStore
     from omnigent.stores.project_store.sqlalchemy_store import SqlAlchemyProjectStore
+    from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
 
     # On-disk SQLite (mkdtemp ensures uniqueness so concurrent
     # invocations don't collide).
@@ -367,6 +369,9 @@ def _build_app_with_stub_stores() -> Any:
         host_store=HostStore(db_uri),
         policy_store=SqlAlchemyPolicyStore(db_uri),
         project_store=SqlAlchemyProjectStore(db_uri),
+        # Feature-gated routers are part of the public contract; mount them for the spec.
+        skill_store=SqlAlchemySkillStore(db_uri),
+        feature_flags=FeatureFlags(frozenset({Feature.SKILLS_MARKETPLACE})),
     )
 
 

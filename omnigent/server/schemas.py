@@ -270,6 +270,9 @@ class SkillSummary(BaseModel):
     name: str
     description: str
     display_name: str | None = None
+    #: ``owner/repo`` of the marketplace source an installed skill came from;
+    #: ``None`` for bundled and host skills.
+    source: str | None = None
 
 
 class NativeReasoningEffortOption(BaseModel):

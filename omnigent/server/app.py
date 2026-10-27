@@ -166,6 +166,7 @@ from omnigent.server.server_config import (
     PickerCuration,
 )
 from omnigent.server.ws_origin import WebSocketOriginMiddleware
+from omnigent.skills.service import SkillFetcher
 from omnigent.stores import (
     AgentStore,
     ArtifactStore,
@@ -185,6 +186,7 @@ from omnigent.stores.preference_store import PreferenceStore
 from omnigent.stores.project_store import ProjectStore
 from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.dispatch import ScheduledTaskDispatchStore
+from omnigent.stores.skill_store import SkillStore
 from omnigent.util.event_loop_watchdog import monitor_event_loop
 
 if TYPE_CHECKING:
@@ -1548,6 +1550,7 @@ def create_app(
     policy_store: PolicyStore | None = None,
     permission_store: PermissionStore | None = None,
     scheduled_task_store: ScheduledTaskStore | None = None,
+    skill_store: SkillStore | None = None,
     project_store: ProjectStore | None = None,
     auth_provider: AuthProvider | None = None,
     host_store: HostStore | None = None,
@@ -1617,6 +1620,9 @@ def create_app(
         CRUD endpoints.
     :param permission_store: Store for session-level access grants.
         ``None`` disables permission checks (all access allowed).
+    :param skill_store: Store behind the skills marketplace. When provided
+        and the ``skills_marketplace`` feature is on, the marketplace routes
+        are mounted and installed skills ride into served agent bundles.
     :param scheduled_task_store: Store backing the recurring-task
         scheduler. When provided, the FastAPI lifespan
         starts an :class:`ScheduledTaskScheduler` that arms a timer per
@@ -2262,6 +2268,22 @@ def create_app(
     )
     app.state.startup_inputs = startup_inputs
     app.state.host_store = host_store
+    app.state.skill_store = skill_store
+    # Tests swap in a fetcher whose clone copies a fixture repository.
+    app.state.skill_fetcher = SkillFetcher()
+    if skill_store is not None and resolved_feature_flags.enabled(Feature.SKILLS_MARKETPLACE):
+        from omnigent.server.routes.skill_marketplace import create_skill_marketplace_router
+
+        app.include_router(
+            create_skill_marketplace_router(
+                skill_store=skill_store,
+                artifact_store=artifact_store,
+                auth_provider=auth_provider,
+                permission_store=permission_store,
+            ),
+            prefix="/v1",
+            tags=["skills"],
+        )
     app.state.mcp_gateway_backend = mcp_gateway_backend
     app.state.mcp_registry = mcp_registry
     app.state.mcp_registry_auth = auth_provider
@@ -3730,6 +3752,7 @@ def create_app(
             conversation_store,
             agent_store,
             file_store=file_store,
+            skill_store=skill_store,
             artifact_store=artifact_store,
             runner_router=runner_router,
             auth_provider=auth_provider,
@@ -4943,6 +4966,7 @@ def create_app(
                 agent_cache=agent_cache,
                 auth_provider=auth_provider,
                 permission_store=permission_store,
+                skill_store=skill_store,
             ),
             prefix="/v1",
             tags=["skills"],

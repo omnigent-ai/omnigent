@@ -8,6 +8,7 @@ import secrets
 from fastapi import APIRouter, HTTPException, Query, Request
 from pydantic import BaseModel, Field
 
+from omnigent.entities import InstalledSkill
 from omnigent.harness_aliases import canonicalize_harness
 from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_host_frame
 from omnigent.runtime.agent_cache import AgentCache
@@ -16,11 +17,14 @@ from omnigent.server.host_registry import HostConnection, HostRegistry
 from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import validate_session_agent
+from omnigent.server.routes.skill_marketplace import source_label
 from omnigent.server.schemas import SkillSummary
+from omnigent.server.skill_injection import skill_allowed
 from omnigent.spec.types import AgentSpec
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.skill_store import SkillStore
 
 _SKILLS_TIMEOUT_S = 15.0
 
@@ -42,6 +46,7 @@ def create_skills_router(
     agent_cache: AgentCache | None = None,
     auth_provider: AuthProvider | None = None,
     permission_store: PermissionStore | None = None,
+    skill_store: SkillStore | None = None,
 ) -> APIRouter:
     """Build the discovery route, mounted under ``/v1``."""
     router = APIRouter()
@@ -170,6 +175,9 @@ def create_skills_router(
                 for skill in spec.skills
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
+        if skill_store is not None:
+            installed = await asyncio.to_thread(skill_store.list_for_user, user_id)
+            skills += installed_skill_summaries(installed, spec, {s.name for s in skills})
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router
@@ -223,3 +231,23 @@ async def request_host_skills(
         ) from exc
     finally:
         host_conn.pending_skills.pop(request_id, None)
+
+
+def installed_skill_summaries(
+    installed: list[InstalledSkill], spec: AgentSpec | None, taken: set[str]
+) -> list[SkillSummary]:
+    """Installed skills the menu should list: enabled, allowed by the spec, not shadowed."""
+    out: list[SkillSummary] = []
+    for skill in installed:
+        if not skill.enabled or skill.name in taken or not skill_allowed(spec, skill.name):
+            continue
+        taken.add(skill.name)
+        out.append(
+            SkillSummary(
+                name=skill.name,
+                description=skill.description,
+                display_name=skill.display_name,
+                source=source_label(skill.source_url),
+            )
+        )
+    return out

@@ -154,7 +154,14 @@ async def test_session_catalog_needs_no_runner_and_allows_shared_editors(
     assert response.status_code == (200 if acknowledged else 502)
     if acknowledged:
         assert response.json() == {
-            "skills": [{"name": "child-review", "description": "Review", "display_name": None}],
+            "skills": [
+                {
+                    "name": "child-review",
+                    "description": "Review",
+                    "display_name": None,
+                    "source": None,
+                }
+            ],
             "warnings": [warning],
         }
     else:
@@ -278,7 +285,12 @@ async def test_presession_catalog_matches_filtered_invocations(
     assert response.status_code == 200
     expected = resolve_session_skills(spec, (tmp_path,), None)
     assert response.json()["skills"] == [
-        {"name": s.name, "description": s.description, "display_name": s.display_name}
+        {
+            "name": s.name,
+            "description": s.description,
+            "display_name": s.display_name,
+            "source": None,
+        }
         for s in expected
     ]
     assert "hidden" not in {s["name"] for s in response.json()["skills"]}

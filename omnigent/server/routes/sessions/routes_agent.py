@@ -44,6 +44,9 @@ from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent as _can_mutate_session_agent,
 )
 from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id,
+)
+from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -85,9 +88,11 @@ from omnigent.server.schemas import (
     PolicySummary,
     SkillSummary,
 )
+from omnigent.server.skill_injection import _bundle_spec, with_installed_skills
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.skill_store import SkillStore
 
 
 def register_agent_routes(
@@ -101,6 +106,7 @@ def register_agent_routes(
     permission_store: PermissionStore | None = None,
     agent_cache: AgentCache | None = None,
     host_registry: HostRegistry | None = None,
+    skill_store: SkillStore | None = None,
 ) -> None:
     """Register the agent sub-resource routes on router."""
 
@@ -254,6 +260,17 @@ def register_agent_routes(
             raise OmnigentError(
                 "Agent bundle not found in artifact store",
                 code=ErrorCode.INTERNAL_ERROR,
+            )
+        if skill_store is not None:
+            # Installed skills follow the session owner, whoever fetches the bundle.
+            owner_id = await asyncio.to_thread(get_session_owner_id, conv.id, permission_store)
+            bundle_bytes = await asyncio.to_thread(
+                with_installed_skills,
+                bundle_bytes,
+                owner_id=owner_id,
+                skill_store=skill_store,
+                artifact_store=artifact_store,
+                spec=_bundle_spec(agent_cache, agent),
             )
         selection_headers = {}
         if request.headers.get(MCP_SELECTION_HEADER) == "1":

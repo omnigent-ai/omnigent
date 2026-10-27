@@ -38,6 +38,7 @@ class Feature(StrEnum):
     GRID_SESSIONS_DISPLAY_UI = "grid_sessions_display_ui"
     AUTOMATIONS_V2 = "automations_v2"
     SPLITTABLE_TERMINAL_VIEW_UI = "splittable_terminal_view_ui"
+    SKILLS_MARKETPLACE = "skills_marketplace"
 
 
 @dataclass(frozen=True)
@@ -94,6 +95,12 @@ FEATURE_DEFINITIONS: tuple[FeatureDefinition, ...] = (
         description="Split the main terminal view into several shell panes",
         owner="web",
         review_by_release="0.22.0",
+    ),
+    FeatureDefinition(
+        feature=Feature.SKILLS_MARKETPLACE,
+        description="Browse and install skills from git repositories in Settings → Skills",
+        owner="server",
+        review_by_release="0.23.0",
     ),
     FeatureDefinition(
         feature=Feature.USAGE_PAGE,
