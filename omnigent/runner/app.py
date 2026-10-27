@@ -7891,6 +7891,10 @@ def create_runner_app(
             # prompt and strands its approval card unanswerable.
             if approval_wait_is_fresh(conv_id):
                 return True
+            from omnigent.native._native_forwarder_health import has_active_subagents
+
+            if has_active_subagents(conv_id):
+                return True
             # An attached viewer alone does not spare the pane (a tab left open
             # overnight kept idle native stacks resident). Count it only when a
             # human drove it recently: a CLI keypress, or any web-bridge event.

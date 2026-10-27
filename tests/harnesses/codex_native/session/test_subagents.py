@@ -690,6 +690,88 @@ def test_forwarder_collab_item_started_registers_child_before_completed(
     )
 
 
+def test_rotated_parent_releases_a_held_child_that_never_registered(
+    tmp_path: Path,
+) -> None:
+    """
+    A child that holds the pane but never registered still releases it after a parent rotation.
+
+    Discovery holds the parent pane before the child's AP session exists. If
+    registration never happens and the parent then rotates, pending discovery
+    is cleared, yet the child's completion must still reach the activity
+    tracker; otherwise the rotated pane stays busy and is never idle-reaped.
+    """
+    from omnigent.native._native_forwarder_health import (
+        NativeSubagentActivity,
+        has_active_subagents,
+    )
+
+    posted: list[tuple[str, dict[str, Any]]] = []
+    activity = NativeSubagentActivity("conv_parent")
+    state = codex_native_forwarder._CodexForwarderState(
+        parent_session_id="conv_parent",
+        child_activity=activity,
+    )
+    child_started: dict[str, Any] = {
+        "method": "thread/started",
+        "params": {
+            "thread": {
+                "id": "thread_child",
+                "source": {"subAgent": {"thread_spawn": {"parent_thread_id": "thread_parent"}}},
+            }
+        },
+    }
+    child_turn_started: dict[str, Any] = {
+        "method": "turn/started",
+        "params": {"threadId": "thread_child", "turn": {"id": "turn_child"}},
+    }
+    child_turn_completed: dict[str, Any] = {
+        "method": "turn/completed",
+        "params": {
+            "threadId": "thread_child",
+            "turn": {"id": "turn_child", "status": "completed", "items": []},
+        },
+    }
+
+    async def run() -> None:
+        """
+        Discover the child, rotate the parent, then complete the child.
+
+        :returns: None.
+        """
+        async with httpx.AsyncClient(
+            base_url="http://127.0.0.1:8000",
+            transport=httpx.MockTransport(_make_omnigent_handler(posted)),
+        ) as client:
+            for event in (child_started, child_turn_started):
+                await codex_native_forwarder._handle_event(
+                    client,
+                    **_forwarder_context(client, tmp_path, session_id="conv_parent"),
+                    event=event,
+                    expected_thread_id="thread_parent",
+                    forwarder_state=state,
+                )
+            assert has_active_subagents("conv_parent")
+            state.note_parent_rotation("conv_rotated")
+            assert has_active_subagents("conv_rotated"), "rotation must keep the child's hold"
+            await codex_native_forwarder._handle_event(
+                client,
+                **_forwarder_context(client, tmp_path, session_id="conv_rotated"),
+                event=child_turn_completed,
+                expected_thread_id="thread_rotated",
+                forwarder_state=state,
+            )
+
+    try:
+        asyncio.run(run())
+        assert state.session_for_child_thread("thread_child") is None
+        assert not has_active_subagents("conv_rotated"), (
+            "the completed child still holds the rotated pane"
+        )
+    finally:
+        activity.close()
+
+
 def test_completed_item_key_is_total_never_empty() -> None:
     """
     ``_completed_item_key`` returns a non-empty string for every item shape.
