@@ -18,6 +18,7 @@ from omnigent.harnesses.codex_native.bridge import (
     read_bridge_state,
 )
 from tests.harnesses.codex_native.session._support import (
+    _capture_handler,
     _elicitation_tracker,
     _expected_status_data,
     _FakeCodexAppServerClient,
@@ -684,6 +685,439 @@ def test_subscribe_until_ready_parks_until_signal_then_resumes(
     # that succeeds. If it were still polling we'd never reach here (fake_sleep
     # raises); if it never retried after the signal it would hang on await task.
     assert attempts >= 2, attempts
+
+
+def _list_turns_refusal() -> codex_native_app_server.CodexAppServerResponseError:
+    """Build the ``thread/resume`` refusal Codex returned for the worker thread."""
+    return codex_native_app_server.CodexAppServerResponseError(
+        {"code": -32601, "message": "list_turns is not supported yet"}
+    )
+
+
+def _failed_statuses(posted: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Return the posted ``failed`` session-status payloads in order."""
+    return [
+        payload["data"]
+        for payload in posted
+        if payload["type"] == "external_session_status" and payload["data"]["status"] == "failed"
+    ]
+
+
+def test_subscribe_until_ready_fails_each_refused_turn_until_resume_succeeds(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Each refusal interrupts and fails the running turn; the next activation retries."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient()
+    resume_errors: list[Exception | None] = [_list_turns_refusal()] * 4 + [None]
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+    posted: list[dict[str, Any]] = []
+
+    async def scripted_request(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        fake_client.requests.append((method, params))
+        if method == "thread/resume":
+            error = resume_errors.pop(0)
+            if error is not None:
+                raise error
+            return {"result": {"thread": {"turns": []}}}
+        return {"result": {}}
+
+    monkeypatch.setattr(fake_client, "request", scripted_request)
+
+    async def wait_for_failures(task: asyncio.Task[None], count: int) -> None:
+        while len(_failed_statuses(posted)) < count and not task.done():
+            await asyncio.sleep(0)
+
+    async def run() -> None:
+        ready = asyncio.Event()
+        ready.set()
+        async with _recording_forwarder_client(posted) as client:
+            task = asyncio.create_task(
+                codex_native_forwarder._subscribe_until_ready(
+                    fake_client,  # type: ignore[arg-type]
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=tmp_path,
+                    thread_id="thread_123",
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    forwarder_state=forwarder_state,
+                    ready_signal=ready,
+                )
+            )
+            await asyncio.wait_for(wait_for_failures(task, 1), timeout=5.0)
+            assert _failed_statuses(posted), (
+                f"refused thread/resume left turn_123 running with nothing surfaced: {posted}"
+            )
+            state = read_bridge_state(tmp_path)
+            assert state is not None
+            assert state.active_turn_id is None
+            assert not task.done(), "a refused subscription should wait for the next activation"
+            _write_forwarder_bridge(tmp_path, active_turn_id="turn_456")
+            ready.set()
+            await asyncio.wait_for(wait_for_failures(task, 2), timeout=5.0)
+            ready.set()
+            await asyncio.wait_for(task, timeout=5.0)
+
+    asyncio.run(run())
+
+    resume_with_turns = ("thread/resume", {"threadId": "thread_123"})
+    resume_without_turns = ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+    assert fake_client.requests == [
+        resume_with_turns,
+        resume_without_turns,
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_123"}),
+        resume_with_turns,
+        resume_without_turns,
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_456"}),
+        resume_without_turns,
+    ]
+    failures = _failed_statuses(posted)
+    assert [failure["response_id"] for failure in failures] == ["codex_turn_123", "codex_turn_456"]
+    assert all("list_turns is not supported yet" in failure["output"] for failure in failures)
+    assert forwarder_state.surfaced_terminal_error_turns == {"turn_123", "turn_456"}
+
+
+def test_supervise_forwarder_retries_subscription_on_activity_during_refused_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """Thread activity seen while a refused turn is failing re-arms the subscription retry."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient()
+    resume_errors: list[Exception | None] = [_list_turns_refusal()] * 2 + [None]
+    interrupted = asyncio.Event()
+    activity_handled = asyncio.Event()
+    resumed = asyncio.Event()
+    posted: list[dict[str, Any]] = []
+
+    async def refuse_first_subscription(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        fake_client.requests.append((method, params))
+        if method == "turn/interrupt":
+            interrupted.set()
+            await activity_handled.wait()
+            return {"result": {}}
+        error = resume_errors.pop(0)
+        if error is not None:
+            raise error
+        resumed.set()
+        return {"result": {"thread": {"turns": []}}}
+
+    async def thread_activity_during_interrupt() -> Any:
+        await interrupted.wait()
+        yield {
+            "method": "thread/status/changed",
+            "params": {"threadId": "thread_123", "status": {"type": "active"}},
+        }
+        activity_handled.set()
+        await resumed.wait()
+
+    monkeypatch.setattr(fake_client, "request", refuse_first_subscription)
+    monkeypatch.setattr(fake_client, "iter_events", thread_activity_during_interrupt)
+
+    async def run() -> None:
+        await asyncio.wait_for(
+            codex_native_forwarder.supervise_forwarder(
+                base_url="http://127.0.0.1:1",
+                headers={},
+                session_id="conv_123",
+                bridge_dir=tmp_path,
+                app_server_url=str(tmp_path / "app-server.sock"),
+                thread_id="thread_123",
+                client=fake_client,  # type: ignore[arg-type]
+                ap_transport=httpx.MockTransport(_capture_handler(posted)),
+            ),
+            timeout=5.0,
+        )
+
+    asyncio.run(run())
+
+    resume_without_turns = ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+    assert fake_client.requests == [
+        ("thread/resume", {"threadId": "thread_123"}),
+        resume_without_turns,
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_123"}),
+        resume_without_turns,
+    ]
+    assert [failure["response_id"] for failure in _failed_statuses(posted)] == ["codex_turn_123"]
+
+
+def _record_sleeps(monkeypatch: pytest.MonkeyPatch) -> list[float]:
+    """Replace the forwarder's sleep with one that records each delay."""
+    delays: list[float] = []
+
+    async def recording_sleep(delay: float) -> None:
+        delays.append(delay)
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(codex_native_forwarder, "_sleep", recording_sleep)
+    return delays
+
+
+def _subscribe_without_signal(
+    fake_client: _FakeCodexAppServerClient,
+    bridge_dir: Path,
+    *,
+    forwarder_state: codex_native_forwarder._CodexForwarderState | None = None,
+) -> list[dict[str, Any]]:
+    """Run one subscription attempt with no ready signal; return the posted events."""
+    posted: list[dict[str, Any]] = []
+
+    async def run() -> None:
+        async with _recording_forwarder_client(posted) as client:
+            await asyncio.wait_for(
+                codex_native_forwarder._subscribe_until_ready(
+                    fake_client,  # type: ignore[arg-type]
+                    client,
+                    session_id="conv_123",
+                    bridge_dir=bridge_dir,
+                    thread_id="thread_123",
+                    usage_coalescer=_usage_coalescer(client),
+                    elicitation_tracker=_elicitation_tracker(),
+                    forwarder_state=forwarder_state,
+                ),
+                timeout=5.0,
+            )
+
+    asyncio.run(run())
+    return posted
+
+
+def test_subscribe_until_ready_fails_turn_recorded_after_the_refusal(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    """A refusal that beats ``turn/start`` fails its turn; a failed interrupt keeps its id."""
+    _write_forwarder_bridge(tmp_path, active_turn_id=None)
+    fake_client = _FakeCodexAppServerClient()
+    polls = 0
+
+    async def refuse_resume_and_drop_interrupt(
+        method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        fake_client.requests.append((method, params))
+        if method == "thread/resume":
+            raise _list_turns_refusal()
+        raise ConnectionError("Codex app-server disconnected before responding to turn/interrupt")
+
+    monkeypatch.setattr(fake_client, "request", refuse_resume_and_drop_interrupt)
+
+    async def record_turn_on_third_poll(_delay: float) -> None:
+        nonlocal polls
+        polls += 1
+        if polls == 3:
+            _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+        await asyncio.sleep(0)
+
+    monkeypatch.setattr(codex_native_forwarder, "_sleep", record_turn_on_third_poll)
+
+    posted = _subscribe_without_signal(fake_client, tmp_path)
+
+    assert fake_client.requests == [
+        ("thread/resume", {"threadId": "thread_123", "excludeTurns": True}),
+        ("turn/interrupt", {"threadId": "thread_123", "turnId": "turn_123"}),
+    ]
+    failures = _failed_statuses(posted)
+    assert [failure["response_id"] for failure in failures] == ["codex_turn_123"]
+    assert "may still be running: list_turns is not supported yet" in failures[0]["output"]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == "turn_123"
+
+
+@pytest.mark.parametrize(
+    ("active_turn_id", "thread_ready"),
+    [
+        pytest.param("turn_123", True, id="replaying-active-turn"),
+        pytest.param(None, False, id="fresh-thread-first-turn"),
+    ],
+)
+def test_subscribe_until_ready_subscribes_without_turns_codex_cannot_list(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    active_turn_id: str | None,
+    thread_ready: bool,
+) -> None:
+    """A resume refused only for its turns subscribes without them and leaves the turn running."""
+    _write_forwarder_bridge(tmp_path, active_turn_id=active_turn_id)
+    fake_client = _FakeCodexAppServerClient()
+
+    async def refuse_listing_turns(method: str, params: dict[str, Any]) -> dict[str, Any]:
+        nonlocal thread_ready
+        fake_client.requests.append((method, params))
+        if not thread_ready:
+            thread_ready = True
+            raise codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "no rollout found for thread id thread_123"}
+            )
+        if not params.get("excludeTurns"):
+            raise _list_turns_refusal()
+        return {"result": {"thread": {"id": "thread_123", "turns": []}}}
+
+    monkeypatch.setattr(fake_client, "request", refuse_listing_turns)
+    _record_sleeps(monkeypatch)
+
+    posted = _subscribe_without_signal(fake_client, tmp_path)
+
+    resume_without_turns = ("thread/resume", {"threadId": "thread_123", "excludeTurns": True})
+    expected = [("thread/resume", {"threadId": "thread_123"}), resume_without_turns]
+    if active_turn_id is None:
+        expected.insert(0, resume_without_turns)
+    assert fake_client.requests == expected
+    assert posted == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == active_turn_id
+
+
+@pytest.mark.parametrize(
+    ("startup_rejections", "outcome"),
+    [
+        pytest.param(2, "was stopped", id="turn-still-starting"),
+        pytest.param(None, "had already ended", id="turn-never-interruptible"),
+    ],
+)
+def test_subscribe_until_ready_retries_interrupt_while_refused_turn_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    startup_rejections: int | None,
+    outcome: str,
+) -> None:
+    """Codex's "no active turn" answer during turn startup is retried within the wait."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient()
+    interrupts = 0
+
+    async def refuse_resume_while_turn_starts(
+        method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        nonlocal interrupts
+        fake_client.requests.append((method, params))
+        if method == "thread/resume":
+            raise _list_turns_refusal()
+        interrupts += 1
+        if startup_rejections is None or interrupts <= startup_rejections:
+            raise codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "no active turn to interrupt"}
+            )
+        return {"result": {}}
+
+    monkeypatch.setattr(fake_client, "request", refuse_resume_while_turn_starts)
+    delays = _record_sleeps(monkeypatch)
+
+    posted = _subscribe_without_signal(fake_client, tmp_path)
+
+    wait = codex_native_forwarder._REFUSED_SUBSCRIPTION_TURN_WAIT_SECONDS
+    retry_delay = codex_native_forwarder._SUBSCRIBE_RETRY_DELAY_SECONDS
+    retries = int(wait / retry_delay) if startup_rejections is None else startup_rejections
+    assert interrupts == retries + 1
+    assert delays == [retry_delay] * retries
+    failures = _failed_statuses(posted)
+    assert [failure["response_id"] for failure in failures] == ["codex_turn_123"]
+    assert f"{outcome}: list_turns is not supported yet" in failures[0]["output"]
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id is None
+
+
+@pytest.mark.parametrize(
+    ("already_failed", "turn_after_interrupt", "interrupt_error"),
+    [
+        pytest.param(False, "turn_456", None, id="replaced-by-newer-turn"),
+        pytest.param(
+            False,
+            "turn_456",
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "expected active turn id turn_123 but found turn_456"}
+            ),
+            id="superseded-before-interrupt",
+        ),
+        pytest.param(False, None, None, id="cleared-by-another-owner"),
+        pytest.param(True, None, None, id="already-failed"),
+    ],
+)
+def test_subscribe_until_ready_skips_a_replaced_or_already_failed_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    already_failed: bool,
+    turn_after_interrupt: str | None,
+    interrupt_error: Exception | None,
+) -> None:
+    """A refusal posts nothing for a turn already failed, or cleared or replaced meanwhile."""
+    _write_forwarder_bridge(tmp_path, active_turn_id="turn_123")
+    fake_client = _FakeCodexAppServerClient()
+    forwarder_state = codex_native_forwarder._CodexForwarderState()
+    if already_failed:
+        forwarder_state.surfaced_terminal_error_turns.add("turn_123")
+
+    async def refuse_resume_then_change_turn(
+        method: str, params: dict[str, Any]
+    ) -> dict[str, Any]:
+        fake_client.requests.append((method, params))
+        if method == "thread/resume":
+            raise _list_turns_refusal()
+        _write_forwarder_bridge(tmp_path, active_turn_id=turn_after_interrupt)
+        if interrupt_error is not None:
+            raise interrupt_error
+        return {"result": {}}
+
+    monkeypatch.setattr(fake_client, "request", refuse_resume_then_change_turn)
+
+    posted = _subscribe_without_signal(fake_client, tmp_path, forwarder_state=forwarder_state)
+
+    expected_methods = ["thread/resume", "thread/resume"]
+    if not already_failed:
+        expected_methods.append("turn/interrupt")
+    assert [method for method, _params in fake_client.requests] == expected_methods
+    assert posted == []
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == ("turn_123" if already_failed else turn_after_interrupt)
+
+
+@pytest.mark.parametrize(
+    ("error", "active_turn_id", "waits_for_turn"),
+    [
+        pytest.param(
+            ConnectionError("Codex app-server disconnected before responding to thread/resume"),
+            "turn_123",
+            False,
+            id="transport-error",
+        ),
+        pytest.param(
+            codex_native_app_server.CodexAppServerResponseError(
+                {"code": -32600, "message": "Server is draining; retry after reconnecting"}
+            ),
+            "turn_123",
+            False,
+            id="supported-request-error",
+        ),
+        pytest.param(_list_turns_refusal(), None, True, id="refusal-without-active-turn"),
+    ],
+)
+def test_subscribe_until_ready_leaves_turn_state_without_refused_active_turn(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    error: Exception,
+    active_turn_id: str | None,
+    waits_for_turn: bool,
+) -> None:
+    """Only an unsupported-request refusal of a thread with a running turn fails that turn."""
+    _write_forwarder_bridge(tmp_path, active_turn_id=active_turn_id)
+    fake_client = _FakeCodexAppServerClient(error=error)
+    delays = _record_sleeps(monkeypatch)
+
+    posted = _subscribe_without_signal(fake_client, tmp_path)
+
+    assert [method for method, _params in fake_client.requests] == ["thread/resume"]
+    assert posted == []
+    assert sum(delays) == pytest.approx(
+        codex_native_forwarder._REFUSED_SUBSCRIPTION_TURN_WAIT_SECONDS if waits_for_turn else 0.0
+    )
+    state = read_bridge_state(tmp_path)
+    assert state is not None
+    assert state.active_turn_id == active_turn_id
 
 
 def test_supervise_forwarder_continues_after_event_handler_failure(
