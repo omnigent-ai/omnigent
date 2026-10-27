@@ -253,7 +253,7 @@ class SessionAccess:
     conversation: Conversation | None
 
 
-def _require_access_and_level_sync(
+def require_access_and_level_sync(
     user_id: str | None,
     conversation_id: str,
     required_level: int,
@@ -261,6 +261,10 @@ def _require_access_and_level_sync(
     conversation_store: ConversationStore,
 ) -> SessionAccess:
     """Synchronous core of :func:`require_access_and_level`.
+
+    Callable directly from a worker thread so a route can run it inside its
+    own :func:`shared_read_scope` alongside the other reads of the request
+    (the nested scope here then reuses the caller's checkout).
 
     Folds :func:`_require_access_sync` and :func:`_get_permission_level_sync`
     into a single resolution: one :meth:`PermissionStore.resolve_access`
@@ -370,7 +374,7 @@ async def require_access_and_level(
     :meth:`PermissionStore.resolve_access` + at most one conversation read)
     instead of the ~5-6 separate store round-trips the two helpers issued
     independently. On a remote DB those round-trips dominate the snapshot's
-    fixed cost. Async wrapper over :func:`_require_access_and_level_sync`,
+    fixed cost. Async wrapper over :func:`require_access_and_level_sync`,
     routed through :func:`asyncio.to_thread` to keep the event loop unblocked.
 
     :param user_id: The authenticated user, or ``None`` to skip.
@@ -383,7 +387,7 @@ async def require_access_and_level(
     :raises OmnigentError: 401 / 403 / 404 as documented on the sync core.
     """
     return await asyncio.to_thread(
-        _require_access_and_level_sync,
+        require_access_and_level_sync,
         user_id,
         conversation_id,
         required_level,

@@ -898,6 +898,18 @@ def shared_read_scope() -> Iterator[None]:
         _shared_read_sessions.reset(token)
 
 
+def rollback_shared_reads() -> None:
+    """Roll back the enclosing :func:`shared_read_scope` after a caught read failure.
+
+    A failed statement leaves a Postgres transaction aborted, so every later
+    read on the shared session fails until it is rolled back. Call this from
+    the ``except`` block that swallows a read error inside the scope; the next
+    read starts a fresh transaction. No-op outside a scope.
+    """
+    for session in (_shared_read_sessions.get() or {}).values():
+        session.rollback()
+
+
 def make_managed_session_maker(
     engine: Engine,
     *,
