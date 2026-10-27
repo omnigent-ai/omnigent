@@ -160,6 +160,9 @@ user-visible behavior. It then uses exactly these four H2 sections in order:
 - [Azure DevOps pull requests](./azure-devops.md) covers the shared panel,
   composer, associations, partial results, and Canvas links.
 
+- [Forgejo pull requests](./forgejo.md) covers Forgejo, Gitea, and Codeberg in
+  the shared panel, host and login discovery, and agent tracking.
+
 ## Seed scope
 
 The original five recipes form the seed set. Completing this set means checking
