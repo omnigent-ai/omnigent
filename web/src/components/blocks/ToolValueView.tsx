@@ -55,11 +55,18 @@ function FieldList({ entries, depth }: { entries: [string, unknown][]; depth: nu
   if (entries.length === 0) return <EmptyValue />;
   const shown = entries.slice(0, MAX_LIST_ROWS);
   const hidden = entries.length - shown.length;
+  // Only the outermost list is framed as a table; nested values stay plain inside its cells.
+  const framed = depth === 0;
   return (
     <>
-      <dl className="grid grid-cols-[auto_minmax(0,1fr)] gap-x-4 gap-y-1">
+      <dl
+        className={cn(
+          "grid grid-cols-[auto_minmax(0,1fr)]",
+          framed ? "overflow-hidden rounded-md border" : "gap-x-4 gap-y-1",
+        )}
+      >
         {shown.map(([key, value]) => (
-          <FieldRow key={key} label={humanizeKey(key)} title={key}>
+          <FieldRow key={key} label={humanizeKey(key)} title={key} framed={framed}>
             <ValueNode value={value} depth={depth + 1} />
           </FieldRow>
         ))}
@@ -72,19 +79,40 @@ function FieldList({ entries, depth }: { entries: [string, unknown][]; depth: nu
 function FieldRow({
   label,
   title,
+  framed,
   children,
 }: {
   label: string;
   title: string;
+  framed: boolean;
   children: ReactNode;
 }) {
+  const term = (
+    <dt
+      className={cn(
+        "max-w-48 break-words text-muted-foreground",
+        framed && "bg-muted/30 px-2.5 py-1",
+      )}
+      title={title}
+    >
+      {label}
+    </dt>
+  );
+  const detail = <dd className={cn("min-w-0 break-words", framed && "px-2.5 py-1")}>{children}</dd>;
+  if (!framed) {
+    return (
+      <>
+        {term}
+        {detail}
+      </>
+    );
+  }
   return (
-    <>
-      <dt className="max-w-48 break-words text-muted-foreground" title={title}>
-        {label}
-      </dt>
-      <dd className="min-w-0 break-words">{children}</dd>
-    </>
+    // The row spans both columns so its divider runs under the label and the value.
+    <div className="col-span-2 grid grid-cols-subgrid border-t first:border-t-0">
+      {term}
+      {detail}
+    </div>
   );
 }
 
@@ -149,7 +177,7 @@ function ListValue({ items, depth }: { items: unknown[]; depth: number }) {
     items.every(isRecord) &&
     items.some((item) => pickTitleField(item))
   ) {
-    return <RecordRows records={items} />;
+    return <RecordRows records={items} framed={depth === 0} />;
   }
   if (depth >= MAX_FIELD_DEPTH) return <CompactJson value={items} />;
   return (
@@ -161,22 +189,34 @@ function ListValue({ items, depth }: { items: unknown[]; depth: number }) {
 }
 
 /** A list of records (todos, issues, search hits) as one row each. */
-function RecordRows({ records }: { records: Record<string, unknown>[] }) {
+function RecordRows({ records, framed }: { records: Record<string, unknown>[]; framed: boolean }) {
   const shown = records.slice(0, MAX_LIST_ROWS);
   const hidden = records.length - shown.length;
   return (
-    <ol className="grid gap-1.5">
+    <ol className={framed ? "divide-y overflow-hidden rounded-md border" : "grid gap-1.5"}>
       {shown.map((record, index) => (
         // Records carry no guaranteed id and the list never reorders.
         // eslint-disable-next-line react/no-array-index-key
-        <RecordRow key={index} record={record} position={index + 1} />
+        <RecordRow key={index} record={record} position={index + 1} framed={framed} />
       ))}
-      {hidden > 0 && <li className="text-muted-foreground text-sm">and {hidden} more</li>}
+      {hidden > 0 && (
+        <li className={cn("text-muted-foreground text-sm", framed && "px-2.5 py-1")}>
+          and {hidden} more
+        </li>
+      )}
     </ol>
   );
 }
 
-function RecordRow({ record, position }: { record: Record<string, unknown>; position: number }) {
+function RecordRow({
+  record,
+  position,
+  framed,
+}: {
+  record: Record<string, unknown>;
+  position: number;
+  framed: boolean;
+}) {
   const title = pickTitleField(record);
   const detail = pickDetailField(record);
   const status = pickStatusField(record);
@@ -189,7 +229,12 @@ function RecordRow({ record, position }: { record: Record<string, unknown>; posi
       !shownKeys.has(key) && (typeof value === "string" || typeof value === "number"),
   );
   return (
-    <li className="grid grid-cols-[1.25rem_minmax(0,1fr)_auto] gap-x-2">
+    <li
+      className={cn(
+        "grid grid-cols-[1.25rem_minmax(0,1fr)_auto] gap-x-2",
+        framed && "px-2.5 py-1.5",
+      )}
+    >
       <span className="text-muted-foreground/70 text-sm tabular-nums leading-[inherit]">
         {numericId ?? position}
       </span>

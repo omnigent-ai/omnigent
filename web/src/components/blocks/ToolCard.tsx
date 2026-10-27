@@ -30,6 +30,7 @@ import { useTerminalIsDark } from "@/components/theme/useTerminalIsDark";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Collapsible, CollapsibleContent, CollapsibleTrigger } from "@/components/ui/collapsible";
+import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import { Tooltip, TooltipContent, TooltipTrigger } from "@/components/ui/tooltip";
 import { cn } from "@/lib/utils";
 import type { RenderItem, ToolState } from "@/lib/renderItems";
@@ -257,13 +258,15 @@ function DefaultToolBody({ call, duration }: ToolBodyProps) {
   );
 }
 
+type ToolBodyView = "fields" | "raw";
+
 /**
- * The input and result as labeled fields, with the exact JSON payloads one
- * Raw toggle away. The toggle keeps its place so it keeps keyboard focus.
+ * The input and result as labeled fields, with the exact JSON payloads behind
+ * a Fields | Raw switch. The switch keeps its place so it keeps keyboard focus.
  */
 function GenericToolBody({ call, duration }: ToolBodyProps) {
   const { args, output, state } = call;
-  const [showRaw, setShowRaw] = useState(false);
+  const [view, setView] = useState<ToolBodyView>("fields");
   const inputJson = useMemo(() => JSON.stringify(args, null, 2), [args]);
   const hasInput = Object.keys(args).length > 0;
   // A completed call with no output (provider-native tools) has no result to show.
@@ -271,39 +274,45 @@ function GenericToolBody({ call, duration }: ToolBodyProps) {
   const result = <ToolResultView output={output} state={state} duration={duration} />;
   if (!hasInput && output === null) return result;
   return (
-    <>
-      <section className="space-y-1">
-        <div className="flex min-h-6 items-center gap-2">
-          {!showRaw && <ToolSectionLabel>{hasInput ? "Input" : "Result"}</ToolSectionLabel>}
-          <RawToggleButton
-            className="ml-auto"
-            pressed={showRaw}
-            onToggle={() => setShowRaw((value) => !value)}
-          />
-        </div>
-        {showRaw ? (
-          <div className="space-y-2">
-            <CodePanel
-              title="Parameters"
-              text={inputJson}
-              copyText={inputJson}
-              copyLabel="Copy parameters"
-            />
-            {output === null ? result : <OutputSection output={prettyPrintIfJson(output)} />}
-          </div>
-        ) : hasInput ? (
-          <ToolValueView value={args} />
-        ) : (
-          result
+    <Tabs
+      value={view}
+      onValueChange={(value) => setView(value === "raw" ? "raw" : "fields")}
+      componentId="diagnostics.tool.body_view"
+      className="gap-1"
+    >
+      <div className="flex min-h-6 items-center gap-2">
+        {view === "fields" && <ToolSectionLabel>{hasInput ? "Input" : "Result"}</ToolSectionLabel>}
+        <TabsList
+          aria-label="Tool call view"
+          className="ml-auto p-0.5 group-data-horizontal/tabs:h-6"
+        >
+          <TabsTrigger value="fields" className="px-2 text-sm">
+            Fields
+          </TabsTrigger>
+          <TabsTrigger value="raw" className="px-2 text-sm">
+            Raw
+          </TabsTrigger>
+        </TabsList>
+      </div>
+      <TabsContent value="fields" className="space-y-2">
+        {hasInput ? <ToolValueView value={args} /> : result}
+        {hasInput && hasResult && (
+          <section className="space-y-1">
+            <ToolSectionLabel>Result</ToolSectionLabel>
+            {result}
+          </section>
         )}
-      </section>
-      {!showRaw && hasInput && hasResult && (
-        <section className="space-y-1">
-          <ToolSectionLabel>Result</ToolSectionLabel>
-          {result}
-        </section>
-      )}
-    </>
+      </TabsContent>
+      <TabsContent value="raw" className="space-y-2">
+        <CodePanel
+          title="Parameters"
+          text={inputJson}
+          copyText={inputJson}
+          copyLabel="Copy parameters"
+        />
+        {output === null ? result : <OutputSection output={prettyPrintIfJson(output)} />}
+      </TabsContent>
+    </Tabs>
   );
 }
 
@@ -402,19 +411,11 @@ function ToolResultView({
   }
 }
 
-function RawToggleButton({
-  pressed,
-  onToggle,
-  className,
-}: {
-  pressed: boolean;
-  onToggle: () => void;
-  className?: string;
-}) {
+function RawToggleButton({ pressed, onToggle }: { pressed: boolean; onToggle: () => void }) {
   return (
     <Button
       aria-pressed={pressed}
-      className={cn("h-6 px-1.5 text-muted-foreground", pressed && "text-foreground", className)}
+      className={cn("h-6 px-1.5 text-muted-foreground", pressed && "text-foreground")}
       onClick={onToggle}
       size="xs"
       type="button"

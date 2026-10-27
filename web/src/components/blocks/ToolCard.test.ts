@@ -23,6 +23,11 @@ function renderCard(props: Parameters<typeof ToolCard>[0]) {
   return render(createElement(TooltipProvider, null, createElement(ToolCard, props)));
 }
 
+// Radix tabs switch on mouse down (or focus), not on a synthetic click.
+function showView(name: "Fields" | "Raw") {
+  fireEvent.mouseDown(screen.getByRole("tab", { name }));
+}
+
 function renderFileToolCard(
   viewer: {
     openFile: (path: string) => void;
@@ -136,8 +141,8 @@ describe("ToolCard rendering", () => {
     expect(line.className).toContain("text-destructive");
   });
 
-  it("expands to labeled Input and Result fields, with the raw JSON behind Raw", () => {
-    // WHY: the expanded view shows labeled fields, with the payloads one Raw toggle away.
+  it("expands to labeled Input and Result fields, with the raw JSON behind a Fields | Raw switch", () => {
+    // WHY: the expanded view shows labeled fields, with the payloads one switch away.
     const { container } = renderCard({
       name: "my_tool",
       arguments: { includeComments: false, todoList: [{ title: "Find workflow", status: "done" }] },
@@ -154,13 +159,25 @@ describe("ToolCard rendering", () => {
     expect(screen.getAllByText("the output text").length).toBeGreaterThan(1);
     expect(screen.queryByText("Parameters")).toBeNull();
 
-    const raw = screen.getByRole("button", { name: "Raw" });
-    fireEvent.click(raw);
+    // Both views stay visible, so the current one reads at a glance.
+    const fields = screen.getByRole("tab", { name: "Fields" });
+    const raw = screen.getByRole("tab", { name: "Raw" });
+    expect(fields).toHaveAttribute("aria-selected", "true");
+    expect(raw).toHaveAttribute("aria-selected", "false");
+
+    showView("Raw");
+    expect(raw).toHaveAttribute("aria-selected", "true");
+    expect(fields).toHaveAttribute("aria-selected", "false");
     expect(screen.getByText("Parameters")).toBeInTheDocument();
     expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.queryByText("Input")).toBeNull();
     expect(container.textContent).toContain('"includeComments": false');
-    // The toggle stays put, so keyboard focus survives switching views.
-    expect(screen.getByRole("button", { name: "Raw" })).toBe(raw);
+    // The switch stays put, so keyboard focus survives switching views.
+    expect(screen.getByRole("tab", { name: "Raw" })).toBe(raw);
+
+    showView("Fields");
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(screen.queryByText("Parameters")).toBeNull();
   });
 
   it("renders an MCP content-block JSON result as fields", () => {
@@ -333,7 +350,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    fireEvent.click(screen.getByRole("button", { name: "Raw" }));
+    showView("Raw");
 
     // Both the Parameters and Output panels default to wrapping.
     const pres = Array.from(container.querySelectorAll("pre"));
@@ -353,7 +370,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    fireEvent.click(screen.getByRole("button", { name: "Raw" }));
+    showView("Raw");
 
     const toggles = screen.getAllByRole("button", { name: "Disable word wrap" });
     expect(toggles.length).toBe(2); // Parameters + Output
