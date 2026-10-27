@@ -14,6 +14,8 @@ from urllib.parse import urlsplit, urlunsplit
 import tomlkit
 from tomlkit.exceptions import ParseError, TOMLKitError
 
+from omnigent.errors import ErrorCode, OmnigentError
+
 _CODEX_CONFIG_PATHS = (
     "agents.*.config_file",
     "experimental_compact_prompt_file",
@@ -147,10 +149,23 @@ def reserved_codex_transport_arg(args: Sequence[str]) -> str | None:
             # Skip the option and its value (an attached ``=`` form carries its own).
             index += 1 if "=" in arg else 2
             continue
-        if arg in _RESERVED_CODEX_TRANSPORT_TOKENS:
-            return arg
+        token = arg.split("=", 1)[0]
+        if token in _RESERVED_CODEX_TRANSPORT_TOKENS:
+            return token
         index += 1
     return None
+
+
+class CodexTransportArgsError(OmnigentError, ValueError):
+    """Saved launch arguments conflict with the transport Omnigent manages."""
+
+    def __init__(self, token: str) -> None:
+        super().__init__(
+            f"terminal_launch_args may not contain the runner-owned Codex transport "
+            f"token {token!r}. Start a new Codex session without that argument; "
+            "Omnigent starts the app-server and attaches the terminal automatically.",
+            code=ErrorCode.HARNESS_NOT_CONFIGURED,
+        )
 
 
 def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
@@ -162,11 +177,7 @@ def reject_reserved_codex_transport_args(args: Sequence[str]) -> None:
     """
     token = reserved_codex_transport_arg(args)
     if token is not None:
-        raise ValueError(
-            f"terminal_launch_args may not contain the runner-owned Codex transport "
-            f"token {token!r}: the runner starts the app-server and appends the TUI "
-            "attach itself"
-        )
+        raise CodexTransportArgsError(token)
 
 
 def canonical_codex_launch_args(args: Sequence[str]) -> list[str]:

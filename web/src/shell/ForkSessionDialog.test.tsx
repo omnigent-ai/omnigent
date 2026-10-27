@@ -232,45 +232,52 @@ beforeEach(() => {
 afterEach(cleanup);
 
 describe("ForkSessionDialog", () => {
-  it.each([
-    ["managed snapshot", null],
-    ["Arclet host", "arclet"],
-    ["Databricks Sandbox host", "lakebox"],
-  ])("blocks the whole form for an unsupported source detected by %s", async (source, provider) => {
-    useSessionMock.mockReturnValue({
-      session: {
-        hostId: "host_1",
-        labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
-      },
-      isLoading: false,
-      error: null,
-    } as ReturnType<typeof useSession>);
-    setHosts([host({ sandbox_provider: provider })]);
-    renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo" });
+  it.each<[string, string | null, Partial<ServerInfo> | undefined]>([
+    ["managed snapshot", null, undefined],
+    ["Databricks Sandbox host", "lakebox", undefined],
+    [
+      "Arclet host without an Arclet to fork onto",
+      "arclet",
+      { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox"] },
+    ],
+  ])(
+    "blocks the whole form for an unsupported source detected by %s",
+    async (source, provider, info) => {
+      useSessionMock.mockReturnValue({
+        session: {
+          hostId: "host_1",
+          labels: source === "managed snapshot" ? { "omnigent.host_type": "managed" } : {},
+        },
+        isLoading: false,
+        error: null,
+      } as ReturnType<typeof useSession>);
+      setHosts([host({ sandbox_provider: provider })]);
+      renderDialog({ sourceHostId: "host_1", sourceWorkspace: "/Users/a/repo", info });
 
-    const submit = screen.getByTestId("fork-session-submit");
-    expect(submit).toBeDisabled();
-    expect(screen.getByRole("group", { name: "Clone session" })).toBe(submit.parentElement);
-    expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
-      "Forking this sandbox session is not supported yet.",
-    );
-    expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
-    expect(screen.queryByTestId("fork-session-advanced-toggle")).not.toBeInTheDocument();
-    fireEvent.click(submit);
-    fireEvent.focus(submit.parentElement!);
-    fireEvent.keyDown(submit.parentElement!, { key: "Enter" });
-    await waitFor(() =>
-      expect(screen.getByRole("tooltip")).toHaveTextContent(
+      const submit = screen.getByTestId("fork-session-submit");
+      expect(submit).toBeDisabled();
+      expect(screen.getByRole("group", { name: "Clone session" })).toBe(submit.parentElement);
+      expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
         "Forking this sandbox session is not supported yet.",
-      ),
-    );
-    expect(submit.parentElement).toHaveAccessibleDescription(
-      "Forking this sandbox session is not supported yet.",
-    );
-    expect(forkSessionMock).not.toHaveBeenCalled();
-    expect(launchRunnerMock).not.toHaveBeenCalled();
-    expect(checkHostDirectoryMock).not.toHaveBeenCalled();
-  });
+      );
+      expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-advanced-toggle")).not.toBeInTheDocument();
+      fireEvent.click(submit);
+      fireEvent.focus(submit.parentElement!);
+      fireEvent.keyDown(submit.parentElement!, { key: "Enter" });
+      await waitFor(() =>
+        expect(screen.getByRole("tooltip")).toHaveTextContent(
+          "Forking this sandbox session is not supported yet.",
+        ),
+      );
+      expect(submit.parentElement).toHaveAccessibleDescription(
+        "Forking this sandbox session is not supported yet.",
+      );
+      expect(forkSessionMock).not.toHaveBeenCalled();
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("does not expose an actionable form before the source snapshot resolves", () => {
     useSessionMock.mockReturnValue({ session: null, isLoading: true, error: null });
@@ -742,13 +749,15 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByRole("heading", { name: "Continue in another directory" })).toBeVisible();
       expect(
         screen.getByText(
-          "Choose an existing directory to continue this conversation in a new session. Files from the missing workspace won’t be restored.",
+          "Choose an existing directory to continue this conversation in a new session, optionally in a new git worktree. Files from the missing workspace won’t be restored.",
         ),
       ).toBeVisible();
       expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("serena-laptop");
       expect(screen.getByTestId("workspace-path-input")).toBeVisible();
       expect(screen.getByTestId("workspace-path-input")).toHaveValue("");
-      expect(screen.queryByTestId("fork-session-branch-input")).not.toBeInTheDocument();
+      // Offered up front, but never prefilled with the missing worktree's branch.
+      expect(screen.getByTestId("fork-session-branch-input")).toBeVisible();
+      expect(screen.getByTestId("fork-session-branch-input")).toHaveValue("");
       expect(screen.queryByTestId("fork-session-reuse-dir-hint")).not.toBeInTheDocument();
       expect(screen.getByRole("button", { name: "Continue" })).toHaveAttribute(
         "aria-disabled",
@@ -841,6 +850,52 @@ describe("ForkSessionDialog", () => {
       );
     });
 
+    it("continues in a new git worktree of the chosen repository", async () => {
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as Awaited<ReturnType<typeof forkSession>>);
+      launchRunnerMock.mockResolvedValue({ runnerId: "r1" });
+      renderDialog(RECOVERY);
+
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/Users/a/repo" },
+      });
+      fireEvent.change(screen.getByTestId("fork-session-branch-input"), {
+        target: { value: "recovered" },
+      });
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(launchRunnerMock).toHaveBeenCalledTimes(1));
+      expect(checkHostDirectoryMock).toHaveBeenCalledExactlyOnceWith("host_1", "/Users/a/repo");
+      // Even when the chosen repo is the one the missing worktree came from,
+      // the new branch is not based on the missing worktree's branch.
+      expect(launchRunnerMock).toHaveBeenCalledWith("host_1", "conv_fork", "/Users/a/repo", {
+        branchName: "recovered",
+        baseBranch: undefined,
+      });
+      expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork");
+    });
+
+    it("points a directory conflict at the worktree field", () => {
+      useDirectorySessionsMock.mockReturnValue({
+        data: [{ id: "conv_other", host_id: "host_1", workspace: "/Users/a/repo" }],
+      } as unknown as ReturnType<typeof useDirectorySessions>);
+      useRunnerHealthMock.mockReturnValue(new Map([["conv_other", true]]));
+      renderDialog(RECOVERY);
+
+      fireEvent.change(screen.getByTestId("workspace-path-input"), {
+        target: { value: "/Users/a/repo" },
+      });
+      expect(screen.getByTestId("fork-session-conflict-hint")).toHaveTextContent(
+        "1 other agent is working in this directory, so writes may conflict. Name a git branch to work in an isolated copy.",
+      );
+
+      fireEvent.change(screen.getByTestId("fork-session-branch-input"), {
+        target: { value: "recovered" },
+      });
+      expect(screen.queryByTestId("fork-session-conflict-hint")).not.toBeInTheDocument();
+    });
+
     it("requires an online host instead of falling back to a fresh sandbox", () => {
       setHosts([host({ status: "offline" })]);
       renderDialog({
@@ -851,6 +906,25 @@ describe("ForkSessionDialog", () => {
       expect(screen.getByTestId("fork-session-submit")).toHaveAttribute("aria-disabled", "true");
       expect(screen.getByTestId("connect-host-command")).toBeVisible();
       expect(screen.queryByTestId("fork-session-sandbox-hint")).not.toBeInTheDocument();
+    });
+
+    it("explains that a sandbox-only source can't continue in a host directory", () => {
+      useSessionMock.mockReturnValue({
+        session: { hostId: "host_1", labels: {} },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      setHosts([host({ sandbox_provider: "arclet" })]);
+      renderDialog({
+        ...RECOVERY,
+        info: { managed_sandboxes_enabled: true, sandbox_providers: ["arclet"] },
+      });
+
+      expect(screen.getByTestId("fork-session-unavailable")).toHaveTextContent(
+        "This sandbox session can only be cloned onto a new sandbox.",
+      );
+      expect(screen.getByRole("button", { name: "Continue" })).toBeDisabled();
+      expect(screen.queryByTestId("fork-session-host-select")).not.toBeInTheDocument();
     });
   });
 
@@ -1496,6 +1570,87 @@ describe("ForkSessionDialog", () => {
       expect(checkHostDirectoryMock).not.toHaveBeenCalled();
       await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
     });
+
+    it("offers an Arclet source only a fresh Arclet and forks onto it", async () => {
+      useSessionMock.mockReturnValue({
+        session: {
+          hostId: "host_1",
+          labels: {
+            "omnigent.host_type": "managed",
+            [SANDBOX_REPO_LABEL_KEY]: "https://github.com/databricks-eng/universe",
+          },
+        },
+        isLoading: false,
+        error: null,
+      } as unknown as ReturnType<typeof useSession>);
+      // Both the source Arclet and another machine are online; neither is a target.
+      setHosts([host({ sandbox_provider: "arclet" }), host({ host_id: "host_2", name: "laptop" })]);
+      forkSessionMock.mockResolvedValue({
+        id: "conv_fork",
+      } as unknown as Awaited<ReturnType<typeof forkSession>>);
+      renderDialog({
+        ...CODING,
+        info: { managed_sandboxes_enabled: true, sandbox_providers: ["lakebox", "arclet"] },
+      });
+
+      expect(screen.getByTestId("fork-session-sandbox-only-hint")).toHaveTextContent(
+        "This session can only be cloned onto a new Arclet Sandbox.",
+      );
+      expect(screen.getByTestId("fork-session-sandbox-hint")).toBeInTheDocument();
+      expect(screen.queryByTestId("fork-session-connect-host-toggle")).not.toBeInTheDocument();
+      // The only target is preselected, so the default state is submittable.
+      expect(screen.getByTestId("fork-session-host-select")).toHaveTextContent("Arclet Sandbox");
+      openHostSelect();
+      expect(screen.getAllByRole("option")).toHaveLength(1);
+      expect(screen.getByTestId("fork-session-sandbox-option")).toHaveTextContent("Arclet Sandbox");
+      fireEvent.click(screen.getByTestId("fork-session-sandbox-option"));
+      openAdvanced();
+      expect(screen.getByTestId("fork-session-sandbox-repo-input")).toHaveValue(
+        "https://github.com/databricks-eng/universe",
+      );
+
+      fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+      await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+      expect(forkSessionMock).toHaveBeenCalledWith("conv_src", {
+        title: undefined,
+        agentId: undefined,
+        upToResponseId: undefined,
+        config: {},
+        sandbox: { provider: "arclet", workspace: "https://github.com/databricks-eng/universe" },
+      });
+      expect(launchRunnerMock).not.toHaveBeenCalled();
+      expect(checkHostDirectoryMock).not.toHaveBeenCalled();
+      await waitFor(() => expect(navigateMock).toHaveBeenCalledWith("/c/conv_fork"));
+    });
+
+    it.each([true, false])(
+      "chooses the sandbox host's id only on a server that accepts it (%s)",
+      async (accepts) => {
+        forkSessionMock.mockResolvedValue({
+          id: "conv_fork",
+        } as unknown as Awaited<ReturnType<typeof forkSession>>);
+        renderDialog({
+          ...CODING,
+          info: {
+            managed_sandboxes_enabled: true,
+            sandbox_provider: "modal",
+            request_managed_sandbox_host_id: accepts,
+          },
+        });
+
+        selectSandbox();
+        fireEvent.click(screen.getByTestId("fork-session-submit"));
+
+        await waitFor(() => expect(forkSessionMock).toHaveBeenCalledTimes(1));
+        const sandbox = forkSessionMock.mock.calls[0][1]?.sandbox;
+        if (accepts) {
+          expect(sandbox?.hostId).toMatch(/^[0-9a-f]{32}$/);
+        } else {
+          expect(sandbox !== undefined && "hostId" in sandbox).toBe(false);
+        }
+      },
+    );
 
     it("inherits ALL repositories from a multi-repo sandbox source", async () => {
       // A source with several repos records them space-joined; the single

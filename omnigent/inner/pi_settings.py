@@ -24,8 +24,9 @@ _Settings: TypeAlias = dict[str, object]
 DEFAULT_PI_AGENT_DIR = Path.home() / ".pi" / "agent"
 
 # Install / checkout trees Pi places under the agent dir. Symlinked into the
-# managed dir so ``packages`` entries in settings keep resolving.
-_PI_AGENT_RESOURCE_DIRS: tuple[str, ...] = ("npm", "git")
+# managed dir so ``packages`` entries in settings keep resolving. MCP server
+# config and auth are shared the same way.
+_PI_AGENT_RESOURCE_DIRS: tuple[str, ...] = ("npm", "git", "mcp.json", "mcp-auth.json")
 
 
 def _read_settings_file(path: Path) -> _Settings:
@@ -59,13 +60,17 @@ def _symlink_agent_resource_dirs(
     """Symlink package install trees from *global_agent_dir* into *managed_dir*."""
     for name in _PI_AGENT_RESOURCE_DIRS:
         source = global_agent_dir / name
-        if not source.is_dir():
-            continue
         target = managed_dir / name
-        if target.exists():
-            continue
         try:
-            target.symlink_to(source, target_is_directory=True)
+            # A reused managed dir may still link to a previous root or a removed source.
+            if target.is_symlink():
+                if target.readlink() == source and source.exists():
+                    continue
+                target.unlink()
+            elif target.exists():
+                continue
+            if source.exists():
+                target.symlink_to(source, target_is_directory=source.is_dir())
         except OSError as exc:
             _logger.warning(
                 "Could not symlink Pi agent resource %s -> %s: %s",
@@ -87,7 +92,8 @@ def prepare_managed_pi_agent_dir(
     Copies (merges) ``settings.json`` from the user's global agent dir into
     *managed_dir*, applies *overlay* (e.g. Omnigent retry policy), and
     symlinks install trees (``npm/``, ``git/``) so ``packages`` entries keep
-    working. The user's ``~/.pi/agent`` is never modified.
+    working, plus ``mcp.json`` and ``mcp-auth.json``, which Pi may update
+    (e.g. refreshed MCP OAuth tokens).
 
     Project-scoped ``.pi/settings.json`` at the session cwd is still read by
     Pi at runtime and overrides these global settings per Pi's normal rules.

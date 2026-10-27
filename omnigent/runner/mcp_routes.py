@@ -26,6 +26,7 @@ from omnigent.llms.summarize import (
     build_summarization_prompt,
     extract_summary_text,
 )
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.runner.app_support import (
     SpecResolver,
     _BodyRequest,
@@ -417,7 +418,7 @@ def register_mcp_routes(
                     conn["base_url"] = global_auth.base_url
                 return conn
 
-        if model.startswith(("databricks/", "databricks-")):
+        if is_databricks_model_id(model):
             _db_profile = (
                 spec.executor.profile or (spec.executor.config or {}).get("profile") or "DEFAULT"
             )
@@ -455,7 +456,7 @@ def register_mcp_routes(
             if family.base_url:
                 conn["base_url"] = family.base_url
             return conn or None
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.warning(
                 "/v1/summarize: failed to resolve provider %r",
                 provider_name,

@@ -3,7 +3,7 @@
 # wheels it depends on), run the readiness gates, and publish all three to
 # (Test)PyPI via OIDC Trusted Publishing. The three version-lock together,
 # so every release publishes all three at the same version. Self-contained:
-# publishes straight from this repo on `ubuntu-latest` for clean public
+# publishes straight from this repo on a GitHub-hosted runner for clean public
 # PyPI/npm access (never a mirror/proxy).
 #
 # Release flow:
@@ -54,7 +54,7 @@ jobs:
   build-and-publish:
     # Gated to this repository; inert in forks and mirrors.
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Bound a hung run under GitHub's 6-hour default (real work takes minutes).
     timeout-minutes: 30
     # Environment binds the Trusted Publisher config: test-pypi unprotected,
@@ -64,7 +64,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0  # v7.0.0
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up uv (clean public resolution, no proxy cache)
         uses: ./.github/actions/setup-uv
@@ -166,7 +166,7 @@ jobs:
 
       # 7. Persist the built artifacts for inspection.
       - name: Upload built distributions
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: dist-omnigent
           path: dist/

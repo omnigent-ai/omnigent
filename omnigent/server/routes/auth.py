@@ -9,8 +9,8 @@ supports the ``omnigent login`` CLI command.
 
 Native apps sign in through the system browser with an RFC 8252
 redirect: a loopback (the desktop shell) or an allowlisted private-use
-scheme (the iOS app's ``ai.omnigent.ios:/oauth/callback``, see
-:data:`NATIVE_APP_REDIRECT_URIS`). ``/auth/login`` accepts that
+scheme (the iOS and Android apps, see :data:`NATIVE_APP_REDIRECT_URIS`).
+``/auth/login`` accepts that
 ``native_redirect_uri`` plus a PKCE ``code_challenge``, the callback
 redirects the browser to it with a one-time code, and the app exchanges
 the code and its verifier at ``/auth/native-token``. The code only
@@ -92,7 +92,9 @@ _NATIVE_LOOPBACK_HOSTS = frozenset({"127.0.0.1", "::1"})
 # RFC 8252 §7.1 private-use-scheme redirects of first-party apps, matched
 # exactly. The well-known manifest lists them so an app can tell whether
 # this server accepts its redirect before opening the browser.
-NATIVE_APP_REDIRECT_URIS: frozenset[str] = frozenset({"ai.omnigent.ios:/oauth/callback"})
+NATIVE_APP_REDIRECT_URIS: frozenset[str] = frozenset(
+    {"ai.omnigent.android:/oauth/callback", "ai.omnigent.ios:/oauth/callback"}
+)
 _NATIVE_PARAMS = ("native_redirect_uri", "native_state", "code_challenge", "code_challenge_method")
 # RFC 7636: an S256 challenge is a 43-char base64url SHA-256 digest, and a
 # verifier is 43-128 unreserved characters.
@@ -494,26 +496,29 @@ def create_auth_router(
         if not email:
             return fail(400, "Could not determine user email from IdP", "server_error")
 
-        # Forced re-auth verification (anti-phishing device-consent gate).
-        # /login stamped reauth_at when it sent prompt=login + max_age=0.
-        # A conformant IdP must then set the id_token's auth_time to the
-        # actual (re-)authentication instant; if it silently reused its
-        # session, auth_time predates our demand and we must refuse rather
-        # than mint a fresh session that would pass the freshness gate.
-        # GitHub has no id_token / auth_time, so reauth is never set for it.
+        # Forced re-auth gate (device consent, CLI tickets): /login sent prompt=login + max_age=0
+        # and stamped reauth_at, so a missing or older auth_time means re-auth is unproven.
+        # Refuse it unless OMNIGENT_OIDC_REQUIRE_REAUTH is off; GitHub never stamps reauth_at.
         reauth_at = state_payload.get("reauth_at")
-        if isinstance(reauth_at, int):
+        if isinstance(reauth_at, int) and not config.require_reauth:
+            _logger.info(
+                "Accepting reauth login without verifying auth_time "
+                "(OMNIGENT_OIDC_REQUIRE_REAUTH is disabled)"
+            )
+        elif isinstance(reauth_at, int):
             auth_time = _resolve_oidc_auth_time(token_json, config)
             if auth_time is None:
                 _logger.warning(
                     "Rejecting reauth login: IdP id_token has no auth_time claim, "
-                    "so forced re-authentication (prompt=login) cannot be verified"
+                    "so forced re-authentication (prompt=login) cannot be verified; "
+                    "set OMNIGENT_OIDC_REQUIRE_REAUTH=0 if this IdP never issues it"
                 )
                 return fail(403, "IdP did not confirm re-authentication")
             if auth_time < reauth_at:
                 _logger.warning(
                     "Rejecting reauth login: id_token auth_time %d predates the "
-                    "re-authentication demand at %d (IdP reused its session)",
+                    "re-authentication demand at %d (IdP reused its session; "
+                    "set OMNIGENT_OIDC_REQUIRE_REAUTH=0 if it ignores max_age)",
                     auth_time,
                     reauth_at,
                 )

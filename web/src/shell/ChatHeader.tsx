@@ -33,6 +33,7 @@ import {
 } from "@/components/ui/dropdown-menu";
 import { AgentInfoButton } from "@/components/AgentInfo";
 import { ConversationBreadcrumb } from "./ConversationBreadcrumb";
+import { CreatedBySession } from "./CreatedBySession";
 import { HeaderConversationMenu } from "./HeaderConversationMenu";
 import { SessionActionMenuItem } from "@/components/SessionActionMenuItem";
 import { HeaderProjectTag } from "./HeaderProjectTag";
@@ -46,6 +47,7 @@ import { useOmnigentAnalytics } from "@/lib/analytics";
 import { cn } from "@/lib/utils";
 import { MOBILE_GLASS_SURFACE } from "./mobileGlass";
 import { TAB_BADGE_BASE } from "./railTabs";
+import { TerminalSplitControls } from "./TerminalSplitControls";
 import { ViewModeMenuItems, ViewModeToggle } from "./ViewModeToggle";
 import { SidebarOpenButton } from "./SidebarOpenButton";
 
@@ -134,6 +136,7 @@ interface ChatHeaderProps {
   subAgentName?: string | null;
   /** Active session id, or undefined on the landing composer. */
   conversationId: string | undefined;
+  createdBySessionId?: string | null;
   /** Effective access to the active session. */
   permissionLevel?: number | null;
   /** Owner-managed top-level row backing the title-adjacent action menu. */
@@ -326,6 +329,7 @@ export function ChatHeader({
   isChildSession,
   subAgentName,
   conversationId,
+  createdBySessionId,
   permissionLevel,
   actionConversation = null,
   conversationTitle,
@@ -602,6 +606,9 @@ export function ChatHeader({
             className="pr-1"
           />
         )}
+        {conversationId && createdBySessionId && (
+          <CreatedBySession key={createdBySessionId} sessionId={createdBySessionId} />
+        )}
       </div>
 
       <div className="flex items-center gap-2 max-md:gap-0 max-md:empty:hidden">
@@ -619,6 +626,14 @@ export function ChatHeader({
           <AgentInfoButton
             agent={boundAgent}
             sessionId={conversationId}
+            permissionLevel={permissionLevel}
+          />
+        )}
+        {/* Split the Terminal view into shell panes — self-gates to null
+            unless the feature is on and the agent terminal is shown. */}
+        {!pending && conversationId && (
+          <TerminalSplitControls
+            conversationId={conversationId}
             permissionLevel={permissionLevel}
           />
         )}

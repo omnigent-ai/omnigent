@@ -118,6 +118,7 @@ const {
 } = require("./settingsNavigation");
 const omnigentCli = require("./omnigent_cli");
 const serverManager = require("./server_manager");
+const { diagnostics } = require("./diagnostics");
 
 /** Absolute path to the bundled setup page (the "connect to server" form). */
 const SETUP_PAGE = path.join(__dirname, "..", "setup", "index.html");
@@ -583,8 +584,8 @@ let reconnectSlowDelayMs = 60_000;
  * Electron asks the embedder (us) rather than showing Chrome's own prompt.
  * With NO handler wired, Chromium denies by default — which surfaces as a
  * `not-allowed` error the instant `recognition.start()` runs, i.e. "the
- * dictation button does nothing." We grant only the audio-related set and
- * deny everything else.
+ * dictation button does nothing." Grants require an allow-listed permission
+ * from the pinned server's top-level page.
  *
  * NOTE: this clears the FIRST of two gates. Web Speech `SpeechRecognition`
  * also relies on Google's cloud speech backend keyed to official Chrome
@@ -599,12 +600,15 @@ let reconnectSlowDelayMs = 60_000;
  * denies when a permission-check handler is wired and returns false).
  * Sanitized write only lets the page PUT text on the clipboard from a
  * user gesture; ``clipboard-read`` stays denied.
+ * ``fullscreen`` lets recordings use native fullscreen controls on the
+ * pinned server's top-level page.
  */
 const GRANTED_PERMISSIONS = new Set([
   "media",
   "audioCapture",
   "mediaKeySystem",
   "clipboard-sanitized-write",
+  "fullscreen",
 ]);
 
 /**
@@ -1048,6 +1052,13 @@ const UNAVAILABLE_HINT = "Databricks isn't responding.";
 
 function showDatabricksAuthRequired(win, failedUrl, error, { returnUrl: failedReturnUrl } = {}) {
   if (win.isDestroyed()) return;
+  diagnostics.record("auth_required", {
+    origin: originOf(failedUrl),
+    phase: "databricks",
+    code: error.errorCode,
+    status: error.status,
+    requestId: error.requestId,
+  });
   console.warn("[omnigent] databricks auth: connection requires sign-in", {
     origin: originOf(failedUrl),
     phase: error.phase ?? "authentication",
@@ -1143,6 +1154,11 @@ function oidcSignInMessage(serverUrl, error, serverName) {
 /** Return an OIDC window to the connect screen, explaining why. */
 function showOidcAuthRequired(win, serverUrl, error, serverName = null) {
   if (win.isDestroyed()) return;
+  diagnostics.record("auth_required", {
+    origin: originOf(serverUrl),
+    phase: "oidc",
+    code: error?.code,
+  });
   console.warn("[omnigent] oidc auth: connection requires sign-in", {
     origin: originOf(serverUrl),
     code: error?.code,
@@ -2107,6 +2123,7 @@ async function loadServerUrl(
   { interactive = false, loadUrl, attempt = beginConnectionAttempt(win) } = {},
 ) {
   const signal = attempt.controller.signal;
+  let serverUrl = requestedServerUrl;
   const current = () =>
     !signal.aborted && !win.isDestroyed() && connectionAttempts.get(win) === attempt;
   const assertCurrent = () => {
@@ -2115,7 +2132,7 @@ async function loadServerUrl(
   };
   try {
     assertCurrent();
-    let serverUrl = requestedServerUrl;
+    diagnostics.record("connection_start", { origin: originOf(serverUrl), interactive });
     databricksAuth?.reset(win);
     oidcAuth?.detach(win);
     pinWindow(win, originOf(serverUrl), attempt);
@@ -2133,6 +2150,7 @@ async function loadServerUrl(
     let target = loadUrl ?? (routePath ? resolveServerPath(serverUrl, routePath) : serverUrl);
     let manifest = null;
     if (usesBrowserAuth(serverUrl)) {
+      diagnostics.record("auth_mode", { origin: originOf(serverUrl), phase: "databricks" });
       reportConnectionProgress(win, attempt, "authenticating");
       const auth = getDatabricksAuth();
       win.webContents.stop();
@@ -2212,6 +2230,7 @@ async function loadServerUrl(
       assertCurrent();
       const cookieName = oidcSessionCookie(serverUrl, manifest, windowState?.ephemeral);
       if (cookieName) {
+        diagnostics.record("auth_mode", { origin: originOf(serverUrl), phase: "oidc" });
         if (windowState) {
           windowState.authKind = "oidc";
           windowState.oidcCookie = cookieName;
@@ -2256,6 +2275,7 @@ async function loadServerUrl(
     if (!reconnectOverlay.isShown(win)) connectionLoading.show(win, attempt, "Opening Omnigent…");
     await win.loadURL(target);
     assertCurrent();
+    diagnostics.record("connection_result", { origin: originOf(serverUrl), outcome: "loaded" });
     // Loaded: any reconnect this window was waiting on is over.
     cancelReconnect(win);
     // Only a manifest that was actually read can say the name went away.
@@ -2265,6 +2285,14 @@ async function loadServerUrl(
     const arcaServerUrl = windowArcaServerUrl(win);
     void refreshArcaBinary().then(() => arcaAutoConnect.ensure(arcaServerUrl));
     return serverUrl;
+  } catch (error) {
+    diagnostics.record("connection_result", {
+      origin: originOf(serverUrl),
+      outcome: error?.name === "AbortError" ? "cancelled" : "failed",
+      code: error?.code ?? error?.errorCode,
+      status: error?.status,
+    });
+    throw error;
   } finally {
     connectionLoading.hide(win, attempt);
     attempt.pending = false;
@@ -2316,6 +2344,10 @@ function registerNavigationFallbacks(win) {
       // not yank the window off its new destination.
       const failedOrigin = originOf(validatedURL ?? "");
       if (failedOrigin !== windows.get(win)?.origin) return;
+      diagnostics.record("navigation_failed", {
+        origin: failedOrigin,
+        code: `net_${Math.abs(errorCode)}`,
+      });
       let error = `${errorDescription || "load failed"} (${errorCode})`;
       const serverUrl = windows.get(win)?.serverUrl;
       const reconnectable =
@@ -2355,6 +2387,7 @@ function registerNavigationFallbacks(win) {
     const state = windows.get(win);
     const failedOrigin = originOf(url ?? "");
     if (failedOrigin !== state?.origin) return;
+    diagnostics.record("navigation_failed", { origin: failedOrigin, status: httpResponseCode });
     const status = httpStatusText
       ? `${httpResponseCode} ${httpStatusText}`
       : `HTTP ${httpResponseCode}`;
@@ -2762,13 +2795,15 @@ function openFindBar(target) {
   });
   bar.on("closed", () => {
     findBars.delete(target);
-    if (!target.isDestroyed()) {
-      target.removeListener("resize", reposition);
-      target.removeListener("move", reposition);
-      target.webContents.removeListener("found-in-page", onFound);
-      target.webContents.stopFindInPage("clearSelection");
-      target.focus();
-    }
+    if (target.isDestroyed()) return;
+    target.removeListener("resize", reposition);
+    target.removeListener("move", reposition);
+    target.webContents.removeListener("found-in-page", onFound);
+    // Closing the parent (Cmd+W) destroys its webContents before this child's
+    // "closed" fires, while the parent window itself is not yet destroyed.
+    if (target.webContents.isDestroyed()) return;
+    target.webContents.stopFindInPage("clearSelection");
+    target.focus();
   });
 }
 
@@ -3346,6 +3381,32 @@ function changeServer() {
 // roles kills those shortcuts inside webview text fields.
 // ---------------------------------------------------------------------------
 
+async function exportDiagnostics() {
+  const parent = activeWindow();
+  try {
+    const options = {
+      title: "Export Omnigent Desktop Diagnostics",
+      defaultPath: `Omnigent-desktop-diagnostics-${new Date().toISOString().slice(0, 10)}.jsonl`,
+      filters: [{ name: "Diagnostic logs", extensions: ["jsonl"] }],
+    };
+    const { canceled, filePath } = parent
+      ? await dialog.showSaveDialog(parent, options)
+      : await dialog.showSaveDialog(options);
+    if (canceled || !filePath) return;
+    diagnostics.exportTo(filePath);
+  } catch (error) {
+    const options = {
+      type: "error",
+      title: "Could not export diagnostics",
+      message: "Omnigent could not save the desktop diagnostics.",
+      detail: error?.message ?? "Check that the destination is writable and try again.",
+      buttons: ["OK"],
+    };
+    if (parent && !parent.isDestroyed()) await dialog.showMessageBox(parent, options);
+    else await dialog.showMessageBox(options);
+  }
+}
+
 function buildMenu() {
   const isMac = process.platform === "darwin";
   const aboutItem = aboutMenuItem("Omnigent", () => {
@@ -3408,6 +3469,11 @@ function buildMenu() {
       },
     },
     { type: "separator" },
+    {
+      id: "export_diagnostics",
+      label: "Export Diagnostics…",
+      click: () => void exportDiagnostics(),
+    },
     // Keep update checks in the shell-owned About modal so the menu, update
     // prompt, and About item all converge on one status/progress surface.
     {
@@ -3678,6 +3744,37 @@ function hardenAgentPartition(partition, win, canPrompt, getAnchorBounds) {
   });
 }
 
+// Electron keeps one webRequest listener per event per session, and a
+// conversation's tabs share one partition, so install once per session and let
+// the registry attribute each request to its view.
+const guardedAgentSessions = new WeakSet();
+
+/** Enforce the agent navigation policy on document requests at the network layer. */
+function guardAgentPartitionRequests(partition, registry) {
+  const ses = session.fromPartition(partition);
+  if (guardedAgentSessions.has(ses)) return;
+  guardedAgentSessions.add(ses);
+  // Documents only: frames plus <object>/<embed> content, which also renders.
+  const filter = {
+    urls: ["http://*/*", "https://*/*"],
+    types: ["mainFrame", "subFrame", "object"],
+  };
+  const answer = (decision, callback) =>
+    decision.then(
+      (cancel) => callback({ cancel }),
+      () => callback({ cancel: true }),
+    );
+  ses.webRequest.onBeforeRequest(filter, (details, callback) =>
+    answer(registry.shouldCancelAgentRequest(details), callback),
+  );
+  ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
+    callback(registry.agentRequestHeaders(details)),
+  );
+  ses.webRequest.onHeadersReceived(filter, (details, callback) =>
+    answer(registry.shouldCancelAgentResponse(details), callback),
+  );
+}
+
 /**
  * Main-owned recovery scope for a loopback preview request, excluding the
  * renderer-supplied host match that decides whether this session may ask.
@@ -3775,8 +3872,16 @@ function createBrowserRegistryForWindow(win) {
       );
       const view = new WebContentsView(opts);
       policy.attach(view.webContents);
+      guardAgentPartitionRequests(opts.webPreferences.partition, registry);
       return view;
     },
+    // Resolve and look up proxies through the view's own Chromium session, so
+    // the agent checks see what its navigation will use.
+    resolveHost: async (hostname, partition) => {
+      const { endpoints } = await session.fromPartition(partition).resolveHost(hostname);
+      return endpoints.map((endpoint) => endpoint.address);
+    },
+    resolveProxy: (url, partition) => session.fromPartition(partition).resolveProxy(url),
     onSuppressionChange: (suppressed) => {
       if (suppressed) browserPermissionPrompt.dismiss(win);
     },
@@ -4737,7 +4842,11 @@ function registerIpc() {
     return {
       databricksInternalFeatures: enabled,
       canExtendArca: enabled,
+      canRefreshDbcert: enabled,
       arcaPreviewRecovery: true,
+      // Importing local Chrome cookies is wired for macOS only (Keychain-decrypted
+      // v10 values); the SPA hides the toolbar button everywhere else.
+      chromeCookieImport: process.platform === "darwin",
     };
   });
 
@@ -4816,6 +4925,68 @@ function registerIpc() {
     }
   });
 
+  // SPA → renew this machine's dbcert from the expired-dbcert banner; Arca
+  // Companion then copies it to the user's boxes. Same gates as arca-extend.
+  // Clicks from several windows share one sign-in.
+  let dbcertPreflight = null;
+  let dbcertGeneration = 0;
+  let dbcertRefresh = null;
+  ipcMain.handle("omnigent:dbcert-refresh", async (event, options) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("dbcert-refresh is only available to a connected server page");
+    }
+    if (!canExtendArca(event)) {
+      return { ok: false, error: "dbcert refresh is not enabled for this server." };
+    }
+    if (!dbcertRefresh) {
+      const refresh = {
+        renewal: arca.runDbcertRefresh({ skipArcaSync: true }).then((result) => {
+          if (result.ok) {
+            dbcertGeneration += 1;
+            dbcertPreflight = null;
+          }
+          return result;
+        }),
+        sync: null,
+      };
+      refresh.renewal = refresh.renewal.finally(() => {
+        if (!refresh.sync && dbcertRefresh === refresh) dbcertRefresh = null;
+      });
+      dbcertRefresh = refresh;
+    }
+    const refresh = dbcertRefresh;
+    if (options?.skipArcaSync === true) return refresh.renewal;
+    refresh.sync ??= refresh.renewal
+      .then((result) => (result.ok ? arca.runDbcertArcaSync() : result))
+      .finally(() => {
+        if (dbcertRefresh === refresh) dbcertRefresh = null;
+      });
+    return refresh.sync;
+  });
+
+  const checkCurrentDbcert = () => {
+    if (!dbcertPreflight) {
+      const generation = dbcertGeneration;
+      const pending = arca
+        .checkDbcert()
+        .then((result) => (generation === dbcertGeneration ? result : checkCurrentDbcert()))
+        .finally(() => {
+          if (dbcertPreflight === pending) dbcertPreflight = null;
+        });
+      dbcertPreflight = pending;
+    }
+    return dbcertPreflight;
+  };
+  ipcMain.handle("omnigent:dbcert-check", async (event) => {
+    if (!isPinnedOriginSender(event)) {
+      throw new Error("dbcert-check is only available to a connected server page");
+    }
+    if (!canExtendArca(event)) {
+      return { ok: false, error: "dbcert checks are not enabled for this server." };
+    }
+    return checkCurrentDbcert();
+  });
+
   // Push a status ping when a host child connects or exits on its own (no
   // polling) — the server-management module owns the subprocess and reports
   // lifecycle changes here.
@@ -4827,6 +4998,7 @@ function registerIpc() {
     ipcMain,
     isPinnedOriginSender,
     getRegistryForEvent: browserRegistryForSender,
+    getWindowForEvent: (event) => BrowserWindow.fromWebContents(event.sender),
     getAgentContextForEvent: (event, sourceHostId) => ({
       serverTarget: arcaTarget(windowArcaServerUrl(BrowserWindow.fromWebContents(event.sender))),
       sourceHostId: typeof sourceHostId === "string" ? sourceHostId : null,
@@ -5066,10 +5238,10 @@ let deepLinkInFlight = false;
  */
 function enqueueDeepLink(raw) {
   if (!parseOmnigentDeepLink(raw)) {
-    console.log(`[omnigent] deep-link: ignored unrecognized URL ${String(raw)}`);
+    console.log("[omnigent] deep-link: ignored unrecognized URL");
     return;
   }
-  console.log(`[omnigent] deep-link: queued ${raw} (ready=${app.isReady()})`);
+  console.log(`[omnigent] deep-link: queued (ready=${app.isReady()})`);
   pendingDeepLinks.push(raw);
   drainPendingDeepLinks();
 }
@@ -5264,6 +5436,7 @@ if (!gotLock) {
   });
 
   app.whenReady().then(() => {
+    diagnostics.initialize(app);
     // App User Model ID so Windows attributes notifications/taskbar correctly.
     if (process.platform === "win32")
       app.setAppUserModelId(isDevBuild ? DEV_DOMAIN : "ai.omnigent.desktop");

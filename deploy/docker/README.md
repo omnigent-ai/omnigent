@@ -41,9 +41,9 @@ docker compose down -v
 
 ## Release features
 
-Release features are deployment-wide and off by default. Enable one or more
-with the comma-separated `OMNIGENT_FEATURES` variable in `.env`, then recreate
-the server container:
+Override release-feature defaults with comma-separated names in
+`OMNIGENT_FEATURES` in `.env`: a name enables a feature, and `-name` disables
+it. Empty or unset uses the defaults. Then recreate the server container:
 
 ```dotenv
 OMNIGENT_FEATURES=usage_page
@@ -57,8 +57,9 @@ curl -s http://localhost:8000/v1/info | jq '.features'
 Known keys and their lifecycle are documented in
 [`designs/FEATURE_FLAGS.md`](../../designs/FEATURE_FLAGS.md). Unknown keys fail
 server startup so a typo cannot silently produce the wrong rollout. To roll
-back, remove the key (or empty the variable), run `docker compose up -d` again,
-and reload the web app.
+back, add `-feature_name`, run `docker compose up -d` again, and reload the
+web app. Runner overrides such as `-claude_osc_status` must also be set on
+separately running hosts; restart their host/runners and launch fresh terminals.
 
 ## Extra built-in agents
 
@@ -281,7 +282,10 @@ When migrating from a custom integration that inferred public-client mode from
 an absent secret, explicitly add `OMNIGENT_OIDC_TOKEN_ENDPOINT_AUTH_METHOD=none`.
 If your trusted enterprise directory omits `email_verified`, the existing
 `OMNIGENT_OIDC_SKIP_EMAIL_VERIFICATION=1` remains a separate operator choice;
-these compatibility options never enable it automatically.
+these compatibility options never enable it automatically. Likewise, if CLI or
+device sign-in fails with "IdP did not confirm re-authentication" because the
+IdP omits `auth_time` (for example, Cloudflare Access), opt out with
+`OMNIGENT_OIDC_REQUIRE_REAUTH=0`; see `.env.example` for the trade-off.
 
 To verify a deployment, restart with the settings above, sign in from a private
 browser window, then run `omnigent login <server-url>` and finish the browser

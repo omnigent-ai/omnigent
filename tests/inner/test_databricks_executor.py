@@ -802,6 +802,27 @@ def test_read_databrickscfg_pat_profile_returns_token_verbatim(
     assert creds.token == "dapi-fake-pat-token-for-unit-test"
 
 
+@pytest.mark.parametrize("reader", [_read_databrickscfg, _read_databrickscfg_file_fallback])
+@pytest.mark.parametrize(
+    "contents",
+    [
+        "token = private-malformed-secret\n",
+        "[broken]\nhost = https://workspace.example\nprivate-malformed-secret\n",
+        "[broken]\nhost = https://workspace.example\nhost = private-malformed-secret\n",
+    ],
+)
+def test_ambient_credential_probe_handles_malformed_profile(
+    tmp_path, monkeypatch, clean_databricks_env, caplog, reader, contents
+):
+    profile = tmp_path / "databrickscfg"
+    profile.write_text(contents)
+    monkeypatch.setenv("DATABRICKS_CONFIG_FILE", str(profile))
+
+    assert reader("broken") is None
+    assert "private-malformed-secret" not in caplog.text
+    assert not any(record.exc_info for record in caplog.records)
+
+
 def test_read_databrickscfg_missing_profile_falls_back_to_file_reader(
     pat_only_cfg: _Path,
 ) -> None:
@@ -2808,3 +2829,39 @@ def test_reused_token_source_retries_resolution_after_failure(monkeypatch):
     assert source.current_token() is None
     available["ok"] = True
     assert source.current_token() == "tok-late"
+
+
+def test_reused_token_source_logs_first_failure_until_resolution_succeeds(monkeypatch, caplog):
+    """Only the first failure after a success is logged; a recovery re-arms it."""
+    from omnigent.inner.databricks_executor import (
+        DatabricksAuthError,
+        _DatabricksBearerAuth,
+        _ReusedDatabricksTokenSource,
+    )
+
+    class _Cfg:
+        def authenticate(self):
+            raise DatabricksAuthError("mint failed")
+
+    outcomes = iter(["not logged in", "profile DEFAULT not found", None, "not logged in"])
+
+    def _fake_resolve(profile=None, *, host=None):
+        cause = next(outcomes)
+        if cause is not None:
+            raise DatabricksAuthError(cause)
+        return _DatabricksBearerAuth(_Cfg(), profile_name=None), "https://ex.test"
+
+    monkeypatch.setattr(
+        "omnigent.inner.databricks_executor._resolve_databricks_auth", _fake_resolve
+    )
+
+    source = _ReusedDatabricksTokenSource()
+    with caplog.at_level("INFO", logger="omnigent.inner.databricks_executor"):
+        for _ in range(4):
+            assert source.current_token() is None
+
+    messages = [r.getMessage() for r in caplog.records if "SDK auth unavailable" in r.getMessage()]
+    assert messages == [
+        "Databricks SDK auth unavailable: DatabricksAuthError: not logged in",
+        "Databricks SDK auth unavailable: DatabricksAuthError: not logged in",
+    ]

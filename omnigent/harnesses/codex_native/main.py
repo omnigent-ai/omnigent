@@ -16,7 +16,7 @@ import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from tempfile import NamedTemporaryFile, TemporaryDirectory
 
@@ -31,6 +31,7 @@ from omnigent._wrapper_labels import (
 )
 from omnigent._wrapper_labels import WRAPPER_LABEL_KEY as _WRAPPER_LABEL_KEY
 from omnigent.conversation_browser import conversation_url, open_conversation_link_if_enabled
+from omnigent.entities.conversation import NON_CONTENT_ITEM_TYPES
 from omnigent.entities.session_resources import terminal_resource_id
 from omnigent.harness_availability import (
     HARNESS_BINARY_MISSING,
@@ -71,6 +72,7 @@ from omnigent.harnesses.codex_native.bridge import (
 )
 from omnigent.harnesses.codex_native.forwarder import (
     _replay_dead_letters_before_resume,
+    codex_rollout_last_turn_model,
     supervise_forwarder,
 )
 from omnigent.harnesses.codex_native.state import read_launch_state, write_launch_state
@@ -102,11 +104,12 @@ from omnigent.native.native_terminal import (
 from omnigent.native.native_terminal import (
     normalize_extra_args as _normalize_extra_args,
 )
-from omnigent.native.native_terminal import request_with_429_retry
+from omnigent.native.native_terminal import post_initial_prompt, request_with_429_retry
 from omnigent.native.native_terminal import (
     terminal_attach_url as _attach_url,
 )
 from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
+from omnigent.util.http_retry import jittered_retry_delay
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 _logger = logging.getLogger(__name__)
@@ -299,7 +302,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
             or native_codex_launch_base_url(launch) is not None
         )
         defers_to_codex_config = not native_codex_launch_pins_model_provider(launch)
-    except Exception:  # noqa: BLE001 - readiness must never raise; fail onto auth.json.
+    except Exception:  # readiness must never raise; fail onto auth.json.
         _logger.debug("codex readiness: launch resolve failed; using auth.json", exc_info=True)
         routes_through_provider = False
     if routes_through_provider and not defers_to_codex_config:
@@ -318,7 +321,7 @@ def _codex_auth_unavailable_reason() -> HarnessUnavailableReason | None:
         if not _codex_auth_json_has_available_credential(source.auth_path):
             return HARNESS_NEEDS_AUTH
         return None
-    except Exception:  # noqa: BLE001 - readiness must never raise.
+    except Exception:  # readiness must never raise.
         _logger.debug("codex readiness: local auth check failed", exc_info=True)
         return HARNESS_NEEDS_AUTH
 
@@ -660,7 +663,7 @@ def _wrapper_spec_raw_instructions(spec_path: Path) -> str | None:
 
     try:
         spec = load_agent_spec(spec_path, expand_env=False)
-    except Exception:  # noqa: BLE001 — best-effort; never block the launch
+    except Exception:  # best-effort; never block the launch
         _logger.warning(
             "Could not resolve raw instructions from wrapper spec %s",
             spec_path,
@@ -861,12 +864,13 @@ def _run_with_remote_server(
                 headers.update(new_headers)
 
             if prompt:
-                await _post_initial_prompt(
+                await post_initial_prompt(
                     base_url=base_url,
                     headers=headers,
                     session_id=prepared.session_id,
                     prompt=prompt,
                     auth=attach_auth,
+                    harness_name="Codex",
                 )
                 record_startup_event("initial_prompt_submitted")
             await _attach_terminal_resource(
@@ -1096,50 +1100,6 @@ async def _wait_for_codex_terminal_ready(
     raise click.ClickException(
         f"The runner did not create the Codex terminal for {session_id!r} within {timeout_s:.0f}s."
     )
-
-
-async def _post_initial_prompt(
-    *,
-    base_url: str,
-    headers: dict[str, str],
-    session_id: str,
-    prompt: str,
-    auth: httpx.Auth | None,
-) -> None:
-    """
-    Send the first Codex prompt through Omnigent instead of the app-server.
-
-    :param base_url: Omnigent server base URL.
-    :param headers: HTTP auth headers for Omnigent requests.
-    :param session_id: Session id, e.g. ``"conv_abc123"``.
-    :param prompt: User prompt text.
-    :param auth: Optional refresh-capable HTTP auth for long-lived
-        Databricks-backed sessions.
-    :returns: None.
-    :raises click.ClickException: If Omnigent rejects the prompt.
-    """
-    from omnigent.cli_auth import open_server_client
-
-    async with open_server_client(
-        base_url,
-        headers=headers,
-        auth=auth,
-        timeout=httpx.Timeout(30.0),
-    ) as client:
-        resp = await client.post(
-            f"/v1/sessions/{url_component(session_id)}/events",
-            json={
-                "type": "message",
-                "data": {
-                    "role": "user",
-                    "content": [{"type": "input_text", "text": prompt}],
-                },
-            },
-        )
-    if resp.status_code >= 400:
-        raise click.ClickException(
-            f"Codex initial prompt failed ({resp.status_code}): {error_text(resp)}"
-        )
 
 
 async def _prepare_codex_terminal(
@@ -1855,6 +1815,10 @@ def _copy_rollout_with_cwd(
             dst.write(json.dumps(record, separators=(",", ":")) + "\n")
 
 
+class _CodexForkModelMismatchError(Exception):
+    """A fork's source rollout last ran on a model other than the fork's."""
+
+
 def _clone_codex_rollout(
     *,
     source_session_id: str,
@@ -1862,6 +1826,7 @@ def _clone_codex_rollout(
     target_thread_id: str,
     clone_codex_home: Path,
     clone_workspace: Path,
+    clone_model: str | None = None,
 ) -> Path | None:
     """
     Clone a source Codex rollout into the clone's own ``CODEX_HOME``.
@@ -1894,9 +1859,17 @@ def _clone_codex_rollout(
     :param clone_workspace: The resolved directory the clone will run in
         (its worktree or same dir). Written into the structural ``cwd``
         fields. Pass an already-resolved path.
+    :param clone_model: Model the clone launches on, e.g.
+        ``"system.ai.gpt-6-1-sol"``. When the source's last turn ran on a
+        different model, the clone is declined: Codex would first compact
+        the copied history on the source's model, and the fork would fail
+        whenever that model is unavailable (for example, over budget).
+        ``None`` skips the check.
     :returns: Path to the written clone rollout, or ``None`` when the ids
-        are unsafe or the source rollout can't be found on this host
-        (caller launches fresh in that case).
+        are unsafe or the source rollout can't be found on this host (the
+        caller rebuilds from Omnigent items or launches fresh).
+    :raises _CodexForkModelMismatchError: If the source's last turn used a
+        model other than *clone_model*; the caller must rebuild the history.
     :raises click.ClickException: If the source rollout is malformed.
     """
     if not _CODEX_THREAD_ID_RE.fullmatch(source_thread_id):
@@ -1907,6 +1880,17 @@ def _clone_codex_rollout(
     source = _find_codex_rollout(source_home, source_thread_id)
     if source is None:
         return None
+    if clone_model is not None:
+        from omnigent.models.codex_model_vocabulary import comparable_model_id
+
+        source_model = codex_rollout_last_turn_model(source)
+        if source_model is not None and comparable_model_id(source_model) != comparable_model_id(
+            clone_model
+        ):
+            raise _CodexForkModelMismatchError(
+                f"Codex rollout {source.name} last ran on {source_model}, "
+                f"but the fork launches on {clone_model}"
+            )
     # Preserve the source's ``sessions/<YYYY>/<MM>/<DD>/`` layout; only swap
     # the thread id embedded in the rollout filename so the clone lands in
     # its own CODEX_HOME under the assigned id.
@@ -2079,7 +2063,7 @@ def _codex_resume_rollout_path(codex_home: Path, external_session_id: str) -> Pa
     existing = _find_codex_rollout(codex_home, external_session_id)
     if existing is not None:
         return existing
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     partition = (
         codex_home / "sessions" / now.strftime("%Y") / now.strftime("%m") / now.strftime("%d")
     )
@@ -2122,6 +2106,14 @@ class _CodexResumeHistoryUnavailableError(click.ClickException):
     """Server history is temporarily unavailable for Codex cold resume."""
 
 
+_CODEX_HISTORY_FETCH_ATTEMPTS = 3
+_CODEX_HISTORY_RETRY_MAX_DELAY_S = 10.0
+
+
+async def _codex_history_retry_sleep(delay: float) -> None:
+    await asyncio.sleep(delay)
+
+
 async def _fetch_all_session_items_for_codex_resume(
     client: httpx.AsyncClient,
     session_id: str,
@@ -2133,8 +2125,8 @@ async def _fetch_all_session_items_for_codex_resume(
     :param session_id: Omnigent conversation id, e.g. ``"conv_abc123"``.
     :returns: Flat API item dicts from
         ``GET /v1/sessions/{id}/items``.
-    :raises _CodexResumeHistoryUnavailableError: If transport or server errors
-        prevent fetching an item page.
+    :raises _CodexResumeHistoryUnavailableError: If transport or server errors,
+        or persistent throttling, prevent fetching an item page.
     :raises click.ClickException: If the server rejects the request or returns
         an invalid page.
     """
@@ -2144,16 +2136,35 @@ async def _fetch_all_session_items_for_codex_resume(
         params: dict[str, str | int] = {"limit": 1000, "order": "asc"}
         if after is not None:
             params["after"] = after
-        try:
-            resp = await client.get(
-                f"/v1/sessions/{url_component(session_id)}/items",
-                params=params,
+        for attempt in range(1, _CODEX_HISTORY_FETCH_ATTEMPTS + 1):
+            try:
+                resp = await client.get(
+                    f"/v1/sessions/{url_component(session_id)}/items",
+                    params=params,
+                )
+            except httpx.TransportError as exc:
+                raise _CodexResumeHistoryUnavailableError(
+                    f"Failed to fetch history for {session_id!r}: {exc}"
+                ) from exc
+            if resp.status_code != 429 or attempt == _CODEX_HISTORY_FETCH_ATTEMPTS:
+                break
+            delay = jittered_retry_delay(
+                resp,
+                backoff=0.5 * (2 ** (attempt - 1)),
+                max_delay=_CODEX_HISTORY_RETRY_MAX_DELAY_S,
             )
-        except httpx.TransportError as exc:
-            raise _CodexResumeHistoryUnavailableError(
-                f"Failed to fetch history for {session_id!r}: {exc}"
-            ) from exc
-        if resp.status_code >= 500:
+            if delay is None:
+                break
+            _logger.warning(
+                "Session history throttled for %r (attempt %d/%d); retrying in %.2fs",
+                session_id,
+                attempt,
+                _CODEX_HISTORY_FETCH_ATTEMPTS,
+                delay,
+                extra={"session_id": session_id},
+            )
+            await _codex_history_retry_sleep(delay)
+        if resp.status_code == 429 or resp.status_code >= 500:
             raise _CodexResumeHistoryUnavailableError(
                 f"Failed to fetch history for {session_id!r} "
                 f"({resp.status_code}): {error_text(resp)}"
@@ -2257,9 +2268,10 @@ def _codex_rollout_records_from_session_items(
         items,
         interrupted_response_ids=interrupted_response_ids,
     )
+    items = _codex_items_with_outputs_in_call_order(
+        [item for item in items if _session_item_response_id(item) not in interrupted_response_ids]
+    )
     for index, item in enumerate(items):
-        if _session_item_response_id(item) in interrupted_response_ids:
-            continue
         item_call_id = item.get("call_id")
         if (
             item.get("type") == "function_call_output"
@@ -2360,6 +2372,51 @@ def _codex_rollout_records_from_session_items(
         if event_msg is not None:
             records.append(event_msg)
     return records
+
+
+def _codex_items_with_outputs_in_call_order(
+    items: list[_JsonObject],
+) -> list[_JsonObject]:
+    """
+    Reorder tool outputs separated only by metadata to match their calls' order.
+
+    Parallel tool outputs are stored in completion order, but Codex keeps them
+    in call order, and providers that pair outputs by position reject the swap.
+
+    :param items: Flat Omnigent item dicts in chronological order.
+    :returns: Items with output slots sorted by their calls' positions, preserving
+        metadata positions and all content or compaction boundaries. Unmatched
+        outputs keep their relative order at the end of the run.
+    """
+    call_positions: dict[str, int] = {}
+    for position, item in enumerate(items):
+        call_id = item.get("call_id")
+        if item.get("type") == "function_call" and isinstance(call_id, str):
+            call_positions.setdefault(call_id, position)
+    ordered = list(items)
+    output_positions: list[int] = []
+
+    def flush_run() -> None:
+        outputs = sorted(
+            (ordered[position] for position in output_positions),
+            key=lambda output: (
+                (0, call_positions[call_id])
+                if isinstance(call_id := output.get("call_id"), str) and call_id in call_positions
+                else (1, 0)
+            ),
+        )
+        for position, output in zip(output_positions, outputs, strict=True):
+            ordered[position] = output
+        output_positions.clear()
+
+    for position, item in enumerate(items):
+        item_type = item.get("type")
+        if item_type == "function_call_output":
+            output_positions.append(position)
+        elif item_type == "compaction" or item_type not in NON_CONTENT_ITEM_TYPES:
+            flush_run()
+    flush_run()
+    return ordered
 
 
 def _codex_function_output_counts(
@@ -2805,7 +2862,7 @@ def _codex_rollout_timestamp() -> str:
     :returns: ISO-8601 timestamp with ``Z`` suffix, e.g.
         ``"2026-06-08T12:34:56.789Z"``.
     """
-    return datetime.now(timezone.utc).isoformat(timespec="milliseconds").replace("+00:00", "Z")
+    return datetime.now(UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 async def _patch_external_session_id(

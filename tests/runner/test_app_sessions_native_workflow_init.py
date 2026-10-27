@@ -19,6 +19,7 @@ from omnigent.debug_logging import record_to_row
 from omnigent.entities.session_resources import SessionResourceView
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
+from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.databricks_executor import DatabricksAuthError
 from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
@@ -247,6 +248,50 @@ async def test_resolve_native_spawn_env_label_builder_reads_bridge_id() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("launched_into_label_dir", [True, False])
+async def test_resolve_native_spawn_env_codex_failed_label_read_keeps_the_launch_dir(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    launched_into_label_dir: bool,
+) -> None:
+    """A Codex spawn whose label read fails reads bridge state where the terminal was launched.
+
+    A rotated session's terminal is launched into its bridge-id label's
+    directory. If the spawn-time label read then fails, the executor must still
+    get that directory, not the session id's; with no launch on this runner it
+    keeps the session id's directory.
+    """
+    from omnigent.harnesses.codex_native import bridge as codex_bridge
+    from omnigent.runner.native import orchestration as native_orchestration
+
+    monkeypatch.setattr(codex_bridge, "_BRIDGE_ROOT", tmp_path / "bridges")
+    label_dir = codex_bridge.bridge_dir_for_bridge_id("bridge_rotated_from")
+    if launched_into_label_dir:
+        monkeypatch.setitem(native_orchestration._AUTO_CODEX_BRIDGE_DIRS, "conv_codex", label_dir)
+
+    def _labels_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(503, json={"error": "unavailable"})
+
+    transport = httpx.MockTransport(_labels_handler)
+    async with httpx.AsyncClient(transport=transport, base_url="http://ap") as client:
+        env = await _resolve_native_spawn_env(
+            "codex-native",
+            "conv_codex",
+            server_client=client,
+            optional_labels=None,
+        )
+
+    expected = (
+        label_dir
+        if launched_into_label_dir
+        else codex_bridge.bridge_dir_for_bridge_id("conv_codex")
+    )
+    assert env is not None
+    assert env[codex_bridge.CODEX_NATIVE_BRIDGE_DIR_ENV_VAR] == str(expected)
+    assert env[codex_bridge.CODEX_NATIVE_REQUEST_SESSION_ID_ENV_VAR] == "conv_codex"
+
+
+@pytest.mark.asyncio
 async def test_resolve_native_spawn_env_claude_uses_bridge_id_helper() -> None:
     """Claude resolves its bridge id through the runner helper, not a label read."""
     captured: dict[str, Any] = {}
@@ -377,7 +422,27 @@ def _launch_ctx(**overrides: Any) -> NativeLaunchContext:
         (
             "kiro-native",
             "_auto_create_kiro_terminal",
-            {"server_client", "ensure_comment_relay"},
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "goose-native",
+            "_auto_create_goose_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "hermes-native",
+            "_auto_create_hermes_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "qwen-native",
+            "_auto_create_qwen_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
+        ),
+        (
+            "devin-native",
+            "_auto_create_devin_terminal",
+            {"server_client", "ensure_comment_relay", "agent_spec"},
         ),
         (
             "kimi-native",
@@ -594,6 +659,32 @@ async def test_launch_native_terminal_publishes_start_error_on_failure(
     )
     # pending True/False bracket the attempt, and a start-error event is published.
     assert any("error" in name.lower() or "error" in event for name, event in events)
+
+
+@pytest.mark.asyncio
+async def test_launch_native_terminal_publishes_model_outside_allowlist_without_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model outside the harness's list is published as a setup error, not a crash."""
+    from omnigent.runner.native import _launch_native_terminal
+
+    async def _reject_model(ctx: NativeLaunchContext) -> object:
+        raise ModelNotAllowedError("model-b", "pi-native", ("model-a",))
+
+    monkeypatch.setattr("omnigent.runner.native._launch_pi", _reject_model)
+    events: list[dict[str, Any]] = []
+    result = await _launch_native_terminal(
+        "pi-native",
+        _launch_ctx(publish_event=lambda _name, event: events.append(event)),
+        ensure_locks={},
+    )
+
+    assert result is False
+    failed = next(event for event in events if event.get("status") == "failed")
+    assert failed["error"]["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert "Allowed models: 'model-a'." in failed["error"]["message"]
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 @pytest.mark.asyncio
@@ -840,6 +931,27 @@ async def test_ensure_native_terminal_missing_workspace_returns_410_without_stac
     assert all(record.exc_info is None for record in caplog.records)
     assert "resource unavailable" in caplog.text
     assert "agent unavailable" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_ensure_native_terminal_model_outside_allowlist_returns_412_without_stack(
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A model outside the harness's list is a setup error, not a startup defect."""
+    from omnigent.runner.native import _ensure_native_terminal
+
+    async def _reject_model(ctx: NativeLaunchContext) -> object:
+        raise ModelNotAllowedError("model-b", "goose-native", ("model-a",))
+
+    monkeypatch.setattr("omnigent.runner.native._launch_goose", _reject_model)
+    resp = await _ensure_native_terminal(
+        "goose", _ensure_ctx(_FakeEnsureRegistry(existing=None)), ensure_locks={}
+    )
+
+    assert resp is not None and resp.status_code == 412
+    assert json.loads(bytes(resp.body))["error"]["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert all(record.exc_info is None for record in caplog.records)
 
 
 @pytest.mark.asyncio

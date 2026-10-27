@@ -30,8 +30,8 @@ _PROMPT = "Continue the changes we discussed."
 _ANSWER = "The implementation plan is saved in this conversation."
 _SOURCE_NOTICE = "The original session’s workspace was unavailable."
 _DESCRIPTION = (
-    "Choose an existing directory to continue this conversation in a new session. "
-    "Files from the missing workspace won’t be restored."
+    "Choose an existing directory to continue this conversation in a new session, "
+    "optionally in a new git worktree. Files from the missing workspace won’t be restored."
 )
 
 
@@ -285,6 +285,9 @@ def test_continue_missing_workspace_in_another_directory(
     directory = dialog.get_by_role("combobox", name="Working directory path")
     expect(directory).to_be_visible()
     expect(directory).to_have_value("")
+    worktree = dialog.get_by_role("textbox", name="Git worktree (optional)")
+    expect(worktree).to_be_visible()
+    expect(worktree).to_have_value("")
     submit = dialog.get_by_role("button", name="Continue", exact=True)
     expect(submit).to_be_disabled()
     page.screenshot(path=str(artifacts / "choose-another-directory.png"), full_page=True)

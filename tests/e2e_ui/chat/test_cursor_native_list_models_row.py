@@ -248,7 +248,7 @@ def _expand_list_models_tool_call(page: Page) -> None:
     group.click()
     expect(group).to_have_attribute("aria-expanded", "true")
 
-    direct = worked.get_by_role("button", name=re.compile(r"^sys_list_models"))
+    direct = worked.get_by_role("button", name=re.compile(r"^List models"))
     expect(direct).to_be_visible(timeout=30_000)
     direct.click()
     expect(direct).to_have_attribute("aria-expanded", "true")
@@ -318,9 +318,13 @@ def test_cursor_native_worker_row_not_source_none(
     # The completed-turn fold appears after the working indicator clears.
     expect(page.get_by_test_id("working-indicator")).to_be_hidden(timeout=30_000)
 
-    # Put the catalog on screen the way a user reads it (and the video shows it).
+    # Put the catalog on screen the way a user reads it (and the video shows it):
+    # labeled fields, or JSON when it is too long to show in full.
     _expand_list_models_tool_call(page)
-    expect(page.get_by_text(re.compile(r'"cursor"')).first).to_be_visible(timeout=30_000)
+    cursor_row = page.get_by_test_id("turn-worked-fold").get_by_text(
+        re.compile(r'"cursor"|^Cursor$')
+    )
+    expect(cursor_row.first).to_be_visible(timeout=30_000)
 
     row = _cursor_catalog_row(chat.base_url, chat.session_id)
 

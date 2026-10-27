@@ -22,7 +22,7 @@ def _resolve_procedures() -> str:
             skills["otto-review-remediation"],
             resource("resolve-inputs", "ticket-only.md"),
             resource("resolve-inputs", "reproduction.md"),
-            skills["resolve-impact-assessment"],
+            skills["otto-impact-assessment"],
             skills["resolve-repro-audit"],
             resource("resolve-inputs", "existing-fix.md"),
             skills["resolve-review-pr"],
@@ -30,15 +30,11 @@ def _resolve_procedures() -> str:
             skills["resolve-publish"],
             skills["resolve-drive-pr"],
             skills["otto-pr-review-loop"],
-            *(
-                resource("resolve-drive-pr", name)
-                for name in (
-                    "preview.md",
-                    "ci.md",
-                    "validation-prompt.md",
-                    "final-review.md",
-                )
-            ),
+            skills["otto-drive-pr"],
+            resource("otto-drive-pr", "preview.md"),
+            resource("otto-drive-pr", "ci.md"),
+            resource("resolve-drive-pr", "validation-prompt.md"),
+            resource("resolve-drive-pr", "final-review.md"),
             skills["resolve-handoff"],
         ]
     )
@@ -360,6 +356,10 @@ def test_resolve_agent_bundle_ships_the_shared_skills(tmp_path: Path) -> None:
         ("otto-pr-review-loop", "SKILL.md"),
         ("otto-pr-review-loop", "review_cycle.py"),
         ("otto-review-remediation", "SKILL.md"),
+        ("otto-impact-assessment", "SKILL.md"),
+        ("otto-drive-pr", "SKILL.md"),
+        ("otto-drive-pr", "ci.md"),
+        ("otto-drive-pr", "preview.md"),
     ):
         assert (_RESOLVE_AGENT / "skills" / name).resolve() == (shared / name).resolve()
         assert name in bundled_skills

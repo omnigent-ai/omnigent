@@ -1566,7 +1566,7 @@ describe("LatestTurnSpacer", () => {
     // WHY: the anchor row can be absent for the first frame(s) on a cold load of
     // a windowed transcript (the scroll element is published before the
     // virtualizer fills its window). Capture must retry rather than depend on a
-    // resize that need not fire — the wrapper height is estimate-fixed.
+    // resize that need not fire — the wrapper height tracks the estimate.
     const holder: { cb: (() => void) | null } = { cb: null };
     class StubResizeObserver {
       constructor(cb: () => void) {

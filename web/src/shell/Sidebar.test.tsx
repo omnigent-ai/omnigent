@@ -13,17 +13,22 @@ import { sidebarConfig, type SidebarConfig } from "@/lib/sidebarConfig";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { useEffect } from "react";
+import { GridSessionsProvider } from "@/grid/GridSessionsContext";
+import * as readStateHooks from "@/hooks/useUnseenConversations";
+import { getOmnigentServerIdentity } from "@/lib/host";
 import { MemoryRouter, Route, Routes } from "react-router-dom";
-import { ALT_KEY, ARIA_MOD_KEY, MOD_KEY } from "@/components/KeyboardShortcut";
+import { ARIA_MOD_KEY, MOD_KEY, SHIFT_KEY } from "@/components/KeyboardShortcut";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 import type * as PullRequestsModule from "@/hooks/usePullRequests";
 import {
+  markConversationRead,
   markConversationSeen,
   resetReadStateForTests,
   seedReadState,
 } from "@/hooks/useUnseenConversations";
 import { FALLBACK_SERVER_INFO, type ServerInfo } from "@/lib/capabilities";
+import { isMacPlatform } from "@/lib/hotkeys";
 import { clearOptimisticTitles, recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { clearSessionDrafts, setSessionDraft } from "@/lib/sessionDrafts";
 import * as sessionsApi from "@/lib/sessionsApi";
@@ -48,6 +53,7 @@ const {
   projectSessionsLoadingRef,
   useHostsMock,
   usePullRequestInfoMock,
+  useSessionWorktreesMock,
 } = vi.hoisted(() => ({
   projectsMock: [] as string[],
   projectRowsRef: { current: undefined as { id: string; name: string }[] | undefined },
@@ -77,12 +83,17 @@ const {
   projectSessionsLoadingRef: { current: false },
   useHostsMock: vi.fn(),
   usePullRequestInfoMock: vi.fn(),
+  useSessionWorktreesMock: vi.fn(),
 }));
 
 // The session tooltip reads repo / PR / branch from the session's GitHub info.
 vi.mock("@/hooks/usePullRequests", async (importOriginal) => ({
   ...(await importOriginal<typeof PullRequestsModule>()),
   usePullRequestInfo: usePullRequestInfoMock,
+}));
+
+vi.mock("@/hooks/useSessionWorktrees", () => ({
+  useSessionWorktrees: useSessionWorktreesMock,
 }));
 
 vi.mock("@/hooks/useHosts", () => ({
@@ -290,6 +301,8 @@ beforeEach(() => {
   useHostsMock.mockReturnValue({ data: [] });
   usePullRequestInfoMock.mockReset();
   usePullRequestInfoMock.mockReturnValue({ data: undefined });
+  useSessionWorktreesMock.mockReset();
+  useSessionWorktreesMock.mockReturnValue({ data: undefined });
   localStorage.clear();
   resetReadStateForTests();
   clearSessionDrafts();
@@ -579,7 +592,12 @@ describe("Sidebar session list", () => {
       renderSidebar();
 
       const scroller = screen.getByLabelText("Conversations").querySelector("nav")!;
-      expect(scroller).toHaveClass("overflow-y-auto", "px-2", "[scrollbar-width:thin]");
+      expect(scroller).toHaveClass(
+        "overflow-y-auto",
+        "px-2",
+        "[scrollbar-gutter:stable]",
+        "[scrollbar-width:thin]",
+      );
       expect(scroller.className).toContain("[&::-webkit-scrollbar]:w-2");
       expect(scroller).not.toHaveClass("[scrollbar-width:none]");
       expect(scroller.className).not.toContain("[&::-webkit-scrollbar]:hidden");
@@ -1181,10 +1199,10 @@ describe("Sidebar session list", () => {
     const newSession = screen.getByTestId("new-chat-button");
     const shortcut = newSession.querySelector<HTMLElement>('[data-slot="shortcut-keys"]');
 
-    expect(newSession).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Alt+N`);
+    expect(newSession).toHaveAttribute("aria-keyshortcuts", `${ARIA_MOD_KEY}+Shift+O`);
     expect(
       Array.from(newSession.querySelectorAll('[data-slot="kbd"]'), (key) => key.textContent),
-    ).toEqual([MOD_KEY, ALT_KEY, "N"]);
+    ).toEqual([MOD_KEY, isMacPlatform() ? SHIFT_KEY : "Shift", "O"]);
     expect(shortcut).toHaveClass(
       "absolute",
       "top-1/2",
@@ -1499,10 +1517,19 @@ describe("Sidebar session list", () => {
 });
 
 describe("Sidebar failed session indicator", () => {
-  function renderSessionSidebar(initialEntry = "/") {
+  function renderSessionSidebar(initialEntry = "/", gridEnabled = false) {
     const qc = new QueryClient({ defaultOptions: { queries: { retry: false } } });
     const tree = () => {
-      const sidebar = <Sidebar open onClose={vi.fn()} />;
+      const content = <Sidebar open onClose={vi.fn()} />;
+      const sidebar = gridEnabled ? (
+        <CapabilitiesProvider
+          info={{ ...FALLBACK_SERVER_INFO, features: { grid_sessions_display_ui: true } }}
+        >
+          <GridSessionsProvider>{content}</GridSessionsProvider>
+        </CapabilitiesProvider>
+      ) : (
+        content
+      );
       return (
         <QueryClientProvider client={qc}>
           <SidebarDataProvider>
@@ -1510,6 +1537,7 @@ describe("Sidebar failed session indicator", () => {
               <MemoryRouter initialEntries={[initialEntry]}>
                 <Routes>
                   <Route path="/c/:conversationId" element={sidebar} />
+                  <Route path="/grid/:gridId" element={sidebar} />
                   <Route path="*" element={sidebar} />
                 </Routes>
               </MemoryRouter>
@@ -1521,6 +1549,55 @@ describe("Sidebar failed session indicator", () => {
     const result = render(tree());
     return { ...result, refresh: () => result.rerender(tree()) };
   }
+
+  it("keeps rows memoized across grid renames and updates changed members", async () => {
+    projectRowsRef.current = [];
+    mockConversations([conv("conv_a", "Codex"), conv("conv_b", "Codex"), conv("conv_c", "Codex")]);
+    const viewer = vi.spyOn(identity, "getCurrentUserId").mockReturnValue("local");
+    const resolve = vi.spyOn(identity, "resolveIdentity").mockResolvedValue("local");
+    const readState = vi.spyOn(readStateHooks, "useConversationReadState");
+    const key = `omnigent:session-grids:${getOmnigentServerIdentity() ?? "default"}:local`;
+    const grid = {
+      id: "saved",
+      name: "Original",
+      layout: { axis: "columns", children: ["conv_a", "conv_b"] },
+    };
+    localStorage.setItem(key, JSON.stringify([grid]));
+    try {
+      await act(async () => {
+        renderSessionSidebar("/grid/saved", true);
+      });
+      expect(screen.getByRole("link", { name: "Original" })).toBeVisible();
+      fireEvent.doubleClick(screen.getByRole("link", { name: "Original" }));
+      const input = screen.getByRole("textbox", { name: "Rename grid" });
+      fireEvent.change(input, { target: { value: "Renamed" } });
+      readState.mockClear();
+      fireEvent.keyDown(input, { key: "Enter" });
+      expect(screen.getByRole("link", { name: "Renamed" })).toBeVisible();
+      expect(readState).not.toHaveBeenCalled();
+      localStorage.setItem(
+        key,
+        JSON.stringify([{ ...grid, layout: { axis: "columns", children: ["conv_a", "conv_c"] } }]),
+      );
+      await act(async () => {
+        window.dispatchEvent(new StorageEvent("storage", { key, storageArea: localStorage }));
+      });
+      expect(screen.getByRole("link", { name: "conv_b" })).not.toHaveClass(
+        "bg-[var(--sidebar-active)]/50",
+      );
+      expect(screen.getByRole("link", { name: "conv_c" })).toHaveClass(
+        "bg-[var(--sidebar-active)]/50",
+      );
+      expect(screen.getByRole("link", { name: "conv_c" })).not.toHaveClass("ring-1");
+      // The focused pane (first by default) also gets a ring.
+      expect(screen.getByRole("link", { name: "conv_a" })).toHaveClass("ring-1");
+      expect(readState.mock.calls.some(([id]) => id === "conv_a")).toBe(false);
+    } finally {
+      viewer.mockRestore();
+      resolve.mockRestore();
+      readState.mockRestore();
+    }
+  });
 
   it("replaces an unread dot with the error icon and keeps it after marking read", () => {
     const session = conv("conv_error", "Codex", {
@@ -3076,6 +3153,15 @@ describe("Sidebar view options", () => {
     "Updated in the last 7 days",
     "Updated in the last 30 days",
     "Updated earlier",
+    "Yesterday",
+    "In the last 7 days",
+    "In the last 30 days",
+    "Earlier",
+    "acp:private",
+    "Claude Code",
+    "Claude SDK",
+    "Codex",
+    "Unknown harness",
   ]);
   const groupHeaders = () =>
     screen
@@ -3084,7 +3170,7 @@ describe("Sidebar view options", () => {
       .filter((title) => GROUP_TITLES.has(title));
   const groupSection = (title: string) => screen.getByText(title).closest("section")!;
 
-  it("hides Status grouping and falls back to Default for a saved Status selection", () => {
+  it("restores Status grouping from a saved selection and offers it in the menu", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
     projectsMock.push("Customer X");
     mockConversations([
@@ -3092,23 +3178,163 @@ describe("Sidebar view options", () => {
       conv("conv_idle", "Codex", { status: "idle" }),
     ]);
     renderGroupingSidebar();
-    expect(screen.getByText("Projects")).toBeInTheDocument();
-    expect(screen.getByRole("button", { name: "Sessions" })).toBeInTheDocument();
-    expect(screen.queryByRole("button", { name: "Working" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Done" })).toBeNull();
+    expect(screen.queryByText("Projects")).toBeNull();
+    expect(screen.queryByRole("button", { name: "Sessions" })).toBeNull();
+    expect(groupHeaders()).toEqual(["Working", "Done"]);
 
     openViewSubmenu("session-grouping-menu");
-    expect(screen.queryByTestId("session-grouping-status")).toBeNull();
-    expect(screen.getByRole("menuitemradio", { name: "Default" })).toHaveAttribute(
+    expect(screen.getByRole("menuitemradio", { name: "Status" })).toHaveAttribute(
       "aria-checked",
       "true",
     );
     expect(screen.getByRole("menuitemradio", { name: "Created" })).toBeInTheDocument();
     expect(screen.getByRole("menuitemradio", { name: "Updated" })).toBeInTheDocument();
+    expect(screen.getByRole("menuitemradio", { name: "Harness" })).toBeInTheDocument();
   });
 
-  it("folds shared sessions into the groups instead of a Shared section", () => {
-    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "updated" }));
+  it.each(["created", "updated"])(
+    "groups by harness across agents, projects and sharing with %s ordering",
+    (ordering) => {
+      localStorage.setItem(
+        "omnigent:sidebar-view",
+        JSON.stringify({ grouping: "harness", ordering }),
+      );
+      projectsMock.push("Customer X");
+      seedPins(["conv_pinned"]);
+      mockConversations([
+        conv("conv_project_native", "project_builder", {
+          harness: "codex-native",
+          created_at: 1,
+          updated_at: 300,
+          labels: { omni_project: "Customer X" },
+        }),
+        conv("conv_shared_sdk", "shared_reviewer", {
+          harness: "codex",
+          created_at: 3,
+          updated_at: 100,
+          owner: "other@example.com",
+        }),
+        conv("conv_custom_sdk", "custom_builder", {
+          harness: "codex",
+          created_at: 2,
+          updated_at: 200,
+        }),
+        conv("conv_wrapper", "custom_name", {
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+        }),
+        conv("conv_claude_sdk", "custom_claude", { harness: "claude-sdk" }),
+        conv("conv_raw", "custom_acp", { harness: "acp:private" }),
+        conv("conv_unknown", "named_without_harness"),
+        conv("conv_pinned", "pinned_agent", { harness: "pi-native" }),
+      ]);
+      renderGroupingSidebar();
+      selectSessionFilter("all");
+      expect(groupHeaders()).toEqual([
+        "acp:private",
+        "Claude Code",
+        "Claude SDK",
+        "Codex",
+        "Unknown harness",
+      ]);
+      expect(
+        within(groupSection("Codex"))
+          .getAllByRole("link", { name: /^conv_/ })
+          .map((link) => link.textContent),
+      ).toEqual(
+        ordering === "created"
+          ? ["conv_shared_sdk", "conv_custom_sdk", "conv_project_native"]
+          : ["conv_project_native", "conv_custom_sdk", "conv_shared_sdk"],
+      );
+      for (const [title, id] of [
+        ["Claude Code", "conv_wrapper"],
+        ["Claude SDK", "conv_claude_sdk"],
+        ["acp:private", "conv_raw"],
+        ["Unknown harness", "conv_unknown"],
+        ["Pinned", "conv_pinned"],
+      ]) {
+        expect(within(groupSection(title!)).getByText(id!)).toBeInTheDocument();
+      }
+      expect(screen.queryByRole("button", { name: "Projects" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Pi" })).toBeNull();
+    },
+  );
+
+  it.each(["empty", "loading", "error"])("keeps Working visible while %s", (state) => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    mockConversations([]);
+    const original = useConvMock.getMockImplementation()!;
+    useConvMock.mockImplementation(
+      (...args) =>
+        ({
+          ...original(...args),
+          isLoading: state === "loading",
+          isError: state === "error",
+          error: state === "error" ? new Error("unavailable") : null,
+        }) as ReturnType<typeof useConversations>,
+    );
+    renderGroupingSidebar();
+    expect(groupHeaders()).toEqual(["Working"]);
+    const working = within(groupSection("Working"));
+    if (state === "empty") {
+      expect(working.getByText("No sessions")).toHaveClass("text-muted-foreground");
+    } else {
+      expect(working.queryByText("No sessions")).toBeNull();
+      expect(working.getByRole("status")).toHaveTextContent(
+        state === "loading" ? "Loading…" : "Failed to load: unavailable",
+      );
+    }
+    expect(working.getByTestId("session-filter")).toBeInTheDocument();
+    expect(working.getByTestId("sessions-new-session")).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Working" }));
+    expect(working.queryByText("No sessions")).toBeNull();
+  });
+
+  it.each([
+    { status: "streaming" as const, terminalPending: false },
+    { status: "idle" as const, terminalPending: true },
+  ])("holds startup for grouping while row status stays live: %j", (startup) => {
+    vi.useFakeTimers();
+    try {
+      localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+      mockConversations([conv("conv_new", "Codex", { status: "idle" })]);
+      renderGroupingSidebar();
+      expect(groupHeaders()).toEqual(["Working", "Done"]);
+      act(() => useChatStore.setState({ conversationId: "conv_new", ...startup }));
+      expect(within(groupSection("Working")).getByText("conv_new")).toBeInTheDocument();
+      expect(screen.getByTestId("session-state-badge")).toHaveAttribute("data-state", "starting");
+      act(() => useChatStore.setState({ status: "idle", terminalPending: false }));
+      expect(useChatStore.getState().status).toBe("idle");
+      expect(screen.queryByTestId("session-state-badge")).toBeNull();
+      act(() => vi.advanceTimersByTime(9_999));
+      expect(within(groupSection("Working")).getByText("conv_new")).toBeInTheDocument();
+      act(() => vi.advanceTimersByTime(1));
+      expect(within(groupSection("Done")).getByText("conv_new")).toBeInTheDocument();
+      expect(within(groupSection("Working")).getByText("No sessions")).toBeInTheDocument();
+    } finally {
+      cleanup();
+      vi.useRealTimers();
+    }
+  });
+
+  it("updates read and draft groups live while preserving the hover hold", () => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "status" }));
+    seedReadState([{ id: "conv_idle", viewer_last_seen: 100 }]);
+    mockConversations([conv("conv_idle", "Codex", { status: "idle", updated_at: 200 })]);
+    renderGroupingSidebar();
+    expect(groupHeaders()).toEqual(["Unread", "Working"]);
+    act(() => markConversationRead("conv_idle", 200));
+    expect(groupHeaders()).toEqual(["Working", "Done"]);
+    const list = screen.getByTestId("sidebar-conversation-list");
+    fireEvent.mouseOver(list);
+    act(() => setSessionDraft("conv_idle", { text: "half-typed", files: [] }));
+    expect(groupHeaders()).toEqual(["Working", "Done"]);
+    fireEvent.mouseLeave(list);
+    expect(groupHeaders()).toEqual(["Working", "Draft"]);
+  });
+
+  it.each(["status", "updated"])("folds shared sessions into %s groups", (grouping) => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping }));
     mockConversations([
       conv("conv_mine", "Claude Code", { status: "running", updated_at: Date.now() / 1000 }),
       conv("conv_shared", "Claude Code", {
@@ -3121,24 +3347,28 @@ describe("Sidebar view options", () => {
     selectSessionFilter("all");
 
     expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
-    expect(groupHeaders()).toEqual(["Updated today", "Updated earlier"]);
-    expect(within(groupSection("Updated earlier")).getByText("conv_shared")).toBeInTheDocument();
+    const titles = grouping === "status" ? ["Working", "Done"] : ["Updated today", "Earlier"];
+    expect(groupHeaders()).toEqual(titles);
+    expect(within(groupSection(titles[1])).getByText("conv_shared")).toBeInTheDocument();
     // The first group carries every list control: filter, Select and New session.
-    const firstGroup = groupSection("Updated today");
+    const firstGroup = groupSection(titles[0]);
     expect(within(firstGroup).getByTestId("session-filter")).toBeTruthy();
     expect(within(firstGroup).getByTestId("toggle-selection-mode")).toBeTruthy();
     expect(within(firstGroup).getByTestId("sessions-new-session")).toBeTruthy();
   });
 
-  it("keeps the filter reachable on the Sessions header when there's nothing to group", () => {
-    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "updated" }));
-    mockConversations([]);
-    renderGroupingSidebar();
+  it.each(["updated", "harness"])(
+    "keeps the filter reachable when %s has nothing to group",
+    (grouping) => {
+      localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping }));
+      mockConversations([]);
+      renderGroupingSidebar();
 
-    expect(screen.queryByText("Projects")).toBeNull();
-    const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
-    expect(within(sessions).getByTestId("session-filter")).toBeTruthy();
-  });
+      expect(screen.queryByText("Projects")).toBeNull();
+      const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+      expect(within(sessions).getByTestId("session-filter")).toBeTruthy();
+    },
+  );
 
   it("keeps Load more while any group is expanded", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping: "updated" }));
@@ -3166,7 +3396,7 @@ describe("Sidebar view options", () => {
 
     // A next page can land in any group, so collapsing only the last one
     // mustn't stall pagination; collapsing every group does.
-    fireEvent.click(screen.getByRole("button", { name: "Updated earlier" }));
+    fireEvent.click(screen.getByRole("button", { name: "Earlier" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Updated today" }));
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
@@ -3213,21 +3443,15 @@ describe("Sidebar view options", () => {
       ]);
       renderGroupingSidebar();
       const prefix = grouping === "created" ? "Created" : "Updated";
-      expect(groupHeaders()).toEqual([
-        `${prefix} today`,
-        `${prefix} yesterday`,
-        `${prefix} earlier`,
-      ]);
+      expect(groupHeaders()).toEqual([`${prefix} today`, "Yesterday", "Earlier"]);
       expect(within(groupSection(`${prefix} today`)).getByText("conv_today")).toBeInTheDocument();
+      expect(within(groupSection("Yesterday")).getByText("conv_yesterday")).toBeInTheDocument();
       expect(
-        within(groupSection(`${prefix} yesterday`)).getByText("conv_yesterday"),
-      ).toBeInTheDocument();
-      expect(
-        within(groupSection(`${prefix} ${grouping === "created" ? "earlier" : "today"}`)).getByText(
+        within(groupSection(grouping === "created" ? "Earlier" : `${prefix} today`)).getByText(
           "conv_old",
         ),
       ).toBeInTheDocument();
-      expect(within(groupSection(`${prefix} earlier`)).getByText("conv_filed")).toBeInTheDocument();
+      expect(within(groupSection("Earlier")).getByText("conv_filed")).toBeInTheDocument();
       if (grouping === "updated") {
         expect(
           within(groupSection("Updated today"))
@@ -3237,6 +3461,34 @@ describe("Sidebar view options", () => {
       }
       expect(screen.queryByText("Projects")).toBeNull();
       expect(screen.getAllByTestId("session-filter")).toHaveLength(1);
+    },
+  );
+
+  it.each(["created", "updated"])(
+    "prefixes the first available %s group and preserves collapse keys",
+    (grouping) => {
+      const prefix = grouping === "created" ? "Created" : "Updated";
+      localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ grouping }));
+      localStorage.setItem(
+        "omnigent:collapsed-sidebar-sections",
+        JSON.stringify([`${prefix} earlier`]),
+      );
+      const now = new Date();
+      const yesterday =
+        new Date(now.getFullYear(), now.getMonth(), now.getDate() - 1).getTime() / 1000;
+      mockConversations([
+        conv("conv_yesterday", "Codex", { created_at: yesterday, updated_at: yesterday }),
+        conv("conv_old", "Codex", { created_at: 0, updated_at: 0 }),
+      ]);
+      renderGroupingSidebar();
+      expect(screen.getByRole("button", { name: `${prefix} yesterday` })).toBeInTheDocument();
+      expect(screen.getByRole("button", { name: "Earlier" })).toHaveAttribute(
+        "aria-expanded",
+        "false",
+      );
+      expect(screen.queryByText("conv_old")).toBeNull();
+      fireEvent.click(screen.getByRole("button", { name: "Earlier" }));
+      expect(within(groupSection("Earlier")).getByText("conv_old")).toBeInTheDocument();
     },
   );
 
@@ -3302,7 +3554,7 @@ describe("Sidebar view options", () => {
         }),
       ]);
       renderGroupingSidebar();
-      if (grouping === "default" || grouping === "status")
+      if (grouping === "default")
         fireEvent.click(screen.getByRole("button", { name: /^Customer X/ }));
       expect(
         screen.getAllByRole("link", { name: /^conv_/ }).map((link) => link.textContent),
@@ -3336,8 +3588,9 @@ describe("Sidebar view options", () => {
     fireEvent.click(screen.getByTestId("session-show-environment"));
     fireEvent.click(screen.getByTestId("session-show-updated"));
 
-    // The row names a host's kind, not the host; the tooltip carries the name.
+    // Environment text is available to screen readers without widening the metadata row.
     expect(within(row).getByTestId("session-row-meta")).toHaveTextContent("Remote·fix/retries");
+    expect(within(row).getByText("Remote")).toHaveClass("sr-only");
     expect(within(row).getByTestId("session-row-updated")).toHaveTextContent("2m");
     // With a second line, the controls and the timestamp stay on the title line.
     expect(controls()).toHaveClass("top-4", "md:top-3.5");
@@ -3345,6 +3598,7 @@ describe("Sidebar view options", () => {
     // A session without a branch omits that part rather than leaving a gap.
     const bare = screen.getByText("conv_no_branch").closest("li")!;
     expect(within(bare).getByTestId("session-row-meta")).toHaveTextContent(/^Local machine$/);
+    expect(within(bare).getByText("Local machine")).toHaveClass("sr-only");
     expect(JSON.parse(localStorage.getItem("omnigent:sidebar-view")!).show).toEqual([
       "updated",
       "environment",
@@ -3352,7 +3606,61 @@ describe("Sidebar view options", () => {
     ]);
   });
 
-  it("labels this machine's host by device instead of its host name", () => {
+  it("resolves an unrecorded branch only when Branch is shown, without a GitHub lookup", () => {
+    useSessionWorktreesMock.mockReturnValue({
+      data: {
+        status: "ok",
+        worktrees: [
+          { path: "/repo", branch: "main", is_main: true, detached: false },
+          { path: "/repo/packages", branch: "feature/web", is_main: false, detached: false },
+        ],
+      },
+    });
+    mockConversations([
+      conv("conv_workspace", "Codex", { host_id: "host", workspace: "/repo/packages/web" }),
+      conv("conv_recorded", "Codex", {
+        host_id: "host",
+        workspace: "/other",
+        git_branch: "recorded/branch",
+      }),
+    ]);
+    renderGroupingSidebar();
+    expect(
+      useSessionWorktreesMock.mock.calls.every((args) => args.every((arg) => arg === null)),
+    ).toBe(true);
+
+    openViewSubmenu("session-show-menu");
+    fireEvent.click(screen.getByTestId("session-show-branch"));
+    const row = within(screen.getByText("conv_workspace").closest("li")!);
+    expect(row.getByTestId("session-row-meta")).toHaveTextContent(/^feature\/web$/);
+    expect(row.getByTestId("quick-pin-conversation").closest(".absolute")).toHaveClass("top-4");
+    expect(screen.getByText("recorded/branch")).toBeInTheDocument();
+    expect(useSessionWorktreesMock).toHaveBeenCalledWith(
+      "conv_workspace",
+      "host",
+      "/repo/packages/web",
+    );
+    expect(useSessionWorktreesMock).not.toHaveBeenCalledWith("conv_recorded", "host", "/other");
+    expect(usePullRequestInfoMock).not.toHaveBeenCalled();
+
+    fireEvent.click(screen.getByTestId("session-show-branch"));
+    expect(screen.queryByTestId("session-row-meta")).toBeNull();
+  });
+
+  it.each([
+    { status: "unknown" },
+    { status: "not_git" },
+    { status: "ok", worktrees: [] },
+    { status: "ok", worktrees: [{ path: "/repo", branch: "HEAD", detached: true }] },
+  ])("omits unresolved or detached workspace branches: %j", (data) => {
+    localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["branch"] }));
+    useSessionWorktreesMock.mockReturnValue({ data });
+    mockConversations([conv("conv_workspace", "Codex", { host_id: "host", workspace: "/repo" })]);
+    renderGroupingSidebar();
+    expect(screen.queryByTestId("session-row-meta")).toBeNull();
+  });
+
+  it("keeps the device name accessible on the environment icon", () => {
     localStorage.setItem("omnigent:sidebar-view", JSON.stringify({ show: ["environment"] }));
     // A loopback server with one online host: that host is this machine.
     isServerLocalMock.mockReturnValue(true);
@@ -3365,6 +3673,7 @@ describe("Sidebar view options", () => {
       "session-row-meta",
     );
     expect(meta).toHaveTextContent(/^This /);
+    expect(within(meta).getByText(/^This /)).toHaveClass("sr-only");
     expect(meta).not.toHaveTextContent("Build Mac");
   });
 
@@ -3510,56 +3819,61 @@ describe("sidebar_grouping_ui release flag", () => {
     }),
   ];
 
-  it("keeps the default sidebar while off, ignoring stored view options", async () => {
-    localStorage.setItem(
-      "omnigent:sidebar-view",
-      JSON.stringify({
-        grouping: "created",
-        ordering: "created",
-        show: ["environment", "updated"],
-      }),
-    );
-    useHostsMock.mockReturnValue({
-      data: [{ host_id: "host_box", name: "Build box", sandbox_provider: null }],
-    });
-    mockConversations(SHARED_AND_OWNED);
-    renderSidebar();
-    selectSessionFilter("all");
+  it.each(["status", "created", "harness"])(
+    "ignores saved %s grouping while the flag is off",
+    async (grouping) => {
+      localStorage.setItem(
+        "omnigent:sidebar-view",
+        JSON.stringify({
+          grouping,
+          ordering: "created",
+          show: ["environment", "updated"],
+        }),
+      );
+      useHostsMock.mockReturnValue({
+        data: [{ host_id: "host_box", name: "Build box", sandbox_provider: null }],
+      });
+      mockConversations(SHARED_AND_OWNED);
+      renderSidebar();
+      selectSessionFilter("all");
 
-    // One flat list with the filter on its own header; no Shared section or groups.
-    const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
-    expect(within(sessions).getByTestId("session-filter")).toBeInTheDocument();
-    expect(within(sessions).getByText("conv_shared")).toBeInTheDocument();
-    expect(
-      within(sessions)
-        .getAllByRole("link", { name: /^conv_/ })
-        .map((link) => link.textContent),
-    ).toEqual(["conv_mine", "conv_shared"]);
-    expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
-    expect(screen.queryByRole("button", { name: "Done" })).toBeNull();
-    expect(screen.queryByTestId("session-row-meta")).toBeNull();
-    expect(screen.queryByTestId("session-row-updated")).toBeNull();
+      // One flat list with the filter on its own header; no Shared section or groups.
+      const sessions = screen.getByRole("button", { name: "Sessions" }).closest("section")!;
+      expect(within(sessions).getByTestId("session-filter")).toBeInTheDocument();
+      expect(within(sessions).getByText("conv_shared")).toBeInTheDocument();
+      expect(
+        within(sessions)
+          .getAllByRole("link", { name: /^conv_/ })
+          .map((link) => link.textContent),
+      ).toEqual(["conv_mine", "conv_shared"]);
+      expect(screen.queryByRole("button", { name: "Shared" })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Done" })).toBeNull();
+      expect(screen.queryByTestId("session-row-meta")).toBeNull();
+      expect(screen.queryByTestId("session-row-updated")).toBeNull();
 
-    // The menu offers Display alone, as a flat list.
-    fireEvent.pointerDown(screen.getByTestId("session-filter"), {
-      button: 0,
-      ctrlKey: false,
-      pointerType: "mouse",
-    });
-    expect(screen.getByText("Display")).toBeInTheDocument();
-    expect(screen.queryByTestId("session-grouping-menu")).toBeNull();
-    expect(screen.queryByTestId("session-show-menu")).toBeNull();
-    fireEvent.keyDown(document.activeElement!, { key: "Escape" });
+      // The menu offers Display alone, as a flat list.
+      fireEvent.pointerDown(screen.getByTestId("session-filter"), {
+        button: 0,
+        ctrlKey: false,
+        pointerType: "mouse",
+      });
+      expect(screen.getByText("Display")).toBeInTheDocument();
+      expect(screen.queryByTestId("session-grouping-menu")).toBeNull();
+      expect(screen.queryByTestId("session-show-menu")).toBeNull();
+      fireEvent.keyDown(document.activeElement!, { key: "Escape" });
 
-    // The tooltip is the plain one: no harness, no GitHub lookup.
-    fireEvent.pointerMove(screen.getByRole("link", { name: "conv_mine" }), {
-      pointerType: "mouse",
-    });
-    const tooltip = await screen.findByTestId("session-tooltip-content");
-    expect(within(tooltip).getByTestId("session-tooltip-location")).toHaveTextContent("Build box");
-    expect(within(tooltip).queryByTestId("session-tooltip-harness")).toBeNull();
-    expect(usePullRequestInfoMock).not.toHaveBeenCalled();
-  });
+      // The tooltip is the plain one: no harness, no GitHub lookup.
+      fireEvent.pointerMove(screen.getByRole("link", { name: "conv_mine" }), {
+        pointerType: "mouse",
+      });
+      const tooltip = await screen.findByTestId("session-tooltip-content");
+      expect(within(tooltip).getByTestId("session-tooltip-location")).toHaveTextContent(
+        "Build box",
+      );
+      expect(within(tooltip).queryByTestId("session-tooltip-harness")).toBeNull();
+      expect(usePullRequestInfoMock).not.toHaveBeenCalled();
+    },
+  );
 
   it("puts the filter and Select on the Projects header, leaving New session on Sessions", () => {
     mockConversations(THREE_TYPE_CONVERSATIONS);

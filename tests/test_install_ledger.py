@@ -74,6 +74,7 @@ def test_write_install_ledger_from_env_records_profile_and_dep_provenance(
     monkeypatch.setenv("OMNIGENT_DATA_DIR", str(state))
     monkeypatch.setenv("OMNIGENT_LEDGER_PROFILE", str(profile))
     monkeypatch.setenv("OMNIGENT_LEDGER_DEP_UV", "omnigent")
+    monkeypatch.setenv("OMNIGENT_LEDGER_DEP_DATABRICKS", "omnigent")
 
     ledger = install_ledger.write_install_ledger_from_env()
 
@@ -83,6 +84,8 @@ def test_write_install_ledger_from_env_records_profile_and_dep_provenance(
     assert data["entries"]["profiles"][0]["path"] == str(profile)
     assert ledger.entries.deps["uv"].installed_by == "omnigent"
     assert ledger.entries.deps["uv"].confidence == "certain"
+    assert ledger.entries.deps["databricks"].installed_by == "omnigent"
+    assert ledger.entries.deps["databricks"].confidence == "certain"
 
 
 def test_installer_ledger_supersedes_backfill_and_preserves_dep_ownership(

@@ -407,7 +407,7 @@ describe("ProjectSettingsDialog", () => {
     getProjectMock.mockResolvedValue({
       id: "p_1",
       name: "Work",
-      config: { agent_id: "ag_claude", model: "opus" },
+      config: { agent_id: "ag_claude", model: "opus", effort: "high" },
     });
     renderDialog();
     await waitFor(() =>
@@ -417,7 +417,239 @@ describe("ProjectSettingsDialog", () => {
     );
     fireEvent.click(screen.getByTestId("project-settings-save"));
     await waitFor(() =>
-      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", model: "opus" }),
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_claude",
+        model: "opus",
+        effort: "high",
+      }),
     );
   });
+
+  // Effort default: offered beside the model for harnesses with an effort
+  // ladder, stored as `effort`, and dropped when it no longer applies.
+  async function pickSelectOption(testId: string, option: string | RegExp): Promise<void> {
+    fireEvent.pointerDown(screen.getByTestId(testId), { button: 0, pointerType: "mouse" });
+    fireEvent.click(await screen.findByRole("option", { name: option }));
+  }
+
+  const codexAgent = () =>
+    pickerAgent({
+      id: "ag_codex",
+      name: "codex-native-ui",
+      display_name: "Codex",
+      harness: "codex-native",
+    });
+  const ladder = (...efforts: string[]) => efforts.map((reasoningEffort) => ({ reasoningEffort }));
+
+  it("stores a picked effort for Claude Code and hides the field for an agent without one", async () => {
+    availableAgentsMock.mockReturnValue({ data: [pickerAgent(), claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude" },
+    });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-effort")).toBeInTheDocument());
+
+    await pickSelectOption("project-settings-effort", "High");
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude", effort: "high" }),
+    );
+
+    // A bundle agent has no create-time effort → no field.
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-custom-agents"));
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_1"));
+    await waitFor(() =>
+      expect(screen.queryByTestId("project-settings-effort")).not.toBeInTheDocument(),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenLastCalledWith("p_1", { agent_id: "ag_1" }));
+  });
+
+  it("treats a malformed stored effort as no default", async () => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", effort: 3 as unknown as string },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default"),
+    );
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_claude" }));
+  });
+
+  it("offers Pi's own effort ladder and stores a Pi-only level", async () => {
+    const piAgent = pickerAgent({
+      id: "ag_pi",
+      name: "pi-native-ui",
+      display_name: "Pi",
+      harness: "pi-native",
+    });
+    availableAgentsMock.mockReturnValue({ data: [piAgent] });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_pi" } });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-effort")).toBeInTheDocument());
+
+    await pickSelectOption("project-settings-effort", "Minimal");
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", { agent_id: "ag_pi", effort: "minimal" }),
+    );
+  });
+
+  it("drops a stored Codex effort the loaded ladder lacks, even after a model change", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
+    hostModelOptionsMock.mockReturnValue({
+      data: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          supportedReasoningEfforts: ladder("low", "xhigh"),
+        },
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+    });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_codex", model: "gpt-mini", effort: "xhigh" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-model")).toHaveTextContent("GPT mini"),
+    );
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
+    expect(screen.getByText(/saved effort \(xHigh\) isn't available/)).toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenLastCalledWith("p_1", {
+        agent_id: "ag_codex",
+        model: "gpt-mini",
+      }),
+    );
+
+    // Switching to a model that has xhigh must not bring the hidden level back.
+    await pickSelectOption("project-settings-model", "GPT-5.5");
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
+    expect(screen.queryByText(/saved effort/)).not.toBeInTheDocument();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenLastCalledWith("p_1", {
+        agent_id: "ag_codex",
+        model: "gpt-5.5",
+      }),
+    );
+  });
+
+  it.each([
+    {
+      label: "is cleared",
+      change: () => fireEvent.click(screen.getByRole("button", { name: "Clear" })),
+      saved: {},
+    },
+    {
+      label: "changes",
+      change: () => {
+        fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+        fireEvent.click(screen.getByTestId("new-chat-landing-agent-ag_codex"));
+      },
+      saved: { agent_id: "ag_codex" },
+    },
+  ])("drops the effort default when the default agent $label", async ({ change, saved }) => {
+    availableAgentsMock.mockReturnValue({ data: [claudeAgent(), codexAgent()] });
+    getProjectMock.mockResolvedValue({
+      id: "p_1",
+      name: "Work",
+      config: { agent_id: "ag_claude", effort: "max" },
+    });
+    renderDialog();
+    await waitFor(() =>
+      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("Max"),
+    );
+    change();
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() => expect(updateMock).toHaveBeenCalledWith("p_1", saved));
+  });
+
+  it("offers the Codex model's effort ladder and drops an effort the new model lacks", async () => {
+    availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
+    hostModelOptionsMock.mockReturnValue({
+      data: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          isDefault: true,
+          supportedReasoningEfforts: ladder("low", "medium", "high", "xhigh"),
+        },
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+    });
+    getProjectMock.mockResolvedValue({ id: "p_1", name: "Work", config: { agent_id: "ag_codex" } });
+    renderDialog();
+    await waitFor(() => expect(screen.getByTestId("project-settings-effort")).toBeInTheDocument());
+
+    // No model pinned → the catalog default's ladder.
+    await pickSelectOption("project-settings-effort", "xHigh");
+    // A model whose ladder lacks xhigh resets the effort to no default.
+    await pickSelectOption("project-settings-model", "GPT mini");
+    expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("No default");
+    fireEvent.pointerDown(screen.getByTestId("project-settings-effort"), {
+      button: 0,
+      pointerType: "mouse",
+    });
+    expect(screen.queryByRole("option", { name: "xHigh" })).not.toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("option", { name: "Low" }));
+
+    fireEvent.click(screen.getByTestId("project-settings-save"));
+    await waitFor(() =>
+      expect(updateMock).toHaveBeenCalledWith("p_1", {
+        agent_id: "ag_codex",
+        model: "gpt-mini",
+        effort: "low",
+      }),
+    );
+  });
+
+  it.each([
+    { label: "the catalog is unavailable, plain save", catalog: [], clearModel: false },
+    { label: "the catalog is unavailable, model cleared", catalog: [], clearModel: true },
+    {
+      label: "the catalog lists neither model nor a default, model cleared",
+      catalog: [
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+      clearModel: true,
+    },
+  ])(
+    "keeps a stored Codex effort while its ladder is unknown ($label)",
+    async ({ catalog, clearModel }) => {
+      availableAgentsMock.mockReturnValue({ data: [codexAgent()] });
+      hostModelOptionsMock.mockReturnValue({ data: catalog });
+      getProjectMock.mockResolvedValue({
+        id: "p_1",
+        name: "Work",
+        config: { agent_id: "ag_codex", model: "gpt-5.5", effort: "high" },
+      });
+      renderDialog();
+      await waitFor(() =>
+        expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High"),
+      );
+      if (clearModel) await pickSelectOption("project-settings-model", "No default");
+      expect(screen.getByTestId("project-settings-effort")).toHaveTextContent("High");
+      fireEvent.click(screen.getByTestId("project-settings-save"));
+      await waitFor(() =>
+        expect(updateMock).toHaveBeenCalledWith("p_1", {
+          agent_id: "ag_codex",
+          ...(clearModel ? {} : { model: "gpt-5.5" }),
+          effort: "high",
+        }),
+      );
+    },
+  );
 });

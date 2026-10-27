@@ -536,7 +536,10 @@ def new_ledger(*, source: str, strategy: str, deep: bool) -> InstallLedger:
     entries = LedgerEntries(
         profiles=profiles,
         injected_external_config=observed_external_configs(deep=deep),
-        deps={name: _dep(name, deep=deep) for name in ("uv", "node", "npm", "tmux", "bwrap")},
+        deps={
+            name: _dep(name, deep=deep)
+            for name in ("uv", "node", "npm", "tmux", "bwrap", "databricks")
+        },
         wheel=_wheel_entry(
             deep=deep, source="observed" if source == "backfill" else "recorded", confidence="high"
         ),
