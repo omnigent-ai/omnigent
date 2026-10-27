@@ -4878,7 +4878,14 @@ def codex_terminal_env(app_server: CodexNativeAppServer) -> dict[str, str]:
         key: value
         for key, value in {**app_server.env, "CODEX_HOME": str(app_server.codex_home)}.items()
         if key
-        in {"CODEX_HOME", "DATABRICKS_HOST", "DATABRICKS_CODEX_TOKEN", "OTEL_RESOURCE_ATTRIBUTES"}
+        in {
+            "CODEX_HOME",
+            "DATABRICKS_HOST",
+            "DATABRICKS_CODEX_TOKEN",
+            "OTEL_RESOURCE_ATTRIBUTES",
+            "EDITOR",
+            "VISUAL",
+        }
         or key.startswith(("OPENAI_", "HTTP_", "HTTPS_", "NO_PROXY", "ALL_PROXY"))
     }
 

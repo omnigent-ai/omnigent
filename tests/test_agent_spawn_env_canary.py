@@ -59,6 +59,8 @@ def hostile_env():
         "PATH": "/usr/bin:/bin",
         "LANG": "en_US.UTF-8",
         "HTTPS_PROXY": "http://proxy:8080",
+        "EDITOR": "nvim",
+        "VISUAL": '"/selected install/bin/code" --wait',
         **CANARY_SECRETS,
     }
 
@@ -183,6 +185,8 @@ def test_real_builder_still_yields_a_usable_environment(harness, hostile_env, mo
     assert env["HOME"] == "/home/user"
     assert env["PATH"] == "/usr/bin:/bin"
     assert env["HTTPS_PROXY"] == "http://proxy:8080"
+    assert env["EDITOR"] == "nvim"
+    assert env["VISUAL"] == '"/selected install/bin/code" --wait'
 
 
 def test_real_builders_pass_node_extra_ca_certs(monkeypatch):

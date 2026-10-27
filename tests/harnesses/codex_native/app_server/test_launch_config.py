@@ -419,6 +419,26 @@ def test_native_codex_resource_attributes_reach_server_and_terminal(
         }
 
 
+@pytest.mark.parametrize(
+    "editors",
+    [{}, {"EDITOR": "nvim"}, {"VISUAL": "code --wait"}, {"EDITOR": "vi", "VISUAL": "nvim"}],
+)
+def test_editor_preferences_reach_codex_terminal(tmp_path: Path, editors: dict[str, str]) -> None:
+    server = _test_app_server(
+        tmp_path,
+        codex_home=tmp_path / "codex-home",
+        bridge_dir=tmp_path / "bridge",
+        workspace=tmp_path,
+        env={**editors, "UNRELATED_SECRET": "synthetic-secret"},
+    )
+
+    env = codex_terminal_env(server)
+
+    assert {name: env[name] for name in ("EDITOR", "VISUAL") if name in env} == editors
+    assert env["CODEX_HOME"] == str(server.codex_home)
+    assert "UNRELATED_SECRET" not in env
+
+
 def test_build_codex_native_server_without_bypass_emits_no_bypass_config(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
