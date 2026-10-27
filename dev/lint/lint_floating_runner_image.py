@@ -2,8 +2,8 @@
 
 ``ubuntu-latest`` and friends move to a new OS image without notice; a move to
 ubuntu-26.04 broke every Playwright job at once. Workflows name an explicit
-image such as ``ubuntu-24.04`` instead. Values are matched exactly, so ``runs-on``
-labels, matrix entries and input defaults are checked but prose is not.
+image such as ``ubuntu-24.04`` instead. Every YAML string is checked, including
+labels inside ``${{ }}`` expressions, except script and prose keys like ``run``.
 """
 
 from __future__ import annotations
@@ -23,35 +23,34 @@ HINT = (
     "deliberately once the workflow is known to work on the newer image."
 )
 
-FLOATING_LABEL = re.compile(r"^(?:ubuntu|windows|macos)-latest$")
+FLOATING_LABEL = re.compile(r"(?<![\w-])(?:ubuntu|windows|macos)-latest(?:-x?large)?(?![\w-])")
+PROSE_KEYS = frozenset({"run", "script", "name", "description"})
 SCANNED_ROOT = ".github/"
 
 
-def _strings(node: object) -> Iterator[str]:
-    """Yield every string key and value in a parsed YAML document."""
-    if isinstance(node, str):
-        yield node
-    elif isinstance(node, dict):
-        for key, value in node.items():
-            yield from _strings(key)
-            yield from _strings(value)
-    elif isinstance(node, list):
-        for item in node:
-            yield from _strings(item)
+def _scalars(node: yaml.Node | None, key: str | None = None) -> Iterator[yaml.ScalarNode]:
+    """Yield every scalar node that is not the value of a script or prose key."""
+    if isinstance(node, yaml.ScalarNode):
+        if key not in PROSE_KEYS:
+            yield node
+    elif isinstance(node, yaml.MappingNode):
+        for key_node, value_node in node.value:
+            yield from _scalars(key_node)
+            child_key = key_node.value if isinstance(key_node, yaml.ScalarNode) else None
+            yield from _scalars(value_node, child_key)
+    elif isinstance(node, yaml.SequenceNode):
+        for item in node.value:
+            yield from _scalars(item, key)
 
 
 def floating_labels(source: str) -> list[tuple[int, str]]:
     """Return ``(lineno, label)`` for each floating runner label in a YAML document."""
-    labels = {value for value in _strings(yaml.safe_load(source)) if FLOATING_LABEL.match(value)}
-    hits = []
-    for lineno, line in enumerate(source.splitlines(), start=1):
-        code = line.split("#", 1)[0]
-        hits.extend(
-            (lineno, label)
-            for label in sorted(labels)
-            if re.search(rf"(?<![\w-]){label}(?![\w-])", code)
-        )
-    return hits
+    hits = {
+        (scalar.start_mark.line + 1, label)
+        for scalar in _scalars(yaml.compose(source, Loader=yaml.SafeLoader))
+        for label in FLOATING_LABEL.findall(scalar.value)
+    }
+    return sorted(hits)
 
 
 def check() -> list[str]:

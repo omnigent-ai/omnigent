@@ -22,13 +22,22 @@ jobs:
   pinned:
     runs-on: macos-15
     steps:
-      - run: echo "ubuntu-latest-ish names are not labels"
+      - name: Report ubuntu-latest drift
+        run: echo "ubuntu-latest is prose here"
+  expression:
+    runs-on: ${{ inputs.os || 'ubuntu-latest' }}
+  large:
+    runs-on: macos-latest-xlarge
+  lookalike:
+    runs-on: ubuntu-latest-ish
 """
 
 
-def test_flags_floating_labels_but_not_pinned_images_or_prose() -> None:
+def test_flags_floating_labels_in_values_and_expressions_but_not_prose() -> None:
     assert lint.floating_labels(_WORKFLOW) == [
         (6, "ubuntu-latest"),
         (9, "ubuntu-latest"),
         (13, "windows-latest"),
+        (21, "ubuntu-latest"),
+        (23, "macos-latest-xlarge"),
     ]
