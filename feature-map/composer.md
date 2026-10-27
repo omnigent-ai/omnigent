@@ -131,7 +131,9 @@ and steers messages while the agent is busy.
   can be steered into the running turn. Side-chat composers queue and steer the
   same way, with their own queue strip.
 - `browser-pointer-queue`: desktop Design-mode instructions follow the same queue
-  and always-steer preference, keeping their element screenshots.
+  and always-steer preference, keeping their element screenshots. States: sent
+  from the agent/link tab or a user-opened Browser tab; rejected after switching
+  to another session.
 - `pi-compact`: `/compact` follows the normal queue/Always steer preference.
   Send now interrupts the turn and compacts. During compaction, queued messages
   wait in the web queue; immediate sends are retained by the Pi integration.
