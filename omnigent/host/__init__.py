@@ -7,6 +7,11 @@
 # ``EX_CONFIG`` from sysexits.h.
 HOST_FATAL_EXIT_CODE = 78
 
+# Exit code when this host's own Python runtime was deleted while it ran, so it
+# can no longer spawn runners. Retryable: a supervisor that relaunches the host
+# (or the next CLI command) starts it on a fresh runtime. 75 is ``EX_TEMPFAIL``.
+HOST_RUNTIME_GONE_EXIT_CODE = 75
+
 # Exit code a shell reports for a SIGTERM-killed process (128 + 15). A
 # supervisor treats it as a deliberate stop, not a crash.
 HOST_SIGTERM_EXIT_CODE = 143

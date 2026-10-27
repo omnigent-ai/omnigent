@@ -39,6 +39,7 @@ HOST_TASK_ERROR_EVENT = "host_task_error"
 HostExitReason = Literal[
     "clean",
     "lifecycle_lost",
+    "runtime_gone",
     "interrupted",
     "signal",
     "fatal_connect",

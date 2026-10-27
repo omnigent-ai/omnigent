@@ -26,13 +26,17 @@ from websockets.frames import Close
 from websockets.http11 import Response
 
 from omnigent import debug_logging
-from omnigent.host import HOST_FATAL_EXIT_CODE
+from omnigent.host import HOST_FATAL_EXIT_CODE, HOST_RUNTIME_GONE_EXIT_CODE
 from omnigent.host.connect import (
     HostConnectError,
     HostProcess,
     HostRetryableConnectionError,
+    HostRuntimeGoneExit,
     ModelOptionsResult,
     _build_runner_env,
+    _exit_if_runtime_gone,
+    _interpreter_missing,
+    _interpreter_runs,
     _runner_exit_error,
     _RunnerHandle,
     run_host_process,
@@ -999,28 +1003,46 @@ async def test_host_boot_skips_managed_gateway_with_malformed_profile(
     assert not any(record.exc_info for record in caplog.records)
 
 
+@pytest.mark.parametrize("failure", ["disk_full", "interpreter_unreadable"])
 async def test_handle_launch_attributes_spawn_failure_to_host(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
+    failure: str,
 ) -> None:
-    """A spawn OSError (e.g. a full disk) is a host fault, not an unattributed one."""
-    host = _make_host_process()
+    """A spawn OSError (e.g. a full disk) is a host fault, not an unattributed one.
 
-    def _disk_full(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
-        raise OSError(errno.ENOSPC, "No space left on device", str(tmp_path / "runner.log"))
+    An interpreter that is present but unreadable, e.g. under a directory that
+    lost its search permission, is an ordinary spawn failure, not a deleted one.
+    """
+    host = _make_host_process()
+    locked_dir = tmp_path / "locked-venv"
+    spawn_error = OSError(errno.ENOSPC, "No space left on device", str(tmp_path / "runner.log"))
+    if failure == "interpreter_unreadable":
+        (locked_dir / "bin").mkdir(parents=True)
+        (locked_dir / "bin" / "python").touch()
+        monkeypatch.setattr(sys, "executable", str(locked_dir / "bin" / "python"))
+        locked_dir.chmod(0)
+        spawn_error = PermissionError(errno.EACCES, "Permission denied", sys.executable)
+
+    def _spawn_fails(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        raise spawn_error
 
     monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
-    monkeypatch.setattr(host, "_spawn_runner_proc", _disk_full)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn_fails)
     frame = HostLaunchRunnerFrame(
-        request_id="req_disk_full",
-        binding_token="token_disk_full",
+        request_id="req_spawn_failure",
+        binding_token="token_spawn_failure",
         workspace=str(tmp_path),
-        session_id="session_disk_full",
+        session_id="session_spawn_failure",
     )
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
-        result = await host._handle_launch(frame)
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+            result = await host._handle_launch(frame)
+    finally:
+        if locked_dir.exists():
+            locked_dir.chmod(0o700)
 
     assert isinstance(result, HostLaunchRunnerResultFrame)
     assert result.status == "failed"
@@ -1033,6 +1055,194 @@ async def test_handle_launch_attributes_spawn_failure_to_host(
     assert failure.attributes["error_category"] == "host"
     assert failure.attributes["error_impact"] == "blocking"
     assert failure.attributes["error_phase"] == "runner_launch"
+    # The interpreter still exists, so this is an ordinary spawn failure.
+    assert not host._runtime_gone
+    assert "was deleted" not in (result.error or "")
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "idle",
+        "live_runner",
+        "queued_launch_fails",
+        "queued_launch_after_restore",
+        "queued_launch_after_unusable_restore",
+    ],
+)
+async def test_launch_on_deleted_runtime_retires_host_after_reply_is_sent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    scenario: str,
+) -> None:
+    """A deleted interpreter fails the launch clearly and retires the host once idle.
+
+    Every later spawn would fail the same way, so the host exits for a restart
+    on a fresh runtime, but only after every accepted launch is answered and
+    only once no live runner would be torn down. A launch queued behind the
+    failed one that spawns after the runtime is restored keeps its runner; an
+    unusable file left at the old path doesn't count as restored.
+    """
+
+    host = _make_host_process()
+    missing = tmp_path / "deleted-venv" / "bin" / "python"
+    working_python = os.path.realpath(sys.executable)
+    original_popen = subprocess.Popen
+    original_spawn = host._spawn_runner_proc
+    spawn_calls: list[int] = []
+
+    def _spawn(*args: object, **kwargs: object) -> tuple[subprocess.Popen[bytes], Path]:
+        spawn_calls.append(len(spawn_calls))
+        if len(spawn_calls) == 2 and scenario.startswith("queued_launch_after"):
+            missing.parent.mkdir(parents=True)
+            if scenario == "queued_launch_after_restore":
+                missing.symlink_to(working_python)
+                return original_spawn(*args, **kwargs)  # type: ignore[arg-type]
+            # An empty file at the old path can't be executed.
+            missing.touch()
+            raise PermissionError(errno.EACCES, "Permission denied", str(missing))
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(missing))
+
+    def _sleeping_popen(_args: list[str], **kwargs: object) -> subprocess.Popen[bytes]:
+        return original_popen(
+            ["sleep", "60"],
+            stdin=subprocess.DEVNULL,
+            stdout=kwargs["stdout"],
+            stderr=kwargs["stderr"],
+        )
+
+    monkeypatch.setattr(sys, "executable", str(missing))
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _spawn)
+    monkeypatch.setattr("omnigent.host.connect._RUNTIME_GONE_POLL_S", 0.01)
+    if scenario == "live_runner":
+        host._runners["runner_live"] = Mock()
+    tunnel = _GatedTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed ws
+    watch = asyncio.create_task(host._runtime_gone_watch(tunnel))  # type: ignore[arg-type]
+    frames = [
+        HostLaunchRunnerFrame(
+            request_id=f"req_{index}",
+            binding_token=f"token_{index}",
+            workspace=str(tmp_path),
+            session_id=f"session_{index}",
+        )
+        for index in range(2 if scenario.startswith("queued") else 1)
+    ]
+
+    # Only the restored runtime really spawns; the interpreter probe must not be patched.
+    spawn_patch = (
+        patch("omnigent.host.connect.subprocess.Popen", side_effect=_sleeping_popen)
+        if scenario == "queued_launch_after_restore"
+        else contextlib.nullcontext()
+    )
+    try:
+        with spawn_patch:
+            # The second launch queues on the lifecycle lock behind the first.
+            for frame in frames:
+                host._start_frame_task(tunnel, encode_host_frame(frame))  # type: ignore[arg-type]
+            await asyncio.wait_for(tunnel.send_started.wait(), timeout=5.0)
+            for _ in range(5):
+                await asyncio.sleep(0)
+            # The failure reply is still being sent, so the host must not retire yet.
+            assert host._runtime_gone
+            assert not host.lifecycle_lost
+            assert tunnel.closed_after_sent is None
+            tunnel.release.set()
+            await asyncio.wait_for(_drain_frame_tasks(host), timeout=10.0)
+
+        retires = scenario in {
+            "idle",
+            "queued_launch_fails",
+            "queued_launch_after_unusable_restore",
+        }
+        if retires:
+            await asyncio.wait_for(watch, timeout=10.0)
+        else:
+            await asyncio.sleep(0.1)
+            assert not watch.done()
+        replies = {
+            reply.request_id: reply
+            for reply in map(decode_host_frame, tunnel.sent)
+            if isinstance(reply, HostLaunchRunnerResultFrame)
+        }
+        assert len(replies) == len(frames)
+        restored = scenario == "queued_launch_after_restore"
+        for frame in frames:
+            reply = replies[frame.request_id]
+            if restored and frame is frames[1]:
+                assert reply.status == "launched", reply.error
+                continue
+            assert reply.status == "failed"
+            assert str(missing) in (reply.error or "")
+            assert "was deleted" in (reply.error or "")
+        assert host.runtime_gone is retires
+        # Retiring closes the tunnel gracefully after every reply, never before one.
+        assert tunnel.closed_after_sent == (len(frames) if retires else None)
+
+        if scenario == "idle":
+            # Once retiring, a new launch is refused without spawning.
+            late = await host._handle_launch(frames[0])
+            assert late.status == "failed"
+            assert "shutting down" in (late.error or "")
+            assert len(spawn_calls) == 1
+        if restored:
+            relaunched = host._runners[token_bound_runner_id("token_1")]
+            assert relaunched.proc.poll() is None
+            # Its leaving doesn't retire the host: the probe finds spawning works again.
+            relaunched.proc.kill()
+            await asyncio.wait_for(asyncio.gather(*host._watcher_tasks), timeout=10.0)
+            deadline = time.monotonic() + 10.0
+            while host._runtime_gone:
+                assert time.monotonic() < deadline
+                await asyncio.sleep(0.01)
+            assert not host.lifecycle_lost
+    finally:
+        watch.cancel()
+        _cleanup_host(host)
+
+
+async def test_received_launch_is_answered_before_runtime_gone_retirement(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A launch received before its handler starts still holds off retirement."""
+    host = _make_host_process()
+    missing = tmp_path / "deleted-venv" / "bin" / "python"
+
+    def _interpreter_gone(*_args: object) -> tuple[subprocess.Popen[bytes], Path]:
+        raise FileNotFoundError(errno.ENOENT, "No such file or directory", str(missing))
+
+    monkeypatch.setattr(sys, "executable", str(missing))
+    monkeypatch.setattr(host, "_current_auth_token", lambda **_kwargs: None)
+    monkeypatch.setattr(host, "_spawn_runner_proc", _interpreter_gone)
+    monkeypatch.setattr("omnigent.host.connect._RUNTIME_GONE_POLL_S", 0.01)
+    tunnel = _GatedTunnel()
+    host._ws = tunnel  # type: ignore[assignment] — duck-typed ws
+    watch = asyncio.create_task(host._runtime_gone_watch(tunnel))  # type: ignore[arg-type]
+    first, second = (
+        HostLaunchRunnerFrame(
+            request_id=f"req_{name}",
+            binding_token=f"token_{name}",
+            workspace=str(tmp_path),
+            session_id=f"session_{name}",
+        )
+        for name in ("first", "second")
+    )
+
+    host._start_frame_task(tunnel, encode_host_frame(first))  # type: ignore[arg-type]
+    await asyncio.wait_for(tunnel.send_started.wait(), timeout=5.0)
+    # Wake the first reply's send, then receive the second launch behind it.
+    tunnel.release.set()
+    host._start_frame_task(tunnel, encode_host_frame(second))  # type: ignore[arg-type]
+    await asyncio.wait_for(watch, timeout=10.0)
+
+    replies = [decode_host_frame(sent) for sent in tunnel.sent]
+    assert [reply.request_id for reply in replies] == ["req_first", "req_second"]  # type: ignore[union-attr]
+    for reply in replies:
+        assert isinstance(reply, HostLaunchRunnerResultFrame)
+        assert "was deleted" in (reply.error or "")
+    assert host.runtime_gone
+    assert tunnel.closed_after_sent == 2
 
 
 @pytest.mark.parametrize("binding_token", ["token_abc", "", "   "])
@@ -1385,6 +1595,7 @@ class _FakeTunnel:
     def __init__(self) -> None:
         """Initialize with an empty sent-frame log."""
         self.sent: list[str] = []
+        self.closed_after_sent: int | None = None
 
     async def send(self, data: str) -> None:
         """Record an outbound frame.
@@ -1396,6 +1607,40 @@ class _FakeTunnel:
     async def recv(self) -> str:
         """Simulate an immediate disconnect after hello."""
         raise ConnectionError("test disconnect")
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        """Record a graceful close and how many frames were sent before it."""
+        self.closed_after_sent = len(self.sent)
+
+
+class _GatedTunnel(_FakeTunnel):
+    """Fake tunnel whose sends park until ``release`` is set."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.send_started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send(self, data: str) -> None:
+        self.send_started.set()
+        await self.release.wait()
+        await super().send(data)
+
+
+class _ClosingTunnel(_FakeTunnel):
+    """Fake tunnel whose receive waits until the host closes it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._closed = asyncio.Event()
+
+    async def recv(self) -> str:
+        await self._closed.wait()
+        raise ConnectionError("tunnel closed")
+
+    async def close(self, code: int = 1000, reason: str = "") -> None:
+        await super().close(code, reason)
+        self._closed.set()
 
 
 class _ConnectionErrorTunnel:
@@ -3516,6 +3761,177 @@ async def test_handle_stop_terminates_process(tmp_path: Path) -> None:
     assert proc.poll() is not None, "Runner process should be terminated after stop"
     # Runner should be removed from tracking.
     assert "runner_aaa" not in host._runners
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="reads /proc for the probe state")
+async def test_runtime_probe_keeps_its_exit_status_from_the_orphan_reaper(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """An orphan sweep during the probe can't make a restored runtime look broken.
+
+    The sweep runs after the probe's child exited but before asyncio collected
+    it; stealing that status would report 255 and retire a working host.
+    """
+    pid_file = tmp_path / "probe.pid"
+    gate = tmp_path / "probe.gate"
+    interpreter = tmp_path / "restored-venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    # Stands in for a reinstalled interpreter that exits 0 once released.
+    interpreter.write_text(
+        f'#!/bin/sh\necho $$ > "{pid_file}"\nwhile [ ! -e "{gate}" ]; do sleep 0.01; done\n'
+    )
+    interpreter.chmod(0o755)
+    monkeypatch.setattr(sys, "executable", str(interpreter))
+    host = _make_host_process()
+    host._runtime_gone = True
+    retire = asyncio.create_task(host._retire_if_runtime_gone(_FakeTunnel()))  # type: ignore[arg-type]
+    deadline = time.monotonic() + 5.0
+    while not pid_file.exists() or not pid_file.read_text().strip():
+        assert time.monotonic() < deadline, "the stand-in interpreter never started"
+        await asyncio.sleep(0.01)
+    probe_pid = int(pid_file.read_text())
+    gate.touch()
+    # Block the loop until the probe is a zombie, so asyncio can't collect it first.
+    deadline = time.monotonic() + 5.0
+    while Path(f"/proc/{probe_pid}/stat").read_text().split(")")[-1].split()[0] != "Z":
+        assert time.monotonic() < deadline
+        time.sleep(0.01)
+    host._reap_orphans_once([probe_pid])
+    await asyncio.wait_for(retire, timeout=10.0)
+
+    assert not host._runtime_gone
+    assert not host.lifecycle_lost
+    assert not host.runtime_gone
+
+
+@pytest.mark.skipif(sys.platform == "win32", reason="POSIX shell stand-in interpreter")
+async def test_runtime_probe_kills_and_reaps_an_interpreter_that_hangs(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A probe that doesn't finish in time fails, and its child doesn't linger."""
+    pid_file = tmp_path / "probe.pid"
+    interpreter = tmp_path / "hung-venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.write_text(f'#!/bin/sh\necho $$ > "{pid_file}"\nexec sleep 60\n')
+    interpreter.chmod(0o755)
+    monkeypatch.setattr("omnigent.host.connect._RUNTIME_PROBE_TIMEOUT_S", 0.5)
+
+    assert not await _interpreter_runs(str(interpreter))
+
+    probe_pid = int(pid_file.read_text())
+    # Killed and reaped: the pid is gone rather than left as a zombie.
+    with pytest.raises(ProcessLookupError):
+        os.kill(probe_pid, 0)
+
+
+@pytest.mark.parametrize(
+    ("stat_error", "missing"),
+    [
+        (None, False),
+        (FileNotFoundError(errno.ENOENT, "No such file or directory"), True),
+        (NotADirectoryError(errno.ENOTDIR, "Not a directory"), True),
+        (PermissionError(errno.EACCES, "Permission denied"), False),
+        (OSError(errno.EIO, "Input/output error"), False),
+    ],
+    ids=["present", "absent", "parent_not_a_dir", "permission_denied", "io_error"],
+)
+def test_interpreter_missing_only_for_absence(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, stat_error: OSError | None, missing: bool
+) -> None:
+    """Only an absent path reads as a deleted interpreter; other stat errors don't."""
+    interpreter = tmp_path / "venv" / "bin" / "python"
+    interpreter.parent.mkdir(parents=True)
+    interpreter.touch()
+    real_stat = os.stat
+
+    def _stat(path: object, *args: object, **kwargs: object) -> os.stat_result:
+        if stat_error is not None and os.fspath(path) == str(interpreter):  # type: ignore[arg-type]
+            raise stat_error
+        return real_stat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(os, "stat", _stat)
+
+    assert _interpreter_missing(str(interpreter)) is missing
+
+
+@pytest.mark.parametrize("retired", [False, True])
+def test_exit_if_runtime_gone_maps_retirement_to_restartable_exit(retired: bool) -> None:
+    """Only a host that retired for a deleted runtime exits with the restartable code."""
+    host = _make_host_process()
+    host._runtime_gone = True
+    host._retired_for_runtime_gone = retired
+
+    if not retired:
+        _exit_if_runtime_gone(host)
+        return
+    with pytest.raises(HostRuntimeGoneExit) as exc_info:
+        _exit_if_runtime_gone(host)
+    assert exc_info.value.code == HOST_RUNTIME_GONE_EXIT_CODE
+
+
+@pytest.mark.parametrize(
+    "blocker", ["runner", "frame_task", "watcher_task", "stop_task", "parked_report"]
+)
+async def test_runtime_gone_host_retires_only_once_idle(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, blocker: str
+) -> None:
+    """A live runner, an unanswered frame, or an unsent exit report holds off retirement."""
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "deleted-venv" / "bin" / "python"))
+    monkeypatch.setattr("omnigent.host.connect._RUNTIME_GONE_POLL_S", 0.01)
+    host = _make_host_process()
+    host._note_runtime_gone()
+    tunnel = _FakeTunnel()
+    pending = asyncio.create_task(asyncio.Event().wait())
+    tasks = {
+        "frame_task": host._frame_tasks,
+        "watcher_task": host._watcher_tasks,
+        "stop_task": host._runner_stop_tasks,
+    }
+    if blocker == "runner":
+        host._runners["runner_last"] = Mock()
+    elif blocker == "parked_report":
+        host._unreported_exits["runner_last"] = Mock()
+    else:
+        tasks[blocker].add(pending)
+    watch = asyncio.create_task(host._runtime_gone_watch(tunnel))  # type: ignore[arg-type]
+    try:
+        await asyncio.sleep(0.1)
+        assert not host.lifecycle_lost
+        assert tunnel.closed_after_sent is None
+
+        host._runners.clear()
+        host._unreported_exits.clear()
+        for task_set in tasks.values():
+            task_set.discard(pending)
+        await asyncio.wait_for(watch, timeout=10.0)
+        assert host.runtime_gone
+        assert tunnel.closed_after_sent == 0
+    finally:
+        watch.cancel()
+        pending.cancel()
+
+
+async def test_reconnect_reports_parked_exit_before_runtime_gone_retirement(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A deleted-runtime host flushes a parked exit report, then retires."""
+    monkeypatch.setattr(sys, "executable", str(tmp_path / "deleted-venv" / "bin" / "python"))
+    monkeypatch.setattr("omnigent.host.connect._RUNTIME_GONE_POLL_S", 0.01)
+    host = _make_host_process()
+    host._note_runtime_gone()
+    host._unreported_exits["runner_last"] = HostRunnerExitedFrame(
+        runner_id="runner_last", error="runner process exited with code 1", had_connected=True
+    )
+    tunnel = _ClosingTunnel()
+
+    with pytest.raises(ConnectionError, match="tunnel closed"):
+        await asyncio.wait_for(host._serve_frames(tunnel), timeout=10.0)  # type: ignore[arg-type]
+
+    hello, report = (decode_host_frame(sent) for sent in tunnel.sent)
+    assert isinstance(hello, HostHelloFrame)
+    assert isinstance(report, HostRunnerExitedFrame)
+    assert host.runtime_gone
+    assert tunnel.closed_after_sent == 2
 
 
 async def test_handle_stop_unknown_runner() -> None:
@@ -10210,8 +10626,16 @@ async def test_host_mcp_tools_failure_is_private(monkeypatch, caplog, error, sta
         (lambda: (_ for _ in ()).throw(SystemExit(0)), "clean"),
         (lambda: (_ for _ in ()).throw(SystemExit(3)), "exit"),
         (lambda: (_ for _ in ()).throw(KeyboardInterrupt()), "interrupted"),
+        (lambda: (_ for _ in ()).throw(HostRuntimeGoneExit()), "runtime_gone"),
     ],
-    ids=["lifecycle-lost", "system-exit-none", "system-exit-0", "system-exit-3", "ctrl-c"],
+    ids=[
+        "lifecycle-lost",
+        "system-exit-none",
+        "system-exit-0",
+        "system-exit-3",
+        "ctrl-c",
+        "runtime-gone",
+    ],
 )
 def test_run_host_process_classifies_how_the_host_ended(
     monkeypatch: pytest.MonkeyPatch,
@@ -10223,13 +10647,21 @@ def test_run_host_process_classifies_how_the_host_ended(
     caplog.set_level(logging.INFO, logger="omnigent.host.crash_reporting")
     monkeypatch.setattr("omnigent.host.connect._serve_host_until_exit", lambda *_a, **_k: serve())
 
-    with contextlib.suppress(SystemExit, KeyboardInterrupt):
+    exit_code: object = None
+    try:
         run_host_process(
             server_url="https://app.example.databricks.com",
             config_path=tmp_path / "config.yaml",
         )
+    except SystemExit as exc:
+        exit_code = exc.code
+    except KeyboardInterrupt:
+        pass
 
     assert _host_exit_reasons(caplog) == [expected]
+    if expected == "runtime_gone":
+        # A restartable status, so a supervisor relaunches the host.
+        assert exit_code == HOST_RUNTIME_GONE_EXIT_CODE
 
 
 @pytest.mark.parametrize(
