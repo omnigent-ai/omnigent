@@ -4272,7 +4272,10 @@ def inject_user_message(
     # below — and hides the input box, wedging the readiness gate — so
     # reclaim the input box before waiting on it.
     surface = _restore_occupied_input(
-        info["socket_path"], info["tmux_target"], bridge_dir=bridge_dir
+        info["socket_path"],
+        info["tmux_target"],
+        bridge_dir=bridge_dir,
+        recovery_timeout_s=timeout_s,
     )
     if surface is not None and surface != _OVERLAY_SURFACE:
         # An overlay may be launcher output the readiness gate waits through; a
@@ -6064,6 +6067,7 @@ def _restore_occupied_input(
     *,
     bridge_dir: Path | None = None,
     timeout_s: float | None = None,
+    recovery_timeout_s: float | None = None,
 ) -> str | None:
     """
     Dismiss a terminal-opened surface occupying Claude's input box.
@@ -6116,6 +6120,7 @@ def _restore_occupied_input(
     :param bridge_dir: Bridge whose live permission hooks protect the native prompt.
     :param timeout_s: Seconds to keep dismissing, e.g. ``1.5``. ``None`` uses
         :data:`_OCCUPIED_INPUT_DISMISS_TIMEOUT_S`.
+    :param recovery_timeout_s: Readiness budget after expanding an ambiguous frame.
     :returns: ``None`` once the input box is free (or the capture is torn);
         otherwise the :func:`_occupying_surface` description of what is
         still on screen, for the caller to refuse to type into.
@@ -6126,7 +6131,12 @@ def _restore_occupied_input(
     confirmed = False
     unclearable_seen = False
     while True:
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = _capture_unambiguous_composer(
+            socket_path,
+            tmux_target,
+            timeout_s=dismiss_timeout_s if recovery_timeout_s is None else recovery_timeout_s,
+            bridge_dir=bridge_dir,
+        )
         _raise_if_user_prompt_pending(
             bridge_dir,
             pane,
@@ -6337,8 +6347,80 @@ def _composer_frame_rule_indices(lines: list[str]) -> list[int]:
     rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
     if len(rules) < 2:
         return rules
+    if _composer_frame_ambiguous(lines, rules):
+        return []
     frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
     return [idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent]
+
+
+def _composer_frame_ambiguous(lines: list[str], rules: list[int] | None = None) -> bool:
+    """Detect an apparent input frame nested beneath another aligned prompt."""
+    if rules is None:
+        rules = [idx for idx, line in enumerate(lines) if _is_box_rule(line)]
+    if len(rules) < 2:
+        return False
+    frame_indent = min(len(lines[idx]) - len(lines[idx].lstrip()) for idx in rules[-2:])
+    frame_rules = [
+        idx for idx in rules if len(lines[idx]) - len(lines[idx].lstrip()) == frame_indent
+    ]
+    if len(frame_rules) < 2:
+        return False
+    inner_row = next(
+        (row for row in lines[frame_rules[-2] + 1 : frame_rules[-1]] if row.strip()), ""
+    )
+    if inner_row.strip()[:1] not in _COMPOSER_MODE_GLYPHS:
+        return False
+    # A clipped or wrapped opening title may leave no recognizable outer rule.
+    for first, row in enumerate(lines[: frame_rules[-2]]):
+        indent = len(row) - len(row.lstrip())
+        if (
+            indent < frame_indent
+            and row.strip()[:1] in _COMPOSER_MODE_GLYPHS
+            and all(
+                not following.strip() or len(following) - len(following.lstrip()) > indent
+                for following in lines[first + 1 :]
+            )
+        ):
+            return True
+    return False
+
+
+def _raise_if_composer_frame_ambiguous(pane: str) -> None:
+    """Preserve a draft or dialog when the capture cannot identify the live box."""
+    if _composer_frame_ambiguous(pane.splitlines()):
+        raise ClaudeComposerNotCleared(
+            "Claude Code's input box could not be distinguished from quoted draft text, "
+            "so nothing was sent. Open the terminal, expand it and clear the input box, "
+            "then retry."
+        )
+
+
+def _capture_unambiguous_composer(
+    socket_path: str,
+    tmux_target: str,
+    *,
+    timeout_s: float,
+    bridge_dir: Path | None,
+) -> str:
+    """Expand competing frames before readiness; keep the size through delivery."""
+    pane = _capture_pane(socket_path, tmux_target)
+    if _composer_frame_ambiguous(pane.splitlines()):
+        cleanup = _COMPOSER_RECOVERY_CLEANUP.get()
+        if cleanup is not None and cleanup.enter_context(
+            _usable_composer_height(socket_path, tmux_target)
+        ):
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            _wait_for_claude_prompt_ready(
+                socket_path,
+                tmux_target,
+                timeout_s=timeout_s,
+                bridge_dir=bridge_dir,
+                extend_for_slow_boot=False,
+                recover_ambiguous_frame=False,
+            )
+            pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_composer_frame_ambiguous(pane)
+    return pane
 
 
 def _composer_box(pane: str) -> _ComposerBox | None:
@@ -6463,12 +6545,14 @@ def _clear_composer(socket_path: str, tmux_target: str, *, preserve_draft: bool 
         capture showed the box whole and down to one row; nothing was pasted.
     :raises RuntimeError: If a ``tmux`` invocation fails.
     """
+    _raise_if_composer_frame_ambiguous(_capture_pane(socket_path, tmux_target))
     # Space returns focus from the footer to the input box. The clear also
     # removes the space when the input box already held focus.
     if not preserve_draft:
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     for round_no in range(_COMPOSER_CLEAR_MAX_ROUNDS + 1):
         pane = _capture_pane(socket_path, tmux_target)
+        _raise_if_composer_frame_ambiguous(pane)
         box = _composer_box(pane)
         # Blank rows after the glyph row hold nothing a paste could join.
         settled = box is not None and box.framed and not any(row.strip() for row in box.rows[1:])
@@ -6788,6 +6872,7 @@ def _wait_for_claude_prompt_ready(
     timeout_s: float,
     bridge_dir: Path | None = None,
     extend_for_slow_boot: bool = True,
+    recover_ambiguous_frame: bool = True,
 ) -> None:
     """
     Block until Claude Code's TUI input box is ready for keystrokes.
@@ -6820,6 +6905,7 @@ def _wait_for_claude_prompt_ready(
         time). A slow boot then fails the wait instead of outliving the request,
         while a dead pane still ends it at the first liveness check, a
         :data:`_CLAUDE_LIVENESS_POLL_INTERVAL_S` in, rather than at the cap.
+    :param recover_ambiguous_frame: Disable nested resizing during a recovery recheck.
     :returns: None.
     :raises ClaudeTerminalExited: If the pane is gone: tmux affirms the
         process exited, carrying its wait-status so a clean quit is
@@ -6871,7 +6957,17 @@ def _wait_for_claude_prompt_ready(
     # still meaningful, and it guarantees a capture to attach on failure.
     while True:
         _check_injection_cancelled()
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = (
+            _capture_unambiguous_composer(
+                socket_path,
+                tmux_target,
+                timeout_s=max(0.0, timeout_s - (time.monotonic() - started)),
+                bridge_dir=bridge_dir,
+            )
+            if recover_ambiguous_frame
+            else _capture_pane(socket_path, tmux_target)
+        )
+        _raise_if_composer_frame_ambiguous(pane)
         _raise_if_user_prompt_pending(
             bridge_dir,
             pane,
@@ -7030,6 +7126,7 @@ def _reclaim_and_wait_for_prompt(
         socket_path,
         tmux_target,
         bridge_dir=bridge_dir,
+        recovery_timeout_s=timeout_s if ready_timeout_s is None else ready_timeout_s,
         # At least two polls, so a surface is confirmed before it is refused.
         timeout_s=(
             None
@@ -7051,10 +7148,21 @@ def _reclaim_and_wait_for_prompt(
     # waited on until the budget lapses, then the pane reaped; the reclaim may
     # also have read a torn frame as a free input box. A torn frame here is
     # re-read once rather than taken for "no dialog".
-    pane = _capture_pane(socket_path, tmux_target)
+    recovery_budget = timeout_s if ready_timeout_s is None else ready_timeout_s
+    pane = _capture_unambiguous_composer(
+        socket_path,
+        tmux_target,
+        timeout_s=max(0.0, recovery_budget - (time.monotonic() - started)),
+        bridge_dir=bridge_dir,
+    )
     if not pane.strip():
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        pane = _capture_pane(socket_path, tmux_target)
+        pane = _capture_unambiguous_composer(
+            socket_path,
+            tmux_target,
+            timeout_s=max(0.0, recovery_budget - (time.monotonic() - started)),
+            bridge_dir=bridge_dir,
+        )
     if _composer_row(pane) is None:
         dialog = _unnamed_dialog_hint(pane)
         if dialog is not None:

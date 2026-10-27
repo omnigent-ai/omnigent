@@ -20,7 +20,7 @@ import time
 import unicodedata
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import suppress
+from contextlib import nullcontext, suppress
 from http.client import BadStatusLine, RemoteDisconnected
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from itertools import pairwise
@@ -11595,6 +11595,173 @@ def test_a_draft_taller_than_the_pane_is_cleared_before_delivery(
 
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("cursor_at_end", [False, True], ids=["cursor-at-start", "cursor-at-end"])
+@pytest.mark.parametrize("wrapped_opening", [False, True], ids=["whole-title", "wrapped-title"])
+def test_a_quoted_prompt_in_a_clipped_draft_cannot_end_clearing_early(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    cursor_at_end: bool,
+    wrapped_opening: bool,
+) -> None:
+    """Nested draft rules cannot prove the real composer's hidden rows were cleared."""
+    draft = (
+        "draft\n──────\n❯ quoted prompt\n──────\nHIDDEN ONE\nHIDDEN TWO\nHIDDEN THREE\nHIDDEN FOUR"
+    )
+    composer = _EditableComposer(draft, cursor=len(draft) if cursor_at_end else 0, visible_rows=4)
+    composer.install(monkeypatch)
+    if wrapped_opening:
+        capture = claude_native_bridge._capture_pane
+        monkeypatch.setattr(
+            claude_native_bridge,
+            "_capture_pane",
+            lambda *args: capture(*args).replace(
+                composer._RULE + "\n", "first part of a long title\nlast part ─\n", 1
+            ),
+        )
+    monkeypatch.setattr(
+        claude_native_bridge, "_usable_composer_height", lambda *_: nullcontext(False)
+    )
+    expected = "/effort high" if slash else "hello from the web"
+    sends: list[tuple[str, ...]] = []
+
+    def run_tmux(socket_path: str, *args: str) -> None:
+        sends.append(args)
+        composer._run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"):
+        claude_native_bridge._clear_composer("/tmp/example/tmux.sock", "claude:0.0")
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"):
+        if slash:
+            claude_native_bridge.inject_slash_command(bridge_dir, command=expected)
+        else:
+            inject_user_message(bridge_dir, content=expected)
+
+    assert sends == []
+    assert composer.submitted == []
+    assert composer.text == draft
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("cursor_at_end", [False, True], ids=["cursor-at-start", "cursor-at-end"])
+@pytest.mark.parametrize("expansion_resolves", [False, True], ids=["still-ambiguous", "resolved"])
+def test_quoted_prompt_in_a_clipped_draft_recovers_after_expansion(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    cursor_at_end: bool,
+    expansion_resolves: bool,
+) -> None:
+    """Showing the real frame lets delivery clear the full draft and send exactly once."""
+    draft = "draft\n──────\n❯ quoted prompt\n──────\nHIDDEN ONE\nHIDDEN TWO\nHIDDEN THREE"
+    composer = _EditableComposer(draft, cursor=len(draft) if cursor_at_end else 0, visible_rows=4)
+    composer.install(monkeypatch)
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="120 6 latest\n", stderr=""),
+    )
+    sizes: list[str] = []
+
+    def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
+        if args[0] == "resize-window":
+            height = args[args.index("-y") + 1]
+            sizes.append(height)
+            composer._visible_rows = None if int(height) >= 24 and expansion_resolves else 4
+        else:
+            composer._run_tmux(socket_path, *args)
+
+    monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    expected = "/effort high" if slash else "hello from the web"
+    result = (
+        nullcontext()
+        if expansion_resolves
+        else pytest.raises(claude_native_bridge.ClaudeComposerNotCleared)
+    )
+    with result:
+        if slash:
+            claude_native_bridge.inject_slash_command(bridge_dir, command=expected)
+        else:
+            inject_user_message(bridge_dir, content=expected)
+
+    assert [text.strip() for text in composer.submitted] == (
+        [expected] if expansion_resolves else []
+    )
+    if not expansion_resolves:
+        assert composer.text == draft
+    assert sizes == ["24", "6"]
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize(
+    "healthy_captures", [0, 1, 2], ids=["restore", "pre-readiness", "readiness"]
+)
+@pytest.mark.parametrize(
+    "pane",
+    [
+        "──────\n❯ old\n  ──────\n  ❯ current\n  ──────\n",
+        "──────\n❯ old\n  ──────\n  ! existing command\n  ──────\n",
+        "──────\n❯ old message\n──────\n❯ echoed message\n  ──────\n  ❯ current\n  ──────\n",
+    ],
+    ids=[
+        "adjacent-box-or-quote",
+        "adjacent-shell-or-quote",
+        "old-closed-box-and-echo",
+    ],
+)
+def test_ambiguous_composer_frames_receive_no_injection_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    healthy_captures: int,
+    pane: str,
+) -> None:
+    """A competing outer prompt cannot authorize typing into an inner box."""
+    sends = _fake_tmux(monkeypatch, [_IDLE_PANE] * healthy_captures + [pane])
+    monkeypatch.setattr(
+        claude_native_bridge, "_usable_composer_height", lambda *_: nullcontext(False)
+    )
+    bridge_dir = _picker_bridge_dir(tmp_path)
+    with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared):
+        if slash:
+            claude_native_bridge.inject_slash_command(
+                bridge_dir, command="/effort high", ready_timeout_s=0.5
+            )
+        else:
+            inject_user_message(bridge_dir, content="hello from the web", timeout_s=0.5)
+    assert sends == []
+
+
+def test_an_unrecognized_dialog_is_not_replaced_by_an_older_outer_prompt(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dialog title prevents the old outer prompt from becoming the live box."""
+    pane = "──────\n❯ old\n  ──────\n  Change effort?\n  ❯ 1. Yes\n  ──────\n"
+    sends = _fake_tmux(monkeypatch, [pane])
+
+    assert claude_native_bridge._composer_row(pane) is None
+    assert claude_native_bridge._composer_box(pane) is None
+    with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared):
+        claude_native_bridge._clear_composer("/tmp/example/tmux.sock", "claude:0.0")
+    assert sends == [["send-keys", "-t", "claude:0.0", "Space"]]
+
+
+def test_composer_clearing_rechecks_an_ambiguous_repaint_before_editing(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A layout change after focusing the input box still receives no clearing burst."""
+    sends = _fake_tmux(
+        monkeypatch, [_IDLE_PANE, "──────\n❯ draft\n  ──────\n  ❯ quote\n  ──────\n"]
+    )
+    with pytest.raises(claude_native_bridge.ClaudeComposerNotCleared):
+        claude_native_bridge._clear_composer("/tmp/example/tmux.sock", "claude:0.0")
+    assert sends == [["send-keys", "-t", "claude:0.0", "Space"]]
+
+
+@pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
 @pytest.mark.parametrize("cursor", [0, 8, 18], ids=["start", "middle", "end"])
 @pytest.mark.parametrize("draft", ["", "ONE\nTWO\nTHREE\nFOUR"], ids=["empty", "hidden-draft"])
 def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
@@ -11639,6 +11806,7 @@ def test_delivery_expands_a_clipped_composer_until_submit_is_verified(
 
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
+@pytest.mark.parametrize("quoted_frame", [False, True], ids=["clipped", "quoted-frame"])
 @pytest.mark.parametrize(
     ("pane", "error"),
     [
@@ -11652,11 +11820,16 @@ def test_composer_recovery_rechecks_the_surface_before_typing(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     slash: bool,
+    quoted_frame: bool,
     pane: str,
     error: type[Exception],
 ) -> None:
     """A dialog exposed by resizing receives no clearing, paste or submit keystrokes."""
-    composer = _EditableComposer("", cursor=0, visible_rows=1)
+    composer = _EditableComposer(
+        "draft\n──────\n❯ quote\n──────\nhidden" if quoted_frame else "",
+        cursor=0,
+        visible_rows=4 if quoted_frame else 1,
+    )
     composer.install(monkeypatch)
     monkeypatch.setattr(
         subprocess,
@@ -11762,6 +11935,25 @@ def test_composer_box_does_not_read_other_screens_as_a_scrolled_draft(pane: str)
             claude_native_bridge._ComposerBox(["❯ one", "  ──────"], framed=False),
         ),
         (
+            "──────\n❯ draft\n  ──────\n  ❯ quoted prompt\n  ──────\n",
+            None,
+        ),
+        (
+            "  ╭──────╮\n  ❯ draft\n    ──────\n    ❯ quoted prompt\n    ──────\n",
+            None,
+        ),
+        ("──────\n❯ draft\n  ──────\n  ❯\n  ──────\n    ──────\n", None),
+        (
+            "──────\n❯ draft\n  ──────\n  ❯ quote\n  ──────\n──────\n",
+            claude_native_bridge._ComposerBox(
+                ["❯ draft", "  ──────", "  ❯ quote", "  ──────"], framed=True
+            ),
+        ),
+        (
+            "──────\n❯ old\n──────\nold output\n  ──────\n  ❯ current\n  ──────\n",
+            claude_native_bridge._ComposerBox(["  ❯ current"], framed=True),
+        ),
+        (
             "──────\nold output\n  ──────\n  ❯ one\n    ──────\n    four\n  ──────\n",
             claude_native_bridge._ComposerBox(["  ❯ one", "    ──────", "    four"], framed=True),
         ),
@@ -11777,6 +11969,11 @@ def test_composer_box_does_not_read_other_screens_as_a_scrolled_draft(pane: str)
         "closing-rule-off-screen",
         "rule-inside-draft",
         "rule-inside-clipped-draft",
+        "quoted-prompt-inside-clipped-draft",
+        "quoted-prompt-inside-indented-corner-clipped-draft",
+        "empty-quoted-prompt-with-deeper-rule",
+        "quoted-prompt-inside-complete-draft",
+        "indented-frame-below-old-complete-composer-and-output",
         "indented-frame-with-earlier-rule",
         "dialog-selector",
         "no-box",
