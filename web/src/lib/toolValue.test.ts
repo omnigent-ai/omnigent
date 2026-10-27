@@ -160,6 +160,8 @@ describe("isProseText", () => {
     expect(isProseText("Faster builds\nSmaller bundles", "releaseNote")).toBe(true);
     expect(isProseText("[1] See the RFC.\n\nMore notes", "summary")).toBe(true);
     expect(isProseText("- [x] Done: tests\n- [ ] Ship", "summary")).toBe(true);
+    expect(isProseText("When a <b, swap them\nThanks", "notes")).toBe(true);
+    expect(isProseText("Steps\n\n    run();\n- Build\n- Ship", "notes")).toBe(true);
     const withSample =
       "Steps:\n\n- Build\n    - web\n    - server\n- Ship\n\n```ts\nconst a = 1;\nif (a) {\n  run();\n}\n```\n";
     expect(isProseText(withSample, "description")).toBe(true);
@@ -209,6 +211,11 @@ describe("isProseText", () => {
       "Intro <![CDATA[secret]]>\nmore",
       "Intro <!X hidden>\nmore",
       'Intro <instructions\nrole="x"\n> more',
+      "Summary\n<pre\nHidden rest\n\nmore text",
+      "Intro\n<?php\nEverything after this is hidden",
+      "<details\nHidden rest",
+      "<details>\nWhen a<b swap them\n</details>",
+      "<details>\nSee <https://x/docs>\n</details>",
     ]) {
       expect(isProseText(hiddenMarkup, "description")).toBe(false);
     }
@@ -230,6 +237,7 @@ describe("isProseText", () => {
       false,
     );
     expect(isProseText("function f() {\n  return 1;\n}\n# not a heading", "notes")).toBe(false);
+    expect(isProseText("Steps\n\n    run();\n    stop();\n- Build\n- Ship", "notes")).toBe(false);
   });
 
   it("leaves text the chat renderer shows without markdown literal", () => {

@@ -296,10 +296,10 @@ const CODE_KEY_WORDS = new Set([
   "xml",
   "yaml",
 ]);
-// A markup tag such as `<instructions>`, even split over lines, which markdown would hide;
-// autolinks do not match. GitHub bodies' `<details>`, `<summary>` and `<br>` do not count.
-const MARKUP_TAG =
-  /<\/?(?!(?:details|summary|br|sub|sup|kbd)(?![\w-]))[A-Za-z][\w-]*(?:\s[^<>]*)?\/?>/i;
+// Tags in GitHub bodies, such as `<details>`, `<summary>` and `<br>`, which render as markdown.
+const GITHUB_BODY_TAG = /<\/?(?:details|summary|br|sub|sup|kbd)(?![\w-])(?:\s[^<>]*)?\/?>/gi;
+// A markup tag such as `<instructions>`, even split over lines; autolinks do not match.
+const MARKUP_TAG = /<\/?[A-Za-z][\w-]*(?:\s[^<>]*)?\/?>/;
 
 // Indentation, `>` quote markers and list bullets that can nest a block in a line.
 const CONTAINER_PREFIX = /^(?:[ \t>]|(?:[-*+]|\d{1,9}[.)])[ \t])*/;
@@ -384,6 +384,17 @@ function withoutCodeSpans(line: string): { text: string; clear: boolean } {
   return { text: text + line.slice(position), clear: true };
 }
 
+// Whether a line opening with `<`, up to a blank line, holds a tag other than GitHub's, even an
+// unfinished one. Markdown passes such an HTML block raw, where `<pre` swallows the text after it.
+function hidesInHtmlBlock(text: string): boolean {
+  let inBlock = false;
+  for (const line of text.split("\n")) {
+    inBlock = line.trim() !== "" && (inBlock || line.replace(CONTAINER_PREFIX, "").startsWith("<"));
+    if (inBlock && /<[A-Za-z/]/.test(line.replace(GITHUB_BODY_TAG, ""))) return true;
+  }
+  return false;
+}
+
 // `text` without its closed `<!-- -->` comments, which markdown hides; linear in its length.
 function withoutHtmlComments(text: string): string {
   let kept = "";
@@ -421,8 +432,11 @@ export function isProseText(text: string, key?: string): boolean {
   if (isPathologicalText(text) || looksLikeData(text)) return false;
   // Fenced and inline code render literally as markdown too, so only the rest is checked.
   const outsideCode = withoutHtmlComments(withoutCode(text));
-  // An unclosed `<!--`, `<?`, `<![CDATA[` or `<!X` hides text, like a markup tag.
-  if (MARKUP_TAG.test(outsideCode) || /<[?!]/.test(outsideCode)) return false;
+  const markup = outsideCode.replace(GITHUB_BODY_TAG, "");
+  // A markup tag, an unclosed `<!--`, `<?`, `<![CDATA[` or `<!X`, or a raw HTML block hides text.
+  if (MARKUP_TAG.test(markup) || /<[?!]/.test(markup) || hidesInHtmlBlock(outsideCode)) {
+    return false;
+  }
   const lines = outsideCode.split("\n").filter((line) => line.trim().length > 0);
   // A link reference definition such as `[//]: # (note)` renders as nothing.
   if (lines.some((line) => /^\[[^\]]+\]:/.test(line.replace(CONTAINER_PREFIX, "")))) return false;
