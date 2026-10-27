@@ -145,7 +145,7 @@ executor:
   harness: openai-agents
 os_env:
   type: caller_process
-  cwd: {json.dumps(str(workspace))}
+  cwd: .
   sandbox:
     type: none
 """

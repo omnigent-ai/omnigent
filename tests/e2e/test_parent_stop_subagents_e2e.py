@@ -10,16 +10,18 @@ Run: uv run --no-sync pytest tests/e2e/test_parent_stop_subagents_e2e.py -v -s
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
 import threading
 import time
-from contextlib import ExitStack
+from contextlib import ExitStack, suppress
 from pathlib import Path
 
 import httpx
@@ -98,14 +100,20 @@ class _Stream:
         self.done = threading.Event()
         self.error: Exception | None = None
         self.url = f"{base_url}/v1/sessions/{session_id}/stream"
-        self.thread = threading.Thread(target=self._read, daemon=True)
+        self.loop: asyncio.AbstractEventLoop | None = None
+        self.task: asyncio.Task | None = None
+        self.thread = threading.Thread(target=lambda: asyncio.run(self._read()), daemon=True)
 
-    def _read(self) -> None:
+    async def _read(self) -> None:
+        self.loop = asyncio.get_running_loop()
+        self.task = asyncio.current_task()
         try:
-            with httpx.Client(trust_env=False, timeout=httpx.Timeout(30, read=30)) as client:
-                with client.stream("GET", self.url) as response:
+            async with httpx.AsyncClient(
+                trust_env=False, timeout=httpx.Timeout(30, read=30)
+            ) as client:
+                async with client.stream("GET", self.url) as response:
                     response.raise_for_status()
-                    for line in response.iter_lines():
+                    async for line in response.aiter_lines():
                         if self.done.is_set():
                             return
                         if line.startswith("data:"):
@@ -115,6 +123,9 @@ class _Stream:
                             event = json.loads(payload)
                             self.events.append(event)
                             self.ready.set()
+        except asyncio.CancelledError:
+            if not self.done.is_set():
+                self.error = RuntimeError("Session SSE reader was cancelled unexpectedly")
         except httpx.ReadTimeout as exc:
             if not self.done.is_set():
                 self.error = exc
@@ -134,9 +145,13 @@ class _Stream:
 
     def __exit__(self, exc_type, *_args):
         self.done.set()
-        self.thread.join(timeout=35)
+        if self.loop is not None and self.task is not None:
+            # Wake an idle read after the observation window, without another heartbeat.
+            with suppress(RuntimeError):  # The stream may already have closed its loop.
+                self.loop.call_soon_threadsafe(self.task.cancel)
+        self.thread.join(timeout=5)
         if exc_type is None:
-            assert not self.thread.is_alive(), "SSE reader did not exit within its read timeout"
+            assert not self.thread.is_alive(), "SSE reader did not exit after cancellation"
             self.check_error()
 
 
@@ -162,6 +177,19 @@ def test_native_parent_teardown_preserves_child_outcome(
         for key, value in os.environ.items()
         if key in {"PATH", "LANG", "LC_ALL", "TMPDIR", "SSL_CERT_FILE", "SSL_CERT_DIR"}
     }
+    if harness == "codex":
+        # Set the app-server's MCP budget; --remote TUI overrides cannot change it.
+        codex = shutil.which("codex")
+        assert codex is not None
+        bin_dir = tmp_path / "bin"
+        bin_dir.mkdir()
+        launcher = bin_dir / "codex"
+        launcher.write_text(
+            f'#!/bin/sh\nexec {shlex.quote(codex)} "$@" '
+            "-c mcp_servers.omnigent.startup_timeout_sec=60\n"
+        )
+        launcher.chmod(0o755)
+        base_env["PATH"] = f"{bin_dir}{os.pathsep}{base_env['PATH']}"
     env = {
         "OMNIGENT_CONFIG_HOME": str(config),
         "CLAUDE_CONFIG_DIR": str(tmp_path / "claude-config"),

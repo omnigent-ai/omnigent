@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
-import { maybeOpenLinkInApp, onInAppLinkOpen } from "@/lib/openLinkInApp";
+import { maybeOpenLinkInApp, onInAppLinkOpen, parseHttpUrl } from "@/lib/openLinkInApp";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
@@ -71,4 +71,15 @@ it.each([
   arrange();
   expect(maybeOpenLinkInApp(conv, href)).toBe(false);
   expect(openOrNavigate).not.toHaveBeenCalled();
+});
+
+it.each([
+  ["https://example.com/page", "https://example.com/page"],
+  ["http://localhost:3000/x", "http://localhost:3000/x"],
+  ["javascript:alert(1)", null],
+  ["  JavaScript:alert(1)", null],
+  ["data:text/html,<script>alert(1)</script>", null],
+  ["http://[", null],
+])("parseHttpUrl(%j) keeps only http(s) URLs", (href, expected) => {
+  expect(parseHttpUrl(href)?.href ?? null).toBe(expected);
 });

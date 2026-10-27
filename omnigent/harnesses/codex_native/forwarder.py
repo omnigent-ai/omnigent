@@ -75,6 +75,7 @@ from omnigent.native._native_post_delivery import (
     post_may_have_been_delivered,
     replay_dead_letters,
 )
+from omnigent.native._native_supersession import post_clear_supersession
 from omnigent.runtime.tool_output import cap_tool_output
 from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -134,6 +135,9 @@ _EXTERNAL_COMPACTION_STATUS_TYPE = "external_compaction_status"
 # handlers are harmless no-ops if a build spells these differently.
 _CODEX_COMPACTION_ITEM_TYPE = "contextCompaction"
 _CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
+# In-progress turns in ``thread/resume`` identify items by position, not by
+# the native ids their live notifications carry.
+_CODEX_RESUME_POSITION_ITEM_ID = re.compile(r"item-\d+")
 # How often the forwarder claims pending ``/side`` questions from the bridge dir.
 # The executor writes one and returns, so this is the delay before the side chat
 # starts; a fork is cheap, so poll fast enough to feel immediate.
@@ -143,6 +147,15 @@ _SIDE_CHAT_POLL_SECONDS = 0.5
 # ``response.reasoning_text.delta`` (preceded by ``response.reasoning.started``
 # when ``data.started`` is true) so the web UI paints a live reasoning block.
 _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE = "external_output_reasoning_delta"
+_CODEX_STREAMING_DELTA_METHODS = frozenset(
+    {
+        "item/agentMessage/delta",
+        "item/plan/delta",
+        "item/commandExecution/outputDelta",
+        "item/reasoning/textDelta",
+        "item/reasoning/summaryTextDelta",
+    }
+)
 _EXTERNAL_CODEX_COLLABORATION_MODE_CHANGE_TYPE = "external_codex_collaboration_mode_change"
 # Per-attempt client budget for the elicitation long-poll, slightly above
 # the server-side wait (``_CODEX_NATIVE_ELICITATION_HOOK_TIMEOUT_S``) so
@@ -305,6 +318,47 @@ class _ForwarderTarget:
     elicitation_tracker: _CodexElicitationTaskTracker
 
 
+@dataclass
+class _CodexChildStream:
+    """Child output and turn identity, independent of the parent's disk bridge."""
+
+    state: _CodexForwarderState
+    delta_coalescer: _OutputTextDeltaCoalescer
+    active_turn_id: str | None = None
+    terminal_turn_ids: set[str] = field(default_factory=set)
+
+    def accepts_event(self, method: str, params: _JsonObject) -> bool:
+        turn_id = _terminal_turn_id_from_params(params) or _turn_id_from_payload(params)
+        terminal_error = turn_id in self.state.surfaced_terminal_error_turns
+        if method == "turn/started":
+            if turn_id in self.terminal_turn_ids or terminal_error:
+                return False
+            self.active_turn_id = turn_id
+            self.state.reasoning_stream_item_id = None
+        elif method in {"turn/completed", "turn/failed"}:
+            if turn_id is not None:
+                if turn_id in self.terminal_turn_ids or self.active_turn_id not in {None, turn_id}:
+                    return False
+                self.terminal_turn_ids.add(turn_id)
+                self.active_turn_id = None
+        elif method == "error" and params.get("willRetry") is not True:
+            if turn_id is not None and (
+                turn_id in self.terminal_turn_ids or self.active_turn_id not in {None, turn_id}
+            ):
+                return False
+            # The error handler retires deltas through its surfaced-error set.
+            # The following turn boundary must still run completion cleanup.
+        elif method in _CODEX_STREAMING_DELTA_METHODS:
+            if turn_id is None or turn_id in self.terminal_turn_ids or terminal_error:
+                return False
+            # Subscription can miss turn/started. The first live delta can
+            # establish that turn, but cannot revive a completed one.
+            if self.active_turn_id is None:
+                self.active_turn_id = turn_id
+            return self.active_turn_id == turn_id
+        return True
+
+
 @dataclass(frozen=True)
 class _CodexToolCall:
     """
@@ -426,6 +480,12 @@ class _CodexForwarderState:
         assistant reply, the forwarder recovers and posts the turn's user
         message if the live stream missed it (see
         :func:`_ensure_user_message_posted`).
+    :param user_message_copy_balance: Unmatched user-message copies of
+        unfinished turns keyed by (thread, turn, content digest): positive
+        counts live copies and negative counts resumed copies with positional
+        ids such as ``item-1``.
+    :param resume_echo_thread_ids: Threads whose resume snapshot is being
+        replayed on a connection that also received its live notifications.
     :param partial_text_by_turn: Visible assistant/plan text fragments keyed
         by turn id, e.g. ``{"turn_123": [_PartialTextBuffer(...)]}``.
         Normal completed items remain the durable source of truth; this
@@ -474,9 +534,12 @@ class _CodexForwarderState:
     subagents_by_thread: dict[str, str] = field(default_factory=dict)
     pending_child_threads: dict[str, str | None] = field(default_factory=dict)
     subscribed_child_threads: set[str] = field(default_factory=set)
+    child_streams: dict[str, _CodexChildStream] = field(default_factory=dict)
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
+    user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    resume_echo_thread_ids: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
     _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
@@ -622,6 +685,26 @@ class _CodexForwarderState:
         self.subagents_by_thread[thread_id] = session_id
         self.pending_child_threads.pop(thread_id, None)
 
+    def child_stream(
+        self, client: httpx.AsyncClient, thread_id: str, session_id: str
+    ) -> _CodexChildStream:
+        """Share one child's live/replayed item state without sharing parent control state."""
+        stream = self.child_streams.get(thread_id)
+        if stream is None:
+            stream = _CodexChildStream(
+                state=_CodexForwarderState(model=self.model, codex_client=self.codex_client),
+                delta_coalescer=_OutputTextDeltaCoalescer(client, session_id),
+            )
+            self.child_streams[thread_id] = stream
+        return stream
+
+    async def close_child_streams(self) -> None:
+        """Drain child output while the forwarder's HTTP client is still open."""
+        await asyncio.gather(
+            *(stream.delta_coalescer.close() for stream in self.child_streams.values())
+        )
+        self.child_streams.clear()
+
     def note_parent_rotation(self, session_id: str) -> None:
         """
         Record that the forwarder moved to a new parent AP session.
@@ -706,6 +789,42 @@ class _CodexForwarderState:
         :returns: ``True`` when the turn's user message has been posted.
         """
         return turn_id in self.posted_user_turns
+
+    def pair_user_message_copy(self, key: tuple[str, str, str], *, resumed: bool) -> bool:
+        """
+        Match a user-message copy against the other delivery of the same input.
+
+        Codex identifies an in-progress turn's resumed user input by position
+        and its live notification by a native id, so the copies share only
+        their thread, turn and content. A live copy matches a resumed copy
+        only while that thread's echoing replay registered it.
+
+        :param key: ``(thread_id, turn_id, content_digest)`` for the copy.
+        :param resumed: Whether the copy came from a resume snapshot.
+        :returns: ``True`` when the copy duplicates an unmatched copy.
+        """
+        balance = self.user_message_copy_balance.get(key, 0)
+        step = -1 if resumed else 1
+        duplicate = balance * step < 0
+        if duplicate or not resumed or key[0] in self.resume_echo_thread_ids:
+            if balance + step:
+                self.user_message_copy_balance[key] = balance + step
+            else:
+                self.user_message_copy_balance.pop(key, None)
+        return duplicate
+
+    def forget_user_message_copies(self, turn_id: str) -> None:
+        """
+        Drop unmatched user-message copies once their turn ends.
+
+        Resume snapshots give positional ids only to in-progress turns, so a
+        finished turn's copies can no longer pair.
+
+        :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+        :returns: None.
+        """
+        for key in [key for key in self.user_message_copy_balance if key[1] == turn_id]:
+            del self.user_message_copy_balance[key]
 
     def note_tool_call_posted(self, call_id: str) -> None:
         """Record that a command's live function-call item was posted."""
@@ -1614,7 +1733,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     started=chunk.reasoning_started,
                 )
-            except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
+            except Exception:  # preserve the long-lived forwarder.
                 _logger.warning("Codex forwarder reasoning delta flush failed", exc_info=True)
             return
         if chunk.tool_call_id is not None:
@@ -1625,7 +1744,7 @@ class _OutputTextDeltaCoalescer:
                     delta,
                     call_id=chunk.tool_call_id,
                 )
-            except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
+            except Exception:  # preserve the long-lived forwarder.
                 _logger.warning("Codex forwarder tool-output delta flush failed", exc_info=True)
             return
         index: int | None = None
@@ -1643,7 +1762,7 @@ class _OutputTextDeltaCoalescer:
                 index=index,
                 final=final,
             )
-        except Exception:  # noqa: BLE001 - preserve the long-lived forwarder.
+        except Exception:  # preserve the long-lived forwarder.
             _logger.warning("Codex forwarder delta flush failed", exc_info=True)
 
 
@@ -1971,7 +2090,7 @@ class _CodexElicitationTaskTracker:
             )
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001 - keep the long-lived forwarder alive.
+        except Exception:  # keep the long-lived forwarder alive.
             _logger.warning(
                 "Codex forwarder elicitation hook task failed: method=%s",
                 event.get("method"),
@@ -2239,7 +2358,7 @@ async def supervise_forwarder(
                         codex_client=client,
                         forwarder_state=forwarder_state,
                     )
-                except Exception:  # noqa: BLE001 - keep the long-lived mirror alive.
+                except Exception:  # keep the long-lived mirror alive.
                     _logger.warning("Codex forwarder event handling failed", exc_info=True)
         finally:
             if mcp_settle_timer is not None:
@@ -2255,6 +2374,7 @@ async def supervise_forwarder(
             side_chat_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await side_chat_task
+            await forwarder_state.close_child_streams()
             await client.close()
 
 
@@ -2302,10 +2422,11 @@ async def _drive_side_chat_requests(
                             codex_client,
                             parent_thread_id=parent_thread_id,
                             question=request.question,
+                            bridge_dir=bridge_dir,
                         )
                         if child_thread_id is None:
                             raise RuntimeError("thread/fork returned no thread id")
-                    except Exception:  # noqa: BLE001 - one bad request must not drop the rest.
+                    except Exception:  # one bad request must not drop the rest.
                         _logger.warning(
                             "Codex /side fork failed for %s", request.path, exc_info=True
                         )
@@ -2316,7 +2437,7 @@ async def _drive_side_chat_requests(
                     # done, and a failed one has surfaced a notice — keeping it
                     # would retry the same failure forever.
                     side_chat.discard_side_chat_request(request.path)
-        except Exception:  # noqa: BLE001 - keep the drain loop alive.
+        except Exception:  # keep the drain loop alive.
             _logger.warning("Codex /side drain iteration failed", exc_info=True)
         await _sleep(_SIDE_CHAT_POLL_SECONDS)
 
@@ -2355,7 +2476,7 @@ async def _post_side_chat_failed_notice(
             response_id=marker,
             source_id=marker,
         )
-    except Exception:  # noqa: BLE001 - the notice is best-effort.
+    except Exception:  # the notice is best-effort.
         _logger.warning("Codex /side failure notice could not be posted", exc_info=True)
 
 
@@ -2427,6 +2548,12 @@ async def _maybe_rotate_session_on_thread_started(
         old_session_id,
         new_session_id,
         new_thread_id,
+    )
+    await post_clear_supersession(
+        ap_client,
+        old_session_id=old_session_id,
+        new_session_id=new_session_id,
+        agent_name=_AGENT_NAME,
     )
     return True
 
@@ -2644,6 +2771,7 @@ async def _subscribe_until_ready_inner(
     )
     saw_not_ready = False
     while True:
+        received_live_items = client.is_subscribed_to_thread(thread_id)
         try:
             params: _JsonObject = {"threadId": thread_id}
             if not saw_not_ready and replay_from_turn_id is None:
@@ -2651,7 +2779,7 @@ async def _subscribe_until_ready_inner(
             response = await client.request("thread/resume", params)
         except asyncio.CancelledError:
             raise
-        except Exception as exc:  # noqa: BLE001 - app-server error envelopes are surfaced as RuntimeError.
+        except Exception as exc:  # app-server error envelopes are surfaced as RuntimeError.
             if _is_thread_not_ready_error(exc):
                 if not saw_not_ready:
                     _logger.info(
@@ -2701,16 +2829,22 @@ async def _subscribe_until_ready_inner(
             await _sync_codex_approval_mode_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
-        await _replay_resume_response(
-            ap_client,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            response=response,
-            usage_coalescer=usage_coalescer,
-            elicitation_tracker=elicitation_tracker,
-            forwarder_state=forwarder_state,
-            replay_from_turn_id=replay_from_turn_id,
-        )
+        if forwarder_state is not None and received_live_items:
+            forwarder_state.resume_echo_thread_ids.add(thread_id)
+        try:
+            await _replay_resume_response(
+                ap_client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                response=response,
+                usage_coalescer=usage_coalescer,
+                elicitation_tracker=elicitation_tracker,
+                forwarder_state=forwarder_state,
+                replay_from_turn_id=replay_from_turn_id,
+            )
+        finally:
+            if forwarder_state is not None:
+                forwarder_state.resume_echo_thread_ids.discard(thread_id)
         return
 
 
@@ -3042,6 +3176,16 @@ async def _handle_event(
     )
     if route_session_id is None:
         return
+    event_state = forwarder_state
+    event_bridge_dir = bridge_dir if not is_child else None
+    if is_child and forwarder_state is not None:
+        child_thread_id = _thread_id_from_params(params)
+        assert child_thread_id is not None
+        child_stream = forwarder_state.child_stream(client, child_thread_id, route_session_id)
+        if not child_stream.accepts_event(method, params):
+            return
+        event_state = child_stream.state
+        delta_coalescer = child_stream.delta_coalescer
     # First model-produced item settles the synthesized MCP startup round
     # mid-turn — codex defers turn execution until the round ends, so
     # assistant-side output proves startup is over before the idle edge.
@@ -3059,8 +3203,8 @@ async def _handle_event(
             forwarder_state.mcp_startup_settled = True
     # item/started: register collab-agent children early (before item/completed)
     # so live child events can be routed to the child session immediately.
-    # Only meaningful for the parent thread; children don't spawn grandchildren here.
-    if method == "item/started" and not is_child and forwarder_state is not None:
+    # Child discovery remains connection-wide; output state is per thread.
+    if method == "item/started" and forwarder_state is not None:
         item = params.get("item")
         if isinstance(item, dict) and item.get("type") == _CODEX_COLLAB_AGENT_ITEM_TYPE:
             await _handle_collab_item(client, params, item, forwarder_state)
@@ -3069,7 +3213,7 @@ async def _handle_event(
         elif isinstance(item, dict) and item.get("type") == _CODEX_COMPACTION_ITEM_TYPE:
             # Compaction started mid-turn — show the spinner.
             await _post_compaction_status(
-                client, route_session_id, "in_progress", forwarder_state=forwarder_state
+                client, route_session_id, "in_progress", forwarder_state=event_state
             )
         elif isinstance(item, dict) and item.get("type") == "agentMessage":
             # Post the turn's user message NOW — before the assistant's text
@@ -3083,11 +3227,11 @@ async def _handle_event(
             # now), so the web UI renders the question above the reply. The
             # ``item/completed`` guard below remains the backstop for the
             # resume-backfill path, which replays only ``item/completed``.
-            await _ensure_user_message_posted(client, route_session_id, params, forwarder_state)
+            await _ensure_user_message_posted(client, route_session_id, params, event_state)
         elif isinstance(item, dict) and item.get("type") == "commandExecution":
             call_id = await _post_tool_call_item(client, route_session_id, params, item)
-            if call_id is not None:
-                forwarder_state.note_tool_call_posted(call_id)
+            if call_id is not None and event_state is not None:
+                event_state.note_tool_call_posted(call_id)
         return
     if method == _CODEX_SERVER_REQUEST_RESOLVED_METHOD:
         # Resolve on the session the elicitation was published on (a child
@@ -3104,10 +3248,10 @@ async def _handle_event(
         session_id=route_session_id,
         event=event,
         method=method,
-        delta_coalescer=delta_coalescer if not is_child else None,
+        delta_coalescer=delta_coalescer,
         elicitation_tracker=elicitation_tracker,
         codex_client=codex_client,
-        forwarder_state=forwarder_state,
+        forwarder_state=event_state,
     ):
         return
     # Child token-usage events must post to the child session, not the
@@ -3118,7 +3262,7 @@ async def _handle_event(
         _SessionUsageCoalescer(
             client,
             route_session_id,
-            model=forwarder_state.model if forwarder_state is not None else None,
+            model=event_state.model if event_state is not None else None,
         )
         if is_child
         else None
@@ -3126,36 +3270,47 @@ async def _handle_event(
     if await _maybe_handle_turn_event(
         client,
         session_id=route_session_id,
-        bridge_dir=bridge_dir if not is_child else None,
+        bridge_dir=event_bridge_dir,
         method=method,
         params=params,
         usage_coalescer=(child_coalescer if child_coalescer is not None else usage_coalescer),
-        delta_coalescer=delta_coalescer if not is_child else None,
+        delta_coalescer=delta_coalescer,
         elicitation_tracker=elicitation_tracker,
         codex_client=codex_client,
-        forwarder_state=forwarder_state if not is_child else None,
+        forwarder_state=event_state,
     ):
         if child_coalescer is not None:
             await child_coalescer.flush()
         return
-    if not is_child and await _maybe_handle_delta_event(
+    if await _maybe_handle_delta_event(
         client,
         session_id=route_session_id,
-        bridge_dir=bridge_dir,
+        bridge_dir=event_bridge_dir,
         method=method,
         params=params,
         delta_coalescer=delta_coalescer,
-        forwarder_state=forwarder_state,
+        forwarder_state=event_state,
     ):
         return
     if method == "item/completed":
+        item = params.get("item")
+        # Nested-spawn registration uses the connection's complete child map.
+        # Transcript dedup and partial text belong only to the routed child.
+        item_state = (
+            forwarder_state
+            if isinstance(item, dict)
+            and item.get("type")
+            in {_CODEX_COLLAB_AGENT_ITEM_TYPE, _CODEX_SUBAGENT_ACTIVITY_ITEM_TYPE}
+            else event_state
+        )
         await _handle_completed_event(
             client,
             session_id=route_session_id,
             params=params,
-            delta_coalescer=delta_coalescer if not is_child else None,
-            forwarder_state=forwarder_state,
-            bridge_dir=bridge_dir,
+            delta_coalescer=delta_coalescer,
+            forwarder_state=item_state,
+            bridge_dir=event_bridge_dir,
+            file_observer_bridge_dir=bridge_dir,
         )
 
 
@@ -3608,7 +3763,7 @@ async def _maybe_fail_turn_on_certificate_failure(
             await codex_client.request(
                 "turn/interrupt", {"threadId": thread_id, "turnId": turn_id}
             )
-        except Exception:  # noqa: BLE001 - the failure is surfaced either way.
+        except Exception:  # the failure is surfaced either way.
             _logger.warning(
                 "Codex turn interrupt after a certificate failure failed", exc_info=True
             )
@@ -3737,7 +3892,7 @@ async def _maybe_handle_turn_event(
                     compaction_model = await asyncio.to_thread(
                         _failed_compaction_model, bridge_dir, selected_model
                     )
-                except Exception:  # noqa: BLE001 - the failure still posts, undiagnosed.
+                except Exception:  # the failure still posts, undiagnosed.
                     _logger.warning("Could not read the Codex rollout's last model", exc_info=True)
             await _post_turn_status_edge(
                 client,
@@ -3836,7 +3991,7 @@ async def _maybe_handle_turn_event(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 _logger.warning(
                     "Failed to persist codex compaction item for %s: %s",
                     session_id,
@@ -3857,7 +4012,7 @@ async def _maybe_handle_delta_event(
     client: httpx.AsyncClient,
     *,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     method: str,
     params: _JsonObject,
     delta_coalescer: _OutputTextDeltaCoalescer | None,
@@ -3918,7 +4073,7 @@ async def _maybe_handle_delta_event(
             _logger.warning("Codex command output delta missing string delta: call_id=%s", call_id)
             return True
         turn_id = _turn_id_from_payload(params)
-        if not _is_active_turn_delta(bridge_dir, turn_id):
+        if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
             _logger.info("Codex forwarder ignored stale command output delta: turn_id=%s", turn_id)
             return True
         await delta_coalescer.append_tool_output(delta, call_id=call_id)
@@ -3939,6 +4094,7 @@ async def _handle_completed_event(
     delta_coalescer: _OutputTextDeltaCoalescer | None,
     forwarder_state: _CodexForwarderState | None,
     bridge_dir: Path | None = None,
+    file_observer_bridge_dir: Path | None = None,
 ) -> None:
     """
     Flush pending text and mirror one completed Codex item.
@@ -3950,6 +4106,7 @@ async def _handle_completed_event(
         before the completed item.
     :param forwarder_state: Optional state that records completed
         Plan-mode items.
+    :param file_observer_bridge_dir: Runner relay directory shared by native children.
     :returns: None.
     """
     if delta_coalescer is not None:
@@ -3957,7 +4114,12 @@ async def _handle_completed_event(
     if forwarder_state is not None:
         forwarder_state.record_completed_plan(params)
     await _handle_completed_item(
-        client, session_id, params, forwarder_state=forwarder_state, bridge_dir=bridge_dir
+        client,
+        session_id,
+        params,
+        forwarder_state=forwarder_state,
+        bridge_dir=bridge_dir,
+        file_observer_bridge_dir=file_observer_bridge_dir,
     )
 
 
@@ -4051,6 +4213,9 @@ async def _handle_terminal_turn_boundary_inner(
         params=params,
         forwarder_state=forwarder_state,
     )
+    terminal_turn_id = _terminal_turn_id_from_params(params)
+    if forwarder_state is not None and terminal_turn_id is not None:
+        forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
     if terminal.edge is not None:
         await _post_turn_status_edge(client, session_id, terminal.edge)
@@ -4135,8 +4300,8 @@ def _handle_turn_diff_updated(
     each carrying the full unified diff so far. Posting every update would
     spam the transcript with a growing diff, so the forwarder only stashes
     the newest diff here and flushes it once at the terminal turn boundary
-    (:func:`_flush_turn_diff`). A no-op without ``forwarder_state`` (child
-    threads / tests that bypass ``supervise_forwarder``).
+    (:func:`_flush_turn_diff`). A no-op without ``forwarder_state`` (tests
+    that bypass ``supervise_forwarder``).
 
     :param params: Codex ``turn/diff/updated`` params, e.g.
         ``{"threadId": "thread_1", "turnId": "turn_1", "diff": "--- a/x\\n..."}``.
@@ -5175,11 +5340,20 @@ def _claim_completed_item(
     item_key, is_anon = _completed_item_key(params, item, forwarder_state)
     if not forwarder_state.claim_item_key(item_key):
         return None
+    thread_id = _thread_id_from_params(params) or "thread"
+    turn_id = params.get("turnId")
+    turn_id = turn_id if isinstance(turn_id, str) and turn_id else "turn"
     if is_anon:
-        thread_id = _thread_id_from_params(params) or "thread"
-        turn_id = params.get("turnId")
-        turn_id = turn_id if isinstance(turn_id, str) and turn_id else "turn"
         forwarder_state.advance_anon_counter(thread_id, turn_id)
+    elif item.get("type") == "userMessage" and isinstance(item.get("content"), list):
+        content = json.dumps(item["content"], sort_keys=True)
+        content_digest = hashlib.sha256(content.encode()).hexdigest()
+        resumed = _CODEX_RESUME_POSITION_ITEM_ID.fullmatch(str(item.get("id"))) is not None
+        if forwarder_state.pair_user_message_copy(
+            (thread_id, turn_id, content_digest), resumed=resumed
+        ):
+            _logger.info("Codex forwarder skipped duplicate user message: key=%s", item_key)
+            return None
     return item_key
 
 
@@ -5190,6 +5364,7 @@ async def _handle_completed_item(
     *,
     forwarder_state: _CodexForwarderState | None = None,
     bridge_dir: Path | None = None,
+    file_observer_bridge_dir: Path | None = None,
 ) -> None:
     """Serialize and forward one completed Codex transcript item."""
     async with _conversation_item_delivery_scope(session_id):
@@ -5199,6 +5374,7 @@ async def _handle_completed_item(
             params,
             forwarder_state=forwarder_state,
             bridge_dir=bridge_dir,
+            file_observer_bridge_dir=file_observer_bridge_dir,
         )
 
 
@@ -5209,6 +5385,7 @@ async def _handle_completed_item_inner(
     *,
     forwarder_state: _CodexForwarderState | None = None,
     bridge_dir: Path | None = None,
+    file_observer_bridge_dir: Path | None = None,
 ) -> None:
     """
     Forward one Codex completed item event when it maps to Omnigent history.
@@ -5263,7 +5440,7 @@ async def _handle_completed_item_inner(
                 await _persist_codex_compaction_item(
                     client, session_id=session_id, bridge_dir=bridge_dir
                 )
-            except Exception as exc:  # noqa: BLE001
+            except Exception as exc:
                 _logger.warning(
                     "Failed to persist codex compaction item for %s: %s",
                     session_id,
@@ -5305,7 +5482,10 @@ async def _handle_completed_item_inner(
         return
     if item_type in _TOOL_ITEM_TYPES:
         if item_type == "fileChange":
-            await _observe_file_change(bridge_dir, item)
+            await _observe_file_change(
+                file_observer_bridge_dir if file_observer_bridge_dir is not None else bridge_dir,
+                item,
+            )
         await _post_tool_item(
             client,
             session_id,
@@ -6008,7 +6188,7 @@ def _collab_parent_thread_id(
 async def _handle_agent_message_delta(
     client: httpx.AsyncClient,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     params: _JsonObject,
     delta_coalescer: _OutputTextDeltaCoalescer,
     forwarder_state: _CodexForwarderState | None,
@@ -6041,7 +6221,7 @@ async def _handle_agent_message_delta(
     if not isinstance(delta, str):
         _logger.warning("Codex agentMessage delta missing string delta: turn_id=%s", turn_id)
         return
-    if not _is_active_turn_delta(bridge_dir, turn_id):
+    if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
@@ -6076,7 +6256,7 @@ async def _handle_agent_message_delta(
 async def _handle_plan_delta(
     client: httpx.AsyncClient,
     session_id: str,
-    bridge_dir: Path,
+    bridge_dir: Path | None,
     params: _JsonObject,
     delta_coalescer: _OutputTextDeltaCoalescer,
     forwarder_state: _CodexForwarderState | None,
@@ -6108,7 +6288,7 @@ async def _handle_plan_delta(
     if not isinstance(delta, str):
         _logger.warning("Codex plan delta missing string delta: turn_id=%s", turn_id)
         return
-    if not _is_active_turn_delta(bridge_dir, turn_id):
+    if bridge_dir is not None and not _is_active_turn_delta(bridge_dir, turn_id):
         edge = _delta_recovery_status_edge(bridge_dir, params, turn_id)
         if edge is not None:
             await _ensure_user_message_posted(client, session_id, params, forwarder_state)
@@ -6183,7 +6363,7 @@ async def _ensure_user_message_posted(
         response = await codex_client.request("thread/resume", {"threadId": thread_id})
     except asyncio.CancelledError:
         raise
-    except Exception:  # noqa: BLE001 - degrade to current behavior on resume failure.
+    except Exception:  # degrade to current behavior on resume failure.
         _logger.warning(
             "Codex forwarder could not resume to recover user message: thread=%s turn=%s",
             thread_id,
@@ -6317,15 +6497,20 @@ async def _post_agent_message(
     text = item.get("text")
     if not isinstance(text, str) or not text:
         return False
+    item_data: _JsonObject = {
+        "role": "assistant",
+        "agent": _AGENT_NAME,
+        "content": [{"type": "output_text", "text": text}],
+    }
+    # Codex labels progress vs. answer text; the web UI folds commentary.
+    phase = item.get("phase")
+    if isinstance(phase, str):
+        item_data["phase"] = phase
     return await _post_external_item(
         client,
         session_id,
         item_type="message",
-        item_data={
-            "role": "assistant",
-            "agent": _AGENT_NAME,
-            "content": [{"type": "output_text", "text": text}],
-        },
+        item_data=item_data,
         response_id=_response_id(params),
         message_id=_completed_streaming_message_id(params, item, "agentMessage"),
         source_id=source_id or _source_id(params, item),
@@ -6944,6 +7129,24 @@ async def _post_turn_status_edge(
         edge.source,
         edge.turn_id,
         edge.status,
+        extra=debug_event(
+            "codex_turn_status",
+            session_id=session_id,
+            turn_id=edge.turn_id,
+            status=edge.status,
+            protocol_source=edge.source[:128],
+            has_turn_id=edge.turn_id is not None,
+            has_error=edge.error is not None,
+            native_error_kind=edge.error.kind if edge.error is not None else None,
+            native_error_reason=(
+                "thread_persistence_shutdown"
+                if edge.error is not None
+                and "failed to shutdown thread persistence" in edge.error.message[:4096].casefold()
+                else "unclassified"
+                if edge.error is not None
+                else None
+            ),
+        ),
     )
     response_id = _response_id(_params_with_turn_id({}, edge.turn_id)) if edge.turn_id else None
     output: str | None = None
@@ -7171,7 +7374,7 @@ async def _persist_codex_compaction_item(
             rollout = _latest_thread_rollout(state) if state is not None else None
             if rollout is not None:
                 compacted = _read_compacted_history(rollout)
-        except Exception:  # noqa: BLE001
+        except Exception:
             _logger.debug(
                 "Failed to read codex rollout for compaction persist",
                 exc_info=True,
@@ -7721,7 +7924,7 @@ async def _replay_dead_letters_before_resume(
             max_records=_REPLAY_MAX_RECORDS,
             deadline_seconds=_REPLAY_DEADLINE_SECONDS,
         )
-    except Exception:  # noqa: BLE001 - replay must never block resume.
+    except Exception:  # replay must never block resume.
         _logger.warning("Codex dead-letter replay before resume failed", exc_info=True)
 
 
@@ -8582,10 +8785,10 @@ def _completed_item_key(
     Build a total dedup key for one durable Codex transcript item.
 
     The key is always non-empty so dedup is never silently disabled.
-    Items with stable Codex-assigned ``id`` fields use
-    ``threadId:turnId:item.id`` — identical across replay and live
-    deliveries of the same item, so the second delivery is correctly
-    dropped by the dedup gate.
+    Items with Codex-assigned ``id`` fields use ``threadId:turnId:item.id``.
+    Completed turns reuse live ids on replay; an in-progress turn's resumed
+    user input instead has a positional id that
+    :meth:`_CodexForwarderState.pair_user_message_copy` matches by content.
 
     Items without a stable ``id`` fall back to a per-(thread, turn)
     positional counter. The counter is peeked here and only advanced by

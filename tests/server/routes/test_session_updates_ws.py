@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 import pytest
 from fastapi import FastAPI
@@ -348,6 +348,25 @@ def test_cleared_field_pushes_explicit_null(app: FastAPI, stores, fast_rescan: N
         # the client can overlay-clear the stale runner_id.
         assert "runner_id" in item
         assert item["runner_id"] is None
+
+
+def test_harness_override_is_streamed_and_cleared(app: FastAPI, stores, fast_rescan: None) -> None:
+    """Harness grouping follows streamed overrides and clears an unknown harness."""
+    conversation_store = stores[0]
+    session_id = _seed_session(stores, owner=ALICE, title="custom agent")
+    conversation_store.update_conversation(session_id, harness_override="pi")
+    with TestClient(app).websocket_connect(
+        "/v1/sessions/updates", headers={"X-Forwarded-Email": ALICE}
+    ) as ws:
+        ws.send_text(json.dumps({"type": "watch", "session_ids": [session_id]}))
+        snapshot = _recv_until(ws, {"snapshot"})
+        assert snapshot["items"][0]["harness"] == "pi"
+        conversation_store.update_conversation(session_id, _unset_harness_override=True)
+        changed = _recv_until(ws, {"changed"})
+        item = {item["id"]: item for item in changed["items"]}[session_id]
+        # The seeded agent has no bundle, so its default harness is unknown.
+        assert "harness" in item
+        assert item["harness"] is None
 
 
 def test_no_change_emits_no_changed_frame(app: FastAPI, stores, fast_rescan: None) -> None:
@@ -777,7 +796,7 @@ def test_daily_cost_recorded_for_owned_session_without_a_policy(app: FastAPI, st
     regression that re-added the gate would leave ``get_daily_cost`` at 0.0.
     """
     conversation_store = stores[0]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     sid = _seed_session(stores, owner=ALICE, title="no-policy session")
     resp = TestClient(app).post(
         f"/v1/sessions/{sid}/events",
@@ -801,7 +820,7 @@ def test_daily_cost_tracks_display_cost_not_policy_cost(app: FastAPI, stores) ->
     the rollup would over-report the daily total by the gate's mid-turn lead.
     """
     conversation_store = stores[0]
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
     sid = _seed_session(stores, owner=ALICE, title="cost split session")
     resp = TestClient(app).post(
         f"/v1/sessions/{sid}/events",
@@ -836,7 +855,7 @@ def test_daily_cost_attributed_via_root_for_sub_agent_without_owner_grant(
     cumulative spend on the child, and asserts the owner's daily total rises.
     """
     conversation_store, _agent_store, _permission_store = stores
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    today = datetime.now(UTC).strftime("%Y-%m-%d")
 
     # Parent session — owned by Alice.
     parent_id = _seed_session(stores, owner=ALICE, title="parent session")

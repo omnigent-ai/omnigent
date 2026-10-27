@@ -89,10 +89,25 @@ afterEach(() => {
 });
 
 describe("loadAllSessions", () => {
-  it("takes a quick first page without a preview, then full pages, and returns only server rows", async () => {
+  it("takes a quick first page, follows filtered cursors, and returns only owned server rows", async () => {
+    vi.mocked(identity.resolveIdentity).mockResolvedValue("me");
     vi.mocked(identity.authenticatedFetch)
-      .mockResolvedValueOnce(jsonResponse(page([session("a", 9), session("b", 8)], "b", true)))
-      .mockResolvedValueOnce(jsonResponse(page([session("c", 7)], null, false)));
+      .mockResolvedValueOnce(
+        jsonResponse(
+          page(
+            [
+              session("a", 9, { owner: "me" }),
+              session("b", 8),
+              session("shared", 7, { owner: "someone-else", permission_level: 4 }),
+            ],
+            "shared",
+            true,
+          ),
+        ),
+      )
+      .mockResolvedValueOnce(
+        jsonResponse(page([session("c", 6, { owner: "me", permission_level: 1 })], null, false)),
+      );
     const progress: { ids: string[]; hasMore: boolean }[] = [];
 
     const result = await loadAllSessions([], (update) =>
@@ -104,10 +119,10 @@ describe("loadAllSessions", () => {
       String(INITIAL_SESSION_PAGE_LIMIT),
       String(SESSION_PAGE_LIMIT),
     ]);
-    expect(queries[1].get("after")).toBe("b");
+    expect(queries[1].get("after")).toBe("shared");
     expect(queries[0].get("kind")).toBe("default");
     expect(queries[0].get("sort_by")).toBe("updated_at");
-    expect(queries.map((query) => query.get("visibility"))).toEqual(["all", "all"]);
+    expect(queries.map((query) => query.get("visibility"))).toEqual(["mine", "mine"]);
     expect(progress).toEqual([
       { ids: ["a", "b"], hasMore: true },
       { ids: ["a", "b", "c"], hasMore: false },
@@ -116,7 +131,12 @@ describe("loadAllSessions", () => {
   });
 
   it("starts with a full page when a preview exists and keeps the preview merged until complete", async () => {
-    const preview = [session("p", 5), session("a", 9)];
+    resolveViewer();
+    const preview = [
+      session("p", 5),
+      session("a", 9),
+      session("shared", 10, { owner: "someone-else" }),
+    ];
     vi.mocked(identity.authenticatedFetch)
       .mockResolvedValueOnce(jsonResponse(page([session("a", 9)], "a", true)))
       .mockResolvedValueOnce(jsonResponse(page([session("z", 1)], null, false)));
@@ -166,10 +186,20 @@ describe("loadAllSessions", () => {
     vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(jsonResponse({}, 503));
     await expect(loadAllSessions([], () => undefined)).rejects.toThrow("503");
   });
+
+  it("does not confirm an empty list when identity fails but owned sessions arrive", async () => {
+    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
+      jsonResponse(page([session("owned", 1, { owner: "me" })], null, false)),
+    );
+    const onProgress = vi.fn();
+    await expect(loadAllSessions([], onProgress)).rejects.toThrow("determine session ownership");
+    expect(onProgress).not.toHaveBeenCalled();
+  });
 });
 
 describe("cachedSessionPreview", () => {
-  it("reads top-level active rows from the sidebar cache, newest first, capped", () => {
+  it("reads only owned top-level active rows, newest first, capped, without guessing identity", () => {
+    resolveViewer();
     const client = new QueryClient();
     client.setQueryData(["conversations", "", true], {
       pageParams: [undefined],
@@ -177,7 +207,10 @@ describe("cachedSessionPreview", () => {
         page(
           [
             session("old", 1),
-            session("new", 3),
+            session("legacy-admin", 2, { permission_level: 4 }),
+            session("new", 3, { owner: "me", permission_level: 1 }),
+            session("shared-grant", 4, { permission_level: 1 }),
+            session("shared-owner", 5, { owner: "someone-else", permission_level: 4 }),
             session("archived", 9, { archived: true }),
             session("child", 8, { parent_session_id: "new" }),
           ],
@@ -186,23 +219,42 @@ describe("cachedSessionPreview", () => {
         ),
       ],
     });
-    expect(cachedSessionPreview(client).map((row) => row.id)).toEqual(["new", "old"]);
+    expect(cachedSessionPreview(client).map((row) => row.id)).toEqual([
+      "new",
+      "legacy-admin",
+      "old",
+    ]);
     expect(cachedSessionPreview(client, 1).map((row) => row.id)).toEqual(["new"]);
+    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
+    expect(cachedSessionPreview(client).map((row) => row.id)).toEqual(["legacy-admin", "old"]);
   });
 });
 
 describe("applyLiveRows", () => {
-  it("takes fresher live rows, ignores older ones, and drops rows that became archived", () => {
+  it("takes fresher rows, ignores older ones, and drops archived or newly shared sessions", () => {
+    resolveViewer();
     const stale = session("a", 5, { status: "idle", title: null });
     const untouched = session("b", 7);
-    const olderInCache = session("c", 9);
+    const olderInCache = session("c", 9, { owner: "me" });
     const live = new Map([
       ["a", session("a", 5, { status: "running", title: "Named" })],
       ["b", session("b", 7)],
-      ["c", session("c", 3, { status: "running" })],
+      ["c", session("c", 3, { status: "running", owner: "someone-else" })],
       ["d", session("d", 8, { archived: true })],
+      ["e", session("e", 8, { owner: "someone-else" })],
+      ["f", session("f", 8, { permission_level: 1 })],
     ]);
-    const next = applyLiveRows([stale, untouched, olderInCache, session("d", 8)], live);
+    const next = applyLiveRows(
+      [
+        stale,
+        untouched,
+        olderInCache,
+        session("d", 8),
+        session("e", 8, { owner: "me" }),
+        session("f", 8, { permission_level: 4 }),
+      ],
+      live,
+    );
     expect(next.map((row) => [row.id, row.status, row.title])).toEqual([
       ["a", "running", "Named"],
       ["b", "idle", "b"],
@@ -386,17 +438,19 @@ describe("useCanvasSessions", () => {
     });
   });
 
-  it("waits for identity before reading a viewer-scoped reload cache", async () => {
-    resolveViewer();
-    const firstClient = new QueryClient();
-    vi.mocked(identity.authenticatedFetch).mockResolvedValueOnce(
-      jsonResponse(page([session("a", 9), session("b", 8)], null, false)),
+  it("waits for identity before restoring only owned rows from a legacy reload cache", async () => {
+    window.sessionStorage.setItem(
+      "omnigent:canvas-sessions:server-a:me",
+      JSON.stringify({
+        version: 1,
+        sessions: [
+          session("a", 9, { owner: "me" }),
+          session("b", 8),
+          session("shared-owner", 7, { owner: "someone-else", permission_level: 4 }),
+          session("shared-grant", 6, { permission_level: 1 }),
+        ],
+      }),
     );
-    const first = renderHook(() => useCanvasSessions(), { wrapper: wrapper(firstClient) });
-    await waitFor(() => expect(first.result.current.complete).toBe(true));
-    first.unmount();
-
-    vi.mocked(identity.getCurrentUserId).mockReturnValue(null);
     vi.mocked(identity.resolveIdentity).mockResolvedValue("me");
     const reloadedClient = new QueryClient();
     reloadedClient.setQueryData(["conversations", "", true], {

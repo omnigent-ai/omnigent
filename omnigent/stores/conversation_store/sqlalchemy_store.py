@@ -98,6 +98,8 @@ from omnigent.stores.conversation_store import (
     FORK_CARRY_HISTORY_LABEL_KEY,
     FORK_SOURCE_EXTERNAL_SESSION_LABEL_KEY,
     FORK_SOURCE_LABEL_KEY,
+    MAX_PENDING_INPUTS,
+    PENDING_INPUT_RESPONSE_ID,
     PINNED_LABEL_KEY,
     PROJECT_LABEL_KEY,
     ConversationAlreadyExistsError,
@@ -159,6 +161,31 @@ def _encode_session_state(
 # to the connection's next pooled use. Longer than the client's own
 # ``SEARCH_FETCH_TIMEOUT_MS`` so the browser gives up first on the happy path.
 _SEARCH_STATEMENT_TIMEOUT_MS = 15_000
+
+# ``list_conversations(search_scope=...)`` values; see its docstring.
+_SEARCH_SCOPES = frozenset({"all", "title", "content"})
+
+# Escapes LIKE wildcards in a search query. ``/``, as SQLAlchemy's own
+# ``autoescape`` uses, sidesteps MySQL's backslash handling in string literals.
+_LIKE_ESCAPE = "/"
+
+
+def _like_contains_pattern(query: str) -> str:
+    """
+    Return a lowercase ``LIKE`` pattern matching ``query`` as a literal substring.
+
+    :param query: The user's search string, e.g. ``"50%_off"``.
+    :returns: The pattern with ``%``, ``_`` and the escape character escaped,
+        e.g. ``"%50/%/_off%"``; pass ``escape=_LIKE_ESCAPE`` alongside it.
+    """
+    escaped = (
+        query.lower()
+        .replace(_LIKE_ESCAPE, _LIKE_ESCAPE * 2)
+        .replace("%", f"{_LIKE_ESCAPE}%")
+        .replace("_", f"{_LIKE_ESCAPE}_")
+    )
+    return f"%{escaped}%"
+
 
 # Upper bound on rows fetched per SQL statement when listing conversation
 # items. A deployed managed-Postgres backend failed one oversized read of a
@@ -658,7 +685,7 @@ def _fetch_search_snippets(
     """
     if not conversation_ids or not query:
         return {}
-    pattern = f"%{query.lower()}%"
+    pattern = _like_contains_pattern(query)
     workspace_id = current_workspace_id()
     # workspace_id leads the (workspace_id, conversation_id, position) index.
     # Both the aggregate and the join-back below must include it or Postgres
@@ -670,7 +697,7 @@ def _fetch_search_snippets(
     match_pred = and_(
         SqlConversationItem.workspace_id == workspace_id,
         SqlConversationItem.conversation_id.in_(conversation_ids),
-        SqlConversationItem.search_text.ilike(pattern),
+        SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE),
     )
     # Earliest matching position per conversation — a small (conv_id, position)
     # aggregate, no bodies materialized.
@@ -2141,6 +2168,94 @@ class SqlAlchemyConversationStore(ConversationStore):
             decoded = self._decode_item_data_batch([r.data for r in ordered])
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
 
+    def list_host_conversation_ids(
+        self,
+        host_id: str,
+        *,
+        after: str | None = None,
+        limit: int = 32,
+    ) -> list[str]:
+        if not 1 <= limit <= 100:
+            raise ValueError("limit must be between 1 and 100")
+        query = select(SqlConversationMetadata.id).where(
+            SqlConversationMetadata.workspace_id == current_workspace_id(),
+            SqlConversationMetadata.host_id == host_id,
+        )
+        if after is not None:
+            query = query.where(SqlConversationMetadata.id > after)
+        with self._session("list_host_conversations") as session:
+            return list(session.scalars(query.order_by(SqlConversationMetadata.id).limit(limit)))
+
+    def list_pending_inputs_page(
+        self,
+        conversation_id: str,
+        *,
+        after: int | None = None,
+        limit: int = MAX_PENDING_INPUTS,
+    ) -> tuple[list[ConversationItem], int | None]:
+        # The cursor is the last returned position. The response-id index bounds
+        # the read to the conversation's pending rows (append caps them at
+        # MAX_PENDING_INPUTS), so ordering them by position stays small.
+        query = select(SqlConversationItem).where(
+            SqlConversationItem.workspace_id == current_workspace_id(),
+            SqlConversationItem.conversation_id == conversation_id,
+            SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
+        )
+        if after is not None:
+            query = query.where(SqlConversationItem.position > after)
+        with self._conv_session("list_pending_inputs") as session:
+            rows = list(
+                session.scalars(
+                    query.order_by(SqlConversationItem.position, SqlConversationItem.id).limit(
+                        limit + 1
+                    )
+                )
+            )
+        more = len(rows) > limit
+        rows = rows[:limit]
+        decoded = self._decode_item_data_batch([row.data for row in rows])
+        items = [_to_item(row, data) for row, data in zip(rows, decoded, strict=True)]
+        return items, rows[-1].position if more else None
+
+    def transition_pending_input(
+        self,
+        conversation_id: str,
+        item_id: str,
+        *,
+        expected: str,
+        status: str | None,
+    ) -> bool:
+        item = self.get_item(conversation_id, item_id)
+        if item is None or item.response_id != PENDING_INPUT_RESPONSE_ID:
+            return False
+
+        def write(session: Session) -> bool:
+            self._lock_conversation(session, conversation_id)
+            row = session.get(
+                SqlConversationItem,
+                (
+                    current_workspace_id(),
+                    conversation_id,
+                    item_id,
+                    item.created_at,
+                ),
+            )
+            if (
+                row is None
+                or row.response_id != PENDING_INPUT_RESPONSE_ID
+                or row.status != encode_item_status(expected)
+            ):
+                return False
+            if status is None:
+                session.delete(row)
+            else:
+                row.status = encode_item_status(status)
+            return True
+
+        return run_write_transaction(
+            self._conv_session_immediate, "transition_pending_input", write
+        )
+
     def get_item(self, conversation_id: str, item_id: str) -> ConversationItem | None:
         """
         Fetch one persisted item by id, or ``None`` when absent.
@@ -2219,6 +2334,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(
                     SqlConversationItem.workspace_id == current_workspace_id(),
                     SqlConversationItem.conversation_id == conversation_id,
+                    SqlConversationItem.response_id != PENDING_INPUT_RESPONSE_ID,
                 )
             )
             if type is not None:
@@ -2434,7 +2550,6 @@ class SqlAlchemyConversationStore(ConversationStore):
         ]
         encoded_data = self._encode_item_data_batch(raw_jsons)
         workspace_id = current_workspace_id()
-        completed_status = encode_item_status("completed")
         # Precompute per-item row values (sans position) BEFORE the write
         # transaction so a CockroachDB 40001 replay reuses the same generated
         # ids: a retry must be indistinguishable from the first attempt. A
@@ -2443,6 +2558,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         prepared_rows: list[tuple[NewConversationItem, dict[str, object], str | None]] = []
         for item, data in zip(items, encoded_data, strict=True):
             search = self._item_search_text(item)
+            if item.response_id == PENDING_INPUT_RESPONSE_ID and search is not None:
+                search = ""
             item_id = item.stable_id or generate_item_id(item.type)
             values: dict[str, object] = {
                 "workspace_id": workspace_id,
@@ -2450,7 +2567,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 "conversation_id": conversation_id,
                 "response_id": item.response_id,
                 "created_at": now,
-                "status": completed_status,
+                "status": encode_item_status(item.status),
                 "type": encode_item_type(item.type),
                 "data": data,
                 "created_by": item.created_by,
@@ -2493,8 +2610,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .scalars()
                     .all()
                 )
-                decoded = self._decode_item_data_batch([row.data for row in existing_rows])
+                replaced_ids = {item.replaces_pending_id for item in items}
+                existing_rows = [
+                    row
+                    for row in existing_rows
+                    if not (
+                        row.id in replaced_ids and row.response_id == PENDING_INPUT_RESPONSE_ID
+                    )
+                ]
                 existing_by_id = {row.id: row for row in existing_rows}
+                decoded = self._decode_item_data_batch([row.data for row in existing_rows])
                 deduped_by_id.update(
                     {
                         row.id: _to_item(row, data).model_copy(update={"deduplicated": True})
@@ -2512,6 +2637,54 @@ class SqlAlchemyConversationStore(ConversationStore):
                         for item in items
                         if item.stable_id is not None
                     ]
+
+            replacements: dict[str, tuple[int, int]] = {}
+            for item, prepared, _ in prepared_rows:
+                if item.replaces_pending_id is None or item.stable_id in existing_by_id:
+                    continue
+                row = session.scalar(
+                    select(SqlConversationItem)
+                    .where(
+                        SqlConversationItem.workspace_id == workspace_id,
+                        SqlConversationItem.conversation_id == conversation_id,
+                        SqlConversationItem.id == item.replaces_pending_id,
+                        SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
+                    )
+                    .limit(1)
+                )
+                if row is not None:
+                    replacements[cast(str, prepared["id"])] = (row.position, row.created_at)
+                    session.execute(
+                        delete(SqlConversationItem).where(
+                            SqlConversationItem.workspace_id == workspace_id,
+                            SqlConversationItem.conversation_id == conversation_id,
+                            SqlConversationItem.id == row.id,
+                            SqlConversationItem.created_at == row.created_at,
+                        )
+                    )
+
+            new_pending = {
+                cast(str, values["id"])
+                for item, values, _ in prepared_rows
+                if item.response_id == PENDING_INPUT_RESPONSE_ID
+                and item.stable_id not in existing_by_id
+            }
+            if new_pending:
+                queued = list(
+                    session.scalars(
+                        select(SqlConversationItem.id)
+                        .where(
+                            SqlConversationItem.workspace_id == workspace_id,
+                            SqlConversationItem.conversation_id == conversation_id,
+                            SqlConversationItem.response_id == PENDING_INPUT_RESPONSE_ID,
+                        )
+                        .limit(MAX_PENDING_INPUTS)
+                    )
+                )
+                if len(queued) + len(new_pending) > MAX_PENDING_INPUTS:
+                    raise OmnigentError(
+                        "Too many messages waiting for startup", code=ErrorCode.CONFLICT
+                    )
 
             conv_row = session.get(SqlConversation, (current_workspace_id(), conversation_id))
             has_new_conversation_activity = any(
@@ -2565,23 +2738,24 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                         continue
                 position = next_pos
-                next_pos += 1
                 values = dict(prepared)
+                replacement = replacements.get(cast(str, values["id"]))
+                if replacement is not None:
+                    position, values["created_at"] = replacement
+                else:
+                    next_pos += 1
                 values["position"] = position
                 item_id = cast(str, values["id"])
-                if search is not None:
+                if search:
                     fts_rows.append((item_id, conversation_id, search))
                 row_values.append(values)
                 persisted.append(
                     ConversationItem(
                         id=item_id,
-                        # The row stores int codes; the entity carries the
-                        # string names. item.type is the source string and
-                        # the status was just written as "completed".
                         type=item.type,
-                        status="completed",
+                        status=item.status,
                         response_id=item.response_id,
-                        created_at=now,
+                        created_at=cast(int, values["created_at"]),
                         data=item.data,
                         created_by=item.created_by,
                     )
@@ -2762,6 +2936,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         order: str = "desc",
         sort_by: str = "created_at",
         search_query: str | None = None,
+        search_scope: str = "all",
         accessible_by: str | None = None,
         owned_by: str | None = None,
         shared_only: bool = False,
@@ -2812,6 +2987,11 @@ class SqlAlchemyConversationStore(ConversationStore):
             query. Implemented with the SQL ``LIKE`` operator
             (no FTS) so it works against both SQLite and
             Postgres without extra extensions.
+        :param search_scope: Which matches ``search_query`` returns:
+            ``"all"`` (title or content), ``"title"`` (title matches
+            only), or ``"content"`` (content matches whose title does
+            not match), so the two groups never overlap. Ignored when
+            ``search_query`` is empty.
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
@@ -2840,6 +3020,7 @@ class SqlAlchemyConversationStore(ConversationStore):
             ``False`` (default) disables the filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
+        :raises ValueError: If ``search_scope`` is not a known scope.
         """
         from omnigent.server.auth import LEVEL_OWNER
 
@@ -2865,6 +3046,8 @@ class SqlAlchemyConversationStore(ConversationStore):
         needs_meta_filter = (accessible_by is not None) or (owned_by is not None) or shared_only
         if shared_only and accessible_by is None:
             raise ValueError("shared_only=True requires accessible_by to be set")
+        if search_scope not in _SEARCH_SCOPES:
+            raise ValueError(f"invalid search_scope: {search_scope!r}")
 
         # ACL strategy. Single-DB (the AP and Omnigent tables share one bind):
         # push the permission check into the conversations query as a
@@ -3030,8 +3213,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             if title is not None:
                 stmt = stmt.where(SqlConversation.title == title)
             if search_query:
-                pattern = f"%{search_query.lower()}%"
-                title_match = func.lower(SqlConversation.title).like(pattern)
+                pattern = _like_contains_pattern(search_query)
+                title_match = func.lower(SqlConversation.title).like(pattern, escape=_LIKE_ESCAPE)
                 # Correlated EXISTS rather than ``id IN (SELECT ...)``: the IN
                 # form is uncorrelated, so the match set is built for the WHOLE
                 # workspace before the outer query discards every row the caller
@@ -3051,11 +3234,16 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .where(
                         SqlConversationItem.workspace_id == current_workspace_id(),
                         SqlConversationItem.conversation_id == SqlConversation.id,
-                        SqlConversationItem.search_text.ilike(pattern),
+                        SqlConversationItem.search_text.ilike(pattern, escape=_LIKE_ESCAPE),
                     )
                     .exists()
                 )
-                stmt = stmt.where(or_(title_match, content_match))
+                if search_scope == "title":
+                    stmt = stmt.where(title_match)
+                elif search_scope == "content":
+                    stmt = stmt.where(~title_match, content_match)
+                else:
+                    stmt = stmt.where(or_(title_match, content_match))
             if project is not None:
                 # Dual-read by project NAME: a session is "in <name>" if it has
                 # EITHER the first-class membership (metadata.project_id → the
@@ -3187,7 +3375,9 @@ class SqlAlchemyConversationStore(ConversationStore):
             # search_snippet=None — the title already shows the hit. Items
             # are AP-side, so this must run inside the conv session.
             snippets = (
-                _fetch_search_snippets(session, row_ids, search_query) if search_query else {}
+                _fetch_search_snippets(session, row_ids, search_query)
+                if search_query and search_scope != "title"
+                else {}
             )
             # Build AP-only entities; metadata fetched separately below.
             ap_entities = [(r, labels_by_conv.get(r.id, {})) for r in rows]
@@ -4801,6 +4991,7 @@ class SqlAlchemyConversationStore(ConversationStore):
                 .where(
                     SqlConversationItem.workspace_id == current_workspace_id(),
                     SqlConversationItem.conversation_id == source_conversation_id,
+                    SqlConversationItem.response_id != PENDING_INPUT_RESPONSE_ID,
                 )
                 .order_by(SqlConversationItem.position.asc())
             )
@@ -4879,6 +5070,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     mapped_boundary_id = copied_item_ids.get(boundary_id)
                     if mapped_boundary_id is not None:
                         compaction_data["last_item_id"] = mapped_boundary_id
+                    # Replay snapshots own attachment references just like message rows.
+                    if file_id_map:
+                        for message in compaction_data.get("compacted_messages") or []:
+                            if isinstance(message, dict):
+                                _remap_item_file_references(message, file_id_map, new_conv_id)
                     remapped.append(json.dumps(compaction_data))
                 remapped_compaction_data = dict(
                     zip(

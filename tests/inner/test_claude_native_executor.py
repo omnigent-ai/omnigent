@@ -1759,9 +1759,10 @@ async def test_run_turn_reports_a_refused_routed_model_switch_as_undelivered(
         (False, "pending_prompt"),
         (True, "pending_prompt"),
         (True, "draft_persisted"),
+        (True, "capture_lost"),
         (False, "missing_target"),
     ],
-    ids=["before_submit", "after_submit", "draft_not_accepted", "missing_target"],
+    ids=["before_submit", "after_submit", "draft_not_accepted", "capture_lost", "missing_target"],
 )
 async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_ambiguous(
     monkeypatch: pytest.MonkeyPatch,
@@ -1782,13 +1783,19 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     def run_tmux(socket_path: str, *args: str) -> None:
         nonlocal pane, enters, prompt_pending
         del socket_path
-        if args[0] == "paste-buffer":
+        if args[-1] == "Space":
+            pane = "──────\n❯ \n──────\n"
+        elif args[0] == "send-keys" and "-l" in args:
+            pane = "❯ "
+        elif args[0] == "paste-buffer":
             pane = "❯ review this function"
             prompt_pending = not submitted
         elif args[-1] == "Enter":
             # The draft stays visible, so submit verification looks to retry.
             enters += 1
             prompt_pending = refusal == "pending_prompt"
+            if refusal == "capture_lost":
+                pane = ""
 
     if refusal == "missing_target":
         wait_for_target = claude_bridge._wait_for_tmux_info
@@ -1840,10 +1847,11 @@ async def test_run_turn_preserves_refused_input_but_keeps_post_submit_failures_a
     expected_detail = {
         "pending_prompt": "waiting for an explicit answer",
         "draft_persisted": "draft is still in the input box",
+        "capture_lost": "delivery could not be confirmed",
         "missing_target": "tmux target is not advertised",
     }[refusal]
     assert expected_detail in error.message
-    assert error.undelivered is (refusal != "pending_prompt" or not submitted)
+    assert error.undelivered is (refusal in {"draft_persisted", "missing_target"} or not submitted)
 
 
 @pytest.mark.asyncio

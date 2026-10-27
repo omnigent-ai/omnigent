@@ -2,7 +2,10 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -57,3 +60,42 @@ async def test_repop_swallows_databricks_auth_error(
     records = [r for r in caplog.records if "cost popup" in r.getMessage()]
     assert records
     assert all(r.levelno <= logging.WARNING and r.exc_info is None for r in records)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("harness", ["claude-native", "codex-native", "opencode-native"])
+async def test_cost_popup_resolves_credentials_outside_event_loop(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, harness: str
+) -> None:
+    captured: dict[str, Any] = {}
+    real_build = runner_app.build_native_controls
+
+    def spy_build(**kwargs: Any) -> Any:
+        captured.update(kwargs)
+        return real_build(**kwargs)
+
+    def token() -> str:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        return "mock-popup-token"
+
+    def make_factory() -> Any:
+        with pytest.raises(RuntimeError, match="no running event loop"):
+            asyncio.get_running_loop()
+        return token
+
+    monkeypatch.setattr(runner_app, "build_native_controls", spy_build)
+    monkeypatch.setenv("RUNNER_SERVER_URL", "http://ap.example")
+    monkeypatch.setattr("omnigent.runner._entry._make_auth_token_factory", make_factory)
+    for adapter in ("claude_native", "codex_native", "opencode_native"):
+        monkeypatch.setattr(
+            f"omnigent.harnesses.{adapter}.bridge._BRIDGE_ROOT", tmp_path / adapter
+        )
+    create_runner_app(server_client=NullServerClient())  # type: ignore[arg-type]
+
+    config_path = await captured["_native_cost_popup_config_file"]("conv-popup", harness)
+    assert config_path.is_relative_to(tmp_path)
+    assert json.loads(config_path.read_text()) == {
+        "ap_server_url": "http://ap.example",
+        "ap_auth_headers": {"Authorization": "Bearer mock-popup-token"},
+    }

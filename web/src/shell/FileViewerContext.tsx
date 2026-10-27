@@ -11,6 +11,8 @@ import { createContext, useContext } from "react";
 export interface FilePosition {
   line: number;
   column?: number;
+  /** Last line of a cited range (`file.ts:10-20`), greater than `line`. */
+  endLine?: number;
 }
 
 export type OpenFileOptions = Partial<FilePosition>;
