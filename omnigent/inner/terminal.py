@@ -30,7 +30,6 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, TypeAlias, cast
 
 from omnigent._platform import IS_WINDOWS
-from omnigent.cli_invocation import cli_invocation
 from omnigent.debug_logging import debug_event
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.native import owner_claim
@@ -46,6 +45,7 @@ from .agent_env import strip_desktop_session_env
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
+from .node_cmd_shim import node_cmd_shim_argv
 from .os_env import (
     OSEnvironment,
     _copy_tree,
@@ -923,7 +923,8 @@ def reap_orphaned_terminals() -> int:
         if claim is None or not owner_claim.owner_is_gone(claim, process_alive=_process_alive):
             continue
         socket_path = entry / "tmux.sock"
-        had_socket = socket_path.exists()
+        # A Windows tmux may name its server by this path without creating a file.
+        had_socket = socket_path.exists() or IS_WINDOWS
         if had_socket:
             try:
                 result = subprocess.run(
@@ -1692,7 +1693,8 @@ class TerminalInstance:
                 raise
             inner_cmd = [launcher_path, *self.args]
         else:
-            inner_cmd = [self.command, *self.args]
+            # A Windows tmux refuses a .cmd shim, which needs cmd.exe to parse its arguments.
+            inner_cmd = [*(node_cmd_shim_argv(self.command) or [self.command]), *self.args]
         if self.program_status_app is not None:
             status_path = self.private_dir / "program-status.json"
             status_path.unlink(missing_ok=True)
@@ -1710,6 +1712,11 @@ class TerminalInstance:
         inner_str = shlex.join(inner_cmd)
         if self.tmux_start_on_attach:
             inner_str = f"tmux wait-for {_TMUX_START_ON_ATTACH_CHANNEL}; exec {inner_str}"
+        pane_command = [inner_str]
+        if IS_WINDOWS:
+            # A Windows tmux runs a joined command through cmd.exe, which does
+            # not understand POSIX quoting; the argv after "--" runs as given.
+            pane_command = ["--", *inner_cmd]
 
         option_commands = [
             *_tmux_managed_option_commands(
@@ -1724,6 +1731,10 @@ class TerminalInstance:
                 self.conversation_link or _TMUX_EMPTY_OPTION_VALUE,
             ],
         ]
+        if IS_WINDOWS:
+            # Windows has no terminfo; its programs draw Unicode only for a
+            # TERM they know, and Claude Code draws ">" under tmux-256color.
+            option_commands.append(["set-option", "-g", "default-terminal", "xterm-256color"])
         if self.tmux_start_on_attach:
             option_commands.append(
                 [
@@ -1762,7 +1773,7 @@ class TerminalInstance:
                         "24",
                         "-c",
                         host_cwd,
-                        inner_str,
+                        *pane_command,
                     ],
                     *pane_died_hook,
                 ]
@@ -2016,7 +2027,7 @@ class TerminalInstance:
         # observe a failure. A private socket can still belong to a live tmux
         # server (or a remain-on-exit pane), so cleanup must not trust that
         # advisory flag before issuing kill-server.
-        if self.running or self.socket_path.exists():
+        if self.running or self.socket_path.exists() or IS_WINDOWS:
             with contextlib.suppress(RuntimeError):
                 await self._tmux("kill-server")
         self.running = False
@@ -2825,12 +2836,6 @@ def create_terminal_instance(
     :returns: A :class:`TerminalCreateResult` carrying the new instance
         and the resolved cwd to pass to ``launch()``.
     """
-    if IS_WINDOWS:
-        raise RuntimeError(
-            "Native terminal harnesses (tmux/PTY) are not supported on Windows. "
-            f"Run an SDK-based harness via `{cli_invocation()} run <agent.yaml>` (e.g. the "
-            "claude-sdk, cursor, copilot, or codex harness) or use the web UI."
-        )
     _require_supported_tmux()
 
     # Create the instance's private directory.
@@ -2939,6 +2944,8 @@ def create_terminal_instance(
         tmux_start_on_attach=spec.tmux_start_on_attach,
         keep_alive_after_exit=spec.keep_alive_after_exit,
     )
-    instance._clipboard_bridge = TerminalClipboardBridge(private_dir, socket_path)
+    # The copy helper needs AF_UNIX sockets, which Python on Windows lacks.
+    if not IS_WINDOWS:
+        instance._clipboard_bridge = TerminalClipboardBridge(private_dir, socket_path)
 
     return TerminalCreateResult(instance=instance, cwd=cwd)

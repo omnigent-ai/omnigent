@@ -287,8 +287,9 @@ async def _reveal_claude_row(page: Any) -> Any:
     return row
 
 
-def test_windows_host_native_agent_carries_warning_badge(live_server: str) -> None:
-    """A native agent on a simulated Windows host carries a warning badge."""
+def test_windows_host_ready_native_agent_stays_unbadged(live_server: str) -> None:
+    """A ready native agent on a simulated Windows host is not badged: native
+    terminals run there through a Windows tmux."""
     real_map = _daemon_readiness_map(simulate_windows=False, credentialed=True)
     if real_map.get(_HARNESS) is not True:
         pytest.skip(
@@ -301,27 +302,7 @@ def test_windows_host_native_agent_carries_warning_badge(live_server: str) -> No
             "Windows simulation broke the CLI probe itself "
             f"(readiness probe reports {windows_map.get(_HARNESS)!r})"
         )
-    _run_in_fresh_loop(_drive_windows_badge(live_server, windows_map))
-
-
-async def _drive_windows_badge(base_url: str, windows_map: dict[str, Any]) -> None:
-    name = f"win11-e2e-{uuid.uuid4().hex[:8]}"
-    async with _fake_host(base_url, name, windows_map) as host_id, async_playwright() as pw:
-        browser = await pw.chromium.launch()
-        context = await browser.new_context()
-        page = await context.new_page()
-        try:
-            await _register_routes(page)
-            await _open_picker_on_host(page, base_url, host_id)
-            row = await _reveal_claude_row(page)
-            await row.hover()
-            await page.wait_for_timeout(1_200)
-            await expect(
-                page.get_by_test_id(f"new-chat-landing-agent-warning-{_AGENT_ID}")
-            ).to_be_visible(timeout=5_000)
-        finally:
-            await context.close()
-            await browser.close()
+    _run_in_fresh_loop(_drive_no_badge(live_server, windows_map))
 
 
 def test_posix_host_ready_native_agent_stays_unbadged(live_server: str) -> None:
@@ -332,12 +313,12 @@ def test_posix_host_ready_native_agent_stays_unbadged(live_server: str) -> None:
             "cannot stage an installed+credentialed claude CLI here "
             f"(readiness probe reports {real_map.get(_HARNESS)!r})"
         )
-    _run_in_fresh_loop(_drive_posix_no_badge(live_server, real_map))
+    _run_in_fresh_loop(_drive_no_badge(live_server, real_map))
 
 
-async def _drive_posix_no_badge(base_url: str, posix_map: dict[str, Any]) -> None:
-    name = f"posix-e2e-{uuid.uuid4().hex[:8]}"
-    async with _fake_host(base_url, name, posix_map) as host_id, async_playwright() as pw:
+async def _drive_no_badge(base_url: str, readiness_map: dict[str, Any]) -> None:
+    name = f"ready-e2e-{uuid.uuid4().hex[:8]}"
+    async with _fake_host(base_url, name, readiness_map) as host_id, async_playwright() as pw:
         browser = await pw.chromium.launch()
         context = await browser.new_context()
         page = await context.new_page()

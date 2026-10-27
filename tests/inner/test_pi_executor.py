@@ -4688,6 +4688,43 @@ def test_rpc_start_spawns_with_exact_env(monkeypatch) -> None:
     assert captured["env"] == {"PATH": "/usr/bin", "PI_CODING_AGENT_DIR": "/tmp/pi-agent"}
 
 
+@pytest.mark.parametrize("shim_argv", [["C:/pnpm/node.exe", "C:/pkg/cli.js"], None])
+def test_rpc_start_runs_a_node_cmd_shim_as_its_node_script(monkeypatch, shim_argv) -> None:
+    """cmd.exe would end pi's command line at the first newline of the system prompt."""
+    from omnigent.inner import pi_executor as pi_mod
+
+    probed: list[str] = []
+    captured: dict[str, tuple[str, ...]] = {}
+
+    def _node_cmd_shim_argv(path: str) -> list[str] | None:
+        probed.append(path)
+        return shim_argv
+
+    async def _fake_spawn(*args, **kwargs):
+        captured["args"] = args
+        return _FakeProcess(stdout_lines=[], stderr_lines=[])
+
+    monkeypatch.setattr(pi_mod, "node_cmd_shim_argv", _node_cmd_shim_argv)
+    monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
+
+    async def _test():
+        rpc = _PiRpcSession()
+        await rpc.start(
+            "C:/pnpm/pi.CMD",
+            env={},
+            system_prompt="line one\nline two",
+            extra_args=["--no-tools"],
+        )
+        await rpc.close()
+
+    _run(_test())
+
+    launcher = shim_argv or ["C:/pnpm/pi.CMD"]
+    assert probed == ["C:/pnpm/pi.CMD"]
+    assert captured["args"][: len(launcher) + 2] == (*launcher, "--mode", "rpc")
+    assert captured["args"][-1] == "--no-tools"
+
+
 def test_redact_argv_for_log_hides_system_prompt() -> None:
     """``_redact_argv_for_log`` replaces the system-prompt value with a
     length-only placeholder while leaving every other flag visible."""

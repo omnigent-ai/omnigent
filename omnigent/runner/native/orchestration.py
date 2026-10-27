@@ -50,7 +50,7 @@ import click
 import httpx
 from fastapi.responses import JSONResponse, Response
 
-from omnigent._platform import IS_WINDOWS, resolve_cli_binary
+from omnigent._platform import resolve_cli_binary
 from omnigent.debug_logging import debug_event, runner_primary_session_id
 from omnigent.entities.session_resources import (
     SessionResourceView,
@@ -8298,14 +8298,6 @@ def _native_terminal_start_error_payload(
         # The raise site composes a client-safe message (versions + upgrade
         # command), so it can be shown verbatim.
         message = str(exc)
-    elif IS_WINDOWS:
-        # Native terminals are tmux/PTY-based and disabled on Windows by design.
-        # Give the client an actionable message instead of a log pointer.
-        message = (
-            f"Native {runtime_name} terminal (tmux/PTY) is not supported on "
-            "Windows. Use an SDK-based harness (e.g. claude-sdk, cursor, "
-            "copilot, or codex) for this agent, or run it on Linux/macOS."
-        )
     else:
         log_reference = process_log_reference("runner")
         cause = _native_terminal_start_failure_cause(exc)

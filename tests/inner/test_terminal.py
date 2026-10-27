@@ -914,12 +914,23 @@ async def test_async_idle_watcher_treats_confirmation_start_failure_as_unknown(
 
 
 @pytest.mark.asyncio
-async def test_close_kills_tmux_when_socket_exists_after_running_cleared(tmp_path: Path) -> None:
-    """Cleanup kills a surviving tmux server even after a watcher marked it dead."""
+@pytest.mark.parametrize(("windows", "socket_file"), [(False, True), (True, False)])
+async def test_close_kills_tmux_when_server_may_survive_after_running_cleared(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    windows: bool,
+    socket_file: bool,
+) -> None:
+    """Cleanup kills a surviving tmux server even after a watcher marked it dead.
+
+    A Windows tmux keeps no socket file, so the socket path cannot show it.
+    """
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", windows)
     private_dir = tmp_path / "terminal"
     private_dir.mkdir()
     socket_path = private_dir / "tmux.sock"
-    socket_path.touch()
+    if socket_file:
+        socket_path.touch()
     instance = TerminalInstance(
         name="runtime",
         session_key="main",
@@ -2198,6 +2209,9 @@ async def _capture_launch_argv(
     monkeypatch: pytest.MonkeyPatch,
     *,
     keep_alive_after_exit: bool,
+    windows: bool = False,
+    command: str = "bash",
+    args: list[str] | None = None,
 ) -> list[str]:
     """
     Launch a terminal with mocked tmux and return the single setup argv.
@@ -2205,6 +2219,9 @@ async def _capture_launch_argv(
     :param tmp_path: Temporary directory for the fake tmux socket.
     :param monkeypatch: Pytest monkeypatch fixture.
     :param keep_alive_after_exit: Value for the instance's opt-in flag.
+    :param windows: Whether the launch takes the Windows path.
+    :param command: The pane program, e.g. ``"bash"``.
+    :param args: Arguments of the pane program, e.g. ``["-c", "echo $HOME"]``.
     :returns: The flattened tmux launch argv.
     """
     captured: list[list[str]] = []
@@ -2220,6 +2237,7 @@ async def _capture_launch_argv(
         captured.append(list(cmd))
         return _SuccessfulProcess()
 
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", windows)
     monkeypatch.setattr(
         terminal_mod,
         "asyncio",
@@ -2234,11 +2252,75 @@ async def _capture_launch_argv(
         session_key="s1",
         socket_path=tmp_path / "tmux.sock",
         private_dir=tmp_path,
+        command=command,
+        args=args or [],
         keep_alive_after_exit=keep_alive_after_exit,
     )
     await instance.launch(cwd=tmp_path)
     assert len(captured) == 1
     return captured[0]
+
+
+def _new_session_command(cmd: list[str]) -> list[str]:
+    """
+    Return the ``new-session`` command from a flattened tmux launch argv.
+
+    :param cmd: Launch argv with commands joined by ``";"``.
+    :returns: The ``new-session`` command and its arguments.
+    """
+    session = cmd[cmd.index("new-session") :]
+    return session[: session.index(";")] if ";" in session else session
+
+
+async def test_launch_on_windows_passes_the_pane_program_as_argv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A Windows tmux runs a joined pane command through cmd.exe, which ignores POSIX quoting."""
+    args = ["-c", "echo $HOME; (x) 'q' \"d\"", ""]
+
+    cmd = await _capture_launch_argv(
+        tmp_path, monkeypatch, keep_alive_after_exit=False, windows=True, args=args
+    )
+
+    assert _new_session_command(cmd)[-len(args) - 2 :] == ["--", "bash", *args]
+
+
+@pytest.mark.parametrize("shim_argv", [["C:/pnpm/node.exe", "C:/pkg/cli.js"], None])
+async def test_launch_on_windows_runs_a_node_cmd_shim_as_its_node_script(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shim_argv: list[str] | None
+) -> None:
+    """A Windows tmux refuses a .cmd pane program, which needs cmd.exe to parse its arguments."""
+    monkeypatch.setattr(
+        terminal_mod,
+        "node_cmd_shim_argv",
+        lambda path: shim_argv if path == "C:/pnpm/pi.CMD" else None,
+    )
+
+    cmd = await _capture_launch_argv(
+        tmp_path,
+        monkeypatch,
+        keep_alive_after_exit=False,
+        windows=True,
+        command="C:/pnpm/pi.CMD",
+        args=["--mode", "rpc"],
+    )
+
+    program = shim_argv or ["C:/pnpm/pi.CMD"]
+    assert _new_session_command(cmd)[-len(program) - 3 :] == ["--", *program, "--mode", "rpc"]
+
+
+async def test_launch_on_windows_gives_panes_a_term_windows_programs_know(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Windows programs such as Claude Code draw Unicode glyphs only for a TERM they know."""
+    cmd = await _capture_launch_argv(
+        tmp_path, monkeypatch, keep_alive_after_exit=False, windows=True
+    )
+
+    options = cmd[: cmd.index("new-session")]
+    assert contains_subsequence(
+        options, ["set-option", "-g", "default-terminal", "xterm-256color"]
+    )
 
 
 @pytest.mark.parametrize("launch_fails", [False, True])
@@ -3294,6 +3376,8 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
 
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
     monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    monkeypatch.setattr(terminal_mod, "_process_alive", terminal_mod._proc.process_alive)
     monkeypatch.setattr(
         terminal_mod,
         "subprocess",
@@ -3314,12 +3398,17 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
     assert unmarked_dir.exists()
 
 
+@pytest.mark.parametrize(("windows", "socket_file"), [(False, True), (True, False)])
 def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    windows: bool,
+    socket_file: bool,
 ) -> None:
     """
     A dead-owner instance with a socket gets ``tmux kill-server``.
+
+    A Windows tmux names its server by the socket path but keeps no file there.
 
     Removing the dir alone leaves the detached tmux server running on
     the unlinked socket — the actual resource leak — so the sweep must
@@ -3343,9 +3432,12 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
         "subprocess",
         SimpleNamespace(run=_record_run, TimeoutExpired=TimeoutError),
     )
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", windows)
+    monkeypatch.setattr(terminal_mod, "_process_alive", terminal_mod._proc.process_alive)
     dead_dir = _write_instance_dir(tmp_path, "omnigent-terminal-dead2", _dead_pid())
     socket_path = dead_dir / "tmux.sock"
-    socket_path.touch()
+    if socket_file:
+        socket_path.touch()
 
     reaped = terminal_mod.reap_orphaned_terminals()
 
@@ -3416,6 +3508,10 @@ def test_reap_orphaned_terminals_logs_reap_when_socket_is_already_gone(
     """
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
     monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
+    # A socket file is how a POSIX tmux shows its server; psutil's liveness check
+    # runs on every platform.
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", False)
+    monkeypatch.setattr(terminal_mod, "_process_alive", terminal_mod._proc.process_alive)
     kill_calls: list[list[str]] = []
     monkeypatch.setattr(
         terminal_mod,
@@ -3439,6 +3535,26 @@ def test_reap_orphaned_terminals_logs_reap_when_socket_is_already_gone(
     assert str(dead_pid) in reap_logs[0]
     # No server existed, and the wording must say so.
     assert "already gone" in reap_logs[0]
+
+
+@pytest.mark.parametrize("windows", [False, True])
+def test_create_terminal_instance_routes_copies_through_the_bridge_off_windows(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    windows: bool,
+) -> None:
+    """The copy helper's bridge listens on an AF_UNIX socket, which Python on
+    Windows lacks."""
+    monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
+    monkeypatch.setattr(terminal_mod, "_require_supported_tmux", lambda: None)
+    monkeypatch.setattr(terminal_mod, "IS_WINDOWS", windows)
+    spec = TerminalEnvSpec(
+        command="bash", os_env=OSEnvSpec(type="caller_process", cwd=str(tmp_path))
+    )
+
+    created = create_terminal_instance(name="bash", session_key="s1", spec=spec)
+
+    assert (created.instance._clipboard_bridge is None) is windows
 
 
 @pytest.mark.skipif(

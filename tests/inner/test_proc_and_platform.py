@@ -98,6 +98,11 @@ def test_normalize_interactive_shells_filters_and_deduplicates() -> None:
         "zsh",
         "bash",
     ]
+    assert _platform.normalize_interactive_shells(["pwsh", "powershell", "cmd"]) == [
+        "pwsh",
+        "powershell",
+        "cmd",
+    ]
     assert _platform.normalize_interactive_shells("bash") == []
 
 
@@ -172,6 +177,25 @@ def test_installed_interactive_shells_lists_default_first_then_alternatives(
     monkeypatch.setenv("SHELL", "/bin/zsh")
     # zsh is the default → first; bash/fish follow in offer order; no dupes.
     assert _platform.installed_interactive_shells() == ["zsh", "bash", "fish"]
+
+
+@pytest.mark.parametrize(
+    ("installed", "expected"),
+    [
+        ({"pwsh", "powershell", "cmd", "bash"}, ["pwsh", "powershell", "cmd", "bash"]),
+        ({"powershell", "cmd"}, ["powershell", "cmd"]),
+    ],
+)
+def test_installed_interactive_shells_on_windows_offers_powershell_cmd_and_bash(
+    monkeypatch: pytest.MonkeyPatch,
+    installed: set[str],
+    expected: list[str],
+) -> None:
+    """PowerShell 7 leads when installed, else Windows PowerShell; ``$SHELL`` is ignored."""
+    monkeypatch.setattr(_platform, "IS_WINDOWS", True)
+    monkeypatch.setattr(_platform, "_resolve_interactive_shell", _fake_resolver(installed))
+    monkeypatch.setenv("SHELL", "/usr/bin/zsh")
+    assert _platform.installed_interactive_shells() == expected
 
 
 @pytest.mark.posix_only
