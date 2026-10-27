@@ -11802,7 +11802,7 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
     operations: list[tuple[str, ...]] = []
 
     def run_tmux(socket_path: str, *args: str, **kwargs: object) -> None:
-        nonlocal notice_visible
+        nonlocal notice_visible, overlay
         operations.append(args)
         if args[0] == "send-keys" and args[-1] == "C-l":
             if scenario == "hidden-draft":
@@ -11810,6 +11810,11 @@ def test_idle_compact_notice_redraw_preserves_delivery_checks(
             if scenario != "unresponsive":
                 notice_visible = False
         else:
+            if args[-1] == "Space" and scenario in {"printed", "hidden-draft"}:
+                # An incremental repaint erases the marker but leaves the wrapped output.
+                overlay = "\n".join(
+                    row.partition("[idle-compact]")[0] for row in overlay.splitlines()
+                )
             composer._run_tmux(socket_path, *args)
 
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
