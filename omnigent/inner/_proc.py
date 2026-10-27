@@ -387,6 +387,9 @@ def kill_tree(process: _ProcessLike | None) -> None:
     Like :func:`terminate_tree` but with ``SIGKILL`` (POSIX) /
     ``TerminateProcess`` (Windows). Use after a grace period when a graceful
     terminate did not take.
+
+    After the leader exits, unobserved descendants may survive: signaling
+    their former group requires a remembered live identity to avoid PID reuse.
     """
     if process is None:
         return

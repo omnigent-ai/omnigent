@@ -11066,6 +11066,7 @@ def _picker_response(*aliases: str) -> bytes:
         ),
     ],
 )
+@pytest.mark.parametrize("with_launcher", [False, True])
 async def test_probe_claude_model_options_uses_harness_startup_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -11073,6 +11074,7 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
     path_override: str | None,
     expected_command: str,
     expected_prefix: list[str],
+    with_launcher: bool,
 ) -> None:
     """Enumeration and alias resolution use the terminal's command and base args."""
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(tmp_path))
@@ -11083,6 +11085,17 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
     (tmp_path / "config.yaml").write_text(
         yaml.safe_dump({"harness": {"claude-native": harness_config}})
     )
+    if with_launcher:
+        from omnigent.claude_launcher import ClaudeLauncher
+
+        class Launcher(ClaudeLauncher):
+            def launch(self, command: str, args: list[str]) -> tuple[str, list[str]]:
+                assert command == expected_command
+                assert args[: len(expected_prefix) + 1] == [*expected_prefix, "-p"]
+                return "plugin-wrapper", [command, *args]
+
+        monkeypatch.setenv("OMNIGENT_CLAUDE_LAUNCHER", "test-launcher")
+        monkeypatch.setattr("omnigent.claude_launcher._load_launcher", lambda _name: Launcher())
 
     class _FakeProcess:
         pid = None
@@ -11095,8 +11108,9 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
             )
 
     async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
-        assert command == expected_command
-        assert list(args[: len(expected_prefix) + 1]) == [*expected_prefix, "-p"]
+        assert command == ("plugin-wrapper" if with_launcher else expected_command)
+        prefix = [expected_command, *expected_prefix] if with_launcher else expected_prefix
+        assert list(args[: len(prefix) + 1]) == [*prefix, "-p"]
         # No --settings without an apiKeyHelper to deliver.
         assert "--settings" not in args
         return _FakeProcess()

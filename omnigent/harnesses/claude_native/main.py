@@ -923,23 +923,19 @@ def _parse_claude_current_model(stdout: str) -> dict[str, str]:
     return resolved
 
 
-def _claude_model_probe_invocation(
+def _claude_model_probe_launch(
     claude_config: ClaudeNativeUcodeConfig | None,
     extra_args: Sequence[str] = (),
     *,
     stream_input: bool = False,
-) -> tuple[str, list[str], dict[str, str]]:
+) -> tuple[str, list[str]]:
     """
-    Assemble one headless ``/model`` probe invocation.
-
-    Shared by the alias-enumeration run and the per-alias resolution runs
-    so the two cannot drift: same launch resolution, session env, speed
-    env, and env-unset list.
+    Resolve probe command and arguments without constructing the launch environment.
 
     :param claude_config: The resolved native launch config, or ``None``.
     :param extra_args: Appended CLI args (e.g. ``--model <alias>``).
     :param stream_input: Send control requests and /model over stdin.
-    :returns: ``(command, launch_args, env)`` ready to exec.
+    :returns: ``(command, launch_args)`` shared by discovery and its cache key.
     """
     from omnigent.claude_launcher import resolve_claude_launch
     from omnigent.config import load_effective_config
@@ -969,7 +965,19 @@ def _claude_model_probe_invocation(
     cfg = load_effective_config()
     command = resolve_harness_command("claude-native", default="claude", cfg=cfg)
     launch_args = resolve_harness_args("claude-native", tuple(args), cfg=cfg)
-    command, launch_args = resolve_claude_launch(command, launch_args)
+    return resolve_claude_launch(command, launch_args)
+
+
+def _claude_model_probe_invocation(
+    claude_config: ClaudeNativeUcodeConfig | None,
+    extra_args: Sequence[str] = (),
+    *,
+    stream_input: bool = False,
+) -> tuple[str, list[str], dict[str, str]]:
+    """Assemble a headless probe with the terminal's launch and auth environment."""
+    command, launch_args = _claude_model_probe_launch(
+        claude_config, extra_args, stream_input=stream_input
+    )
     env = dict(os.environ)
     env.update(build_native_claude_terminal_env(claude_config))
     env.update(
@@ -1331,7 +1339,7 @@ def claude_catalog_fingerprint(claude_config: ClaudeNativeUcodeConfig | None) ->
     from omnigent.models.model_catalog_store import binary_identity, fingerprint_of
     from omnigent.onboarding.ambient import claude_managed_model_picker
 
-    command, launch_args, _ = _claude_model_probe_invocation(claude_config, stream_input=True)
+    command, launch_args = _claude_model_probe_launch(claude_config, stream_input=True)
     ambient_gateway = None
     if claude_config is None:
         managed_base_url, _ = managed_claude_gateway_signal()

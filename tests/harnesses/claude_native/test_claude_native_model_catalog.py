@@ -162,10 +162,11 @@ async def test_catalog_runs_wrapper_bootstrap_before_discovery(
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize("probe", ["enumeration", "alias"])
-async def test_model_probe_timeout_terminates_wrapper_children(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, probe: str
+@pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+async def test_model_probe_interrupt_terminates_wrapper_children(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, probe: str, cancel: bool
 ) -> None:
-    """A wrapper child holding the probe's pipes cannot outlive its timeout."""
+    """Timeout and cancellation stop wrapper children holding the probe's pipes."""
     child_pid_path = tmp_path / "child.pid"
     wrapper = textwrap.dedent("""\
         import subprocess, sys
@@ -178,7 +179,7 @@ async def test_model_probe_timeout_terminates_wrapper_children(
     monkeypatch.setattr(
         claude_native, "_claude_model_probe_invocation", lambda *_args, **_kwargs: invocation
     )
-    monkeypatch.setattr(claude_native, "_CLAUDE_MODEL_PROBE_TIMEOUT_S", 1.0)
+    monkeypatch.setattr(claude_native, "_CLAUDE_MODEL_PROBE_TIMEOUT_S", 60.0 if cancel else 1.0)
     task = asyncio.create_task(
         claude_native._run_claude_model_probe(None, stream_input=False)
         if probe == "enumeration"
@@ -189,9 +190,14 @@ async def test_model_probe_timeout_terminates_wrapper_children(
         await poll_until_async(child_pid_path.exists, timeout_s=3)
         with contextlib.suppress(psutil.NoSuchProcess):
             child = psutil.Process(int(child_pid_path.read_text()))
+        if cancel:
+            task.cancel()
         await asyncio.wait({task}, timeout=3)
-        assert task.done(), "probe timeout left a wrapper child holding its pipes open"
-        assert task.result() == (None if probe == "enumeration" else {})
+        assert task.done(), "interrupted probe left a wrapper child holding its pipes open"
+        if cancel:
+            assert task.cancelled()
+        else:
+            assert task.result() == (None if probe == "enumeration" else {})
         if child is not None:
             await poll_until_async(lambda: not _proc.process_alive(child.pid), timeout_s=1)
     finally:
@@ -199,7 +205,29 @@ async def test_model_probe_timeout_terminates_wrapper_children(
         if child is not None:
             with contextlib.suppress(psutil.NoSuchProcess):
                 child.kill()
-        await asyncio.wait_for(task, timeout=2)
+        with contextlib.suppress(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2)
+
+
+@pytest.mark.parametrize("credential", ["ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN"])
+def test_stored_catalog_does_not_validate_launch_credentials(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, credential: str
+) -> None:
+    """Reading a catalog must not run the terminal's auth-environment validation."""
+    isolate_provider_resolution(monkeypatch, tmp_path / "config")
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path / "data"))
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={credential: "test-credential"}, api_key_helper="printf test-token"
+    )
+    rows = [{"id": "opus", "model": "gateway-opus", "isDefault": True}]
+    fingerprint = claude_native.claude_catalog_fingerprint(config)
+    model_catalog_store.write_catalog("claude-native", fingerprint, rows)
+
+    assert claude_native.stored_claude_catalog_rows(config) == rows
+    assert claude_native.stored_claude_picker_values(config) == ["opus"]
+    assert not claude_native.claude_launch_catalog_is_stale(config)
+    with pytest.raises(RuntimeError, match="apiKeyHelper is configured"):
+        claude_native._claude_model_probe_invocation(config)
 
 
 def _stub_picker(
