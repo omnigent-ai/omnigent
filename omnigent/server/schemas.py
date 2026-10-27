@@ -3168,6 +3168,15 @@ class GrantPermissionRequest(BaseModel):
     user_id: str
     level: int = Field(ge=1, le=3)
 
+    @field_validator("user_id")
+    @classmethod
+    def _normalize_user_id(cls, value: str) -> str:
+        """Normalize user_id to lowercase, preserving the public sentinel."""
+        stripped = value.strip()
+        if stripped == "__public__":
+            return stripped
+        return stripped.lower()
+
 
 class PermissionObject(BaseModel):
     """

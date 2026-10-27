@@ -3496,3 +3496,103 @@ async def test_shared_parent_readiness_remains_private(
         )
     assert response.status_code == 201, response.text
     assert "harness_not_configured" not in response.text
+
+
+async def test_grant_permission_normalizes_mixed_case_user_id(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Granting with a mixed-case or padded email normalizes to lowercase identity."""
+    agent = await create_test_agent(auth_client, user="owner@example.com")
+    session = await _create_session_as(auth_client, agent["id"], "owner@example.com")
+    session_id = session["id"]
+
+    # 1. Mixed-case grant reaches the lowercase user identity.
+    grant_resp = await auth_client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": "  Alice@Example.COM  ", "level": LEVEL_READ},
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+    assert grant_resp.status_code == 200, grant_resp.text
+    assert grant_resp.json()["user_id"] == "alice@example.com"
+
+    # Lowercase Alice can now access the session.
+    alice_get = await auth_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Forwarded-Email": "alice@example.com"},
+    )
+    assert alice_get.status_code == 200, alice_get.text
+
+    # 2. Granting to self with mixed-case is rejected as self-modification.
+    self_grant = await auth_client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": "Owner@Example.COM", "level": LEVEL_READ},
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+    assert self_grant.status_code == 403, self_grant.text
+    assert "Cannot modify your own permissions" in self_grant.text
+
+    # 3. Public sentinel is preserved.
+    pub_grant = await auth_client.put(
+        f"/v1/sessions/{session_id}/permissions",
+        json={"user_id": "  __public__  ", "level": LEVEL_READ},
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+    assert pub_grant.status_code == 200, pub_grant.text
+    assert pub_grant.json()["user_id"] == "__public__"
+
+
+async def test_revoke_permission_normalizes_mixed_case_target(
+    auth_client: httpx.AsyncClient,
+) -> None:
+    """Revoking and leaving with mixed-case target URLs normalizes properly."""
+    agent = await create_test_agent(auth_client, user="owner@example.com")
+    session = await _create_session_as(auth_client, agent["id"], "owner@example.com")
+    session_id = session["id"]
+
+    await _grant_permission(
+        auth_client,
+        session_id,
+        granter="owner@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_READ,
+    )
+
+    # Bob can access.
+    bob_get = await auth_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert bob_get.status_code == 200
+
+    # Owner revokes using mixed-case target in URL.
+    revoke_resp = await auth_client.delete(
+        f"/v1/sessions/{session_id}/permissions/Bob@Example.COM",
+        headers={"X-Forwarded-Email": "owner@example.com"},
+    )
+    assert revoke_resp.status_code == 204
+
+    # Bob's access is gone.
+    bob_get2 = await auth_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert bob_get2.status_code == 404
+
+    # Re-grant, then Bob leaves self using mixed-case target in URL.
+    await _grant_permission(
+        auth_client,
+        session_id,
+        granter="owner@example.com",
+        target_user="bob@example.com",
+        level=LEVEL_READ,
+    )
+    leave_resp = await auth_client.delete(
+        f"/v1/sessions/{session_id}/permissions/Bob@Example.COM",
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert leave_resp.status_code == 204
+    bob_get3 = await auth_client.get(
+        f"/v1/sessions/{session_id}",
+        headers={"X-Forwarded-Email": "bob@example.com"},
+    )
+    assert bob_get3.status_code == 404
