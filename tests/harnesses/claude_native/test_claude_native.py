@@ -11048,25 +11048,28 @@ def _picker_response(*aliases: str) -> bytes:
 
 
 @pytest.mark.parametrize(
-    ("harness_config", "path_override", "expected_command", "expected_prefix"),
+    ("harness_config", "path_override", "expected_command", "expected_prefix", "with_launcher"),
     [
-        ({}, None, "claude", []),
-        ({"command": "claude-wrapper", "args": ["--"]}, None, "claude-wrapper", ["--"]),
+        ({}, None, "claude", [], False),
+        ({"command": "claude-wrapper", "args": ["--"]}, None, "claude-wrapper", ["--"], False),
         (
             {"command": "env", "args": ["CLAUDE_MODE=gateway", "claude-wrapper", "--"]},
             None,
             "env",
             ["CLAUDE_MODE=gateway", "claude-wrapper", "--"],
+            False,
         ),
         (
             {"command": "claude-wrapper", "args": ["--"]},
             "claude-override",
             "claude-override",
             ["--"],
+            False,
         ),
+        ({"command": "claude-wrapper", "args": ["--"]}, None, "claude-wrapper", ["--"], True),
     ],
+    ids=["bare", "configured-wrapper", "env-wrapper", "path-override", "launcher-composition"],
 )
-@pytest.mark.parametrize("with_launcher", [False, True])
 async def test_probe_claude_model_options_uses_harness_startup_config(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -11892,6 +11895,20 @@ def test_catalog_fingerprint_changes_with_launch_command_and_args(
     ]:
         (tmp_path / "config.yaml").write_text(
             yaml.safe_dump({"harness": {"claude-native": {"command": command, "args": args}}})
+        )
+        fingerprint = claude_native.claude_catalog_fingerprint(None)
+        assert fingerprint not in fingerprints
+        assert claude_native.claude_catalog_fingerprint(None) == fingerprint
+        fingerprints.add(fingerprint)
+
+    for invocation in [
+        ("plugin-wrapper-a", ["--mode=direct"]),
+        ("plugin-wrapper-b", ["--mode=direct"]),
+        ("plugin-wrapper-b", ["--mode=gateway"]),
+    ]:
+        monkeypatch.setattr(
+            "omnigent.claude_launcher.resolve_claude_launch",
+            lambda *_args, result=invocation: result,
         )
         fingerprint = claude_native.claude_catalog_fingerprint(None)
         assert fingerprint not in fingerprints

@@ -159,6 +159,18 @@ async def test_catalog_runs_wrapper_bootstrap_before_discovery(
     assert "--input-format" in observed[0]["args"]
     assert "--model" in observed[1]["args"]
 
+    # Bootstrap changes ambient settings, so the next read needs a new catalog key.
+    assert claude_native.claude_catalog_fingerprint(None) != fingerprint
+    assert claude_native.stored_claude_catalog_rows(None) is None
+    assert await claude_native.claude_launch_catalog(None) == rows
+    assert claude_native.stored_claude_catalog_rows(None) == rows
+    refreshed_log = launches.read_text()
+    refreshed = [json.loads(line) for line in refreshed_log.splitlines()]
+    assert len(refreshed) == 4
+    assert all(launch["model"] == gateway_model for launch in refreshed)
+    assert await claude_native.claude_launch_catalog(None) == rows
+    assert launches.read_text() == refreshed_log
+
 
 @pytest.mark.posix_only
 @pytest.mark.parametrize("probe", ["enumeration", "alias"])
