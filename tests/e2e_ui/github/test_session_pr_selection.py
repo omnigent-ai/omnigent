@@ -20,9 +20,8 @@ def _expect_pr_tooltip(page: Page, label: str, trigger: Locator) -> Locator:
     expect(content).to_be_visible()
     expect(content).to_have_accessible_name(label)
     expect(content).to_have_attribute("data-slot", "tooltip-content")
-    expect(content).to_have_class(re.compile(r"\bbg-neutral-900\b"))
-    expect(content).to_have_class(re.compile(r"\btext-white\b"))
-    expect(content).to_have_css("color", "rgb(255, 255, 255)")
+    expect(content).to_have_class(re.compile(r"\bmenu-surface\b"))
+    expect(content).to_have_class(re.compile(r"\btext-popover-foreground\b"))
     content.evaluate("""element => Promise.all(
         element.getAnimations().map(animation => animation.finished.catch(() => {}))
     )""")
@@ -34,7 +33,7 @@ def _expect_pr_tooltip(page: Page, label: str, trigger: Locator) -> Locator:
         context.fillRect(0, 0, 1, 1);
         return [...context.getImageData(0, 0, 1, 1).data];
     }""")
-    assert max(background[:3]) < 64 and background[3] == 255
+    assert background[3] == 255
     box, anchor, viewport = content.bounding_box(), trigger.bounding_box(), page.viewport_size
     assert box and anchor and viewport
     assert box["x"] >= -1 and box["x"] + box["width"] <= viewport["width"] + 1

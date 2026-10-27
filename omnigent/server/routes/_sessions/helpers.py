@@ -110,7 +110,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.engine import PolicyEngine
 from omnigent.runtime.tool_output import cap_tool_output
-from omnigent.server import presence, session_live_state, shutdown_state
+from omnigent.server import presence, session_live_state, session_pull_requests, shutdown_state
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_parked_elicitations,
@@ -122,7 +122,12 @@ from omnigent.server.auth import (
     LEVEL_READ,
     RESERVED_USER_PUBLIC,
 )
-from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
+from omnigent.server.host_registry import (
+    HostConnection,
+    HostLaunchResult,
+    HostRegistry,
+    RunnerExitReports,
+)
 from omnigent.server.managed_hosts import (
     MANAGED_SANDBOX_LABEL_NAMESPACE,
     ManagedHostLaunch,
@@ -4970,6 +4975,7 @@ def _publish_status(
     failure_context: object = None,
     failure_intake: Mapping[str, str] | None = None,
     disconnect_evidence: Mapping[str, str] | None = None,
+    turn_completed: bool = False,
 ) -> None:
     """
     Publish a typed :class:`SessionStatusEvent` to the live stream and
@@ -5007,6 +5013,9 @@ def _publish_status(
     :param failure_intake: Content-free observations from the failed-status intake path.
     :param disconnect_evidence: Flat string attributes describing the runner
         drop that caused a ``"failed"`` edge, logged on the failure row only.
+    :param turn_completed: Whether an ``"idle"`` edge reports a turn the harness
+        confirmed finished (e.g. claude-native's ``Stop`` hook), which clears a
+        sticky ``failed`` like a ``running`` edge would.
     """
     # ``failed`` is sticky against a trailing ``idle``. A turn error is
     # terminal — it must not be silently downgraded to ``idle`` by a
@@ -5019,8 +5028,14 @@ def _publish_status(
     # error persists exactly until the session does real work again. No
     # in-process flow performs a legitimate ``failed`` → ``idle``
     # transition (compaction failure publishes ``running`` → ``idle``, not
-    # ``failed``), so this is a safe, harness-agnostic invariant.
-    if status == "idle" and _session_status_cache.get(session_id) == "failed":
+    # ``failed``), so this is a safe, harness-agnostic invariant. A confirmed
+    # turn completion is the exception: it proves a later turn succeeded even
+    # when its ``running`` edge never arrived, so it clears ``failed`` too.
+    if (
+        status == "idle"
+        and not turn_completed
+        and _session_status_cache.get(session_id) == "failed"
+    ):
         # Session stays ``failed`` (terminal); the turn is over, so drop any
         # tracked in-flight response id rather than leaving it for the
         # snapshot to reopen a streaming bubble.
@@ -5030,6 +5045,10 @@ def _publish_status(
     _session_status_cache[session_id] = status
     if previous_status != status:
         _publish_child_status_to_parent(session_id, status)
+    if status == "idle" and previous_status in ("running", "waiting") and persist_live_status:
+        # A turn can open or merge a PR while nobody watches; refresh what the server
+        # stores. Stops and archives publish idle without persisting it, and skip this.
+        session_pull_requests.notify_turn_end(session_id)
     # Mirror the transition onto the conversation row (best-effort,
     # deduplicated, off-loop) so replicas that don't hold this session's
     # runner tunnel serve the same sidebar status.
@@ -6227,6 +6246,54 @@ def _spawn_superseded_runner_stop(
     task.add_done_callback(_detached_supersede_stops.discard)
 
 
+#: Code of the info-level transcript notice left when a relaunch found the
+#: session workspace deleted and the host recreated it empty.
+_WORKSPACE_RECREATED_NOTICE_CODE = "workspace_recreated"
+
+
+async def _note_workspace_recreated_on_host(
+    conv: Conversation,
+    conversation_store: ConversationStore,
+) -> None:
+    """
+    Persist and publish the notice that the host recreated the session workspace.
+
+    Runs once per launch, under the relaunch lock, so riders of the same
+    flight never duplicate it. A persistence failure is logged, not raised:
+    the runner is already starting and the turn should proceed.
+
+    :param conv: The relaunched session row (supplies ``workspace``).
+    :param conversation_store: Store used for the durable append.
+    """
+    item = NewConversationItem(
+        type="error",
+        response_id=generate_task_id(),
+        data=ErrorData(
+            source="execution",
+            code=_WORKSPACE_RECREATED_NOTICE_CODE,
+            message=(
+                f"The session workspace {conv.workspace} no longer existed on the "
+                "host, so it was recreated as an empty directory. Anything it used "
+                "to contain is gone; restore the checkout or worktree if the agent "
+                "needs it."
+            ),
+            level="info",
+        ),
+    )
+    try:
+        persisted = await asyncio.to_thread(conversation_store.append, conv.id, [item])
+    except Exception:  # noqa: BLE001
+        _logger.warning(
+            "Failed to persist workspace-recreated notice for session %s",
+            conv.id,
+            exc_info=True,
+            extra={"session_id": conv.id},
+        )
+        return
+    if persisted:
+        _publish_external_conversation_item(conv.id, persisted[0])
+
+
 async def _launch_runner_on_host_impl(
     conv: Conversation,
     conversation_store: ConversationStore,
@@ -6358,7 +6425,7 @@ async def _launch_runner_on_host_locked(
             )
             return _HostLaunchAttempt(runner_id=new_runner_id)
         request_id = secrets.token_hex(8)
-        launch_future: asyncio.Future[dict[str, str | None]] = (
+        launch_future: asyncio.Future[HostLaunchResult] = (
             asyncio.get_running_loop().create_future()
         )
         host_conn.pending_launches[request_id] = launch_future
@@ -6442,6 +6509,19 @@ async def _launch_runner_on_host_locked(
                 error_code=result.get("error_code"),
                 error=result.get("error"),
             )
+        if result.get("workspace_recreated"):
+            _logger.warning(
+                "Host recreated the missing workspace for session %s",
+                conv.id,
+                extra=debug_event(
+                    "workspace_recreated",
+                    session_id=conv.id,
+                    runner_id=new_runner_id,
+                    stage="runner_launch",
+                    workspace=conv.workspace,
+                ),
+            )
+            await _note_workspace_recreated_on_host(conv, conversation_store)
         return _HostLaunchAttempt(runner_id=new_runner_id, acknowledged=True)
 
 

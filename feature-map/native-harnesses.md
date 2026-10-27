@@ -86,6 +86,8 @@ implements them separately, so a fix for one harness does not reach the others.
   Env wrappers are split into these fields, without a duplicate raw invocation.
   Sessions can add to or override these host defaults. Project config can
   choose the default harness, but commands and arguments come only from user config.
+  Codex's `harness.codex-native.app_server` (`command` plus `args`) is a separate,
+  config-file-only wrapper for its session app-servers; unset runs Codex directly.
   Other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
@@ -614,6 +616,12 @@ Cross-harness journeys:
   terminal. Check retained history and cumulative input usage 1,000 → 1,100 →
   1,200. The provider replies and usage are scripted; this does not prove live
   billing or recovery after the runner deletes the bridge directory.
+- **`resume`, Pi user setup (own environment):**
+  `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` drives native startup
+  and process resume through the server/host/runner. User skills/extensions and
+  relative settings must survive relocation of the agent root, including a
+  relative custom root. Existing context/prompt opt-outs remain independent.
+  This is not Claude marketplace or Managed deployment coverage.
 - **`resume`, Pi cost reporting (component boundaries):**
   `tests/harnesses/pi_native/test_pi_native_extension.py` exercises Pi-reported
   dollars, duplicate callbacks, local/server restart baselines and missing pricing.

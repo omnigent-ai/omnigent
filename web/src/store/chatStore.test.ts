@@ -32,6 +32,7 @@ import type {
 } from "@/lib/blocks";
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
 import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
@@ -13276,6 +13277,65 @@ describe("chatStore — startStreamPump reconnect loop", () => {
     await vi.advanceTimersByTimeAsync(20);
     controller.abort();
     await loop;
+  });
+
+  it("stretches failed reopens while the page is hidden and reopens once visible", async () => {
+    seedSession("conv_hidden_backoff", []);
+    const sinks: StreamSink[] = [];
+    let openAttempts = 0;
+    let serverUp = true;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (/\/v1\/sessions\/[^/]+\/stream$/.test(url)) {
+        openAttempts += 1;
+        if (!serverUp) return mockResponse({}, { ok: false, status: 503 });
+        const sink = pushableStream();
+        sinks.push(sink);
+        return mockResponse(null, { bodyStream: sink.stream });
+      }
+      return defaultFetchHandler(input, init);
+    });
+    const setPageHidden = (hidden: boolean): void => {
+      Object.defineProperty(document, "hidden", { configurable: true, get: () => hidden });
+      document.dispatchEvent(new Event("visibilitychange"));
+    };
+    const controller = new AbortController();
+    useChatStore.setState({ conversationId: "conv_hidden_backoff", abortController: controller });
+
+    const loop = startStreamPump("conv_hidden_backoff", controller, setState, getState);
+    try {
+      await vi.advanceTimersByTimeAsync(1);
+      expect(openAttempts).toBe(1);
+
+      // Backgrounded, then the server goes away: the instant reopen after a
+      // healthy drop is refused, and the retries after it wait the hidden
+      // cadence instead of the visible 5 s ramp.
+      setPageHidden(true);
+      serverUp = false;
+      sinks[0]!.error();
+      await vi.advanceTimersByTimeAsync(6_000);
+      expect(openAttempts).toBe(2);
+      await vi.advanceTimersByTimeAsync(20_000);
+      expect(openAttempts).toBe(2);
+
+      // Back in the foreground the stretched wait ends within a first-retry delay.
+      serverUp = true;
+      setPageHidden(false);
+      await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS);
+      expect(openAttempts).toBe(3);
+      expect(sinks).toHaveLength(2);
+
+      sinks[1]!.push("data: [DONE]\n\n");
+      sinks[1]!.close();
+      await vi.advanceTimersByTimeAsync(20);
+    } finally {
+      // Restore visibility through the event too, so the presence tracker's
+      // hidden state cannot leak into later tests if this one fails.
+      Reflect.deleteProperty(document, "hidden");
+      document.dispatchEvent(new Event("visibilitychange"));
+      controller.abort();
+      await loop;
+    }
   });
 
   it("preserves native streamed text across a server process restart", async () => {

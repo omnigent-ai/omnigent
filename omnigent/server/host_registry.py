@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypedDict
 
 from cachetools import TTLCache
 
@@ -352,6 +352,22 @@ class WebSocketLike(Protocol):
         ...
 
 
+class HostLaunchResult(TypedDict, total=False):
+    """
+    Resolved fields of a ``host.launch_runner_result`` awaited by launch callers.
+
+    Mirrors :class:`omnigent.host.frames.HostLaunchRunnerResultFrame`; a
+    caller-synthesized failure (lost connection, timeout) carries only
+    ``status`` and ``error``.
+    """
+
+    status: str
+    runner_id: str | None
+    error: str | None
+    error_code: str | None
+    workspace_recreated: bool
+
+
 @dataclass
 class HostConnection:
     """Per-host state while the tunnel is open.
@@ -477,7 +493,7 @@ class HostConnection:
     # user machine reusing a managed host's id under ordinary login. Read by the
     # default-public policy so only genuine sandboxes count as managed.
     registered_with_managed_token: bool = False
-    pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
+    pending_launches: dict[str, asyncio.Future[HostLaunchResult]] = field(
         default_factory=dict,
     )
     pending_stops: dict[str, asyncio.Future[dict[str, str | None]]] = field(

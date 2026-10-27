@@ -12,8 +12,8 @@ into a *managed* Pi config dir (selected via ``PI_CODING_AGENT_DIR``), so the
 runner-owned ``pi`` process authenticates exactly like the configured harness —
 mirroring how codex-native routes through the Databricks Unity Gateway.
 
-The managed config dir is per-session (like codex-native's managed
-``CODEX_HOME``), so this never mutates the user's global ``~/.pi/agent``.
+Model-provider configuration is per-session. Linked user resources remain
+shared, including MCP configuration and refreshed OAuth tokens.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import logging
 import os
 import re
 import subprocess
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import suppress
 from copy import deepcopy
@@ -438,16 +438,18 @@ class PiProviderConfig:
         )
 
 
-def global_pi_agent_dir() -> Path:
+def global_pi_agent_dir(
+    *, env: Mapping[str, str] | None = None, workspace: Path | None = None
+) -> Path:
     """Return Pi's own agent config root (``~/.pi/agent`` by default).
 
     Honours Pi's ``PI_CODING_AGENT_DIR`` override so the pre-launch catalog
     reads the same login the launched Pi would.
     """
-    override = os.environ.get(PI_CODING_AGENT_DIR_ENV_VAR, "").strip()
-    if override:
-        return Path(override)
-    return Path.home() / ".pi" / "agent"
+    source_env = os.environ if env is None else env
+    override = source_env.get(PI_CODING_AGENT_DIR_ENV_VAR, "").strip()
+    root = Path(override).expanduser() if override else Path.home() / ".pi" / "agent"
+    return workspace / root if workspace is not None and not root.is_absolute() else root
 
 
 def _read_json_object(path: Path) -> dict[str, object]:
@@ -1946,6 +1948,7 @@ def pi_native_provider_launch(
     reasoning_effort: str | None = None,
     *,
     selection: str | None = None,
+    global_agent_dir: Path | None = None,
 ) -> PiNativeLaunch:
     """Write the managed config and return the launch env + CLI args for Pi.
 
@@ -1957,6 +1960,7 @@ def pi_native_provider_launch(
     :param selection: Optional picker value naming a generated provider and
         model. When that provider no longer serves the model, the provider that
         does is used instead.
+    :param global_agent_dir: User root resolved against the session workspace.
     :returns: The launch env, CLI args and any effort warning.
     :raises ValueError: If no generated provider serves the selected model.
     """
@@ -2001,7 +2005,11 @@ def pi_native_provider_launch(
     if provider.curated_models and enabled_refs:
         overlay["enabledModels"] = enabled_refs
     prepare_managed_pi_agent_dir(
-        agent_dir, overlay=overlay, global_agent_dir=global_pi_agent_dir()
+        agent_dir,
+        overlay=overlay,
+        global_agent_dir=global_agent_dir
+        if global_agent_dir is not None
+        else global_pi_agent_dir(),
     )
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     if os.name == "posix" and any(

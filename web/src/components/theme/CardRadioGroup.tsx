@@ -87,7 +87,7 @@ function SelectedBadge() {
 
 function themeCardClass(selected: boolean, layout?: string) {
   return cn(
-    "relative flex flex-col rounded-lg border-2 transition-[color,background-color,border-color,box-shadow]",
+    "relative flex flex-col rounded-lg border transition-[color,background-color,border-color,box-shadow]",
     selected
       ? "border-primary bg-primary/5"
       : "border-border hover:border-border-strong hover:bg-muted hover:shadow-sm",
