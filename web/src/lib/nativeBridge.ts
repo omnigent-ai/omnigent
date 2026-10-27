@@ -194,6 +194,16 @@ interface ElectronDesktopApi extends NativeShellApi {
   chooseDirectory?: (defaultPath?: string) => Promise<string | null>;
   /** This machine's path for a dropped File; "" if none or off the pinned server. */
   getPathForFile?: (file: File) => Promise<string>;
+  getFileOpenApps?: () => Promise<FileOpenApp[]>;
+  openFileInApp?: (hostId: string, path: string, appId: string) => Promise<boolean>;
+  getFileOpenSshHost?: (hostId: string, fingerprints?: string[]) => Promise<string | null>;
+  openRemoteFileInApp?: (
+    hostId: string,
+    path: string,
+    appId: string,
+    sshHost: string,
+    directory: boolean,
+  ) => Promise<boolean>;
   /** This machine's identity (CLI installed + host id) — fast, no subprocess. */
   getHostIdentity?: () => Promise<HostIdentity | null>;
   /** Start / stop / restart this machine's host daemon for the window's server. */
@@ -1223,6 +1233,74 @@ export async function resetCliPath(): Promise<CliStatus | null> {
 /** True when the desktop shell can reveal this machine's files in the OS file manager. */
 export function supportsFileReveal(): boolean {
   return typeof electronApi()?.revealFile === "function";
+}
+
+export interface FileOpenApp {
+  id: string;
+  label: string;
+  /** Native app icon as a data URL, when available. */
+  icon?: string;
+  /** Opens the containing folder when the selected item is a file. */
+  directory?: boolean;
+}
+
+export function supportsFileOpen(): boolean {
+  const api = electronApi();
+  return typeof api?.getFileOpenApps === "function" && typeof api?.openFileInApp === "function";
+}
+
+export function supportsRemoteFileOpen(): boolean {
+  const api = electronApi();
+  return (
+    typeof api?.getFileOpenApps === "function" && typeof api?.openRemoteFileInApp === "function"
+  );
+}
+
+export function supportsFileOpenSshDiscovery(): boolean {
+  return typeof electronApi()?.getFileOpenSshHost === "function";
+}
+
+export async function getFileOpenSshHost(
+  hostId: string,
+  fingerprints?: string[],
+): Promise<string | null> {
+  try {
+    return (await electronApi()?.getFileOpenSshHost?.(hostId, fingerprints)) ?? null;
+  } catch {
+    return null;
+  }
+}
+
+export async function openRemoteFileInApp(
+  hostId: string,
+  path: string,
+  appId: string,
+  sshHost: string,
+  directory: boolean,
+): Promise<boolean> {
+  try {
+    return (
+      (await electronApi()?.openRemoteFileInApp?.(hostId, path, appId, sshHost, directory)) ?? false
+    );
+  } catch {
+    return false;
+  }
+}
+
+export async function getFileOpenApps(): Promise<FileOpenApp[]> {
+  try {
+    return (await electronApi()?.getFileOpenApps?.()) ?? [];
+  } catch {
+    return [];
+  }
+}
+
+export async function openFileInApp(hostId: string, path: string, appId: string): Promise<boolean> {
+  try {
+    return (await electronApi()?.openFileInApp?.(hostId, path, appId)) ?? false;
+  } catch {
+    return false;
+  }
 }
 
 /** Ask the desktop shell to reveal ``path``; resolves false if it could not. */

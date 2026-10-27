@@ -825,6 +825,7 @@ def test_hello_frame_round_trip() -> None:
         runners=["runner_token_aaa", "runner_token_bbb"],
         interactive_shells=["zsh", "bash"],
         connection_id="host-connection-1",
+        ssh_host_key_fingerprints=["SHA256:public-key"],
     )
     decoded = decode_host_frame(encode_host_frame(original))
     assert isinstance(decoded, HostHelloFrame)
@@ -834,6 +835,7 @@ def test_hello_frame_round_trip() -> None:
     assert decoded.runners == ["runner_token_aaa", "runner_token_bbb"]
     assert decoded.interactive_shells == ["zsh", "bash"]
     assert decoded.connection_id == "host-connection-1"
+    assert decoded.ssh_host_key_fingerprints == ["SHA256:public-key"]
 
 
 def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None:
@@ -850,6 +852,7 @@ def test_hello_frame_without_interactive_shells_is_backward_compatible() -> None
     )
     assert isinstance(decoded, HostHelloFrame)
     assert decoded.interactive_shells is None
+    assert decoded.ssh_host_key_fingerprints is None
     # An older host advertises no capabilities — the server must read this as an
     # empty set (feature unsupported), not choke on the missing key.
     assert decoded.capabilities == []

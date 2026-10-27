@@ -169,6 +169,7 @@ def _no_real_model_catalog_prewarm(monkeypatch: pytest.MonkeyPatch) -> None:
         return True
 
     monkeypatch.setattr(HostProcess, "_prewarm_model_options", _noop)
+    monkeypatch.setattr("omnigent.host.ssh_identity.ssh_host_key_fingerprints", lambda: None)
 
 
 @pytest.fixture(autouse=True)
@@ -2704,12 +2705,15 @@ async def test_fast_capability_discovery_is_included_in_hello(
     """The first hello carries both readiness and gateway backing."""
     host = _make_host_process()
 
-    async def _discover() -> None:
-        host._configured_harnesses = {"codex-native": True}
-        host._gateway_inference = {"codex-native": True}
-        host._capabilities_initialized = True
-
-    monkeypatch.setattr(host, "_initialize_capabilities", _discover)
+    monkeypatch.setattr(
+        host, "_probe_configured_harnesses", AsyncMock(return_value={"codex-native": True})
+    )
+    monkeypatch.setattr(
+        host, "_probe_gateway_inference", AsyncMock(return_value={"codex-native": True})
+    )
+    monkeypatch.setattr(
+        "omnigent.host.ssh_identity.ssh_host_key_fingerprints", lambda: ["SHA256:public-key"]
+    )
     tunnel = _BlockingTunnel()
     serve_task = asyncio.create_task(host._serve_frames(tunnel))  # type: ignore[arg-type]
     try:
@@ -2722,6 +2726,8 @@ async def test_fast_capability_discovery_is_included_in_hello(
     assert len(tunnel.sent) == 1
     assert hello.configured_harnesses == {"codex-native": True}
     assert hello.gateway_inference == {"codex-native": True}
+
+    assert hello.ssh_host_key_fingerprints == ["SHA256:public-key"]
 
 
 async def test_slow_capability_discovery_blocks_registration_and_frame_dispatch(

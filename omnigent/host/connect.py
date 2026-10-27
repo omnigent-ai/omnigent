@@ -1339,6 +1339,7 @@ class HostProcess:
         self._configured_harnesses: dict[str, HarnessAvailability] | None = None
         self._harness_accounts: HarnessAccounts | None = None
         self._gateway_inference: dict[str, bool] | None = None
+        self._ssh_host_key_fingerprints: list[str] | None = None
         self._capabilities_initialized = False
         # Invalidates deferred probe results when an install or credential
         # write has already produced a fresher snapshot. Capability state is
@@ -4616,19 +4617,23 @@ class HostProcess:
 
     async def _initialize_capabilities(self) -> None:
         """Collect startup metadata before registration, with bounded fallback."""
+        from omnigent.host.ssh_identity import ssh_host_key_fingerprints
+
         if self._capabilities_initialized:
             return
         generation = self._capability_generation
         try:
-            configured, gateway = await asyncio.wait_for(
+            configured, gateway, ssh_fingerprints = await asyncio.wait_for(
                 asyncio.gather(
                     self._probe_configured_harnesses(startup=True),
                     self._probe_gateway_inference(startup=True),
+                    self._run_host_subprocess_in_thread(ssh_host_key_fingerprints),
                 ),
                 timeout=_HOST_CAPABILITY_INIT_TIMEOUT_S,
             )
         except TimeoutError:
             configured = gateway = None
+            ssh_fingerprints = None
             _logger.error(
                 "Host capability discovery exceeded %.0fs; continuing with unknown metadata",
                 _HOST_CAPABILITY_INIT_TIMEOUT_S,
@@ -4639,6 +4644,7 @@ class HostProcess:
             )
         if self._capability_generation == generation:
             self._replace_capabilities(configured, gateway)
+        self._ssh_host_key_fingerprints = ssh_fingerprints
         self._capabilities_initialized = True
 
     def _replace_capabilities(
@@ -5424,6 +5430,7 @@ class HostProcess:
             installation_id=_tel_install_id,
             capabilities=list(HOST_CAPABILITIES),
             connection_id=connection_id,
+            ssh_host_key_fingerprints=self._ssh_host_key_fingerprints,
         )
         try:
             encoded_hello = encode_host_frame(hello)

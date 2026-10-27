@@ -54,6 +54,7 @@ def _make_hello(
     gateway_inference: dict[str, bool] | None = None,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    ssh_host_key_fingerprints: list[str] | None = None,
 ) -> str:
     """Encode a HostHelloFrame for tests.
 
@@ -75,6 +76,7 @@ def _make_hello(
             gateway_inference=gateway_inference,
             harness_accounts=harness_accounts,
             capabilities=capabilities or [],
+            ssh_host_key_fingerprints=ssh_host_key_fingerprints,
         )
     )
 
@@ -152,6 +154,7 @@ async def _connect_host(
     gateway_inference: dict[str, bool] | None = None,
     harness_accounts: dict[str, dict[str, object]] | None = None,
     capabilities: list[str] | None = None,
+    ssh_host_key_fingerprints: list[str] | None = None,
 ) -> ApplicationCommunicator:
     """Connect a mock host via WebSocket tunnel.
 
@@ -180,6 +183,7 @@ async def _connect_host(
                 gateway_inference,
                 harness_accounts,
                 capabilities,
+                ssh_host_key_fingerprints=ssh_host_key_fingerprints,
             ),
         },
     )
@@ -482,6 +486,23 @@ async def test_hosts_api_gateway_inference_null_for_older_host(
     assert listing.json()["hosts"][0]["gateway_inference"] is None
     assert single.status_code == 200
     assert single.json()["gateway_inference"] is None
+
+
+@pytest.mark.parametrize("fingerprints", [None, ["SHA256:public-key"]])
+async def test_host_ssh_identity_is_live_connection_metadata(
+    host_api_app: tuple[FastAPI, HostRegistry, HostStore, SqlAlchemyConversationStore],
+    fingerprints: list[str] | None,
+) -> None:
+    app, registry, _hs, _cs = host_api_app
+    comm = await _connect_host(app, registry, ssh_host_key_fingerprints=fingerprints)
+    async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
+        response = await client.get(f"/v1/hosts/{_HOST_ID}")
+        assert response.status_code == 200
+        assert response.json()["ssh_host_key_fingerprints"] == fingerprints
+        await comm.send_input({"type": "websocket.disconnect", "code": 1000})
+        await comm.wait(timeout=budget(1.0))
+        response = await client.get(f"/v1/hosts/{_HOST_ID}")
+        assert response.json()["ssh_host_key_fingerprints"] is None
 
 
 async def test_gateway_inference_reconverges_after_a_server_restart(

@@ -4320,6 +4320,34 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     );
   });
 
+  it("resolves the editor SSH alias only for the window's verified Arca host", async (t) => {
+    const { arcaTarget } = require("../src/arcaIdentity");
+    const serverUrl = "https://account.databricks.com/omnigent?o=123";
+    const hostId = "a".repeat(32);
+    const h = loadNavigationHarness({
+      serverUrl,
+      internalFeatures: true,
+      arcaResult: { ok: true, identity: { serverUrl: arcaTarget(serverUrl), hostId } },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const resolve = h.ipc.get("omnigent:file-open-ssh-host");
+    const event = { sender: h.webContents, senderFrame: { url: serverUrl } };
+
+    assert.equal(await resolve(event, hostId), null);
+    await h.api.startArcaHostConnect(serverUrl).promise;
+    assert.equal(await resolve(event, hostId), "arca.ssh");
+    assert.equal(await resolve(event, "b".repeat(32)), null);
+    assert.equal(await resolve(event, ""), null);
+    assert.equal(
+      await resolve({ ...event, senderFrame: { url: "https://other.example" } }, hostId),
+      null,
+    );
+
+    h.api.setWindowServerUrl(h.win, serverUrl.replace("123", "456"));
+    assert.equal(await resolve(event, hostId), null);
+  });
+
   it("uses consent to recapture a source host that differs from the remembered host", async (t) => {
     const { arcaTarget } = require("../src/arcaIdentity");
     const serverUrl = "https://account.databricks.com/omnigent?o=123";

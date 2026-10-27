@@ -38,6 +38,7 @@ const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
 const { registerFolderChooser } = require("./folderChooser");
+const { registerFileOpen } = require("./fileOpen");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -4660,6 +4661,19 @@ function registerIpc() {
     shell,
     isPinnedOriginSender,
     localHostId: () => omnigentCli.localHostId(),
+  });
+  registerFileOpen({
+    ipcMain,
+    shell,
+    isPinnedOriginSender,
+    localHostId: () => omnigentCli.localHostId(),
+    getAppIcon: async (appPath) => (await app.getFileIcon(appPath, { size: "small" })).toDataURL(),
+    resolveSshHost: (event, hostId) => {
+      const win = BrowserWindow.fromWebContents(event.sender);
+      if (!win) return null;
+      const identity = arcaIdentities.get(windowArcaServerUrl(win));
+      return identity?.hostId === hostId ? "arca.ssh" : null;
+    },
   });
 
   registerFolderChooser({

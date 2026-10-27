@@ -128,6 +128,13 @@ contextBridge.exposeInMainWorld("omnigentDesktop", {
    */
   getPathForFile: (file) =>
     ipcRenderer.invoke("omnigent:dropped-file-path", webUtils.getPathForFile(file)),
+  getFileOpenApps: () => ipcRenderer.invoke("omnigent:file-open-apps"),
+  openFileInApp: (hostId, path, appId) =>
+    ipcRenderer.invoke("omnigent:open-file-in-app", hostId, path, appId),
+  getFileOpenSshHost: (hostId, fingerprints) =>
+    ipcRenderer.invoke("omnigent:file-open-ssh-host", hostId, fingerprints),
+  openRemoteFileInApp: (hostId, path, appId, sshHost, directory) =>
+    ipcRenderer.invoke("omnigent:open-remote-file-in-app", hostId, path, appId, sshHost, directory),
   /**
    * This machine's identity — `{ cliInstalled, hostId }` — read from local
    * config with no subprocess, so it's instant. Lets the SPA recognize "this

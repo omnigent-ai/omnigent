@@ -11,6 +11,7 @@
 
 import { FileViewerContext, useWorkspacePaths, type FilePosition } from "./FileViewerContext";
 import { revealInFileManager, revealLabel, useRevealTarget } from "./RevealInFileManager";
+import { useOpenInActions } from "./OpenInMenu";
 import {
   dismissFilePosition,
   isFilePositionDismissed,
@@ -798,6 +799,7 @@ function FileViewerBody({
   const isDeletedFile =
     changedFiles.data?.data.some((f) => f.path === path && f.status === "deleted") ?? false;
   const revealTarget = useRevealTarget(path);
+  const openInActions = useOpenInActions(isDeletedFile ? null : path);
 
   // Diff is a global toggle — turning it on/off on any file carries over as you
   // navigate to the next file. Source ↔ preview is also shared across previewable
@@ -1137,6 +1139,8 @@ function FileViewerBody({
      * single trigger. Unlike `options`, these are not mutually exclusive and
      * carry no "selected choice" semantics. `onSelect` is ignored. */
     menu?: ToolbarOption[];
+    /** Keep independent actions grouped in a submenu when the toolbar collapses. */
+    nestedMenu?: boolean;
   }
   const toolbarActions: ToolbarAction[] = [];
   if (lang === "markdown" && !markdownSourceFallback && viewMode !== "diff") {
@@ -1354,6 +1358,16 @@ function FileViewerBody({
     ),
     onSelect: copyFileLink,
   });
+  if (openInActions.length) {
+    toolbarActions.push({
+      key: "open-in",
+      label: "Open in…",
+      textLabel: "Open in…",
+      icon: null,
+      menu: openInActions,
+      nestedMenu: true,
+    });
+  }
 
   const showNavButtons = currentNavIdx !== -1 && navigableFiles.length > 1 && !!onNavigateTo;
   const {
@@ -1395,11 +1409,13 @@ function FileViewerBody({
                   <Button
                     type="button"
                     variant="ghost"
-                    size="icon-sm"
+                    size={action.textLabel ? "sm" : "icon-sm"}
                     aria-label={action.label}
                     tabIndex={interactive ? undefined : -1}
                   >
                     {action.icon}
+                    {action.textLabel}
+                    {action.textLabel && <ChevronDownIcon />}
                   </Button>
                 </DropdownMenuTrigger>
               </TooltipTrigger>
@@ -1638,17 +1654,16 @@ function FileViewerBody({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="end" className="w-auto min-w-40">
                   {toolbarActions.map((action) =>
-                    action.options ? (
-                      // A mutually-exclusive picker (e.g. view mode) collapses to
-                      // a nested submenu so its "selected choice" semantics — one
-                      // highlighted option — stay intact.
+                    action.options || action.nestedMenu ? (
+                      // Keep view-mode choices and app destinations grouped
+                      // in submenus when the toolbar collapses.
                       <DropdownMenuSub key={action.key}>
                         <DropdownMenuSubTrigger className="whitespace-nowrap">
                           {action.icon}
                           {action.tooltip ?? action.label}
                         </DropdownMenuSubTrigger>
                         <DropdownMenuSubContent>
-                          {action.options.map((option) => (
+                          {(action.options ?? action.menu ?? []).map((option) => (
                             <DropdownMenuItem
                               key={option.key}
                               className={cn(
