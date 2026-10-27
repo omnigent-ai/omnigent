@@ -381,6 +381,7 @@ from omnigent.server.schemas import (
     SessionEventInput,
     SessionListItem,
     SessionModelEvent,
+    SessionPullRequestSummary,
     SessionResponse,
     SessionStatusEvent,
     SessionUsageEvent,
@@ -1184,6 +1185,8 @@ def _build_session_list_item(
     child_session_ids: list[str],
     comments_fingerprint: CommentsFingerprint | None,
     harness: str | None = None,
+    pull_request: SessionPullRequestSummary | None = None,
+    pull_requests_synced: bool | None = None,
 ) -> SessionListItem:
     """
     Assemble one :class:`SessionListItem` from a conversation row and
@@ -1226,6 +1229,10 @@ def _build_session_list_item(
         ``comments_updated_at=None`` so the two states look identical
         on the wire.
     :param harness: Resolved session harness from the batch's cached agent specs.
+    :param pull_request: The conversation's first linked pull request,
+        from the server's PR store; ``None`` when it has none.
+    :param pull_requests_synced: Whether the server has imported the
+        conversation's PRs, or ``None`` without PR storage.
     :returns: The assembled :class:`SessionListItem`.
     """
     # ``conv.agent_id`` is guaranteed non-None by the caller (sessions
@@ -1287,6 +1294,8 @@ def _build_session_list_item(
         search_snippet=conv.search_snippet,
         parent_session_id=conv.parent_conversation_id,
         project_id=conv.project_id,
+        pull_request=pull_request,
+        pull_requests_synced=pull_requests_synced,
     )
 
 

@@ -79,6 +79,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import presence
+from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -147,6 +148,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
+    _EXTERNAL_PULL_REQUESTS_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
@@ -309,6 +311,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.session_pull_request_store import UnreadablePullRequestsError
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -348,6 +351,7 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
         _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
         _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_PULL_REQUESTS_TYPE,
     }
 )
 
@@ -757,6 +761,7 @@ _RUNNER_EVENT_TYPES = frozenset(
         _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_PULL_REQUESTS_TYPE,
     }
 )
 
@@ -993,6 +998,24 @@ def register_events_routes(
     if register_runner_ingest is not None:
         register_runner_ingest(ingest_runner_batch)
 
+    pull_request_store = server_prs.open_store(conversation_store)
+
+    async def _store_reported_pull_requests(session_id: str, body: SessionEventInput) -> None:
+        """Merge the PRs a runner discovered; the runner retries until this succeeds."""
+        if pull_request_store is None:
+            return
+        reports = server_prs.parse_reports(body.data.get("prs"))
+        if not reports:
+            return
+        try:
+            await asyncio.to_thread(pull_request_store.apply_report, session_id, reports)
+        except UnreadablePullRequestsError:  # Retrying cannot help.
+            _logger.warning(
+                "Ignoring reported pull requests for an unreadable document",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+
     async def _post_event_impl(
         request: Request | _RunnerEventContext | StartupInputContext,
         session_id: str,
@@ -1215,6 +1238,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_STATUS_TYPE,
             _SUBAGENT_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
+            _EXTERNAL_PULL_REQUESTS_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MCP_STARTUP_TYPE,
             _EXTERNAL_MODEL_CHANGE_TYPE,
@@ -2498,6 +2522,9 @@ def register_events_routes(
                     error=record_error if isinstance(record_error, str) and record_error else None,
                 )
             _publish_mcp_startup(session_id, mcp_servers)
+            return {"queued": False}
+        if body.type == _EXTERNAL_PULL_REQUESTS_TYPE:
+            await _store_reported_pull_requests(session_id, body)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
             # Persist the harness-reported cumulative usage so the
