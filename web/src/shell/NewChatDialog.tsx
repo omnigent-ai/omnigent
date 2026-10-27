@@ -4939,31 +4939,38 @@ export function NewChatLandingScreen() {
   const skillsHarness = autoRoutingSelected
     ? null
     : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
-  // Preview the connected Arca's home catalog before the Arclet has its own host.
-  const arcletSkills = sandboxSelected && effectiveSandboxProvider === "arclet";
-  const skillsHost = sandboxSelected
-    ? arcletSkills
-      ? findConnectedArcaHost(allHosts, readArcaHostId())
-      : undefined
-    : selectedHost;
+  // Native prompts stay plain text; SDK skill invocations require the sandbox's catalog.
+  const arcletSkills =
+    sandboxSelected && effectiveSandboxProvider === "arclet" && isNativeTerminalAgent;
+  function getSkillsHost() {
+    if (!sandboxSelected) return selectedHost;
+    if (arcletSkills) return findConnectedArcaHost(allHosts, readArcaHostId());
+    return undefined;
+  }
+  const skillsHost = getSkillsHost();
   const skillsHostId = sandboxSelected ? skillsHost?.host_id : selectedHostId;
   const skillsPath = sandboxSelected ? "~" : workspaceTrimmed;
-  const skillsUnavailableMessage =
-    sandboxSelected && !arcletSkills
-      ? "Host skills will be available after the sandbox starts."
-      : selectedAgent?.id === PENDING_AGENT_ID
-        ? "Skills will be available after this session starts."
-        : !skillsHostId
-          ? arcletSkills
-            ? "Connect your Arca to discover skills before the sandbox starts."
-            : "Choose a host to discover skills."
-          : skillsHost?.status !== "online"
-            ? "Skills unavailable while the host is offline."
-            : !sandboxSelected && !workspaceValid
-              ? "Choose a working directory to discover skills."
-              : !skillsHarness
-                ? "Choose a harness to discover host skills."
-                : undefined;
+  function getSkillsUnavailableMessage() {
+    if (sandboxSelected && !arcletSkills) {
+      return "Host skills will be available after the sandbox starts.";
+    }
+    if (selectedAgent?.id === PENDING_AGENT_ID) {
+      return "Skills will be available after this session starts.";
+    }
+    if (!skillsHostId) {
+      if (arcletSkills) return "Connect your Arca to discover skills before the sandbox starts.";
+      return "Choose a host to discover skills.";
+    }
+    if (!sandboxSelected && skillsHost?.status !== "online") {
+      return "Skills unavailable while the host is offline.";
+    }
+    if (!sandboxSelected && !workspaceValid) {
+      return "Choose a working directory to discover skills.";
+    }
+    if (!skillsHarness) return "Choose a harness to discover host skills.";
+    return undefined;
+  }
+  const skillsUnavailableMessage = getSkillsUnavailableMessage();
   const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
   const {
     skills: hostSkills,
