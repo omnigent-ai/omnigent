@@ -141,6 +141,8 @@ def test_mock_config_restores_symlink_target(monkeypatch, tmp_path, raise_in_tes
 class _ConfigStub:
     options: dict[str, Any] = field(default_factory=dict)
     stash: pytest.Stash = field(default_factory=pytest.Stash)
+    # Set only on xdist workers, e.g. ``{"workerid": "gw0"}``.
+    workerinput: dict[str, Any] | None = None
 
     def getoption(self, name: str, default: Any = None) -> Any:
         return self.options.get(name, default)
@@ -178,9 +180,8 @@ def test_worker_replaces_and_restores_an_inherited_suite_config_home(
     (inherited / "config.yaml").write_text("controller copy\n")
     monkeypatch.setenv("OMNIGENT_CONFIG_HOME", str(inherited))
     monkeypatch.setenv("OMNIGENT_UI_TESTS_CONFIG_HOME", str(inherited))
-    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw0")
     monkeypatch.delenv("OMNIGENT_REPRO_SERVER_URL", raising=False)
-    config = cast(Config, _ConfigStub({"numprocesses": 2}))
+    config = cast(Config, _ConfigStub({"numprocesses": 2}, workerinput={"workerid": "gw0"}))
     configuration._isolate_config_home(config)
     worker_home = Path(os.environ["OMNIGENT_CONFIG_HOME"])
     assert worker_home != inherited
@@ -197,8 +198,10 @@ def test_worker_replaces_and_restores_an_inherited_suite_config_home(
 def test_xdist_controller_leaves_config_home_to_its_workers(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    for name in ("OMNIGENT_CONFIG_HOME", "PYTEST_XDIST_WORKER", "OMNIGENT_REPRO_SERVER_URL"):
+    for name in ("OMNIGENT_CONFIG_HOME", "OMNIGENT_REPRO_SERVER_URL"):
         monkeypatch.delenv(name, raising=False)
+    # A controller launched from inside another xdist worker inherits its id.
+    monkeypatch.setenv("PYTEST_XDIST_WORKER", "gw3")
     config = cast(Config, _ConfigStub({"numprocesses": 2}))
     configuration._isolate_config_home(config)
     assert "OMNIGENT_CONFIG_HOME" not in os.environ
@@ -219,8 +222,7 @@ def test_unconfigure_restores_both_variables_exactly(
             monkeypatch.delenv(name, raising=False)
         else:
             monkeypatch.setenv(name, value)
-    for name in ("PYTEST_XDIST_WORKER", "OMNIGENT_REPRO_SERVER_URL"):
-        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("OMNIGENT_REPRO_SERVER_URL", raising=False)
     config = cast(Config, _ConfigStub())
     configuration._isolate_config_home(config)
     private_home = Path(os.environ["OMNIGENT_CONFIG_HOME"])

@@ -103,10 +103,7 @@ def _isolate_config_home(config: pytest.Config) -> None:
         config.getoption("--ui-base-url", default=None)
         or os.environ.get("OMNIGENT_REPRO_SERVER_URL")
         # An xdist controller spawns nothing; each worker makes its own copy.
-        or (
-            config.getoption("numprocesses", default=0)
-            and not os.environ.get("PYTEST_XDIST_WORKER")
-        )
+        or (config.getoption("numprocesses", default=0) and timings.xdist_worker(config) is None)
     ):
         return
     from omnigent.config import global_config_path
@@ -133,7 +130,7 @@ def _isolate_playwright_output(config: pytest.Config) -> None:
     output = config.getoption("--output", default=None)
     if output is None:
         return
-    if worker := os.environ.get("PYTEST_XDIST_WORKER"):
+    if worker := timings.xdist_worker(config):
         config.option.output = os.path.join(output, worker)
     elif config.getoption("numprocesses", default=0):
         shutil.rmtree(output, ignore_errors=True)

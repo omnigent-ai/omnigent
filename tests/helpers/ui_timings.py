@@ -14,11 +14,21 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     parser.addoption("--ui-timing-output", type=Path, help="Write per-phase JSONL timing records.")
 
 
+def xdist_worker(config: pytest.Config) -> str | None:
+    """Return this process's xdist worker id, e.g. ``"gw0"``, or ``None``.
+
+    Reads xdist's own worker input rather than ``PYTEST_XDIST_WORKER``, which
+    a pytest run launched from inside another worker inherits.
+    """
+    workerinput = getattr(config, "workerinput", None)
+    return workerinput["workerid"] if workerinput is not None else None
+
+
 def pytest_configure(config: pytest.Config) -> None:
     path = config.getoption("--ui-timing-output")
     if path is None:
         return
-    worker = os.environ.get("PYTEST_XDIST_WORKER")
+    worker = xdist_worker(config)
     if worker:
         # Each xdist worker records the tests it ran in its own file.
         path = path.with_name(f"{path.stem}-{worker}{path.suffix}")
