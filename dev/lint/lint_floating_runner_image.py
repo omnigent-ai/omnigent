@@ -1,9 +1,10 @@
 """Flag GitHub Actions runner labels that float to whatever image GitHub ships next.
 
-``ubuntu-latest`` and friends move to a new OS image without notice; a move to
-ubuntu-26.04 broke every Playwright job at once. Workflows name an explicit
-image such as ``ubuntu-24.04`` instead. Every YAML string is checked, including
-labels inside ``${{ }}`` expressions, except script and prose keys like ``run``.
+``ubuntu-latest`` and friends move to each new OS image GitHub ships; the
+announced move to ubuntu-26.04 still broke every Playwright job at once.
+Workflows name an explicit image such as ``ubuntu-24.04`` instead. Every YAML
+string is checked, including labels inside ``${{ }}`` expressions, except
+script and prose keys like ``run``.
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ import yaml
 
 RULE_NAME = "floating-runner-image"
 HINT = (
-    "GitHub repoints `*-latest` runner labels at new OS images without notice.\n"
+    "GitHub repoints `*-latest` runner labels at each new OS image it ships.\n"
     "Name the image explicitly, e.g. `runs-on: ubuntu-24.04`, and move it\n"
     "deliberately once the workflow is known to work on the newer image."
 )
