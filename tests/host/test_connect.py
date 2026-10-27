@@ -2460,10 +2460,13 @@ async def test_connect_watchdog_silent_on_intentional_stop(
 
 @pytest.mark.parametrize("had_connected", [None, False, True])
 @pytest.mark.parametrize("send_fails", [False, True])
+@pytest.mark.parametrize("console_error", [None, BrokenPipeError, ValueError, OSError])
 async def test_unreported_exit_flushes_after_reconnect(
     capsys: pytest.CaptureFixture[str],
+    monkeypatch: pytest.MonkeyPatch,
     had_connected: bool | None,
     send_fails: bool,
+    console_error: type[Exception] | None,
 ) -> None:
     """An exit report that raced a disconnect is sent after the next hello.
 
@@ -2482,6 +2485,10 @@ async def test_unreported_exit_flushes_after_reconnect(
     )
     assert "runner_parked" in host._unreported_exits
     tunnel = _FakeTunnel()
+    if console_error is not None:
+        monkeypatch.setattr(
+            "omnigent.host.connect.print", Mock(side_effect=console_error), raising=False
+        )
 
     # _serve_frames sends hello, flushes parked reports, then hits the
     # fake recv's immediate disconnect.
@@ -7976,12 +7983,12 @@ async def test_sustained_recycle_failures_fall_back_to_backoff(
     assert prompt == [0, 1, 2], f"prompt cadence must stop after the streak cap: {prompt}"
 
 
-@pytest.mark.parametrize("console_error", [None, BrokenPipeError(), ValueError("closed")])
+@pytest.mark.parametrize("console_error", [None, BrokenPipeError, ValueError, OSError])
 async def test_silent_connect_streak_escalates_and_slows_reconnects(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
-    console_error: Exception | None,
+    console_error: type[Exception] | None,
 ) -> None:
     """Repeated accepted-but-silent connections escalate to slow backoff."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
@@ -7992,12 +7999,13 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     spy = _ConnectSpy([None, None, None, None, None, asyncio.CancelledError()])
     _patch_connect(monkeypatch, spy)
     host = _host()
+    if console_error is not None:
+        monkeypatch.setattr(
+            "omnigent.host.connect.print", Mock(side_effect=console_error), raising=False
+        )
 
     with (
         caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
-        patch("omnigent.host.connect.print", side_effect=console_error, create=True)
-        if console_error is not None
-        else contextlib.nullcontext(),
         patch.object(
             _DroppedTunnel,
             "recv",
@@ -10033,6 +10041,50 @@ async def test_dispatch_fs_write_op_routes_github_set_preference(
     )
     assert out == {"object": "session.github.info", "ok": True}
     assert seen == {"root": "/ws/omnigent", "account": "octocat", "remote": "origin"}
+
+
+def test_host_serves_a_pr_the_server_vouches_for(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Reads and writes serve a PR this host never recorded once the server vouches for it."""
+    from omnigent.host.frames import HostFsResultFrame, HostFsWriteFrame
+    from omnigent.runner import github_resource
+
+    monkeypatch.setenv("OMNIGENT_DATA_DIR", str(tmp_path))
+    monkeypatch.setattr(github_resource, "_pr_token", lambda *_a: None)
+    monkeypatch.setattr(github_resource, "_gh", lambda *_a, **_kw: (0, "{}", ""))
+    url = "https://github.com/example/one/pull/42"
+    host = _make_host_process()
+
+    def read(params: dict[str, object]) -> HostFsResultFrame:
+        return host._handle_fs_request(
+            HostFsRequestFrame(
+                request_id="merge-options",
+                op="github_merge_options",
+                workspace=str(tmp_path),
+                session_id="session",
+                params=params,
+            )
+        )
+
+    try:
+        refused = read({"pr_url": url})
+        served = read({"pr_url": url, "server_tracked": True})
+        written = host._handle_fs_write(
+            HostFsWriteFrame(
+                request_id="disable-auto-merge",
+                op="github_disable_auto_merge",
+                workspace=str(tmp_path),
+                session_id="session",
+                params={"pr_url": url, "server_tracked": True},
+            )
+        )
+    finally:
+        _cleanup_host(host)
+    assert refused.status == "error"
+    assert "not associated" in (refused.error or "")
+    assert served.status == "ok", served
+    assert written.status == "ok", written
 
 
 async def test_dispatch_fs_write_op_unknown_op_raises() -> None:

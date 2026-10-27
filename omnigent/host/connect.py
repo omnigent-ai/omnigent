@@ -258,7 +258,7 @@ def _print_host_status(
     stream = sys.stderr if stderr else sys.stdout
     try:
         print(message, file=stream, flush=True)
-    except (BrokenPipeError, ValueError) as exc:
+    except (OSError, ValueError) as exc:
         if (
             isinstance(exc, BrokenPipeError)
             and (stream is sys.__stdout__ or stream is sys.__stderr__)
@@ -1501,7 +1501,7 @@ class HostProcess:
                 self._reap_orphans_once(child_pids)
             except asyncio.CancelledError:
                 raise
-            except Exception:  # noqa: BLE001 — a reaper must survive a failed sweep
+            except Exception:  # a reaper must never die on a stray error
                 _logger.debug("orphan reaper sweep failed", exc_info=True)
 
     def _reap_orphans_once(self, child_pids: Iterable[int] | None = None) -> int:
@@ -2378,7 +2378,7 @@ class HostProcess:
         )
         try:
             await self._stop_runner_and_trigger(proc, "runner_spawn_abandoned")
-        except Exception:  # noqa: BLE001 — detached cleanup must be observed
+        except Exception:  # detached cleanup must be observed
             _logger.warning(
                 "Failed to stop abandoned runner pid=%s",
                 proc.pid,
@@ -2446,7 +2446,7 @@ class HostProcess:
                     runner_id,
                     session_id,
                 )
-            except Exception:  # noqa: BLE001 — detached cleanup must be observed
+            except Exception:  # must never die unobserved
                 _logger.warning(
                     "Failed to stop superseded runner %s for session %s; "
                     "the process may linger until it exits on its own",
@@ -2711,7 +2711,7 @@ class HostProcess:
             try:
                 await self._send_text(ws, encode_host_frame(report))
                 return
-            except Exception:  # noqa: BLE001 — any send failure parks the report
+            except Exception:  # any send failure parks the report
                 _logger.debug(
                     "Could not send runner_exited for %s; queueing for reconnect",
                     runner_id,
@@ -3696,8 +3696,13 @@ class HostProcess:
             self._fs_readers.move_to_end(expanded)
             reader = cached[1]
         params = frame.params or {}
+        from omnigent.runner import pr_resource
+
         try:
-            payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
+            with pr_resource.server_tracking(
+                params.get("server_tracked"), params.get("default_pr_url")
+            ):
+                payload = self._dispatch_fs_op(reader, frame.op, frame.session_id, params)
         except WorkspaceReaderError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -3927,7 +3932,7 @@ class HostProcess:
 
         try:
             rows = await codex_launch_catalog()
-        except Exception:  # noqa: BLE001 — unavailable catalogs must not crash the host
+        except Exception:  # no catalog, never a crash
             _logger.warning("Codex model catalog unavailable", exc_info=True)
             return None
         if rows is None:
@@ -3954,7 +3959,7 @@ class HostProcess:
         try:
             config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
             rows = await claude_launch_catalog(config)
-        except Exception:  # noqa: BLE001 — unavailable catalogs must not crash the host
+        except Exception:  # no catalog, never a crash
             _logger.warning("Claude model catalog unavailable", exc_info=True)
             return None
         if rows is None:
@@ -4003,7 +4008,7 @@ class HostProcess:
                 from omnigent.harnesses.pi_native.credentials import pi_native_model_options
 
                 pi_models = await asyncio.to_thread(pi_native_model_options)
-            except Exception:  # noqa: BLE001 — unavailable catalogs must not crash the host
+            except Exception:  # no catalog, never a crash
                 _logger.warning("Pi model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
@@ -4033,7 +4038,7 @@ class HostProcess:
                     status="failed",
                     error=str(exc),
                 )
-            except Exception:  # noqa: BLE001 — unavailable catalogs must not crash the host
+            except Exception:  # no catalog, never a crash
                 _logger.warning("Devin model catalog unavailable", exc_info=True)
                 return HostModelOptionsResultFrame(
                     request_id=frame.request_id,
@@ -4203,10 +4208,14 @@ class HostProcess:
                 error_code="not_found",
                 error="workspace directory does not exist on host",
             )
+        params = {**(frame.params or {}), "session_id": frame.session_id}
+        from omnigent.runner import pr_resource
+
         try:
-            payload = self._dispatch_fs_write_op(
-                expanded, frame.op, {**(frame.params or {}), "session_id": frame.session_id}
-            )
+            with pr_resource.server_tracking(
+                params.get("server_tracked"), params.get("default_pr_url")
+            ):
+                payload = self._dispatch_fs_write_op(expanded, frame.op, params)
         except ValueError as exc:
             return HostFsResultFrame(
                 request_id=frame.request_id,
@@ -4475,7 +4484,7 @@ class HostProcess:
                     explicit_refresh=explicit_refresh,
                 )
                 return harness, account
-            except Exception:  # noqa: BLE001 — failed probes leave account state unknown
+            except Exception:
                 _logger.warning("Host %s account probe failed", harness, exc_info=True)
                 return harness, {"kind": "unknown"}
 
@@ -5305,7 +5314,7 @@ class HostProcess:
                     self._auth_token_factory_resolved = True
             if self._auth_token_factory is not None:
                 return self._auth_token_factory()
-        except Exception:  # noqa: BLE001 — unavailable auth must not crash the host
+        except Exception:
             _logger.debug("Could not obtain auth token", exc_info=True)
         return None
 

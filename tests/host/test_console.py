@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import json
 import os
 import subprocess
@@ -108,10 +109,13 @@ def test_closed_console_preserves_process_exit(
         assert "HTTP 403" in exits[0]["attributes"]["error"]
 
 
-def test_mocked_print_does_not_redirect_a_healthy_console(monkeypatch: pytest.MonkeyPatch) -> None:
-    """A print stub raising BrokenPipeError says nothing about the actual descriptor."""
+@pytest.mark.parametrize("console_error", [BrokenPipeError(), OSError(errno.EIO, "I/O error")])
+def test_mocked_print_does_not_redirect_a_healthy_console(
+    monkeypatch: pytest.MonkeyPatch, console_error: OSError
+) -> None:
+    """A print stub raising an error says nothing about the actual descriptor."""
     monkeypatch.setattr(sys, "stdout", sys.__stdout__)
-    monkeypatch.setattr(host_connect, "print", Mock(side_effect=BrokenPipeError()), raising=False)
+    monkeypatch.setattr(host_connect, "print", Mock(side_effect=console_error), raising=False)
     redirect = Mock()
     monkeypatch.setattr(host_connect.os, "dup2", redirect)
     host_connect._print_host_status("test status")

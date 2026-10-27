@@ -404,6 +404,7 @@ from omnigent.spec.types import (
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
 from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
     PINNED_LABEL_KEY,
     RUNNER_LIVENESS_TTL_S,
     SIDE_CHAT_LABEL_KEY,
@@ -4582,6 +4583,8 @@ async def _bind_and_launch_managed_runner(
     # From here a shutdown may cancel the launch: the host's replica finishes it.
     if (launch_task := asyncio.current_task()) is not None:
         _unbound_managed_launch_tasks.discard(launch_task)
+    if (launch := tracker.get(session_id)) is not None:
+        launch.bound.set()
     if relaunch_host is not None:
         await _note_workspace_reset_on_recreate(session_id, conversation_store)
     # Host bound; what remains is launching the runner and waiting
@@ -11249,6 +11252,7 @@ async def _create_session_from_existing_agent(
     artifact_store: ArtifactStore | None = None,
     background_title_coordinator: BackgroundSessionTitleCoordinator | None = None,
     project_store: ProjectStore | None = None,
+    created_by_session_id: str | None = None,
 ) -> tuple[SessionResponse, Conversation]:
     """
     Create a session bound to an already-registered agent.
@@ -11278,6 +11282,7 @@ async def _create_session_from_existing_agent(
         ``file_id`` references in ``initial_items`` before forwarding
         to the runner.
     :param artifact_store: Optional binary content store for the same.
+    :param created_by_session_id: Server-authorized source of an independent worker.
     :returns: The newly created session snapshot and its conversation row.
     :raises OmnigentError: 404 if no agent matches ``body.agent_id``;
         403/404 if ``parent_session_id`` or session-scoped ``agent_id``
@@ -11818,6 +11823,8 @@ async def _create_session_from_existing_agent(
 
     native_agent = native_coding_agent_for_agent_name(agent.name)
     initial_labels = dict(body.labels) if body.labels else {}
+    if created_by_session_id is not None:
+        initial_labels[CREATED_BY_SESSION_LABEL_KEY] = created_by_session_id
     initial_labels.update(registry_labels)
     if created_worktree_path is not None:
         from omnigent.server.routes._host_worktree import (

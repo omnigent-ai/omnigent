@@ -115,6 +115,7 @@ import {
 import { useResizableInlinePanel } from "@/hooks/useResizableInlinePanel";
 import { useResizableSidebar } from "@/hooks/useResizableSidebar";
 import { ChatHeader } from "./ChatHeader";
+import { CREATED_BY_SESSION_LABEL_KEY } from "./CreatedBySession";
 import { ExecutionLogsPanel } from "./ExecutionLogsPanel";
 import {
   FileViewerContext,
@@ -2509,6 +2510,7 @@ function AppShellImpl() {
                     isChildSession={isChildSession}
                     subAgentName={activeSession?.subAgentName ?? null}
                     conversationId={conversationId}
+                    createdBySessionId={activeSession?.labels?.[CREATED_BY_SESSION_LABEL_KEY]}
                     permissionLevel={permissionLevel}
                     actionConversation={actionConversation}
                     conversationTitle={headerConversationTitle}

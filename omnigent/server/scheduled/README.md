@@ -38,6 +38,24 @@ flowchart TD
     N --> O["Record outcome, or check again on a later sweep"]
 ```
 
+## Run now
+
+`POST /v1/scheduled-tasks/{id}/run` calls `run_now(task)`. It records a pending
+`scheduled` run with its own `manual:<id>` trigger key, and derives the run's host
+ID like any occurrence. If this replica owns that host and has startup capacity,
+it claims the run and starts it right away. Otherwise the host's owner claims it
+on a later poll. Each poll reads one page (`batch_size`) of pending runs, resuming
+where the previous poll stopped and wrapping at the end, so requests for other
+replicas' hosts cost each poll at most one page. The claim moves the run to `starting` with a lease, so Run now
+gets the same executor, heartbeats and recovery as a scheduled occurrence.
+
+Run now works on paused tasks and never moves `next_run_at`. Each request is its
+own run and may overlap a scheduled one. A pending run whose task is deleted
+before it is claimed is recorded as `skipped`, then purged with the task. If the
+task's target changes first, the claim moves the run to the new host ID and
+leaves it for that host's owner. Once a request is recorded, the route returns
+202 even if starting it here fails; a later poll starts it.
+
 After downtime, an overdue task runs once and then moves to its next future time.
 For example, an hourly task due at 9 AM runs once when the server returns at
 12:30 PM, then again at 1 PM. Missed hours are not replayed. A task with no saved
@@ -102,14 +120,18 @@ Give each application its own scheduled-task store instance. `create_app()` sets
 that object's scheduling mode; sharing it lets one app overwrite another's mode.
 Separate instances can share a database, with all replicas using the same mode.
 
-The application supplies these through `ScheduledTaskDispatchHooks`, passed to
-`create_app(scheduled_task_dispatch=...)`:
+A deployment can override these through `ScheduledTaskDispatchHooks`, passed to
+`create_app(scheduled_task_dispatch=...)`. Omitted hooks use the defaults:
 
-| Callback | Responsibility |
-| --- | --- |
-| `on_fire(task, lease)` | Start the already-claimed run and record its startup outcome. |
-| `on_expired(run)` | Inspect an interrupted startup and preserve delivered work or clean up abandoned resources. |
-| `owns_host(workspace_id, host_id)` | Decide whether this replica should start or recover work for the host. The default allows every host. |
+| Callback | Responsibility | Default |
+| --- | --- | --- |
+| `on_fire(task, lease)` | Start the already-claimed run and record its startup outcome. | The built-in executor |
+| `on_expired(run)` | Inspect an interrupted startup and preserve delivered work or clean up abandoned resources. | The built-in executor |
+| `owns_host(workspace_id, host_id)` | Decide whether this replica should start or recover work for the host. | Every host |
+| `fire_identity(task)` | Async context manager the built-in executor enters to act as the task's owner, e.g. by assuming a stored delegation. | None |
+
+Replace `on_fire` and `on_expired` together or not at all. `fire_identity` is
+only for the built-in executor; a replacement executor acts as the owner itself.
 
 `owns_host` is awaited during due-task polling, so it must return promptly and
 respect cancellation.
@@ -128,11 +150,12 @@ of the supplied executor; the scheduler itself does not provision sandboxes or
 deliver prompts. The executor also rechecks the owner's authorization, because a
 valid lease is not permission to act as that user.
 
-The recovery callback returns one of three results:
+The recovery callback returns one of four results:
 
 | Result | Meaning |
 | --- | --- |
 | `"running"` | Startup was successfully handed off; preserve the work. |
+| `"succeeded"` | The prompt was delivered and the session's turn already finished. The completion hook only updates `running` runs, so recovery records this itself. |
 | `"failed"` | Startup cannot continue and cleanup has completed. |
 | `None`, or an exception | The outcome or cleanup is uncertain; check again on a later sweep. |
 
@@ -142,6 +165,69 @@ cleanup must be safe to repeat and run concurrently. Lease checks use server
 clocks, which must stay synchronized. Callbacks must respect cancellation and
 keep their work inside the awaited call; cancellation cannot undo an external
 request that was already accepted.
+
+## The built-in executor
+
+`ClaimedRunExecutor` in [fire.py](fire.py) runs the same steps as a legacy fire:
+validate the task, create the session, grant the owner, then launch. It records
+each step on the claimed run instead of inserting a new one:
+
+1. It renews the lease before creating the session and before launching.
+2. It attaches the session to the run right after creating it.
+3. For a connected host, it records `running` once the prompt is sent.
+4. For a managed sandbox, it saves the prompt, then starts the sandbox under the
+   run's `host_id`, so the sandbox's connection routes to the replica that owns
+   that ID. It records `running` once the session row stores the sandbox's
+   host. Until then no other replica can finish the launch or deliver the
+   prompt. A sandbox that has not bound within 12 minutes is abandoned: the
+   saved prompt fails, the launch is cancelled, the sandbox is torn down, and
+   the run fails with `sandbox_registration_timeout`.
+5. A known failure records `failed` with the same `error_code` the legacy path
+   uses, e.g. `host_offline` or `launch_failed`. A managed launch records its
+   stage instead: `sandbox_create_failed` before the host binds, or
+   `runner_start_failed` after. An unsupported target records `skipped`.
+
+It also stamps `last_run_at` and `last_run_conversation_id` on the task, as legacy
+fires do. Both paths create sessions with the same helper, so per-task session
+settings such as the model override apply to both.
+
+The executor runs under the owner's account and host-owner scopes, as legacy
+fires do. When `fire_identity` is set, it enters that first. If entering raises
+`FireIdentityRevoked`, the run fails with `reauthorization_required` and no
+session is created. A deleted owner disables the task with `owner_deleted`
+instead. Any other error is treated as temporary: the run fails with
+`owner_identity_unavailable`, and the next occurrence tries again.
+
+Recovery enters the same identity before inspecting a session. A temporary
+error leaves the run for a later sweep. `FireIdentityRevoked` records `failed`
+without inspecting or cleaning up, so a sandbox is left to the provider's
+lifetime cap.
+
+Tasks a fire starts, such as the sandbox launch, copy the identity's context
+variables and can outlive the fire. The identity's `__aexit__` must not revoke
+credentials those tasks still use.
+
+Recovery decides from the saved session and never sends a prompt. It treats a
+run as a managed sandbox run when its `host_id` is the sandbox ID derived from
+its task and trigger key. That check uses the run rather than the task's current
+target, which may have been edited since the claim.
+
+| Saved state | Result |
+| --- | --- |
+| No session on the run | `failed`: launch starts only after the session is attached. |
+| Connected host, neither the prompt nor agent output in the transcript, and no active turn | `failed`: the prompt was never sent. |
+| Connected host, prompt delivered | `failed` if the session failed. `succeeded` if it is idle and its newest output is the agent's reply. Otherwise `running`. |
+| Managed sandbox whose launch already failed | `failed` |
+| Managed sandbox with its host bound | `running` while the prompt is pending, otherwise the outcome of a delivered prompt as above. |
+| Managed sandbox still provisioning on this server | `None`: check again on a later sweep. |
+| Managed sandbox with no host bound and no local launch | Tear down the sandbox registered under the run's host ID, fail the saved prompt, then `failed`. |
+| Session deleted | Tear down any sandbox for a managed run, then `failed`. |
+
+An `idle` status alone does not mean the turn finished: a session can be idle
+with its prompt saved but never run. Runner bookkeeping such as `resource_event`
+items does not count as evidence either. Teardown only ever applies to
+server-managed sandbox hosts. It is safe to repeat, so two replicas can recover
+the same run.
 
 ## Timing and capacity
 
@@ -173,18 +259,14 @@ Invalid settings fail startup when the flag is on. With the flag off, only
 ## Switching schedulers
 
 Set `OMNIGENT_FEATURES=automations_v2` and restart all scheduler replicas together.
-The application requires a compatible store and execution/recovery callbacks.
-Built-in entrypoints, including the CLI and Docker server, do not yet supply these
-callbacks, so enabling the flag there fails startup. A deployment wrapper must
-pass them to `create_app()` before enabling the flag.
-The legacy Run now path still uses a local overlap guard, so it must join the
-claimed-run path before rollout. The executor integration must also handle a
-session that finishes while its run still says `starting`; the current recovery
-callback can only return `running`, `failed`, or an uncertain outcome.
+The application requires a compatible store. Without `scheduled_task_dispatch`,
+it uses the built-in executor and owns every host, which suits a single replica.
+A multi-replica deployment passes its own `owns_host`.
 
 To switch back, stop new startups and let existing ones finish or recover. Then
 set `OMNIGENT_FEATURES=-automations_v2` and restart all replicas. Legacy startup
-clears saved `next_run_at` values before creating future timers. Task definitions,
+clears saved `next_run_at` values before creating future timers, and records
+pending Run now requests as `skipped` (`dispatch_disabled`). Task definitions,
 run history, and running agent sessions are retained. Clearing the saved times
 prevents a later re-enable from replaying occurrences handled by the old timers.
 If clearing or startup fails, it retries after `startup_retry_seconds` (default 30).
@@ -225,7 +307,7 @@ to its session events.
 
 | Event | Logged when | Extra attributes |
 | --- | --- | --- |
-| `scheduled_run_claimed` | This server claimed a due occurrence. | `target`, `host_id`, `claim_delay_seconds` |
+| `scheduled_run_claimed` | This server claimed a due occurrence or a Run now request. | `target`, `host_id`, `claim_delay_seconds` |
 | `scheduled_run_claim_skipped` | The claim did not apply: the occurrence was already claimed, or the task was edited, paused, or deleted after it was listed. | `target` (no run) |
 | `scheduled_run_session_attached` | The executor recorded the fired session with `lease.attach_session()`, or changed it. | `target`, `session_delay_seconds` |
 | `scheduled_run_startup_ended` | Startup ended on the executing server. | `target`, `outcome`, `error_code`, `prompt_delay_seconds` |
@@ -234,7 +316,7 @@ to its session events.
 
 `startup_ended` outcomes are `running`, `failed`, or `skipped` from the executor, or
 `lease_lost`, `interrupted`, `unfinished`, or `cancelled` when startup ended without
-a result. Recovery outcomes are `running`, `failed`, `uncertain`, `superseded` (the
+a result. Recovery outcomes are `running`, `succeeded`, `failed`, `uncertain`, `superseded` (the
 run was no longer the expired startup recovery inspected), `timeout`, or `error`.
 Operations are `poll`, `initialize`, `claim`, `recovery`, `cleanup`, and
 `lease_renewal`. `claim` failures and single-task `initialize` failures include
@@ -260,7 +342,7 @@ The design's success metrics come from these events:
 
 | Success metric | Calculation |
 | --- | --- |
-| Fire success rate | Distinct `run_id`s whose `startup_ended` or `recovered` outcome is `running` ÷ distinct claimed `run_id`s, excluding runs the executor ended as `skipped`. Occurrences missed during downtime are never claimed. |
+| Fire success rate | Distinct `run_id`s whose `startup_ended` outcome is `running`, or whose `recovered` outcome is `running` or `succeeded`, ÷ distinct claimed `run_id`s, excluding runs the executor ended as `skipped`. Occurrences missed during downtime are never claimed. |
 | Duplicate fires | Claimed `run_id`s per `(task_workspace_id, task_id, scheduled_at)`. The database's unique key keeps this at one, so the query only confirms that constraint holds. `claim_skipped` also counts edited, paused, and deleted tasks, so it is not a duplicate count. |
 | Fire delay | p90 of `session_delay_seconds`. The executor must call `lease.attach_session()`; a session passed only to `finish()` produces no fire-delay event. To exclude sandbox boot time, it must attach the session before waiting for the sandbox. |
 | Time to prompt | `prompt_delay_seconds` on `running` outcomes, by `target`. |
@@ -271,6 +353,7 @@ Failure stages come from the executor's `error_code`.
 ## Code
 
 [dispatch_scheduler.py](dispatch_scheduler.py) coordinates polling, heartbeats, and
-recovery. [schedule.py](schedule.py) calculates occurrence times and identities.
+recovery. [fire.py](fire.py) holds the fire steps shared by both schedulers and the
+built-in executor. [schedule.py](schedule.py) calculates occurrence times and identities.
 The [store](../../stores/scheduled_task_store/sqlalchemy_store.py) implements the
 atomic database operations. [config.py](config.py) validates timing and capacity.

@@ -41,27 +41,34 @@ sandbox minted per fire, using the normal runner-idle and provider keepalive
 lifecycle. A managed fire saves its prompt in the session before provisioning
 starts; the host's replica delivers it once the sandbox connects, so a restart
 mid-provision doesn't lose it, and the fire doesn't hold its overlap guard while
-the sandbox starts. Future execution modes include branch selection,
-replay/backfill, and multi-replica leasing through shared session-create
-orchestration rather than this direct fire path.
+the sandbox starts. Future execution modes include branch selection and
+replay/backfill.
+
+**Persistent dispatch.** With ``automations_v2``, the database scheduler claims
+each occurrence and :class:`ClaimedRunExecutor` runs the same steps on that
+claimed run instead of inserting a new one. It records the session on the run
+before launching, and ends startup once the prompt is sent (connected host) or
+saved with the sandbox's host bound to the session (managed sandbox). Its
+recovery callback decides interrupted startups from the session's state.
 """
 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 import time
 import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
 from enum import Enum
-from typing import Any
+from typing import TYPE_CHECKING, Any, Literal, Protocol
 
 from starlette.datastructures import Headers
 
 from omnigent.db.account_authority import account_authority_scope
 from omnigent.db.db_models import workspace_scope
-from omnigent.entities import Conversation, ScheduledTask
+from omnigent.entities import Conversation, ScheduledTask, ScheduledTaskRun
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.mcp_selection import mcp_selection_revision
 from omnigent.server.auth import LEVEL_OWNER, LEVEL_READ, RESERVED_USER_LOCAL, RESERVED_USER_PUBLIC
@@ -73,8 +80,16 @@ from omnigent.server.routes._session_create_validation import (
     validate_session_model_metadata,
     validate_session_permission_mode,
 )
+from omnigent.server.scheduled.dispatch_scheduler import (
+    FireIdentity,
+    FireIdentityRevoked,
+    StartupLease,
+)
 from omnigent.server.schemas import SessionEventInput
 from omnigent.stores.conversation_store import SCHEDULED_TASK_ORIGIN_LABEL_KEY
+
+if TYPE_CHECKING:
+    from omnigent.server.managed_hosts import ManagedLaunchTracker
 
 _logger = logging.getLogger(__name__)
 
@@ -111,9 +126,32 @@ _IN_FLIGHT_TASKS: set[tuple[int, str]] = set()
 # orchestration can be unit-tested without a live host/runner.
 LaunchDispatch = Callable[[Conversation, ScheduledTask], Awaitable[None]]
 ConnectedHostPreflight = Callable[[ScheduledTask], Awaitable[None]]
-# ``launch_start(conv, task)`` — start provisioning a sandbox in the background
-# once the managed fire's prompt is saved and its run recorded.
-ManagedLaunchStart = Callable[[Conversation, ScheduledTask], None]
+
+
+@dataclass(frozen=True)
+class _LaunchErrorCodes:
+    """Error codes for a managed launch that fails before or after its host is bound."""
+
+    before_binding: str
+    after_binding: str
+
+
+# Legacy timers keep one code for every managed launch failure.
+_LEGACY_LAUNCH_ERRORS = _LaunchErrorCodes("launch_failed", "launch_failed")
+# Claimed runs record the failure stage: creating the sandbox, or starting its runner.
+_STAGED_LAUNCH_ERRORS = _LaunchErrorCodes("sandbox_create_failed", "runner_start_failed")
+
+# How long a claimed managed fire waits for its sandbox to register and bind.
+SANDBOX_REGISTRATION_TIMEOUT_S = 12 * 60
+# How long an abandoned launch gets to stop before its sandbox is torn down.
+_ABANDONED_LAUNCH_SETTLE_S = 30.0
+
+# ``launch_start(conv, task, host_id, error_codes)`` — start provisioning a sandbox
+# in the background once the managed fire's prompt is saved. ``host_id`` is the
+# host identity the sandbox registers under, or ``None`` to mint one.
+ManagedLaunchStart = Callable[
+    [Conversation, ScheduledTask, str | None, _LaunchErrorCodes], asyncio.Task[None]
+]
 
 
 class _FireResult(Enum):
@@ -182,6 +220,93 @@ class _FireDispatch:
     managed_start: ManagedLaunchStart | None = None
 
 
+class _FireRecorder(Protocol):
+    """How one fire records its progress and outcome.
+
+    Legacy timers insert a new run row when the fire ends. Persistent dispatch
+    records progress on the run it already claimed, under a startup lease.
+    """
+
+    async def check(self) -> None:
+        """Raise before an external action if the fire may no longer proceed."""
+        ...
+
+    async def session_created(self, conversation_id: str) -> None:
+        """Record the fired session before it is launched, so recovery can find it."""
+        ...
+
+    async def finish(
+        self,
+        status: str,
+        *,
+        conversation_id: str | None = None,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        """Record the fire's startup outcome."""
+        ...
+
+    async def hand_off_managed(
+        self, conv: Conversation, task: ScheduledTask, start: ManagedLaunchStart | None
+    ) -> None:
+        """Start the sandbox for a managed fire whose prompt is saved, and record the result."""
+        ...
+
+
+class _NewRunRecorder:
+    """Legacy timers: insert one run row once the fire's outcome is known."""
+
+    def __init__(self, deps: FireDeps, task: ScheduledTask, scheduled_at: int) -> None:
+        self._deps = deps
+        self._task = task
+        self._scheduled_at = scheduled_at
+
+    async def check(self) -> None:
+        return None
+
+    async def session_created(self, conversation_id: str) -> None:  # noqa: ARG002
+        return None
+
+    async def finish(
+        self,
+        status: str,
+        *,
+        conversation_id: str | None = None,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        await _record_run(
+            self._deps,
+            self._task,
+            conversation_id,
+            self._scheduled_at,
+            status=status,
+            error=error,
+            error_code=error_code,
+        )
+
+    async def hand_off_managed(
+        self, conv: Conversation, task: ScheduledTask, start: ManagedLaunchStart | None
+    ) -> None:
+        await self.finish("running", conversation_id=conv.id)
+        if start is None:
+            return
+        # Started only after the run exists, so a fast launch failure has a
+        # running run to fail.
+        try:
+            start(conv, task, None, _LEGACY_LAUNCH_ERRORS)
+        except Exception as exc:
+            _logger.exception(
+                "scheduled fire: managed launch did not start for task %s (session %s)",
+                task.id,
+                conv.id,
+            )
+            reason = f"managed sandbox failed to launch: {exc}"
+            await _fail_running_run(self._deps, conv.id, reason, "launch_failed")
+            if self._deps.startup_inputs is not None:
+                await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
+
+
 def _prompt_event(prompt: str) -> SessionEventInput:
     """Build the user-message event that carries a task's prompt to the runner."""
     return SessionEventInput(
@@ -227,9 +352,9 @@ def build_run_now(
 ) -> Callable[[int, str], Awaitable[bool]]:
     """Build the manual "run now" trigger — an immediate fire of a task.
 
-    Reuses the legacy :func:`_run_fire_for_task` path and its process-local
-    ``_IN_FLIGHT_TASKS`` overlap guard. Persistent scheduled runs use database
-    claims and do not share this guard, so they can overlap a manual run.
+    Legacy timers only: reuses :func:`_run_fire_for_task` and its process-local
+    ``_IN_FLIGHT_TASKS`` overlap guard. With ``automations_v2``, Run now is a
+    claimed run started through the database scheduler instead.
     Unlike :func:`build_on_fire`, a paused task is runnable here
     (``require_active=False``). A deleted or missing task is still a no-op.
 
@@ -358,13 +483,13 @@ async def _run_fire(
             )
             return
 
-        scheduled_at = int(time.time())
+        recorder = _NewRunRecorder(deps, task, int(time.time()))
         try:
             with (
                 account_authority_scope(task.user_id, task.account_generation),
                 host_owner_scope(task.user_id, task.account_generation),
             ):
-                await _run_fire_for_task(deps, task, fire_dispatch, scheduled_at)
+                await _run_fire_for_task(deps, task, fire_dispatch, recorder)
         except Exception:
             _logger.exception("scheduled fire: task %s failed", task.id)
 
@@ -373,215 +498,157 @@ async def _run_fire_for_task(
     deps: FireDeps,
     task: ScheduledTask,
     fire_dispatch: _FireDispatch,
-    scheduled_at: int,
+    recorder: _FireRecorder,
 ) -> None:
-    """Run a freshly re-read active task, routed by ``execution_target``.
+    """Run a task, routed by ``execution_target``, recording progress on *recorder*.
 
     ``managed_sandbox`` provisions a fresh sandbox per fire (never reusing an
     existing one); ``connected_host`` runs the resolve/validate/launch flow
-    below. Any other target records a skipped run.
+    below. Any other target records a skipped run. Unexpected errors propagate:
+    the legacy caller logs them, and persistent dispatch leaves the claimed run
+    for recovery.
     """
+    # A deleted / rotated owner registration fires nothing — managed or
+    # connected — and disables the task.
+    if await _owner_is_deleted(deps, task):
+        await _disable_for_deleted_owner(deps, task, recorder)
+        return
+    managed = task.execution_target == "managed_sandbox"
+    if not managed and task.execution_target != "connected_host":
+        _logger.info(
+            "scheduled fire: task %s target %r is not supported — skipping",
+            task.id,
+            task.execution_target,
+        )
+        await recorder.finish(
+            "skipped",
+            error=f"execution_target {task.execution_target!r} not supported yet",
+            error_code="unsupported_target",
+        )
+        return
+
+    dispatch = fire_dispatch.managed if managed else fire_dispatch.connected
+    preflight = None if managed else fire_dispatch.connected_preflight
+
+    # Resolve this fire's host/workspace without changing the stored task.
+    # A managed launch starts hostless and binds a fresh sandbox afterward.
     try:
-        # A deleted / rotated owner registration fires nothing — managed or
-        # connected — and disables the task.
-        if await _owner_is_deleted(deps, task):
-            _logger.warning(
-                "scheduled fire: task %s owner %r registration is inactive; disabling task",
-                task.id,
-                task.user_id,
-            )
-            await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
-            await _record_run(
-                deps,
-                task,
-                None,
-                scheduled_at,
-                status="failed",
-                error=f"owner {task.user_id!r} registration is no longer active; task disabled",
-                error_code="owner_deleted",
-            )
-            return
-        managed = task.execution_target == "managed_sandbox"
-        if not managed and task.execution_target != "connected_host":
-            _logger.info(
-                "scheduled fire: task %s target %r is not supported — skipping",
-                task.id,
-                task.execution_target,
-            )
-            await asyncio.to_thread(
-                _record_run_sync,
-                deps,
-                task,
-                None,
-                scheduled_at,
-                "skipped",
-                error=f"execution_target {task.execution_target!r} not supported yet",
-                error_code="unsupported_target",
-            )
-            return
+        effective = await _resolve_effective_task(deps, task)
+    except _CannotLaunchScheduledFire as exc:
+        _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
+        await recorder.finish("failed", error=str(exc), error_code=exc.error_code)
+        return
 
-        dispatch = fire_dispatch.managed if managed else fire_dispatch.connected
-        preflight = None if managed else fire_dispatch.connected_preflight
+    input_error = None if managed else _validate_connected_host_inputs(effective)
+    if input_error is not None:
+        error, error_code = input_error
+        _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
+        await recorder.finish("failed", error=error, error_code=error_code)
+        return
 
-        # Resolve this fire's host/workspace without changing the stored task.
-        # A managed launch starts hostless and binds a fresh sandbox afterward.
+    if preflight is not None:
         try:
-            effective = await _resolve_effective_task(deps, task)
+            await preflight(effective)
         except _CannotLaunchScheduledFire as exc:
             _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
-            await _record_run(
-                deps,
-                task,
-                None,
-                scheduled_at,
-                status="failed",
-                error=str(exc),
-                error_code=exc.error_code,
-            )
+            await recorder.finish("failed", error=str(exc), error_code=exc.error_code)
             return
 
-        input_error = None if managed else _validate_connected_host_inputs(effective)
-        if input_error is not None:
-            error, error_code = input_error
-            _logger.warning("scheduled fire: task %s cannot run: %s", task.id, error)
-            await _record_run(
-                deps,
-                task,
-                None,
-                scheduled_at,
-                status="failed",
-                error=error,
-                error_code=error_code,
-            )
-            return
+    # Check connected-host workspaces, including the resolved HOME default,
+    # against the agent's cwd boundary. A new sandbox has no workspace yet.
+    validate_workspace = preflight is not None and effective.workspace is not None
+    validation_error = await _validate_fire_session_inputs(
+        deps, effective, validate_workspace=validate_workspace
+    )
+    if validation_error is not None:
+        error, error_code = validation_error
+        _logger.warning("scheduled fire: task %s failed validation: %s", task.id, error)
+        await recorder.finish("failed", error=error, error_code=error_code)
+        return
 
-        if preflight is not None:
-            try:
-                await preflight(effective)
-            except _CannotLaunchScheduledFire as exc:
-                _logger.warning("scheduled fire: task %s cannot launch: %s", task.id, exc)
-                await _record_run(
-                    deps,
-                    task,
-                    None,
-                    scheduled_at,
-                    status="failed",
-                    error=str(exc),
-                    error_code=exc.error_code,
-                )
-                return
-
-        # Check connected-host workspaces, including the resolved HOME default,
-        # against the agent's cwd boundary. A new sandbox has no workspace yet.
-        validate_workspace = preflight is not None and effective.workspace is not None
-        validation_error = await _validate_fire_session_inputs(
-            deps, effective, validate_workspace=validate_workspace
-        )
-        if validation_error is not None:
-            error, error_code = validation_error
-            _logger.warning("scheduled fire: task %s failed validation: %s", task.id, error)
-            await _record_run(
-                deps,
-                task,
-                None,
-                scheduled_at,
-                status="failed",
-                error=error,
-                error_code=error_code,
-            )
-            return
-
-        try:
-            effective = await _own_task_agent(deps, effective)
-            conv = await _create_session(deps, effective)
-        except Exception:
-            _logger.exception("scheduled fire: failed to create session for task %s", task.id)
-            await _record_run(
-                deps,
-                task,
-                None,
-                scheduled_at,
-                status="failed",
-                error="session creation failed",
-                error_code="session_create_failed",
-            )
-            return
-
-        await _attach_cost_budget(deps, task, conv.id)
-
-        try:
-            await _grant_owner(deps, effective, conv.id)
-        except Exception:
-            _logger.exception(
-                "scheduled fire: owner grant failed for task %s (session %s)",
-                task.id,
-                conv.id,
-            )
-            await _record_run(
-                deps,
-                task,
-                conv.id,
-                scheduled_at,
-                status="failed",
-                error="owner grant failed",
-                error_code="owner_grant_failed",
-            )
-            return
-
-        # Default-public access is optional decoration on top of the owner
-        # grant, so a failure here must not cancel an otherwise-ready run — the
-        # session simply stays private.
-        try:
-            await _grant_default_public(deps, effective, conv.id)
-        except Exception:
-            _logger.exception(
-                "scheduled fire: default-public grant failed for task %s (session %s); "
-                "continuing with a private session",
-                task.id,
-                conv.id,
-            )
-
-        try:
-            await dispatch(conv, effective)
-        except Exception:
-            # The session + grant are already persisted and owner-visible, so a
-            # launch/dispatch failure still records a run — just a failed one.
-            _logger.exception(
-                "scheduled fire: launch/dispatch failed for task %s (session %s)",
-                task.id,
-                conv.id,
-            )
-            await _record_run(
-                deps,
-                task,
-                conv.id,
-                scheduled_at,
-                status="failed",
-                error="runner launch/dispatch failed",
-                error_code="launch_failed",
-            )
-            return
-
-        await _record_run(deps, task, conv.id, scheduled_at, status="running")
-        if managed and fire_dispatch.managed_start is not None:
-            # Started only after the run exists, so a fast launch failure has a
-            # running run to fail.
-            try:
-                fire_dispatch.managed_start(conv, effective)
-            except Exception as exc:
-                _logger.exception(
-                    "scheduled fire: managed launch did not start for task %s (session %s)",
-                    task.id,
-                    conv.id,
-                )
-                reason = f"managed sandbox failed to launch: {exc}"
-                await _fail_running_run(deps, conv.id, reason, "launch_failed")
-                if deps.startup_inputs is not None:
-                    await deps.startup_inputs.record_launch_failure(conv.id, reason)
-                return
-        _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
+    await recorder.check()
+    try:
+        effective = await _own_task_agent(deps, effective)
+        conv = await _create_session(deps, effective)
     except Exception:
-        _logger.exception("scheduled fire: task %s failed", task.id)
+        _logger.exception("scheduled fire: failed to create session for task %s", task.id)
+        await recorder.finish(
+            "failed", error="session creation failed", error_code="session_create_failed"
+        )
+        return
+    await recorder.session_created(conv.id)
+
+    await _attach_cost_budget(deps, task, conv.id)
+
+    try:
+        await _grant_owner(deps, effective, conv.id)
+    except Exception:
+        _logger.exception(
+            "scheduled fire: owner grant failed for task %s (session %s)",
+            task.id,
+            conv.id,
+        )
+        await recorder.finish(
+            "failed",
+            conversation_id=conv.id,
+            error="owner grant failed",
+            error_code="owner_grant_failed",
+        )
+        return
+
+    # Default-public access is optional decoration on top of the owner
+    # grant, so a failure here must not cancel an otherwise-ready run — the
+    # session simply stays private.
+    try:
+        await _grant_default_public(deps, effective, conv.id)
+    except Exception:
+        _logger.exception(
+            "scheduled fire: default-public grant failed for task %s (session %s); "
+            "continuing with a private session",
+            task.id,
+            conv.id,
+        )
+
+    await recorder.check()
+    try:
+        await dispatch(conv, effective)
+    except Exception:
+        # The session + grant are already persisted and owner-visible, so a
+        # launch/dispatch failure still records a run — just a failed one.
+        _logger.exception(
+            "scheduled fire: launch/dispatch failed for task %s (session %s)",
+            task.id,
+            conv.id,
+        )
+        await recorder.finish(
+            "failed",
+            conversation_id=conv.id,
+            error="runner launch/dispatch failed",
+            error_code="launch_failed",
+        )
+        return
+
+    if managed:
+        await recorder.hand_off_managed(conv, effective, fire_dispatch.managed_start)
+    else:
+        await recorder.finish("running", conversation_id=conv.id)
+    _logger.info("scheduled fire: task %s fired session %s", task.id, conv.id)
+
+
+async def _disable_for_deleted_owner(
+    deps: FireDeps, task: ScheduledTask, recorder: _FireRecorder
+) -> None:
+    _logger.warning(
+        "scheduled fire: task %s owner %r registration is inactive; disabling task",
+        task.id,
+        task.user_id,
+    )
+    await asyncio.to_thread(deps.scheduled_task_store.update, task.id, state="deleted")
+    await recorder.finish(
+        "failed",
+        error=f"owner {task.user_id!r} registration is no longer active; task disabled",
+        error_code="owner_deleted",
+    )
 
 
 async def _owner_is_deleted(deps: FireDeps, task: ScheduledTask) -> bool:
@@ -1022,11 +1089,7 @@ def _record_run_sync(
     error_code: str | None = None,
 ) -> None:
     """Synchronous run recording body for ``asyncio.to_thread`` callers."""
-    now = int(time.time())
-    update_fields: dict[str, Any] = {"last_run_at": now}
-    if conversation_id is not None:
-        update_fields["last_run_conversation_id"] = conversation_id
-    deps.scheduled_task_store.update(task.id, **update_fields)
+    now = _stamp_last_run_sync(deps, task, conversation_id)
     deps.scheduled_task_store.create_run(
         _new_id(),
         task.id,
@@ -1037,6 +1100,16 @@ def _record_run_sync(
         error=error,
         error_code=error_code,
     )
+
+
+def _stamp_last_run_sync(deps: FireDeps, task: ScheduledTask, conversation_id: str | None) -> int:
+    """Stamp ``last_run_at`` (and the fired session, if any) on the task; return the time."""
+    now = int(time.time())
+    update_fields: dict[str, Any] = {"last_run_at": now}
+    if conversation_id is not None:
+        update_fields["last_run_conversation_id"] = conversation_id
+    deps.scheduled_task_store.update(task.id, **update_fields)
+    return now
 
 
 async def _validate_fire_session_inputs(
@@ -1280,7 +1353,12 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
     failure fails both the saved prompt and the fire's run.
     """
 
-    def _start(conv: Conversation, task: ScheduledTask) -> None:
+    def _start(
+        conv: Conversation,
+        task: ScheduledTask,
+        host_id: str | None,
+        error_codes: _LaunchErrorCodes,
+    ) -> asyncio.Task[None]:
         from omnigent.server.routes.sessions import (
             _publish_sandbox_status,
             _run_managed_launch,
@@ -1310,10 +1388,14 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
                     provider=None,
                     agent_store=deps.agent_store,
                     agent_id=task.agent_id,
+                    host_id=host_id,
                 )
             except Exception as exc:
                 await _fail_running_run(
-                    deps, conv.id, f"managed sandbox failed to launch: {exc}", "launch_failed"
+                    deps,
+                    conv.id,
+                    f"managed sandbox failed to launch: {exc}",
+                    _launch_error_code(tracker, conv.id, error_codes),
                 )
                 raise
             launch = tracker.get(conv.id)
@@ -1322,10 +1404,10 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
                     deps,
                     conv.id,
                     f"managed sandbox launch failed: {launch.error}",
-                    "launch_failed",
+                    _launch_error_code(tracker, conv.id, error_codes),
                 )
 
-        _start_managed_launch_task(
+        return _start_managed_launch_task(
             conv.id,
             _launch(),
             conversation_store=deps.conversation_store,
@@ -1334,6 +1416,17 @@ def _make_managed_sandbox_start(deps: FireDeps) -> ManagedLaunchStart:
         )
 
     return _start
+
+
+def _launch_error_code(
+    tracker: ManagedLaunchTracker, session_id: str, codes: _LaunchErrorCodes
+) -> str:
+    launch = tracker.get(session_id)
+    return (
+        codes.after_binding
+        if launch is not None and launch.bound.is_set()
+        else codes.before_binding
+    )
 
 
 async def _fail_running_run(
@@ -1353,3 +1446,395 @@ async def _fail_running_run(
             )
 
     await asyncio.to_thread(_transition)
+
+
+class _ClaimedRunRecorder:
+    """Persistent dispatch: record progress on the claimed run, under its startup lease."""
+
+    def __init__(
+        self,
+        deps: FireDeps,
+        task: ScheduledTask,
+        lease: StartupLease,
+        *,
+        registration_timeout_s: float = SANDBOX_REGISTRATION_TIMEOUT_S,
+    ) -> None:
+        self._deps = deps
+        self._task = task
+        self._lease = lease
+        self._registration_timeout_s = registration_timeout_s
+
+    async def check(self) -> None:
+        await self._lease.check()
+
+    async def session_created(self, conversation_id: str) -> None:
+        await self._lease.attach_session(conversation_id)
+
+    async def finish(
+        self,
+        status: str,
+        *,
+        conversation_id: str | None = None,
+        error: str | None = None,
+        error_code: str | None = None,
+    ) -> None:
+        await self._lease.finish(
+            status, conversation_id=conversation_id, error=error, error_code=error_code
+        )
+        # The outcome is already recorded; a failed stamp only leaves the task's
+        # last-run summary stale.
+        try:
+            await asyncio.to_thread(
+                _stamp_last_run_sync, self._deps, self._task, self._lease.run.conversation_id
+            )
+        except Exception:
+            _logger.exception(
+                "scheduled fire: could not stamp the last run on task %s", self._task.id
+            )
+
+    async def hand_off_managed(
+        self, conv: Conversation, task: ScheduledTask, start: ManagedLaunchStart | None
+    ) -> None:
+        if start is None:
+            await self.finish("running", conversation_id=conv.id)
+            return
+        await self.check()
+        # The sandbox registers under the run's host ID, so host-ID routing sends
+        # its connection back to the replica that owns this run.
+        try:
+            launch_task = start(conv, task, self._lease.run.host_id, _STAGED_LAUNCH_ERRORS)
+        except Exception as exc:
+            _logger.exception(
+                "scheduled fire: managed launch did not start for task %s (session %s)",
+                task.id,
+                conv.id,
+            )
+            reason = f"managed sandbox failed to launch: {exc}"
+            await self._fail_saved_prompt(conv.id, reason)
+            await self.finish(
+                "failed",
+                conversation_id=conv.id,
+                error=reason,
+                error_code=_STAGED_LAUNCH_ERRORS.before_binding,
+            )
+            return
+        # The saved prompt alone is not a handoff: until the session records its
+        # host, no other replica can finish the launch or deliver the prompt.
+        try:
+            async with asyncio.timeout(self._registration_timeout_s):
+                error = await _wait_for_managed_binding(self._deps, conv.id, launch_task)
+        except TimeoutError:
+            await self._abandon_unregistered_sandbox(conv.id, launch_task)
+            return
+        if error is not None:
+            await self.finish(
+                "failed",
+                conversation_id=conv.id,
+                error=error,
+                error_code=_STAGED_LAUNCH_ERRORS.before_binding,
+            )
+            return
+        await self.finish("running", conversation_id=conv.id)
+        # The runner launch after binding can fail before this write commits,
+        # while the launch's own check still found no running run to fail.
+        error = _managed_launch_failure(self._deps.managed_launches, conv.id, launch_task)
+        if error is not None:
+            await _fail_running_run(
+                self._deps, conv.id, error, _STAGED_LAUNCH_ERRORS.after_binding
+            )
+
+    async def _fail_saved_prompt(self, conversation_id: str, reason: str) -> None:
+        if self._deps.startup_inputs is not None:
+            await self._deps.startup_inputs.record_launch_failure(conversation_id, reason)
+
+    async def _abandon_unregistered_sandbox(
+        self, conversation_id: str, launch_task: asyncio.Task[None]
+    ) -> None:
+        """Fail a sandbox that never registered: its prompt, its launch, then the sandbox."""
+        reason = f"the sandbox did not register within {self._registration_timeout_s:g} seconds"
+        # Fail the prompt first, so a host that binds during cleanup delivers nothing,
+        # and the cancelled launch finds no pending prompt to fail with its own reason.
+        await self._fail_saved_prompt(conversation_id, reason)
+        launch_task.cancel()
+        await asyncio.wait({launch_task}, timeout=_ABANDONED_LAUNCH_SETTLE_S)
+        await _terminate_run_sandbox(self._deps, self._lease.run.host_id)
+        await self.finish(
+            "failed",
+            conversation_id=conversation_id,
+            error=reason,
+            error_code="sandbox_registration_timeout",
+        )
+
+
+async def _wait_for_managed_binding(
+    deps: FireDeps, session_id: str, launch_task: asyncio.Task[None]
+) -> str | None:
+    """Wait for a managed launch to bind its host; return why it did not, or ``None``.
+
+    Leaves the launch running: once bound, it finishes on its own.
+    """
+    tracker = deps.managed_launches
+    launch = tracker.get(session_id) if tracker is not None else None
+    waiters: list[asyncio.Future[Any]] = []
+    if launch is not None:
+        waiters = [
+            asyncio.ensure_future(launch.bound.wait()),
+            asyncio.ensure_future(launch.settled.wait()),
+        ]
+    try:
+        await asyncio.wait([*waiters, launch_task], return_when=asyncio.FIRST_COMPLETED)
+    finally:
+        for waiter in waiters:
+            waiter.cancel()
+    conv = await asyncio.to_thread(deps.conversation_store.get_conversation, session_id)
+    if conv is not None and conv.host_id is not None:
+        return None
+    return (
+        _managed_launch_failure(tracker, session_id, launch_task)
+        or "managed sandbox launch ended before its host connected"
+    )
+
+
+def _managed_launch_failure(
+    tracker: ManagedLaunchTracker | None, session_id: str, launch_task: asyncio.Task[None]
+) -> str | None:
+    """Why a managed launch failed, if it has; ``None`` while it is running or succeeded."""
+    launch = tracker.get(session_id) if tracker is not None else None
+    if launch is not None and launch.error is not None:
+        return f"managed sandbox launch failed: {launch.error}"
+    if launch_task.done() and not launch_task.cancelled() and launch_task.exception() is not None:
+        return f"managed sandbox failed to launch: {launch_task.exception()}"
+    return None
+
+
+# How far back recovery reads a fired session's transcript for its prompt and reply.
+_RECOVERY_TRANSCRIPT_ITEMS = 50
+
+
+@dataclass(frozen=True)
+class _TranscriptEvidence:
+    """What a fired session's newest transcript items show about its first turn."""
+
+    # The prompt reached the agent: it is in the transcript, or the agent produced output.
+    delivered: bool
+    # The newest item after the prompt, apart from runner bookkeeping, is the agent's reply.
+    answered: bool
+
+
+def _transcript_evidence(items: list[Any]) -> _TranscriptEvidence:
+    """Read items newest first. Runner bookkeeping such as ``resource_event`` is not evidence."""
+    answered = agent_output = False
+    for item in items:
+        role = getattr(item.data, "role", None) if item.type == "message" else None
+        if role == "user":
+            return _TranscriptEvidence(delivered=True, answered=answered)
+        if role == "assistant" and not agent_output:
+            answered = True
+        if item.type != "resource_event":
+            agent_output = True
+    return _TranscriptEvidence(delivered=agent_output, answered=answered)
+
+
+def _delivered_run_outcome(
+    conv: Conversation, evidence: _TranscriptEvidence
+) -> Literal["running", "succeeded", "failed"]:
+    """Outcome of a run whose prompt reached the agent.
+
+    ``live_status`` alone cannot prove the turn finished: a session can read
+    ``idle`` with its prompt saved but never run. Only an idle session whose
+    newest output is the agent's reply has finished.
+    """
+    if conv.live_status == "failed":
+        return "failed"
+    if conv.live_status == "idle" and evidence.answered:
+        return "succeeded"
+    return "running"
+
+
+class ClaimedRunExecutor:
+    """Start runs the persistent scheduler claimed, and recover interrupted startups.
+
+    Both run as the task's owner: the account and host-owner scopes the legacy
+    fire path uses, plus an optional *fire_identity* (e.g. an assumed
+    delegation) for deployments whose stores need the owner's credentials.
+    """
+
+    def __init__(
+        self,
+        deps: FireDeps,
+        *,
+        fire_identity: FireIdentity | None = None,
+        launch_dispatch: LaunchDispatch | None = None,
+        registration_timeout_s: float = SANDBOX_REGISTRATION_TIMEOUT_S,
+    ) -> None:
+        self._deps = deps
+        self._fire_identity = fire_identity
+        self._fire_dispatch = _build_fire_dispatch(deps, launch_dispatch)
+        self._registration_timeout_s = registration_timeout_s
+
+    async def fire(self, task: ScheduledTask, lease: StartupLease) -> None:
+        """``on_fire``: start the claimed run and record its startup outcome."""
+        recorder = _ClaimedRunRecorder(
+            self._deps, task, lease, registration_timeout_s=self._registration_timeout_s
+        )
+        async with contextlib.AsyncExitStack() as stack:
+            try:
+                await self._enter_owner_identity(stack, task)
+            except FireIdentityRevoked:
+                _logger.warning(
+                    "scheduled fire: task %s owner can no longer be acted for",
+                    task.id,
+                    exc_info=True,
+                )
+                await self._fail_revoked_fire(task, recorder)
+                return
+            except Exception:
+                _logger.warning(
+                    "scheduled fire: could not act as the owner of task %s", task.id, exc_info=True
+                )
+                await recorder.finish(
+                    "failed",
+                    error="Could not act as the automation's owner. The next run tries again.",
+                    error_code="owner_identity_unavailable",
+                )
+                return
+            await _run_fire_for_task(self._deps, task, self._fire_dispatch, recorder)
+
+    async def _fail_revoked_fire(self, task: ScheduledTask, recorder: _FireRecorder) -> None:
+        # A deleted owner's identity is revoked too; disable the task as the
+        # fire path does, instead of asking a deleted account to re-authorize.
+        try:
+            deleted = await _owner_is_deleted(self._deps, task)
+        except Exception:
+            _logger.warning(
+                "scheduled fire: could not check the owner of task %s", task.id, exc_info=True
+            )
+            deleted = False
+        if deleted:
+            await _disable_for_deleted_owner(self._deps, task, recorder)
+            return
+        await recorder.finish(
+            "failed",
+            error="Could not act as the automation's owner. "
+            "The owner must re-authorize the automation.",
+            error_code="reauthorization_required",
+        )
+
+    async def recover(
+        self, run: ScheduledTaskRun
+    ) -> Literal["running", "succeeded", "failed"] | None:
+        """``on_expired``: decide an interrupted startup from its session; never resend.
+
+        A temporary failure to act as the owner propagates, so a later sweep
+        checks the run again.
+        """
+        task = await asyncio.to_thread(self._deps.scheduled_task_store.get, run.scheduled_task_id)
+        async with contextlib.AsyncExitStack() as stack:
+            if task is not None:
+                try:
+                    await self._enter_owner_identity(stack, task)
+                except FireIdentityRevoked:
+                    # Nothing can be inspected or cleaned up as the owner any more;
+                    # an abandoned sandbox is left to the provider's lifetime cap.
+                    _logger.warning(
+                        "scheduled fire: task %s owner can no longer be acted for; "
+                        "recording run %s failed without inspecting it",
+                        task.id,
+                        run.id,
+                        exc_info=True,
+                    )
+                    return "failed"
+            return await self._inspect_startup(run)
+
+    async def _enter_owner_identity(
+        self, stack: contextlib.AsyncExitStack, task: ScheduledTask
+    ) -> None:
+        if self._fire_identity is not None:
+            await stack.enter_async_context(self._fire_identity(task))
+        stack.enter_context(account_authority_scope(task.user_id, task.account_generation))
+        stack.enter_context(host_owner_scope(task.user_id, task.account_generation))
+
+    async def _inspect_startup(
+        self, run: ScheduledTaskRun
+    ) -> Literal["running", "succeeded", "failed"] | None:
+        from omnigent.server.scheduled.schedule import sandbox_host_id
+
+        if run.conversation_id is None:
+            # Launch starts only after the session is recorded, so nothing ran.
+            return "failed"
+        conv = await asyncio.to_thread(
+            self._deps.conversation_store.get_conversation, run.conversation_id
+        )
+        # Decided from the run, not the task: its target may have changed since
+        # the claim. Only a sandbox run's host ID is derived from its occurrence.
+        managed = run.trigger_key is not None and run.host_id == sandbox_host_id(
+            run.scheduled_task_id, run.workspace_id, run.trigger_key
+        )
+        if conv is None:
+            if managed:
+                await self._terminate_sandbox(run.host_id)
+            return "failed"
+        if managed:
+            return await self._inspect_managed_startup(run, conv)
+        evidence = await self._transcript_evidence(conv.id)
+        if not evidence.delivered and conv.live_status not in ("running", "waiting"):
+            # The prompt was never sent, and recovery never sends it.
+            return "failed"
+        return _delivered_run_outcome(conv, evidence)
+
+    async def _transcript_evidence(self, conversation_id: str) -> _TranscriptEvidence:
+        page = await asyncio.to_thread(
+            self._deps.conversation_store.list_items,
+            conversation_id,
+            limit=_RECOVERY_TRANSCRIPT_ITEMS,
+            order="desc",
+        )
+        return _transcript_evidence(page.data)
+
+    async def _inspect_managed_startup(
+        self, run: ScheduledTaskRun, conv: Conversation
+    ) -> Literal["running", "succeeded", "failed"] | None:
+        from omnigent.server.startup_inputs import STARTUP_LABEL
+
+        if conv.labels.get(STARTUP_LABEL) == "failed":
+            # The launch failure is already recorded on the session.
+            return "failed"
+        if conv.host_id is not None:
+            # The prompt was saved before the launch began; the host's replica
+            # delivers it.
+            pending = await asyncio.to_thread(
+                self._deps.conversation_store.list_pending_inputs, conv.id
+            )
+            if any(item.status in ("in_progress", "incomplete") for item in pending):
+                return "running"
+            return _delivered_run_outcome(conv, await self._transcript_evidence(conv.id))
+        tracker = self._deps.managed_launches
+        launch = tracker.get(conv.id) if tracker is not None else None
+        if launch is not None and not launch.settled.is_set():
+            # Still provisioning on this server; a later sweep sees the binding.
+            return None
+        reason = (
+            launch.error
+            if launch is not None and launch.error is not None
+            else "the sandbox launch stopped before its host connected"
+        )
+        await self._terminate_sandbox(run.host_id)
+        if self._deps.startup_inputs is not None:
+            await self._deps.startup_inputs.record_launch_failure(conv.id, reason)
+        return "failed"
+
+    async def _terminate_sandbox(self, host_id: str | None) -> None:
+        await _terminate_run_sandbox(self._deps, host_id)
+
+
+async def _terminate_run_sandbox(deps: FireDeps, host_id: str | None) -> None:
+    """Tear down the sandbox registered under a run's host ID, if one exists."""
+    from omnigent.server.managed_hosts import terminate_managed_host
+
+    if host_id is None or deps.host_store is None:
+        return
+    host = await asyncio.to_thread(deps.host_store.get_host, host_id)
+    # Only a server-managed sandbox is torn down, never a user's own host.
+    if host is None or host.sandbox_provider is None:
+        return
+    await terminate_managed_host(host, deps.host_store, deps.sandbox_config)

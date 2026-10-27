@@ -967,6 +967,7 @@ def register_core_routes(
             raise HTTPException(status_code=422, detail=exc.errors(include_context=False)) from exc
 
         orchestration_source = request.headers.get(ORCHESTRATION_SOURCE_HEADER)
+        source = None
         if orchestration_source is not None:
             source = await asyncio.to_thread(
                 require_orchestration_source,
@@ -1059,6 +1060,7 @@ def register_core_routes(
             artifact_store=artifact_store,
             background_title_coordinator=background_title_coordinator,
             project_store=project_store,
+            created_by_session_id=source.id if source is not None else None,
         )
         # Notify the runner about the new session so it can resolve
         # the spec and cache sub_agent_name before the first turn.

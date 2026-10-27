@@ -1290,7 +1290,7 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
 
-        async def _t():
+        async def _t(model):
             with patch(
                 "omnigent.inner.databricks_executor._read_databrickscfg",
                 return_value=DatabricksCredentials(
@@ -1298,7 +1298,7 @@ class TestConstructor(unittest.TestCase):
                     token="dapi_test_token",
                 ),
             ):
-                executor = ClaudeSDKExecutor(gateway=True, model="databricks-claude-opus-4-7")
+                executor = ClaudeSDKExecutor(gateway=True, model=model)
 
             captured: dict[str, object] = {}
 
@@ -1317,7 +1317,10 @@ class TestConstructor(unittest.TestCase):
 
             self.assertEqual(captured["thinking"], {"type": "adaptive", "display": "summarized"})
 
-        _run(_t())
+        # Legacy serving-endpoint and Unity Catalog spellings of the same tier.
+        for model in ("databricks-claude-opus-4-7", "system.ai.claude-opus-4-7"):
+            with self.subTest(model=model):
+                _run(_t(model))
 
     def test_databricks_fable_pins_thinking_to_adaptive(self):
         """gateway=True + fable sets ``thinking={"type": "adaptive", "display": "summarized"}``.
@@ -1330,7 +1333,7 @@ class TestConstructor(unittest.TestCase):
         from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
         from omnigent.inner.databricks_executor import DatabricksCredentials
 
-        async def _t():
+        async def _t(model):
             with patch(
                 "omnigent.inner.databricks_executor._read_databrickscfg",
                 return_value=DatabricksCredentials(
@@ -1338,7 +1341,7 @@ class TestConstructor(unittest.TestCase):
                     token="dapi_test_token",
                 ),
             ):
-                executor = ClaudeSDKExecutor(gateway=True, model="databricks-claude-fable-5")
+                executor = ClaudeSDKExecutor(gateway=True, model=model)
 
             captured: dict[str, object] = {}
 
@@ -1357,7 +1360,10 @@ class TestConstructor(unittest.TestCase):
 
             self.assertEqual(captured["thinking"], {"type": "adaptive", "display": "summarized"})
 
-        _run(_t())
+        # Legacy serving-endpoint and Unity Catalog spellings of the same tier.
+        for model in ("databricks-claude-fable-5", "system.ai.claude-fable-5"):
+            with self.subTest(model=model):
+                _run(_t(model))
 
     def test_databricks_sonnet_leaves_thinking_unset(self):
         """gateway=True + non-adaptive-tier model preserves CLI default thinking."""
@@ -2412,6 +2418,10 @@ def _databricks_opus_executor():
     return _databricks_gateway_executor(model="databricks-claude-opus-4-7")
 
 
+def _databricks_uc_opus_executor():
+    return _databricks_gateway_executor(model="system.ai.claude-opus-4-7")
+
+
 @pytest.mark.parametrize(
     ("settings_text", "expected"),
     [
@@ -2503,6 +2513,7 @@ async def test_hermetic_turn_reads_relative_config_dir_from_cli_cwd(
         (_default_executor, 1024, {"type": "disabled"}),
         (_default_executor, 1025, None),
         (_databricks_opus_executor, 32000, {"type": "adaptive", "display": "summarized"}),
+        (_databricks_uc_opus_executor, 32000, {"type": "adaptive", "display": "summarized"}),
     ],
     ids=[
         "title-cap",
@@ -2510,6 +2521,7 @@ async def test_hermetic_turn_reads_relative_config_dir_from_cli_cwd(
         "largest-cap-without-room",
         "smallest-cap-with-room",
         "large-cap-adaptive-model",
+        "large-cap-uc-adaptive-model",
     ],
 )
 async def test_output_token_cap_reaches_cli_and_keeps_thinking_when_a_budget_fits(

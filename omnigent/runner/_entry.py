@@ -1733,11 +1733,19 @@ def create_app(
     # starlette 1.x removed add_event_handler; drive startup/shutdown via lifespan.
     @contextlib.asynccontextmanager
     async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
+        from omnigent.runner import pr_reports
+
         await _start_pm()
+        reporter = pr_reports.PullRequestReporter(
+            lambda *args, **kwargs: server_client.post(*args, **kwargs)
+        )
+        pr_reports.install(reporter)
         try:
             with monitor_event_loop(process_role="runner"):
                 yield
         finally:
+            pr_reports.install(None)
+            await reporter.aclose()
             await _stop_pm()
 
     app.router.lifespan_context = _lifespan

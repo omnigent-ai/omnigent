@@ -13,10 +13,11 @@ import pytest
 from omnigent.db.db_models import current_workspace_id, workspace_scope
 from omnigent.server.scheduled.dispatch_scheduler import (
     PersistentTaskScheduler,
+    ScheduledTaskDispatchHooks,
     StartupLease,
     StartupLeaseLost,
 )
-from omnigent.server.scheduled.schedule import occurrence_host_id
+from omnigent.server.scheduled.schedule import occurrence_host_id, sandbox_host_id
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import SqlAlchemyScheduledTaskStore
 from tests._helpers.polling import poll_until_async
 from tests.server.scheduled.test_scheduler import FakeClock
@@ -1947,3 +1948,186 @@ async def test_finished_schedules_are_completed_and_not_rescanned(store, monkeyp
         assert store.list_uninitialized_tasks() == []
     finally:
         await scheduler.stop()
+
+
+def test_dispatch_hooks_replace_the_built_in_executor_only_as_a_whole() -> None:
+    assert ScheduledTaskDispatchHooks().on_fire is None
+    ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock())
+    with pytest.raises(ValueError, match="both on_fire and on_expired"):
+        ScheduledTaskDispatchHooks(on_fire=AsyncMock())
+    with pytest.raises(ValueError, match="both on_fire and on_expired"):
+        ScheduledTaskDispatchHooks(on_expired=AsyncMock())
+    # A replacement executor would silently ignore it.
+    with pytest.raises(ValueError, match="fire_identity applies only"):
+        ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock(), fire_identity=AsyncMock())
+
+
+async def test_run_now_starts_a_manual_run_here_when_this_replica_owns_its_host(
+    store, monkeypatch
+) -> None:
+    task = store.update(_task(store).id, state="paused")
+    clock = FakeClock(task.created_at + 60)
+    fired = []
+
+    async def fire(snapshot, lease):
+        fired.append((snapshot.state, lease.run))
+        await lease.finish("running")
+
+    scheduler = PersistentTaskScheduler(store, fire, AsyncMock(), now=clock.now, poll_seconds=3600)
+    # Only the request itself may start the run in this test.
+    monkeypatch.setattr(scheduler, "_claim_pending", AsyncMock())
+    await scheduler.start()
+    try:
+        run = await scheduler.run_now(task)
+        await asyncio.gather(*list(scheduler._startups.values()))
+    finally:
+        await scheduler.stop()
+
+    # Run now is a manual override: a paused task starts, under its own occurrence key.
+    [(state, started)] = fired
+    assert state == "paused"
+    assert (started.id, started.status) == (run.id, "starting")
+    assert started.trigger_key.startswith("manual:")
+    assert started.host_id == occurrence_host_id(task, started.trigger_key)
+    assert store.list_runs(task.id)[0][0].status == "running"
+    assert store.get(task.id).next_run_at is None
+
+
+async def test_run_now_waits_for_the_host_owner_to_start_it(store) -> None:
+    task = _task(store)
+    clock = FakeClock(task.created_at + 60)
+    owned = False
+
+    async def owns_host(_workspace_id, _host_id):
+        return owned
+
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), owns_host=owns_host, now=clock.now
+    )
+    run = await scheduler.run_now(task)
+    assert run.status == "scheduled"
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    fire.assert_not_awaited()
+
+    owned = True
+    await scheduler.poll_once()
+    await _drain(scheduler)
+    [(snapshot, lease)] = [call.args for call in fire.await_args_list]
+    assert (snapshot.id, lease.run.id) == (task.id, run.id)
+    assert store.list_pending_runs() == []
+    # Run now never moves the schedule of an active task.
+    assert store.get(task.id).next_run_at == task.next_run_at
+
+
+async def test_run_now_keeps_a_recorded_request_when_starting_it_here_fails(store) -> None:
+    task = _task(store)
+    clock = FakeClock(task.created_at + 60)
+    calls = 0
+
+    async def owns_host(_workspace_id, _host_id):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise RuntimeError("ownership lookup unavailable")
+        return True
+
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), owns_host=owns_host, now=clock.now, poll_seconds=3600
+    )
+    await scheduler.start()
+    try:
+        # Recorded, so the caller must not retry and create a second run.
+        run = await scheduler.run_now(task)
+        assert run is not None
+        await scheduler.poll_once()
+        await _drain(scheduler)
+    finally:
+        await scheduler.stop()
+    [(_snapshot, lease)] = [call.args for call in fire.await_args_list]
+    assert lease.run.id == run.id
+
+
+async def test_pending_runs_cost_each_poll_one_page_and_still_make_progress(store) -> None:
+    # Each sandbox request has its own host, so ownership differs per request.
+    task = _task(store, execution_target="managed_sandbox")
+    clock = FakeClock(task.created_at + 60)
+
+    def request(key):
+        host_id = occurrence_host_id(task, key)
+        return store.request_manual_run(
+            task, now=task.created_at, trigger_key=key, host_id=host_id
+        )
+
+    unowned = [request(f"manual:{i}") for i in range(5)]
+    owned = request("manual:owned")
+    owned_host = owned.host_id
+    pages = []
+    list_pending_runs = store.list_pending_runs
+
+    def recording_list(**kwargs):
+        pages.append(kwargs["after"])
+        return list_pending_runs(**kwargs)
+
+    store.list_pending_runs = recording_list
+
+    async def owns_host(_workspace_id, host_id):
+        return host_id == owned_host
+
+    fire = AsyncMock()
+    scheduler = PersistentTaskScheduler(
+        store, fire, AsyncMock(), owns_host=owns_host, now=clock.now, batch_size=2
+    )
+    polls = 0
+    while not fire.await_count:
+        polls += 1
+        assert polls <= 4
+        pages.clear()
+        await scheduler.poll_once()
+        await _drain(scheduler)
+        # Requests owned by other replicas never cost a poll more than one page.
+        assert len(pages) == 1
+    [(_snapshot, lease)] = [call.args for call in fire.await_args_list]
+    assert lease.run.id == owned.id
+    assert {run.id for run in list_pending_runs()} == {run.id for run in unowned}
+
+
+async def test_run_now_moves_to_the_new_host_owner_after_a_target_change(store) -> None:
+    task = _task(store, host_id=uuid.uuid4().hex, workspace="/repo")
+    clock = FakeClock(task.created_at + 60)
+    old_host = task.host_id
+    asked = {"old": [], "new": []}
+    fired = {"old": AsyncMock(), "new": AsyncMock()}
+    new_host = None
+
+    def replica(name, owns):
+        async def owns_host(_workspace_id, host_id):
+            asked[name].append(host_id)
+            return owns(host_id)
+
+        return PersistentTaskScheduler(
+            store, fired[name], AsyncMock(), owns_host=owns_host, now=clock.now
+        )
+
+    old_owner = replica("old", lambda host_id: host_id == old_host)
+    new_owner = replica("new", lambda host_id: host_id == new_host)
+    # Recorded on the old host; neither replica polls before the edit.
+    run = await new_owner.run_now(task)
+    assert run.host_id == old_host
+    store.update(task.id, execution_target="managed_sandbox", host_id=None, workspace=None)
+    new_host = sandbox_host_id(task.id, task.workspace_id, run.trigger_key)
+
+    # The old owner's claim moves the request to the sandbox host instead of starting it.
+    await old_owner.poll_once()
+    await _drain(old_owner)
+    await new_owner.poll_once()
+    await _drain(new_owner)
+
+    assert old_host in asked["old"]
+    assert new_host in asked["new"]
+    fired["old"].assert_not_awaited()
+    [(snapshot, lease)] = [call.args for call in fired["new"].await_args_list]
+    assert snapshot.execution_target == "managed_sandbox"
+    assert (lease.run.id, lease.run.host_id) == (run.id, new_host)

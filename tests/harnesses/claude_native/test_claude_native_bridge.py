@@ -1861,6 +1861,31 @@ def test_read_transcript_rewrites_logout_and_login_together(tmp_path: Path) -> N
     assert _assistant_transcript_text(tmp_path, raw_text, is_api_error=True) == expected
 
 
+def test_read_transcript_login_guidance_in_managed_sandbox_points_at_a_new_session(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A managed sandbox (``IS_SANDBOX=1``) cannot run ``omni setup``.
+
+    Its credentials arrive at launch, so the appended remedy names the only
+    self-service step (a new session) and the fallback when that still fails
+    (the sandbox administrator). The CLI's own text is kept.
+    """
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    raw_text = "Login expired · Please run /login"
+
+    rendered = _assistant_transcript_text(tmp_path, raw_text, is_api_error=True)
+
+    assert rendered.startswith(f"{raw_text}\n\n")
+    assert "credentials at launch" in rendered
+    assert "new session" in rendered
+    assert "if sign-in still fails" in rendered
+    assert "sandbox administrator" in rendered
+    assert "refresh its credentials" in rendered
+    assert "omni setup" not in rendered
+
+
 def test_read_transcript_items_from_offset_skips_existing_prefix(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -8630,6 +8655,30 @@ def test_hook_record_stop_failure_message_gets_web_chat_guidance() -> None:
     assert login.failure_message is not None
     assert login.failure_message.startswith("Login expired · Please run /login\n\n")
     assert "omni setup" in login.failure_message
+
+
+def test_hook_record_stop_failure_login_guidance_in_managed_sandbox(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The failure card's remedy follows the host kind like the transcript's."""
+    monkeypatch.setenv("IS_SANDBOX", "1")
+    login = _hook_record_from_jsonl_record(
+        _make_jsonl_record(
+            {
+                "hook_event_name": "StopFailure",
+                "error": "authentication_failed",
+                "error_details": "Login expired · Please run /login",
+            }
+        )
+    )
+    assert login.failure_message is not None
+    assert login.failure_message.startswith("Login expired · Please run /login\n\n")
+    assert "omni setup" not in login.failure_message
+    assert "credentials at launch" in login.failure_message
+    assert "new session" in login.failure_message
+    assert "if sign-in still fails" in login.failure_message
+    assert "sandbox administrator" in login.failure_message
+    assert "refresh its credentials" in login.failure_message
 
 
 def test_hook_record_stop_failure_last_assistant_message_not_used() -> None:

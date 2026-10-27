@@ -10652,16 +10652,17 @@ def _reject_server_reserved_label_seed(labels: dict[str, str] | None) -> None:
         )
     from omnigent.server.routes._host_worktree import WORKTREE_ROOT_LABEL_KEY
     from omnigent.stores.conversation_store import (
+        CREATED_BY_SESSION_LABEL_KEY,
         SCHEDULED_TASK_ORIGIN_LABEL_KEY,
         SIDE_CHAT_SOURCE_LABEL_KEY,
     )
 
-    if SCHEDULED_TASK_ORIGIN_LABEL_KEY in labels:
-        raise OmnigentError(
-            f"label {SCHEDULED_TASK_ORIGIN_LABEL_KEY!r} is server-internal "
-            "and cannot be set by clients",
-            code=ErrorCode.INVALID_INPUT,
-        )
+    for key in (SCHEDULED_TASK_ORIGIN_LABEL_KEY, CREATED_BY_SESSION_LABEL_KEY):
+        if key in labels:
+            raise OmnigentError(
+                f"label {key!r} is server-internal and cannot be set by clients",
+                code=ErrorCode.INVALID_INPUT,
+            )
 
     if SIDE_CHAT_SOURCE_LABEL_KEY in labels:
         raise OmnigentError(
