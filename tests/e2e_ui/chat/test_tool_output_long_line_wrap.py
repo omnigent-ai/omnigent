@@ -219,7 +219,7 @@ def test_tool_output_long_line_wraps_instead_of_clipping(
     terminal = page.get_by_test_id("shell-tool-terminal")
     expect(terminal).to_contain_text("python3 -c")
     expect(terminal.get_by_text("exit 0", exact=True)).to_be_visible()
-    expect(page.get_by_text("Input", exact=True)).to_have_count(0)
+    expect(page.get_by_role("button", name="Copy input", exact=True)).to_have_count(0)
 
     # Regression guard: the long output line fits the panel width — no
     # horizontal clipping/scrolling needed to read it.
