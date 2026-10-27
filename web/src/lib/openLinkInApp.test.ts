@@ -1,7 +1,12 @@
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { showToast } from "@/components/ui/toast";
 import { writeOpenLinksInApp } from "@/lib/linkOpenPreferences";
-import { maybeOpenLinkInApp, onInAppLinkOpen, parseHttpUrl } from "@/lib/openLinkInApp";
+import {
+  maybeOpenLinkInApp,
+  onInAppLinkOpen,
+  openLinkInApp,
+  parseHttpUrl,
+} from "@/lib/openLinkInApp";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 
@@ -39,6 +44,29 @@ it("surfaces the Browser tab only after the view accepts the link", async () => 
   expect(surfaced).toEqual([]);
   await vi.waitFor(() => expect(surfaced).toEqual([CONV]));
   expect(window.open).not.toHaveBeenCalled();
+});
+
+it("allows an explicit choice with the click preference off without changing that preference", () => {
+  writeOpenLinksInApp(false);
+  expect(openLinkInApp(CONV, URL_)).toBe(true);
+  expect(openOrNavigate).toHaveBeenCalledWith(CONV, URL_, undefined, { agent: true });
+  expect(maybeOpenLinkInApp(CONV, URL_)).toBe(false);
+});
+
+it.each([
+  [undefined, URL_],
+  [CONV, "mailto:a@example.com"],
+  [CONV, "file:///tmp/report.html"],
+  [CONV, "http://[::1"],
+])("does not route an explicit unsupported target (%s, %s)", (conversationId, href) => {
+  expect(openLinkInApp(conversationId, href)).toBe(false);
+  expect(openOrNavigate).not.toHaveBeenCalled();
+});
+
+it("does not route an explicit choice when the browser bridge is unavailable", () => {
+  delete (window as { omnigentDesktop?: unknown }).omnigentDesktop;
+  expect(openLinkInApp(CONV, URL_)).toBe(false);
+  expect(openOrNavigate).not.toHaveBeenCalled();
 });
 
 it.each([

@@ -34,9 +34,10 @@ import { VideoPlayer } from "@/components/VideoPlayer";
 import { isRemoteVideoUrl, isVideoFile } from "@/lib/video";
 import { useThrottledValue } from "@/hooks/useThrottledValue";
 import { withBasePath } from "@/lib/basePath";
+import { followLinkWithPopupFallback, openLinkInApp, openLinkInBrowser } from "@/lib/openLinkInApp";
+import { supportsBrowser, isNativeShell } from "@/lib/nativeBridge";
 import { copyText } from "@/lib/clipboard";
 import { absoluteWorkspacePath } from "@/lib/composerContext";
-import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
 import { cn } from "@/lib/utils";
 import {
   useFileViewer,
@@ -245,6 +246,81 @@ function githubPullRequest(href: string | undefined): string | null {
   }
 }
 
+function ChatLinkMenu({
+  children,
+  href,
+  copyHref = href,
+  openInApp,
+  path,
+}: {
+  children: React.ReactElement;
+  href: string;
+  copyHref?: string;
+  path?: string;
+  openInApp?: () => void;
+}) {
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      <ContextMenuContent>
+        {path && (
+          <ContextMenuItem
+            onSelect={() =>
+              void copyText(path).then(
+                () => toast.success("Copied path"),
+                () => toast.error("Couldn't copy the path"),
+              )
+            }
+          >
+            <CopyIcon />
+            Copy path
+          </ContextMenuItem>
+        )}
+        <ContextMenuItem
+          disabled={!openInApp}
+          onSelect={openInApp}
+          title={openInApp ? undefined : "The integrated website browser requires the desktop app."}
+        >
+          Open in Omnigent
+        </ContextMenuItem>
+        <ContextMenuItem onSelect={() => openLinkInBrowser(href)}>
+          {isNativeShell() ? "Open in default browser" : "Open in browser tab"}
+        </ContextMenuItem>
+        <ContextMenuItem
+          onSelect={() => {
+            void copyText(copyHref).then(
+              () => showToast("Link copied"),
+              () => showToast("Could not copy the link. Please try again."),
+            );
+          }}
+        >
+          Copy link
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+}
+
+/** Right-click menu that copies the path a file link names. */
+function FileLinkContextMenu({ path, children }: { path: string; children: React.ReactElement }) {
+  const copyPath = () =>
+    void copyText(path).then(
+      () => toast.success("Copied path"),
+      () => toast.error("Couldn't copy the path"),
+    );
+  return (
+    <ContextMenu>
+      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
+      <ContextMenuContent>
+        <ContextMenuItem onSelect={copyPath}>
+          <CopyIcon />
+          Copy path
+        </ContextMenuItem>
+      </ContextMenuContent>
+    </ContextMenu>
+  );
+}
+
 function PullRequestLinkLabel({ children }: { children: React.ReactNode }) {
   const words = typeof children === "string" ? children.match(/^(\S+)([\s\S]*)$/) : null;
   const prefix = (
@@ -315,7 +391,7 @@ function WorkspaceFileLink({
     // popup fallback so a click still works where new tabs can't open.
     const blankHref = props.target === "_blank" && typeof rebased === "string" ? rebased : null;
     const pullRequest = githubPullRequest(rebased);
-    return (
+    const link = (
       <a
         href={rebased}
         className={cn(STREAMDOWN_LINK_CLASS, className)}
@@ -337,6 +413,27 @@ function WorkspaceFileLink({
           children
         )}
       </a>
+    );
+    if (typeof rebased !== "string" || !/^(?:https?:)?\/\//i.test(rebased)) return link;
+    let menuHref: string;
+    try {
+      menuHref = new URL(rebased, window.location.href).toString();
+    } catch {
+      return link;
+    }
+    return (
+      <ChatLinkMenu
+        href={menuHref}
+        openInApp={
+          conversationId && supportsBrowser()
+            ? () => {
+                openLinkInApp(conversationId, rebased);
+              }
+            : undefined
+        }
+      >
+        {link}
+      </ChatLinkMenu>
     );
   }
 
@@ -416,50 +513,48 @@ function WorkspaceFileLink({
 
   // No href: the parked fragment would still navigate on cmd/middle-click, and
   // no URL opens the FileViewer. role/tabIndex/onKeyDown restore button semantics.
-  return (
-    <FileLinkContextMenu path={copyPath}>
-      <a
-        {...props}
-        role="button"
-        tabIndex={0}
-        aria-label={shortLabel && linkText ? linkText : props["aria-label"]}
-        title={title ?? path}
-        data-streamdown="link"
-        // Dotted underline distinguishes "opens in the FileViewer" from a link
-        // that leaves the app; the rest matches Streamdown so a file link in a
-        // table cell wraps like any other.
-        className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
-        onClick={openWorkspaceFile}
-        onKeyDown={(e) => {
-          if (e.key === "Enter" || e.key === " ") {
-            e.preventDefault();
-            openWorkspaceFile();
-          }
-        }}
-      >
-        {shortLabel ?? children}
-      </a>
-    </FileLinkContextMenu>
+  const link = (
+    <a
+      {...props}
+      role="button"
+      tabIndex={0}
+      aria-label={shortLabel && linkText ? linkText : props["aria-label"]}
+      title={title ?? path}
+      data-streamdown="link"
+      // Dotted underline distinguishes "opens in the FileViewer" from a link
+      // that leaves the app; the rest matches Streamdown so a file link in a
+      // table cell wraps like any other.
+      className={cn(STREAMDOWN_LINK_CLASS, "decoration-dotted underline-offset-2", className)}
+      onClick={openWorkspaceFile}
+      onKeyDown={(e) => {
+        if (e.key === "Enter" || e.key === " ") {
+          e.preventDefault();
+          openWorkspaceFile();
+        }
+      }}
+    >
+      {shortLabel ?? children}
+    </a>
   );
-}
-
-/** Right-click menu that copies the path a file link names. */
-function FileLinkContextMenu({ path, children }: { path: string; children: React.ReactElement }) {
-  const copyPath = () =>
-    void copyText(path).then(
-      () => toast.success("Copied path"),
-      () => toast.error("Couldn't copy the path"),
-    );
+  if (!conversationId) return <FileLinkContextMenu path={copyPath}>{link}</FileLinkContextMenu>;
+  const url = new URL(
+    withBasePath(`/c/${encodeURIComponent(conversationId)}`),
+    window.location.origin,
+  );
+  url.searchParams.set("file", resolvedPath);
+  const citation = splitWorkspaceFileCitation(path);
+  if (citation.line !== null) url.searchParams.set("line", String(citation.line));
+  if (citation.column) url.searchParams.set("column", String(citation.column));
+  if (citation.endLine) url.searchParams.set("endLine", String(citation.endLine));
   return (
-    <ContextMenu>
-      <ContextMenuTrigger asChild>{children}</ContextMenuTrigger>
-      <ContextMenuContent>
-        <ContextMenuItem onSelect={copyPath}>
-          <CopyIcon />
-          Copy path
-        </ContextMenuItem>
-      </ContextMenuContent>
-    </ContextMenu>
+    <ChatLinkMenu
+      href={url.toString()}
+      copyHref={path}
+      openInApp={openWorkspaceFile}
+      path={copyPath}
+    >
+      {link}
+    </ChatLinkMenu>
   );
 }
 

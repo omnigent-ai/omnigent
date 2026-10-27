@@ -18,6 +18,7 @@ import { FilePathAwareMessageResponse } from "./ChatMarkdown";
 
 vi.mock("@/components/ui/toast", () => ({ showToast: vi.fn() }));
 import { showToast } from "@/components/ui/toast";
+import { copyText } from "@/lib/clipboard";
 
 const { copyTextMock } = vi.hoisted(() => ({
   copyTextMock: vi.fn<(text: string) => Promise<void>>(),
@@ -41,6 +42,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.restoreAllMocks();
+  delete window.__OMNIGENT_BASE_PATH__;
   vi.unstubAllGlobals();
 });
 
@@ -116,6 +118,48 @@ function renderMarkdown(
 }
 
 describe("markdown links to workspace files", () => {
+  it("keeps a cited line range in the context menu's file-viewer URL", async () => {
+    renderMarkdown("[notes](docs/notes.md:12-18)", ["docs/notes.md"], FILE_VIEWER_WITH_SESSION);
+    fireEvent.contextMenu(screen.getByRole("button", { name: "notes" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open in Omnigent" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12, endLine: 18 });
+    fireEvent.contextMenu(screen.getByRole("button", { name: "notes" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy link" }));
+    await waitFor(() => expect(copyText).toHaveBeenCalledWith("docs/notes.md#L12-L18"));
+  });
+
+  it("offers file preview, browser tab and copy actions scoped to the viewer conversation", async () => {
+    window.__OMNIGENT_BASE_PATH__ = "/omni";
+    renderMarkdown("[notes](docs/notes.md:12:3)", ["docs/notes.md"], FILE_VIEWER_WITH_SESSION);
+    const link = screen.getByRole("button", { name: "notes" });
+    fireEvent.contextMenu(link);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open in Omnigent" }));
+    expect(openFile).toHaveBeenCalledWith("docs/notes.md", { line: 12, column: 3 });
+
+    fireEvent.contextMenu(link);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy link" }));
+    await waitFor(() => expect(copyText).toHaveBeenCalledWith("docs/notes.md#L12C3"));
+
+    const click = vi.spyOn(HTMLAnchorElement.prototype, "click").mockImplementation(() => {});
+    const popupDocument = document.implementation.createHTMLDocument();
+    vi.spyOn(window, "open").mockReturnValue({ opener: window, document: popupDocument } as Window);
+    fireEvent.contextMenu(link);
+    fireEvent.click(screen.getByRole("menuitem", { name: "Open in browser tab" }));
+    const expected = `${window.location.origin}/omni/c/conv_1?file=docs%2Fnotes.md&line=12&column=3`;
+    expect(click.mock.instances[0]).toHaveProperty("href", expected);
+  });
+
+  it("reports a failed link copy instead of claiming success", async () => {
+    vi.mocked(copyText).mockRejectedValueOnce(new Error("clipboard unavailable"));
+    renderMarkdown("[notes](docs/notes.md)", ["docs/notes.md"], FILE_VIEWER_WITH_SESSION);
+    fireEvent.contextMenu(screen.getByRole("button", { name: "notes" }));
+    fireEvent.click(screen.getByRole("menuitem", { name: "Copy link" }));
+    await waitFor(() =>
+      expect(toastMock).toHaveBeenCalledWith("Could not copy the link. Please try again."),
+    );
+    expect(openFile).not.toHaveBeenCalled();
+  });
+
   it("plays an existing root-level recording outside the changed-file list", async () => {
     fetchMock.mockResolvedValue(dirListing(["demo.webm"]));
     renderMarkdown("[Screen recording](demo.webm)", [], FILE_VIEWER_WITH_SESSION);
@@ -702,11 +746,12 @@ describe("copying a file link's path", () => {
     expect(toast.success).not.toHaveBeenCalled();
   });
 
-  it("leaves the native menu on an external link", () => {
+  it("offers link actions without a file-path action on an external link", () => {
     renderMarkdown("[docs](https://example.com/page)");
 
-    // fireEvent returns false when a handler called preventDefault.
-    expect(fireEvent.contextMenu(screen.getByRole("link", { name: "docs" }))).toBe(true);
-    expect(screen.queryByRole("menuitem")).toBeNull();
+    fireEvent.contextMenu(screen.getByRole("link", { name: "docs" }));
+    expect(screen.getByRole("menuitem", { name: "Copy link" })).toBeVisible();
+    expect(screen.queryByRole("menuitem", { name: "Copy path" })).toBeNull();
+    expect(copyTextMock).not.toHaveBeenCalled();
   });
 });
