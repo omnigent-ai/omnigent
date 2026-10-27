@@ -341,6 +341,8 @@ async def test_gateway_executor_routes_new_client_through_shim(monkeypatch) -> N
     ``_get_or_create_client`` (the seam where ``options.env`` is
     consumed); spawning the real CLI is infeasible in unit tests.
     """
+    from claude_agent_sdk import ClaudeAgentOptions
+
     from omnigent.inner.claude_sdk_executor import ClaudeSDKExecutor
     from omnigent.inner.databricks_executor import DatabricksCredentials
 
@@ -357,14 +359,15 @@ async def test_gateway_executor_routes_new_client_through_shim(monkeypatch) -> N
     class _StubClient:
         """Captures ``options.env`` at connect time (= CLI spawn time)."""
 
-        def __init__(self, options) -> None:  # type: ignore[no-untyped-def]  # SDK options shape owned by stub
+        def __init__(self, options, transport=None) -> None:  # type: ignore[no-untyped-def]  # SDK options shape owned by stub
             self.options = options
             self._query = None
-            self._transport = None
+            self._transport = transport
 
         async def connect(self) -> None:
             """Snapshot the env the CLI subprocess would receive."""
-            connect_env.update(self.options.env)
+            assert self._transport is not None
+            connect_env.update(self._transport._options.env)
 
         async def disconnect(self) -> None:
             """No-op disconnect for teardown."""
@@ -374,11 +377,8 @@ async def test_gateway_executor_routes_new_client_through_shim(monkeypatch) -> N
 
         ClaudeSDKClient = _StubClient
 
-    from types import SimpleNamespace
-
-    options = SimpleNamespace(
+    options = ClaudeAgentOptions(
         env={"ANTHROPIC_BASE_URL": "https://example.databricks.com/ai-gateway/anthropic"},
-        stderr=None,
     )
     try:
         await executor._get_or_create_client(
