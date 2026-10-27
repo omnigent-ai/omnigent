@@ -1834,6 +1834,30 @@ def create_runner_app(
         task.add_done_callback(_background_tasks.discard)
         _background_tasks.add(task)
 
+    def _required_terminal_exit_attributes(
+        event: TerminalExitEvent,
+        error: dict[str, str],
+        diagnosis: FailureDiagnosis | None,
+        impact: ErrorImpact,
+    ) -> dict[str, object]:
+        """Return the debug-log attributes for a required-terminal exit."""
+        return {
+            **{
+                key: value
+                for key, value in event.lifecycle_context.items()
+                if key not in {"event_name", "session_id", "turn_id", "user_id"}
+            },
+            "terminal_id": event.terminal_id,
+            "terminal_instance_id": event.terminal_instance_id,
+            "terminal_name": event.terminal_name,
+            "terminal_exit_status": event.exit_status,
+            "runner_shutting_down": _shutting_down.is_set(),
+            "error_code": error["code"],
+            # An unrecognized exit is the harness CLI dying under the runner.
+            "error_category": (diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
+            "error_impact": impact.value,
+        }
+
     def _publish_terminal_exit(event: TerminalExitEvent) -> None:
         _publish_event(
             event.session_id,
@@ -1849,6 +1873,10 @@ def create_runner_app(
         # app-server turn; the native-terminal ensure path can recreate it.
         if event.lifecycle != TerminalLifecycle.REQUIRED:
             return
+
+        # Captured pane text can carry credentials the default log redactor
+        # misses, so sanitize the composed message before logging it.
+        from omnigent.harnesses.diagnostics import sanitize_diagnostic_text
 
         # A required terminal exit ends the session. Tear down any registered
         # Codex app-server alongside it; this is a no-op for other harnesses.
@@ -1890,13 +1918,10 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
-        if event.session_was_idle:
-            _release_required_terminal_session(event.session_id)
-            return
-
         if _shutting_down.is_set():
-            # tmux died with this runner's process group on a stop signal, not
-            # a crash; the server settles the turn from the dropped tunnel.
+            # tmux died with this runner's process group on a stop signal, not a
+            # crash; the server settles the turn from the dropped tunnel. Ordered
+            # before the idle check so stopping idle sessions stays benign.
             _logger.info(
                 "required terminal %s exited for %s while the runner is shutting down; "
                 "not failing the turn",
@@ -1907,28 +1932,33 @@ def create_runner_app(
             _release_required_terminal_session(event.session_id)
             return
 
+        if event.session_was_idle:
+            # No turn fails, so this is the only record of why the terminal died;
+            # without it a startup exit stays unattributed. The idle session is
+            # not failed and can re-ensure the terminal, so this exit is transient.
+            idle_log = debug_event("required_terminal_exited_idle", session_id=event.session_id)
+            idle_log["attributes"] = _required_terminal_exit_attributes(
+                event, error, diagnosis, ErrorImpact.TRANSIENT
+            )
+            _logger.warning(
+                "required terminal %s exited while %s was idle: %s",
+                event.terminal_name,
+                event.session_id,
+                sanitize_diagnostic_text(error.get("message", "")),
+                extra=idle_log,
+            )
+            _release_required_terminal_session(event.session_id)
+            return
+
         exit_log = debug_event("required_terminal_exited", session_id=event.session_id)
-        exit_log["attributes"] = {
-            **{
-                key: value
-                for key, value in event.lifecycle_context.items()
-                if key not in {"event_name", "session_id", "turn_id", "user_id"}
-            },
-            "terminal_id": event.terminal_id,
-            "terminal_instance_id": event.terminal_instance_id,
-            "terminal_name": event.terminal_name,
-            "terminal_exit_status": event.exit_status,
-            "runner_shutting_down": _shutting_down.is_set(),
-            "error_code": error["code"],
-            # An unrecognized exit is the harness CLI dying under the runner.
-            "error_category": (diagnosis.category if diagnosis else ErrorCategory.RUNNER).value,
-            "error_impact": ErrorImpact.BLOCKING.value,
-        }
+        exit_log["attributes"] = _required_terminal_exit_attributes(
+            event, error, diagnosis, ErrorImpact.BLOCKING
+        )
         _logger.error(
             "required terminal %s exited; failing turn for %s: %s",
             event.terminal_name,
             event.session_id,
-            error.get("message"),
+            sanitize_diagnostic_text(error.get("message", "")),
             extra=exit_log,
         )
         _publish_event(
