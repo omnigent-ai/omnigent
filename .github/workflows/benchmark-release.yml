@@ -58,7 +58,7 @@ jobs:
   benchmark:
     name: Baseline vs candidate (sqlite, same runner)
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 45
     # Job-level so a release.yml caller never shares its `release` group; keyed
     # on the calling workflow so the PR benchmark's re-check and this file's own

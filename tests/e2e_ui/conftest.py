@@ -93,6 +93,9 @@ from tests.helpers.ui_configuration import (
     pytest_configure as pytest_configure,
 )
 from tests.helpers.ui_configuration import (
+    pytest_unconfigure as pytest_unconfigure,
+)
+from tests.helpers.ui_configuration import (
     temp_omnigent_mock_config as _temp_omnigent_mock_config,
 )
 from tests.helpers.ui_server_compat import (

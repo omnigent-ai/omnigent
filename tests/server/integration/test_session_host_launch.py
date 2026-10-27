@@ -4207,6 +4207,312 @@ async def test_rider_of_a_refused_relaunch_surfaces_the_refusal(
         assert "omnigent setup" in item["message"], item
 
 
+# ── Sub-agent children riding the parent's shared runner ─────────────────────
+
+
+class _HostFrameResponder:
+    """Answer host round-trips in the background and record every stop request."""
+
+    def __init__(self, comm: ApplicationCommunicator) -> None:
+        self._comm = comm
+        self.stopped_runner_ids: list[str] = []
+        self.launch_frames: list[HostLaunchRunnerFrame] = []
+        self._task: asyncio.Task[None] | None = None
+
+    async def __aenter__(self) -> _HostFrameResponder:
+        self._task = asyncio.create_task(self._serve())
+        return self
+
+    async def __aexit__(self, *_exc: object) -> None:
+        assert self._task is not None
+        self._task.cancel()
+        with contextlib.suppress(asyncio.CancelledError, asyncio.TimeoutError):
+            await self._task
+
+    async def _serve(self) -> None:
+        while True:
+            output = await self._comm.receive_output(timeout=budget(30.0))
+            if output["type"] != "websocket.send":
+                continue
+            try:
+                frame = decode_host_frame(output["text"])
+            except ValueError:
+                # Keepalive pings interleave with the frames under test.
+                continue
+            if isinstance(frame, HostStatFrame):
+                reply: object = HostStatResultFrame(
+                    request_id=frame.request_id,
+                    status="ok",
+                    exists=True,
+                    type="directory",
+                    canonical_path=frame.path,
+                )
+            elif isinstance(frame, HostStopRunnerFrame):
+                self.stopped_runner_ids.append(frame.runner_id)
+                reply = HostStopRunnerResultFrame(request_id=frame.request_id, status="stopped")
+            elif isinstance(frame, HostLaunchRunnerFrame):
+                self.launch_frames.append(frame)
+                reply = HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id, status="launched", runner_id="runner_from_host"
+                )
+            else:
+                continue
+            await self._comm.send_input(
+                {"type": "websocket.receive", "text": encode_host_frame(reply)}
+            )
+
+
+async def _inline_child_session(client: httpx.AsyncClient, parent_id: str) -> dict[str, str]:
+    """Create a sub-agent child on the parent's host; it inherits the parent's runner."""
+    parent = (await client.get(f"/v1/sessions/{parent_id}")).json()
+    create_resp = await client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": parent["agent_id"],
+            "host_id": _HOST_ID,
+            "parent_session_id": parent_id,
+            "workspace": _WORKSPACE,
+            "title": "child C",
+        },
+    )
+    assert create_resp.status_code == 201, create_resp.text
+    child = create_resp.json()
+    assert child["host_id"] == _HOST_ID
+    assert child["runner_id"] == parent["runner_id"]
+    return {"id": child["id"], "runner_id": child["runner_id"]}
+
+
+async def _drain_detached_stops() -> None:
+    from omnigent.server.routes._sessions import orchestration
+
+    await asyncio.gather(*list(orchestration._detached_stop_tasks), return_exceptions=True)
+
+
+@pytest.fixture
+def _shared_runner_family(
+    monkeypatch: pytest.MonkeyPatch,
+) -> Iterator[dict[str, str]]:
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+
+    monkeypatch.setattr(sessions_module, "_ARCHIVE_STOP_UNDO_GRACE_S", 0.0)
+    set_runner_client(None)
+    ids: dict[str, str] = {}
+    try:
+        yield ids
+    finally:
+        for session_id in ids.values():
+            sessions_module._intentional_stop_sessions.pop(session_id, None)
+            sessions_module._session_status_cache.pop(session_id, None)
+
+
+async def test_archiving_child_does_not_stop_parents_shared_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """A child's archive must end only the child, not the runner its parent is on."""
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        _shared_runner_family.update(parent=parent["id"], child=child["id"])
+
+        archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
+        assert archive.status_code == 200, archive.text
+        await _drain_detached_stops()
+
+    parent_row = (await client.get(f"/v1/sessions/{parent['id']}")).json()
+    assert parent_row["archived"] is False
+    assert parent["runner_id"] not in host.stopped_runner_ids, (
+        f"archiving child {child['id']} asked the host to stop the parent's runner "
+        f"{parent['runner_id']} (stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_unbinding_child_before_archive_does_not_stop_parents_shared_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """Clearing the child's runner first does not help once its idle status heals the binding."""
+    from omnigent.server.routes import sessions as sessions_module
+
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    store = SqlAlchemyConversationStore(db_uri)
+    app.state.tunnel_registry.register(parent["runner_id"], _NoopRunnerWS(), _runner_hello())
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(lambda _request: httpx.Response(202, json={})),
+        base_url="http://runner",
+    ) as runner:
+
+        async def resolve(sid: str, router: object, **kwargs: Any) -> httpx.AsyncClient | None:
+            conv = kwargs.get("conversation") or store.get_conversation(sid)
+            return runner if conv and app.state.tunnel_registry.get(conv.runner_id) else None
+
+        monkeypatch.setattr(sessions_module, "_get_runner_client", resolve)
+        async with _HostFrameResponder(comm) as host:
+            child = await _inline_child_session(client, parent["id"])
+            _shared_runner_family.update(parent=parent["id"], child=child["id"])
+
+            unbind = await client.patch(f"/v1/sessions/{child['id']}", json={"runner_id": ""})
+            assert unbind.status_code == 200, unbind.text
+            assert store.get_conversation(child["id"]).runner_id is None
+            # The child's turn-end status lands after the unbind, as the native forwarder sends it.
+            idle = await client.post(
+                f"/v1/sessions/{child['id']}/events",
+                json={"type": "external_session_status", "data": {"status": "idle"}},
+            )
+            assert idle.status_code in (200, 202), idle.text
+            healed_runner_id = store.get_conversation(child["id"]).runner_id
+            assert healed_runner_id == parent["runner_id"], (
+                "the idle status should heal the binding"
+            )
+
+            archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
+            assert archive.status_code == 200, archive.text
+            await _drain_detached_stops()
+
+    assert parent["runner_id"] not in host.stopped_runner_ids, (
+        f"unbound child {child['id']} was healed back to runner {healed_runner_id!r}; archiving "
+        f"it asked the host to stop the parent's runner {parent['runner_id']} "
+        f"(stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_stopping_child_does_not_stop_parents_shared_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """``stop_session`` on a child ends the child's work, not the parent's runner."""
+    from omnigent.runtime import set_runner_client
+
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        fake_runner = httpx.AsyncClient(
+            transport=httpx.MockTransport(lambda _request: httpx.Response(204)),
+            base_url="http://runner",
+        )
+        set_runner_client(fake_runner)
+        try:
+            stop = await client.post(
+                f"/v1/sessions/{child['id']}/events", json={"type": "stop_session"}
+            )
+        finally:
+            set_runner_client(None)
+            await fake_runner.aclose()
+        assert stop.status_code in (200, 202), stop.text
+
+    assert parent["runner_id"] not in host.stopped_runner_ids, (
+        f"stopping child {child['id']} asked the host to stop the parent's runner "
+        f"{parent['runner_id']} (stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_child_relaunch_does_not_stop_parents_shared_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """A child's relaunch must not reap the runner it inherited from its parent."""
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes._sessions import helpers as sessions_helpers
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        response = await client.post(
+            f"/v1/sessions/{child['id']}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hi"}]},
+            },
+        )
+        await asyncio.gather(
+            *list(sessions_helpers._detached_supersede_stops), return_exceptions=True
+        )
+
+    assert [frame.session_id for frame in host.launch_frames] == [child["id"]], response.text
+    rebound_runner_id = SqlAlchemyConversationStore(db_uri).get_conversation(child["id"]).runner_id
+    assert rebound_runner_id not in (None, parent["runner_id"]), (
+        f"the relaunch should bind child {child['id']} to a runner of its own, "
+        f"got {rebound_runner_id!r}"
+    )
+    assert parent["runner_id"] not in host.stopped_runner_ids, (
+        f"relaunching child {child['id']} asked the host to stop the parent's runner "
+        f"{parent['runner_id']} (stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_archiving_child_off_the_shared_runner_stops_its_own_runner(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """A child that moved onto a runner of its own still tears that runner down."""
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        _shared_runner_family.update(parent=parent["id"], child=child["id"])
+        own_runner_id = token_bound_runner_id("child-own-binding-token")
+        SqlAlchemyConversationStore(db_uri).replace_runner_id(child["id"], own_runner_id)
+
+        archive = await client.patch(f"/v1/sessions/{child['id']}", json={"archived": True})
+        assert archive.status_code == 200, archive.text
+        await _drain_detached_stops()
+
+    assert host.stopped_runner_ids == [own_runner_id], (
+        f"archiving child {child['id']} on its own runner {own_runner_id} should stop only "
+        f"that runner (stops: {host.stopped_runner_ids})"
+    )
+
+
+async def test_archiving_grandchild_on_roots_shared_runner_does_not_stop_it(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    _shared_runner_family: dict[str, str],
+) -> None:
+    """A grandchild left on the root's runner after its parent moved on keeps it alive."""
+    comm = await _connect_host(app)
+    parent = await _inline_launch_session(client, comm)
+    async with _HostFrameResponder(comm) as host:
+        child = await _inline_child_session(client, parent["id"])
+        grandchild = await _inline_child_session(client, child["id"])
+        _shared_runner_family.update(
+            parent=parent["id"], child=child["id"], grandchild=grandchild["id"]
+        )
+        SqlAlchemyConversationStore(db_uri).replace_runner_id(
+            child["id"], token_bound_runner_id("child-relaunch-binding-token")
+        )
+
+        archive = await client.patch(f"/v1/sessions/{grandchild['id']}", json={"archived": True})
+        assert archive.status_code == 200, archive.text
+        await _drain_detached_stops()
+
+    assert host.stopped_runner_ids == [], (
+        f"archiving grandchild {grandchild['id']} asked the host to stop "
+        f"{host.stopped_runner_ids}; it still rides the root's runner {parent['runner_id']}"
+    )
+
+
 class _StagedRunners:
     """Resolve only runners that have connected, and record what each one receives.
 

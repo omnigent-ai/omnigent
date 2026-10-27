@@ -3,7 +3,7 @@
 # wheels it depends on), run the readiness gates, and publish all three to
 # (Test)PyPI via OIDC Trusted Publishing. The three version-lock together,
 # so every release publishes all three at the same version. Self-contained:
-# publishes straight from this repo on `ubuntu-latest` for clean public
+# publishes straight from this repo on a GitHub-hosted runner for clean public
 # PyPI/npm access (never a mirror/proxy).
 #
 # Release flow:
@@ -54,7 +54,7 @@ jobs:
   build-and-publish:
     # Gated to this repository; inert in forks and mirrors.
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     # Bound a hung run under GitHub's 6-hour default (real work takes minutes).
     timeout-minutes: 30
     # Environment binds the Trusted Publisher config: test-pypi unprotected,

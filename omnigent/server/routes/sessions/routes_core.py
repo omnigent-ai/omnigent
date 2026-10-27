@@ -156,6 +156,7 @@ from omnigent.server.routes._sessions.helpers import (
     _require_collaboration_mode_forward,
     _require_cost_control_label_authority,
     _require_permission_mode_forward,
+    _resolve_harness,
     _RunnerForwardResult,
     _same_provider_family,
     _session_status_cache,
@@ -352,6 +353,7 @@ async def _restore_refused_settings(
     live_change: _LiveSettingsChange | None,
     began: int,
     saved: int,
+    restore_effort: bool = True,
 ) -> None:
     """Undo a refused live change, keeping newer writes and restoring what it replaced."""
     from omnigent.server.routes.sessions.routes_events import (
@@ -363,7 +365,7 @@ async def _restore_refused_settings(
     await _raise_if_runner_re_tunnelled_to_another_replica(
         session_id, attempted.runner_id, conversation_store
     )
-    restore = {"reasoning_effort": True, "model_override": restore_model}
+    restore = {"reasoning_effort": restore_effort, "model_override": restore_model}
     replaced = {
         "reasoning_effort": previous.reasoning_effort,
         "model_override": previous.model_override,
@@ -1694,6 +1696,32 @@ def register_core_routes(
 
     # ── GET /sessions ───────────────────────────────────────────
 
+    def _session_agent_metadata(
+        conversations: list[Conversation],
+    ) -> tuple[dict[str, str], dict[str, str | None]]:
+        """Resolve list metadata off the event loop with one batched agent read."""
+        agents = agent_store.get_many(
+            list({conv.agent_id for conv in conversations if conv.agent_id is not None})
+        )
+        harnesses_by_id: dict[str, str | None] = {}
+        for conv in conversations:
+            try:
+                harnesses_by_id[conv.id] = _resolve_harness(
+                    conv, agent_cache=agent_cache, agents_by_id=agents
+                )
+            except Exception as error:
+                # Optional artifact metadata must not hide an otherwise readable session.
+                harnesses_by_id[conv.id] = None
+                _logger.warning(
+                    "Could not resolve list harness for session %s (%s)",
+                    conv.id,
+                    type(error).__name__,
+                )
+        return (
+            {agent.id: agent.name for agent in agents.values()},
+            harnesses_by_id,
+        )
+
     @router.get(
         "/sessions",
         response_model=None,
@@ -1877,15 +1905,14 @@ def register_core_routes(
                 last_id=page.last_id,
                 has_more=page.has_more,
             )
-        # Batch-fetch permissions and agent names concurrently.
+        # Batch-fetch permissions and agent metadata concurrently.
         # The tasks table has been removed — status comes exclusively from
         # the relay-fed ``_session_status_cache``.
-        unique_agent_ids = list({c.agent_id for c in page.data if c.agent_id is not None})
         perms_by_conv: dict[str, list[SessionPermission]]
         if permission_store is not None:
-            perms_by_conv, agent_names_by_id, child_ids_by_parent = await asyncio.gather(
+            perms_by_conv, agent_metadata, child_ids_by_parent = await asyncio.gather(
                 asyncio.to_thread(permission_store.list_for_sessions, conv_ids),
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+                asyncio.to_thread(_session_agent_metadata, page.data),
                 asyncio.to_thread(
                     conversation_store.list_child_conversation_ids_by_parent,
                     conv_ids,
@@ -1897,8 +1924,8 @@ def register_core_routes(
                 else False
             )
         else:
-            agent_names_by_id, child_ids_by_parent = await asyncio.gather(
-                asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+            agent_metadata, child_ids_by_parent = await asyncio.gather(
+                asyncio.to_thread(_session_agent_metadata, page.data),
                 asyncio.to_thread(
                     conversation_store.list_child_conversation_ids_by_parent,
                     conv_ids,
@@ -1906,6 +1933,7 @@ def register_core_routes(
             )
             perms_by_conv = {}
             user_is_admin = False
+        agent_names_by_id, harnesses_by_id = agent_metadata
         # In-memory lookup — no I/O, so batching avoids re-acquiring
         # the index's lock per row but otherwise has no DB cost.
         pending_counts = pending_elicitations.counts_for(conv_ids)
@@ -1973,6 +2001,7 @@ def register_core_routes(
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
+                harness=harnesses_by_id.get(conv.id),
                 grants=perms_by_conv.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
@@ -2089,21 +2118,22 @@ def register_core_routes(
         convs = await asyncio.to_thread(_load_sessions, accessible)
         if not convs:
             return []
-        unique_agent_ids = list({c.agent_id for c in convs if c.agent_id is not None})
         conv_ids = [c.id for c in convs]
-        agent_names_by_id, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
-            asyncio.to_thread(agent_store.get_names, unique_agent_ids),
+        agent_metadata, child_ids_by_parent, comments_fingerprints = await asyncio.gather(
+            asyncio.to_thread(_session_agent_metadata, convs),
             asyncio.to_thread(
                 conversation_store.list_child_conversation_ids_by_parent,
                 conv_ids,
             ),
             _comments_fingerprints_for(conv_ids),
         )
+        agent_names_by_id, harnesses_by_id = agent_metadata
         pending_counts = pending_elicitations.counts_for(conv_ids)
         items = [
             _build_session_list_item(
                 conv,
                 agent_names_by_id=agent_names_by_id,
+                harness=harnesses_by_id.get(conv.id),
                 grants=perms_by_conv.get(conv.id, []),
                 user_id=user_id,
                 user_is_admin=user_is_admin,
@@ -3318,17 +3348,22 @@ def register_core_routes(
                         raise OmnigentError(
                             _CODEX_SETTINGS_RESTORED_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE
                         )
-                    await asyncio.to_thread(
-                        conversation_store.update_conversation,
+                    await _restore_refused_settings(
+                        conversation_store,
                         session_id,
-                        model_override=conv.model_override,
-                        _unset_model_override=conv.model_override is None,
+                        previous=conv,
+                        attempted=updated,
+                        restore_model=True,
+                        restore_effort=False,
+                        live_change=live_change,
+                        began=began,
+                        saved=saved,
                     )
                     if unsupported is not None:
                         raise OmnigentError(unsupported, code=ErrorCode.INVALID_INPUT)
                     raise OmnigentError(
                         "The terminal did not apply the model change. "
-                        "The previous selection has been restored.",
+                        "Please check the current selection and try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
             else:

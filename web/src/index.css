@@ -2196,6 +2196,7 @@ html[data-electron-mac] .breadcrumb-folder {
 .tiptap-md-content .ProseMirror a {
   color: var(--primary);
   text-decoration: underline;
+  cursor: pointer;
 }
 .tiptap-md-content .ProseMirror hr {
   border: none;
