@@ -209,8 +209,8 @@ describe("isProseText", () => {
       "<details>\n```\n<instructions>\n```\n</details>",
       "<details>\n<summary>Logs</summary>\nUse `<Button>` here\n</details>",
       "Intro\nUse \\`<instructions>` here",
-      "Intro\nUse ``` <instructions> ` here",
-      "See `a\nb` <instructions> `c`",
+      "Fences use ``` and <instructions> is the tag; inline code uses ` too.\nThanks",
+      "x ` a\nb ` <hide> ` c",
       "Intro\nText <span title='`'>x<instructions>`",
     ]) {
       expect(isProseText(unclearCode, "description")).toBe(false);

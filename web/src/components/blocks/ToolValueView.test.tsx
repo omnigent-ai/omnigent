@@ -127,6 +127,15 @@ describe("ToolValueView", () => {
     expect(prose.querySelector("img, [onerror]")).toBeNull();
   });
 
+  it("keeps a description literal when its backticks do not form code", () => {
+    // Unpaired backtick runs are plain text in markdown, so the tag would be hidden markup.
+    const description =
+      "Fences use ``` and <instructions> is the tag; inline code uses ` too.\nThanks";
+    const container = renderValue({ description });
+    expect(screen.queryByTestId("tool-prose-value")).toBeNull();
+    expect(container.querySelector("pre")?.textContent).toBe(description);
+  });
+
   it("renders a templated GitHub body as prose, hiding its comments", async () => {
     renderValue({
       body: "<!-- Describe your change -->\n## Summary\n\n- Fix it\n\n<details><summary>Logs</summary>\n\nAll green\n</details>\n",
