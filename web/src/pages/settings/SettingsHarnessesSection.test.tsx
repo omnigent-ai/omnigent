@@ -172,7 +172,7 @@ const fixDialogProps = vi.fn();
 vi.mock("./HarnessFixDialog", () => ({
   HarnessFixDialog: (props: {
     open: boolean;
-    mode: "reconfigure" | "update" | "install";
+    mode: "reconfigure" | "update" | "install" | "switch";
     harness: string;
     host: Host;
     onFixed: (result: {
@@ -628,7 +628,7 @@ describe("Harness details", () => {
     renderHarnesses("codex-native");
 
     expect(screen.getByText("Sign-in expired")).toBeTruthy();
-    expect(screen.getByRole("button", { name: "Reconfigure" })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Sign in again" })).toBeTruthy();
     expect(screen.queryByText(/Codex can’t sign in/)).toBeNull();
   });
 
@@ -668,6 +668,67 @@ describe("Harness details", () => {
     expect(screen.getByText("Providers")).toBeTruthy();
     expect(screen.queryByText("Not signed in")).toBeNull();
     expect(screen.queryByText("Sign-in expired")).toBeNull();
+  });
+
+  it("opens switch-account confirmation for a ready subscription", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        harness_login_supported: true,
+        harness_accounts: {
+          claude: {
+            kind: "subscription",
+            email: "person@example.com",
+            plan: "Pro",
+          },
+        },
+      },
+    ];
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+
+    fireEvent.click(screen.getByRole("button", { name: "Switch account" }));
+    expect(screen.getByTestId("fix-dialog")).toHaveAttribute("data-mode", "switch");
+  });
+
+  it("does not offer account switching when the host lacks login support", () => {
+    hosts = [
+      {
+        ...ONLINE,
+        harness_accounts: {
+          claude: { kind: "subscription", email: "person@example.com", plan: "Pro" },
+        },
+      },
+    ];
+    renderHarnesses("claude-native");
+    selectTab("Settings");
+
+    expect(screen.queryByRole("button", { name: "Switch account" })).toBeNull();
+    expect(screen.getAllByText("Configured").length).toBeGreaterThan(0);
+  });
+
+  it.each([
+    ["codex-native", { kind: "api_key" as const }],
+    [
+      "opencode-native",
+      {
+        kind: "providers" as const,
+        providers: [{ id: "anthropic", label: "Anthropic", auth_type: "api_key" as const }],
+      },
+    ],
+  ])("does not offer account switching for %s non-subscription credentials", (harness, account) => {
+    hosts = [
+      {
+        ...ONLINE,
+        configured_harnesses: { [harness]: true },
+        harness_login_supported: true,
+        harness_accounts: { [harness === "codex-native" ? "codex" : "opencode"]: account },
+      },
+    ];
+    renderHarnesses(harness);
+    if (screen.queryByRole("tab", { name: "Settings" })) selectTab("Settings");
+
+    expect(screen.queryByRole("button", { name: "Switch account" })).toBeNull();
   });
 
   it("uses Update for an outdated harness", () => {
@@ -818,7 +879,7 @@ describe("Harness details", () => {
     expect(screen.queryByTestId("fix-dialog")).toBeNull();
   });
 
-  it("hides reconfiguration for an expired account on a managed sandbox host", () => {
+  it("hides Sign in again for an expired account on a managed sandbox host", () => {
     hosts = [
       {
         ...ONLINE,
@@ -829,7 +890,7 @@ describe("Harness details", () => {
     renderHarnesses("codex-native");
 
     expect(screen.getByLabelText("Needs reconfiguration: Missing credentials")).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Reconfigure" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Sign in again" })).toBeNull();
   });
 
   it("falls back to the grid for an unknown harness slug", () => {
