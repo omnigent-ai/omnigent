@@ -631,7 +631,7 @@ describe("ToolCard shell terminal theme", () => {
     writeTerminalThemeMode("dark");
     const terminal = renderExpandedShell();
     expect(terminal).toHaveAttribute("data-terminal-theme", "dark");
-    expect(terminal.style.getPropertyValue("--background")).toBe("#131517");
+    expect(terminal.style.getPropertyValue("--background")).toBe("#0a0a0a");
     // Selected text keeps the terminal's light text, not the light app's dark one.
     expect(terminal.style.getPropertyValue("--selection-foreground")).toBe("#e4e4e7");
 

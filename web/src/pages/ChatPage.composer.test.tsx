@@ -712,6 +712,8 @@ describe("Composer send shortcut", () => {
     const tooltip = await screen.findByRole("tooltip");
 
     expect(within(tooltip).getByText("Send")).toBeInTheDocument();
+    expect(tooltip).toHaveClass("menu-surface", "bg-popover", "text-popover-foreground");
+    expect(tooltip).not.toHaveClass("bg-slate-900", "text-slate-100");
     expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
   });
 

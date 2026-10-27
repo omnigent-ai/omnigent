@@ -60,11 +60,7 @@ export function Kbd({
 
 export function KeyboardShortcutTooltipContent({ label, keys }: { label: string; keys: string[] }) {
   return (
-    <TooltipContent
-      side="top"
-      shortcut={keys}
-      className="border border-slate-700 bg-slate-900 text-slate-100 dark:border-slate-700 dark:bg-slate-900 dark:text-slate-100"
-    >
+    <TooltipContent side="top" shortcut={keys}>
       <span>{label}</span>
     </TooltipContent>
   );

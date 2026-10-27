@@ -6825,7 +6825,7 @@ export function NewChatLandingScreen() {
               e.preventDefault();
               void handleCreate();
             }}
-            className="relative z-10"
+            className="relative z-30"
           >
             <ChatComposer
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}

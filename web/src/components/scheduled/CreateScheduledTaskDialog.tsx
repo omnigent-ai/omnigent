@@ -475,7 +475,7 @@ export function CreateScheduledTaskDialog({
                 // Match the sibling <Select> fields (Frequency / host): full
                 // width, bordered, h-8, normal foreground text — not the compact
                 // muted ghost styling the composer footer uses.
-                triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input/30"
+                triggerClassName="h-8 w-full justify-between rounded-lg border border-input bg-transparent px-2.5 text-foreground hover:bg-transparent hover:text-foreground dark:bg-input"
                 triggerLabelClassName="max-w-none text-ui"
               />
             </div>
