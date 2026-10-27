@@ -831,7 +831,7 @@ _PREFERRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
 # onboarding asks explicitly instead of choosing an unexpected alternative.
 _REQUIRED_DEFAULT_TIER_TOKEN: dict[str, str] = {
     "openrouter": "kimi",
-    "atlascloud": "deepseek-v4-pro",
+    "atlascloud": "v4-pro",  # DeepSeek V4 Pro variants
 }
 
 
