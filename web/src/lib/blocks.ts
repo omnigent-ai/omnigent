@@ -1,3 +1,4 @@
+import type { AssistantMessagePhase } from "./conversationItems";
 import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_blocks.py.
 //
@@ -387,6 +388,8 @@ export interface TextDone {
   hasCodeBlocks: boolean;
   /** True when this persisted assistant text came from an interrupted turn. */
   interrupted?: boolean;
+  /** Harness label for the message, when the harness reports one (Codex). */
+  phase?: AssistantMessagePhase;
   /** UI-only marker for a provisional native preview with missing live output. */
   previewInterrupted?: boolean;
   /** Last native chunk index rendered in this provisional preview. */

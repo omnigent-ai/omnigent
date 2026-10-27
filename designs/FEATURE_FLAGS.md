@@ -29,7 +29,7 @@ lifecycle metadata.
 | Key | Default | Owner | Review by | Purpose |
 | --- | --- | --- | --- | --- |
 | `session_orchestration` | On | Server | 0.22.0 | Private-owner peer messages and independent workers. Append `-session_orchestration` and restart every server replica to refuse new orchestration; already accepted work may finish. Existing reads and child operations remain available. Server-only; not exposed in `/v1/info`. |
-| `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI rollout for automation improvements: scheduling, run management, execution targets and UI. Currently selects the DB scheduler instead of per-task timers and is exposed to the frontend. Requires claimed-run fire/recovery hooks and a transactional store; coordinated restart and startup draining are required when switching schedulers. See the [scheduler integration contract](../omnigent/server/scheduled/README.md). |
+| `automations_v2` | Off | Server | 0.20.0 | Shared backend/UI rollout for automation improvements: scheduling, run management, execution targets and UI. Currently selects the DB scheduler instead of per-task timers and is exposed to the frontend. Requires a transactional store; a multi-replica deployment also supplies host ownership, and coordinated restart and startup draining are required when switching schedulers. See the [scheduler integration contract](../omnigent/server/scheduled/README.md). |
 | `usage_page` | Off | Web | 0.11.0 | Exposes the web Usage route, sidebar navigation, timeline, and cost breakdown details. The existing `GET /v1/usage` CLI API remains available while off. |
 | `harness_install` | Off | Onboarding | 0.11.0 | Allows the web UI to install or configure supported harnesses on a connected host. |
 | `canvas` | Off | Web | 0.15.0 | Exposes the web Canvas route (`/canvas`) and its sidebar navigation: top-level sessions as draggable cards, one canvas per project. |
@@ -61,9 +61,9 @@ for Claude working-status acceptance and kill-switch verification.
    features, apply the override to the host/runner environment, restart those
    processes, and launch fresh terminals.
 
-The built-in server entrypoints do not yet supply the required execution/recovery
-hooks. Enabling `automations_v2` there fails startup, even if only UI changes are
-needed. A deployment wrapper must provide the hooks through `create_app()`.
+With `automations_v2`, the built-in server entrypoints run claimed runs with the
+built-in executor and own every host, which suits a single replica. A
+multi-replica deployment passes its own host ownership through `create_app()`.
 
 For `session_orchestration`, verify the server gate with an actual peer-message
 or independent-create request; `/v1/info` does not advertise this backend flag.

@@ -579,3 +579,18 @@ the process and reader states with its tail. With the flag unset or `0`, confirm
 `stderr_reader_state = 'failed'` and `stderr_reader_error_type = 'ValueError'`
 distinguishes a failed drain from a live reader with an otherwise stalled
 startup. Use the return code and adjacent lifecycle events to interpret it.
+
+
+For failed status events, `session_turn_failed` also records the incoming error,
+code, message, output, detail, context, and response-ID field availability under
+`failure_wire_*`. These observations precede server detail enrichment and contain
+no event text. Existing normalized native hook metadata remains on the same row.
+`active_response_id_at_failure` names the server's cached response when available;
+it is an observation, not proof that a bare status belongs to that response.
+
+`failure_connection_source=relay_stream` identifies the connection retained by
+the stream response, with its advertised version, connection ID, and generation.
+A replacement tunnel does not change that snapshot. For external status posts,
+`bound_runner_at_intake` describes the currently bound local runner and does not
+claim it sent the event. An absent local connection is explicitly unavailable;
+it may be owned by another server replica. No version is inferred from the server.

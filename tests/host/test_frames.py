@@ -20,6 +20,13 @@ from omnigent.host.frames import (
     HostFsRequestFrame,
     HostFsResultFrame,
     HostFsWriteFrame,
+    HostHarnessLoginCancelFrame,
+    HostHarnessLoginCancelResultFrame,
+    HostHarnessLoginCompletedFrame,
+    HostHarnessLoginFrame,
+    HostHarnessLoginResultFrame,
+    HostHarnessLogoutFrame,
+    HostHarnessLogoutResultFrame,
     HostHarnessReadinessFrame,
     HostHelloFrame,
     HostImportedLocalSession,
@@ -1088,6 +1095,38 @@ def test_legacy_hello_without_harness_accounts_decodes_to_none() -> None:
     assert decoded.harness_accounts is None
 
 
+def test_harness_login_frames_round_trip() -> None:
+    frames = [
+        HostHarnessLoginFrame(request_id="start-1", harness="codex", login_id="login-1"),
+        HostHarnessLoginResultFrame(
+            request_id="start-1",
+            status="ok",
+            login_id="login-1",
+            verification_url="https://example.test/device",
+            user_code="ABCD-EFGH",
+            expires_at=1234,
+        ),
+        HostHarnessLoginCancelFrame(request_id="cancel-1", login_id="login-1"),
+        HostHarnessLoginCancelResultFrame(request_id="cancel-1", status="ok"),
+        HostHarnessLoginCompletedFrame(
+            login_id="login-1",
+            success=True,
+            expired=False,
+            configured_harnesses={"codex": True},
+            harness_accounts={"codex": {"kind": "chatgpt", "expired": False}},
+        ),
+        HostHarnessLogoutFrame(request_id="logout-1", harness="codex"),
+        HostHarnessLogoutResultFrame(
+            request_id="logout-1",
+            status="ok",
+            configured_harnesses={"codex": "needs-auth"},
+            harness_accounts={"codex": {"kind": "unknown", "expired": True}},
+        ),
+    ]
+
+    assert [decode_host_frame(encode_host_frame(frame)) for frame in frames] == frames
+
+
 def test_connection_error_frame_round_trip() -> None:
     """Connection errors preserve the server stage and exception message."""
     original = HostConnectionErrorFrame(
@@ -1342,6 +1381,37 @@ def test_launch_runner_result_frame_legacy_payload_decodes_error_code_none() -> 
     decoded = decode_host_frame(legacy)
     assert isinstance(decoded, HostLaunchRunnerResultFrame)
     assert decoded.error_code is None
+
+
+def test_launch_runner_result_frame_workspace_recreated_round_trip() -> None:
+    """
+    Verify ``workspace_recreated`` survives encode → decode and reads as
+    False from an OLDER host that never sends the key.
+
+    The server persists its "workspace was recreated" notice off this flag;
+    if it is dropped, the user is never told their directory is now empty.
+    """
+    original = HostLaunchRunnerResultFrame(
+        request_id="req_001",
+        status="launched",
+        runner_id="runner_token_abc",
+        workspace_recreated=True,
+    )
+    decoded = decode_host_frame(encode_host_frame(original))
+    assert isinstance(decoded, HostLaunchRunnerResultFrame)
+    assert decoded.workspace_recreated is True
+
+    legacy = json.dumps(
+        {
+            "kind": "host.launch_runner_result",
+            "request_id": "req_001",
+            "status": "launched",
+            "runner_id": "runner_token_abc",
+        }
+    )
+    decoded_legacy = decode_host_frame(legacy)
+    assert isinstance(decoded_legacy, HostLaunchRunnerResultFrame)
+    assert decoded_legacy.workspace_recreated is False
 
 
 def test_stop_runner_frame_round_trip() -> None:

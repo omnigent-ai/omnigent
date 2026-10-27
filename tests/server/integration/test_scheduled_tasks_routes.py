@@ -1934,6 +1934,38 @@ async def test_run_now_503_when_scheduler_not_running(
 
 
 @pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_database_scheduler_run_now_404_for_nonowned_task(
+    auth_app: FastAPI, auth_client: httpx.AsyncClient, db_uri: str
+) -> None:
+    _make_user(db_uri, "bob@example.com")
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    resp = await auth_client.post(
+        f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers("bob@example.com")
+    )
+    assert resp.status_code == 404, resp.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list_pending_runs() == []
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
+async def test_database_scheduler_run_now_503_when_scheduler_not_running(
+    auth_app: FastAPI,
+    auth_client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    created = (
+        await auth_client.post("/v1/scheduled-tasks", json=_create_body(), headers=_headers())
+    ).json()
+    await auth_app.state.scheduled_task_scheduler.stop()
+    monkeypatch.setattr(auth_app.state, "scheduled_task_scheduler", None)
+    resp = await auth_client.post(f"/v1/scheduled-tasks/{created['id']}/run", headers=_headers())
+    assert resp.status_code == 503, resp.text
+    assert SqlAlchemyScheduledTaskStore(db_uri).list_pending_runs() == []
+
+
+@pytest.mark.parametrize("auth_app", [True], indirect=True)
 @pytest.mark.parametrize("scheduler_available", [True, False])
 async def test_database_scheduler_crud_uses_persisted_next_run(
     auth_app: FastAPI,

@@ -32,6 +32,7 @@ from omnigent._platform import IS_WINDOWS
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
 from omnigent.llms.errors import is_context_length_exceeded as _is_context_length_exceeded
 from omnigent.models import model_catalog
+from omnigent.models.model_override import is_databricks_model_id
 from omnigent.process_logging import redact_log_text
 from omnigent.spec.types import RetryPolicy
 from omnigent.util.json_types import JsonObject as _JsonObject
@@ -552,7 +553,7 @@ def _get_openai_async_client(
     # Treating it as Databricks-hosted sent credential-less OpenAI agents into
     # ambient Databricks auth, surfacing an "install databricks-sdk" error at
     # users who never configured Databricks.
-    allow_ambient_databricks = model is not None and model.startswith("databricks-")
+    allow_ambient_databricks = model is not None and is_databricks_model_id(model)
 
     # An explicit Databricks profile is authoritative; model-service names
     # are opaque Unity Catalog identifiers such as catalog.schema.service.
@@ -601,15 +602,15 @@ def _get_openai_async_client(
     if api_key:
         return AsyncOpenAI(api_key=api_key, **retry_kwargs)
 
-    # Without an explicit profile, only legacy Databricks model names opt in
-    # to ambient Databricks credentials.
+    # Without an explicit profile, only Databricks model names opt in to
+    # ambient Databricks credentials.
     if not profile and not allow_ambient_databricks:
         target = f"for model {model!r}" if model is not None else "and no model is pinned"
         raise ValueError(
             f"No provider credentials were configured {target}. "
             "Set OPENAI_API_KEY (and optionally OPENAI_BASE_URL), configure a "
-            "Databricks profile, or use a 'databricks-' prefixed model name "
-            "for legacy automatic Databricks routing."
+            "Databricks profile, or use a Databricks model name (system.ai.* or "
+            "databricks-*) for automatic Databricks routing."
         )
 
     # No env client: use the explicit profile or legacy ambient Databricks auth.

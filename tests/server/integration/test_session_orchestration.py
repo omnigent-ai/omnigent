@@ -10,6 +10,7 @@ from omnigent.runner.tool_dispatch import execute_tool
 from omnigent.server.auth import LEVEL_EDIT, LEVEL_READ
 from omnigent.server.feature_flags import FeatureFlags
 from omnigent.stores.conversation_store import (
+    CREATED_BY_SESSION_LABEL_KEY,
     SCHEDULED_TASK_ORIGIN_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
 )
@@ -615,12 +616,55 @@ async def test_same_host_creation_uses_current_source_and_stays_private(
     expected_workspace = "/moved" if move_before_recheck else "/original"
     assert checks == 2
     assert created.parent_conversation_id is None
+    assert created.labels[CREATED_BY_SESSION_LABEL_KEY] == manager["id"]
     assert (created.host_id, created.workspace) == (expected_host, expected_workspace)
     assert frames and all(host == expected_host for host, _ in frames)
     launches = [frame for _, frame in frames if isinstance(frame, HostLaunchRunnerFrame)]
     assert len(launches) == 1 and launches[0].workspace == expected_workspace
     grants, _ = SqlAlchemyPermissionStore(db_uri).list_for_session(created.id)
     assert [grant.user_id for grant in grants] == ["alice"]
+
+    assert CREATED_BY_SESSION_LABEL_KEY not in store.get_conversation(manager["id"]).labels
+    # Discovery and label-write rules are independent of the routing variants above.
+    if child_manager or move_before_recheck or policy_denied:
+        return
+
+    info = json.loads(
+        await execute_tool(
+            tool_name="sys_session_get_info",
+            arguments=json.dumps({"session_id": created_id}),
+            server_client=auth_client,
+            conversation_id=manager["id"],
+        )
+    )
+    assert info["created_by_session_id"] == manager["id"]
+    listing = json.loads(
+        await execute_tool(
+            tool_name="sys_session_list",
+            arguments="{}",
+            server_client=auth_client,
+            conversation_id=manager["id"],
+        )
+    )
+    worker = next(row for row in listing["sessions"] if row["session_id"] == created_id)
+    assert worker["created_by_session_id"] == manager["id"]
+    assert worker["parent_session_id"] is None
+    for value in ("", source["id"]):
+        labels = {CREATED_BY_SESSION_LABEL_KEY: value}
+        response = await auth_client.patch(f"/v1/sessions/{created_id}", json={"labels": labels})
+        assert response.status_code == 400, response.text
+        response = await auth_client.post(
+            "/v1/sessions", json={"agent_id": source["agent_id"], "labels": labels}
+        )
+        assert response.status_code == 400, response.text
+    response = await auth_client.patch(f"/v1/sessions/{created_id}", json={"labels": {}})
+    assert response.status_code == 200, response.text
+    assert (
+        SqlAlchemyConversationStore(db_uri)
+        .get_conversation(created_id)
+        .labels[CREATED_BY_SESSION_LABEL_KEY]
+        == manager["id"]
+    )
 
 
 @pytest.mark.parametrize("shape", ["parent", "multipart", "initial_items", "skill"])
@@ -728,6 +772,9 @@ async def test_managed_creation_uses_default_provider_and_saves_private_first_ta
         assert captured["owner"] == "alice"
         store = SqlAlchemyConversationStore(db_uri)
         assert store.get_conversation(session_id).parent_conversation_id is None
+        assert (
+            store.get_conversation(session_id).labels[CREATED_BY_SESSION_LABEL_KEY] == source["id"]
+        )
         assert "First task" in str(store.list_pending_inputs(session_id))
         assert f"[Message from session {source['id']}]" in str(
             store.list_pending_inputs(session_id)

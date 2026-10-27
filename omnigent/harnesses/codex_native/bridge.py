@@ -1599,7 +1599,9 @@ def update_active_turn_id(bridge_dir: Path, active_turn_id: str | None) -> None:
     """
     with _bridge_state_lock(bridge_dir):
         state = read_bridge_state(bridge_dir)
-        if state is None:
+        # An accepted steer often returns the turn already saved here. Rewriting
+        # it can fail on a full disk after Codex has accepted the message.
+        if state is None or state.active_turn_id == active_turn_id:
             return
         _write_bridge_state_unlocked(
             bridge_dir,

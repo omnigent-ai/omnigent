@@ -2000,7 +2000,9 @@ def pi_native_provider_launch(
     enabled_refs = _enabled_model_refs(rendered)
     if provider.curated_models and enabled_refs:
         overlay["enabledModels"] = enabled_refs
-    prepare_managed_pi_agent_dir(agent_dir, overlay=overlay)
+    prepare_managed_pi_agent_dir(
+        agent_dir, overlay=overlay, global_agent_dir=global_pi_agent_dir()
+    )
     env = {PI_CODING_AGENT_DIR_ENV_VAR: str(agent_dir)}
     if os.name == "posix" and any(
         config.get("apiKey", "").startswith("!") for config in rendered["providers"].values()

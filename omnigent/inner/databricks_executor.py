@@ -382,6 +382,10 @@ def databricks_bearer_token_command(
         f"token=$({mint} --output json | jq -r '.access_token // empty'); "
         "fi; "
         f"{fallback}"
+        # A single CLI/OIDC blip must not empty the token: retry the plain mint once.
+        'if [ -z "$token" ]; then sleep 1; '
+        f"token=$({mint} --output json | jq -r '.access_token // empty'); "
+        "fi; "
         'printf "%s\\n" "$token"; fi'
     )
 

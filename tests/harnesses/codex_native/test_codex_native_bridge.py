@@ -548,6 +548,32 @@ def test_clear_active_turn_id_if_matches(
     assert state.active_turn_id == expected_active_after
 
 
+@pytest.mark.parametrize(
+    ("active_turn_id", "next_turn_id"),
+    [(None, None), ("turn_a", "turn_a"), (None, "turn_a"), ("turn_a", "turn_b"), ("turn_a", None)],
+)
+def test_active_turn_update_requires_storage_only_when_state_changes(
+    bridge_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    active_turn_id: str | None,
+    next_turn_id: str | None,
+) -> None:
+    _seed_active_turn(bridge_dir, active_turn_id)
+    before = read_bridge_state(bridge_dir)
+
+    def disk_full(*args, **kwargs):
+        raise OSError(errno.ENOSPC, "No space left on device")
+
+    monkeypatch.setattr(codex_native_bridge.tempfile, "mkstemp", disk_full)
+    if active_turn_id == next_turn_id:
+        update_active_turn_id(bridge_dir, next_turn_id)
+    else:
+        with pytest.raises(OSError) as raised:
+            update_active_turn_id(bridge_dir, next_turn_id)
+        assert raised.value.errno == errno.ENOSPC
+    assert read_bridge_state(bridge_dir) == before
+
+
 def test_clear_active_turn_id_if_matches_no_state_returns_true(bridge_dir: Path) -> None:
     """
     With no bridge state on disk, clearing reports cleared and runs ``on_cleared``.

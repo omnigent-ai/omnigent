@@ -115,6 +115,9 @@ async def test_subscribe_reserves_delivery_order_before_post_resume_sync(
     """A live completion cannot overtake replay while resume metadata sync waits."""
 
     class _ResumeClient:
+        def is_subscribed_to_thread(self, _thread_id: str) -> bool:
+            return True
+
         async def request(self, _method: str, _params: dict) -> dict:
             return {
                 "result": {

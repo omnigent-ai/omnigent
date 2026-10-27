@@ -57,7 +57,10 @@ export const CompletedFileRead: Story = {
   args: {
     name: "sys_os_read",
     arguments: { path: "src/components/blocks/ToolCard.tsx" },
-    output: "File read successfully.",
+    output: JSON.stringify({
+      path: "src/components/blocks/ToolCard.tsx",
+      content: 'import { useMemo } from "react";\n\nexport function ToolCard() {}\n',
+    }),
     state: "output-available",
     startedAt: null,
     duration: 3.25,
@@ -67,12 +70,103 @@ export const CompletedFileRead: Story = {
 export const LongOutputPreview: Story = {
   args: {
     name: "component_audit",
-    argsSummary: "mode=visual",
     arguments: { mode: "visual", requestedLines: 85 },
     output: longOutput,
     state: "output-available",
     startedAt: null,
     duration: 1.2,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// A tool with no formatter: humanized title, key argument values, and the
+// expanded input as labeled fields instead of a JSON dump.
+export const GenericTodoListExpanded: Story = {
+  args: {
+    name: "manage_todo_list",
+    arguments: {
+      operation: "write",
+      todoList: [
+        {
+          id: 1,
+          title: "Find review workflow and GitHub identity",
+          description: "Loaded review-queue skill; authenticated as the reviewer.",
+          status: "completed",
+        },
+        {
+          id: 2,
+          title: "Fetch open PRs awaiting your review and prioritize them",
+          description: "Checking review history, CI and mergeability.",
+          status: "in-progress",
+        },
+      ],
+    },
+    output: "Task plan updated (2 tasks).",
+    state: "output-available",
+    startedAt: null,
+    duration: 0.061,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// MCP results arrive as content blocks wrapping the server's JSON.
+export const McpJsonResultExpanded: Story = {
+  args: {
+    name: "mcp__linear__get_issue",
+    arguments: { id: "OMNI-12243", includeComments: false },
+    output: JSON.stringify([
+      {
+        type: "text",
+        text: JSON.stringify({
+          id: "OMNI-12243",
+          title: "Claude mod replaces tmux paste for native turns",
+          state: "In Review",
+          priority: "P1",
+          labels: ["claude-native", "harness"],
+          url: "https://linear.app/omnigent/issue/OMNI-12243",
+        }),
+      },
+    ]),
+    state: "output-available",
+    startedAt: null,
+    duration: 0.412,
+  },
+  play: async ({ canvasElement }) => expand(canvasElement),
+};
+
+// A failure the tool reported reads in red on the collapsed row.
+export const McpFailureCollapsed: Story = {
+  args: {
+    name: "mcp__github__create_pull_request",
+    arguments: {
+      owner: "omnigent-ai",
+      repo: "omnigent",
+      head: "shell-card-pinned-selection",
+      base: "main",
+      draft: true,
+    },
+    output:
+      "Error: 422 Validation Failed: A pull request already exists for " +
+      "omnigent-ai:shell-card-pinned-selection.",
+    state: "output-available",
+    startedAt: null,
+    duration: 1.2,
+  },
+};
+
+export const ScheduledTaskExpanded: Story = {
+  args: {
+    name: "sys_scheduled_task_create",
+    arguments: {
+      name: "weekday-review-queue",
+      schedule: "0 9 * * 1-5",
+      prompt: "Check PRs awaiting my review and post a summary.",
+      enabled: true,
+    },
+    output: JSON.stringify({ task_id: "st_8f21c0", next_run_at: "2026-10-27T16:00:00Z" }),
+    state: "output-available",
+    startedAt: null,
+    duration: 0.088,
   },
   play: async ({ canvasElement }) => expand(canvasElement),
 };

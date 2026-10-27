@@ -82,11 +82,14 @@ process/database state produces an explicit error. The three connection
 variables must be supplied together; use the wrapper rather than setting only
 one of them.
 
-Standalone native mock fixtures save an existing provider config to an
-owner-only `.e2e-backup` file next to its resolved target before replacing it
-and restore it on exit. A config symlink remains intact.
-If the test process is killed, recover that backup before retrying; subsequent
-runs refuse to overwrite it.
+Standalone UI runs give each pytest process a private `OMNIGENT_CONFIG_HOME`
+seeded with copies of the user `config.yaml` and file-backed `secrets.json`, so
+native mock fixtures never edit the real files. When the caller sets
+`OMNIGENT_CONFIG_HOME`, the fixtures instead save its existing provider config
+to an owner-only `.e2e-backup` file next to the resolved target before replacing
+it and restore it on exit. A config symlink remains intact. If the test process
+is killed, recover that backup before retrying; subsequent runs refuse to
+overwrite it.
 
 Arbitrary Python/Playwright commands also work with the wrapper. They receive
 `OMNIGENT_REPRO_SERVER_URL`, `OMNIGENT_REPRO_MODEL_URL`, and

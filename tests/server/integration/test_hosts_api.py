@@ -17,6 +17,7 @@ from httpx import ASGITransport, AsyncClient
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.host.frames import (
     CAP_HARNESS_ACCOUNTS,
+    CAP_HARNESS_LOGIN,
     HARNESS_NOT_CONFIGURED_ERROR_CODE,
     WORKSPACE_MISSING_ERROR_CODE,
     HostHelloFrame,
@@ -354,7 +355,7 @@ async def test_hosts_api_configured_harnesses_null_for_older_host(
     assert resp.json()["hosts"][0]["configured_harnesses"] is None
 
 
-async def test_harness_accounts_are_live_only_and_support_is_explicit(
+async def test_harness_accounts_are_live_only_and_login_support_is_explicit(
     db_uri: str,
 ) -> None:
     """Account PII follows the local tunnel and is never read from the host row."""
@@ -364,7 +365,7 @@ async def test_harness_accounts_are_live_only_and_support_is_explicit(
         registry,
         configured_harnesses={"codex": True},
         harness_accounts={"codex": {"kind": "chatgpt", "email": "person@example.test"}},
-        capabilities=[CAP_HARNESS_ACCOUNTS],
+        capabilities=[CAP_HARNESS_ACCOUNTS, CAP_HARNESS_LOGIN],
     )
 
     async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as client:
@@ -373,6 +374,7 @@ async def test_harness_accounts_are_live_only_and_support_is_explicit(
         "codex": {"kind": "chatgpt", "email": "person@example.test"}
     }
     assert connected["harness_accounts_supported"] is True
+    assert connected["harness_login_supported"] is True
 
     other_app, _other_registry, _other_store, _other_conversations = _build_host_api_app(
         db_uri, harness_install=True
@@ -386,6 +388,8 @@ async def test_harness_accounts_are_live_only_and_support_is_explicit(
     assert "harness_accounts" not in detail
     assert disconnected["harness_accounts_supported"] is False
     assert detail["harness_accounts_supported"] is False
+    assert disconnected["harness_login_supported"] is False
+    assert detail["harness_login_supported"] is False
 
 
 @pytest.mark.parametrize(

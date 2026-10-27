@@ -1,5 +1,6 @@
 """Real local host/server/SDK and Codex processes; scripted model, no cloud sandbox."""
 
+import ast
 import json
 import os
 import shutil
@@ -304,12 +305,53 @@ def test_private_manager_launch_send_read_and_sharing(
                 created = next(row for row in rows if row["title"] == "Independent worker")
                 created = client.get(f"/v1/sessions/{created['id']}").json()
                 assert created["parent_session_id"] is None
+                assert created["labels"]["omnigent.created_by_session_id"] == manager
                 assert created["host_id"] == host_id
                 wait_text(created["id"], "NEW_WORKER_RESULT")
                 grants = client.get(f"/v1/sessions/{created['id']}/permissions").json()[
                     "permissions"
                 ]
                 assert [g["user_id"] for g in grants] == ["local"]
+
+                configure(
+                    "MANAGER_SEND_READ_CREATE_FIND",
+                    [
+                        {"tool_calls": [tool("sys_session_list", {}, "creator-list")]},
+                        {
+                            "tool_calls": [
+                                tool(
+                                    "sys_session_get_info",
+                                    {"session_id": created["id"]},
+                                    "creator-info",
+                                )
+                            ]
+                        },
+                        {"text": "CREATOR_FOUND"},
+                    ],
+                )
+                send(manager, "MANAGER_SEND_READ_CREATE_FIND")
+                wait_text(manager, "CREATOR_FOUND")
+                for call_id in ("creator-list", "creator-info"):
+                    results = tool_results(call_id)
+                    assert results
+                    output = results[-1].get("output", results[-1].get("content"))
+                    if harness == "codex-native":
+                        # Codex wraps MCP content in timing text; the SDK renders a Python dict.
+                        content = json.loads(output.split("\nOutput:\n", 1)[1])
+                        payload = json.loads(content[0]["text"])
+                    else:
+                        payload = ast.literal_eval(output)
+                    discovered_worker = (
+                        next(
+                            row
+                            for row in payload["sessions"]
+                            if row["session_id"] == created["id"]
+                        )
+                        if call_id == "creator-list"
+                        else payload
+                    )
+                    assert discovered_worker["session_id"] == created["id"]
+                    assert discovered_worker["created_by_session_id"] == manager
 
                 before_managed = {
                     row["id"]
