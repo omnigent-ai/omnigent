@@ -187,7 +187,7 @@ _MODEL_MIGRATION_CATALOG_TIMEOUT_SECONDS = 3.0
 
 
 class CodexAppServerSilentStartTimeout(RuntimeError):
-    """Readiness timed out while the app-server process was alive but never listened.
+    """Readiness timed out while the app-server process was alive but never initialized.
 
     Carries the timeout message; ``start()`` respawns the process once and
     turns a second occurrence into a plain ``RuntimeError``.
@@ -1125,6 +1125,7 @@ class CodexAppServerClient:
         # ``None`` marks the end of the event stream (reader exited).
         self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
+        self._subscribed_thread_ids: set[str] = set()
 
     async def connect(self) -> None:
         """
@@ -1148,6 +1149,7 @@ class CodexAppServerClient:
         # Fresh queue per connection so a previous stream's end marker
         # cannot end this connection's consumers.
         self._events = asyncio.Queue()
+        self._subscribed_thread_ids = set()
         self._reader_task = asyncio.create_task(
             self._reader_loop(),
             name="codex-native-app-server-reader",
@@ -1232,7 +1234,26 @@ class CodexAppServerClient:
             exc = CodexAppServerResponseError(error)
             exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
             raise exc
+        if method in {"thread/start", "thread/resume"}:
+            result = response.get("result")
+            thread = result.get("thread") if isinstance(result, dict) else None
+            thread_id = thread.get("id") if isinstance(thread, dict) else params.get("threadId")
+            if isinstance(thread_id, str) and thread_id:
+                self._subscribed_thread_ids.add(thread_id)
         return response
+
+    def is_subscribed_to_thread(self, thread_id: str) -> bool:
+        """
+        Return whether this connection already receives a thread's notifications.
+
+        Codex sends turn and item notifications only to connections that
+        started or resumed the thread.
+
+        :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+        :returns: ``True`` after a successful ``thread/start`` or
+            ``thread/resume`` for the thread on this connection.
+        """
+        return thread_id in self._subscribed_thread_ids
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:
         """
@@ -2341,12 +2362,12 @@ class CodexNativeAppServer:
             try:
                 startup_client = await self._wait_until_ready()
             except CodexAppServerSilentStartTimeout as silent:
-                # A loaded host can leave a fresh app-server silent; a second spawn
-                # listens. It must reuse the transport: callers captured the listen
+                # A fresh app-server can stall before initialization; a second spawn
+                # can recover. Reuse the transport: callers captured the listen
                 # URL before start() and hand it to the TUI, forwarder and bridge.
                 with contextlib.suppress(Exception):  # diagnostics never block recovery
                     _logger.warning(
-                        "Codex app-server never listened and is still running "
+                        "Codex app-server never initialized and is still running "
                         "(recent_stderr_bytes=%d); respawning it once on the same transport",
                         silent.recent_stderr_bytes,
                         extra=self._startup_snapshot_event(
@@ -2644,18 +2665,18 @@ class CodexNativeAppServer:
         Wait until the app-server socket accepts an initialized
         client, and return that connection for startup RPCs.
 
-        The budget bounds the retry loop; a connect attempt already in
-        flight when it expires is not interrupted.
+        The budget bounds both connection retries and the initialize handshake.
 
         :returns: Connected app-server client. The caller owns it.
         :raises CodexAppServerSilentStartTimeout: If the budget expires while
-            the process is still alive and never listened; ``start()``
+            the process is still alive and never initialized; ``start()``
             respawns it once.
         :raises RuntimeError: If the app-server exits early.
         """
-        deadline = asyncio.get_running_loop().time() + _APP_SERVER_READY_TIMEOUT_SECONDS
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + _APP_SERVER_READY_TIMEOUT_SECONDS
         last_error: Exception | None = None
-        while asyncio.get_running_loop().time() < deadline:
+        while loop.time() < deadline:
             if self.proc is not None and self.proc.returncode is not None:
                 detail = " | ".join((self.recent_stderr or [])[-5:])
                 raise RuntimeError(f"Codex app-server exited early: {detail}")
@@ -2671,7 +2692,8 @@ class CodexNativeAppServer:
                         self.socket_path,
                         client_name="omnigent-probe",
                     )
-                await client.connect()
+                async with asyncio.timeout_at(deadline):
+                    await client.connect()
                 return client
             except asyncio.CancelledError:
                 if client is not None:
@@ -2683,7 +2705,9 @@ class CodexNativeAppServer:
                 if client is not None:
                     with contextlib.suppress(Exception):
                         await client.close()
-                await asyncio.sleep(_CONNECT_RETRY_DELAY_SECONDS)
+                remaining = deadline - loop.time()
+                if remaining > 0:
+                    await asyncio.sleep(min(_CONNECT_RETRY_DELAY_SECONDS, remaining))
 
         detail = " | ".join((self.recent_stderr or [])[-5:])
         target = self.listen_url or f"unix://{self.socket_path}"
@@ -2691,7 +2715,7 @@ class CodexNativeAppServer:
             f"Timed out after {_APP_SERVER_READY_TIMEOUT_SECONDS:g}s waiting for the "
             f"Codex app-server at {target}: {last_error}; stderr={detail}"
         )
-        # Still running but never listened: start() can respawn it once.
+        # Still running but never initialized: start() can respawn it once.
         if self.proc is not None and self.proc.returncode is None:
             recent_stderr_bytes = sum(
                 len(line.encode("utf-8")) for line in (self.recent_stderr or [])

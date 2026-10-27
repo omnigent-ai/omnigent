@@ -4853,6 +4853,70 @@ def test_fork_preserves_compaction_boundary_at_workspace_error(
     assert conversation_store.list_items(source.id).data == original_items
 
 
+def test_fork_remaps_attachments_in_compaction_snapshot(
+    conversation_store: SqlAlchemyConversationStore,
+) -> None:
+    """A fork's replay snapshot must use its own file rows, like ordinary messages."""
+    source = conversation_store.create_conversation()
+    boundary = conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="message",
+                response_id="response-example",
+                data=MessageData(role="user", content=[{"type": "input_text", "text": "Read"}]),
+            )
+        ],
+    )[0]
+    snapshot = [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [
+                {"type": "input_image", "file_id": "source-image", "filename": "image.png"},
+                {"type": "input_file", "file_id": "source-file", "filename": "notes.txt"},
+                {"type": "input_file", "file_id": "missing-file"},
+                {"type": "input_text", "text": "source-image"},
+            ],
+        }
+    ]
+    conversation_store.append(
+        source.id,
+        [
+            NewConversationItem(
+                type="compaction",
+                response_id="response-example",
+                data=CompactionData(
+                    summary="Read the attachments",
+                    last_item_id=boundary.id,
+                    token_count=10,
+                    compacted_messages=snapshot,
+                ),
+            )
+        ],
+    )
+
+    fork = conversation_store.fork_conversation(
+        source.id,
+        file_id_map={"source-image": "fork-image", "source-file": "fork-file"},
+    )
+
+    fork_items = conversation_store.list_items(fork.id, order="asc").data
+    compaction = fork_items[1].data
+    assert isinstance(compaction, CompactionData)
+    assert compaction.last_item_id == fork_items[0].id
+    assert compaction.compacted_messages is not None
+    assert compaction.compacted_messages[0]["content"] == [
+        {"type": "input_image", "file_id": "fork-image", "filename": "image.png"},
+        {"type": "input_file", "file_id": "fork-file", "filename": "notes.txt"},
+        {"type": "input_file", "file_id": "missing-file"},
+        {"type": "input_text", "text": "source-image"},
+    ]
+    source_compaction = conversation_store.list_items(source.id, type="compaction").data[0].data
+    assert isinstance(source_compaction, CompactionData)
+    assert source_compaction.compacted_messages == snapshot
+
+
 def test_fork_conversation_remaps_file_references(
     conversation_store: SqlAlchemyConversationStore,
     agent_store: SqlAlchemyAgentStore,

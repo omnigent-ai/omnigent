@@ -7111,9 +7111,8 @@ async def _read_fd_with_reader(loop: asyncio.AbstractEventLoop, fd: int) -> byte
     try:
         return await fut
     finally:
-        if not fut.done():
-            with contextlib.suppress(Exception):
-                loop.remove_reader(fd)
+        with contextlib.suppress(Exception):
+            loop.remove_reader(fd)
 
 
 async def _send_resize(ws: _WebSocketClient, stdin_fd: int) -> None:

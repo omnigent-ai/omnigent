@@ -79,7 +79,8 @@ class ScheduledTaskStore(ABC):
         :param execution_target: ``"connected_host"`` (default) or
             ``"managed_sandbox"`` (a fresh server-provisioned sandbox per fire).
         :param state: Lifecycle state — ``active``/``paused``/``deleted``.
-            Defaults to ``"active"``.
+            Defaults to ``"active"``. Persistent dispatch sets ``completed``
+            once a schedule has no remaining occurrences.
         :returns: The newly created :class:`ScheduledTask`.
         :raises ValueError: If ``state`` is not a recognized value.
         """

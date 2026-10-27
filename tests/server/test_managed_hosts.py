@@ -8,6 +8,7 @@ import logging
 import re
 import subprocess
 import sys
+import threading
 import types
 import uuid
 from collections.abc import Sequence
@@ -4109,6 +4110,108 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
     assert (
         host_store.resolve_launch_token("62a91eb065624754c6a6dfb5869dd7e8", "tok-term-1") is None
     )
+
+
+class _LogCapturingFakeLauncher(FakeSandboxLauncher):
+    """Fake launcher that records log captures in order with terminates."""
+
+    def __init__(
+        self,
+        *,
+        capture_error: Exception | None = None,
+        capture_blocks: threading.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.events: list[tuple[str, str]] = []
+        self._capture_error = capture_error
+        self._capture_blocks = capture_blocks
+
+    def capture_logs(self, sandbox_id: str) -> str | None:
+        self.events.append(("capture", sandbox_id))
+        if self._capture_blocks is not None:
+            self._capture_blocks.wait()
+        if self._capture_error is not None:
+            raise self._capture_error
+        return "## /tmp/omnigent-host.log\nhost exiting (fatal_connect)"
+
+    def terminate(self, sandbox_id: str) -> None:
+        self.events.append(("terminate", sandbox_id))
+        super().terminate(sandbox_id)
+
+
+def _register_capture_host(host_store: HostStore, host_id: str) -> Host:
+    return host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-capture",
+        user_id=_OWNER,
+        token="tok-capture",
+        provider="modal",
+        sandbox_id="sb-capture",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+
+async def test_terminate_managed_host_capture_logs_logs_before_terminating(
+    db_uri: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An opted-in teardown logs the sandbox's log tails, then terminates it."""
+    fake = _LogCapturingFakeLauncher()
+    host_store = HostStore(db_uri)
+    host = _register_capture_host(host_store, "0f7c1e9a2b3d4c5e8f9a0b1c2d3e4f5a")
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.server.managed_hosts"):
+        await terminate_managed_host(host, host_store, _injected_config(fake), capture_logs=True)
+
+    assert fake.events == [("capture", "sb-capture"), ("terminate", "sb-capture")]
+    assert "Managed sandbox sb-capture logs before teardown" in caplog.text
+    assert "host exiting (fatal_connect)" in caplog.text
+    assert host_store.get_host(host.host_id) is None
+
+
+async def test_terminate_managed_host_skips_log_capture_by_default(db_uri: str) -> None:
+    """Teardown without ``capture_logs`` never reads the sandbox's logs."""
+    fake = _LogCapturingFakeLauncher()
+    host_store = HostStore(db_uri)
+    host = _register_capture_host(host_store, "1a2b3c4d5e6f40718293a4b5c6d7e8f9")
+
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+
+    assert fake.events == [("terminate", "sb-capture")]
+
+
+async def test_terminate_managed_host_terminates_when_log_capture_fails(db_uri: str) -> None:
+    """A failed log read is only diagnostics; the sandbox is still terminated."""
+    fake = _LogCapturingFakeLauncher(capture_error=click.ClickException("exec failed"))
+    host_store = HostStore(db_uri)
+    host = _register_capture_host(host_store, "2b3c4d5e6f7a48129304b5c6d7e8f9a0")
+
+    await terminate_managed_host(host, host_store, _injected_config(fake), capture_logs=True)
+
+    assert fake.events == [("capture", "sb-capture"), ("terminate", "sb-capture")]
+    assert host_store.get_host(host.host_id) is None
+
+
+async def test_terminate_managed_host_terminates_when_log_capture_hangs(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A capture that never returns times out and the sandbox is still terminated."""
+    monkeypatch.setattr("omnigent.server.managed_hosts.SANDBOX_LOG_CAPTURE_TIMEOUT_S", 0.05)
+    release = threading.Event()
+    fake = _LogCapturingFakeLauncher(capture_blocks=release)
+    host_store = HostStore(db_uri)
+    host = _register_capture_host(host_store, "4d5e6f7a8b9c40d1a2b3c4d5e6f7a8b9")
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.server.managed_hosts"):
+            await terminate_managed_host(
+                host, host_store, _injected_config(fake), capture_logs=True
+            )
+    finally:
+        release.set()
+
+    assert fake.events == [("capture", "sb-capture"), ("terminate", "sb-capture")]
+    assert "Timed out after 0.05s capturing logs from managed sandbox sb-capture" in caplog.text
+    assert host_store.get_host(host.host_id) is None
 
 
 async def test_terminate_managed_host_cleans_active_and_pending_generations(db_uri: str) -> None:

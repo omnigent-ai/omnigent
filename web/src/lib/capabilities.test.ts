@@ -218,6 +218,21 @@ describe("resolveServerInfo request_managed_sandbox_host_id", () => {
   });
 });
 
+describe("resolveServerInfo session_event_types", () => {
+  it.each([
+    [undefined, []],
+    ["clear", []],
+    [
+      ["message", 1, "clear"],
+      ["message", "clear"],
+    ],
+  ])("parses %o as %o", async (advertised, expected) => {
+    expect((await probe({ session_event_types: advertised })).session_event_types).toEqual(
+      expected,
+    );
+  });
+});
+
 describe("resolveServerInfo smart_routing_sources", () => {
   it("reads an explicit field verbatim", async () => {
     const parsed = await probe({

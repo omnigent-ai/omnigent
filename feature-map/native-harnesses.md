@@ -23,15 +23,20 @@ implements them separately, so a fix for one harness does not reach the others.
   card; its Reconfigure control and full-card click replace a separate banner action.
 - `account-management`: Settings harness cards show the non-secret account label
   reported by the connected host (email, plan, organization, or provider names).
-  An expired account is shown as needing reconfiguration and the repair dialog
-  presents the existing copyable CLI sign-in command. The server owns
-  `/v1/hosts/{host}/harnesses/accounts/refresh`. Hosts never probe accounts on
-  their own: an enabled server requests one probe after connection, and Settings
-  requests one when Harnesses opens or its selected host changes. The server
-  reuses a successful result for 60 seconds. Account metadata and the refresh
-  route are available only while harness repair is enabled and the connected
-  host advertises support; older hosts receive no probe, and older servers or
-  flag-off servers never cause a new host to spawn one.
+  An expired Codex account offers **Sign in again**. Codex sign-in opens a
+  device-code modal with an HTTPS sign-in link, one-time code and copy actions,
+  expiration countdown, Cancel, and Try again; a `login_busy` response resumes
+  polling the active login. Configured Codex and Claude subscriptions offer
+  **Switch account** behind a confirmation; Claude includes an optional email
+  hint that is copied into the `--email` command. The server owns the
+  `/v1/hosts/{host}/harnesses/{harness}/login` start/status/cancel routes and
+  `/logout`, plus `/v1/hosts/{host}/harnesses/accounts/refresh`. Hosts never
+  probe accounts on their own: an enabled server requests one probe after
+  connection, and Settings requests one when Harnesses opens or its selected
+  host changes. The server reuses a successful result for 60 seconds. Account
+  metadata and these routes are available only while harness repair is enabled
+  and the connected host advertises support; older hosts receive no probe, and
+  older servers or flag-off servers never cause a new host to spawn one.
 - `isaac-credential-detection`: harness setup offers Isaac when host-side
   Databricks detection finds a matching credential, and fails open for older
   hosts or servers that cannot report detection results.
@@ -50,8 +55,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `chat-render`: the harness's output renders in chat like other harnesses.
   A single-file tool row (Read, Write, Edit) shows its path as a dotted link;
   clicking it opens that file in the workspace viewer without expanding the
-  row. Absolute paths open workspace-relative under the session root and
-  host-absolute outside it; they stay plain text until the root is known.
+  row. Absolute paths show and open workspace-relative under the session root
+  and host-absolute outside it; they stay plain text until the root is known.
+  Other tool rows follow [Tool calls in chat](./tool-calls.md).
   Shell commands and multi-file patches have no file link. A shell row shows
   the command (a script's first line and "+N lines") and expands to a
   terminal panel with the command, its output and exit status, in the
@@ -166,9 +172,15 @@ only when the server enables the `import_review` release feature.
 Settings. Activate either the credential card or its Reconfigure affordance;
 both open the same repair flow.
 
-**Harness account repair:** Settings → Harnesses → a harness with an expired
-account → Settings → Reconfigure. Choose the personal credential and copy the
-CLI sign-in command, then use **Check again** after completing it on the host.
+**Harness account sign-in and switching:** Settings → Harnesses → Codex or
+Claude. Use **Sign in again** on an expired Codex card, or open the configured
+harness and choose **Switch account**. For Codex, open or copy the HTTPS device
+link, copy the one-time code, and wait for the countdown/poller to finish; use
+Cancel to stop the host login or Try again after a terminal error. If another
+Codex login is already active, the dialog resumes its status instead of starting
+a second one. For Claude, confirm the sign-out and optionally enter the target
+email; the dialog presents the supported login command with a shell-quoted
+`--email` hint. Older hosts and servers fall back to the copyable CLI command.
 
 **Idle reap:** finish a turn, then leave the session alone past the idle window:
 a web session with its Terminal view open but untouched or its tabs closed, a

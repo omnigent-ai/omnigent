@@ -932,7 +932,7 @@ function FoldAssistantNarrationControl() {
       <SettingsLabel
         label="Show only the final answer"
         labelId={labelId}
-        description="Once a turn finishes, fold its progress messages into the Worked row. The last message stays visible as the answer."
+        description="Once a turn finishes, fold its progress messages into the Worked row. Codex's marked answers stay visible; for other agents, the last message does."
       />
       <Switch
         aria-labelledby={labelId}

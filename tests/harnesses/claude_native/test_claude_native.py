@@ -5157,6 +5157,61 @@ async def test_attach_exits_on_real_websocket_close_with_4404(
 
 
 @pytest.mark.asyncio
+async def test_read_fd_removes_reader_when_cancelled() -> None:
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    read_task = asyncio.create_task(claude_native._read_fd_with_reader(loop, read_fd))
+    try:
+        await asyncio.sleep(0)
+        assert not read_task.done()
+        read_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read_task
+
+        assert not loop.remove_reader(read_fd), "cancelled read left a selector callback"
+        os.write(write_fd, b"reconnected")
+        assert (
+            await asyncio.wait_for(
+                claude_native._read_fd_with_reader(loop, read_fd), timeout=budget(1.0)
+            )
+            == b"reconnected"
+        )
+        assert not loop.remove_reader(read_fd)
+    finally:
+        read_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await read_task
+        loop.remove_reader(read_fd)
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [b"input", b""], ids=["data", "eof"])
+async def test_read_fd_removes_reader_after_reading(data: bytes) -> None:
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    try:
+        if data:
+            os.write(write_fd, data)
+        os.close(write_fd)
+        write_fd = -1
+
+        assert (
+            await asyncio.wait_for(
+                claude_native._read_fd_with_reader(loop, read_fd), timeout=budget(1.0)
+            )
+            == data
+        )
+        assert not loop.remove_reader(read_fd)
+    finally:
+        loop.remove_reader(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
 async def test_websocket_to_stdout_does_not_block_event_loop() -> None:
     """
     ``_websocket_to_stdout`` offloads the blocking ``os.write`` to a

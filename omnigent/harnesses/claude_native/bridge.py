@@ -435,11 +435,6 @@ _SHELL_MODE_SURFACE = "shell mode"
 # What :func:`_occupying_surface` reports when a draft taller than the pane
 # has scrolled the box's glyph row out of view.
 _SCROLLED_DRAFT_SURFACE = "a draft taller than the terminal"
-# Ctrl+U, CSI-u encoded like the other clearing keys. Claude Code leaves shell
-# mode on it only with the cursor at the start of the line, so a typed command
-# takes two: the first clears the line, the second switches the box back to
-# chat input. Neither submits, and unlike Escape neither interrupts a turn.
-_CLEAR_LINE_KEY = "\x1b[117;5u"
 # The dismissal every surface drawn over the input box advertises in its
 # footer ("Esc to cancel", "Esc to clear"). Claude Code joins keys that share
 # an action with "/", so the task details panels print "Esc/Enter/Space to
@@ -6139,8 +6134,7 @@ def _restore_occupied_input(
                 # Escape keeps a typed shell command in shell mode, so the
                 # command is cleared instead, as a chat draft is before a paste.
                 _logger.info("claude-native: clearing a shell-mode draft from the input box")
-                for _ in range(2):
-                    _run_tmux(socket_path, "send-keys", "-l", "-t", tmux_target, _CLEAR_LINE_KEY)
+                _send_composer_clear_keys(socket_path, tmux_target, rows=len(pane.splitlines()))
             else:
                 _logger.info("claude-native: dismissing %s covering the input box", surface)
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Escape")
@@ -6206,16 +6200,17 @@ def _shell_mode_draft(pane: str) -> bool:
 
     Escape takes an empty shell-mode box back to chat input, but Claude Code
     keeps a box holding a typed command in shell mode, so that one is
-    cleared with :data:`_CLEAR_LINE_KEY` instead.
+    cleared with the same line edits as a chat draft instead.
 
     :param pane: Captured pane text from :func:`_capture_pane`.
-    :returns: ``True`` when the composer row leads with the shell-mode glyph
-        and carries text after it.
+    :returns: ``True`` when the shell-mode composer holds text on any row.
     """
-    row = _composer_row(pane)
-    if row is None or not row.strip().startswith(_SHELL_MODE_GLYPH):
+    box = _composer_box(pane)
+    if box is None or not box.rows[0].strip().startswith(_SHELL_MODE_GLYPH):
         return False
-    return bool(row.strip()[len(_SHELL_MODE_GLYPH) :].strip())
+    return bool(box.rows[0].strip()[len(_SHELL_MODE_GLYPH) :].strip()) or any(
+        row.strip() for row in box.rows[1:]
+    )
 
 
 def _composer_row(pane: str) -> str | None:

@@ -125,6 +125,7 @@ from omnigent.server.routes.scheduled_tasks import create_scheduled_tasks_router
 from omnigent.server.routes.session_mcp_servers import create_session_mcp_servers_router
 from omnigent.server.routes.session_policies import create_session_policies_router
 from omnigent.server.routes.sessions import (
+    CLIENT_SESSION_EVENT_TYPES,
     SessionLiveness,
     announce_hosts_changed,
     create_sessions_router,
@@ -242,6 +243,8 @@ class ServerInfoResponse(BaseModel):
     agent_detail: bool = False
     # Owner configuration reads and conditional PATCH updates.
     agent_config_edit: bool = False
+    # Client event types POST /v1/sessions/{id}/events accepts; empty on older servers.
+    session_event_types: list[str] = []
     # Absent on older servers, which clients treat as the default extensions.
     filesystem_attachments: FilesystemAttachmentsInfo | None = None
     branding: BrandingInfo
@@ -3373,6 +3376,7 @@ def create_app(
                 "agent_detail": True,
                 "agent_config_edit": agent_store.supports_config_edit
                 and artifact_store is not None,
+                "session_event_types": sorted(CLIENT_SESSION_EVENT_TYPES),
                 "filesystem_attachments": {
                     "extensions": sorted(filesystem_attachment_policy.extensions),
                     "all_types": filesystem_attachment_policy.all_types,

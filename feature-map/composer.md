@@ -81,7 +81,9 @@ and steers messages while the agent is busy.
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
   `slash_command` so it runs on an in-process harness. A native terminal side
-  chat shows no menu and sends slash text to the vendor TUI.
+  chat shows no menu and sends slash text to the vendor TUI. Claude Code and
+  Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
+  `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited

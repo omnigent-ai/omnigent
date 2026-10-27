@@ -2884,9 +2884,14 @@ function ComposerImpl(
   // for claude-sdk, whose runner sends /compact to the live SDK client to
   // trigger native compaction. Other SDK harnesses don't support it yet.
   const showCompact = isNativeWrapper || sessionHarness === "claude-sdk";
+  const composerServerInfo = useServerInfo();
   // /clear runs the harness's own /clear in the session terminal, which moves
-  // the terminal onto a fresh session the view then follows.
-  const showClear = sessionHarness === "claude-native" || sessionHarness === "codex-native";
+  // the terminal onto a fresh session the view then follows. Older servers
+  // reject the clear control, so a typed /clear stays plaintext there.
+  const showClear =
+    (sessionHarness === "claude-native" || sessionHarness === "codex-native") &&
+    composerServerInfo !== "loading" &&
+    !!composerServerInfo.session_event_types?.includes("clear");
   // /btw is a Claude Code CLI built-in (side chat), so offer it only on
   // claude-native sessions. Selected/typed, it sends as plaintext to the
   // vendor TUI (see submit) — the forwarder relays its answer to the overlay.
@@ -3351,7 +3356,6 @@ function ComposerImpl(
   );
   const skillLabels = useMemo(() => skillDisplayNames(skills, skillPrefix), [skills, skillPrefix]);
   const selectedAgent = agents?.find((agent) => agent.id === boundAgentId);
-  const composerServerInfo = useServerInfo();
   const registryEnabled =
     composerServerInfo !== "loading" && !!composerServerInfo.enabled_connections?.includes("mcp");
   const hasRegistryServers =

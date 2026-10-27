@@ -12360,9 +12360,9 @@ def test_inject_user_message_refuses_a_shell_mode_draft_it_cannot_clear(
         inject_user_message(bridge_dir, content="hello from the web")
 
     tails = [args[-1] for args in sends]
-    assert tails and set(tails) == {claude_native_bridge._CLEAR_LINE_KEY}, (
-        f"Only the clearing keys may be sent; got {tails}."
-    )
+    assert tails and all(
+        not tail.replace("\x1b[107;5u", "").replace("\x1b[117;5u", "") for tail in tails
+    ), f"Only the clearing keys may be sent; got {tails}."
 
 
 _MCP_APPROVAL_DIALOG_PANE = """\
