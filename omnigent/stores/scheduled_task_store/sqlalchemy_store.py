@@ -234,8 +234,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 created_at=created_at,
                 updated_at=None,
             )
-            if self._dispatch_enabled:
-                row.next_run_at = next_scheduled_time(_to_entity(row), created_at)
+            self._refresh_schedule(row, created_at)
             session.add(row)
             session.flush()
             return _to_entity(row)
@@ -421,11 +420,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 row.last_run_conversation_id = last_run_conversation_id
                 changed = True
             if (row.rrule, row.timezone, row.state) != schedule_before:
-                row.next_run_at = (
-                    next_scheduled_time(_to_entity(row), updated_at)
-                    if self._dispatch_enabled
-                    else None
-                )
+                self._refresh_schedule(row, updated_at)
             if changed:
                 row.updated_at = updated_at
             session.flush()
@@ -808,6 +803,18 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
         )
 
+    def _refresh_schedule(self, row: SqlScheduledTask, after: int) -> None:
+        """Recompute the saved next run; persistent mode completes exhausted schedules."""
+        if row.state == encode_scheduled_task_state("completed"):
+            # A schedule edit or resume re-evaluates a finished schedule.
+            row.state = encode_scheduled_task_state("active")
+        if not self._dispatch_enabled:
+            row.next_run_at = None
+            return
+        row.next_run_at = next_scheduled_time(_to_entity(row), after)
+        if row.next_run_at is None and row.state == encode_scheduled_task_state("active"):
+            row.state = encode_scheduled_task_state("completed")
+
     def configure_dispatch(self, enabled: bool) -> None:
         """Select cursor maintenance before serving requests, using the app's release flag."""
         self._dispatch_enabled = enabled
@@ -925,6 +932,25 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         return run_write_transaction(self._session_immediate, "pause_invalid_schedule", write)
 
+    def complete_schedule(self, task: ScheduledTask) -> bool:
+        """Mark an exhausted schedule completed only if no concurrent edit changed it."""
+        if (
+            task.workspace_id != current_workspace_id()
+            or task.state != "active"
+            or task.next_run_at is not None
+        ):
+            return False
+
+        def write(session: Session) -> bool:
+            row = session.get(SqlScheduledTask, (task.workspace_id, task.id), with_for_update=True)
+            if row is None or _to_entity(row) != task:
+                return False
+            row.state = encode_scheduled_task_state("completed")
+            row.updated_at = now_epoch()
+            return True
+
+        return run_write_transaction(self._session_immediate, "complete_schedule", write)
+
     def list_due_tasks(
         self, now: int, *, after: DispatchCursor | None = None, limit: int = 100
     ) -> builtins.list[ScheduledTask]:
@@ -963,7 +989,8 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
 
         Comparing the full snapshot also catches same-second prompt/host edits;
         updated_at alone cannot serve as a revision. A uniqueness error rolls
-        back the advance, as does any other write failure.
+        back the advance, as does any other write failure. Claiming the final
+        occurrence (``next_run_at=None``) marks the task completed.
         """
         self.check_dispatch_support()
         if lease_seconds <= 0 or (next_run_at is not None and next_run_at <= now):
@@ -994,6 +1021,10 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
                 )
             )
             row.next_run_at = next_run_at
+            if next_run_at is None:
+                # Completing changes the task's visible state, unlike advancing the cursor.
+                row.state = encode_scheduled_task_state("completed")
+                row.updated_at = now
             if existing is not None:
                 return None
             run = SqlScheduledTaskRun(

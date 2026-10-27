@@ -55,8 +55,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `chat-render`: the harness's output renders in chat like other harnesses.
   A single-file tool row (Read, Write, Edit) shows its path as a dotted link;
   clicking it opens that file in the workspace viewer without expanding the
-  row. Absolute paths open workspace-relative under the session root and
-  host-absolute outside it; they stay plain text until the root is known.
+  row. Absolute paths show and open workspace-relative under the session root
+  and host-absolute outside it; they stay plain text until the root is known.
+  Other tool rows follow [Tool calls in chat](./tool-calls.md).
   Shell commands and multi-file patches have no file link. A shell row shows
   the command (a script's first line and "+N lines") and expands to a
   terminal panel with the command, its output and exit status, in the

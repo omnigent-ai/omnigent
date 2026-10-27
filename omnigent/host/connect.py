@@ -3756,8 +3756,26 @@ class HostProcess:
                 session_id=frame.session_id,
                 agent_id=frame.agent_id,
             )
-        except Exception:
-            _logger.exception("Skill discovery failed for %r", frame.harness)
+        except Exception as exc:
+            _logger.exception(
+                "Skill discovery failed for %r",
+                frame.harness,
+                extra=debug_event(
+                    "host_skill_discovery_failed",
+                    session_id=frame.session_id,
+                    request_id=frame.request_id,
+                    host_id=self._identity.host_id,
+                    harness=frame.harness,
+                    discovery_scope="session" if frame.session_id is not None else "directory",
+                    error_type=type(exc).__name__,
+                    http_status=(
+                        exc.response.status_code
+                        if isinstance(exc, httpx.HTTPStatusError)
+                        else None
+                    ),
+                    errno=exc.errno if isinstance(exc, OSError) else None,
+                ),
+            )
             return HostSkillsResultFrame(
                 request_id=frame.request_id,
                 status="failed",

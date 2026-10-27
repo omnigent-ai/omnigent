@@ -427,8 +427,10 @@ class PersistentTaskScheduler:
                 if not await self._validate_schedule(task):
                     continue
                 next_run = await asyncio.to_thread(next_scheduled_time, task, int(self._now()))
-                if next_run is not None:
-                    with workspace_scope(task.workspace_id):
+                with workspace_scope(task.workspace_id):
+                    if next_run is None:
+                        await asyncio.to_thread(self._store.complete_schedule, task)
+                    else:
                         await asyncio.to_thread(self._store.initialize_next_run_at, task, next_run)
             except Exception:
                 _logger.exception(
