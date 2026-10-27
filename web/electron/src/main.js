@@ -85,6 +85,7 @@ const {
   getManagedServerUrls,
 } = require("./managed_preferences");
 const arca = require("./arca");
+const arcaOnboarding = require("./arca_onboarding");
 const cliInstall = require("./cli_install");
 const isaac = require("./isaac");
 const { createArcaConnectFlow } = require("./arca_connect_window");
@@ -350,12 +351,12 @@ const arcaConnectFlow = createArcaConnectFlow({
   pagePath: path.join(__dirname, "..", "arca-connect", "index.html"),
   preloadPath: path.join(__dirname, "arca_connect_preload.js"),
   startConnect: (serverUrl, onOutput) => startArcaHostConnect(serverUrl, { onOutput }),
-  startSetup: (serverUrl) => arca.startArcaSetup(serverUrl),
-  setupCommandLine: (serverUrl) => {
+  startLogin: (serverUrl) => arca.startArcaLogin(serverUrl),
+  loginCommandLine: (serverUrl) => {
     try {
-      return `arca ${arca.buildSetupArgs(serverUrl).join(" ")}`;
+      return `arca ${arca.buildLoginArgs(serverUrl).join(" ")}`;
     } catch {
-      return "arca ssh isaac omni host …";
+      return "arca ssh isaac omni login …";
     }
   },
   commandLine: (serverUrl) => {
@@ -485,12 +486,12 @@ async function connectOnboardingArca(serverUrl, log, sender) {
       result = { ok: false, canceled: true };
     } else {
       // The setup page's Install click authorizes browser sign-in before host startup.
-      log(`$ arca ${arca.buildSetupArgs(serverUrl).join(" ")}`);
+      log(`$ arca ${arcaOnboarding.buildSetupArgs(serverUrl).join(" ")}`);
       log("If sign-in is needed, a browser opens on your laptop. Finish signing in to continue.");
       const target = omnigentCli.normalizeServerUrl(new URL(serverUrl).href);
       let setup = onboardingArcaSetups.get(target);
       if (!setup) {
-        setup = { ...arca.startArcaSetup(serverUrl), waiters: 0 };
+        setup = { ...arcaOnboarding.startArcaSetup(serverUrl), waiters: 0 };
         onboardingArcaSetups.set(target, setup);
         setup.promise = setup.promise.finally(() => {
           if (onboardingArcaSetups.get(target) === setup) onboardingArcaSetups.delete(target);
@@ -4882,10 +4883,9 @@ function registerIpc() {
     const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);
     if (autoRun) {
       const status = await autoRun;
-      // A passive Isaac sign-in can time out before reporting an authentication error.
       if (
         status.state === "failed" &&
-        (status.errorKind === "omni-auth" || status.errorKind === "timeout") &&
+        status.errorKind === "omni-auth" &&
         isPinnedOriginSender(event) &&
         !win.isDestroyed()
       ) {

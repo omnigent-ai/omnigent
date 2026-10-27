@@ -149,6 +149,7 @@ function loadNavigationHarness({
   dbcertRefreshResult = { ok: true },
   dbcertSyncResult = { ok: true },
   dbcertPreflightResult = { ok: true, valid: true },
+  arcaLoginResult = { ok: true },
   arcaSetupResult = { ok: true },
   arcaConsentResult,
   loadServer = async () => {},
@@ -190,6 +191,8 @@ function loadNavigationHarness({
     arcaConsentRuns: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
+    arcaLogins: [],
+    arcaLoginCancels: 0,
     arcaSetups: [],
     arcaSetupCancels: 0,
   };
@@ -501,6 +504,20 @@ function loadNavigationHarness({
         const result = typeof arcaResult === "function" ? arcaResult(url) : arcaResult;
         return { command: "arca ssh", promise: Promise.resolve(result), cancel: () => {} };
       },
+      startArcaLogin: (url) => {
+        calls.arcaLogins.push(url);
+        const result =
+          typeof arcaLoginResult === "function" ? arcaLoginResult(url) : arcaLoginResult;
+        return {
+          promise: Promise.resolve(result),
+          cancel: () => {
+            calls.arcaLoginCancels += 1;
+          },
+        };
+      },
+    },
+    "./arca_onboarding": {
+      ...require("../src/arca_onboarding"),
       startArcaSetup: (url) => {
         calls.arcaSetups.push(url);
         const result =
@@ -646,8 +663,6 @@ function loadNavigationHarness({
               ? await arcaConsentResult(consentServerUrl, options)
               : arcaConsentResult;
           if (consent?.ok !== true) return consent;
-          const setup = await deps.startSetup(consentServerUrl).promise;
-          if (!setup.ok) return { ...setup, shownInConsole: true };
           const connect = deps.startConnect(consentServerUrl, () => {});
           return { ...(await connect.promise), shownInConsole: true };
         },
@@ -1065,10 +1080,32 @@ describe("Arca auto-connect wiring", () => {
     await h.api.loadServerUrl(h.win, workspace);
     await tick();
     assert.deepEqual(h.calls.arcaConnects, [workspace]);
+    assert.deepEqual(h.calls.arcaSetups, []);
+  });
+
+  it("connects from an existing server without running onboarding setup", async (t) => {
+    const h = loadNavigationHarness({
+      serverUrl: workspace,
+      databricksMode: "browser",
+      internalFeatures: true,
+      arcaPath,
+      arcaConsentResult: { ok: true },
+      arcaResult: { ok: true, alreadyRunning: false },
+    });
+    t.after(h.cleanup);
+    h.api.registerIpc();
+    const result = await h.ipc.get("omnigent:arca-connect")({
+      sender: h.webContents,
+      senderFrame: { url: workspace },
+    });
+    assert.equal(result.ok, true);
+    assert.equal(result.alreadyRunning, false);
+    assert.deepEqual(h.calls.arcaConnects, [workspace]);
+    assert.deepEqual(h.calls.arcaSetups, []);
   });
 
   for (const errorKind of ["omni-auth", "timeout"]) {
-    it(`offers consented setup when an explicit connect joins a passive ${errorKind}`, async (t) => {
+    it(`preserves existing connect recovery for a passive ${errorKind} without onboarding setup`, async (t) => {
       let finishPassive;
       let attempts = 0;
       const h = loadNavigationHarness({
@@ -1098,10 +1135,14 @@ describe("Arca auto-connect wiring", () => {
       assert.deepEqual(h.calls.arcaSetups, []);
       finishPassive({ ok: false, errorKind, error: "Browser sign-in did not complete." });
 
-      assert.equal((await requested).ok, true);
-      assert.deepEqual(h.calls.arcaConsentRuns, [{ serverUrl: workspace, options: undefined }]);
-      assert.deepEqual(h.calls.arcaSetups, [workspace]);
-      assert.deepEqual(h.calls.arcaConnects, [workspace, workspace]);
+      const recovered = errorKind === "omni-auth";
+      assert.equal((await requested).ok, recovered);
+      assert.deepEqual(
+        h.calls.arcaConsentRuns,
+        recovered ? [{ serverUrl: workspace, options: undefined }] : [],
+      );
+      assert.deepEqual(h.calls.arcaSetups, []);
+      assert.deepEqual(h.calls.arcaConnects, recovered ? [workspace, workspace] : [workspace]);
     });
   }
 
@@ -4547,6 +4588,7 @@ describe("browser-view teardown on server change (src/main.js)", () => {
     assert.equal(h.calls.arcaConsentRuns[0].serverUrl, serverUrl);
     assert.equal(h.calls.arcaConsentRuns[0].options.reason, "preview-reconnect");
     await until(() => h.calls.arcaConnects.length === 1, "consented recovery run");
+    assert.deepEqual(h.calls.arcaSetups, []);
     await until(
       () =>
         deps.getAgentNavigationHintForEvent(event, "http://localhost:5173", hostId, hostId) ===
