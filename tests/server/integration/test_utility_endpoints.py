@@ -115,6 +115,9 @@ async def test_info_returns_expected_fields(client: httpx.AsyncClient) -> None:
     # Gates the web's /clear for native sessions; older servers reject it.
     assert data["session_event_types"] == sorted(CLIENT_SESSION_EVENT_TYPES)
     assert "clear" in data["session_event_types"]
+    # Browser-posted despite its prefix; runner-only events stay unadvertised.
+    assert "external_btw_dismiss" in data["session_event_types"]
+    assert "external_output_text_delta" not in data["session_event_types"]
     # single_user reflects OMNIGENT_LOCAL_SINGLE_USER, which the suite's
     # conftest sets to "1" (the default local-dev posture), so it's true here.
     # The multi-user (marker-off) case is covered below.
