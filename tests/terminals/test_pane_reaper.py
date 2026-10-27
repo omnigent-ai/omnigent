@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -31,6 +32,211 @@ from omnigent.terminals.pane_reaper import (
 )
 from omnigent.terminals.registry import TerminalRegistry
 from tests.runner.helpers import NullServerClient, make_test_terminal_instance
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    [
+        "completed",
+        "failed",
+        "disconnected",
+        "completed_backfill",
+        "completed_backfill_stale_spawn_snapshot",
+        "terminal_before_registration",
+        "terminal_before_registration_unavailable",
+        "terminal_before_registration_empty",
+        "unknown_unavailable",
+        "unknown_empty",
+        "queued_idle_after_resume",
+        "unknown_idle_only_empty",
+    ],
+)
+async def test_quiet_codex_discovered_child_holds_its_parent_pane(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """Native children protect the pane without runner-dispatched work or recent output."""
+    from omnigent.harnesses.codex_native import forwarder
+
+    class EventClient:
+        def __init__(self) -> None:
+            self.events: asyncio.Queue = asyncio.Queue()
+            self.queued_idle_handled: asyncio.Future | None = None
+
+        async def request(self, _method: str, params: dict) -> dict:
+            if params["threadId"] == "thread_child" and outcome.endswith("unavailable"):
+                raise RuntimeError("synthetic child history unavailable")
+            if params["threadId"] == "thread_child" and outcome == "queued_idle_after_resume":
+                self.queued_idle_handled = asyncio.get_running_loop().create_future()
+                await self.events.put(
+                    (
+                        {
+                            "method": "thread/status/changed",
+                            "params": {"threadId": "thread_child", "status": {"type": "idle"}},
+                        },
+                        self.queued_idle_handled,
+                    )
+                )
+            status = (
+                "completed"
+                if outcome.startswith(("completed_backfill", "terminal_before_registration"))
+                else "inProgress"
+            )
+            return {
+                "result": {
+                    "thread": {
+                        "id": params["threadId"],
+                        "turns": []
+                        if outcome.endswith("empty")
+                        else [
+                            {
+                                "id": "turn_new"
+                                if outcome == "queued_idle_after_resume"
+                                else "turn_child",
+                                "status": status,
+                                "items": [],
+                            }
+                        ],
+                    }
+                }
+            }
+
+        async def iter_events(self):
+            while True:
+                event, handled = await self.events.get()
+                if event is None:
+                    return
+                yield event
+                handled.set_result(None)
+
+        async def emit(self, method: str, params: dict) -> None:
+            handled = asyncio.get_running_loop().create_future()
+            await self.events.put(({"method": method, "params": params}, handled))
+            await asyncio.wait_for(handled, 5)
+
+        async def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(native_cost_popup, "_tmux_last_client_input_at", lambda *_args: None)
+    monkeypatch.setattr(native_cost_popup, "_tmux_window_activity_at", lambda *_args: None)
+    monkeypatch.setattr(claude_native_bridge, "_APPROVAL_WAIT_ROOT", tmp_path / "approval-waits")
+    registry = TerminalRegistry()
+    app = create_runner_app(
+        terminal_registry=registry,
+        resource_registry=SessionResourceRegistry(terminal_registry=registry),
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    pane = PaneRef(
+        "conv_native_parent",
+        terminal_resource_id("codex", "main"),
+        "codex",
+        tmp_path / "tmux.sock",
+    )
+    other = PaneRef("conv_other_parent", pane.terminal_id, "codex", tmp_path / "other.sock")
+    client = EventClient()
+    task = asyncio.create_task(
+        forwarder.supervise_forwarder(
+            base_url="http://127.0.0.1:6767",
+            headers={},
+            session_id=pane.conversation_id,
+            bridge_dir=tmp_path / "bridge",
+            app_server_url="ws://127.0.0.1:9876",
+            thread_id="thread_parent",
+            client=client,  # type: ignore[arg-type]
+            ap_transport=httpx.MockTransport(
+                lambda request: httpx.Response(200, json={"child_session_id": "conv_native_child"})
+            ),
+        )
+    )
+    try:
+        await client.emit(
+            "thread/started",
+            {
+                "thread": {
+                    "id": "thread_child",
+                    "source": {
+                        "subAgent": {"thread_spawn": {"parent_thread_id": "thread_parent"}}
+                    },
+                }
+            },
+        )
+        reaper = app.state.native_pane_reaper
+        assert await reaper._is_busy(pane)
+        if outcome.startswith("terminal_before_registration"):
+            await client.emit(
+                "turn/completed",
+                {
+                    "threadId": "thread_child",
+                    "turn": {"id": "turn_child", "status": "completed", "items": []},
+                },
+            )
+            assert not await reaper._is_busy(pane)
+        await client.emit(
+            "item/started",
+            {
+                "threadId": "thread_parent",
+                "item": {
+                    "type": "collabAgentToolCall",
+                    "tool": "spawnAgent",
+                    "receiverThreadIds": ["thread_child"],
+                    "agentsStates": {"thread_child": {"status": "running"}},
+                }
+                if outcome.endswith("stale_spawn_snapshot")
+                else {
+                    "type": "subAgentActivity",
+                    "kind": "started",
+                    "agentThreadId": "thread_child",
+                },
+            },
+        )
+        if outcome.startswith(("completed_backfill", "terminal_before_registration")):
+            assert not await reaper._is_busy(pane)
+            return
+        if outcome == "queued_idle_after_resume":
+            assert client.queued_idle_handled is not None
+            await asyncio.wait_for(client.queued_idle_handled, 5)
+        elif outcome == "unknown_idle_only_empty":
+            await client.emit(
+                "thread/status/changed", {"threadId": "thread_child", "status": {"type": "idle"}}
+            )
+            assert not await reaper._is_busy(pane)
+            return
+        assert await reaper._is_busy(pane)
+        assert not await reaper._is_busy(other)
+        # No further child output is needed to hold past the full idle window.
+        assert reaper._classify(0, [pane], busy_convs={pane.conversation_id}) == []
+        assert reaper._classify(1_000_000, [pane], busy_convs={pane.conversation_id}) == []
+        await client.emit("turn/started", {"threadId": "thread_child", "turn": {"id": "turn_new"}})
+        await client.emit(
+            "turn/completed",
+            {
+                "threadId": "thread_child",
+                "turn": {"id": "turn_child", "status": "completed", "items": []},
+            },
+        )
+        assert await reaper._is_busy(pane)
+        if outcome != "disconnected" and not outcome.startswith("unknown"):
+            # A failed child turn ends through its own notification method.
+            await client.emit(
+                "turn/failed" if outcome == "failed" else "turn/completed",
+                {
+                    "threadId": "thread_child",
+                    "turn": {
+                        "id": "turn_new",
+                        "status": "completed"
+                        if outcome == "queued_idle_after_resume"
+                        else outcome,
+                        "items": [],
+                    },
+                },
+            )
+        else:
+            await client.events.put((None, None))
+            await asyncio.wait_for(task, 5)
+        assert not await reaper._is_busy(pane)
+    finally:
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
 
 
 def _pane(conv: str, name: str = "claude") -> PaneRef:
