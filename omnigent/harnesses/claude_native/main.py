@@ -1019,8 +1019,7 @@ async def _resolve_claude_model_alias(
     )
     try:
         process = await asyncio.create_subprocess_exec(
-            command,
-            *launch_args,
+            *_proc.pipe_supervised_command(command, *launch_args),
             cwd=str(Path.home()),
             env=env,
             stdin=asyncio.subprocess.DEVNULL,
@@ -1193,8 +1192,7 @@ async def _run_claude_model_probe(
     )
     try:
         process = await asyncio.create_subprocess_exec(
-            command,
-            *launch_args,
+            *_proc.pipe_supervised_command(command, *launch_args),
             cwd=str(Path.home()),
             env=env,
             stdin=asyncio.subprocess.PIPE if stream_input else asyncio.subprocess.DEVNULL,

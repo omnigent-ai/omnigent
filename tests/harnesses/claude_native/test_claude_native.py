@@ -11108,9 +11108,11 @@ async def test_probe_claude_model_options_uses_harness_startup_config(
             )
 
     async def _fake_exec(command: str, *args: str, **kwargs: Any) -> _FakeProcess:
-        assert command == ("plugin-wrapper" if with_launcher else expected_command)
         prefix = [expected_command, *expected_prefix] if with_launcher else expected_prefix
-        assert list(args[: len(prefix) + 1]) == [*prefix, "-p"]
+        expected_argv = claude_native._proc.pipe_supervised_command(
+            "plugin-wrapper" if with_launcher else expected_command, *prefix, "-p"
+        )
+        assert (command, *args)[: len(expected_argv)] == expected_argv
         # No --settings without an apiKeyHelper to deliver.
         assert "--settings" not in args
         return _FakeProcess()
@@ -11251,7 +11253,8 @@ async def test_probe_claude_model_options_runs_the_harness_under_the_launch_env(
     assert probe is not None
     assert probe.alias_rows == [{"id": "opus", "model": "opus", "displayName": "opus"}]
     args = captured["args"]
-    assert args[:3] == ["-p", "--input-format", "stream-json"]
+    probe_start = args.index("-p")
+    assert args[probe_start : probe_start + 3] == ["-p", "--input-format", "stream-json"]
     assert "--strict-mcp-config" in args and "--no-session-persistence" in args
     settings_payload = json.loads(args[args.index("--settings") + 1])
     assert settings_payload == {"apiKeyHelper": "printf token"}

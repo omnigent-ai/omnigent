@@ -24,9 +24,11 @@ import logging
 import os
 import signal
 import subprocess
+import sys
 import time
 import weakref
 from contextlib import suppress
+from pathlib import Path
 from typing import Protocol, TypedDict
 
 import psutil  # type: ignore[import-untyped]
@@ -133,6 +135,24 @@ def spawn_kwargs() -> SpawnKwargs:
     if IS_POSIX:
         return {"start_new_session": True}
     return {"creationflags": _CREATE_NEW_PROCESS_GROUP}
+
+
+def pipe_supervised_command(command: str, *args: str) -> tuple[str, ...]:
+    """Retain a POSIX group leader while descendants hold captured output pipes.
+
+    Use with ``spawn_kwargs()`` and captured stdout/stderr. The supervisor
+    inherits stdin, cwd and env, and buffers output until EOF, like communicate.
+    Windows retains direct execution and its existing tree-cleanup behavior.
+    """
+    if not IS_POSIX:
+        return (command, *args)
+    return (
+        sys.executable,
+        "-I",
+        str(Path(__file__).with_name("_pipe_supervisor.py")),
+        command,
+        *args,
+    )
 
 
 def remember_process_group(process: _ProcessLike) -> None:

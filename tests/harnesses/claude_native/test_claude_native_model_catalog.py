@@ -163,19 +163,47 @@ async def test_catalog_runs_wrapper_bootstrap_before_discovery(
 @pytest.mark.posix_only
 @pytest.mark.parametrize("probe", ["enumeration", "alias"])
 @pytest.mark.parametrize("cancel", [False, True], ids=["timeout", "cancel"])
+@pytest.mark.parametrize("wrapper_exits", [False, True], ids=["wrapper-waits", "wrapper-exits"])
 async def test_model_probe_interrupt_terminates_wrapper_children(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, probe: str, cancel: bool
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    probe: str,
+    cancel: bool,
+    wrapper_exits: bool,
 ) -> None:
     """Timeout and cancellation stop wrapper children holding the probe's pipes."""
     child_pid_path = tmp_path / "child.pid"
+    registered_path = tmp_path / "registered"
+    remember_process_group = _proc.remember_process_group
+    processes: list[asyncio.subprocess.Process] = []
+
+    def register(process: asyncio.subprocess.Process) -> None:
+        remember_process_group(process)
+        processes.append(process)
+        registered_path.touch()
+
+    monkeypatch.setattr(_proc, "remember_process_group", register)
     wrapper = textwrap.dedent("""\
-        import subprocess, sys
+        import os, subprocess, sys, time
         from pathlib import Path
+        while not Path(sys.argv[2]).exists():
+            time.sleep(0.01)
         child = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)"])
-        Path(sys.argv[1]).write_text(str(child.pid))
-        child.wait()
+        Path(sys.argv[1]).write_text(f"{child.pid} {os.getpid()}")
+        if sys.argv[3] == "wait":
+            child.wait()
         """)
-    invocation = (sys.executable, ["-c", wrapper, str(child_pid_path)], dict(os.environ))
+    invocation = (
+        sys.executable,
+        [
+            "-c",
+            wrapper,
+            str(child_pid_path),
+            str(registered_path),
+            "exit" if wrapper_exits else "wait",
+        ],
+        dict(os.environ),
+    )
     monkeypatch.setattr(
         claude_native, "_claude_model_probe_invocation", lambda *_args, **_kwargs: invocation
     )
@@ -188,8 +216,11 @@ async def test_model_probe_interrupt_terminates_wrapper_children(
     child = None
     try:
         await poll_until_async(child_pid_path.exists, timeout_s=3)
+        child_pid, wrapper_pid = map(int, child_pid_path.read_text().split())
         with contextlib.suppress(psutil.NoSuchProcess):
-            child = psutil.Process(int(child_pid_path.read_text()))
+            child = psutil.Process(child_pid)
+        if wrapper_exits:
+            await poll_until_async(lambda: not _proc.process_alive(wrapper_pid), timeout_s=1)
         if cancel:
             task.cancel()
         await asyncio.wait({task}, timeout=3)
@@ -198,6 +229,7 @@ async def test_model_probe_interrupt_terminates_wrapper_children(
             assert task.cancelled()
         else:
             assert task.result() == (None if probe == "enumeration" else {})
+        assert processes[0].returncode is not None, "probe supervisor was left running"
         if child is not None:
             await poll_until_async(lambda: not _proc.process_alive(child.pid), timeout_s=1)
     finally:
@@ -310,7 +342,7 @@ def _stub_picker(
             return self.returncode
 
     async def spawn(command: str, *args: str, **kwargs: Any) -> Process:
-        launches.append(args)
+        launches.append((command, *args))
         alias = args[args.index("--model") + 1] if "--model" in args else None
         if "--input-format" in args:
             assert kwargs["stdin"] == asyncio.subprocess.PIPE
@@ -408,7 +440,8 @@ async def test_catalog_falls_back_for_older_claude(
     ]
     assert len(launches) == 3
     assert "--input-format" in launches[0]
-    assert launches[1][:3] == ("--", "-p", "/model")
+    prefix = _proc.pipe_supervised_command("claude-wrapper", "--", "-p", "/model")
+    assert launches[1][: len(prefix)] == prefix
     assert "--input-format" not in launches[1]
     assert "--model" in launches[2]
 
