@@ -282,6 +282,15 @@ describe("ChatHeader — workspace pane alignment", () => {
     expect(header).not.toBeNull();
     expect(header).toHaveClass("inset-x-0", "md:right-[var(--workspace-panel-offset,0px)]");
   });
+
+  it("adds the glass backdrop only on session pages", () => {
+    const landing = renderHeader({ sidebarOpen: true });
+    expect(landing.container.querySelector("header")).not.toHaveClass("session-header-glass");
+    landing.unmount();
+
+    const session = renderHeader({ sidebarOpen: true, conversationId: "conv-1" });
+    expect(session.container.querySelector("header")).toHaveClass("session-header-glass");
+  });
 });
 
 describe("ChatHeader — workspace pane shortcut", () => {

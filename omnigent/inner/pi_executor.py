@@ -2580,7 +2580,9 @@ class PiExecutor(Executor):
             prepare_managed_pi_agent_dir(
                 pathlib.Path(tmp_dir),
                 overlay=self._retry_policy.pi.settings(),
-                global_agent_dir=global_pi_agent_dir(),
+                global_agent_dir=global_pi_agent_dir(
+                    env=self._env, workspace=pathlib.Path(self._cwd) if self._cwd else None
+                ),
             )
             from omnigent.inner.pi_gateway import pi_gateway_extension_args
 

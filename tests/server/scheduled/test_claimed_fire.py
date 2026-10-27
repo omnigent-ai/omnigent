@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import time
 import uuid
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
@@ -497,16 +498,17 @@ class _RecoveryConversationStore:
 def _expired_run(
     task: ScheduledTask, *, conversation_id: str | None = _CONV_ID
 ) -> ScheduledTaskRun:
-    trigger_key = scheduled_trigger_key(1_800_000_000)
+    expired_at = int(time.time()) - 1
+    trigger_key = scheduled_trigger_key(expired_at - 120)
     return ScheduledTaskRun(
         id=uuid.uuid4().hex,
         scheduled_task_id=task.id,
         status="starting",
-        scheduled_at=1_800_000_000,
+        scheduled_at=expired_at - 120,
         conversation_id=conversation_id,
         trigger_key=trigger_key,
         host_id=occurrence_host_id(task, trigger_key),
-        lease_expires_at=1_800_000_120,
+        lease_expires_at=expired_at,
     )
 
 
@@ -670,23 +672,87 @@ async def test_recovery_cleans_up_the_sandbox_of_a_deleted_session(store, monkey
     terminate.assert_awaited_once()
 
 
-async def test_recovery_leaves_a_failed_managed_launch_failed(store, monkeypatch) -> None:
+def _draining_sandbox_config(shutdown_drain_s: float) -> Any:
+    from omnigent.server.managed_hosts import ManagedSandboxConfig, ManagedSandboxDeployment
+
+    return ManagedSandboxDeployment.single(
+        ManagedSandboxConfig(
+            server_url="https://server.example.com",
+            launcher_factory=lambda: pytest.fail("recovery never launches a sandbox"),
+            token_ttl_s=90000,
+        ),
+        shutdown_drain_s=shutdown_drain_s,
+    )
+
+
+async def test_recovery_fails_a_failed_managed_launch_and_tears_down_its_sandbox(
+    store, monkeypatch
+) -> None:
     from omnigent.server import managed_hosts
 
     terminate = AsyncMock()
     monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
     task = _saved_task(store, execution_target="managed_sandbox")
+    run = _expired_run(task)
+    # Still inside another replica's shutdown drain: a known failure doesn't wait it out.
+    clock = FakeClock(run.lease_expires_at + 1)
+    # The sandbox bound after its prompt had already failed, so it can never deliver it.
     conversations = _RecoveryConversationStore(
-        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, labels={STARTUP_LABEL: "failed"})
+        _FakeConversation(
+            id=_CONV_ID, agent_id=_AGENT_ID, host_id=run.host_id, labels={STARTUP_LABEL: "failed"}
+        )
     )
     startup = FakeStartupInputs()
+    hosts = _sandbox_hosts(task, run, "agent_sandbox")
     executor = ClaimedRunExecutor(
-        _deps(store, conversation_store=conversations, startup_inputs=startup)
+        _deps(
+            store,
+            conversation_store=conversations,
+            host_store=hosts,
+            sandbox_config=_draining_sandbox_config(30),
+            startup_inputs=startup,
+        ),
+        now=clock.now,
     )
 
-    assert await executor.recover(_expired_run(task)) == "failed"
+    assert await executor.recover(run) == "failed"
     assert startup.launch_failures == []
+    assert terminate.await_args.args[0] is hosts.hosts[run.host_id]
+
+
+async def test_recovery_waits_out_another_replicas_shutdown_drain(store, monkeypatch) -> None:
+    from omnigent.server import managed_hosts
+
+    terminate = AsyncMock()
+    monkeypatch.setattr(managed_hosts, "terminate_managed_host", terminate)
+    task = _saved_task(store, execution_target="managed_sandbox")
+    run = _expired_run(task)
+    config = _draining_sandbox_config(30)
+    clock = FakeClock(run.lease_expires_at + 10)
+    startup = FakeStartupInputs()
+    conversations = _RecoveryConversationStore(
+        _FakeConversation(id=_CONV_ID, agent_id=_AGENT_ID, labels={STARTUP_LABEL: "pending"})
+    )
+    executor = ClaimedRunExecutor(
+        _deps(
+            store,
+            conversation_store=conversations,
+            host_store=_sandbox_hosts(task, run, "agent_sandbox"),
+            sandbox_config=config,
+            managed_launches=ManagedLaunchTracker(),
+            startup_inputs=startup,
+        ),
+        now=clock.now,
+    )
+
+    # The replica that lost the lease may still bind the sandbox while it shuts down.
+    assert await executor.recover(run) is None
     terminate.assert_not_awaited()
+    assert startup.launch_failures == []
+    clock.advance(30)
+    assert await executor.recover(run) == "failed"
+    terminate.assert_awaited_once()
+    assert [session for session, _ in startup.launch_failures] == [_CONV_ID]
 
 
 async def test_recovery_with_a_revoked_identity_fails_without_inspecting(store) -> None:

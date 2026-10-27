@@ -6095,6 +6095,10 @@ def _restore_occupied_input(
     startup dialogs whose Escape quits Claude Code instead of closing them
     (:func:`_escape_quits_claude`): they are left for the person to answer.
 
+    Isaac's idle-compaction log can overwrite the rendered input box. Redraw
+    it once with Ctrl+L before any edit keys can erase its identifying prefix,
+    then check the actual composer and pending prompts again.
+
     Escape is only sent while the surface is verifiably on screen —
     never blind, because on the bare composer Escape interrupts an
     in-flight turn. A screen with no input box counts only when it
@@ -6128,6 +6132,7 @@ def _restore_occupied_input(
     last_escape: float | None = None
     confirmed = False
     unclearable_seen = False
+    notice_redrawn = False
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_user_prompt_pending(
@@ -6144,6 +6149,17 @@ def _restore_occupied_input(
             return None
         surface = _occupying_surface(pane)
         delivery_diagnostics.record_restore_observation(pane=pane, surface=surface)
+        box = _composer_box(pane)
+        if (
+            not notice_redrawn
+            and box is not None
+            and any("[idle-compact]" in row for row in box.rows)
+        ):
+            _logger.info("claude-native: redrawing an idle-compaction notice over the input box")
+            _run_tmux(socket_path, "send-keys", "-t", tmux_target, "C-l")
+            notice_redrawn = True
+            time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
+            continue
         if surface is None:
             return None
         now = time.monotonic()
@@ -9871,6 +9887,8 @@ def _assistant_transcript_items_from_entry(
         items.
     """
     message = entry["message"]
+    if _is_no_response_placeholder(message):
+        return current_response_id, []
     content = message.get("content") if isinstance(message, dict) else None
     source_key = _transcript_source_key(entry, line_number, record_offset)
     waking = current_response_id is not None and current_response_id == settled_response_id
@@ -10107,6 +10125,27 @@ def _is_api_error_entry(entry: _JsonObject) -> bool:
         return True
     message = entry.get("message")
     return isinstance(message, dict) and message.get("isApiErrorMessage") is True
+
+
+_NO_RESPONSE_PLACEHOLDER_TEXT = "No response requested."
+
+
+def _is_no_response_placeholder(message: object) -> bool:
+    """
+    Return whether an assistant message is Claude Code's no-reply placeholder.
+
+    The CLI writes it when it resumes an interrupted turn or a rate limit ends
+    a turn without a message, and never renders it; this mirrors its own check.
+
+    :param message: The transcript record's ``message`` value.
+    :returns: ``True`` for the synthetic ``No response requested.`` message.
+    """
+    if not isinstance(message, dict) or message.get("model") != "<synthetic>":
+        return False
+    content = message.get("content")
+    if isinstance(content, list) and len(content) == 1 and isinstance(content[0], dict):
+        content = content[0].get("text") if content[0].get("type") == "text" else None
+    return content == _NO_RESPONSE_PLACEHOLDER_TEXT
 
 
 def _assistant_message_item(

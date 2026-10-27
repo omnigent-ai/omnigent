@@ -9,10 +9,10 @@
   --tray: #ffffff;
   --popover: #ffffff;
   --popover-foreground: #11171c;
-  --primary: #11171c;
+  --primary: #df3c85;
   --link: #1967b5;
   --primary-foreground: #ffffff;
-  --selection-background: rgba(240, 1, 150, 0.1);
+  --selection-background: rgba(223, 60, 133, 0.1);
   --selection-foreground: #651249;
   --secondary: #eceef1;
   --secondary-foreground: #27272a;
@@ -35,68 +35,53 @@
   --sidebar-accent-foreground: #04355d;
   --sidebar-border: #e4e4e7;
   --sidebar-ring: #2272b4;
-  --sidebar-active: rgba(240, 1, 150, 0.1);
-  --sidebar-active-foreground: #651249;
-}
-
-:root:not(.dark):not([data-theme]) .app-shell {
-  background: var(--background);
-}
-
-:root:not(.dark):not([data-theme]) .conversations-sidebar {
-  background: linear-gradient(90deg, #fffefe, #fcf6fa);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: linear-gradient(90deg, #fffefe, #fcf6fa);
+  --shell-background: var(--background);
 }
 
 .dark:not([data-theme]) {
-  --background: #0e1013;
-  --foreground: oklch(0.965 0.003 240);
+  --background: #0e0b19;
+  --foreground: #f5f5f4;
   --card: rgba(31, 39, 45, 0.6);
   --card-solid: #181f25;
-  --card-foreground: oklch(0.965 0.003 240);
+  --card-foreground: #f5f5f4;
   --tray: rgba(31, 39, 45, 0.6);
   --popover: rgba(26, 33, 41, 0.8);
-  --popover-foreground: oklch(0.965 0.003 240);
-  --primary: #e8ecf0;
+  --popover-foreground: #f5f5f4;
+  --primary: #df3c85;
   --link: #72b7f5;
   --primary-foreground: #11171c;
-  --selection-background: rgba(240, 1, 150, 0.15);
+  --selection-background: rgba(223, 60, 133, 0.15);
   --selection-foreground: #f9a8d4;
   --secondary: #1f272d;
   --secondary-foreground: #e8ecf0;
-  --muted: color-mix(in srgb, #92a4b3 15%, #262f36);
-  --muted-foreground: #92a4b3;
+  --muted: rgb(255 255 255 / 12%);
+  --muted-foreground: rgb(245 245 244 / 56%);
   --code-bg: oklch(0.38 0.005 240);
   --accent: #04355d;
   --accent-foreground: #4299e0;
   --border: oklch(0.28 0.005 240);
   --border-strong: #a1a1aa;
   --button-border: #d6d6d6;
-  --input: oklch(0.28 0.005 240);
+  --input: rgb(255 255 255 / 15%);
   --ring: #e8ecf0;
   --brand-accent: #df3c85;
-  --sidebar: rgba(17, 23, 28, 0.75);
-  --sidebar-foreground: oklch(0.965 0.003 240);
+  --sidebar: #0e0b19;
+  --sidebar-foreground: #f5f5f4;
   --sidebar-primary: oklch(0.64 0.22 254);
   --sidebar-primary-foreground: oklch(0.12 0.004 240);
   --sidebar-accent: oklch(0.245 0.005 240);
   --sidebar-accent-foreground: oklch(0.965 0.003 240);
   --sidebar-border: oklch(0.28 0.005 240);
   --sidebar-ring: oklch(0.92 0.003 240 / 0.4);
-  --sidebar-active: rgba(240, 1, 150, 0.15);
-  --sidebar-active-foreground: #f472b6;
-}
-
-.dark:not([data-theme]) .app-shell {
-  background:
-    radial-gradient(rgba(100, 40, 180, 0.12), transparent 50%),
-    radial-gradient(at 80% 20%, rgba(80, 30, 140, 0.08), transparent 45%),
-    linear-gradient(145deg, #1a0e2d, #0e1418, #130e1b);
-}
-
-.dark:not([data-theme]) .conversations-sidebar {
-  background:
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background:
     linear-gradient(transparent 35%, rgba(92, 48, 108, 0.2)),
     linear-gradient(135deg, rgba(255, 255, 255, 0.04), transparent 60%);
+  --shell-background: var(--background);
 }
 
 :root:not(.dark)[data-theme="dracula"] {
@@ -134,16 +119,10 @@
   --sidebar-accent-foreground: #6b21a8;
   --sidebar-border: #e6e0f2;
   --sidebar-ring: #7c3aed;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-:root:not(.dark)[data-theme="dracula"] .app-shell {
-  background: linear-gradient(160deg, #faf8ff 0%, #f5f1fd 50%, #f3eefb 100%);
-}
-
-:root:not(.dark)[data-theme="dracula"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: linear-gradient(160deg, #faf8ff 0%, #f5f1fd 50%, #f3eefb 100%);
 }
 
 .dark[data-theme="dracula"] {
@@ -181,19 +160,10 @@
   --sidebar-accent-foreground: #ff79c6;
   --sidebar-border: #44475a;
   --sidebar-ring: #bd93f9;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-.dark[data-theme="dracula"] .app-shell {
-  background:
-    radial-gradient(ellipse at 20% 40%, rgba(189, 147, 249, 0.14) 0%, transparent 50%),
-    radial-gradient(ellipse at 80% 20%, rgba(255, 121, 198, 0.1) 0%, transparent 45%),
-    linear-gradient(160deg, #2a2c3a 0%, #282a36 55%, #21222c 100%);
-}
-
-.dark[data-theme="dracula"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: var(--background);
 }
 
 :root:not(.dark)[data-theme="github"] {
@@ -205,10 +175,10 @@
   --tray: #ffffff;
   --popover: #ffffff;
   --popover-foreground: #1f2328;
-  --primary: #1f883d;
+  --primary: #0969da;
   --link: #0968d9;
   --primary-foreground: #ffffff;
-  --selection-background: rgba(31, 136, 61, 0.15);
+  --selection-background: rgba(9, 105, 218, 0.15);
   --selection-foreground: #1f2328;
   --secondary: #eaeef2;
   --secondary-foreground: #1f2328;
@@ -231,16 +201,10 @@
   --sidebar-accent-foreground: #0550ae;
   --sidebar-border: #d1d9e0;
   --sidebar-ring: #0969da;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-:root:not(.dark)[data-theme="github"] .app-shell {
-  background: linear-gradient(180deg, #fbfcfd 0%, #f6f8fa 100%);
-}
-
-:root:not(.dark)[data-theme="github"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: linear-gradient(180deg, #fbfcfd 0%, #f6f8fa 100%);
 }
 
 .dark[data-theme="github"] {
@@ -252,10 +216,10 @@
   --tray: rgba(22, 27, 34, 0.72);
   --popover: rgba(22, 27, 34, 0.9);
   --popover-foreground: #e6edf3;
-  --primary: #238636;
+  --primary: #58a6ff;
   --link: #58a6ff;
-  --primary-foreground: #ffffff;
-  --selection-background: rgba(35, 134, 54, 0.39);
+  --primary-foreground: #0d1117;
+  --selection-background: rgba(88, 166, 255, 0.39);
   --selection-foreground: #e6edf3;
   --secondary: #21262d;
   --secondary-foreground: #e6edf3;
@@ -278,16 +242,10 @@
   --sidebar-accent-foreground: #58a6ff;
   --sidebar-border: #30363d;
   --sidebar-ring: #58a6ff;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-.dark[data-theme="github"] .app-shell {
-  background: linear-gradient(160deg, #0d1117 0%, #0a0e14 100%);
-}
-
-.dark[data-theme="github"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: var(--background);
 }
 
 :root:not(.dark)[data-theme="catppuccin"] {
@@ -325,16 +283,10 @@
   --sidebar-accent-foreground: #8839ef;
   --sidebar-border: #ccd0da;
   --sidebar-ring: #8839ef;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-:root:not(.dark)[data-theme="catppuccin"] .app-shell {
-  background: linear-gradient(160deg, #f2f3f7 0%, #eff1f5 60%, #e9ecf2 100%);
-}
-
-:root:not(.dark)[data-theme="catppuccin"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: linear-gradient(160deg, #f2f3f7 0%, #eff1f5 60%, #e9ecf2 100%);
 }
 
 .dark[data-theme="catppuccin"] {
@@ -372,19 +324,10 @@
   --sidebar-accent-foreground: #cba6f7;
   --sidebar-border: #45475a;
   --sidebar-ring: #cba6f7;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-.dark[data-theme="catppuccin"] .app-shell {
-  background:
-    radial-gradient(ellipse at 20% 30%, rgba(203, 166, 247, 0.12) 0%, transparent 55%),
-    radial-gradient(ellipse at 80% 20%, rgba(245, 194, 231, 0.08) 0%, transparent 45%),
-    linear-gradient(160deg, #232336 0%, #1e1e2e 60%, #181825 100%);
-}
-
-.dark[data-theme="catppuccin"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: var(--background);
 }
 
 :root:not(.dark)[data-theme="gruvbox"] {
@@ -422,16 +365,10 @@
   --sidebar-accent-foreground: #af3a03;
   --sidebar-border: #e6d5a8;
   --sidebar-ring: #d65d0e;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-:root:not(.dark)[data-theme="gruvbox"] .app-shell {
-  background: linear-gradient(160deg, #fbf3cd 0%, #fbf1c7 55%, #f7ecbb 100%);
-}
-
-:root:not(.dark)[data-theme="gruvbox"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: linear-gradient(160deg, #fbf3cd 0%, #fbf1c7 55%, #f7ecbb 100%);
 }
 
 .dark[data-theme="gruvbox"] {
@@ -469,19 +406,10 @@
   --sidebar-accent-foreground: #fe8019;
   --sidebar-border: #504945;
   --sidebar-ring: #fe8019;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-.dark[data-theme="gruvbox"] .app-shell {
-  background:
-    radial-gradient(ellipse at 20% 30%, rgba(254, 128, 25, 0.1) 0%, transparent 55%),
-    radial-gradient(ellipse at 80% 20%, rgba(250, 189, 47, 0.07) 0%, transparent 45%),
-    linear-gradient(160deg, #32302f 0%, #282828 60%, #1d2021 100%);
-}
-
-.dark[data-theme="gruvbox"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: var(--background);
 }
 
 :root:not(.dark)[data-theme="solarized"] {
@@ -519,16 +447,10 @@
   --sidebar-accent-foreground: #268bd2;
   --sidebar-border: #c1c5bb;
   --sidebar-ring: #268bd2;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-:root:not(.dark)[data-theme="solarized"] .app-shell {
-  background: #fdf6e3;
-}
-
-:root:not(.dark)[data-theme="solarized"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: #fdf6e3;
 }
 
 .dark[data-theme="solarized"] {
@@ -566,16 +488,10 @@
   --sidebar-accent-foreground: #2aa198;
   --sidebar-border: #304f5c;
   --sidebar-ring: #268bd2;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-.dark[data-theme="solarized"] .app-shell {
-  background: #002b36;
-}
-
-.dark[data-theme="solarized"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: var(--background);
 }
 
 :root:not(.dark)[data-theme="nord"] {
@@ -613,16 +529,10 @@
   --sidebar-accent-foreground: #5e81ac;
   --sidebar-border: #d8dee9;
   --sidebar-ring: #5e81ac;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-:root:not(.dark)[data-theme="nord"] .app-shell {
-  background: linear-gradient(160deg, #eceff4 0%, #e5e9f0 55%, #d8dee9 100%);
-}
-
-:root:not(.dark)[data-theme="nord"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: linear-gradient(160deg, #eceff4 0%, #e5e9f0 55%, #d8dee9 100%);
 }
 
 .dark[data-theme="nord"] {
@@ -660,19 +570,10 @@
   --sidebar-accent-foreground: #88c0d0;
   --sidebar-border: #4c566a;
   --sidebar-ring: #88c0d0;
-  --sidebar-active: color-mix(in srgb, var(--sidebar-foreground) 7%, var(--sidebar));
-  --sidebar-active-foreground: var(--sidebar-foreground);
-}
-
-.dark[data-theme="nord"] .app-shell {
-  background:
-    radial-gradient(ellipse at 20% 30%, rgba(136, 192, 208, 0.12) 0%, transparent 55%),
-    radial-gradient(ellipse at 80% 20%, rgba(94, 129, 172, 0.08) 0%, transparent 45%),
-    linear-gradient(160deg, #434c5e 0%, #2e3440 60%, #2e3440 100%);
-}
-
-.dark[data-theme="nord"] .conversations-sidebar {
-  background: var(--sidebar);
+  --sidebar-active: color-mix(in srgb, var(--primary) 12%, transparent);
+  --sidebar-active-foreground: var(--primary);
+  --sidebar-background: var(--sidebar);
+  --shell-background: var(--background);
 }
 
 :root:not(.dark)[data-theme="custom"] {
@@ -712,14 +613,8 @@
   --sidebar-ring: var(--custom-light-sidebar-ring);
   --sidebar-active: var(--custom-light-sidebar-active);
   --sidebar-active-foreground: var(--custom-light-sidebar-active-foreground);
-}
-
-:root:not(.dark)[data-theme="custom"] .app-shell {
-  background: var(--custom-light-shell-background);
-}
-
-:root:not(.dark)[data-theme="custom"] .conversations-sidebar {
-  background: var(--custom-light-sidebar-background);
+  --sidebar-background: var(--custom-light-sidebar-background);
+  --shell-background: var(--custom-light-shell-background);
 }
 
 .dark[data-theme="custom"] {
@@ -759,12 +654,6 @@
   --sidebar-ring: var(--custom-dark-sidebar-ring);
   --sidebar-active: var(--custom-dark-sidebar-active);
   --sidebar-active-foreground: var(--custom-dark-sidebar-active-foreground);
-}
-
-.dark[data-theme="custom"] .app-shell {
-  background: var(--custom-dark-shell-background);
-}
-
-.dark[data-theme="custom"] .conversations-sidebar {
-  background: var(--custom-dark-sidebar-background);
+  --sidebar-background: var(--custom-dark-sidebar-background);
+  --shell-background: var(--custom-dark-shell-background);
 }

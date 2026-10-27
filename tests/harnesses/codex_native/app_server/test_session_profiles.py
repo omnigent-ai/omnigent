@@ -272,6 +272,9 @@ async def test_native_codex_materializes_provider_auth_for_app_server_and_tui(
     assert 'model_provider="omnigent_provider"' in remote_argv
     assert 'approval_policy="never"' in app_server_argv
     assert 'sandbox_mode="danger-full-access"' in app_server_argv
+    # Every override precedes the subcommand, joining a wrapper's top-level -c group.
+    subcommand = app_server_argv.index("app-server")
+    assert all(i < subcommand for i, arg in enumerate(app_server_argv) if arg == "-c")
 
     config_path = codex_home / "config.toml"
     config = tomllib.loads(config_path.read_text(encoding="utf-8"))

@@ -193,18 +193,25 @@ async def test_deregister_fails_inventory_waiters_and_ignores_settled_futures() 
     cancelled_skills.cancel()
     completed_mcp = loop.create_future()
     completed_mcp.set_result(None)
+    live_create, live_remove, live_list = (loop.create_future() for _ in range(3))
     conn.pending_skills.update({"live": live_skills, "cancelled": cancelled_skills})
     conn.pending_mcp_servers.update({"live": live_mcp, "completed": completed_mcp})
+    conn.pending_create_worktrees["live"] = live_create
+    conn.pending_remove_worktrees["live"] = live_remove
+    conn.pending_list_worktrees["live"] = live_list
 
     assert registry.deregister(conn.host_id) is True
 
-    for future in (live_skills, live_mcp):
+    for future in (live_skills, live_mcp, live_create, live_remove, live_list):
         with pytest.raises(ConnectionError, match="disconnected"):
             future.result()
     assert cancelled_skills.cancelled()
     assert completed_mcp.result() is None
     assert conn.pending_skills == {}
     assert conn.pending_mcp_servers == {}
+    assert conn.pending_create_worktrees == {}
+    assert conn.pending_remove_worktrees == {}
+    assert conn.pending_list_worktrees == {}
 
 
 async def test_replacement_only_fails_old_inventory_waiters() -> None:
@@ -214,16 +221,19 @@ async def test_replacement_only_fails_old_inventory_waiters() -> None:
     loop = asyncio.get_running_loop()
     old_skills = loop.create_future()
     old_mcp = loop.create_future()
+    old_create_worktree = loop.create_future()
     old.pending_skills["old"] = old_skills
     old.pending_mcp_servers["old"] = old_mcp
+    old.pending_create_worktrees["old"] = old_create_worktree
 
     new = registry.register("host_inventory_replace", FakeWebSocket(), _make_hello(), owner="bob")
 
-    for future in (old_skills, old_mcp):
+    for future in (old_skills, old_mcp, old_create_worktree):
         with pytest.raises(ConnectionError, match="disconnected"):
             future.result()
     assert old.pending_skills == {}
     assert old.pending_mcp_servers == {}
+    assert old.pending_create_worktrees == {}
 
     new_skills = loop.create_future()
     new_mcp = loop.create_future()

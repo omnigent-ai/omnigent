@@ -5221,6 +5221,64 @@ async def test_publish_status_keeps_failed_sticky_against_trailing_idle(
     assert cache_after == "idle"
 
 
+@pytest.mark.parametrize("turn_completed", [True, None], ids=["confirmed", "quiescence"])
+async def test_confirmed_turn_completion_clears_earlier_native_failure(
+    client: httpx.AsyncClient,
+    monkeypatch: pytest.MonkeyPatch,
+    turn_completed: bool | None,
+) -> None:
+    """
+    A later turn's confirmed ``idle`` clears an earlier native turn failure.
+
+    claude-native's ``Stop`` hook marks a successful turn with
+    ``turn_completed``. When that turn's ``running`` edge never arrives, the
+    sticky ``failed`` from an earlier turn would otherwise outlive the
+    recovery and keep the sidebar error marker lit (OMNI-13314). A bare
+    quiescence ``idle`` must still leave the failure in place.
+    """
+    published: list[dict[str, Any]] = []
+    monkeypatch.setattr(
+        "omnigent.server.routes.sessions.session_stream.publish",
+        lambda _session_id, event: published.append(event),
+    )
+    agent = await create_test_agent(
+        client,
+        executor={"type": "omnigent", "config": {"harness": "claude-native"}},
+    )
+    session = await _create_session(client, agent["id"])
+    session_id = session["id"]
+
+    failed_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={
+            "type": "external_session_status",
+            "data": {"status": "failed", "output": "API Error: 500", "response_id": "resp_1"},
+        },
+    )
+    assert failed_resp.status_code == 202, failed_resp.text
+    idle_data: dict[str, Any] = {"status": "idle", "response_id": "resp_2"}
+    if turn_completed is not None:
+        idle_data["turn_completed"] = turn_completed
+    idle_resp = await client.post(
+        f"/v1/sessions/{session_id}/events",
+        json={"type": "external_session_status", "data": idle_data},
+    )
+    assert idle_resp.status_code == 202, idle_resp.text
+
+    snapshot_resp = await client.get(f"/v1/sessions/{session_id}")
+    assert snapshot_resp.status_code == 200, snapshot_resp.text
+    snapshot = snapshot_resp.json()
+    statuses = [event["status"] for event in published if event.get("type") == "session.status"]
+    if turn_completed:
+        assert statuses == ["failed", "idle"]
+        assert snapshot["status"] != "failed"
+        assert snapshot["last_task_error"] is None
+    else:
+        assert statuses == ["failed"]
+        assert snapshot["status"] == "failed"
+        assert snapshot["last_task_error"] is not None
+
+
 async def test_publish_status_tracks_in_flight_response_id(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

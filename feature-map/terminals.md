@@ -140,6 +140,9 @@ verify-env run -- python -m pytest <test> --ui-skip-build --video=on \
   resource facade through three failed launches and a successful retry for
   Claude/Codex terminal roles and an auxiliary shell. The successful real pane
   must accept input, and final cleanup must release every allocated instance.
+  `tests/runner/test_native_terminal_start_error_payload.py::test_host_setup_error_surfaces_its_remedy`
+  (plain `uv run pytest`) checks that a host without a usable tmux shows how
+  to fix it, not a runner-log pointer.
 - **`hidden-terminal`:**
   `tests/e2e_ui/chat/test_hidden_terminal_scrollbar.py::test_hidden_terminal_scrollbar_never_paints_over_foreground`
 - **`dialog-routing`:**

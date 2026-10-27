@@ -548,7 +548,7 @@ export function FilesPanel({
         </div>
       </div>
       {/* Content */}
-      <div className="shrink-0 border-t border-border" />
+      <div className="workspace-panel-header-divider shrink-0 border-t border-border" />
       {/* Search toolbar — the Changed | All scope switch leads, then the
               search field, then the per-view trailing control (Sort for the
               changed list, glob filters for the tree). Lives outside the

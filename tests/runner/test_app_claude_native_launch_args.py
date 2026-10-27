@@ -13,6 +13,7 @@ passed. See designs/NATIVE_RUNNER_SERVER_LAUNCH.md.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 from pathlib import Path
@@ -496,6 +497,70 @@ def test_build_native_claude_terminal_env_rejects_credentials_on_helper_path(
     )
     with pytest.raises(RuntimeError, match=credential):
         build_native_claude_terminal_env(leaking)
+
+
+@pytest.mark.parametrize(
+    ("configured", "managed", "ambient", "disabled"),
+    [
+        ("https://gateway.example/anthropic", None, None, True),
+        ("https://api.anthropic.com", None, None, False),
+        (None, "https://gateway.example/anthropic", None, True),
+        ("https://api.anthropic.com", "https://gateway.example/anthropic", None, True),
+        ("https://gateway.example/anthropic", "https://api.anthropic.com", None, False),
+        ("", None, "https://gateway.example/anthropic", True),
+        (None, None, "https://gateway.example/anthropic", True),
+        ("https://api.anthropic.com", None, "https://gateway.example/anthropic", False),
+        ("https://gateway.example/anthropic", None, "https://api.anthropic.com", True),
+        (None, None, None, False),
+    ],
+)
+def test_claude_terminal_env_disables_refusal_fallback_for_effective_gateway(
+    configured: str | None,
+    managed: str | None,
+    ambient: str | None,
+    disabled: bool,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The effective Anthropic endpoint decides whether canonical fallback is safe."""
+    from omnigent.harnesses.claude_native import main as claude_native
+
+    managed_settings = tmp_path / "managed-settings.json"
+    managed_settings.write_text(
+        json.dumps({"env": {"ANTHROPIC_BASE_URL": managed} if managed else {}})
+    )
+    monkeypatch.setattr(claude_native, "_CLAUDE_CODE_MANAGED_SETTINGS_PATHS", (managed_settings,))
+    if ambient is None:
+        monkeypatch.delenv("ANTHROPIC_BASE_URL", raising=False)
+    else:
+        monkeypatch.setenv("ANTHROPIC_BASE_URL", ambient)
+    config = (
+        ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": configured} if configured else {})
+        if configured is not None
+        else None
+    )
+
+    terminal_env = build_native_claude_terminal_env(config)
+
+    assert (terminal_env.get("CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK") == "1") is disabled
+
+
+@pytest.mark.parametrize(
+    ("base_url", "configured_flag", "expected_flag"),
+    [
+        ("https://gateway.example/anthropic", "0", "1"),
+        ("https://api.anthropic.com", "0", "0"),
+        ("https://api.anthropic.com", "1", "1"),
+    ],
+)
+def test_claude_terminal_env_refusal_fallback_provider_override(
+    base_url: str, configured_flag: str, expected_flag: str
+) -> None:
+    """Gateway launches force the guard; direct Anthropic keeps explicit preferences."""
+    flag = "CLAUDE_CODE_DISABLE_REFUSAL_FALLBACK"
+    config = ClaudeNativeUcodeConfig(env={"ANTHROPIC_BASE_URL": base_url, flag: configured_flag})
+
+    assert build_native_claude_terminal_env(config)[flag] == expected_flag
 
 
 def test_claude_terminal_env_databricks_gateway_helper_path() -> None:
