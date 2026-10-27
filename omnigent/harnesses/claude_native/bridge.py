@@ -166,11 +166,21 @@ def _serialize_bridge_injection(function: _InjectionFunction) -> _InjectionFunct
             try:
                 return function(bridge_dir, *args, **kwargs)
             except ClaudeComposerNotCleared:
-                # The refused paste sent nothing. Give a clipped composer room,
-                # then recheck readiness and pending prompts before retrying.
+                # The refused paste sent nothing. Repaint external notices or give
+                # a clipped composer room, then recheck every delivery guard.
                 info = _wait_for_tmux_info(bridge_dir, timeout_s=_TMUX_READY_TIMEOUT_S)
+                box = _composer_box(_capture_pane(info["socket_path"], info["tmux_target"]))
+                redraw_requested = box is not None and any(
+                    "[idle-compact]" in row for row in box.rows
+                )
+                if redraw_requested:
+                    # Isaac logs outside Claude's renderer; editing keys cannot erase it.
+                    _logger.info(
+                        "claude-native: redrawing an idle-compaction notice over the input box"
+                    )
+                    _run_tmux(info["socket_path"], "send-keys", "-t", info["tmux_target"], "C-l")
                 with _usable_composer_height(info["socket_path"], info["tmux_target"]) as resized:
-                    if not resized:
+                    if not resized and not redraw_requested:
                         raise
                     time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
                     return function(bridge_dir, *args, **kwargs)
