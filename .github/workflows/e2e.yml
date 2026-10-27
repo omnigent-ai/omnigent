@@ -41,9 +41,9 @@ on:
   workflow_dispatch:
     inputs:
       parallelism:
-        description: "Number of pytest workers per shard (-n flag). Default 2 runs up to 16 workers across 8 shards."
+        description: "Number of pytest workers per shard (-n flag). Default 3 runs up to 24 workers across 8 shards."
         required: false
-        default: "2"
+        default: "3"
 
 concurrency:
   # PRs key by number, dispatch by branch (so re-runs cancel); schedule keys
@@ -118,7 +118,7 @@ jobs:
     # Sharded matrix: each shard runs ~1/N of the set, under the wallclock
     # budget where CrowdStrike kills long jobs (#426). max-parallel:8 runs
     # all shards concurrently so one wedged shard can't block the others.
-    # Two pytest workers per shard allow up to 16 concurrent test workers.
+    # Three pytest workers per shard allow up to 24 concurrent test workers.
     name: E2E Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
     # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: setup
@@ -148,5 +148,5 @@ jobs:
         with:
           shard_id: ${{ matrix.shard_id }}
           num_shards: ${{ matrix.num_shards }}
-          parallelism: ${{ github.event.inputs.parallelism || '2' }}
+          parallelism: ${{ github.event.inputs.parallelism || '3' }}
           nightly_full: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
