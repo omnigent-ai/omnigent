@@ -755,6 +755,24 @@ describe("SettingsPage", () => {
     );
   });
 
+  it("re-tints the dark canvas when the background tint changes", () => {
+    renderPage("/settings/appearance");
+
+    fireEvent.click(screen.getByTestId("custom-theme-tint-trigger"));
+    const tint = screen.getByTestId("custom-theme-tint-input") as HTMLInputElement;
+    expect(tint.value).toBe("#FFFFFF");
+    fireEvent.change(tint, { target: { value: "#ff0000" } });
+
+    const style = document.documentElement.style;
+    expect(document.documentElement.getAttribute("data-theme")).toBe("custom");
+    expect(style.getPropertyValue("--custom-light-background")).toBe("#ffb6b6");
+    expect(style.getPropertyValue("--custom-dark-background")).toBe("#360508");
+    // The dark canvas is painted with the shell gradient, so that must follow too.
+    expect(style.getPropertyValue("--custom-dark-shell-background")).toBe(
+      "radial-gradient(rgba(140, 29, 169, 0.12), transparent 50%), radial-gradient(at 80% 20%, rgba(120, 19, 129, 0.08), transparent 45%), linear-gradient(145deg, #420322, #36090d, #3b0310)",
+    );
+  });
+
   it("keeps the preset primary color when contrast creates a custom theme", () => {
     renderPage("/settings/appearance");
     fireEvent.change(screen.getByTestId("color-theme-select"), {

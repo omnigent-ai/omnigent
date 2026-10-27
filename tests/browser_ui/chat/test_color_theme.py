@@ -405,6 +405,44 @@ def test_guided_custom_theme_applies_to_both_modes_and_persists(
     )
 
 
+def test_background_tint_reaches_the_dark_canvas(
+    page: Page, chat_session_contract: ChatSessionContract
+) -> None:
+    """The shared Background tint recolors the dark canvas and shell, not only light mode."""
+    page.emulate_media(color_scheme="dark")
+    base_url, session_id = chat_session_contract.base_url, chat_session_contract.session_id
+    session_url = f"{base_url}/c/{session_id}"
+    page.goto(session_url)
+    expect(page.locator(".app-shell")).to_be_visible(timeout=30_000)
+    stock_dark = _computed_theme_tokens(page)
+
+    _open_appearance(page, base_url)
+    light = _theme_radiogroup(page).get_by_role("radio", name="Light")
+    light.click()
+    expect(light).to_have_attribute("aria-checked", "true")
+    stock_light_background = _computed_theme_tokens(page)["background"]
+    page.get_by_test_id("custom-theme-tint-trigger").click()
+    tint = page.get_by_test_id("custom-theme-tint-input")
+    expect(tint).to_be_visible()
+    tint.fill("#ff0000")
+    page.keyboard.press("Escape")
+    expect(_color_theme_select(page)).to_contain_text("Custom")
+    assert _computed_theme_tokens(page)["background"] != stock_light_background
+
+    dark = _theme_radiogroup(page).get_by_role("radio", name="Dark")
+    dark.click()
+    expect(dark).to_have_attribute("aria-checked", "true")
+    page.goto(session_url)
+    expect(page.locator(".app-shell")).to_be_visible(timeout=30_000)
+    assert _data_theme(page) == "custom"
+    assert _html_has_dark(page)
+    tinted_dark = _computed_theme_tokens(page)
+    assert tinted_dark["background"] != stock_dark["background"], (
+        f"Background tint left the dark canvas at the stock {stock_dark['background']}"
+    )
+    assert tinted_dark["shell"] != stock_dark["shell"], "the dark shell kept the stock gradient"
+
+
 def test_contrast_round_trip_restores_preset_tokens(
     page: Page, chat_session_contract: ChatSessionContract
 ) -> None:
