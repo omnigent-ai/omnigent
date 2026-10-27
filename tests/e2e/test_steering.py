@@ -103,7 +103,7 @@ def test_steering_acknowledged(
     configure_mock_llm(
         mock_llm_server_url,
         [
-            {"text": "Working on your request..."},
+            {"block": True, "text": "Working on your request..."},
             {"text": "PINEAPPLE"},
         ],
         key=model,
@@ -119,13 +119,14 @@ def test_steering_acknowledged(
         content="Write a long essay about testing.",
     )
 
-    _wait_for_session_running(http_client, session_id, timeout=60)
-
-    send_user_message_to_session(
-        http_client,
-        session_id=session_id,
-        content="STOP. Say only: PINEAPPLE",
-    )
+    steer = "STOP. Say only: PINEAPPLE"
+    try:
+        if mock_llm_server_url is not None:
+            _wait_for_mock_gate(mock_llm_server_url)
+        _wait_for_session_running(http_client, session_id, timeout=60)
+        send_user_message_to_session(http_client, session_id=session_id, content=steer)
+    finally:
+        release_mock_gate(mock_llm_server_url)
 
     body = poll_session_until_terminal(
         http_client,
@@ -139,6 +140,11 @@ def test_steering_acknowledged(
     assert "PINEAPPLE" in all_text.upper(), (
         f"Steering not acknowledged. Output was:\n{all_text[:500]}"
     )
+    if mock_llm_server_url is not None:
+        requests = get_mock_requests(mock_llm_server_url, key=model)
+        assert any(steer in json.dumps(request["input"]) for request in requests[1:]), (
+            "The model never received the steering message"
+        )
 
 
 def test_steering_with_tool_items(

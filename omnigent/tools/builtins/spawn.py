@@ -245,7 +245,8 @@ def _build_sys_session_send_schema(
             " Alternatively pass (agent, title) to spawn-or-continue a declared sub-agent. "
             "Use exactly one addressing mode. Reusing a title continues the same child. "
             "For parallel work, emit multiple calls with distinct task-based titles. "
-            "Optional args.file_ids attach uploaded files on the first named send only."
+            "Optional args.file_ids attach uploaded files on the first named send only; "
+            "they cannot be used with session_id or when continuing an existing named session."
         )
     # ``args.harness`` is allowlist-gated (design D.4): advertise it only when
     # at least one declared sub-agent opts in via

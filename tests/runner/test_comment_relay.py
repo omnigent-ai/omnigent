@@ -374,20 +374,8 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
     info = json.loads(relay_file.read_text())
 
     tools_by_name = {t["name"]: t for t in info["tools"]}
-    # The framework comment tools, read-only session-discovery tools
-    # (sys_session_list / sys_session_get_history / sys_session_get_info),
-    # read-only agent tools (sys_agent_list / sys_agent_get /
-    # sys_agent_download), policy tools (sys_add_policy /
-    # sys_policy_registry), and OS tools (sys_os_*) — claude-native
-    # ignores the harness tool schemas, so this relay is the only
-    # surface that reaches Claude Code. All are routed through the AP
-    # server's /mcp endpoint for policy enforcement. The opt-in spawn
-    # writes (sys_session_send/close/create) are absent here because
-    # this fixture's session has no resolvable spec — the fallback
-    # can't evaluate the (tools.agents | spawn) gate; specs that opt
-    # in get them via the ToolManager-derived branch.
-    # No more, no less: a missing entry means the schema loop dropped a class;
-    # an extra entry means an unintended tool leaked into the relay.
+    # Without a resolvable spec, the relay exposes send-by-ID and discovery
+    # but no named spawning, creation or closing tools.
     assert set(tools_by_name) == {
         "list_comments",
         "update_comment",
@@ -396,6 +384,7 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "sys_session_get_info",
         "sys_session_rename",
         "sys_session_message",
+        "sys_session_send",
         "ui_open_file",
         "sys_agent_list",
         "sys_agent_get",
@@ -422,6 +411,10 @@ async def test_terminal_launch_with_bridge_inject_advertises_comment_tools(
         "session_id",
         "message",
     ]
+    assert set(tools_by_name["sys_session_send"]["parameters"]["properties"]) == {
+        "session_id",
+        "args",
+    }
     assert tools_by_name["ui_open_file"]["parameters"]["required"] == ["path"]
     assert tools_by_name["ui_open_file"]["parameters"]["additionalProperties"] is False
     # A url + token prove the localhost relay HTTP server actually started
