@@ -15,6 +15,7 @@ from unittest.mock import AsyncMock, Mock
 
 import psutil
 import pytest
+from websockets.asyncio.server import ServerConnection, serve
 
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_egress import CertificateFailure
@@ -273,7 +274,8 @@ state_dir = Path(os.environ["FAKE_APP_SERVER_STATE_DIR"])
 attempt = len(list(state_dir.glob("attempt-*"))) + 1
 (state_dir / f"attempt-{attempt}").write_text(str(os.getpid()))
 host, port = sys.argv[sys.argv.index("--listen") + 1].removeprefix("ws://").split(":")
-if attempt == 1:
+first_mode = os.environ.get("FAKE_APP_SERVER_FIRST_MODE", "no_listener")
+if attempt == 1 and first_mode == "no_listener":
     # Bound but never listening: connects are refused; the sleep outlasts the
     # test's readiness budget without lingering if teardown ever regresses.
     with socket.socket() as held:
@@ -286,6 +288,9 @@ async def handle(connection):
     async for raw in connection:
         message = json.loads(raw)
         if "id" in message:
+            if attempt == 1 and first_mode == "no_initialize":
+                (state_dir / "initialize-received").touch()
+                continue
             await connection.send(json.dumps({"id": message["id"], "result": {}}))
 
 
@@ -319,10 +324,11 @@ def _free_port_outside_the_ephemeral_range() -> int:
     raise RuntimeError("no free loopback port between 20000 and 29999")
 
 
+@pytest.mark.parametrize("first_mode", ["no_listener", "no_initialize"])
 async def test_start_respawns_a_silent_app_server_on_the_same_transport(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, first_mode: str
 ) -> None:
-    """A real app-server that never listens is replaced on the URL callers already hold."""
+    """An app-server that never initializes is replaced on the URL callers already hold."""
     from omnigent.harnesses.codex_native import app_server as codex_native_app_server
 
     source_home = tmp_path / "source-codex-home"
@@ -348,14 +354,21 @@ async def test_start_respawns_a_silent_app_server_on_the_same_transport(
         tmp_path / "codex-home",
         tmp_path / "bridge",
         workspace,
-        env={"FAKE_APP_SERVER_STATE_DIR": str(state_dir)},
+        env={
+            "FAKE_APP_SERVER_STATE_DIR": str(state_dir),
+            "FAKE_APP_SERVER_FIRST_MODE": first_mode,
+        },
     )
     server.codex_path = str(codex)
     server.listen_url = listen_url
 
-    await server.start()
+    await asyncio.wait_for(server.start(), timeout=15)
     try:
-        assert sorted(path.name for path in state_dir.iterdir()) == ["attempt-1", "attempt-2"]
+        assert sorted(path.name for path in state_dir.glob("attempt-*")) == [
+            "attempt-1",
+            "attempt-2",
+        ]
+        assert (state_dir / "initialize-received").exists() is (first_mode == "no_initialize")
         assert server.listen_url == listen_url
         silent_pid = int((state_dir / "attempt-1").read_text())
         # close() awaited the child, so it is reaped, not merely terminated.
@@ -657,6 +670,93 @@ async def test_wait_until_ready_cancellation_closes_connecting_client(
         await task
 
     assert client.close_calls == 1
+
+
+@pytest.mark.parametrize("outcome", ["timeout", "cancelled"])
+async def test_wait_until_ready_releases_stalled_initialize(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, outcome: str
+) -> None:
+    """A stalled initialize cannot outlive its startup deadline or caller cancellation."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 0.2)
+    initialize_received = asyncio.Event()
+    connection_closed = asyncio.Event()
+
+    async def handle(connection: ServerConnection) -> None:
+        message = json.loads(await connection.recv())
+        assert message["method"] == "initialize"
+        initialize_received.set()
+        await connection.wait_closed()
+        connection_closed.set()
+
+    clients: list[CodexAppServerClient] = []
+
+    def client_for_probe(*, ws_url: str, client_name: str) -> CodexAppServerClient:
+        client = CodexAppServerClient(ws_url=ws_url, client_name=client_name)
+        clients.append(client)
+        return client
+
+    monkeypatch.setattr(codex_native_app_server, "CodexAppServerClient", client_for_probe)
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.proc = Mock(returncode=None)
+    async with serve(handle, "127.0.0.1", 0) as listener:
+        port = listener.sockets[0].getsockname()[1]
+        server.listen_url = f"ws://127.0.0.1:{port}"
+        task = asyncio.create_task(server._wait_until_ready())
+        try:
+            await asyncio.wait_for(initialize_received.wait(), timeout=2)
+            if outcome == "cancelled":
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+            else:
+                with pytest.raises(CodexAppServerSilentStartTimeout) as excinfo:
+                    await asyncio.wait_for(task, timeout=2)
+                assert excinfo.value.last_error_type == "TimeoutError"
+            await asyncio.wait_for(connection_closed.wait(), timeout=2)
+            assert len(clients) == 1
+            assert clients[0]._pending_requests == {}
+            assert clients[0]._reader_task is None
+            assert clients[0]._ws is None
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_wait_until_ready_accepts_initialize_inside_deadline(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A delayed initialize reply still succeeds inside the startup budget."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    monkeypatch.setattr(codex_native_app_server, "_APP_SERVER_READY_TIMEOUT_SECONDS", 2.0)
+    initialized = asyncio.Event()
+
+    async def handle(connection: ServerConnection) -> None:
+        message = json.loads(await connection.recv())
+        assert message["method"] == "initialize"
+        await asyncio.sleep(0.05)
+        await connection.send(json.dumps({"id": message["id"], "result": {}}))
+        notification = json.loads(await connection.recv())
+        assert notification["method"] == "initialized"
+        initialized.set()
+        await connection.wait_closed()
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.proc = Mock(returncode=None)
+    async with serve(handle, "127.0.0.1", 0) as listener:
+        port = listener.sockets[0].getsockname()[1]
+        server.listen_url = f"ws://127.0.0.1:{port}"
+        client = await asyncio.wait_for(server._wait_until_ready(), timeout=3)
+        try:
+            await asyncio.wait_for(initialized.wait(), timeout=2)
+        finally:
+            await client.close()
 
 
 async def test_wait_until_ready_deadline_is_the_app_server_budget(

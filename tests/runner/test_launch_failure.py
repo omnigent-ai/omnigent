@@ -181,6 +181,12 @@ def test_classifies_native_429_and_rate_limit_errors(code: str, message: str) ->
     "message",
     [
         "An unexpected error occurred",
+        "provider auth command `helper` timed out after 20000 ms",
+        "Authentication request timed out",
+        "Tool request timed out",
+        "Fatal error: application network permission was revoked",
+        "Fatal error: application network policy is unavailable",
+        "HTTP 401: currently experiencing high demand, which may cause temporary errors",
         "API Error: Request rejected (401) · UNAUTHENTICATED",
         "API Error: Request rejected (403) · PERMISSION_DENIED",
         (
@@ -303,6 +309,9 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         "API Error: Request rejected (499) · CANCELLED",
         'unexpected status 499 Client Closed Request: {"error_code": "CANCELLED","message":""}',
         '{"error_code":"CANCELLED","message":""}',
+        "Request timed out",
+        " request timed out. ",
+        "We’re currently experiencing high demand, which may cause temporary errors.",
     ],
 )
 def test_classifies_transient_upstream_errors(code: str, message: str) -> None:
@@ -334,6 +343,13 @@ def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> Non
 @pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
 def test_gateway_499_does_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, _GATEWAY_499_OUTPUT) == code
+    assert classify_native_turn_error(code, "Request timed out") == code
+    assert (
+        classify_native_turn_error(
+            code, "We’re currently experiencing high demand, which may cause temporary errors."
+        )
+        == code
+    )
 
 
 @pytest.mark.parametrize(

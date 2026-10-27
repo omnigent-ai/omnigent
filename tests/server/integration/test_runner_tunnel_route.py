@@ -518,7 +518,8 @@ async def test_tunnel_close_race_logs_each_helper_outcome(
                 if message["type"] == "websocket.send":
                     frame_in_transport.set()
                     await peer_closed.wait()
-                    raise RuntimeError(private_detail)
+                    # RuntimeError after disconnect is an expected send/close race.
+                    raise ValueError(private_detail)
                 await send(message)
 
             await self.app(scope, receive_frame, send_frame)
@@ -542,7 +543,7 @@ async def test_tunnel_close_race_logs_each_helper_outcome(
     assert len(ends) == 1
     assert ends[0]["connection_id"] == "conn-close-race"
     outcomes = json.loads(ends[0]["helper_outcomes"])
-    assert outcomes["sender"] == "error:RuntimeError"
+    assert outcomes["sender"] == "error:ValueError"
     assert outcomes["receive"] == "error:WebSocketDisconnect"
     assert ends[0]["receive_close_code"] == 1006
     assert ends[0]["asgi_client_state"] == "DISCONNECTED"

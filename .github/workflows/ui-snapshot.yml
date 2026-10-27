@@ -86,7 +86,7 @@ jobs:
   detect:
     name: Detect render-affecting changes
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       ui: ${{ steps.changes.outputs.ui }}
     steps:

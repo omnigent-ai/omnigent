@@ -4151,6 +4151,18 @@
             ],
             "title": "Model"
           },
+          "phase": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "description": "Assistant-only harness label for the message, e.g. Codex `\"commentary\"` (progress), `\"partial_answer\"` or `\"final_answer\"`. Stored as given so clients can act on values added later; `None` when unset, not a string, or longer than 64 characters.",
+            "title": "Phase"
+          },
           "role": {
             "description": "`\"user\"` or `\"assistant\"`.",
             "enum": [
@@ -4402,7 +4414,7 @@
         "type": "object"
       },
       "NativeUsageBaseline": {
-        "description": "Own-session cumulative tokens for resuming a native usage reporter.\n\nExcludes spawned sessions. Input includes cache reads, matching the native\nusage event contract rather than the display's separate token buckets.",
+        "description": "Own-session cumulative usage for resuming a native usage reporter.\n\nExcludes spawned sessions. Input includes cache reads, matching the native\nusage event contract rather than the display's separate token buckets.",
         "properties": {
           "cumulative_cache_read_input_tokens": {
             "default": 0,
@@ -4410,6 +4422,19 @@
             "minimum": 0.0,
             "title": "Cumulative Cache Read Input Tokens",
             "type": "integer"
+          },
+          "cumulative_cost_usd": {
+            "anyOf": [
+              {
+                "format": "double",
+                "minimum": 0.0,
+                "type": "number"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "title": "Cumulative Cost Usd"
           },
           "cumulative_input_tokens": {
             "default": 0,
@@ -5973,6 +5998,14 @@
           "server_version": {
             "title": "Server Version",
             "type": "string"
+          },
+          "session_event_types": {
+            "default": [],
+            "items": {
+              "type": "string"
+            },
+            "title": "Session Event Types",
+            "type": "array"
           },
           "session_search_scope": {
             "default": true,
@@ -11560,6 +11593,51 @@
         ]
       }
     },
+    "/v1/hosts/{host_id}/harnesses/accounts/refresh": {
+      "post": {
+        "description": "Probe non-secret harness accounts, using a recent connection result.",
+        "operationId": "refresh_host_harness_accounts_v1_hosts__host_id__harnesses_accounts_refresh_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Refresh Host Harness Accounts V1 Hosts  Host Id  Harnesses Accounts Refresh Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Refresh Host Harness Accounts",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
     "/v1/hosts/{host_id}/harnesses/refresh": {
       "post": {
         "description": "Force an immediate full harness-readiness probe on a host.",
@@ -11722,6 +11800,238 @@
           }
         },
         "summary": "Install Host Harness",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/login": {
+      "post": {
+        "description": "Start a Codex device-code login on a connected host.",
+        "operationId": "start_host_harness_login_v1_hosts__host_id__harnesses__harness__login_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Start Host Harness Login V1 Hosts  Host Id  Harnesses  Harness  Login Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Start Host Harness Login",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/login/{login_id}": {
+      "delete": {
+        "description": "Cancel an active device login.",
+        "operationId": "cancel_host_harness_login_v1_hosts__host_id__harnesses__harness__login__login_id__delete",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "login_id",
+            "required": true,
+            "schema": {
+              "title": "Login Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Cancel Host Harness Login V1 Hosts  Host Id  Harnesses  Harness  Login  Login Id  Delete",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Cancel Host Harness Login",
+        "tags": [
+          "hosts"
+        ]
+      },
+      "get": {
+        "description": "Return the current device-login status without exposing its code.",
+        "operationId": "get_host_harness_login_v1_hosts__host_id__harnesses__harness__login__login_id__get",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "login_id",
+            "required": true,
+            "schema": {
+              "title": "Login Id",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Get Host Harness Login V1 Hosts  Host Id  Harnesses  Harness  Login  Login Id  Get",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Get Host Harness Login",
+        "tags": [
+          "hosts"
+        ]
+      }
+    },
+    "/v1/hosts/{host_id}/harnesses/{harness}/logout": {
+      "post": {
+        "description": "Log Codex or Claude out and return freshly probed account state.",
+        "operationId": "logout_host_harness_v1_hosts__host_id__harnesses__harness__logout_post",
+        "parameters": [
+          {
+            "in": "path",
+            "name": "host_id",
+            "required": true,
+            "schema": {
+              "title": "Host Id",
+              "type": "string"
+            }
+          },
+          {
+            "in": "path",
+            "name": "harness",
+            "required": true,
+            "schema": {
+              "title": "Harness",
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "additionalProperties": true,
+                  "title": "Response Logout Host Harness V1 Hosts  Host Id  Harnesses  Harness  Logout Post",
+                  "type": "object"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/HTTPValidationError"
+                }
+              }
+            },
+            "description": "Validation Error"
+          }
+        },
+        "summary": "Logout Host Harness",
         "tags": [
           "hosts"
         ]

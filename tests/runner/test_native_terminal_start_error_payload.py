@@ -19,9 +19,11 @@ from unittest.mock import Mock
 import httpx
 import pytest
 
+from omnigent.db.db_models import LABEL_VALUE_MAX_LEN
 from omnigent.debug_logging import record_to_row
 from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.launch_args import CodexTransportArgsError
+from omnigent.inference_config import ModelNotAllowedError, inference_config_scope
 from omnigent.inner.terminal import TerminalInstance, TmuxUnavailableError
 from omnigent.runner.native import orchestration
 from omnigent.runner.native.orchestration import (
@@ -30,9 +32,18 @@ from omnigent.runner.native.orchestration import (
     _native_terminal_start_error_response,
     _publish_native_terminal_start_error,
 )
+from omnigent.server.routes._sessions.helpers import _truncate_error_message_label
 from omnigent.terminals.registry import TerminalExitedDuringLaunch
 
 _ERROR_ID_RE = re.compile(r" Error ID: (err_[0-9a-f]{32})\.$")
+_ALLOWED_CODEX_MODEL = "system.ai.gpt-5-6-sol"
+_MODEL_OUTSIDE_ALLOWLIST = ModelNotAllowedError(
+    "system.ai.gpt-6-astra", "codex-native", (_ALLOWED_CODEX_MODEL,)
+)
+_SHORT_MODELS = tuple(f"system.ai.gpt-5-{minor}-sol" for minor in range(1, 6))
+_LONG_MODELS = tuple(
+    f"gateway/openai/gpt-5-{minor}-codex-max-preview-2026" for minor in range(1, 6)
+)
 
 
 def test_missing_session_agent_classified_as_lifecycle_condition() -> None:
@@ -105,6 +116,7 @@ def test_other_causes_keep_generic_startup_failure_code(cause: Exception) -> Non
         ),
         (TmuxUnavailableError("tmux is not installed or not on PATH."), "config"),
         (CodexTransportArgsError("app-server"), "config"),
+        (_MODEL_OUTSIDE_ALLOWLIST, "config"),
     ],
 )
 def test_start_failure_log_row_is_blocking_with_derived_category(
@@ -282,6 +294,7 @@ def test_outdated_pi_cli_surfaces_its_actionable_message() -> None:
             "Claude",
         ),
         (CodexTransportArgsError("app-server"), "Codex"),
+        (_MODEL_OUTSIDE_ALLOWLIST, "Codex"),
     ],
 )
 def test_host_setup_error_surfaces_its_remedy(
@@ -496,3 +509,123 @@ def test_ensure_response_and_diagnostic_share_error_and_session_ids(
     # This ``OSError`` has no numeric errno (single-arg constructor), so the
     # structured cause is the class name only.
     assert "(OSError)" in payload["message"]
+
+
+def test_codex_pin_outside_model_allowlist_names_the_allowed_models() -> None:
+    """A Codex pin outside codex-native's model list says which models the session may use."""
+    from omnigent.harnesses.codex_native.app_server import resolve_native_codex_launch
+
+    pinned_model = "system.ai.gpt-6-astra"
+    inference = {
+        "providers": {
+            "gateway": {
+                "kind": "key",
+                "default": ["openai"],
+                "openai": {
+                    "base_url": "https://gateway.example/v1",
+                    "api_key": "sk-test",
+                    "wire_api": "responses",
+                    "models": {"default": _ALLOWED_CODEX_MODEL},
+                },
+            }
+        },
+        "inference": {
+            "harnesses": {
+                "codex-native": {
+                    "provider": "gateway",
+                    "default_model": _ALLOWED_CODEX_MODEL,
+                    "model_allowlist": [_ALLOWED_CODEX_MODEL],
+                }
+            }
+        },
+    }
+    with inference_config_scope(inference):
+        resolve_native_codex_launch(model=_ALLOWED_CODEX_MODEL)
+        with pytest.raises(ModelNotAllowedError) as rejected:
+            resolve_native_codex_launch(model=pinned_model)
+
+    assert rejected.value.code == ErrorCode.INVALID_INPUT
+    payload = _native_terminal_start_error_payload(rejected.value, "Codex", session_id="conv_1")
+    assert payload["code"] == ErrorCode.HARNESS_NOT_CONFIGURED
+    assert payload["message"].startswith(
+        f"Model {pinned_model!r} is not in the configured model list for 'codex-native'. "
+        f"Allowed models: '{_ALLOWED_CODEX_MODEL}'. Error ID: "
+    ), payload["message"]
+
+
+def test_persisted_error_budget_matches_session_label_width() -> None:
+    """The runner's message budget tracks the server's error-label column."""
+    assert orchestration._PERSISTED_ERROR_MESSAGE_MAX_LEN == LABEL_VALUE_MAX_LEN
+
+
+@pytest.mark.parametrize(
+    ("allowed_models", "expected_list"),
+    [
+        ((), "none"),
+        (_SHORT_MODELS[:3], ", ".join(map(repr, _SHORT_MODELS[:3]))),
+        (_SHORT_MODELS, f"{', '.join(map(repr, _SHORT_MODELS[:3]))}, and 2 more"),
+        (_LONG_MODELS, f"{_LONG_MODELS[0]!r}, and 4 more"),
+    ],
+)
+def test_model_outside_allowlist_lists_models_that_fit_the_error_label(
+    allowed_models: tuple[str, ...], expected_list: str
+) -> None:
+    """The allowed list is shortened so the persisted label keeps the error ID."""
+    exc = ModelNotAllowedError("system.ai.gpt-6-astra", "codex-native", allowed_models)
+    payload = _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")
+
+    assert payload["message"].startswith(
+        f"{exc.message}. Allowed models: {expected_list}. Error ID: "
+    ), payload["message"]
+    assert len(payload["message"]) <= LABEL_VALUE_MAX_LEN
+
+
+@pytest.mark.parametrize(
+    ("message_len", "payload_len", "kept_start"),
+    [(207, 255, "Model "), (208, 256, "Model "), (209, 256, "…")],
+)
+def test_model_outside_allowlist_message_keeps_its_start_up_to_the_label_width(
+    message_len: int, payload_len: int, kept_start: str
+) -> None:
+    """A message keeps its start while it and the error ID fit the label, and not after."""
+    unpadded = orchestration._native_terminal_configuration_message(
+        ModelNotAllowedError("", "codex-native", ("model-a",))
+    )
+    assert unpadded is not None
+    exc = ModelNotAllowedError("x" * (message_len - len(unpadded)), "codex-native", ("model-a",))
+    message = _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")["message"]
+
+    assert len(message) == payload_len
+    assert message.startswith(kept_start)
+    assert _truncate_error_message_label(message) == message
+
+
+def test_allowed_model_ids_are_quoted_with_control_characters_escaped() -> None:
+    """A configured model ID can't start a new line in the message or its log record."""
+    exc = ModelNotAllowedError("system.ai.gpt-6-astra", "codex-native", ("model-a\nforged",))
+    message = orchestration._native_terminal_configuration_message(exc)
+
+    assert message is not None
+    assert "\n" not in message
+    assert message.endswith(r"Allowed models: 'model-a\nforged'.")
+
+
+@pytest.mark.parametrize(
+    ("rejected_model", "allowed_models", "kept_ending"),
+    [
+        ("gateway/" + "x" * 240, ("model-a", "model-b"), "Allowed models: 'model-a', and 1 more."),
+        ("system.ai.gpt-6-astra", ("gateway/" + "y" * 240,), "y" * 100 + "'."),
+    ],
+)
+def test_oversized_model_id_keeps_the_error_id_in_the_persisted_label(
+    rejected_model: str, allowed_models: tuple[str, ...], kept_ending: str
+) -> None:
+    """An oversized model ID gives up the message's start, not its remedy or error ID."""
+    exc = ModelNotAllowedError(rejected_model, "codex-native", allowed_models)
+    message = _native_terminal_start_error_payload(exc, "Codex", session_id="conv_1")["message"]
+
+    assert _truncate_error_message_label(message) == message
+    assert message.startswith("…")
+    error_id = _ERROR_ID_RE.search(message)
+    assert error_id is not None, message
+    assert message[: error_id.start()].endswith(kept_ending), message

@@ -48,6 +48,10 @@ class ScheduledTaskDispatchStore(Protocol):
         """Pause only if the active task still matches the rejected snapshot."""
         ...
 
+    def complete_schedule(self, task: ScheduledTask) -> bool:
+        """Mark an active schedule with no remaining occurrence completed, if unchanged."""
+        ...
+
     def list_due_tasks(
         self, now: int, *, after: DispatchCursor | None = None, limit: int = 100
     ) -> list[ScheduledTask]: ...
@@ -62,6 +66,8 @@ class ScheduledTaskDispatchStore(Protocol):
         lease_seconds: int,
     ) -> ScheduledTaskRun | None:
         """Advance an unchanged task and insert its unique starting run atomically.
+
+        A ``None`` next run marks the task completed.
 
         An already-recorded occurrence advances the cursor but returns None,
         as does a changed task. Neither case starts another run.

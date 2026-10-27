@@ -13347,9 +13347,15 @@ async def test_failed_turn_event_names_the_web_message_it_carried() -> None:
 
 
 @pytest.mark.asyncio
-async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
+@pytest.mark.parametrize("with_client_id", [False, True])
+async def test_turn_lifecycle_events_name_the_web_message_they_settle(
+    with_client_id: bool,
+) -> None:
     conv = "conv_stable_id_on_lifecycle"
     stable_id = "8a4b0d2f6c3e5a7b9d1f2e3c4b5a6d7e"
+    identity = {"pending_id": "pending_" + "a" * 32, "delivery_attempt_id": "b" * 32}
+    if with_client_id:
+        identity["input_stable_id"] = stable_id
 
     async def _spec_resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
         del agent_id, session_id
@@ -13382,7 +13388,7 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
                 "agent_id": "ag_stable",
                 "model": "x",
                 "content": [{"role": "user", "content": "hi"}],
-                "stable_id": stable_id,
+                **identity,
             },
         )
         assert response.status_code == 200
@@ -13391,12 +13397,12 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
             "event: response.in_progress",
             "event: response.completed",
         ]
-        assert [
-            json.loads(next(line[5:] for line in frame.splitlines() if line.startswith("data:")))[
-                "input_stable_id"
-            ]
-            for frame in direct_frames
-        ] == [stable_id, stable_id]
+        for frame in direct_frames:
+            event = json.loads(
+                next(line[5:] for line in frame.splitlines() if line.startswith("data:"))
+            )
+            assert {key: event.get(key) for key in identity} == identity
+            assert ("input_stable_id" in event) is with_client_id
         events = await _drain_turn_events(
             app.state.session_event_queues,
             conv,
@@ -13409,7 +13415,10 @@ async def test_turn_lifecycle_events_name_the_web_message_they_settle() -> None:
         for event in events
         if event.get("type") in {"response.in_progress", "response.completed"}
     ]
-    assert [event["input_stable_id"] for event in lifecycle] == [stable_id, stable_id]
+    assert len(lifecycle) == 2
+    for event in lifecycle:
+        assert {key: event.get(key) for key in identity} == identity
+        assert ("input_stable_id" in event) is with_client_id
 
 
 @pytest.mark.asyncio
