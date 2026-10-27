@@ -28,6 +28,7 @@ function setup(t, platform = "darwin", overrides = {}) {
     localHostId: () => "local",
     platform,
     run,
+    getAppIcon: async () => null,
     appDirectories: [directory],
     ...overrides,
   });
@@ -143,6 +144,20 @@ test("offers installed apps and the default app without launching anything", asy
     { id: "default", label: "Default app" },
   ]);
   assert.ok(calls.every(([command]) => command === "/usr/bin/mdfind"));
+});
+
+test("returns real app icons and caches extraction across menu mounts", async (t) => {
+  let reads = 0;
+  const icon = "data:image/png;base64,aWNvbg==";
+  const { list } = setup(t, "darwin", {
+    getAppIcon: async () => {
+      reads++;
+      return icon;
+    },
+  });
+  assert.equal((await list())[0].icon, icon);
+  assert.equal((await list())[0].icon, icon);
+  assert.equal(reads, 1);
 });
 
 test("finds apps in standard directories even without Spotlight metadata", async (t) => {

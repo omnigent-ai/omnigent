@@ -6,6 +6,7 @@ const os = require("node:os");
 const path = require("node:path");
 const { promisify } = require("node:util");
 const { discoverArcaSshHost } = require("./arcaSshDiscovery");
+const { readMacAppIcon } = require("./macAppIcon");
 
 const MAC_APPS = [
   { id: "vscode", label: "VS Code", bundle: "com.microsoft.VSCode", name: "Visual Studio Code" },
@@ -38,7 +39,7 @@ function registerFileOpen({
   localHostId,
   platform = process.platform,
   run = promisify(execFile),
-  getAppIcon = async () => null,
+  getAppIcon = readMacAppIcon,
   resolveSshHost = () => null,
   discoverSshHost = discoverArcaSshHost,
   appDirectories = [
@@ -47,6 +48,7 @@ function registerFileOpen({
     "/System/Applications/Utilities",
   ],
 }) {
+  const iconCache = new Map();
   async function findApp({ name, bundle }) {
     const candidates = await Promise.all(
       appDirectories.map(async (directory) => {
@@ -76,7 +78,12 @@ function registerFileOpen({
         try {
           const appPath = await findApp(app);
           if (!appPath) return null;
-          const icon = await getAppIcon(appPath).catch(() => null);
+          if (!iconCache.has(appPath))
+            iconCache.set(
+              appPath,
+              getAppIcon(appPath).catch(() => null),
+            );
+          const icon = await iconCache.get(appPath);
           return {
             id,
             label,

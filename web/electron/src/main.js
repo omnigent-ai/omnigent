@@ -4667,7 +4667,6 @@ function registerIpc() {
     shell,
     isPinnedOriginSender,
     localHostId: () => omnigentCli.localHostId(),
-    getAppIcon: async (appPath) => (await app.getFileIcon(appPath, { size: "small" })).toDataURL(),
     resolveSshHost: (event, hostId) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       if (!win) return null;
