@@ -68,11 +68,12 @@ describe("browser tab titles", () => {
     const probe = new Promise<Probe>((resolve) => {
       finishProbe = resolve;
     });
+    const browserHasView = vi.fn().mockReturnValue(probe);
     const onBrowserUrlChanged = vi
       .fn<(listener: Listener) => () => void>()
       .mockImplementation(() => vi.fn());
     Object.assign(window, {
-      omnigentDesktop: { browserHasView: () => probe, onBrowserUrlChanged },
+      omnigentDesktop: { browserHasView, onBrowserUrlChanged },
     });
     const { result } = renderHook(() => useBrowserTabs("session-a"));
     const update = onBrowserUrlChanged.mock.calls.at(-1)![0];
@@ -89,6 +90,12 @@ describe("browser tab titles", () => {
         title: "Other session",
       }),
     );
+    const subscriptions = onBrowserUrlChanged.mock.calls.length;
+    const probes = browserHasView.mock.calls.length;
+    act(() => result.current.select("background"));
+    act(() => result.current.select("selected"));
+    expect(onBrowserUrlChanged).toHaveBeenCalledTimes(subscriptions);
+    expect(browserHasView).toHaveBeenCalledTimes(probes);
     await act(async () => {
       finishProbe({ exists: true, url: background.url, title: "Old guide" });
     });
@@ -98,7 +105,7 @@ describe("browser tab titles", () => {
     act(() => update({ ...background, title: "", url: "https://next.example/untitled" }));
     expect(result.current.labelFor("background", 0)).toBe("next.example");
     await act(() => result.current.close("background"));
-    act(() => update(background));
+    act(() => onBrowserUrlChanged.mock.calls.at(-1)![0](background));
     expect(result.current.labelFor("background", 0)).toBe("Browser 1");
     expect(result.current.selected).toBe("selected");
   });

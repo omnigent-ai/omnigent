@@ -65,15 +65,20 @@ export function openAgentBrowserTab(conversationId: string): BrowserTabsState {
 export function useBrowserTabs(conversationId: string) {
   const [state, setState] = useState(() => readBrowserTabsState(conversationId));
   const [pages, setPages] = useState<Record<string, BrowserPage>>({});
+  const viewIdsKey = JSON.stringify(
+    state.tabs.map((tabId) => browserViewId(conversationId, tabId)),
+  );
   useEffect(() => {
     setState(readBrowserTabsState(conversationId));
   }, [conversationId]);
 
   useEffect(() => {
-    const viewIds = new Set(state.tabs.map((tabId) => browserViewId(conversationId, tabId)));
-    setPages((current) =>
-      Object.fromEntries(Object.entries(current).filter(([viewId]) => viewIds.has(viewId))),
-    );
+    const viewIds = new Set<string>(JSON.parse(viewIdsKey));
+    setPages((current) => {
+      const entries = Object.entries(current);
+      const retained = entries.filter(([viewId]) => viewIds.has(viewId));
+      return retained.length === entries.length ? current : Object.fromEntries(retained);
+    });
     const bridge = (window as unknown as { omnigentDesktop?: BrowserTabsBridge }).omnigentDesktop;
     if (!bridge || viewIds.size === 0) return;
     let active = true;
@@ -109,7 +114,7 @@ export function useBrowserTabs(conversationId: string) {
       active = false;
       unsubscribe?.();
     };
-  }, [conversationId, state.tabs]);
+  }, [viewIdsKey]);
 
   const labelFor = (tabId: string, index: number): string => {
     const page = pages[browserViewId(conversationId, tabId)];
