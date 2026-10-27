@@ -24,11 +24,16 @@ import {
   UserCogIcon,
   UsersIcon,
   VectorSquareIcon,
+  SparklesIcon,
 } from "lucide-react";
 import { Link, useLocation } from "@/lib/routing";
 import { Button } from "@/components/ui/button";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
-import { customAgentsSettingsEnabled, isSingleUserMode } from "@/lib/capabilities";
+import {
+  customAgentsSettingsEnabled,
+  isSingleUserMode,
+  skillsMarketplaceEnabled,
+} from "@/lib/capabilities";
 import { useIsAdmin } from "@/hooks/useIsAdmin";
 import { isElectronShell } from "@/lib/nativeBridge";
 import { cn } from "@/lib/utils";
@@ -38,6 +43,7 @@ export type SettingsSectionId =
   | "appearance"
   | "harnesses"
   | "custom-agents"
+  | "skills"
   | "general"
   | "git"
   | "integrations"
@@ -56,6 +62,7 @@ const SECTION_IDS: readonly SettingsSectionId[] = [
   "appearance",
   "harnesses",
   "custom-agents",
+  "skills",
   "general",
   "git",
   "integrations",
@@ -101,6 +108,7 @@ export function settingsNavGroups(
   integrationsEnabled = false,
   customAgentsEnabled = false,
   mcpEnabled = false,
+  skillsEnabled = false,
 ): SettingsNavGroup[] {
   const harnesses: SettingsNavItem = {
     id: "harnesses",
@@ -132,12 +140,12 @@ export function settingsNavGroups(
     general.unshift({ id: "account", label: "Account", icon: UserCogIcon });
   }
   const groups: SettingsNavGroup[] = [{ title: "General", items: general }];
+  const customize: SettingsNavItem[] = [];
   if (customAgentsEnabled) {
-    groups.push({
-      title: "Customize",
-      items: [harnesses, { id: "custom-agents", label: "Custom agents", icon: BotIcon }],
-    });
+    customize.push(harnesses, { id: "custom-agents", label: "Custom agents", icon: BotIcon });
   }
+  if (skillsEnabled) customize.push({ id: "skills", label: "Skills", icon: SparklesIcon });
+  if (customize.length > 0) groups.push({ title: "Customize", items: customize });
   // Keep shell-specific settings directly after the cross-platform preferences.
   if (isDesktop) {
     groups.push({
@@ -203,7 +211,8 @@ export function useSettingsRoute(): {
   const isValidSection =
     (SECTION_IDS as readonly string[]).includes(next) &&
     !(singleUser && (next === "members" || next === "sharing")) &&
-    !(next === "custom-agents" && !customAgentsSettingsEnabled(info));
+    !(next === "custom-agents" && !customAgentsSettingsEnabled(info)) &&
+    !(next === "skills" && !skillsMarketplaceEnabled(info));
   const section = isValidSection ? (next as SettingsSectionId) : defaultSection;
   const harness = section === "harnesses" ? segments[idx + 2] : undefined;
   if (section === "custom-agents" && segments[idx + 2]) {
@@ -266,6 +275,7 @@ export function SettingsSidebarBody({
     integrationsEnabled,
     customAgentsSettingsEnabled(info),
     mcpEnabled,
+    skillsMarketplaceEnabled(info),
   );
 
   return (

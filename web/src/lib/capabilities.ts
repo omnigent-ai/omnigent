@@ -71,7 +71,8 @@ export type FeatureKey =
   | "grid_sessions_display_ui"
   | "automations_v2"
   | "splittable_terminal_view_ui"
-  | "session_orchestration";
+  | "session_orchestration"
+  | "skills_marketplace";
 
 /** Deployment-wide release-feature values advertised by the server. */
 export type FeatureValues = Record<string, boolean>;
@@ -445,6 +446,11 @@ export function sandboxProfilesEnabled(info: ServerInfo | "loading"): boolean {
     info !== "loading" &&
     info.managed_sandboxes_enabled
   );
+}
+
+/** Settings → Skills: browse and install skills from git repositories. */
+export function skillsMarketplaceEnabled(info: ServerInfo | "loading"): boolean {
+  return isFeatureEnabled(info, "skills_marketplace");
 }
 
 export function customAgentsSettingsEnabled(info: ServerInfo | "loading"): boolean {
