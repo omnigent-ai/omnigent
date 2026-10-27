@@ -3423,7 +3423,13 @@ def _databricks_launch_materialization(
     if not host:
         raise CodexDatabricksProfileMissingError(profile)
     host = host.rstrip("/")
-    resolved_model = _resolve_databricks_codex_model(host, profile, model, codex_path=codex_path)
+    # Databricks materialization adds a provider override containing ``model``.
+    # Preserve Codex's configured model before falling back to the workspace's
+    # first servable model; otherwise every unpinned launch silently selects it.
+    requested_model = model or read_codex_home_config_model(_codex_home_config_source_from_env())
+    resolved_model = _resolve_databricks_codex_model(
+        host, profile, requested_model, codex_path=codex_path
+    )
     base_url, auth_command, auth_refresh_interval_ms, auth_config = _databricks_codex_gateway(
         host, profile
     )

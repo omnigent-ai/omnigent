@@ -228,6 +228,40 @@ def test_resolve_databricks_codex_model_matches_servable_ids(
         )
 
 
+def test_databricks_materialization_preserves_codex_configured_default(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An unpinned Databricks launch keeps the user's Codex model setting."""
+    from omnigent.harnesses.codex_native import app_server
+
+    source_home = tmp_path / "codex"
+    source_home.mkdir()
+    (source_home / "config.toml").write_text('model = "gpt-5.6-sol"\n')
+    requested: list[str | None] = []
+
+    def resolve(
+        host: str, profile: str, model: str | None, *, codex_path: str | None = None
+    ) -> str:
+        del host, profile, codex_path
+        requested.append(model)
+        return model or "system.ai.gpt-5-6-luna"
+
+    monkeypatch.setattr(app_server, "_codex_home_config_source_from_env", lambda: source_home)
+    monkeypatch.setattr(app_server, "_databricks_gateway_host", lambda profile: "https://ws.test")
+    monkeypatch.setattr(app_server, "_resolve_databricks_codex_model", resolve)
+    monkeypatch.setattr(
+        app_server,
+        "_databricks_codex_gateway",
+        lambda host, profile: ("https://gateway.test", "printf token", None, None),
+    )
+
+    materialized = app_server._databricks_launch_materialization(model=None, profile="prof")
+
+    assert requested == ["gpt-5.6-sol"]
+    assert materialized.model == "gpt-5.6-sol"
+    assert 'model="gpt-5.6-sol"' in materialized.config_overrides
+
+
 def test_resolve_databricks_codex_model_discovery_failure_warns_without_traceback(
     caplog: pytest.LogCaptureFixture,
     tmp_path: Path,
