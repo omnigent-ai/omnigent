@@ -109,25 +109,17 @@ def test_classifies_missing_binary_by_output() -> None:
     assert diagnosis.title == "Agent command not found"
 
 
-@pytest.mark.parametrize(
-    ("output", "title"),
-    [
-        (
+def test_classifies_gateway_claude_version_failure() -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=0,
+        output=(
             "! ug requires Claude Code 2.1.290 or newer. Your current version is Claude "
-            "Code 2.1.185.\nERROR ug requires Claude Code 2.1.290 or newer.",
-            "Claude Code is too old for the Databricks gateway",
+            "Code 2.1.185.\nERROR ug requires Claude Code 2.1.290 or newer."
         ),
-        (
-            "Failed to fetch safe flags from proxy: [SSL: SSLV3_ALERT_CERTIFICATE_EXPIRE\n"
-            "Please run 'dbcert' on your laptop (NOT ARCA) and try again.",
-            "Databricks certificate expired",
-        ),
-    ],
-)
-def test_classifies_gateway_launcher_prerequisite_failures(output: str, title: str) -> None:
-    diagnosis = classify_terminal_failure(command="env", exit_status=0, output=output)
+    )
     assert diagnosis is not None
-    assert diagnosis.title == title
+    assert diagnosis.title == "Claude Code is too old for the Databricks gateway"
     assert diagnosis.remediation is not None
 
 

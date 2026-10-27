@@ -201,21 +201,6 @@ _TERMINAL_EXIT_MATCHERS: tuple[_TerminalMatcher, ...] = (
             ),
         ),
     ),
-    _TerminalMatcher(
-        "certificate_expired",
-        lambda s: s.output_contains_any(("certificate_expire", "certificate has expired")),
-        FailureDiagnosis(
-            title="Databricks certificate expired",
-            cause=(
-                "The certificate this machine uses to reach Databricks has expired, "
-                "so the agent could not reach its gateway to start."
-            ),
-            remediation=(
-                "Renew the certificate on a Databricks laptop (run `dbcert`), then "
-                "send your message again."
-            ),
-        ),
-    ),
 )
 
 
