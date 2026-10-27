@@ -39,6 +39,7 @@ vi.mock("./hooks/useAgents", () => ({ useSessionAgent: () => ({ data: undefined 
 // URL inside vitest's module graph, so it can't locate the file.
 const indexCssSource = readFileSync("src/index.css", "utf8");
 const generatedPaletteCssSource = readFileSync("src/themePalettes.generated.css", "utf8");
+const centerGlowSvgSource = readFileSync("src/assets/omnigent-center-glow.svg", "utf8");
 const cssSource = `${generatedPaletteCssSource}\n${indexCssSource}`;
 
 // Innermost `selector { ... }` blocks with their match indices, shared by
@@ -170,6 +171,94 @@ describe("index.css backdrop-filter glass rules", () => {
   );
 });
 
+describe("palette-aware surface composition", () => {
+  const lightTokens = indexCssSource.match(/:root \{[^}]*\}/)?.[0];
+  const darkTokens = indexCssSource.match(/\.dark \{[^}]*\}/)?.[0];
+  const appShellRule = indexCssSource.match(/\.dark \.app-shell \{[^}]*\}/)?.[0];
+  const sidebarRule = indexCssSource.match(
+    /\.dark \.omnigent-native-sidebar-surface,[\s\S]*?\.dark \.omnigent-sidebar-panel \{[^}]*\}/,
+  )?.[0];
+  const composerRule = indexCssSource.match(/\.dark \.composer-reference-surface \{[^}]*\}/)?.[0];
+  const composerContextRule = indexCssSource.match(/\.composer-context-bar \{[^}]*\}/)?.[0];
+  const dockedComposerContextRule = indexCssSource.match(
+    /\.composer-context-bar\.rounded-t-none \{[^}]*\}/,
+  )?.[0];
+  const lightMenuRule = indexCssSource.match(/:root:not\(\.dark\) \.menu-surface \{[^}]*\}/)?.[0];
+  const menuRule = indexCssSource.match(/\.dark \.menu-surface \{[^}]*\}/)?.[0];
+  const cardRule = extractBackdropFilterRules().find((rule) => rule.includes(".bg-card"));
+
+  it("keeps generated palette CSS limited to root tokens", () => {
+    expect(generatedPaletteCssSource).not.toContain(".app-shell");
+    expect(generatedPaletteCssSource).not.toContain(".conversations-sidebar");
+    expect(generatedPaletteCssSource).toContain("--shell-background:");
+    expect(generatedPaletteCssSource).toContain("--sidebar-background:");
+  });
+
+  it("uses the palette canvas under the fixed white SVG glow", () => {
+    expect(darkTokens).toContain("--app-shell-bg: var(--background)");
+    expect(darkTokens).toContain("--session-composer-mask-bg: var(--app-shell-bg)");
+    expect(appShellRule).toContain("background-color: var(--app-shell-bg)");
+    expect(appShellRule).toContain('background-image: url("./assets/omnigent-center-glow.svg")');
+    const stopColors = [...centerGlowSvgSource.matchAll(/stop-color="([^"]+)"/g)].map(
+      (match) => match[1],
+    );
+    expect(stopColors).toHaveLength(7);
+    expect(new Set(stopColors)).toEqual(new Set(["white"]));
+    expect(centerGlowSvgSource).toContain('baseFrequency="1.15"');
+    expect(centerGlowSvgSource).toContain('slope="0.012"');
+    expect(centerGlowSvgSource).toContain('filter="url(#microDither)"');
+    expect(centerGlowSvgSource).toContain('opacity="0.32"');
+  });
+
+  it("keeps sidebar, menu, and card effects white over semantic bases", () => {
+    expect(darkTokens).toContain("linear-gradient(transparent 35%, rgb(255 255 255 / 6%))");
+    expect(darkTokens).toContain("linear-gradient(135deg, rgb(255 255 255 / 4%)");
+    expect(darkTokens).toContain(
+      "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
+    );
+    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).toContain("color-mix(in srgb, var(--card) 95%, white)");
+    expect(darkTokens).not.toContain("#5c306c");
+    expect(sidebarRule).toContain("background-color: var(--sidebar)");
+    expect(composerRule).toContain("background-color: var(--composer-surface-bg)");
+    expect(menuRule).toContain("background-color: var(--menu-surface-bg)");
+    expect(cardRule).toContain("background-color: var(--card-surface-bg)");
+  });
+
+  it("keeps the composer context bar mode-aware", () => {
+    expect(lightTokens).toContain(
+      "--composer-header-bg: color-mix(in srgb, var(--background) 94%, black)",
+    );
+    expect(darkTokens).toContain(
+      "--composer-header-bg: color-mix(in srgb, var(--app-shell-bg) 97%, white)",
+    );
+    expect(composerContextRule).toContain("background-color: var(--composer-header-bg)");
+    expect(dockedComposerContextRule).toContain("border-top-width: 0");
+    expect(dockedComposerContextRule).toContain("border-top-left-radius: 0");
+    expect(dockedComposerContextRule).toContain("border-top-right-radius: 0");
+  });
+
+  it("keeps primary CTA colors independent from palette accents", () => {
+    expect(lightTokens).toContain("--primary-cta: #11171c");
+    expect(lightTokens).toContain("--primary-cta-foreground: #fff");
+    expect(darkTokens).toContain("--primary-cta: #e8ecf0");
+    expect(darkTokens).toContain("--primary-cta-foreground: #11171c");
+    expect(generatedPaletteCssSource).not.toContain("--primary-cta");
+  });
+
+  it("keeps menu surfaces white in light mode", () => {
+    expect(lightMenuRule).toContain("background-color: #fff");
+    expect(lightMenuRule).toContain("border: 1px solid rgb(0 0 0 / 8%)");
+  });
+
+  it("does not let surface shorthands erase fixed effect layers", () => {
+    for (const rule of [sidebarRule, menuRule, cardRule]) {
+      expect(rule).toBeDefined();
+      expect(rule).not.toMatch(/(?<!-)background\s*:/);
+    }
+  });
+});
+
 /* Regression test for the "page gets wider when the kebab menu opens" bug.
  *
  * The bg-card glass rule used to exclude `[aria-hidden="true"]` to skip
@@ -215,6 +304,45 @@ describe("index.css bg-card glass rule selector", () => {
     aside.setAttribute("data-collapsed", "true");
     expect(aside.matches(selector)).toBe(false);
     aside.remove();
+  });
+
+  it("applies the same glass composition to nested bg-card surfaces", () => {
+    const aside = makeAside();
+    const nested = document.createElement("div");
+    nested.className = "bg-card";
+    aside.appendChild(nested);
+    expect(nested.matches(selector)).toBe(true);
+    aside.remove();
+  });
+});
+
+describe("workspace panel content border", () => {
+  const surfaceRule = cssBlocks
+    .map(([block]) => block)
+    .find(
+      (block) =>
+        block.includes("[data-workspace-panel-content] > *") &&
+        block.includes("border: none !important"),
+    )!;
+
+  it("leaves the rail edge intact while removing nested surface borders", () => {
+    const dark = document.createElement("div");
+    dark.className = "dark";
+    const rail = document.createElement("aside");
+    rail.setAttribute("aria-label", "Workspace");
+    const content = document.createElement("div");
+    content.setAttribute("data-workspace-panel-content", "");
+    const surface = document.createElement("div");
+    surface.className = "bg-card";
+    content.appendChild(surface);
+    rail.appendChild(content);
+    dark.appendChild(rail);
+    document.body.appendChild(dark);
+
+    const selector = selectorOf(surfaceRule);
+    expect(surface.matches(selector)).toBe(true);
+    expect(rail.matches(selector)).toBe(false);
+    dark.remove();
   });
 });
 
@@ -682,28 +810,31 @@ describe("index.css table cell wrapping rule", () => {
 });
 
 describe("index.css sidebar canvas", () => {
-  const omniLightRule = cssSource.match(
-    /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
+  const lightCanvasRule = indexCssSource.match(
+    /:root:not\(\.dark\) \.conversations-sidebar \{[^}]*\}/,
   )?.[0];
-  const omniDarkRule = cssSource.match(
-    /\.dark:not\(\[data-theme\]\) \.conversations-sidebar \{[^}]*\}/,
+  const darkCanvasRule = indexCssSource.match(
+    /\.dark \.omnigent-native-sidebar-surface,[\s\S]*?\.dark \.omnigent-sidebar-panel \{[^}]*\}/,
   )?.[0];
   const lightEdgeRule = cssSource.match(
     /html:not\(\.dark\) \.conversations-sidebar(?::not\(\.is-peek\))? \{[^}]*\}/,
   )?.[0];
   const darkEdgeRule = cssSource.match(/\.dark \.conversations-sidebar \{[^}]*\}/)?.[0];
   const peekBackgroundRule = cssSource.match(
-    /:root:not\(\.dark\):not\(\[data-theme\]\) \.conversations-sidebar\.is-peek,[\s\S]*?\.dark\[data-theme\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
+    /:root:not\(\[data-theme\]\) \.conversations-sidebar\.is-peek,[\s\S]*?:root\[data-theme\] \.conversations-sidebar\.is-peek \{[^}]*\}/,
   )?.[0];
 
-  it("uses the specified left-to-right gradient for Omnigent light", () => {
-    expect(omniLightRule).toContain("background: linear-gradient(90deg, #fffefe, #fcf6fa)");
+  it("uses palette-owned bases in both modes", () => {
+    expect(lightCanvasRule).toContain("background: var(--sidebar-background, var(--sidebar))");
+    expect(darkCanvasRule).toContain("background-color: var(--sidebar)");
+    expect(darkCanvasRule).toContain("background-image: var(--sidebar-surface-image)");
+    expect(darkCanvasRule).not.toMatch(/\bbackground\s*:/);
   });
 
   it("removes the dot-grid layer from both modes", () => {
     expect(cssSource).not.toContain("--sidebar-dot-color");
-    expect(omniLightRule).not.toContain("radial-gradient");
-    expect(omniDarkRule).not.toContain("radial-gradient");
+    expect(lightCanvasRule).not.toContain("radial-gradient");
+    expect(darkCanvasRule).not.toContain("radial-gradient");
   });
 
   it("uses the shared inset shadow with a dark-only right border", () => {
@@ -711,15 +842,30 @@ describe("index.css sidebar canvas", () => {
     expect(lightEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(darkEdgeRule).toContain(`box-shadow: ${shadow}`);
     expect(lightEdgeRule).toContain("border-right: none");
-    expect(darkEdgeRule).toContain("border-right: 1px solid rgb(255 255 255 / 2%)");
+    expect(darkEdgeRule).toContain("border-right: 1px solid var(--sidebar-edge-border)");
   });
 
-  it("backs floating peek cards with the opaque card color in every theme", () => {
-    expect(peekBackgroundRule).toContain(".dark:not([data-theme]) .conversations-sidebar.is-peek");
-    expect(peekBackgroundRule).toContain(
-      ":root:not(.dark)[data-theme] .conversations-sidebar.is-peek",
-    );
+  it("backs floating peek cards in both modes with the opaque card color", () => {
+    expect(peekBackgroundRule).toContain(":root[data-theme] .conversations-sidebar.is-peek");
     expect(peekBackgroundRule).toContain("background-color: var(--card-solid)");
+  });
+});
+
+describe("index.css composer and menu surfaces", () => {
+  const darkTokens = cssSource.match(/\.dark \{\s*--app-shell-bg:[\s\S]*?\n\}/)?.[0];
+  const queuedSurface = cssSource.match(/\.composer-queued-surface \{[^}]*\}/)?.[0];
+
+  it("composes dark elevated surfaces over the opaque app-shell base", () => {
+    expect(darkTokens).toContain(
+      "--composer-surface-bg: color-mix(in srgb, var(--app-shell-bg) 95%, white)",
+    );
+    expect(darkTokens).toContain("--menu-surface-bg: var(--composer-surface-bg)");
+    expect(darkTokens).not.toContain("--composer-surface-bg: rgb(255 255 255 /");
+  });
+
+  it("uses one opaque surface token for queued rows and workspace metadata", () => {
+    expect(queuedSurface).toContain("background-color: var(--composer-header-bg)");
+    expect(queuedSurface).toContain("background-image: none");
   });
 });
 
@@ -887,15 +1033,8 @@ describe("index.css shadow tokens", () => {
 });
 
 /* Regression test for the "mobile sidebar is see-through" bug.
- *
- * Below md the sidebar is a full-screen overlay on top of the chat. The
- * per-theme `.conversations-sidebar` rules paint its canvas with the
- * `background` SHORTHAND, which resets background-color to transparent — and
- * the dark stack is entirely translucent, so the conversation showed straight
- * through. A later media-query rule restores an opaque fill under the
- * gradients. It only works if it keeps matching the theme rules' specificity
- * (they'd win the tie otherwise) and stays declared after them.
- */
+ * Below md the sidebar overlays the chat, so both canvas rules are followed
+ * by an opaque fill. */
 describe("index.css mobile sidebar opacity", () => {
   const mobileRule = cssSource.match(
     /@media \(width < 48rem\) \{[^@]*?\.conversations-sidebar[^{]*\{[^}]*background-color[^}]*\}/,
@@ -906,18 +1045,18 @@ describe("index.css mobile sidebar opacity", () => {
     expect(mobileRule).toMatch(/background-color:\s*var\(--card-solid\)/);
   });
 
-  it("declares it after the per-theme canvas rules so it wins the cascade", () => {
-    // Matching specificity — the shorthand in the theme rules would otherwise
-    // keep background-color transparent.
-    const palette = generatedPaletteCssSource.lastIndexOf(".conversations-sidebar {");
+  it("declares it after both shared canvas rules so it wins the cascade", () => {
+    const lightPalette = indexCssSource.indexOf(":root:not(.dark) .conversations-sidebar {");
+    const darkPalette = indexCssSource.indexOf(".dark .omnigent-native-sidebar-surface,");
     const mobile = cssSource.indexOf(mobileRule!);
-    expect(palette).toBeGreaterThan(-1);
-    expect(mobile).toBeGreaterThan(palette);
-    // Every palette/mode selector must be covered, or one can go transparent.
-    expect(mobileRule).toContain(":root:not(.dark):not([data-theme]) .conversations-sidebar");
-    expect(mobileRule).toContain(":root:not(.dark)[data-theme] .conversations-sidebar");
-    expect(mobileRule).toContain(".dark:not([data-theme]) .conversations-sidebar");
-    expect(mobileRule).toContain(".dark[data-theme] .conversations-sidebar");
+    expect(lightPalette).toBeGreaterThan(-1);
+    expect(darkPalette).toBeGreaterThan(-1);
+    expect(mobile).toBeGreaterThan(lightPalette);
+    expect(mobile).toBeGreaterThan(darkPalette);
+    expect(mobileRule).toContain(":root:not([data-theme]) .conversations-sidebar");
+    expect(mobileRule).toContain(":root[data-theme] .conversations-sidebar");
+    expect(mobileRule).not.toContain(":not(.dark)");
+    expect(generatedPaletteCssSource).not.toContain(".conversations-sidebar {");
   });
 });
 

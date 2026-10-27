@@ -181,6 +181,7 @@ vi.mock("@/lib/agentLabels", async (importOriginal) => ({
     pi: "Pi",
     antigravity: "Antigravity",
     copilot: "Copilot",
+    grok: "Grok Build",
   }),
 }));
 vi.mock("@/lib/goalApi", async (importOriginal) => ({
@@ -712,6 +713,8 @@ describe("Composer send shortcut", () => {
     const tooltip = await screen.findByRole("tooltip");
 
     expect(within(tooltip).getByText("Send")).toBeInTheDocument();
+    expect(tooltip).toHaveClass("menu-surface", "bg-popover", "text-popover-foreground");
+    expect(tooltip).not.toHaveClass("bg-slate-900", "text-slate-100");
     expect(tooltipKeys(tooltip)).toEqual(["Ctrl", "↵"]);
   });
 
@@ -2375,6 +2378,30 @@ describe("Composer model/effort label", () => {
       />,
     );
     expect(label()).toHaveTextContent("Polly (Pi)");
+  });
+
+  it("shows the harness identity, not the spec pin, for an own-auth ACP session", () => {
+    // Grok Build runs its own model, so the snapshot leaves llmModel null until
+    // the agent reports one. The spec's pinned model must not appear.
+    useChatStore.setState({
+      sessionModelOverride: null,
+      sessionReasoningEffort: null,
+      llmModel: null,
+      sessionHarness: "grok",
+    });
+    renderWithTooltips(
+      <Composer
+        {...composerProps({
+          agents: [{ id: "a1", name: "pinned" }],
+          selectedAgentId: "a1",
+          modelPickerKind: null,
+          showModels: false,
+          showEffort: false,
+        })}
+      />,
+    );
+    expect(label()).toHaveTextContent("Grok Build");
+    expect(label()).not.toHaveTextContent("gpt-4o-mini");
   });
 
   it("names the vendor, not the Task subagent_type, on a Claude Code sub-agent", () => {

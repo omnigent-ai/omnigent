@@ -4499,3 +4499,19 @@ def test_native_token_helper_reaps_its_process_group(
         if process.poll() is None:
             process.terminate()
             process.wait(timeout=4)
+
+
+@pytest.mark.parametrize(
+    "configured", [None, "relative-agent", "/absolute-agent", "~/custom-agent"]
+)
+def test_global_agent_root_uses_launch_environment_and_workspace(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, configured: str | None
+) -> None:
+    monkeypatch.setenv("PI_CODING_AGENT_DIR", str(tmp_path / "wrong-root"))
+    env = {} if configured is None else {"PI_CODING_AGENT_DIR": configured}
+    expected = (
+        Path.home() / ".pi" / "agent" if configured is None else Path(configured).expanduser()
+    )
+    if not expected.is_absolute():
+        expected = tmp_path / expected
+    assert creds.global_pi_agent_dir(env=env, workspace=tmp_path) == expected
