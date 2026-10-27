@@ -236,6 +236,7 @@ _TRANSIENT_UPSTREAM_FRAGMENTS = (
     "server error mid-response",
     "connection lost mid-response",
     "overloaded",
+    "selected model is at capacity",
     "currently experiencing high demand, which may cause temporary errors",
 )
 # 499 is the gateway reporting its own cancelled upstream call, which Claude Code never retries.

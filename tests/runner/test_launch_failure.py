@@ -303,6 +303,7 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         "status_code: 504 Gateway Timeout",
         "API Error: 529",
         "The model is overloaded. Please retry your request.",
+        "Selected model is at capacity. Please try a different model.",
         # The gateway's cancelled upstream call: Claude Code retries 503s, never 499.
         _GATEWAY_499_OUTPUT,
         "API Error: 499",
@@ -344,6 +345,12 @@ def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> Non
 def test_gateway_499_does_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, _GATEWAY_499_OUTPUT) == code
     assert classify_native_turn_error(code, "Request timed out") == code
+    assert (
+        classify_native_turn_error(
+            code, "Selected model is at capacity. Please try a different model."
+        )
+        == code
+    )
     assert (
         classify_native_turn_error(
             code, "We’re currently experiencing high demand, which may cause temporary errors."
