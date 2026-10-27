@@ -6,13 +6,26 @@ import { FileViewerContext } from "@/shell/FileViewerContext";
 import type { RenderItem } from "@/lib/renderItems";
 import { writeTerminalThemeMode } from "@/lib/terminalThemePreferences";
 import { ToolCard, ToolGroupSummary, formatToolDuration, getOutputPreview } from "./ToolCard";
+import type { ToolView } from "./toolViews";
 
-afterEach(cleanup);
+// The registry ships empty; tests register views here to exercise the plug point.
+const registeredViews = vi.hoisted(() => new Map<string, ToolView>());
+vi.mock("./toolViews", () => ({ toolViewFor: (name: string) => registeredViews.get(name) }));
+
+afterEach(() => {
+  cleanup();
+  registeredViews.clear();
+});
 
 // Render helper: ToolCard reads a Tooltip (trigger title) so it needs the
 // TooltipProvider; createElement keeps this in a .ts file without JSX.
 function renderCard(props: Parameters<typeof ToolCard>[0]) {
   return render(createElement(TooltipProvider, null, createElement(ToolCard, props)));
+}
+
+// Radix tabs switch on mouse down (or focus), not on a synthetic click.
+function showView(name: "Fields" | "Raw") {
+  fireEvent.mouseDown(screen.getByRole("tab", { name }));
 }
 
 function renderFileToolCard(
@@ -93,35 +106,168 @@ describe("getOutputPreview", () => {
 });
 
 describe("ToolCard rendering", () => {
-  it("renders the tool title and duration in the collapsed trigger row", () => {
-    // WHY: the trigger row is the always-visible summary; an unknown tool name
-    // falls back to `name(argsSummary)`, and a completed duration renders.
-    renderCard({
-      name: "my_tool",
-      argsSummary: "x=1",
-      arguments: { x: 1 },
-      output: "done",
+  it("renders an unknown tool's humanized title, result line and duration", () => {
+    // WHY: the always-visible trigger shows a humanized title and key argument values.
+    const { container } = renderCard({
+      name: "manage_todo_list",
+      arguments: { operation: "write", todoList: [{ id: 1, title: "Plan", status: "completed" }] },
+      output: "Task plan updated (1 task).",
       state: "output-available",
       duration: 3.25,
     });
-    expect(screen.getByText("my_tool(x=1)")).toBeInTheDocument();
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(screen.getByText("Manage todo list")).toBeInTheDocument();
+    expect(trigger.textContent).toContain("write · 1 item");
+    expect(trigger).toHaveAttribute("title", "Manage todo list write · 1 item (manage_todo_list)");
+    expect(screen.getByTestId("tool-result-line").textContent).toBe("Task plan updated (1 task).");
     expect(screen.getByText("3.3s")).toBeInTheDocument();
+    // WHY: row text follows the Interface font size; the result line sits one caption step down.
+    expect(trigger).toHaveClass("text-ui");
+    expect(screen.getByText("Manage todo list")).toHaveClass("font-medium");
+    expect(screen.getByTestId("tool-result-line")).toHaveClass("text-sm");
   });
 
-  it("expands to reveal the Parameters panel and output on click", () => {
-    // WHY: clicking the trigger must reveal the parameters JSON and the output
-    // section — the collapsed-by-default content path.
+  it("tags an MCP tool with its server and reports its failure on the result line", () => {
+    renderCard({
+      name: "mcp__github__create_pull_request",
+      arguments: { owner: "omnigent-ai", repo: "omnigent", draft: true },
+      output: "Error: 422 Validation Failed: A pull request already exists",
+      state: "output-available",
+    });
+    expect(screen.getByText("Create pull request")).toBeInTheDocument();
+    expect(screen.getByText("github")).toBeInTheDocument();
+    const line = screen.getByTestId("tool-result-line");
+    expect(line.textContent).toBe("Error: 422 Validation Failed: A pull request already exists");
+    expect(line.className).toContain("text-destructive");
+  });
+
+  it("expands to labeled Input and Result fields, with the raw JSON behind a Fields | Raw switch", () => {
+    // WHY: the expanded view shows labeled fields, with the payloads one switch away.
     const { container } = renderCard({
       name: "my_tool",
-      argsSummary: "",
-      arguments: { a: 2 },
+      arguments: { includeComments: false, todoList: [{ title: "Find workflow", status: "done" }] },
       output: "the output text",
       state: "output-available",
     });
-    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
-    fireEvent.click(trigger);
-    expect(screen.getAllByText("Parameters").length).toBeGreaterThan(0);
-    expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(screen.getByText("Include comments")).toBeInTheDocument();
+    expect(screen.getByText("No")).toBeInTheDocument();
+    expect(screen.getByText("Find workflow")).toBeInTheDocument();
+    expect(screen.getByText("done")).toBeInTheDocument();
+    expect(screen.getByText("Result")).toBeInTheDocument();
+    expect(screen.getAllByText("the output text").length).toBeGreaterThan(1);
+    expect(screen.queryByText("Parameters")).toBeNull();
+
+    // Both views stay visible, so the current one reads at a glance.
+    const fields = screen.getByRole("tab", { name: "Fields" });
+    const raw = screen.getByRole("tab", { name: "Raw" });
+    expect(fields).toHaveAttribute("aria-selected", "true");
+    expect(raw).toHaveAttribute("aria-selected", "false");
+
+    showView("Raw");
+    expect(raw).toHaveAttribute("aria-selected", "true");
+    expect(fields).toHaveAttribute("aria-selected", "false");
+    expect(screen.getByText("Parameters")).toBeInTheDocument();
+    expect(screen.getByText("Output")).toBeInTheDocument();
+    expect(screen.queryByText("Input")).toBeNull();
+    expect(container.textContent).toContain('"includeComments": false');
+    // The switch stays put, so keyboard focus survives switching views.
+    expect(screen.getByRole("tab", { name: "Raw" })).toBe(raw);
+
+    showView("Fields");
+    expect(screen.getByText("Input")).toBeInTheDocument();
+    expect(screen.queryByText("Parameters")).toBeNull();
+  });
+
+  it("renders an MCP content-block JSON result as fields", () => {
+    const issue = { id: "OMNI-12243", title: "Claude mod replaces tmux paste", state: "In Review" };
+    const { container } = renderCard({
+      name: "mcp__linear__get_issue",
+      arguments: { id: "OMNI-12243" },
+      output: JSON.stringify([{ type: "text", text: JSON.stringify(issue) }]),
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    const views = screen.getAllByTestId("tool-value-view");
+    expect(views).toHaveLength(2);
+    expect(views[1]!.textContent).toContain("TitleClaude mod replaces tmux paste");
+    expect(views[1]!.textContent).toContain("StateIn Review");
+  });
+
+  it("keeps a JSON result too long to show in full in the expandable preview", () => {
+    // WHY: long results (e.g. a sub-agent's session history) must keep the
+    // truncated preview with its Expand control rather than render every field.
+    const items = Array.from({ length: 60 }, (_, index) => ({ index, text: `item ${index}` }));
+    const { container } = renderCard({
+      name: "sys_session_get_history",
+      arguments: {},
+      output: JSON.stringify({ items }),
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.queryByTestId("tool-value-view")).toBeNull();
+    expect(screen.getByRole("button", { name: "Expand" })).toBeInTheDocument();
+  });
+
+  it("shows a reported failure above the record's other fields", () => {
+    // WHY: a partial failure still returns data; hiding it behind Raw loses the useful part.
+    const { container } = renderCard({
+      name: "search_issues",
+      arguments: {},
+      output: JSON.stringify({ error: "2 of 3 pages failed", results: ["OMNI-1"] }),
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getAllByText("2 of 3 pages failed")).toHaveLength(2);
+    expect(screen.getByTestId("tool-value-view").textContent).toBe("ResultsOMNI-1");
+  });
+
+  it("keeps a short result with a trailing newline inline", () => {
+    const { container } = renderCard({
+      name: "my_tool",
+      arguments: {},
+      output: "ok\n",
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(container.querySelector("pre")).toBeNull();
+    expect(screen.getAllByText("ok").length).toBeGreaterThan(0);
+  });
+
+  it("falls back to the output panel when a JSON result cannot be re-serialized", () => {
+    // WHY: very deep JSON can parse yet exceed JSON.stringify's stack.
+    const stringify = JSON.stringify;
+    const spy = vi.spyOn(JSON, "stringify").mockImplementation((value, ...rest) => {
+      if (value !== null && typeof value === "object" && "deep" in value) {
+        throw new RangeError("Maximum call stack size exceeded");
+      }
+      return stringify(value, ...rest);
+    });
+    try {
+      const { container } = renderCard({
+        name: "my_tool",
+        arguments: {},
+        output: '{"deep": {"a": 1}}',
+        state: "output-available",
+      });
+      fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+      expect(screen.queryByTestId("tool-value-view")).toBeNull();
+      expect(screen.getAllByText("Output").length).toBeGreaterThan(0);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
+  it("shows a tool's reported failure in place of its result", () => {
+    const { container } = renderCard({
+      name: "sys_os_write",
+      arguments: { path: "out.txt", content: "x" },
+      output: '{"error": "permission denied"}',
+      state: "output-available",
+    });
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getAllByText("permission denied")).toHaveLength(2);
   });
 
   it("renders a pending output placeholder while input-available with no output", () => {
@@ -174,13 +320,13 @@ describe("ToolCard rendering", () => {
   ])("opens a Claude Write of %s in the FileViewer as %s", (filePath, opened) => {
     // WHY: Claude Code's file tools pass an absolute `file_path`; a file the
     // agent creates must open like a chat file link — workspace-relative when
-    // under the root, host-absolute otherwise.
+    // under the root, host-absolute otherwise. The row shows that path.
     const openFile = vi.fn();
     renderFileToolCard(
       { openFile, workspaceRoot: "/home/u/ws", workspaceHome: "/home/u" },
       { name: "Write", arguments: { file_path: filePath, content: "x" } },
     );
-    fireEvent.click(screen.getByRole("link", { name: filePath }));
+    fireEvent.click(screen.getByRole("link", { name: opened }));
     expect(openFile).toHaveBeenCalledWith(opened);
   });
 
@@ -204,6 +350,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    showView("Raw");
 
     // Both the Parameters and Output panels default to wrapping.
     const pres = Array.from(container.querySelectorAll("pre"));
@@ -223,6 +370,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    showView("Raw");
 
     const toggles = screen.getAllByRole("button", { name: "Disable word wrap" });
     expect(toggles.length).toBe(2); // Parameters + Output
@@ -234,6 +382,43 @@ describe("ToolCard rendering", () => {
     );
     expect(wrapped.length).toBe(1);
     expect(screen.getByRole("button", { name: "Enable word wrap" })).toBeInTheDocument();
+  });
+});
+
+describe("ToolCard registered views", () => {
+  it("uses a registered view's title, result line and body in place of the generic ones", () => {
+    // WHY: tool-specific renderers plug in through toolViews.ts without
+    // touching ToolCard; each part replaces only its generic counterpart.
+    registeredViews.set("fake_plan", {
+      title: () => ({ verb: "Started 2 of 2", body: "Fetch open PRs" }),
+      summary: (call) => ({ text: `Done: ${String(call.args.done)}`, isError: false }),
+      Body: ({ call }) => createElement("div", null, `Checklist for ${call.name}`),
+    });
+    const { container } = renderCard({
+      name: "fake_plan",
+      arguments: { done: "Find workflow" },
+      output: "Task plan updated (2 tasks).",
+      state: "output-available",
+    });
+    expect(screen.getByText("Started 2 of 2")).toBeInTheDocument();
+    expect(screen.getByTestId("tool-result-line").textContent).toBe("Done: Find workflow");
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("Checklist for fake_plan")).toBeInTheDocument();
+    expect(screen.queryByText("Input")).toBeNull();
+  });
+
+  it("falls back to the generic parts a view leaves out", () => {
+    registeredViews.set("fake_plan", { summary: () => null });
+    const { container } = renderCard({
+      name: "fake_plan",
+      arguments: { step: "one" },
+      output: "ok",
+      state: "output-available",
+    });
+    expect(screen.getByText("Fake plan")).toBeInTheDocument();
+    expect(screen.queryByTestId("tool-result-line")).toBeNull();
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("Input")).toBeInTheDocument();
   });
 });
 
@@ -480,8 +665,8 @@ describe("ToolGroupSummary", () => {
     );
     expect(screen.getByText("Called 2 tools")).toBeInTheDocument();
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getByText("alpha_tool")).toBeInTheDocument();
-    expect(screen.getByText("beta_tool")).toBeInTheDocument();
+    expect(screen.getByText("Alpha tool")).toBeInTheDocument();
+    expect(screen.getByText("Beta tool")).toBeInTheDocument();
   });
 
   it("uses the singular 'tool' for one hidden unrecognized tool", () => {

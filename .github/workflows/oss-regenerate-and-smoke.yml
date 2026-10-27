@@ -1,5 +1,5 @@
 # Keep the repo's public lockfiles consistent with the manifests, validated via
-# a Docker build + CLI smoke. Runs on GitHub-hosted ubuntu-latest so resolution
+# a Docker build + CLI smoke. Runs on a GitHub-hosted runner so resolution
 # sees public registries directly (lockfiles must record public sources, never
 # a proxy). Exists because sync PRs land manifest changes without lockfile
 # updates and the Dockerfile COPYs pnpm-lock.yaml, so the tree is not
@@ -34,7 +34,7 @@ jobs:
       pull-requests: write # open / update the regen PR
     # Gated to this repository; inert in forks and mirrors.
     if: github.repository == 'omnigent-ai/omnigent'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Checkout

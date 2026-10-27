@@ -353,6 +353,7 @@ async def _restore_refused_settings(
     live_change: _LiveSettingsChange | None,
     began: int,
     saved: int,
+    restore_effort: bool = True,
 ) -> None:
     """Undo a refused live change, keeping newer writes and restoring what it replaced."""
     from omnigent.server.routes.sessions.routes_events import (
@@ -364,7 +365,7 @@ async def _restore_refused_settings(
     await _raise_if_runner_re_tunnelled_to_another_replica(
         session_id, attempted.runner_id, conversation_store
     )
-    restore = {"reasoning_effort": True, "model_override": restore_model}
+    restore = {"reasoning_effort": restore_effort, "model_override": restore_model}
     replaced = {
         "reasoning_effort": previous.reasoning_effort,
         "model_override": previous.model_override,
@@ -3347,17 +3348,22 @@ def register_core_routes(
                         raise OmnigentError(
                             _CODEX_SETTINGS_RESTORED_MESSAGE, code=ErrorCode.RUNNER_UNAVAILABLE
                         )
-                    await asyncio.to_thread(
-                        conversation_store.update_conversation,
+                    await _restore_refused_settings(
+                        conversation_store,
                         session_id,
-                        model_override=conv.model_override,
-                        _unset_model_override=conv.model_override is None,
+                        previous=conv,
+                        attempted=updated,
+                        restore_model=True,
+                        restore_effort=False,
+                        live_change=live_change,
+                        began=began,
+                        saved=saved,
                     )
                     if unsupported is not None:
                         raise OmnigentError(unsupported, code=ErrorCode.INVALID_INPUT)
                     raise OmnigentError(
                         "The terminal did not apply the model change. "
-                        "The previous selection has been restored.",
+                        "Please check the current selection and try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     )
             else:

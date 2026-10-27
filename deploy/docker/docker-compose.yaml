@@ -120,6 +120,9 @@ services:
       # IdPs (e.g. Microsoft Entra ID) that issue preferred_username
       # instead of email. Empty means the default (email); see .env.example.
       OMNIGENT_OIDC_EMAIL_CLAIM: "${OMNIGENT_OIDC_EMAIL_CLAIM:-}"
+      # Set to 0 for IdPs (e.g. Cloudflare Access) that omit auth_time on
+      # forced re-authentication. Empty keeps the check; see .env.example.
+      OMNIGENT_OIDC_REQUIRE_REAUTH: "${OMNIGENT_OIDC_REQUIRE_REAUTH:-}"
       # Opt-in OIDC invites (admin pre-authorizes one off-domain email).
       # Off unless set. The admin list (/data/admins) and the optional
       # allowed-domains file (/data/allowed_domains) need no env var —

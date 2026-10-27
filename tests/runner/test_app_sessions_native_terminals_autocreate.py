@@ -76,6 +76,7 @@ from omnigent.runner.resource_registry import (
 )
 from omnigent.runner.session_init_protocol import RunnerSessionInitEnvelope
 from omnigent.spec.types import AgentSpec, ExecutorSpec
+from omnigent.stores.conversation_store import FORK_CARRY_HISTORY_LABEL_KEY
 from omnigent.terminals import TerminalRegistry
 from tests._helpers.pi_native import seed_pi_own_login_catalog
 from tests._helpers.providers import isolate_provider_resolution
@@ -125,17 +126,25 @@ class _RecordingClaudeRegistry:
 
 
 class _ResumeSnapshotServerClient(NullServerClient):
-    """Server client serving one session snapshot and empty labels."""
+    """Server client serving one session snapshot, empty labels and optional items."""
 
-    def __init__(self, session_url: str, snapshot: dict[str, Any]) -> None:
+    def __init__(
+        self,
+        session_url: str,
+        snapshot: dict[str, Any],
+        items: list[dict[str, Any]] | None = None,
+    ) -> None:
         self._session_url = session_url
         self._snapshot = snapshot
+        self._items = items
 
     async def get(self, url: str, **kwargs: Any) -> NullServerClient._Response:
-        """Return empty labels (so the bridge id is the session id) or the snapshot."""
+        """Return empty labels (so the bridge id is the session id), items or the snapshot."""
         del kwargs
         if url.endswith("/labels"):
             payload: dict[str, Any] = {"labels": {}}
+        elif self._items is not None and url == f"{self._session_url}/items":
+            payload = {"data": self._items}
         else:
             assert url == self._session_url
             payload = self._snapshot
@@ -2930,16 +2939,37 @@ async def test_auto_create_cursor_terminal_wires_yolo_auto_accept(
 
 
 @pytest.mark.parametrize(
-    ("snapshot_external_id", "expected_start_at_end"),
+    (
+        "snapshot_external_id",
+        "fork_carry_history",
+        "resume_transcript_available",
+        "initial_prompt_recorded",
+        "expected_start_at_end",
+        "expected_initial_prompt_count",
+    ),
     [
-        ("02857840-6362-408f-b41f-309e396ed7c6", True),
-        (None, False),
+        ("02857840-6362-408f-b41f-309e396ed7c6", False, True, True, True, 0),
+        ("02857840-6362-408f-b41f-309e396ed7c6", False, False, True, False, 0),
+        (None, False, False, False, False, 1),
+        (None, True, False, True, False, 0),
+        ("02857840-6362-408f-b41f-309e396ed7c6", False, True, False, True, 1),
+    ],
+    ids=[
+        "resume",
+        "resume-without-transcript",
+        "fresh",
+        "history-carrying-fork-without-transcript",
+        "older-client-explicit-resume-prompt",
     ],
 )
 @pytest.mark.asyncio
 async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_on_resume(
     snapshot_external_id: str | None,
+    fork_carry_history: bool,
+    resume_transcript_available: bool,
+    initial_prompt_recorded: bool,
     expected_start_at_end: bool,
+    expected_initial_prompt_count: int,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -2964,6 +2994,12 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         ``None`` for a fresh session.
     :param expected_start_at_end: The ``start_at_end`` the forwarder must
         be launched with for that snapshot.
+    :param fork_carry_history: Whether the session is a history-carrying fork.
+    :param resume_transcript_available: Whether prior history can be restored.
+    :param initial_prompt_recorded: Whether history already holds the stored
+        prompt; an older client's explicit resume prompt has not run yet.
+    :param expected_initial_prompt_count: The stored prompt reaches the
+        terminal once unless the session already ran it.
     :param tmp_path: Pytest-provided temporary directory.
     :param monkeypatch: Pytest monkeypatch fixture.
     """
@@ -2987,11 +3023,7 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         _capture_forwarder,
     )
 
-    # Transcript synthesis from Omnigent history has its own coverage; stub it to
-    # return a path so the resume branch sets ``resume_external_session_id``
-    # without a real item fetch. A non-None return mirrors the production
-    # contract: it means ``--resume`` will be passed, which is precisely the
-    # condition that makes the replayed transcript hazard real.
+    # A missing transcript must not replay an already consumed initial prompt.
     synth_calls: list[str] = []
 
     async def _fake_synth(
@@ -3001,23 +3033,35 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         external_session_id: str,
         workspace: Path,
         bridge_dir: Path,
-        resume_copy: bool,
-    ) -> Path:
-        """Record the resume id and return a transcript path."""
+        resume_copy: bool = False,
+    ) -> Path | None:
+        """Record the resume id and optionally provide a transcript."""
         assert not resume_copy
         assert bridge_dir == bridge_dir_for_bridge_id(session_id)
         del client, session_id, workspace
         synth_calls.append(external_session_id)
-        return tmp_path / f"{external_session_id}.jsonl"
+        if not resume_transcript_available:
+            return None
+        transcript_path = tmp_path / f"{external_session_id}.jsonl"
+        transcript_path.touch()
+        return transcript_path
 
     monkeypatch.setattr(
         "omnigent.harnesses.claude_native.main._ensure_local_claude_resume_transcript",
         _fake_synth,
     )
 
-    snapshot: dict[str, Any] = {}
+    initial_prompt = "Reply with READY once.\nThen wait for a new instruction."
+    snapshot: dict[str, Any] = {
+        "terminal_launch_args": [initial_prompt, "--permission-mode", "auto", "--verbose"],
+    }
     if snapshot_external_id is not None:
         snapshot["external_session_id"] = snapshot_external_id
+    if fork_carry_history:
+        snapshot["labels"] = {FORK_CARRY_HISTORY_LABEL_KEY: "1"}
+    recorded_user_texts = [
+        initial_prompt if initial_prompt_recorded else "An earlier instruction."
+    ]
 
     launched_args: list[str] = []
 
@@ -3052,7 +3096,16 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
         _FakeResourceRegistry(),
         lambda _sid, _evt: None,
         server_client=_ResumeSnapshotServerClient(  # type: ignore[arg-type]
-            "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2", snapshot
+            "/v1/sessions/5cdbea97a2fb0c659bc09605401e2bb2",
+            snapshot,
+            items=[
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": text}],
+                }
+                for text in recorded_user_texts
+            ],
         ),
     )
 
@@ -3075,14 +3128,22 @@ async def test_auto_create_claude_terminal_forwarder_skips_replayed_transcript_o
     # ``start_at_end`` must be correct *because* the resume branch ran, not
     # by coincidence: synthesis happens exactly when (and only when) the
     # snapshot carried an external session id.
-    if snapshot_external_id is None:
-        assert synth_calls == []
-    else:
+    if snapshot_external_id is not None:
         assert synth_calls == [snapshot_external_id]
+    else:
+        assert len(synth_calls) == int(fork_carry_history)
 
     # Session titles are generated by an isolated background job, so neither
     # fresh nor resumed Claude terminals receive framework rename instructions.
     assert "--append-system-prompt" not in launched_args
+
+    permission_mode_index = launched_args.index("--permission-mode")
+    assert launched_args[permission_mode_index + 1] == "auto"
+    assert "--verbose" in launched_args
+    assert launched_args.count(initial_prompt) == expected_initial_prompt_count, (
+        "The stored prompt must reach the terminal once and must not be "
+        "submitted again after the session already ran it."
+    )
 
 
 @pytest.mark.asyncio

@@ -130,6 +130,12 @@ async def test_handle_async_request_returns_response() -> None:
 
     response = await task
     assert response.status_code == 200
+    assert response.extensions["omnigent_runner_connection"] == {
+        "runner_id": "r1",
+        "runner_version": session.hello.runner_version,
+        "connection_id": session.hello.connection_id,
+        "generation": session.generation,
+    }
 
     # Drain the streaming body.
     body = b""
@@ -139,6 +145,9 @@ async def test_handle_async_request_returns_response() -> None:
 
     # After iteration, the request should be closed.
     assert req_id not in session.in_flight
+    replacement = reg.register("r1", _NoopWS(), _hello())
+    assert response.extensions["omnigent_runner_connection"]["generation"] == session.generation
+    assert replacement.generation != session.generation
 
 
 @pytest.mark.asyncio

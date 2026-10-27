@@ -158,6 +158,22 @@ _FAKE_CATALOG: dict[str, dict] = {
     },
 }
 
+_FAKE_CATALOG["fireworks_ai"] = {
+    "schema_version": "1.0",
+    "models": {
+        "accounts/fireworks/models/deepseek-v4p1-flash": {
+            "mode": "chat",
+            "capabilities": {"function_calling": True},
+            "context_window": {"max_input": 1000000, "max_output": 384000},
+            "pricing": {
+                "input_per_million_tokens": 0.3,
+                "output_per_million_tokens": 1.2,
+                "cache_read_per_million_tokens": 0.006,
+            },
+        },
+    },
+}
+
 _REAL_FETCH_PROVIDER_CATALOG = _providers_mod._fetch_provider_catalog
 
 
@@ -878,3 +894,30 @@ def test_unknown_provider_gets_default_api_key_mode() -> None:
     assert config.default_mode == "api_key"
     assert len(config.auth_modes) == 1
     assert config.auth_modes[0].fields[0].name == "api_key"
+
+
+@pytest.mark.parametrize(
+    ("model", "target"),
+    [
+        ("accounts/fireworks/models/demo", ("fireworks_ai", "accounts/fireworks/models/demo")),
+        ("accounts/fireworks/routers/demo", ("fireworks_ai", "accounts/fireworks/routers/demo")),
+        (
+            "fireworks/accounts/fireworks/models/demo",
+            ("fireworks_ai", "accounts/fireworks/models/demo"),
+        ),
+        (
+            "vendor/accounts/fireworks/models/demo",
+            ("openrouter", "vendor/accounts/fireworks/models/demo"),
+        ),
+    ],
+)
+def test_fireworks_catalog_lookup_scope(model: str, target: tuple[str, str]) -> None:
+    assert _providers_mod._catalog_lookup_targets(model)[0] == target
+
+
+def test_find_catalog_models_prices_fireworks_gateway_id() -> None:
+    matches = find_catalog_models("accounts/fireworks/models/deepseek-v4p1-flash")
+    assert len(matches) == 1
+    assert matches[0].provider == "fireworks_ai"
+    assert matches[0].input_price == pytest.approx(0.3)
+    assert matches[0].output_price == pytest.approx(1.2)

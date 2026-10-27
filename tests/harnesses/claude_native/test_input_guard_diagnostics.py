@@ -80,7 +80,9 @@ class _Terminal:
             self.pane = _composer(_PRIVATE_TEXT)
         if args[-1] == "Enter" and self.newline_on_enter:
             self.pane = self.pane.replace(f"\n{_RULE}\n", f"\n\n{_RULE}\n")
-        if self.clears_surface and args[-1] in {"Escape", bridge._CLEAR_LINE_KEY}:
+        if self.clears_surface and (
+            args[-1] == "Escape" or bridge._COMPOSER_KILL_TO_LINE_START in args[-1]
+        ):
             self.pane = _composer()
 
 
@@ -122,7 +124,7 @@ def test_shell_refusal_records_recovery_attempts_before_any_paste(
     assert attrs["restore_pane_rows"] == 3
     assert attrs["restore_capture_empty"] is False
     action = "shell_clear" if has_draft else "escape"
-    assert attrs[f"restore_{action}_attempts"] == len(terminal.commands) // (2 if has_draft else 1)
+    assert attrs[f"restore_{action}_attempts"] == len(terminal.commands)
     assert attrs[f"restore_{action}_attempts"] > 1
     assert all(command[-1] != "Enter" for command in terminal.commands)
     assert not terminal.pasted

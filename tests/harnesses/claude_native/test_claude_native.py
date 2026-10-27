@@ -269,9 +269,11 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
         "CLAUDE_CODE_DISABLE_FEEDBACK_SURVEY": "1",
     }
     args = spec["args"]
-    assert args[:9] == [
+    assert args[:11] == [
         "-u",
         "ANTHROPIC_API_KEY",
+        "-u",
+        "ANTHROPIC_AUTH_TOKEN",
         "-u",
         "CLAUDECODE",
         "claude",
@@ -285,6 +287,28 @@ def test_claude_terminal_request_injects_claude_config(tmp_path, monkeypatch) ->
     assert settings["apiKeyHelper"] == "printf %s sk-sentinel-do-not-use"
     assert "hooks" in settings
     assert "modelOverrides" not in settings
+
+
+def test_claude_terminal_request_without_helper_preserves_credentials(
+    tmp_path, monkeypatch
+) -> None:
+    config = claude_native.ClaudeNativeUcodeConfig(
+        env={
+            "CLAUDE_CODE_USE_GATEWAY": "1",
+            "ANTHROPIC_AUTH_TOKEN": "test-token",
+            "ANTHROPIC_API_KEY": "test-key",
+        },
+    )
+    body = claude_native._claude_terminal_request(
+        ("--print", "hi"),
+        command="claude",
+        bridge_dir=_test_bridge_dir(tmp_path, monkeypatch),
+        claude_config=config,
+    )
+
+    assert body["spec"]["args"][:3] == ["-u", "CLAUDECODE", "claude"]
+    assert body["spec"]["env"]["ANTHROPIC_AUTH_TOKEN"] == "test-token"
+    assert body["spec"]["env"]["ANTHROPIC_API_KEY"] == "test-key"
 
 
 def test_native_config_does_not_infer_overrides_from_routable_models() -> None:
@@ -375,9 +399,11 @@ def test_claude_terminal_request_preserves_user_model_arg(tmp_path, monkeypatch)
     )
 
     args = body["spec"]["args"]
-    assert args[:9] == [
+    assert args[:11] == [
         "-u",
         "ANTHROPIC_API_KEY",
+        "-u",
+        "ANTHROPIC_AUTH_TOKEN",
         "-u",
         "CLAUDECODE",
         "claude",
@@ -5128,6 +5154,61 @@ async def test_attach_exits_on_real_websocket_close_with_4404(
     assert recover_calls == [], (
         f"Recover must not fire on a 4404 close; got {len(recover_calls)} call(s)."
     )
+
+
+@pytest.mark.asyncio
+async def test_read_fd_removes_reader_when_cancelled() -> None:
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    read_task = asyncio.create_task(claude_native._read_fd_with_reader(loop, read_fd))
+    try:
+        await asyncio.sleep(0)
+        assert not read_task.done()
+        read_task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await read_task
+
+        assert not loop.remove_reader(read_fd), "cancelled read left a selector callback"
+        os.write(write_fd, b"reconnected")
+        assert (
+            await asyncio.wait_for(
+                claude_native._read_fd_with_reader(loop, read_fd), timeout=budget(1.0)
+            )
+            == b"reconnected"
+        )
+        assert not loop.remove_reader(read_fd)
+    finally:
+        read_task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await read_task
+        loop.remove_reader(read_fd)
+        os.close(write_fd)
+        os.close(read_fd)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("data", [b"input", b""], ids=["data", "eof"])
+async def test_read_fd_removes_reader_after_reading(data: bytes) -> None:
+    loop = asyncio.get_running_loop()
+    read_fd, write_fd = os.pipe()
+    try:
+        if data:
+            os.write(write_fd, data)
+        os.close(write_fd)
+        write_fd = -1
+
+        assert (
+            await asyncio.wait_for(
+                claude_native._read_fd_with_reader(loop, read_fd), timeout=budget(1.0)
+            )
+            == data
+        )
+        assert not loop.remove_reader(read_fd)
+    finally:
+        loop.remove_reader(read_fd)
+        if write_fd != -1:
+            os.close(write_fd)
+        os.close(read_fd)
 
 
 @pytest.mark.asyncio
