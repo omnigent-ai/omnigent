@@ -2953,15 +2953,20 @@ class HostProcess:
         if frame.path == "":
             if os.name == "nt":
                 list_drives = getattr(os, "listdrives", None)
-                drives: list[str] = (
-                    cast(list[str], list_drives())
-                    if callable(list_drives)
-                    else [
-                        f"{letter}:\\"
-                        for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
-                        if os.path.isdir(f"{letter}:\\")
-                    ]
-                )
+                try:
+                    drives: list[str] = (
+                        cast(list[str], list_drives())
+                        if callable(list_drives)
+                        else [
+                            f"{letter}:\\"
+                            for letter in "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                            if os.path.isdir(f"{letter}:\\")
+                        ]
+                    )
+                except OSError as exc:
+                    return HostListDirResultFrame(
+                        request_id=frame.request_id, status="failed", error=str(exc)
+                    )
                 roots = [
                     HostListDirEntry(
                         name=drive,

@@ -4731,6 +4731,23 @@ def test_handle_list_dir_empty_path_returns_windows_drives(monkeypatch) -> None:
     ]
 
 
+def test_handle_list_dir_windows_drive_failure_returns_result(monkeypatch) -> None:
+    """A failed roots enumeration replies immediately rather than timing out."""
+    host = _make_host_process()
+
+    def fail_list_drives() -> list[str]:
+        raise OSError("drive enumeration unavailable")
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(os, "listdrives", fail_list_drives, raising=False)
+
+    result = host._handle_list_dir(HostListDirFrame(request_id="failed-roots", path=""))
+
+    assert result.request_id == "failed-roots"
+    assert result.status == "failed"
+    assert result.error == "drive enumeration unavailable"
+
+
 def test_handle_list_dir_empty_path_returns_posix_root(monkeypatch) -> None:
     """A capable POSIX Host maps the empty roots sentinel to ``/``."""
     host = _make_host_process()
