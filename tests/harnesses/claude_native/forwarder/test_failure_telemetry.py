@@ -742,24 +742,36 @@ async def test_hook_category_and_identity_survive_retry(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("failure_phase", ["transcript_lookup", "context_assembly"])
+@pytest.mark.parametrize("hook_category", [None, "server_error"])
 async def test_hook_telemetry_failure_does_not_block_status(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    failure_phase: str,
+    hook_category: str | None,
 ) -> None:
     bridge_dir = tmp_path / "bridge"
+    hook = {"hook_event_name": "StopFailure", "session_id": "native-session"}
+    if hook_category is not None:
+        hook["error"] = hook_category
+    if failure_phase == "context_assembly":
+        hook["error_details"] = "Generation failed."
     bridge.record_hook_event(
         bridge_dir,
-        {
-            "hook_event_name": "StopFailure",
-            "session_id": "native-session",
-            "error": "server_error",
-            "error_details": "Generation failed.",
-        },
+        hook,
     )
 
     def fail(*args: object, **kwargs: object) -> None:
         raise TypeError("synthetic-private-telemetry-data")
 
-    monkeypatch.setattr(forwarder, "_stop_failure_context", fail)
+    monkeypatch.setattr(
+        forwarder,
+        "_stop_failure_context"
+        if failure_phase == "context_assembly"
+        else "_transcript_api_error_for_hook",
+        fail,
+    )
     caplog.set_level(logging.DEBUG, logger=forwarder.__name__)
     requests = []
 
@@ -786,16 +798,29 @@ async def test_hook_telemetry_failure_does_not_block_status(
             )
     assert state.event_cursor == 1
     assert state.byte_offset == (bridge_dir / "hooks.jsonl").stat().st_size
-    assert requests == [
-        {
-            "type": "external_session_status",
-            "data": {
-                "status": "failed",
-                "response_id": "resp_synthetic",
-                "failure_detail": "Generation failed.",
-            },
-        }
-    ]
+    assert len(requests) == 1
+    assert requests[0]["type"] == "external_session_status"
+    data = requests[0]["data"]
+    context = data.pop("failure_context")
+    expected = {"status": "failed", "response_id": "resp_synthetic"}
+    if failure_phase == "context_assembly":
+        expected["failure_detail"] = "Generation failed."
+    elif hook_category is not None:
+        expected["failure_detail"] = "Claude Code ended the turn with an API error (server_error)."
+    assert data == expected
+    assert context["failure_source"] == "claude_hook"
+    assert context["failure_context_error_type"] == "TypeError"
+    assert context["failure_context_error_phase"] == failure_phase
+    assert context["native_harness"] == "claude-native"
+    assert context["native_hook_event"] == "StopFailure"
+    assert context["native_hook_cursor"] == state.event_cursor
+    assert context["native_hook_offset"] == state.byte_offset
+    assert context["native_hook_recorded_at"] > 0
+    assert context["native_session_id"] == "native-session"
+    assert context.get("native_error_category") == hook_category
+    assert context["runner_version"] == forwarder.VERSION
+    assert context["failure_id"]
+    assert "synthetic-private-telemetry-data" not in json.dumps(context)
     assert "Claude hook failure telemetry failed: TypeError" in caplog.text
     assert "synthetic-private-telemetry-data" not in caplog.text
 

@@ -100,6 +100,10 @@ from omnigent.server.background_session_titles import (
     prepare_background_session_title,
     schedule_background_child_task_summary,
 )
+from omnigent.server.failed_status_diagnostics import (
+    bound_runner_connection,
+    failed_status_intake_attributes,
+)
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
     attribution_user as _attribution_user,
@@ -193,6 +197,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_devin_native_subagent,
     _launch_runner_on_host,
     _native_coding_agent_for_session,
+    _owns_host_runner,
     _parse_background_tasks,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
@@ -1804,10 +1809,15 @@ def register_events_routes(
                         "Couldn't release the side chat's resources. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     ) from exc
-            # Only the host-bound parent owns the shared runner. Stopping
-            # that process disconnects all its chats; child bindings keep it alive.
+            # Only the runner's owner stops it: the process serves every chat
+            # bound to it, so a sub-agent riding an ancestor's runner leaves it up.
             stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
+            if (
+                stop_conv is not None
+                and stop_conv.host_id
+                and stop_conv.runner_id
+                and await _owns_host_runner(stop_conv, conversation_store)
+            ):
                 stop_host_registry = getattr(request.app.state, "host_registry", None)
                 host_stopped = await _stop_host_runner_intentionally(
                     session_id,
@@ -2185,6 +2195,18 @@ def register_events_routes(
                     f"{sorted(_EXTERNAL_SESSION_STATUS_VALUES)}; got {status!r}",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            failure_intake = (
+                failed_status_intake_attributes(
+                    body.data,
+                    runner_id=conv.runner_id,
+                    connection=bound_runner_connection(
+                        getattr(request.app.state, "tunnel_registry", None), conv.runner_id
+                    ),
+                    source="bound_runner_at_intake",
+                )
+                if status == "failed"
+                else None
+            )
             response_id = body.data.get("response_id")
             if response_id is not None and not isinstance(response_id, str):
                 raise OmnigentError(
@@ -2323,6 +2345,7 @@ def register_events_routes(
                 status,
                 status_error,
                 failure_origin="external_session_status",
+                failure_intake=failure_intake,
                 failure_context=data.get("failure_context"),
                 response_id=response_id,
                 background_task_count=bg_count,

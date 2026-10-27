@@ -81,7 +81,9 @@ and steers messages while the agent is busy.
   side chat offers a narrower menu — `/help` plus the session's skills. A built-in
   such as `/help` is handled locally; a recognised skill routes through
   `slash_command` so it runs on an in-process harness. A native terminal side
-  chat shows no menu and sends slash text to the vendor TUI.
+  chat shows no menu and sends slash text to the vendor TUI. Claude Code and
+  Codex native sessions offer `/clear` only when `/v1/info` lists `clear` in
+  `session_event_types`; otherwise a typed `/clear` goes to the terminal as text.
 - `session-mcp-status`: selecting `/mcp` in a started session replaces the slash
   suggestions with the MCP servers enabled for that session and links to harness
   Settings with the session’s host preselected. Host-native entries are limited
@@ -366,11 +368,24 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_updates_after_delayed_catalog`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_highlights_the_reported_model`,
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_alias_selection_persists`.
+  These cases patch browser session/catalog responses; they do not drive a
+  native model change.
   A launching sandbox's provider catalog (Claude, Codex, and Pi) and its
   replacement by the host's or the session's own catalog:
   `tests/browser_ui/chat/test_model_catalog.py::test_launching_sandbox_offers_its_provider_catalog`,
   `tests/browser_ui/chat/test_model_catalog.py::test_bound_host_catalog_replaces_the_launch_preview`,
   `tests/browser_ui/chat/test_model_catalog.py::test_session_catalog_replaces_the_launch_preview`
+- **`model-picker`, in-session with a real Claude terminal (nightly):**
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
+  selects pinned Opus through the gear, repeats it through the model pill,
+  then returns to Sonnet through Ctrl+Shift+M. Each uses the real browser,
+  server, owned isolated host, runner and Claude CLI. Subsequent mock requests
+  retain the wire model's exact generation; native status and `requestedModel`
+  retain the selected `[1m]` suffix, and the correlated API request includes
+  the `context-1m` beta. Chat and the persisted transcript each contain the
+  reply once, with no model-change error. Requires Claude Code and tmux. Use
+  a clean container when machine-managed Claude settings override the mock
+  endpoint; this does not establish live gateway compatibility.
 - **`model-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_model_flows_prelaunch.py::test_claude_default_entry_names_the_true_default`,
   `tests/e2e_ui/start_session/test_native_picker_cli_parity.py::test_codex_picker_offers_the_clis_catalog_and_default`
@@ -401,6 +416,14 @@ Other connection providers alone do not enable the managed MCP picker.
   not become ready within the recovery budget, the pill keeps the previous
   selection; server/runner coverage is in
   `tests/server/integration/test_codex_model_change_after_idle_reap.py`.
+  Real Claude refusal coverage (nightly):
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
+  pauses only its owned CLI while a browser model change is pending, then
+  repeats that selection in a newer silent API write with a different effort.
+  The real request returns 503 and an actionable error card; the pending
+  indicator clears, the reported model stays unchanged, and the newer saved
+  model/effort survive. Cleanup kills the paused CLI, so this case does not
+  prove a retry after refusal.
 - **`effort-terminal-mirror`:**
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_codex_terminal_effort_change_reaches_composer`,
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`

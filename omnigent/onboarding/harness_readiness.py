@@ -609,8 +609,8 @@ def _claude_code_login_configured() -> bool:
         return False
 
 
-def _databricks_file_has_credentialed_profile(path: str) -> bool:
-    """Whether a Databricks config file declares a locally usable profile.
+def _databricks_file_credentialed_profile(path: str) -> str | None:
+    """Return the first locally usable Databricks profile in a config file.
 
     Checks the locally required configuration fields rather than section or
     file existence: a profile counts only when it names a workspace ``host``
@@ -628,14 +628,14 @@ def _databricks_file_has_credentialed_profile(path: str) -> bool:
     override. Local file read only, no network requests; never raises.
 
     :param path: The config file path to inspect.
-    :returns: ``True`` when the file parses and declares at least one profile
-        carrying a workspace host plus authentication material.
+    :returns: The matching profile name, or ``None`` when none carries a
+        workspace host plus authentication material.
     """
     import configparser
 
     try:
         if not os.path.exists(path):
-            return False
+            return None
         parser = configparser.ConfigParser()
         parser.read(path)
         section_names = list(parser.sections())
@@ -655,21 +655,21 @@ def _databricks_file_has_credentialed_profile(path: str) -> bool:
             auth_type = section.get("auth_type", "").strip().lower()
             if not auth_type:
                 if has_pat or has_oauth or has_basic:
-                    return True
+                    return name
                 continue
             # An explicit auth_type selects ONE method; require that method's
             # locally stored material rather than trusting the declaration.
             if auth_type == "pat":
                 if has_pat:
-                    return True
+                    return name
                 continue
             if auth_type == "basic":
                 if has_basic:
-                    return True
+                    return name
                 continue
             if auth_type in ("oauth-m2m", "oauth"):
                 if has_oauth:
-                    return True
+                    return name
                 continue
             if auth_type == "azure-client-secret":
                 if (
@@ -677,18 +677,49 @@ def _databricks_file_has_credentialed_profile(path: str) -> bool:
                     and section.get("azure_client_secret", "").strip()
                     and section.get("azure_tenant_id", "").strip()
                 ):
-                    return True
+                    return name
                 continue
             # Externally resolved methods (databricks-cli, external-browser,
             # metadata-service, github-oidc, azure-cli, …) keep their material
             # outside this file; the declaration is the local signal.
-            return True
-        return False
+            return name
+        return None
     except Exception as exc:
         # Log only the exception class: configparser errors can embed the
         # offending file's contents, which may include credential material.
         _logger.debug("readiness: databricks config parse failed (%s)", type(exc).__name__)
-        return False
+        return None
+
+
+def _databricks_file_has_credentialed_profile(path: str) -> bool:
+    """Whether a Databricks config file declares a locally usable profile."""
+    return _databricks_file_credentialed_profile(path) is not None
+
+
+def _databricks_credential_source() -> str | None:
+    """Describe the ambient Databricks credential source that actually matched."""
+    if os.environ.get("DATABRICKS_HOST", "").strip():
+        if os.environ.get("DATABRICKS_TOKEN", "").strip():
+            return "Databricks environment variables"
+        if (
+            os.environ.get("DATABRICKS_CLIENT_ID", "").strip()
+            and os.environ.get("DATABRICKS_CLIENT_SECRET", "").strip()
+        ):
+            return "Databricks environment variables"
+    config_override = os.environ.get("DATABRICKS_CONFIG_FILE", "").strip()
+    if config_override:
+        profile = _databricks_file_credentialed_profile(config_override)
+        if profile is not None:
+            return f"Databricks profile {profile}"
+    try:
+        from omnigent.onboarding.databricks_config import _DATABRICKSCFG_PATH
+
+        profile = _databricks_file_credentialed_profile(str(_DATABRICKSCFG_PATH))
+        return f"Databricks profile {profile}" if profile is not None else None
+    except Exception as exc:
+        # Class-only: the config path/parse error may embed credential material.
+        _logger.debug("readiness: databricks profile check failed (%s)", type(exc).__name__)
+        return None
 
 
 def _databricks_workspace_configured() -> bool:
@@ -708,25 +739,7 @@ def _databricks_workspace_configured() -> bool:
     :returns: ``True`` when an ambient Databricks credential source is
         resolvable.
     """
-    if os.environ.get("DATABRICKS_HOST", "").strip():
-        if os.environ.get("DATABRICKS_TOKEN", "").strip():
-            return True
-        if (
-            os.environ.get("DATABRICKS_CLIENT_ID", "").strip()
-            and os.environ.get("DATABRICKS_CLIENT_SECRET", "").strip()
-        ):
-            return True
-    config_override = os.environ.get("DATABRICKS_CONFIG_FILE", "").strip()
-    if config_override and _databricks_file_has_credentialed_profile(config_override):
-        return True
-    try:
-        from omnigent.onboarding.databricks_config import _DATABRICKSCFG_PATH
-
-        return _databricks_file_has_credentialed_profile(str(_DATABRICKSCFG_PATH))
-    except Exception as exc:
-        # Class-only: the config path/parse error may embed credential material.
-        _logger.debug("readiness: databricks profile check failed (%s)", type(exc).__name__)
-        return False
+    return _databricks_credential_source() is not None
 
 
 def _adc_file_carries_credentials(path: Path) -> bool:

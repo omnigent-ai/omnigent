@@ -792,7 +792,7 @@ async def test_rejected_native_switch_restores_saved_model(
     )
 
     assert response.status_code == 503, response.text
-    assert "previous selection has been restored" in response.text
+    assert "Please check the current selection and try again" in response.text
     runner_post.assert_awaited_once()
     assert runner_post.call_args.args == (f"/v1/sessions/{session_id}/events",)
     assert runner_post.call_args.kwargs["json"] == {

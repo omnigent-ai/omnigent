@@ -193,7 +193,8 @@ class SysScheduledTaskUpdateTool(Tool):
             "Update a scheduled task's mutable fields. Only the fields you pass "
             "change; omit the rest. Pass agent_id to switch which agent/harness "
             "it runs. Pass state='paused' to stop it firing without deleting it, "
-            "or state='active' to resume."
+            "or state='active' to resume. A 'completed' task has no remaining "
+            "occurrences; change its rrule to schedule it again."
         )
 
     def get_schema(self) -> dict[str, Any]:
