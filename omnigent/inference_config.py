@@ -123,6 +123,7 @@ def parse_inference_config(config: dict[str, object]) -> dict[str, HarnessInfere
             "qwen",
             "jcode",
             "opencode-native",
+            "omp",
             "pi",
             "pi-native",
             "acp",
