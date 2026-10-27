@@ -44,7 +44,7 @@ from omnigent.util.threaded_auth import ThreadedAuth
 from omnigent.version import VERSION
 
 if TYPE_CHECKING:
-    from types import TracebackType
+    from types import FrameType, TracebackType
 
     from omnigent.inner.databricks_executor import _ReusedDatabricksTokenSource
     from omnigent.runner.native import ResolvedSpec
@@ -1211,8 +1211,14 @@ def _run_parent_death_killer(
     request_shutdown: Callable[[], None],
     *,
     adopted: threading.Event | None = None,
+    finish_work: threading.Event | None = None,
+    has_active_work: Callable[[], bool] | None = None,
+    request_idle_shutdown: Callable[[], None] | None = None,
     poll_interval_s: float = 0.5,
     grace_s: float = 2.0,
+    signal_wait_s: float = 2.0,
+    idle_grace_s: float = _GRACEFUL_SHUTDOWN_TUNNEL_TIMEOUT_S + 5.0,
+    finish_work_max_s: float = 1800.0,
     exit_fn: Callable[[int], None] = os._exit,
 ) -> None:
     """Force the runner to exit once its parent (host daemon) dies.
@@ -1233,6 +1239,10 @@ def _run_parent_death_killer(
     The CLI sets it (via the adopt signal) while it is still alive, so the
     flag is observed before the subsequent parent-death is detected.
 
+    When *finish_work* is set (the host's terminal hung up) and work is in
+    flight, the runner keeps serving until *has_active_work* reports idle or
+    *finish_work_max_s* passes; a finished runner then closes as idle.
+
     :param parent_pid: The launcher's process id to monitor, e.g.
         ``12345``.
     :param request_shutdown: Callback that triggers a graceful shutdown
@@ -1240,10 +1250,22 @@ def _run_parent_death_killer(
     :param adopted: Event set when the runner has been adopted; once set,
         the watcher returns without requesting shutdown. ``None`` disables
         adoption (watch until parent death).
+    :param finish_work: Event set by :data:`RUNNER_FINISH_WORK_SIGNAL`;
+        ``None`` disables finishing in-flight work.
+    :param has_active_work: Whether an agent turn is still running.
+    :param request_idle_shutdown: Clean idle close used once finished work
+        drains; ``None`` falls back to *request_shutdown*.
     :param poll_interval_s: Seconds between parent-liveness probes, e.g.
         ``0.5``.
     :param grace_s: Seconds to allow graceful shutdown before the hard
         exit, e.g. ``2.0``.
+    :param signal_wait_s: Seconds to wait for the finish-work signal to
+        become visible after a parent death before falling back to a plain
+        shutdown; kept separate from *grace_s* so the hard-exit backstop and
+        the signal-visibility window tune independently.
+    :param idle_grace_s: Grace before the hard exit after an idle close,
+        covering the tunnel's graceful-close budget.
+    :param finish_work_max_s: Bound on finishing in-flight work, e.g. ``1800``.
     :param exit_fn: Hard-exit function, defaults to :func:`os._exit`;
         injectable so tests can observe it without killing the runner.
     :returns: None.
@@ -1256,6 +1278,31 @@ def _run_parent_death_killer(
     # parent's exit so an intentional detach is never torn down.
     if adopted is not None and adopted.is_set():
         return
+    if (
+        finish_work is not None
+        and has_active_work is not None
+        and _work_still_active(has_active_work)
+        and _await_finish_work_signal(finish_work, signal_wait_s)
+    ):
+        _logger.info(
+            "parent process hung up with work in flight; finishing it before exiting",
+            extra={"session_id": runner_primary_session_id()},
+        )
+        deadline = time.monotonic() + finish_work_max_s
+        while _work_still_active(has_active_work):
+            if time.monotonic() >= deadline:
+                _logger.warning(
+                    "runner exiting: in-flight work did not finish within %.0fs "
+                    "after the parent process hung up",
+                    finish_work_max_s,
+                    extra={"session_id": runner_primary_session_id()},
+                )
+                break
+            time.sleep(poll_interval_s)
+        else:
+            if request_idle_shutdown is not None:
+                request_shutdown = request_idle_shutdown
+                grace_s = idle_grace_s
     request_shutdown()
     time.sleep(grace_s)
     # The hard exit is a backstop reached only when graceful shutdown did not
@@ -1272,6 +1319,25 @@ def _run_parent_death_killer(
     with contextlib.suppress(Exception):
         sys.stderr.flush()
     exit_fn(0)
+
+
+def _work_still_active(has_active_work: Callable[[], bool]) -> bool:
+    """Probe loop-owned work state from a thread; a racing mutation counts as active."""
+    try:
+        return bool(has_active_work())
+    except Exception:  # noqa: BLE001 — a racing probe failure keeps the watchdog alive
+        return True
+
+
+def _await_finish_work_signal(finish_work: threading.Event, signal_wait_s: float) -> bool:
+    """Wait briefly for the finish-work signal after a parent death.
+
+    The signal is delivered through the event loop, which can lag the
+    parent-death probe. A busy runner must not be torn down before a
+    just-delivered hangup request becomes visible; a plain crash (no signal)
+    only waits out this short window before the normal shutdown proceeds.
+    """
+    return finish_work.wait(timeout=signal_wait_s)
 
 
 def _runner_workspace_from_env() -> Path | None:
@@ -1909,10 +1975,13 @@ async def _run_tunnel_from_env() -> None:
     # Set when the launcher adopts this runner (tmux detach); makes the
     # parent-death killer stand down so the runner outlives the CLI.
     adopted_event = threading.Event()
+    # Set when the host hangs up; the parent-death killer then lets work finish.
+    finish_work_event = threading.Event()
     _shutting_down_state = getattr(app.state, "shutting_down", None)
     _install_signal_handlers(
         stop_event,
         adopted_event=adopted_event,
+        finish_work_event=finish_work_event,
         record_reason=_record_exit_reason,
         mark_shutting_down=(
             _shutting_down_state.set if _shutting_down_state is not None else None
@@ -2018,6 +2087,14 @@ async def _run_tunnel_from_env() -> None:
             _record_exit_reason("parent process died")
             loop.call_soon_threadsafe(stop_event.set)
 
+        def _request_finished_work_shutdown() -> None:
+            """Close the tunnel as idle once a hung-up host's work finished.
+
+            :returns: None.
+            """
+            _record_exit_reason("parent process hung up; in-flight work finished")
+            loop.call_soon_threadsafe(tunnel_shutdown_event.set)
+
         # Orphan guard runs on a dedicated daemon thread, not the event
         # loop: if the loop wedges during shutdown (harness mid-boot when
         # the host dies), an event-loop watchdog could never fire. The
@@ -2026,7 +2103,12 @@ async def _run_tunnel_from_env() -> None:
         threading.Thread(
             target=_run_parent_death_killer,
             args=(parent_pid, _request_parent_death_shutdown),
-            kwargs={"adopted": adopted_event},
+            kwargs={
+                "adopted": adopted_event,
+                "finish_work": finish_work_event,
+                "has_active_work": _has_active_work,
+                "request_idle_shutdown": _request_finished_work_shutdown,
+            },
             name=f"runner-parent-killer:{parent_pid}",
             daemon=True,
         ).start()
@@ -2082,6 +2164,7 @@ def _install_signal_handlers(
     adopted_event: threading.Event | None = None,
     record_reason: Callable[[str], None] | None = None,
     mark_shutting_down: Callable[[], None] | None = None,
+    finish_work_event: threading.Event | None = None,
 ) -> None:
     """Install process signal handlers that request graceful shutdown.
 
@@ -2097,6 +2180,9 @@ def _install_signal_handlers(
         shutdown signal arrives, before any teardown runs — lets app.py tell
         an intentional stop from a real crash when a terminal watcher races
         the shutdown. ``None`` skips it.
+    :param finish_work_event: Optional event set when
+        :data:`RUNNER_FINISH_WORK_SIGNAL` arrives (the host's terminal hung up).
+        ``None`` skips the handler.
     :returns: None.
     """
     loop = asyncio.get_running_loop()
@@ -2148,12 +2234,22 @@ def _install_signal_handlers(
 
     for sig in (signal.SIGINT, signal.SIGTERM):
         _try_add_handler(sig, _handle_shutdown_signal, sig)
-    if adopted_event is not None:
-        from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL
+    from omnigent.runner.identity import RUNNER_ADOPT_SIGNAL, RUNNER_FINISH_WORK_SIGNAL
 
-        if RUNNER_ADOPT_SIGNAL is None:
-            return
+    if adopted_event is not None and RUNNER_ADOPT_SIGNAL is not None:
         _try_add_handler(RUNNER_ADOPT_SIGNAL, adopted_event.set)
+    if finish_work_event is not None and RUNNER_FINISH_WORK_SIGNAL is not None:
+        _try_add_handler(RUNNER_FINISH_WORK_SIGNAL, finish_work_event.set)
+        # A degraded loop or one lacking signal support can leave inherited
+        # SIG_IGN, which survives exec and leaks into exec'd agents; replace it
+        # with a plain handler that records the hangup and resets on exec.
+        if degraded or signal.getsignal(RUNNER_FINISH_WORK_SIGNAL) is signal.SIG_IGN:
+
+            def _record_finish_work(_signum: int, _frame: FrameType | None) -> None:
+                finish_work_event.set()
+
+            with contextlib.suppress(ValueError, OSError):
+                signal.signal(RUNNER_FINISH_WORK_SIGNAL, _record_finish_work)
 
 
 def _install_crash_logging() -> None:
@@ -2224,11 +2320,30 @@ def _maybe_prewarm_ambient_detection() -> None:
     prewarm_detect_providers()
 
 
+def _ignore_finish_work_signal_until_handled() -> None:
+    """Ignore the finish-work signal until the loop handler is installed.
+
+    The host may send the finish-work signal while a runner is still booting,
+    before :func:`_install_signal_handlers` runs. Its default action would
+    terminate the runner abruptly, so ignore it during boot; the loop handler
+    later swaps in finish-work handling.
+    """
+    from omnigent.runner.identity import RUNNER_FINISH_WORK_SIGNAL
+
+    if RUNNER_FINISH_WORK_SIGNAL is None:
+        return
+    with contextlib.suppress(ValueError, OSError):
+        signal.signal(RUNNER_FINISH_WORK_SIGNAL, signal.SIG_IGN)
+
+
 def main() -> None:
     """Console entry point for the runner tunnel process.
 
     :returns: None.
     """
+    # Set the boot-time disposition before the slow imports below, so an early
+    # hangup cannot kill the runner while they run.
+    _ignore_finish_work_signal_until_handled()
     from omnigent.process_logging import configure_process_logging
 
     configure_process_logging("runner", force=True)
