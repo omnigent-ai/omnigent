@@ -22,7 +22,7 @@ import sys
 import time
 import urllib.parse
 import uuid
-from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping
+from collections.abc import Awaitable, Callable, Coroutine, Mapping, MutableMapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, NamedTuple, Protocol
 
@@ -67,6 +67,7 @@ from omnigent.errors import (
 )
 from omnigent.harness_plugins import native_provider_for_key
 from omnigent.host.harness_startup import env_wrapper_chdir, env_wrapper_environment
+from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.terminal import build_terminal_os_env_spec, terminal_pane_environment
 from omnigent.models.model_override import validate_model_override
 from omnigent.native.failure_telemetry import (
@@ -8117,6 +8118,46 @@ def _native_terminal_start_failure_cause(exc: BaseException) -> str:
     return class_name
 
 
+# The server keeps this many characters of a start error in the session's error label.
+_PERSISTED_ERROR_MESSAGE_MAX_LEN = 256
+_ERROR_ID_SUFFIX_LEN = len(f" Error ID: err_{'0' * 32}.")
+
+
+def _allowed_models_text(allowed_models: Sequence[str], budget: int) -> str:
+    """
+    List as many quoted allowed models as fit in ``budget`` characters, and at least one.
+
+    :param allowed_models: Ordered model IDs, e.g. ``("model-a", "model-b")``.
+    :param budget: Characters available for the list, e.g. ``100``.
+    :returns: e.g. ``"'model-a', and 1 more"``, or ``"none"`` for an empty list.
+    """
+    quoted = [repr(model) for model in allowed_models]
+    for count in range(len(quoted), 0, -1):
+        hidden = len(quoted) - count
+        text = ", ".join(quoted[:count]) + (f", and {hidden} more" if hidden else "")
+        if count == 1 or len(text) <= budget:
+            return text
+    return "none"
+
+
+def _native_terminal_configuration_message(exc: BaseException) -> str | None:
+    """
+    Return the client-safe remedy for a start failure only the user can fix.
+
+    :param exc: Exception raised by the native terminal creation path.
+    :returns: The message to show verbatim, or ``None`` for other failures.
+    """
+    if isinstance(exc, ModelNotAllowedError):
+        budget = _PERSISTED_ERROR_MESSAGE_MAX_LEN - _ERROR_ID_SUFFIX_LEN
+        prefix = f"{exc.message}. Allowed models: "
+        message = f"{prefix}{_allowed_models_text(exc.allowed_models, budget - len(prefix) - 1)}."
+        # The label keeps a message's start, so an oversized one gives up its start instead.
+        return message if len(message) <= budget else "…" + message[1 - budget :]
+    if isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED:
+        return exc.message
+    return None
+
+
 def _native_terminal_start_error_payload(
     exc: BaseException, runtime_name: str, *, session_id: str
 ) -> dict[str, str]:
@@ -8137,9 +8178,7 @@ def _native_terminal_start_error_payload(
         if isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
         else None
     )
-    configuration_error = (
-        isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
-    )
+    configuration_message = _native_terminal_configuration_message(exc)
     os_error = _os_error_with_errno(exc)
     extra = debug_event(
         "native_terminal_start_failed",
@@ -8147,7 +8186,7 @@ def _native_terminal_start_error_payload(
         error_id=error_id,
         runtime=runtime_name,
         code=ErrorCode.HARNESS_NOT_CONFIGURED
-        if configuration_error
+        if configuration_message is not None
         else lifecycle_code or _NATIVE_TERMINAL_START_FAILED_CODE,
         exception_type=type(exc).__name__,
         exception_cause_type=type(exc.__cause__).__name__ if exc.__cause__ is not None else None,
@@ -8163,23 +8202,27 @@ def _native_terminal_start_error_payload(
         else None,
         # Expected lifecycle and configuration errors have no stack, so
         # preserve their category explicitly for the log sink.
-        error_category=exc.category.value
-        if isinstance(exc, OmnigentError) and (lifecycle_code is not None or configuration_error)
-        else None,
+        error_category=ErrorCategory.CONFIG.value
+        if configuration_message is not None
+        else (
+            exc.category.value
+            if isinstance(exc, OmnigentError) and lifecycle_code is not None
+            else None
+        ),
         error_impact=ErrorImpact.BLOCKING.value,
     )
-    if isinstance(exc, OmnigentError) and configuration_error:
+    if configuration_message is not None:
         _logger.warning(
             "Native %s configuration needs attention; error_id=%s: %s",
             runtime_name,
             error_id,
-            exc.message,
+            configuration_message,
             extra=extra,
         )
         return {
-            "code": exc.code,
+            "code": ErrorCode.HARNESS_NOT_CONFIGURED,
             "error_id": error_id,
-            "message": f"{exc.message} Error ID: {error_id}.",
+            "message": f"{configuration_message} Error ID: {error_id}.",
         }
     if lifecycle_code is not None:
         # Expected session-lifecycle condition: a required session resource was
@@ -8355,10 +8398,9 @@ def _native_terminal_start_error_response(
         with an ``error`` object carrying the real failure message.
     """
     status_code = 500
-    if isinstance(exc, OmnigentError) and (
-        exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES
-        or exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
-    ):
+    if _native_terminal_configuration_message(exc) is not None:
+        status_code = 412
+    elif isinstance(exc, OmnigentError) and exc.code in _NATIVE_TERMINAL_LIFECYCLE_ERROR_CODES:
         status_code = exc.http_status
     error = _native_terminal_start_error_payload(exc, runtime_name, session_id=session_id)
     return JSONResponse(
@@ -10454,9 +10496,7 @@ async def _launch_native_terminal(
             )
             return True
         except Exception as exc:
-            if not (
-                isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
-            ):
+            if _native_terminal_configuration_message(exc) is None:
                 _logger.exception(
                     "Failed to auto-create %s terminal for %s",
                     agent.terminal_name,
@@ -10619,9 +10659,7 @@ async def _ensure_native_terminal(
                     exc,
                     extra={"session_id": ctx.session_id},
                 )
-            elif not (
-                isinstance(exc, OmnigentError) and exc.code == ErrorCode.HARNESS_NOT_CONFIGURED
-            ):
+            elif _native_terminal_configuration_message(exc) is None:
                 _logger.exception(
                     "%s terminal ensure failed for session=%s",
                     agent.display_name,

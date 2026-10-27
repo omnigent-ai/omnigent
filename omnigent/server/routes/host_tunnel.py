@@ -40,6 +40,10 @@ from omnigent.host.frames import (
     HostCreateWorktreeResultFrame,
     HostDetectCredentialsResultFrame,
     HostFsResultFrame,
+    HostHarnessLoginCancelResultFrame,
+    HostHarnessLoginCompletedFrame,
+    HostHarnessLoginResultFrame,
+    HostHarnessLogoutResultFrame,
     HostHarnessReadinessFrame,
     HostHarnessStartupResultFrame,
     HostHelloFrame,
@@ -1039,6 +1043,69 @@ async def _receive_loop(
                 probe_future.set_result(
                     {
                         "status": frame.status,
+                        "harness_accounts": frame.harness_accounts,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostHarnessLoginResultFrame):
+            login_future = conn.pending_harness_login_starts.pop(frame.request_id, None)
+            if login_future is not None and not login_future.done():
+                login_future.set_result(
+                    {
+                        "status": frame.status,
+                        "login_id": frame.login_id,
+                        "verification_url": frame.verification_url,
+                        "user_code": frame.user_code,
+                        "expires_at": frame.expires_at,
+                        "error": frame.error,
+                    }
+                )
+            continue
+
+        if isinstance(frame, HostHarnessLoginCancelResultFrame):
+            cancel_future = conn.pending_harness_login_cancels.pop(frame.request_id, None)
+            if cancel_future is not None and not cancel_future.done():
+                cancel_future.set_result({"status": frame.status, "error": frame.error})
+            continue
+
+        if isinstance(frame, HostHarnessLoginCompletedFrame):
+            state = conn.harness_logins.get(frame.login_id)
+            if state is not None and state.status == "pending":
+                state.status = (
+                    "succeeded" if frame.success else "expired" if frame.expired else "failed"
+                )
+                state.expired = frame.expired
+                state.error = frame.error
+                state.terminal_at = int(time.time())
+                state.terminal_event.set()
+                state.configured_harnesses = frame.configured_harnesses
+                state.harness_accounts = frame.harness_accounts
+                conn.active_harness_logins.pop(state.harness, None)
+                if frame.configured_harnesses is not None:
+                    await asyncio.to_thread(
+                        host_store.update_harness_readiness,
+                        host_id,
+                        frame.configured_harnesses,
+                    )
+                    conn.hello.configured_harnesses = dict(frame.configured_harnesses)
+                    if frame.harness_accounts is not None:
+                        update_harness_accounts(conn, frame.harness_accounts)
+                    if on_host_update is not None:
+                        try:
+                            await on_host_update(host_id, conn.owner)
+                        except Exception:
+                            _logger.exception("on_host_update callback failed for %s", host_id)
+            continue
+
+        if isinstance(frame, HostHarnessLogoutResultFrame):
+            logout_future = conn.pending_harness_logouts.pop(frame.request_id, None)
+            if logout_future is not None and not logout_future.done():
+                logout_future.set_result(
+                    {
+                        "status": frame.status,
+                        "configured_harnesses": frame.configured_harnesses,
                         "harness_accounts": frame.harness_accounts,
                         "error": frame.error,
                     }

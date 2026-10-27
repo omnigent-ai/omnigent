@@ -35,6 +35,7 @@ import {
   isSessionScopedDecision,
   routingExtras,
 } from "./routingDecision";
+import type { AssistantMessagePhase } from "./conversationItems";
 import { isSystemUserContent } from "./systemMessage";
 import type { AgyPermission, CodexPersistMode, RememberScope } from "./types";
 import type { ActiveResponse } from "@/store/types";
@@ -75,6 +76,8 @@ export type RenderItem =
       text: string;
       final: boolean;
       previewInterrupted?: boolean;
+      /** Harness label for the message (Codex); `commentary` is progress narration. */
+      phase?: AssistantMessagePhase;
     }
   | {
       kind: "reasoning";
@@ -1828,6 +1831,7 @@ function textItem(run: AnyBlock[]): RenderItem {
         text: b.fullText,
         final: true,
         ...(b.previewInterrupted ? { previewInterrupted: true } : {}),
+        ...(b.phase !== undefined ? { phase: b.phase } : {}),
       };
     }
   }

@@ -75,6 +75,7 @@ CAP_SKILL_CONTENT = "skill_content"
 CAP_MCP_TOOLS = "mcp_tools"
 CAP_REFRESH_HARNESSES = "refresh_harnesses"
 CAP_HARNESS_ACCOUNTS = "harness_accounts"
+CAP_HARNESS_LOGIN = "harness_login"
 CAP_MCP_REGISTRY = "mcp_registry"
 
 # Every capability THIS build supports; reported verbatim in the hello frame.
@@ -90,6 +91,7 @@ HOST_CAPABILITIES: list[str] = [
     CAP_HARNESS_STARTUP,
     CAP_REFRESH_HARNESSES,
     CAP_HARNESS_ACCOUNTS,
+    CAP_HARNESS_LOGIN,
 ]
 
 
@@ -168,6 +170,13 @@ class HostFrameKind(str, Enum):
     REFRESH_HARNESSES_RESULT = "host.refresh_harnesses_result"
     PROBE_HARNESS_ACCOUNTS = "host.probe_harness_accounts"
     PROBE_HARNESS_ACCOUNTS_RESULT = "host.probe_harness_accounts_result"
+    HARNESS_LOGIN = "host.harness_login"
+    HARNESS_LOGIN_RESULT = "host.harness_login_result"
+    HARNESS_LOGIN_CANCEL = "host.harness_login_cancel"
+    HARNESS_LOGIN_CANCEL_RESULT = "host.harness_login_cancel_result"
+    HARNESS_LOGIN_COMPLETED = "host.harness_login_completed"
+    HARNESS_LOGOUT = "host.harness_logout"
+    HARNESS_LOGOUT_RESULT = "host.harness_logout_result"
     STORE_SECRET = "host.store_secret"
     STORE_SECRET_RESULT = "host.store_secret_result"
     DETECT_CREDENTIALS = "host.detect_credentials"
@@ -877,6 +886,76 @@ class HostProbeAccountsResultFrame:
 
 
 @dataclass
+class HostHarnessLoginFrame:
+    """Server → host: begin a Codex device-code login."""
+
+    request_id: str
+    harness: str
+    login_id: str
+
+
+@dataclass
+class HostHarnessLoginResultFrame:
+    """Host → server: device-code details for a newly started login."""
+
+    request_id: str
+    status: str
+    login_id: str | None = None
+    verification_url: str | None = None
+    user_code: str | None = None
+    expires_at: int | None = None
+    error: str | None = None
+
+
+@dataclass
+class HostHarnessLoginCancelFrame:
+    """Server → host: cancel an active device-code login."""
+
+    request_id: str
+    login_id: str
+
+
+@dataclass
+class HostHarnessLoginCancelResultFrame:
+    """Host → server: acknowledgement of a login cancellation."""
+
+    request_id: str
+    status: str
+    error: str | None = None
+
+
+@dataclass
+class HostHarnessLoginCompletedFrame:
+    """Host → server: unsolicited completion of a device-code login."""
+
+    login_id: str
+    success: bool
+    expired: bool = False
+    error: str | None = None
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
+
+
+@dataclass
+class HostHarnessLogoutFrame:
+    """Server → host: sign the selected harness out."""
+
+    request_id: str
+    harness: str
+
+
+@dataclass
+class HostHarnessLogoutResultFrame:
+    """Host → server: logout result plus freshly probed readiness."""
+
+    request_id: str
+    status: str
+    configured_harnesses: dict[str, HarnessAvailability] | None = None
+    harness_accounts: HarnessAccounts | None = None
+    error: str | None = None
+
+
+@dataclass
 class HostStoreSecretFrame:
     """Server → host: write a harness provider credential on the host.
 
@@ -1377,6 +1456,13 @@ HostFrame = (
     | HostRefreshHarnessesResultFrame
     | HostProbeAccountsFrame
     | HostProbeAccountsResultFrame
+    | HostHarnessLoginFrame
+    | HostHarnessLoginResultFrame
+    | HostHarnessLoginCancelFrame
+    | HostHarnessLoginCancelResultFrame
+    | HostHarnessLoginCompletedFrame
+    | HostHarnessLogoutFrame
+    | HostHarnessLogoutResultFrame
     | HostStoreSecretFrame
     | HostStoreSecretResultFrame
     | HostDetectCredentialsFrame
@@ -1728,6 +1814,76 @@ def encode_host_frame(frame: HostFrame) -> str:
                 "kind": HostFrameKind.PROBE_HARNESS_ACCOUNTS_RESULT.value,
                 "request_id": frame.request_id,
                 "status": frame.status,
+                "harness_accounts": frame.harness_accounts,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+                "login_id": frame.login_id,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "login_id": frame.login_id,
+                "verification_url": frame.verification_url,
+                "user_code": frame.user_code,
+                "expires_at": frame.expires_at,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginCancelFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN_CANCEL.value,
+                "request_id": frame.request_id,
+                "login_id": frame.login_id,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginCancelResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN_CANCEL_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "error": frame.error,
+            }
+        )
+    if isinstance(frame, HostHarnessLoginCompletedFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGIN_COMPLETED.value,
+                "login_id": frame.login_id,
+                "success": frame.success,
+                "expired": frame.expired,
+                "error": frame.error,
+                "configured_harnesses": frame.configured_harnesses,
+                "harness_accounts": frame.harness_accounts,
+            }
+        )
+    if isinstance(frame, HostHarnessLogoutFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGOUT.value,
+                "request_id": frame.request_id,
+                "harness": frame.harness,
+            }
+        )
+    if isinstance(frame, HostHarnessLogoutResultFrame):
+        return _encode_payload(
+            {
+                "kind": HostFrameKind.HARNESS_LOGOUT_RESULT.value,
+                "request_id": frame.request_id,
+                "status": frame.status,
+                "configured_harnesses": frame.configured_harnesses,
                 "harness_accounts": frame.harness_accounts,
                 "error": frame.error,
             }
@@ -2288,6 +2444,55 @@ def _decode_known_host_frame(
             return HostProbeAccountsResultFrame(
                 request_id=_required_str(msg, "request_id"),
                 status=_required_str(msg, "status"),
+                harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
+                error=_optional_nullable_str(msg, "error"),
+            )
+        case HostFrameKind.HARNESS_LOGIN:
+            return HostHarnessLoginFrame(
+                request_id=_required_str(msg, "request_id"),
+                harness=_required_str(msg, "harness"),
+                login_id=_required_str(msg, "login_id"),
+            )
+        case HostFrameKind.HARNESS_LOGIN_RESULT:
+            return HostHarnessLoginResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                login_id=_optional_nullable_str(msg, "login_id"),
+                verification_url=_optional_nullable_str(msg, "verification_url"),
+                user_code=_optional_nullable_str(msg, "user_code"),
+                expires_at=_optional_nullable_int(msg, "expires_at"),
+                error=_optional_nullable_str(msg, "error"),
+            )
+        case HostFrameKind.HARNESS_LOGIN_CANCEL:
+            return HostHarnessLoginCancelFrame(
+                request_id=_required_str(msg, "request_id"),
+                login_id=_required_str(msg, "login_id"),
+            )
+        case HostFrameKind.HARNESS_LOGIN_CANCEL_RESULT:
+            return HostHarnessLoginCancelResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                error=_optional_nullable_str(msg, "error"),
+            )
+        case HostFrameKind.HARNESS_LOGIN_COMPLETED:
+            return HostHarnessLoginCompletedFrame(
+                login_id=_required_str(msg, "login_id"),
+                success=_required_bool(msg, "success"),
+                expired=_required_bool(msg, "expired") if "expired" in msg else False,
+                error=_optional_nullable_str(msg, "error"),
+                configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
+                harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
+            )
+        case HostFrameKind.HARNESS_LOGOUT:
+            return HostHarnessLogoutFrame(
+                request_id=_required_str(msg, "request_id"),
+                harness=_required_str(msg, "harness"),
+            )
+        case HostFrameKind.HARNESS_LOGOUT_RESULT:
+            return HostHarnessLogoutResultFrame(
+                request_id=_required_str(msg, "request_id"),
+                status=_required_str(msg, "status"),
+                configured_harnesses=_optional_str_availability_map(msg, "configured_harnesses"),
                 harness_accounts=normalize_harness_accounts(msg.get("harness_accounts")),
                 error=_optional_nullable_str(msg, "error"),
             )

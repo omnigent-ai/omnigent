@@ -39,6 +39,7 @@ import logging
 import os
 import shlex
 import sys
+import time
 from pathlib import Path
 from typing import TYPE_CHECKING
 
@@ -69,22 +70,44 @@ def _credential_url(server: str, host_id: str) -> str:
     return f"{server.rstrip('/')}/v1/hosts/{host_id}/credentials/databricks"
 
 
+# Pauses between broker attempts. A transient blip otherwise surfaces as an empty
+# bearer, and the harness fails the turn on the spot.
+_RETRY_BACKOFF_S: tuple[float, ...] = (0.5, 1.0)
+
+
 def _fetch(server: str, host_id: str, host_token: str) -> dict | None:
-    """Fetch the broker JSON, or ``None`` on any failure."""
-    try:
-        resp = httpx.get(
-            _credential_url(server, host_id),
-            headers={MANAGED_HOST_TOKEN_HEADER: host_token},
-            timeout=_TIMEOUT_S,
-        )
-    except httpx.HTTPError:
-        return None
-    if resp.status_code != 200:
-        return None
-    try:
-        return resp.json()
-    except ValueError:
-        return None
+    """Fetch the broker JSON; ``None`` on a permanent failure or once retries run out.
+
+    Connection errors, 429 and 5xx are retried; any other non-200 is final. All
+    attempts share one :data:`_TIMEOUT_S` budget, so retrying never outlasts the
+    single attempt the harness's helper timeout was sized for.
+    """
+    deadline = time.monotonic() + _TIMEOUT_S
+    for attempt in range(len(_RETRY_BACKOFF_S) + 1):
+        if attempt:
+            pause = _RETRY_BACKOFF_S[attempt - 1]
+            if time.monotonic() + pause >= deadline:
+                return None
+            time.sleep(pause)
+        try:
+            resp = httpx.get(
+                _credential_url(server, host_id),
+                headers={MANAGED_HOST_TOKEN_HEADER: host_token},
+                timeout=max(deadline - time.monotonic(), 0.1),
+            )
+        except httpx.TransportError:
+            continue
+        except httpx.HTTPError:
+            return None
+        if resp.status_code == 429 or resp.status_code >= 500:
+            continue
+        if resp.status_code != 200:
+            return None
+        try:
+            return resp.json()
+        except ValueError:
+            return None
+    return None
 
 
 def fetch_broker_bearer(server: str, host_id: str, host_token: str) -> tuple[str, str] | None:
