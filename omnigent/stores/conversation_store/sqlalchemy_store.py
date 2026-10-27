@@ -5070,6 +5070,11 @@ class SqlAlchemyConversationStore(ConversationStore):
                     mapped_boundary_id = copied_item_ids.get(boundary_id)
                     if mapped_boundary_id is not None:
                         compaction_data["last_item_id"] = mapped_boundary_id
+                    # Replay snapshots own attachment references just like message rows.
+                    if file_id_map:
+                        for message in compaction_data.get("compacted_messages") or []:
+                            if isinstance(message, dict):
+                                _remap_item_file_references(message, file_id_map, new_conv_id)
                     remapped.append(json.dumps(compaction_data))
                 remapped_compaction_data = dict(
                     zip(

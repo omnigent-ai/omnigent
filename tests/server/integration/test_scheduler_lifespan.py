@@ -37,6 +37,7 @@ from omnigent.stores.scheduled_task_store import ScheduledTaskStore
 from omnigent.stores.scheduled_task_store.sqlalchemy_store import (
     SqlAlchemyScheduledTaskStore,
 )
+from tests._helpers.polling import poll_until_async
 
 pytestmark = pytest.mark.asyncio
 
@@ -337,13 +338,12 @@ async def test_automations_v2_flag_off_keeps_timers_even_with_hooks(
         recover.assert_not_awaited()
 
 
-@pytest.mark.parametrize("has_store,has_hooks", [(True, False), (False, True), (False, False)])
-async def test_automations_v2_flag_requires_dispatch_dependencies(
+@pytest.mark.parametrize("has_hooks", [True, False])
+async def test_automations_v2_flag_requires_a_scheduled_task_store(
     runtime_init: None,
     db_uri: str,
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
-    has_store: bool,
     has_hooks: bool,
 ) -> None:
     monkeypatch.setenv("OMNIGENT_FEATURES", "automations_v2")
@@ -351,9 +351,73 @@ async def test_automations_v2_flag_requires_dispatch_dependencies(
         _build_app(
             db_uri,
             tmp_path,
-            scheduled_task_store=SqlAlchemyScheduledTaskStore(db_uri) if has_store else None,
+            scheduled_task_store=None,
             dispatch=ScheduledTaskDispatchHooks(AsyncMock(), AsyncMock()) if has_hooks else None,
         )
+
+
+async def test_automations_v2_records_claims_with_the_built_in_executor(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Without hooks, the built-in executor records each outcome on the run it claimed."""
+    import time
+
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "automations_v2")
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: int(time.time()) - 3600)
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    store.configure_dispatch(True)
+    task = store.create(
+        _uid("built-in"), "built-in", "prompt", "FREQ=HOURLY", None, _uid("agent"), "UTC"
+    )
+    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+
+    def finished_runs() -> list:
+        return [run for run in store.list_runs(task.id)[0] if run.status != "starting"]
+
+    async with app.router.lifespan_context(app):
+        assert isinstance(app.state.scheduled_task_scheduler, PersistentTaskScheduler)
+        await poll_until_async(finished_runs, timeout_s=10, interval_s=0.1)
+
+    # This server has no host store, so the fire fails, and on the claimed run.
+    [run] = store.list_runs(task.id)[0]
+    assert (run.status, run.error_code) == ("failed", "host_registry_unavailable")
+    assert run.trigger_key is not None
+
+
+async def test_automations_v2_run_now_starts_a_claimed_manual_run(
+    runtime_init: None,
+    db_uri: str,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import httpx
+
+    monkeypatch.setenv("OMNIGENT_FEATURES", "automations_v2")
+    store = SqlAlchemyScheduledTaskStore(db_uri)
+    task = store.create(
+        _uid("run-now"), "run now", "prompt", "FREQ=DAILY", None, _uid("agent"), "UTC"
+    )
+    store.update(task.id, state="paused")
+    app = _build_app(db_uri, tmp_path, scheduled_task_store=store)
+
+    def finished_runs() -> list:
+        return [run for run in store.list_runs(task.id)[0] if run.status != "starting"]
+
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
+            response = await client.post(f"/v1/scheduled-tasks/{uuid.UUID(task.id).hex}/run")
+        assert response.status_code == 202
+        await poll_until_async(finished_runs, timeout_s=10, interval_s=0.1)
+
+    [run] = store.list_runs(task.id)[0]
+    assert run.trigger_key.startswith("manual:")
+    assert (run.status, run.error_code) == ("failed", "host_registry_unavailable")
 
 
 async def test_automations_v2_rejects_store_without_dispatch_operations(

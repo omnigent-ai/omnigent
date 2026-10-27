@@ -3,18 +3,30 @@ import { toast } from "sonner";
 
 import { fetchHosts } from "@/hooks/useHosts";
 import { isArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
-import { connectArcaHost, controlHost, getHostIdentity, isElectronShell } from "@/lib/nativeBridge";
+import {
+  connectArcaHost,
+  controlHost,
+  getHostIdentity,
+  isElectronShell,
+  supportsArcaConnect,
+} from "@/lib/nativeBridge";
+import { retrySession } from "@/lib/sessionsApi";
 
-/** Reconnect this desktop's host directly; use the dialog for fallback and retry. */
+/**
+ * Reconnect this desktop's host directly; use the dialog for fallback and retry.
+ * A resumable sandbox host is woken by the server instead.
+ */
 export function useSessionReconnect({
   sessionId,
   hostId,
   hostName,
+  hostResumable = false,
   isOwner,
 }: {
   sessionId: string | null;
   hostId: string | null;
   hostName?: string | null;
+  hostResumable?: boolean;
   isOwner: boolean;
 }) {
   const [dialogOpen, setDialogOpen] = useState(false);
@@ -27,6 +39,10 @@ export function useSessionReconnect({
     () =>
       hostId !== null && isArcaHost({ host_id: hostId, name: hostName ?? "" }, readArcaHostId()),
     [hostId, hostName],
+  );
+  const runsArcaConnect = useCallback(
+    () => !!hostId && isOwner && supportsArcaConnect() && isSessionArcaHost(),
+    [hostId, isOwner, isSessionArcaHost],
   );
 
   useEffect(() => {
@@ -45,7 +61,7 @@ export function useSessionReconnect({
 
   const reconnectArca = useCallback(async () => {
     if (inFlight.current) return;
-    if (!hostId || !isOwner || !isElectronShell() || !isSessionArcaHost()) {
+    if (!runsArcaConnect()) {
       setCanReconnectArca(false);
       setDialogOpen(true);
       return;
@@ -94,10 +110,40 @@ export function useSessionReconnect({
         setReconnecting(false);
       }
     }
-  }, [hostId, isOwner, isSessionArcaHost]);
+  }, [hostId, runsArcaConnect]);
+
+  // The server resumes the sandbox and starts the agent, as it does for a
+  // message, so this works in the browser and for anyone who can send one.
+  const wakeSandbox = useCallback(async () => {
+    if (inFlight.current || !sessionId) return;
+    const operation: { progressToast?: string | number } = {};
+    inFlight.current = operation;
+    try {
+      operation.progressToast = toast.loading("Reconnecting sandbox…");
+      const result = await retrySession(sessionId);
+      if (inFlight.current !== operation) return;
+      toast.success(result.recovered ? "Sandbox is back online." : "Sandbox is already online.");
+    } catch (err) {
+      if (inFlight.current !== operation) return;
+      toast.error(
+        err instanceof Error && err.message
+          ? `Couldn't reconnect the sandbox: ${err.message}`
+          : "Couldn't reconnect the sandbox. Try again.",
+      );
+    } finally {
+      if (inFlight.current === operation) {
+        if (operation.progressToast !== undefined) toast.dismiss(operation.progressToast);
+        inFlight.current = null;
+      }
+    }
+  }, [sessionId]);
 
   const reconnect = useCallback(async () => {
     if (inFlight.current) return;
+    if (hostId && hostResumable) {
+      await wakeSandbox();
+      return;
+    }
     if (!hostId || !isOwner || !isElectronShell()) {
       setDialogOpen(true);
       return;
@@ -147,10 +193,12 @@ export function useSessionReconnect({
         setReconnecting(false);
       }
     }
-  }, [hostId, isOwner, isSessionArcaHost, reconnectArca]);
+  }, [hostId, hostResumable, isOwner, isSessionArcaHost, reconnectArca, wakeSandbox]);
 
   return {
     reconnect,
+    /** Whether `reconnect` runs the desktop's Arca connect for this session's host. */
+    reconnectsArca: runsArcaConnect(),
     dialogOpen,
     setDialogOpen,
     localReconnect: canReconnectThisMachine

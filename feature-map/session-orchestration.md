@@ -2,8 +2,8 @@
 
 An agent in a private session can send work to another session owned by the
 same user, then read its status/history. It can also create private top-level
-workers on its host or a new managed sandbox. This is behind the disabled-by-default
-`session_orchestration` deployment flag.
+workers on its host or a new managed sandbox. This is enabled by default, with
+`-session_orchestration` in `OMNIGENT_FEATURES` as a server kill switch.
 
 ## Sub-features
 
@@ -11,6 +11,14 @@ workers on its host or a new managed sandbox. This is behind the disabled-by-def
   allowed and their readers see the message. Normal queue/steering applies.
 - `read-results`: the manager reads history/status; replies are not forwarded.
   Existing owner-authorized reads remain allowed when a session is shared.
+- `created-by`: independent workers record their creating session. The worker's
+  Chat/Terminal header rechecks access when opened, hides attribution during the
+  lookup, and links to the creator when accessible; otherwise it says "Created by
+  another session". `sys_session_list` and `sys_session_get_info` expose
+  `created_by_session_id` so managers can identify their workers across restarts.
+- `kill-switch`: an explicit disable refuses new peer sends and independent
+  creates, even if an enable is also listed. Restart every server replica to
+  apply it. Already accepted tasks may finish; ordinary reads and child work remain.
 - `create`: `sys_session_create` retains child creation by default; `same_host`
   and `managed` placements create independent, initially private sessions.
   Managed creation uses the server's configured default sandbox provider.
@@ -36,14 +44,26 @@ workers on its host or a new managed sandbox. This is behind the disabled-by-def
 - In a session with creation tools enabled, ask for a worker with
   `sys_session_create` and `placement="same_host"` or `placement="managed"`.
 - Use the existing Share dialog to share the sender or receiver, then repeat.
+- Open an independent worker in Chat or Terminal and follow its "Created by"
+  link. On mobile web, the same link is in the header. Ask the manager to list
+  its sessions and match `created_by_session_id` to its own session ID.
 
 ## Driving it with the repro environment
 
-Preconditions: enable `OMNIGENT_FEATURES=session_orchestration` only on the
-isolated test server. Own both sessions. Same-host creation requires a connected
+Preconditions: use an isolated test server with the default feature settings.
+Own both sessions. Same-host creation requires a connected
 owned host/workspace. Managed creation requires a launch-capable provider in the
 server's sandbox configuration (for example, Modal or Daytona). Internal deployments
 can supply their own provider through the existing launcher interface.
+
+For `created-by`, extend the creation journey below: open the worker, reload,
+and follow its creator link. Share only the worker with a second viewer and
+verify they see "Created by another session" with no creator link or title.
+Also revoke creator access after that viewer has visited the creator, then open
+the worker through in-app navigation: no cached creator title or link should appear.
+Fork the worker and verify the fork has no "Created by" label. The API/runner
+contract is covered by `tests/server/integration/test_session_orchestration.py`;
+the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
 
 - Own environment: `uv run --no-sync pytest
   tests/e2e/test_private_session_orchestration.py --reruns 0` uses real local
@@ -51,6 +71,9 @@ can supply their own provider through the existing launcher interface.
   requests over HTTP and checks send, history reads, same-host creation, and
   sharing refusal. It also checks that unconfigured managed creation gives a clear
   refusal without creating a session. Codex and tmux are required for the native row.
+  Both harnesses also exercise a server restart with the explicit kill switch:
+  existing runners remain opted in, but their subsequent peer sends and independent
+  creates are refused without writes; session-info reads still work.
   It also fires an owner-created schedule through the real server/host and checks
   that the resulting worker cannot message a peer or create an independent worker.
 - Component integration: `uv run --no-sync pytest
@@ -71,10 +94,19 @@ can supply their own provider through the existing launcher interface.
   open its Chat and confirm the source label and result. Ask the manager to
   read it. Share the manager and repeat: the tool must report refusal and the
   destination must contain no new task. API runs do not prove these UI actions.
+  Append `-session_orchestration` to the isolated server's feature settings and
+  restart it, then repeat from a private manager: expect a disabled error, no new
+  task and no independent worker. Read history/info to confirm reads still work.
 - Live sandbox provisioning and native terminal-entered prompts require separate
   verification; local process checks do not cover them.
 
 ## Gotchas
+
+- "Created by" records origin only: workers remain top-level and have their own
+  permissions and lifecycle. Sharing a worker does not share its creator; the
+  opaque creator ID remains in worker metadata, but the UI resolves its title
+  through a separate authorized read. Forks drop the creator label. Older
+  workers have no label; there is no backfill or automatic completion reply.
 
 - Same host also means the same workspace, inherited together from the host-bound
   ancestor for child managers. Separate sessions do not isolate filesystem edits.
@@ -128,8 +160,9 @@ can supply their own provider through the existing launcher interface.
 - Scheduled origin is recorded before launch, cannot be edited by clients, and
   survives deletion of the schedule and full forks. Forking a scheduled run to
   continue interactively intentionally keeps the orchestration restriction in v1.
-  Sessions predating this marker may have no
-  recoverable scheduling origin; their upgrade policy still needs a decision.
+  Sessions predating this marker may have no recoverable scheduling origin and
+  remain eligible. There is no historical backfill in this version; deployments
+  requiring that exclusion can keep the kill switch set pending classification.
 - Existing child creation and `sys_session_send` keep their parent/completion
   semantics. Independent workers use `sys_session_message` for later work.
 - The server enforces the flag even though tool schemas are discoverable while

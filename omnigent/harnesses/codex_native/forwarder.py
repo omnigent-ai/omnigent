@@ -135,6 +135,9 @@ _EXTERNAL_COMPACTION_STATUS_TYPE = "external_compaction_status"
 # handlers are harmless no-ops if a build spells these differently.
 _CODEX_COMPACTION_ITEM_TYPE = "contextCompaction"
 _CODEX_THREAD_COMPACTED_METHOD = "thread/compacted"
+# In-progress turns in ``thread/resume`` identify items by position, not by
+# the native ids their live notifications carry.
+_CODEX_RESUME_POSITION_ITEM_ID = re.compile(r"item-\d+")
 # How often the forwarder claims pending ``/side`` questions from the bridge dir.
 # The executor writes one and returns, so this is the delay before the side chat
 # starts; a fork is cheap, so poll fast enough to feel immediate.
@@ -477,6 +480,12 @@ class _CodexForwarderState:
         assistant reply, the forwarder recovers and posts the turn's user
         message if the live stream missed it (see
         :func:`_ensure_user_message_posted`).
+    :param user_message_copy_balance: Unmatched user-message copies of
+        unfinished turns keyed by (thread, turn, content digest): positive
+        counts live copies and negative counts resumed copies with positional
+        ids such as ``item-1``.
+    :param resume_echo_thread_ids: Threads whose resume snapshot is being
+        replayed on a connection that also received its live notifications.
     :param partial_text_by_turn: Visible assistant/plan text fragments keyed
         by turn id, e.g. ``{"turn_123": [_PartialTextBuffer(...)]}``.
         Normal completed items remain the durable source of truth; this
@@ -529,6 +538,8 @@ class _CodexForwarderState:
     synced_item_keys: set[str] = field(default_factory=set)
     surfaced_terminal_error_turns: set[str] = field(default_factory=set)
     posted_user_turns: set[str] = field(default_factory=set)
+    user_message_copy_balance: dict[tuple[str, str, str], int] = field(default_factory=dict)
+    resume_echo_thread_ids: set[str] = field(default_factory=set)
     posted_tool_calls: set[str] = field(default_factory=set)
     partial_text_by_turn: dict[str, list[_PartialTextBuffer]] = field(default_factory=dict)
     _anon_item_counters: dict[tuple[str, str], int] = field(default_factory=dict)
@@ -778,6 +789,42 @@ class _CodexForwarderState:
         :returns: ``True`` when the turn's user message has been posted.
         """
         return turn_id in self.posted_user_turns
+
+    def pair_user_message_copy(self, key: tuple[str, str, str], *, resumed: bool) -> bool:
+        """
+        Match a user-message copy against the other delivery of the same input.
+
+        Codex identifies an in-progress turn's resumed user input by position
+        and its live notification by a native id, so the copies share only
+        their thread, turn and content. A live copy matches a resumed copy
+        only while that thread's echoing replay registered it.
+
+        :param key: ``(thread_id, turn_id, content_digest)`` for the copy.
+        :param resumed: Whether the copy came from a resume snapshot.
+        :returns: ``True`` when the copy duplicates an unmatched copy.
+        """
+        balance = self.user_message_copy_balance.get(key, 0)
+        step = -1 if resumed else 1
+        duplicate = balance * step < 0
+        if duplicate or not resumed or key[0] in self.resume_echo_thread_ids:
+            if balance + step:
+                self.user_message_copy_balance[key] = balance + step
+            else:
+                self.user_message_copy_balance.pop(key, None)
+        return duplicate
+
+    def forget_user_message_copies(self, turn_id: str) -> None:
+        """
+        Drop unmatched user-message copies once their turn ends.
+
+        Resume snapshots give positional ids only to in-progress turns, so a
+        finished turn's copies can no longer pair.
+
+        :param turn_id: Codex turn id, e.g. ``"turn_123"``.
+        :returns: None.
+        """
+        for key in [key for key in self.user_message_copy_balance if key[1] == turn_id]:
+            del self.user_message_copy_balance[key]
 
     def note_tool_call_posted(self, call_id: str) -> None:
         """Record that a command's live function-call item was posted."""
@@ -2724,6 +2771,7 @@ async def _subscribe_until_ready_inner(
     )
     saw_not_ready = False
     while True:
+        received_live_items = client.is_subscribed_to_thread(thread_id)
         try:
             params: _JsonObject = {"threadId": thread_id}
             if not saw_not_ready and replay_from_turn_id is None:
@@ -2781,16 +2829,22 @@ async def _subscribe_until_ready_inner(
             await _sync_codex_approval_mode_change(
                 ap_client, session_id=session_id, forwarder_state=forwarder_state
             )
-        await _replay_resume_response(
-            ap_client,
-            session_id=session_id,
-            bridge_dir=bridge_dir,
-            response=response,
-            usage_coalescer=usage_coalescer,
-            elicitation_tracker=elicitation_tracker,
-            forwarder_state=forwarder_state,
-            replay_from_turn_id=replay_from_turn_id,
-        )
+        if forwarder_state is not None and received_live_items:
+            forwarder_state.resume_echo_thread_ids.add(thread_id)
+        try:
+            await _replay_resume_response(
+                ap_client,
+                session_id=session_id,
+                bridge_dir=bridge_dir,
+                response=response,
+                usage_coalescer=usage_coalescer,
+                elicitation_tracker=elicitation_tracker,
+                forwarder_state=forwarder_state,
+                replay_from_turn_id=replay_from_turn_id,
+            )
+        finally:
+            if forwarder_state is not None:
+                forwarder_state.resume_echo_thread_ids.discard(thread_id)
         return
 
 
@@ -4159,6 +4213,9 @@ async def _handle_terminal_turn_boundary_inner(
         params=params,
         forwarder_state=forwarder_state,
     )
+    terminal_turn_id = _terminal_turn_id_from_params(params)
+    if forwarder_state is not None and terminal_turn_id is not None:
+        forwarder_state.forget_user_message_copies(terminal_turn_id)
     handled = terminal.handled
     if terminal.edge is not None:
         await _post_turn_status_edge(client, session_id, terminal.edge)
@@ -5283,11 +5340,20 @@ def _claim_completed_item(
     item_key, is_anon = _completed_item_key(params, item, forwarder_state)
     if not forwarder_state.claim_item_key(item_key):
         return None
+    thread_id = _thread_id_from_params(params) or "thread"
+    turn_id = params.get("turnId")
+    turn_id = turn_id if isinstance(turn_id, str) and turn_id else "turn"
     if is_anon:
-        thread_id = _thread_id_from_params(params) or "thread"
-        turn_id = params.get("turnId")
-        turn_id = turn_id if isinstance(turn_id, str) and turn_id else "turn"
         forwarder_state.advance_anon_counter(thread_id, turn_id)
+    elif item.get("type") == "userMessage" and isinstance(item.get("content"), list):
+        content = json.dumps(item["content"], sort_keys=True)
+        content_digest = hashlib.sha256(content.encode()).hexdigest()
+        resumed = _CODEX_RESUME_POSITION_ITEM_ID.fullmatch(str(item.get("id"))) is not None
+        if forwarder_state.pair_user_message_copy(
+            (thread_id, turn_id, content_digest), resumed=resumed
+        ):
+            _logger.info("Codex forwarder skipped duplicate user message: key=%s", item_key)
+            return None
     return item_key
 
 
@@ -6431,15 +6497,20 @@ async def _post_agent_message(
     text = item.get("text")
     if not isinstance(text, str) or not text:
         return False
+    item_data: _JsonObject = {
+        "role": "assistant",
+        "agent": _AGENT_NAME,
+        "content": [{"type": "output_text", "text": text}],
+    }
+    # Codex labels progress vs. answer text; the web UI folds commentary.
+    phase = item.get("phase")
+    if isinstance(phase, str):
+        item_data["phase"] = phase
     return await _post_external_item(
         client,
         session_id,
         item_type="message",
-        item_data={
-            "role": "assistant",
-            "agent": _AGENT_NAME,
-            "content": [{"type": "output_text", "text": text}],
-        },
+        item_data=item_data,
         response_id=_response_id(params),
         message_id=_completed_streaming_message_id(params, item, "agentMessage"),
         source_id=source_id or _source_id(params, item),
@@ -8714,10 +8785,10 @@ def _completed_item_key(
     Build a total dedup key for one durable Codex transcript item.
 
     The key is always non-empty so dedup is never silently disabled.
-    Items with stable Codex-assigned ``id`` fields use
-    ``threadId:turnId:item.id`` — identical across replay and live
-    deliveries of the same item, so the second delivery is correctly
-    dropped by the dedup gate.
+    Items with Codex-assigned ``id`` fields use ``threadId:turnId:item.id``.
+    Completed turns reuse live ids on replay; an in-progress turn's resumed
+    user input instead has a positional id that
+    :meth:`_CodexForwarderState.pair_user_message_copy` matches by content.
 
     Items without a stable ``id`` fall back to a per-(thread, turn)
     positional counter. The counter is peeked here and only advanced by

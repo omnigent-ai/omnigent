@@ -688,9 +688,27 @@ async def test_ensure_local_pi_resume_session_unsafe_id_returns_none(tmp_path: P
 
 
 @pytest.mark.asyncio
-async def test_ensure_local_pi_resume_session_reuses_existing(tmp_path: Path) -> None:
-    existing = tmp_path / f"2026-06-25T08-00-00-000Z_{_EXTERNAL_ID}.jsonl"
-    existing.write_text('{"type":"session"}\n', encoding="utf-8")
+async def test_ensure_local_pi_resume_session_reuses_existing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.harnesses.pi_native import bridge
+
+    root = tmp_path / "pi-native"
+    bridge_dir = root / "session"
+    session_dir = bridge_dir / "sessions"
+    session_dir.mkdir(parents=True)
+    (bridge_dir / "owner.pid").write_text("999999")
+    existing = session_dir / f"2026-06-25T08-00-00-000Z_{_EXTERNAL_ID}.jsonl"
+    native_history = (
+        '{"type":"session"}\n'
+        '{"type":"compaction","summary":"retained summary"}\n'
+        '{"type":"message","message":{"role":"assistant",'
+        '"usage":{"totalTokens":800000}}}\n'
+    )
+    existing.write_text(native_history, encoding="utf-8")
+    monkeypatch.setattr(bridge, "_BRIDGE_ROOT", root)
+    monkeypatch.setattr("omnigent.inner.terminal._process_alive", lambda _pid: False)
+    assert bridge.prune_orphaned_bridge_dirs() == 0
 
     # The handler would raise if called; reuse must short-circuit the fetch.
     def boom(_request: httpx.Request) -> httpx.Response:  # pragma: no cover - must not run
@@ -703,11 +721,11 @@ async def test_ensure_local_pi_resume_session_reuses_existing(tmp_path: Path) ->
             client,
             session_id="conv_abc",
             external_session_id=_EXTERNAL_ID,
-            session_dir=tmp_path,
+            session_dir=session_dir,
             workspace=Path("/repo"),
         )
     assert path == existing
-    assert existing.read_text(encoding="utf-8") == '{"type":"session"}\n'
+    assert existing.read_text(encoding="utf-8") == native_history
 
 
 @pytest.mark.asyncio

@@ -539,24 +539,36 @@ def create_scheduled_tasks_router(
 
         A manual override that reuses the SHARED scheduled-fire path (the same
         ``on_fire`` machinery — session create, owner grant, runner launch,
-        prompt dispatch, run recording) via ``app.state.scheduled_task_run_now``.
-        Legacy scheduled fires share its process-local overlap guard. Persistent
-        scheduled fires use database claims, which this manual path does not join.
+        prompt dispatch, run recording). Legacy timers fire through
+        ``app.state.scheduled_task_run_now`` and share its process-local overlap
+        guard. With ``automations_v2``, the request is recorded as a pending run
+        that the host's owning replica claims and starts like any occurrence, so
+        Run now gets the same lease, recovery, and host routing. Each request is
+        its own run; it may overlap a scheduled one.
 
         Paused tasks ARE runnable here — run-now is an explicit manual override,
         so it does not require the ``active`` state the scheduler enforces.
 
         Fire-and-forget: like the scheduler, the session create + launch runs in
         the background, so this returns ``202 Accepted`` with the task id rather
-        than the finished run. The new run row (status ``running`` / ``failed`` /
-        ``skipped``) appears in the task's ``/runs`` history and in the LIST
-        endpoint's ``last_run_status`` once recorded. Returns ``409`` when a fire
-        for this task is already in flight, and ``503`` when the scheduler
-        subsystem is not running (no trigger wired).
+        than the finished run. The new run row appears in the task's ``/runs``
+        history and in the LIST endpoint's ``last_run_status``. Legacy timers
+        return ``409`` when a fire for this task is already in flight. Both return
+        ``503`` when the scheduler subsystem is not running.
         """
         owner = _owner(request)
         owner_id = None if owner == RESERVED_USER_LOCAL else owner
         task = _require_owned(scheduled_task_id, owner_id)
+        if getattr(request.app.state, "scheduled_task_dispatch_enabled", False):
+            scheduler = _scheduler(request)
+            if scheduler is None:
+                raise OmnigentError(
+                    "scheduled task scheduler is not running",
+                    code=ErrorCode.RUNNER_UNAVAILABLE,
+                )
+            if await scheduler.run_now(task) is None:
+                raise OmnigentError("Scheduled task not found", code=ErrorCode.NOT_FOUND)
+            return {"triggered": True, "id": task.id}
         run_now = getattr(request.app.state, "scheduled_task_run_now", None)
         if run_now is None:
             raise OmnigentError(

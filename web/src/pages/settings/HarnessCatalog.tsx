@@ -4,6 +4,7 @@ import { useEffect, useState, type ReactNode } from "react";
 import { ArrowLeftIcon, ChevronRightIcon, PlugIcon, SparkleIcon } from "lucide-react";
 import { Link, useSearchParams } from "@/lib/routing";
 import { cn } from "@/lib/utils";
+import { mcpServerDisplayName } from "@/lib/mcpServerName";
 import { Button } from "@/components/ui/button";
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import type { BrandHarness } from "@/components/onboarding/harnessBrand";
@@ -264,18 +265,21 @@ function plural(n: number, word: string) {
 function CatalogRow({
   icon,
   name,
+  label = name,
   detail,
   onOpen,
 }: {
   icon: ReactNode;
   name: string;
+  /** Text shown for the row when it differs from its identifying name. */
+  label?: string;
   detail?: string;
   onOpen?: () => void;
 }) {
   const main = (
     <>
       <span className="flex shrink-0 items-center">{icon}</span>
-      <span className="shrink-0 text-ui font-medium text-foreground">{name}</span>
+      <span className="shrink-0 text-ui font-medium text-foreground">{label}</span>
       {detail && <span className="min-w-0 truncate text-ui text-muted-foreground">{detail}</span>}
     </>
   );
@@ -496,6 +500,7 @@ function McpList({
               key={server.id}
               icon={<LetterAvatar name={server.name} />}
               name={server.name}
+              label={mcpServerDisplayName(server.name)}
               detail={server.detail}
             />
           ))}
@@ -570,7 +575,9 @@ function McpRow({
         >
           <ChevronRightIcon className="size-4 shrink-0 text-muted-foreground group-aria-expanded:rotate-90" />
           <LetterAvatar name={server.name} />
-          <span className="shrink-0 font-medium text-foreground">{server.name}</span>
+          <span className="shrink-0 font-medium text-foreground">
+            {mcpServerDisplayName(server.name)}
+          </span>
           {data?.connection === "connected" && (
             <span className="shrink-0 text-muted-foreground">
               · {data.tools.length}
@@ -600,7 +607,7 @@ function McpRow({
               ? `Update ${host.name} to list tools.`
               : query.error instanceof ApiError && query.error.status === 503
                 ? "Host is busy probing other MCP servers. Collapse and reopen to retry."
-                : `Couldn't reach ${server.name}.`}
+                : `Couldn't reach ${mcpServerDisplayName(server.name)}.`}
           </Notice>
         ) : data ? (
           data.connection !== "connected" ? (

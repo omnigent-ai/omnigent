@@ -104,6 +104,45 @@ def _section_header(page: Page, title: str) -> Locator:
     return page.get_by_role("button", name=title, exact=True)
 
 
+@pytest.mark.parametrize("width", [1440, 390], ids=["desktop", "narrow"])
+def test_harness_grouping_persists_across_reload(
+    page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch, width: int
+) -> None:
+    """Both sidebar layouts group stubbed native/SDK rows and restore Default."""
+    for row, harness in zip(_ROWS, ["codex-native", "claude-native", "codex"], strict=True):
+        monkeypatch.setitem(row, "harness", harness)
+    page.set_viewport_size({"width": width, "height": 900})
+    page.reload()
+    if width < 768:
+        page.get_by_role("button", name="Open sidebar", exact=True).click()
+    _open_view_submenu(page, "session-grouping-menu")
+    page.get_by_role("menuitemradio", name="Harness", exact=True).click()
+    page.keyboard.press("Escape")
+    claude = page.locator("section").filter(has=_section_header(page, "Claude Code"))
+    codex = page.locator("section").filter(has=_section_header(page, "Codex"))
+    expect(claude.locator('a[href^="/c/"]')).to_have_text(["Awaiting session"])
+    expect(codex.locator('a[href^="/c/"]')).to_have_text(["Running session", "Idle session"])
+    expect(claude.get_by_test_id("session-filter")).to_be_visible()
+    expect(_section_header(page, "Projects")).to_have_count(0)
+    _section_header(page, "Codex").click()
+    expect(codex.locator('a[href^="/c/"]')).to_have_count(0)
+    _section_header(page, "Codex").click()
+
+    page.reload()
+    if width < 768:
+        page.get_by_role("button", name="Open sidebar", exact=True).click()
+    expect(codex.locator('a[href^="/c/"]')).to_have_text(["Running session", "Idle session"])
+    _open_view_submenu(page, "session-grouping-menu")
+    expect(page.get_by_role("menuitemradio", name="Harness", exact=True)).to_be_checked()
+    page.get_by_role("menuitemradio", name="Default", exact=True).click()
+    page.keyboard.press("Escape")
+    expect(_section_header(page, "Projects")).to_be_visible()
+    sessions = page.locator("section").filter(has=_section_header(page, "Sessions"))
+    expect(sessions.locator('a[href^="/c/"]')).to_have_text(
+        ["Running session", "Awaiting session", "Idle session"]
+    )
+
+
 def test_grouping_and_show_toggles_persist_across_reload(
     page: Page, stubbed_sidebar: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:

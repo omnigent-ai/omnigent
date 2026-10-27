@@ -79,6 +79,7 @@ from omnigent.runtime import (
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.runtime.policies.approval import _ELICITATION_MODE
 from omnigent.server import presence
+from omnigent.server import session_pull_requests as server_prs
 from omnigent.server._elicitation_registry import (
     _harness_elicitation_owners,
     _harness_elicitation_registry,
@@ -99,6 +100,10 @@ from omnigent.server.background_session_titles import (
     background_title_prompt,
     prepare_background_session_title,
     schedule_background_child_task_summary,
+)
+from omnigent.server.failed_status_diagnostics import (
+    bound_runner_connection,
+    failed_status_intake_attributes,
 )
 from omnigent.server.host_registry import HostConnection, HostRegistry, RunnerExitReports
 from omnigent.server.routes._auth_helpers import (
@@ -143,6 +148,7 @@ from omnigent.server.routes._sessions.common import (
     _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
     _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
     _EXTERNAL_PERMISSION_MODE_CHANGE_TYPE,
+    _EXTERNAL_PULL_REQUESTS_TYPE,
     _EXTERNAL_REASONING_EFFORT_CHANGE_TYPE,
     _EXTERNAL_SESSION_INTERRUPTED_TYPE,
     _EXTERNAL_SESSION_STATUS_TYPE,
@@ -193,6 +199,7 @@ from omnigent.server.routes._sessions.helpers import (
     _is_devin_native_subagent,
     _launch_runner_on_host,
     _native_coding_agent_for_session,
+    _owns_host_runner,
     _parse_background_tasks,
     _persist_external_acp_subagent_start,
     _persist_external_assistant_message,
@@ -242,6 +249,7 @@ from omnigent.server.routes._sessions.orchestration import (
     _cancel_runner_relays,
     _child_session_summaries_from_conversations,
     _codex_side_chat_fork_lost,
+    _codex_side_chat_thread_id,
     _dispatch_session_event_to_runner,
     _enrich_terminal_status_with_subagent_output,
     _ensure_native_terminal_ready,
@@ -303,6 +311,7 @@ from omnigent.stores.conversation_store import (
 from omnigent.stores.file_store import FileStore
 from omnigent.stores.host_store import host_is_live
 from omnigent.stores.permission_store import PermissionStore
+from omnigent.stores.session_pull_request_store import UnreadablePullRequestsError
 from omnigent.telemetry import emit as _tel_emit
 from omnigent.telemetry.anon import anon_user_id as _tel_anon_user_id
 from omnigent.telemetry.events import SessionDeletedEvent as _TelSessionDeletedEvent
@@ -342,6 +351,7 @@ _TRANSIENT_AUDIT_EVENT_TYPES = frozenset(
         _EXTERNAL_OUTPUT_REASONING_DELTA_TYPE,
         _EXTERNAL_TOOL_OUTPUT_DELTA_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_PULL_REQUESTS_TYPE,
     }
 )
 
@@ -751,6 +761,7 @@ _RUNNER_EVENT_TYPES = frozenset(
         _EXTERNAL_OUTPUT_TEXT_DELTA_TYPE,
         _EXTERNAL_SESSION_STATUS_TYPE,
         _EXTERNAL_SESSION_USAGE_TYPE,
+        _EXTERNAL_PULL_REQUESTS_TYPE,
     }
 )
 
@@ -987,6 +998,24 @@ def register_events_routes(
     if register_runner_ingest is not None:
         register_runner_ingest(ingest_runner_batch)
 
+    pull_request_store = server_prs.open_store(conversation_store)
+
+    async def _store_reported_pull_requests(session_id: str, body: SessionEventInput) -> None:
+        """Merge the PRs a runner discovered; the runner retries until this succeeds."""
+        if pull_request_store is None:
+            return
+        reports = server_prs.parse_reports(body.data.get("prs"))
+        if not reports:
+            return
+        try:
+            await asyncio.to_thread(pull_request_store.apply_report, session_id, reports)
+        except UnreadablePullRequestsError:  # Retrying cannot help.
+            _logger.warning(
+                "Ignoring reported pull requests for an unreadable document",
+                exc_info=True,
+                extra={"session_id": session_id},
+            )
+
     async def _post_event_impl(
         request: Request | _RunnerEventContext | StartupInputContext,
         session_id: str,
@@ -1209,6 +1238,7 @@ def register_events_routes(
             _EXTERNAL_SESSION_STATUS_TYPE,
             _SUBAGENT_STATUS_TYPE,
             _EXTERNAL_SESSION_USAGE_TYPE,
+            _EXTERNAL_PULL_REQUESTS_TYPE,
             _EXTERNAL_COMPACTION_STATUS_TYPE,
             _EXTERNAL_MCP_STARTUP_TYPE,
             _EXTERNAL_MODEL_CHANGE_TYPE,
@@ -1803,10 +1833,15 @@ def register_events_routes(
                         "Couldn't release the side chat's resources. Please try again.",
                         code=ErrorCode.RUNNER_UNAVAILABLE,
                     ) from exc
-            # Only the host-bound parent owns the shared runner. Stopping
-            # that process disconnects all its chats; child bindings keep it alive.
+            # Only the runner's owner stops it: the process serves every chat
+            # bound to it, so a sub-agent riding an ancestor's runner leaves it up.
             stop_conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
-            if stop_conv is not None and stop_conv.host_id and stop_conv.runner_id:
+            if (
+                stop_conv is not None
+                and stop_conv.host_id
+                and stop_conv.runner_id
+                and await _owns_host_runner(stop_conv, conversation_store)
+            ):
                 stop_host_registry = getattr(request.app.state, "host_registry", None)
                 host_stopped = await _stop_host_runner_intentionally(
                     session_id,
@@ -2184,6 +2219,18 @@ def register_events_routes(
                     f"{sorted(_EXTERNAL_SESSION_STATUS_VALUES)}; got {status!r}",
                     code=ErrorCode.INVALID_INPUT,
                 )
+            failure_intake = (
+                failed_status_intake_attributes(
+                    body.data,
+                    runner_id=conv.runner_id,
+                    connection=bound_runner_connection(
+                        getattr(request.app.state, "tunnel_registry", None), conv.runner_id
+                    ),
+                    source="bound_runner_at_intake",
+                )
+                if status == "failed"
+                else None
+            )
             response_id = body.data.get("response_id")
             if response_id is not None and not isinstance(response_id, str):
                 raise OmnigentError(
@@ -2304,6 +2351,12 @@ def register_events_routes(
                     cause=diagnosis.cause if diagnosis else None,
                     remediation=diagnosis.remediation if diagnosis else None,
                 )
+            # A confirmed turn completion after a failure means a later turn
+            # succeeded, so the earlier failure must not outlive it.
+            turn_completed = status == "idle" and data.get("turn_completed") is True
+            recovered_from_failure = (
+                turn_completed and _session_status_cache.get(session_id) == "failed"
+            )
             if status_error is not None:
                 failed_agent_name = await asyncio.to_thread(
                     _response_agent_name_from_store, conversation_store, session_id, response_id
@@ -2315,13 +2368,15 @@ def register_events_routes(
                     owner_runner_id=conv.runner_id,
                     agent_name=failed_agent_name,
                 )
-            elif status == "running":
+            elif status == "running" or recovered_from_failure:
                 await _persist_session_status_error_labels(session_id, None, conversation_store)
             _publish_status(
                 session_id,
                 status,
                 status_error,
+                turn_completed=turn_completed,
                 failure_origin="external_session_status",
+                failure_intake=failure_intake,
                 failure_context=data.get("failure_context"),
                 response_id=response_id,
                 background_task_count=bg_count,
@@ -2474,6 +2529,9 @@ def register_events_routes(
                     error=record_error if isinstance(record_error, str) and record_error else None,
                 )
             _publish_mcp_startup(session_id, mcp_servers)
+            return {"queued": False}
+        if body.type == _EXTERNAL_PULL_REQUESTS_TYPE:
+            await _store_reported_pull_requests(session_id, body)
             return {"queued": False}
         if body.type == _EXTERNAL_SESSION_USAGE_TYPE:
             # Persist the harness-reported cumulative usage so the
@@ -3232,11 +3290,16 @@ def register_events_routes(
                 )
         native_terminal_ready = False
         initializer = getattr(request.app.state, "runner_session_initializer", None)
-        if _runner_needs_session_init or (
-            conv.runner_id is not None
-            and _is_native_terminal_session(conv)
-            and initializer is not None
-            and not initializer.is_initialized(conv, runner_client)
+        # Codex child turns run on a thread in the parent's app-server, not their own session.
+        codex_child_turn = body.type == "message" and _codex_side_chat_thread_id(conv) is not None
+        if not codex_child_turn and (
+            _runner_needs_session_init
+            or (
+                conv.runner_id is not None
+                and _is_native_terminal_session(conv)
+                and initializer is not None
+                and not initializer.is_initialized(conv, runner_client)
+            )
         ):
             # Idle reconnects defer initialization until the next interaction.
             # The initializer coalesces completed handshakes for this generation.
@@ -3600,6 +3663,7 @@ def register_events_routes(
         request: Request,
         session_id: str,
         delete_branch: bool = False,
+        capture_logs: bool = False,
     ) -> ConversationDeleted:
         """Delete a session and all associated resources.
 
@@ -3623,6 +3687,12 @@ def register_events_routes(
             block the delete. Defaults to ``False`` (worktree and
             branch left untouched). See
             designs/SESSION_GIT_WORKTREE.md.
+        :param capture_logs: Opt-in, as a query param
+            (``?capture_logs=true``). When ``True`` and the session runs on a
+            managed sandbox, the server logs the sandbox's host and runner
+            log tails before terminating it, so a client that saw a turn fail
+            keeps the evidence. Ignored for sessions without a managed
+            sandbox. Defaults to ``False``.
         :returns: A :class:`ConversationDeleted` confirmation.
         :raises OmnigentError: 404 if no session or no access,
             403 if insufficient permissions, 409 if
@@ -3790,6 +3860,7 @@ def register_events_routes(
                     # terminate; None (config removed since launch)
                     # still deletes the row and revokes the token.
                     getattr(request.app.state, "sandbox_config", None),
+                    capture_logs=capture_logs,
                 )
         try:
             import time as _time

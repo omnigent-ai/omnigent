@@ -347,6 +347,134 @@ def test_host_enable_subcommand_installs_user_service(
     assert "Enabled the Omnigent host user service for local" in result.output
 
 
+def _record_for(target: str) -> cli_module._HostDaemonRecord:
+    """Build a live-looking daemon record for ``target``."""
+    return cli_module._HostDaemonRecord(
+        pid=4242,
+        target=target,
+        mode="server",
+        server_url=target,
+        log_path=None,
+        started_at=1,
+    )
+
+
+@pytest.mark.parametrize(
+    ("args", "listings", "waits"),
+    [
+        pytest.param([], [2, 1, 0], True, id="waits-for-running-turns"),
+        pytest.param(["--force"], [2], False, id="force-replaces-now"),
+        pytest.param([], [None], False, id="unreadable-listing-does-not-block"),
+    ],
+)
+def test_host_enable_lets_running_turns_finish_before_replacing_the_host(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    args: list[str],
+    listings: list[int | None],
+    waits: bool,
+) -> None:
+    """Re-enabling the service replaces a live daemon only once its turns finish."""
+    from omnigent.host.service import HostService
+
+    target = "https://server.example.com"
+    events: list[str] = []
+    remaining = list(listings)
+
+    def _sessions(
+        record: cli_module._HostDaemonRecord, *, connected_only: bool = False
+    ) -> cli_module._DaemonSessionsResult:
+        assert record.target == target
+        assert connected_only is True
+        running = remaining.pop(0) if len(remaining) > 1 else remaining[0]
+        events.append(f"list:{running}")
+        if running is None:
+            return cli_module._DaemonSessionsResult(base_url=target, sessions=[], error="boom")
+        sessions = [{"id": f"conv_{index}", "status": "running"} for index in range(running)]
+        return cli_module._DaemonSessionsResult(
+            base_url=target,
+            sessions=[*sessions, {"id": "conv_idle", "status": "idle"}],
+            error=None,
+        )
+
+    def _terminate(record: cli_module._HostDaemonRecord, *, force: bool) -> str:
+        assert force is False
+        events.append("terminate")
+        return cli_module._STOP_TERMINATED
+
+    def _enable(server_url: str | None, *, environment: dict[str, str]) -> HostService:
+        del environment
+        events.append("enable")
+        service_path = tmp_path / "omnigent-host.service"
+        return HostService(kind="systemd_user", path=service_path, label=service_path.name)
+
+    monkeypatch.setattr("omnigent.cli._resolve_host_server", lambda server: target)
+    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", _record_for)
+    monkeypatch.setattr("omnigent.cli._daemon_owner_is_live", lambda record: True)
+    monkeypatch.setattr("omnigent.cli._sessions_for_daemon", _sessions)
+    monkeypatch.setattr("omnigent.cli._terminate_daemon", _terminate)
+    monkeypatch.setattr("omnigent.cli._UPGRADE_DRAIN_POLL_S", 0.0)
+    monkeypatch.setattr(
+        "omnigent.cli._build_host_daemon_env",
+        lambda *, server_url: {"HOME": str(tmp_path)},
+    )
+    monkeypatch.setattr("omnigent.host.service.enable_user_host_service", _enable)
+
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", target, *args])
+
+    assert result.exit_code == 0, result.output
+    if waits:
+        assert events == ["list:2", "list:1", "list:0", "terminate", "enable"]
+        assert "Waiting for 2 running session(s) to finish" in result.output
+        assert "--force to replace the host now" in result.output
+        assert "1 session(s) still running" in result.output
+    elif args == ["--force"]:
+        assert events == ["terminate", "enable"]
+    else:
+        assert events == ["list:None", "terminate", "enable"]
+        assert "Waiting for" not in result.output
+
+
+def test_host_enable_does_not_wait_on_a_dead_daemon(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A dead daemon's stale running rows can't finish, so enable replaces it at once."""
+    from omnigent.host.service import HostService
+
+    target = "https://server.example.com"
+    terminated: list[str] = []
+    monkeypatch.setattr("omnigent.cli._resolve_host_server", lambda server: target)
+    monkeypatch.setattr("omnigent.cli._ensure_databricks_server_auth", lambda *a, **k: None)
+    monkeypatch.setattr("omnigent.cli._find_daemon_record", _record_for)
+    monkeypatch.setattr("omnigent.cli._daemon_owner_is_live", lambda record: False)
+    monkeypatch.setattr(
+        "omnigent.cli._sessions_for_daemon",
+        lambda record, *, connected_only=False: pytest.fail("listed a dead daemon's sessions"),
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._terminate_daemon",
+        lambda record, *, force: terminated.append(record.target) or cli_module._STOP_TERMINATED,
+    )
+    monkeypatch.setattr(
+        "omnigent.cli._build_host_daemon_env",
+        lambda *, server_url: {"HOME": str(tmp_path)},
+    )
+    service_path = tmp_path / "omnigent-host.service"
+    monkeypatch.setattr(
+        "omnigent.host.service.enable_user_host_service",
+        lambda server_url, *, environment: HostService(
+            kind="systemd_user", path=service_path, label=service_path.name
+        ),
+    )
+
+    result = CliRunner().invoke(cli, ["host", "enable", "--server", target])
+
+    assert result.exit_code == 0, result.output
+    assert terminated == [target]
+
+
 def test_host_disable_subcommand_removes_user_service(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

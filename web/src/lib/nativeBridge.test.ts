@@ -20,6 +20,7 @@ import {
   setNativeServerSwitcherHidden,
   setThemeSource,
   supportsNativeServerPicker,
+  supportsArcaConnect,
   supportsBrowser,
   switchServer,
 } from "./nativeBridge";
@@ -195,6 +196,20 @@ describe("dbcert preflight bridge", () => {
       ok: false,
       error: "Couldn't check your laptop's dbcert. Try again.",
     });
+  });
+});
+
+describe("supportsArcaConnect", () => {
+  it("is true only when the desktop shell offers the Arca connect", () => {
+    setElectron(false);
+    expect(supportsArcaConnect()).toBe(false);
+    // An older desktop shell without the method.
+    setElectron(true);
+    expect(supportsArcaConnect()).toBe(false);
+    (
+      window as unknown as { omnigentDesktop: Record<string, unknown> }
+    ).omnigentDesktop.connectArcaHost = () => Promise.resolve({ ok: true });
+    expect(supportsArcaConnect()).toBe(true);
   });
 });
 

@@ -2059,7 +2059,7 @@ class SandboxStatus(BaseModel):
 
 
 class NativeUsageBaseline(BaseModel):
-    """Own-session cumulative tokens for resuming a native usage reporter.
+    """Own-session cumulative usage for resuming a native usage reporter.
 
     Excludes spawned sessions. Input includes cache reads, matching the native
     usage event contract rather than the display's separate token buckets.
@@ -2068,6 +2068,7 @@ class NativeUsageBaseline(BaseModel):
     cumulative_input_tokens: int = Field(default=0, ge=0)
     cumulative_output_tokens: int = Field(default=0, ge=0)
     cumulative_cache_read_input_tokens: int = Field(default=0, ge=0)
+    cumulative_cost_usd: float | None = Field(default=None, ge=0, allow_inf_nan=False)
 
 
 class ModelUsage(BaseModel):
@@ -2912,6 +2913,72 @@ class ReadStatePutRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+class SessionPullRequestSummary(BaseModel):
+    """
+    The first pull request linked to a session, for list surfaces.
+
+    Stored on the server from what the session's host last reported, so it
+    is available while the host is offline.
+
+    :param url: The PR's URL.
+    :param provider: Git provider id, e.g. ``"github"``.
+    :param provider_display: The provider's labels (``display_name``,
+        ``request_name``, ``number_prefix``), or ``None`` for an unknown provider.
+    :param repository: Base repository, e.g. ``"owner/repo"``.
+    :param number: The PR number.
+    :param title: The last title the host looked up, or ``None``.
+    :param state: ``"OPEN"``, ``"MERGED"`` or ``"CLOSED"`` as last fetched, or
+        ``None`` before the host fetched the PR.
+    :param is_draft: Whether the PR was a draft when last fetched.
+    :param state_checked_at: Epoch seconds of the request that last fetched the
+        PR's state, or ``None`` before one did. Open PRs older than five minutes
+        are refreshed when their host is online; clients show older ones as stale.
+    """
+
+    url: str
+    provider: str
+    provider_display: dict[str, str] | None = None
+    repository: str
+    number: int
+    title: str | None = None
+    state: str | None = None
+    is_draft: bool = False
+    state_checked_at: float | None = None
+
+
+class SessionPullRequest(SessionPullRequestSummary):
+    """
+    A pull request linked to a session, as ``GET /v1/sessions/{id}/pull-requests`` lists it.
+
+    :param host: Forge host, e.g. ``"github.com"``.
+    :param relationship: How the PR joined the session: ``"created"``,
+        ``"worked_on"``, ``"attached"``, or ``"inferred"`` from the branch.
+    :param first_seen_at: Epoch seconds the session first saw the PR.
+    :param last_seen_at: Epoch seconds of the PR's latest activity in the session.
+    """
+
+    host: str
+    relationship: Literal["created", "worked_on", "attached", "inferred"]
+    first_seen_at: float
+    last_seen_at: float
+
+
+class SessionPullRequestList(BaseModel):
+    """
+    A page of a session's linked pull requests in display order, keyed by URL.
+
+    :param synced: Whether the server has imported the session's PRs from its
+        host. Until then an empty list means "not known yet", not "none".
+    """
+
+    object: Literal["list"] = "list"
+    data: list[SessionPullRequest] = Field(default_factory=list)
+    first_id: str | None = None
+    last_id: str | None = None
+    has_more: bool = False
+    synced: bool = False
+
+
 class SessionListItem(BaseModel):
     """
     Lightweight session summary for ``GET /v1/sessions`` list responses.
@@ -2924,6 +2991,7 @@ class SessionListItem(BaseModel):
     :param agent_name: Human-readable name of the bound agent,
         e.g. ``"research-agent"``. ``None`` when the agent row
         cannot be found.
+    :param harness: Canonical effective harness, including per-session overrides.
     :param status: Derived session lifecycle status.
     :param created_at: Unix epoch seconds of creation.
     :param updated_at: Unix epoch seconds of last update.
@@ -3012,11 +3080,17 @@ class SessionListItem(BaseModel):
         matched in its body. Present whenever the query hit an item body
         (even if the title also matched); ``None`` on non-search reads and
         when only the title matched.
+    :param pull_request: The session's first linked pull request, or
+        ``None`` when it has none.
+    :param pull_requests_synced: Whether the server has imported the session's
+        PRs from its host, so a missing ``pull_request`` means "none" rather than
+        "not known yet". ``None`` on servers without PR storage.
     """
 
     id: str
     agent_id: str
     agent_name: str | None = None
+    harness: str | None = None
     status: Literal["idle", "running", "waiting", "failed"]
     created_at: int
     updated_at: int
@@ -3044,6 +3118,8 @@ class SessionListItem(BaseModel):
     # unfiled. Lets the sidebar group sessions by project without a follow-up
     # GET. Distinct from the legacy ``omni_project`` label in ``labels``.
     project_id: str | None = None
+    pull_request: SessionPullRequestSummary | None = None
+    pull_requests_synced: bool | None = None
 
 
 class SessionList(BaseModel):
