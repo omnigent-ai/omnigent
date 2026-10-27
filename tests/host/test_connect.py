@@ -7221,8 +7221,13 @@ async def test_accepted_connect_resets_loopback_refused_streak(
     assert spy.call_count == 6
 
 
+@pytest.mark.parametrize("console_error", [None, BrokenPipeError(), ValueError("closed")])
 def test_run_host_process_exits_nonzero_on_fatal(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+    caplog: pytest.LogCaptureFixture,
+    console_error: Exception | None,
 ) -> None:
     """run_host_process surfaces a fatal tunnel failure as its own exit code.
 
@@ -7235,7 +7240,12 @@ def test_run_host_process_exits_nonzero_on_fatal(
     """
     _patch_connect(monkeypatch, _ConnectSpy([_invalid_status(403)]))
 
-    with pytest.raises(SystemExit) as excinfo:
+    with (
+        patch("omnigent.host.connect.print", side_effect=console_error, create=True)
+        if console_error is not None
+        else contextlib.nullcontext(),
+        pytest.raises(SystemExit) as excinfo,
+    ):
         run_host_process(
             server_url="https://app.example.databricks.com",
             config_path=tmp_path / "config.yaml",
@@ -7245,10 +7255,14 @@ def test_run_host_process_exits_nonzero_on_fatal(
     # from a crash so supervision doesn't retry it.
     assert excinfo.value.code == HOST_FATAL_EXIT_CODE
     assert HOST_FATAL_EXIT_CODE != 1
-    err = capsys.readouterr().err
-    # The actionable message reached stderr (banner + the 403 cause).
-    assert "Could not connect" in err
-    assert "HTTP 403" in err
+    assert _host_exit_reasons(caplog) == ["fatal_connect"]
+    assert isinstance(excinfo.value.__cause__, HostConnectError)
+    assert "HTTP 403" in str(excinfo.value.__cause__)
+    if console_error is None:
+        err = capsys.readouterr().err
+        # The actionable message reached stderr (banner + the 403 cause).
+        assert "Could not connect" in err
+        assert "HTTP 403" in err
 
 
 def _host_exit_reasons(caplog: pytest.LogCaptureFixture) -> list[object]:
@@ -7896,10 +7910,12 @@ async def test_sustained_recycle_failures_fall_back_to_backoff(
     assert prompt == [0, 1, 2], f"prompt cadence must stop after the streak cap: {prompt}"
 
 
+@pytest.mark.parametrize("console_error", [None, BrokenPipeError(), ValueError("closed")])
 async def test_silent_connect_streak_escalates_and_slows_reconnects(
     monkeypatch: pytest.MonkeyPatch,
     caplog: pytest.LogCaptureFixture,
     capsys: pytest.CaptureFixture[str],
+    console_error: Exception | None,
 ) -> None:
     """Repeated accepted-but-silent connections escalate to slow backoff."""
     monkeypatch.setattr("omnigent.host.connect._RECONNECT_BASE_S", 0.0)
@@ -7911,13 +7927,35 @@ async def test_silent_connect_streak_escalates_and_slows_reconnects(
     _patch_connect(monkeypatch, spy)
     host = _host()
 
-    with caplog.at_level(logging.WARNING, logger="omnigent.host.connect"):
+    with (
+        caplog.at_level(logging.WARNING, logger="omnigent.host.connect"),
+        patch("omnigent.host.connect.print", side_effect=console_error, create=True)
+        if console_error is not None
+        else contextlib.nullcontext(),
+        patch.object(
+            _DroppedTunnel,
+            "recv",
+            new_callable=AsyncMock,
+            side_effect=ConnectionClosedError(None, None),
+        ) as recv,
+    ):
         await host.run()
 
+    assert spy.call_count == 6
+    assert recv.await_count == 5
     errors = [record for record in caplog.records if record.levelno == logging.ERROR]
     assert len(errors) == 1
     assert "3 consecutive connections but never responded" in errors[0].message
-    assert capsys.readouterr().err.count("never responded") == 1
+    if console_error is None:
+        assert capsys.readouterr().err.count("never responded") == 1
+    else:
+        failed_streams = [
+            record.attributes["stream"]
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "host_console_write_failed"
+        ]
+        assert failed_streams.count("stdout") == 5
+        assert failed_streams.count("stderr") == 1
     reconnects = [
         record.message for record in caplog.records if "Reconnecting in" in record.message
     ]
