@@ -532,6 +532,7 @@ class _SessionSnapshot:
     sub_agent_name: str | None = None
     parent_session_id: str | None = None
     agent_name: str | None = None
+    acp_permission_mode: str | None = None
     wrapper_label: str | None = None
 
 
@@ -2043,6 +2044,7 @@ def create_runner_app(
             sub_agent_name: str | None = None
             parent_session_id: str | None = None
             agent_name: str | None = None
+            acp_permission_mode: str | None = None
             wrapper_label: str | None = None
             try:
                 resp = await server_client.get(
@@ -2067,6 +2069,17 @@ def create_runner_app(
                     raw_agent_name = body.get("agent_name")
                     if isinstance(raw_agent_name, str) and raw_agent_name:
                         agent_name = raw_agent_name
+                    from omnigent.acp_permissions import (
+                        ACP_PERMISSION_MODE_LABEL,
+                        ACP_PERMISSION_MODES,
+                    )
+
+                    labels = body.get("labels")
+                    mode = (
+                        labels.get(ACP_PERMISSION_MODE_LABEL) if isinstance(labels, dict) else None
+                    )
+                    if mode in ACP_PERMISSION_MODES:
+                        acp_permission_mode = mode
                     wrapper_label = wrapper_label_from_labels(body.get("labels"))
             except Exception:  # noqa: BLE001 — best-effort; created_at falls back to wall time
                 pass
@@ -2079,6 +2092,7 @@ def create_runner_app(
                 sub_agent_name=sub_agent_name,
                 parent_session_id=parent_session_id,
                 agent_name=agent_name,
+                acp_permission_mode=acp_permission_mode,
                 wrapper_label=wrapper_label,
             )
             if snapshot.ok and snapshot.agent_id is not None:
@@ -2157,6 +2171,8 @@ def create_runner_app(
         global _server_version
         _server_version = envelope.server_version
         snapshot = envelope.snapshot
+        from omnigent.acp_permissions import ACP_PERMISSION_MODE_LABEL
+
         _session_snapshot_cache[session_id] = _SessionSnapshot(
             ok=True,
             status_code=200,
@@ -2165,6 +2181,7 @@ def create_runner_app(
             agent_id=agent_id,
             sub_agent_name=envelope.sub_agent_name,
             parent_session_id=snapshot.parent_session_id,
+            acp_permission_mode=snapshot.labels.get(ACP_PERMISSION_MODE_LABEL),
             wrapper_label=wrapper_label_from_labels(snapshot.labels),
         )
         _session_start_cache[session_id] = float(snapshot.created_at)
@@ -5629,6 +5646,23 @@ def create_runner_app(
             )
 
         _turn_agent_id = dispatch.agent_id if dispatch else cast(str | None, body.get("agent_id"))
+        if harness_name == "acp":
+            mode = (await _session_snapshot(conv_id)).acp_permission_mode
+            if mode is not None:
+                try:
+                    applied = await client.post(
+                        f"/v1/sessions/{conv_id}/acp-permission-mode",
+                        json={"permission_mode": mode},
+                        timeout=10.0,
+                    )
+                    applied.raise_for_status()
+                    payload = applied.json()
+                    if not isinstance(payload, dict) or payload.get("permission_mode") != mode:
+                        raise ValueError("ACP permission mode was not confirmed")
+                except (httpx.HTTPError, RuntimeError, ValueError):
+                    return JSONResponse(
+                        status_code=503, content={"error": "acp_permission_mode_failed"}
+                    )
         _has_mcp_hint = dispatch.has_mcp_servers if dispatch else body.get("has_mcp_servers")
         _turn_spec: object | None = None
         _turn_spec_entry: object | None = None
@@ -7002,6 +7036,34 @@ def create_runner_app(
                     enabled=enabled,
                 )
             return Response(status_code=204)
+
+        if body_type == "acp_permission_mode_change":
+            from omnigent.acp_permissions import ACP_PERMISSION_MODES
+
+            mode = body.get("permission_mode")
+            if _session_harness_name(conversation_id) != "acp" or mode not in ACP_PERMISSION_MODES:
+                return JSONResponse(
+                    status_code=400, content={"error": "invalid_acp_permission_mode"}
+                )
+            if process_manager is None:
+                return JSONResponse(status_code=503, content={"error": "no_harness"})
+            try:
+                harness_client = await process_manager.get_client(conversation_id, "any")
+                result = await harness_client.post(
+                    f"/v1/sessions/{conversation_id}/acp-permission-mode",
+                    json={"permission_mode": mode},
+                    timeout=10.0,
+                )
+                if result.status_code == 200 and result.json().get("permission_mode") == mode:
+                    snapshot = await _session_snapshot(conversation_id)
+                    _session_snapshot_cache[conversation_id] = dataclasses.replace(
+                        snapshot, acp_permission_mode=mode
+                    )
+                return _forward_harness_response(result)
+            except (RuntimeError, httpx.HTTPError, ValueError):
+                return JSONResponse(
+                    status_code=503, content={"error": "acp_permission_mode_unavailable"}
+                )
 
         if body_type == "permission_mode_change":
             harness = _session_harness_name(conversation_id)

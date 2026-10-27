@@ -428,6 +428,14 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_codex_terminal_effort_change_reaches_composer`,
   `tests/e2e_ui/chat/test_codex_effort_terminal_composer_mirror.py::test_composer_effort_pick_survives_terminal_turns`
 - **`permission-mode`:**
+  Existing ACP chats, including Cline, expose Ask every time and Full access on
+  desktop and mobile. Unselected chats keep their configured launch behavior;
+  failed runner acknowledgements keep the last confirmed choice.
+  `tests/browser_ui/chat/test_composer_acceptance.py::test_cline_permission_selection_is_persistent_and_reversible`
+  covers selection, reload, rejection and reversal on both layouts.
+  `tests/e2e/test_acp_session_selection.py::test_acp_live_permission_choice_survives_next_turn_and_restores_asking`
+  owns an isolated server, runner and fixture ACP process; it proves the next
+  call is allowed, the ACP process is retained, and asking can be restored.
   `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_permission_mode_switch_persists`
 - **`permission-mode-hotkey`:** in session with a real Claude CLI,
   `tests/e2e_ui/chat/test_claude_native_permission_switch_from_dont_ask.py::test_shift_tab_cycles_permission_mode_from_composer`.

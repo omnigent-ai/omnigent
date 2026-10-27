@@ -1265,6 +1265,57 @@ async def test_default_permission_mode_still_asks() -> None:
 
 
 @pytest.mark.asyncio
+async def test_live_permission_selection_is_reversible_and_keeps_policy() -> None:
+    ex = AcpExecutor(AcpAgentConfig(command="x"))
+    ex._elicitation_handler = AsyncMock(return_value=True)
+    request = {"toolCall": {"title": "shell"}}
+    assert await ex._decide_permission(request) == (True, None)
+    ex.set_permission_mode("bypassPermissions")
+    assert await ex._decide_permission(request) == (True, None)
+    assert ex._elicitation_handler.await_count == 1
+    ex._policy_evaluator = AsyncMock(return_value=Mock(action="POLICY_ACTION_DENY"))
+    assert await ex._decide_permission(request) == (False, None)
+    ex._policy_evaluator = AsyncMock(return_value=Mock(action="POLICY_ACTION_ASK"))
+    assert await ex._decide_permission(request) == (True, None)
+    assert ex._elicitation_handler.await_count == 2
+    ex._policy_evaluator = None
+    ex.set_permission_mode("auto")
+    assert await ex._decide_permission(request) == (True, None)
+    assert ex._elicitation_handler.await_count == 3
+    with pytest.raises(ValueError):
+        ex.set_permission_mode("yolo")
+    assert ex._config.permission_mode == "auto"
+
+
+@pytest.mark.asyncio
+async def test_acp_permission_endpoint_requires_bound_session_and_harness_auth() -> None:
+    import httpx
+
+    from omnigent.inner.acp_harness import create_app
+
+    app = create_app()
+    app.state.conversation_id = "permission-chat"
+    app.state.harness_auth_token = "test-harness-token"
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://harness"
+    ) as client:
+        url = "/v1/sessions/permission-chat/acp-permission-mode"
+        assert (
+            await client.post(url, json={"permission_mode": "bypassPermissions"})
+        ).status_code == 401
+        client.headers["Authorization"] = "Bearer test-harness-token"
+        assert (await client.post(url, json={"permission_mode": "yolo"})).status_code == 400
+        assert (
+            await client.post(
+                url.replace("permission-chat", "another-chat"), json={"permission_mode": "auto"}
+            )
+        ).status_code == 404
+        response = await client.post(url, json={"permission_mode": "bypassPermissions"})
+        assert response.status_code == 200
+        assert response.json() == {"permission_mode": "bypassPermissions"}
+
+
+@pytest.mark.asyncio
 async def test_unrecognized_permission_mode_still_asks() -> None:
     """Only the exact ``bypassPermissions`` waives the card; anything else prompts.
 

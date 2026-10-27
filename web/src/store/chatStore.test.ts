@@ -11197,6 +11197,7 @@ describe("chatStore — session configuration scope", () => {
   ];
 
   interface SnapshotOverrides {
+    harness?: string;
     labels?: Record<string, string>;
     reasoning_effort?: string | null;
     model_override?: string | null;
@@ -11214,6 +11215,7 @@ describe("chatStore — session configuration scope", () => {
         return mockResponse({
           id,
           agent_id: "agent_xyz",
+          harness: overrides.harness,
           status: "idle",
           created_at: 0,
           items: [],
@@ -11242,6 +11244,46 @@ describe("chatStore — session configuration scope", () => {
         return body ? (JSON.parse(body as string) as Record<string, unknown>) : {};
       });
   }
+
+  it("keeps confirmed ACP permission changes on the source chat across navigation and failure", async () => {
+    seedSession("conv_acp_permissions", []);
+    seedSession("conv_other_permissions", []);
+    withSnapshot("conv_acp_permissions", {
+      harness: "acp:cline",
+      labels: { "omnigent.acp.permission_mode": "auto" },
+    });
+    await useChatStore.getState().switchTo("conv_acp_permissions");
+    const previousFetch = fetchMock.getMockImplementation()!;
+    let reject = false;
+    let confirm!: (value: Response) => void;
+    fetchMock.mockImplementation((input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input) === "/v1/sessions/conv_acp_permissions" && init?.method === "PATCH") {
+        return reject
+          ? mockResponse({ detail: "Runner unavailable" }, { ok: false, status: 503 })
+          : new Promise<Response>((resolve) => {
+              confirm = resolve;
+            });
+      }
+      return previousFetch(input, init);
+    });
+    const change = useChatStore.getState().setAcpPermissionMode("bypassPermissions");
+    expect(useChatStore.getState().acpPermissionMode).toBe("auto");
+    await useChatStore.getState().switchTo("conv_other_permissions");
+    confirm(
+      await mockResponse({
+        id: "conv_acp_permissions",
+        harness: "acp:cline",
+        labels: { "omnigent.acp.permission_mode": "bypassPermissions" },
+      }),
+    );
+    await change;
+    expect(useChatStore.getState().acpPermissionMode).toBe("");
+    await useChatStore.getState().switchTo("conv_acp_permissions");
+    expect(useChatStore.getState().acpPermissionMode).toBe("bypassPermissions");
+    reject = true;
+    await expect(useChatStore.getState().setAcpPermissionMode("auto")).rejects.toThrow();
+    expect(useChatStore.getState().acpPermissionMode).toBe("bypassPermissions");
+  });
 
   it("binds an empty native session without PATCHing or retaining prior configuration", async () => {
     seedSession("conv_cn", []);

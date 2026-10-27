@@ -1161,6 +1161,16 @@ class AcpExecutor(Executor):
         """
         return self._config.permission_mode == "bypassPermissions"
 
+    def set_permission_mode(self, mode: str) -> None:
+        """Change subsequent permission decisions without restarting the agent."""
+        from dataclasses import replace
+
+        from omnigent.acp_permissions import ACP_PERMISSION_MODES
+
+        if mode not in ACP_PERMISSION_MODES:
+            raise ValueError("Unsupported ACP permission mode")
+        self._config = replace(self._config, permission_mode=mode)
+
     @staticmethod
     def _permission_options(params: _AcpJsonObject) -> list[_AcpJsonObject]:
         """The agent's offered options, each an ``{optionId, name, kind}`` dict."""

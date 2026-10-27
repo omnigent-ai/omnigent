@@ -27,6 +27,7 @@ from fastapi.responses import Response
 from pydantic import ValidationError
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
+from omnigent.acp_permissions import ACP_PERMISSION_MODE_LABEL, ACP_PERMISSION_MODES
 from omnigent.codex_approval_modes import (
     CODEX_NATIVE_PERMISSION_VALUES,
 )
@@ -2703,7 +2704,10 @@ def register_core_routes(
         """
         # A live effort/model change must read the settings its predecessor confirmed
         # or restored; otherwise a refusal can restore a value Codex never applied.
-        if not body.silent and {"reasoning_effort", "model_override"} & body.model_fields_set:
+        if (
+            not body.silent
+            and {"reasoning_effort", "model_override", "permission_mode"} & body.model_fields_set
+        ):
             live_change = _live_settings_change(session_id)
             async with live_change.lock:
                 return await _update_session(request, session_id, body, include_usage, live_change)
@@ -2832,6 +2836,7 @@ def register_core_routes(
             requested_codex_collaboration_mode = body.collaboration_mode
         permission_mode_requested = "permission_mode" in body.model_fields_set
         requested_permission_mode: str | None = None
+        acp_permission_mode = False
         if permission_mode_requested:
             if body.permission_mode is None:
                 raise OmnigentError(
@@ -2857,11 +2862,17 @@ def register_core_routes(
 
                 allowed_permission_modes = DEVIN_PERMISSION_MODES
             else:
-                raise OmnigentError(
-                    "permission_mode is only supported for claude-native and "
-                    "devin-native sessions",
-                    code=ErrorCode.INVALID_INPUT,
-                )
+                from omnigent.harness_aliases import canonicalize_harness
+                from omnigent.server.routes._sessions.helpers import _resolve_harness
+
+                if canonicalize_harness(_resolve_harness(conv_for_permission_mode)) != "acp":
+                    raise OmnigentError(
+                        "permission_mode is only supported for claude-native, "
+                        "devin-native and ACP sessions",
+                        code=ErrorCode.INVALID_INPUT,
+                    )
+                acp_permission_mode = True
+                allowed_permission_modes = ACP_PERMISSION_MODES
             if body.permission_mode not in allowed_permission_modes:
                 raise OmnigentError(
                     f"permission_mode must be one of {sorted(allowed_permission_modes)}",
@@ -3449,10 +3460,28 @@ def register_core_routes(
                 session_id,
                 runner_router,
                 {
-                    "type": "permission_mode_change",
+                    "type": "acp_permission_mode_change"
+                    if acp_permission_mode
+                    else "permission_mode_change",
                     "permission_mode": requested_permission_mode,
                 },
             )
+            if acp_permission_mode:
+                try:
+                    confirmed = json.loads(_mode_result.body) if _mode_result is not None else None
+                except (ValueError, TypeError):
+                    confirmed = None
+                if (
+                    _mode_result is None
+                    or _mode_result.status_code != 200
+                    or not isinstance(confirmed, dict)
+                    or confirmed.get("permission_mode") != requested_permission_mode
+                ):
+                    raise OmnigentError(
+                        "The ACP runner did not confirm the permission change. "
+                        "Update or reconnect this chat and try again.",
+                        code=ErrorCode.RUNNER_UNAVAILABLE,
+                    )
             # Raises unless the runner confirms the switch, so the label can
             # never claim a mode Claude isn't in. Stores the mode it reached.
             _confirmed_permission_mode = _require_permission_mode_forward(
@@ -3460,7 +3489,11 @@ def register_core_routes(
                 requested_permission_mode,
                 _mode_result,
             )
-            labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY] = _confirmed_permission_mode
+            labels_to_set[
+                ACP_PERMISSION_MODE_LABEL
+                if acp_permission_mode
+                else _CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY
+            ] = _confirmed_permission_mode
             # The launcher restores the mode from terminal_launch_args, not the
             # label above, so pin the confirmed mode there too — otherwise a
             # relaunch reopens in the launch mode, which is Claude's default
@@ -3472,7 +3505,7 @@ def register_core_routes(
                 updated.terminal_launch_args,
                 _confirmed_permission_mode,
             )
-            if updated.terminal_launch_args != _merged_permission_args:
+            if not acp_permission_mode and updated.terminal_launch_args != _merged_permission_args:
                 await asyncio.to_thread(
                     conversation_store.update_conversation,
                     session_id,
@@ -3521,6 +3554,8 @@ def register_core_routes(
                 session_id,
                 labels_to_set[_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY],
             )
+        if ACP_PERMISSION_MODE_LABEL in labels_to_set:
+            _publish_permission_mode(session_id, labels_to_set[ACP_PERMISSION_MODE_LABEL])
         if _CODEX_NATIVE_APPROVAL_MODE_LABEL_KEY in labels_to_set:
             _publish_codex_approval_mode(
                 session_id,
@@ -3915,6 +3950,7 @@ def register_core_routes(
             from omnigent.mcp_selection import MCP_SELECTION_PREFIX
 
             dropped_label_keys_set.add(_CLAUDE_NATIVE_PERMISSION_MODE_LABEL_KEY)
+            dropped_label_keys_set.add(ACP_PERMISSION_MODE_LABEL)
             dropped_label_keys_set.update(
                 key for key in source.labels if key.startswith(MCP_SELECTION_PREFIX)
             )

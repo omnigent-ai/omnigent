@@ -41,6 +41,19 @@ for line in sys.stdin:
         current_model = msg["params"]["value"]
         result = {"configOptions": [{"id": "model", "currentValue": current_model}]}
     elif method == "session/prompt":
+        if any("CHECK_PERMISSIONS" in part.get("text", "")
+               for part in msg["params"].get("prompt", [])):
+            send({"jsonrpc": "2.0", "id": "permission-check",
+                  "method": "session/request_permission", "params": {
+                "sessionId": msg["params"]["sessionId"],
+                "toolCall": {"toolCallId": "safe-command", "title": "run_commands",
+                             "rawInput": {"command": "echo fixture"}},
+                "options": [
+                    {"optionId": "allow", "name": "Allow once", "kind": "allow_once"},
+                    {"optionId": "deny", "name": "Reject", "kind": "reject_once"}]}})
+            decision = json.loads(sys.stdin.readline())
+            assert decision["result"]["outcome"] == {
+                "outcome": "selected", "optionId": "allow"}, decision
         send({"jsonrpc": "2.0", "method": "session/update", "params": {
             "sessionId": msg["params"]["sessionId"], "update": {
                 "sessionUpdate": "agent_message_chunk",
@@ -280,3 +293,50 @@ def test_acp_choice_is_resolved_on_runner(
         assert client.get(f"/v1/sessions/{session}").json()["harness"] == override
     finally:
         client.delete(f"/v1/sessions/{session}").raise_for_status()
+
+
+def test_acp_live_permission_choice_survives_next_turn_and_restores_asking(acp_server) -> None:
+    client, runner_id, launches, _ = acp_server
+    agent = next(a for a in client.get("/v1/agents").json()["data"] if a["name"] == "selection")
+    response = client.post(
+        "/v1/sessions",
+        json={
+            "agent_id": agent["id"],
+            "harness_override": "acp:goose",
+            "initial_items": [_message("Warm up")],
+        },
+    )
+    response.raise_for_status()
+    sid = response.json()["id"]
+    try:
+        client.patch(f"/v1/sessions/{sid}", json={"runner_id": runner_id}).raise_for_status()
+        assert _wait_for_reply(client, sid, 1)["status"] == "idle"
+        before = launches.read_text()
+        result = client.patch(f"/v1/sessions/{sid}", json={"permission_mode": "bypassPermissions"})
+        assert result.status_code == 200, result.text
+        client.post(
+            f"/v1/sessions/{sid}/events", json=_message("CHECK_PERMISSIONS")
+        ).raise_for_status()
+        assert _wait_for_reply(client, sid, 2)["status"] == "idle"
+        assert launches.read_text() == before, (
+            "Permission selection must keep the same ACP process"
+        )
+        assert (
+            client.get(f"/v1/sessions/{sid}").json()["labels"]["omnigent.acp.permission_mode"]
+            == "bypassPermissions"
+        )
+        result = client.patch(f"/v1/sessions/{sid}", json={"permission_mode": "auto"})
+        assert result.status_code == 200, result.text
+        client.post(
+            f"/v1/sessions/{sid}/events", json=_message("CHECK_PERMISSIONS again")
+        ).raise_for_status()
+        deadline = time.monotonic() + 15
+        while time.monotonic() < deadline:
+            pending = client.get(f"/v1/sessions/{sid}").json().get("pending_elicitations", [])
+            if pending:
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail(f"Ask mode did not produce a pending approval: {pending}")
+    finally:
+        client.delete(f"/v1/sessions/{sid}").raise_for_status()
