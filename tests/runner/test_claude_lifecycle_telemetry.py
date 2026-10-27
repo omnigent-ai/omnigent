@@ -17,6 +17,7 @@ import pytest
 from fastapi import FastAPI, Response
 
 from omnigent.debug_logging import current_session_id_scope, record_to_row
+from omnigent.harnesses import diagnostics
 from omnigent.harnesses.claude_native import bridge, hook, lifecycle
 from omnigent.inner.terminal import TerminalInstance
 from omnigent.runner import create_runner_app
@@ -197,7 +198,48 @@ async def test_reason_survives_cleanup_and_sink_serialization_without_reclassify
     )
 
 
-@pytest.mark.parametrize("failure", ["reader", "serialization"])
+@pytest.mark.parametrize("hook_name", [None, "SessionStart", "UserPromptSubmit", "SessionEnd"])
+async def test_launcher_failure_evidence_preserves_tmux_status_and_failure(
+    launch: _Launch,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    hook_name: str | None,
+) -> None:
+    caplog.set_level(logging.INFO)
+    if hook_name is not None:
+        _hook(launch, monkeypatch, hook_name, 100.0, source="startup")
+    launch.instance._remember_exit_status("1 0")
+    launch.instance._remember_pane_snapshot(
+        "Error: Invalid MCP configuration:\n"
+        "MCP config file not found: /private/synthetic-launch-config.json\n"
+        "╭──────── Error ────────╮\n"
+        "│ Claude Code exited with code 1 │\n"
+        "╰──────────────────────╯\n"
+        "Pane is dead (status 0, synthetic timestamp)"
+    )
+    launch.instance.running = False
+    launch.callbacks["on_exit"]()
+    await asyncio.wait_for(launch.resources.wait_for_terminal_exit_cleanup(), timeout=2)
+
+    for event_name in ("terminal_exit_observed", "required_terminal_exited"):
+        [row] = _rows(caplog, event_name)
+        attributes = row["attributes"]
+        assert attributes["terminal_exit_status"] == "0"
+        assert attributes["terminal_exit_status_source"] == "tmux_pane_dead_status"
+        if hook_name is not None:
+            assert "launcher_failure_kind" not in attributes
+            assert "launcher_reported_exit_status" not in attributes
+        else:
+            assert attributes["launcher_failure_kind"] == "missing_mcp_configuration"
+            assert attributes["launcher_reported_exit_status"] == "1"
+            assert attributes["launcher_exit_evidence_source"] == "terminal_final_error_panel"
+        assert "/private/synthetic-launch-config.json" not in json.dumps(attributes)
+    statuses = _drain_session_event_queue(_session_event_queues_ref.get(_SESSION))
+    [failed] = [event for event in statuses if event.get("status") == "failed"]
+    assert failed["error"]["code"] == "required_terminal_exited"
+
+
+@pytest.mark.parametrize("failure", ["reader", "serialization", "launcher_parser"])
 async def test_lifecycle_capture_failure_cannot_prevent_exit_cleanup_or_failure(
     launch: _Launch,
     monkeypatch: pytest.MonkeyPatch,
@@ -211,8 +253,11 @@ async def test_lifecycle_capture_failure_cannot_prevent_exit_cleanup_or_failure(
 
     if failure == "reader":
         monkeypatch.setattr(lifecycle, "read_lifecycle_snapshot", fail)
-    else:
+    elif failure == "serialization":
         monkeypatch.setattr(resource_registry_mod, "lifecycle_log_attributes", fail)
+    else:
+        monkeypatch.setattr(diagnostics, "launcher_failure_evidence", fail)
+        launch.instance._remember_pane_snapshot("startup failed")
     launch.instance.running = False
     launch.callbacks["on_exit"]()
     await asyncio.wait_for(launch.resources.wait_for_terminal_exit_cleanup(), timeout=2)
