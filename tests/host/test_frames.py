@@ -60,6 +60,7 @@ from omnigent.host.frames import (
     HostPluginsResultFrame,
     HostProbeAccountsFrame,
     HostProbeAccountsResultFrame,
+    HostRecoverSessionsFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -3114,3 +3115,19 @@ def test_workspace_call_and_reply_frames_round_trip_bytes() -> None:
     assert decode_host_frame(encode_host_frame(call)) == call
     assert decode_host_frame(encode_host_frame(reply)) == reply
     assert decode_host_frame(encode_host_frame(end)) == end
+
+
+def test_recovery_request_round_trip_and_legacy_hello_default() -> None:
+    frame = HostRecoverSessionsFrame(runners=["alive-runner"])
+    assert decode_host_frame(encode_host_frame(frame)) == frame
+    hello = HostHelloFrame(version="test", frame_protocol_version=1, name="sandbox")
+    assert decode_host_frame(encode_host_frame(hello)).recover_interrupted_sessions is False
+    hello.recover_interrupted_sessions = True
+    assert decode_host_frame(encode_host_frame(hello)).recover_interrupted_sessions is True
+
+
+def test_recovery_launch_roundtrip() -> None:
+    frame = HostLaunchRunnerFrame(
+        request_id="recover", binding_token="token", workspace="/restored", recovery=True
+    )
+    assert decode_host_frame(encode_host_frame(frame)) == frame

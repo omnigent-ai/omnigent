@@ -7,6 +7,7 @@ import logging
 import uuid
 from collections.abc import Iterator, Mapping
 from contextlib import contextmanager, suppress
+from dataclasses import asdict, replace
 from itertools import batched
 from pathlib import PureWindowsPath
 from typing import Any, Literal, Protocol, cast
@@ -52,6 +53,7 @@ from omnigent.db.db_models import (
     SqlPreference,
     SqlProject,
     SqlSessionPermission,
+    SqlSessionRecovery,
     SqlUser,
     SqlUserDailyCost,
     current_workspace_id,
@@ -89,6 +91,7 @@ from omnigent.db.utils import (
 from omnigent.entities import (
     Conversation,
     ConversationItem,
+    MessageData,
     NewConversationItem,
     PagedList,
     parse_item_data,
@@ -97,6 +100,7 @@ from omnigent.errors import ErrorCode, OmnigentError, StaleCursorError
 from omnigent.native.native_coding_agents import native_coding_agent_for_wrapper_label
 from omnigent.native.session_todos import validate_session_todos
 from omnigent.session_import.models import IMPORT_SOURCE_LABEL_KEY
+from omnigent.session_recovery import RECOVERY_PROMPT, SessionRecovery
 from omnigent.stores.conversation_store import (
     _FORK_ONLY_DROPPED_LABEL_KEYS,
     _INSTANCE_SCOPED_LABEL_KEYS,
@@ -2735,6 +2739,47 @@ class SqlAlchemyConversationStore(ConversationStore):
             decoded = self._decode_item_data_batch([r.data for r in ordered])
             return [_to_item(r, d) for r, d in zip(ordered, decoded, strict=True)]
 
+    supports_session_recovery = True
+
+    def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
+        with self._conv_session("get_session_recovery") as session:
+            row = session.get(SqlSessionRecovery, (current_workspace_id(), conversation_id))
+            return SessionRecovery(**json.loads(row.state)) if row is not None else None
+
+    def replace_session_recovery(
+        self,
+        conversation_id: str,
+        expected: SessionRecovery | None,
+        recovery: SessionRecovery | None,
+    ) -> bool:
+        def write(session: Session) -> bool:
+            self._lock_conversation(session, conversation_id)
+            conversation = session.get(SqlConversation, (current_workspace_id(), conversation_id))
+            if conversation is None or conversation.archived:
+                return False
+            row = session.get(SqlSessionRecovery, (current_workspace_id(), conversation_id))
+            actual = SessionRecovery(**json.loads(row.state)) if row is not None else None
+            if actual != expected:
+                return False
+            if recovery is None:
+                if row is not None:
+                    session.delete(row)
+            elif row is None:
+                session.add(
+                    SqlSessionRecovery(
+                        workspace_id=current_workspace_id(),
+                        conversation_id=conversation_id,
+                        state=json.dumps(asdict(recovery)),
+                    )
+                )
+            else:
+                row.state = json.dumps(asdict(recovery))
+            return True
+
+        return run_write_transaction(
+            self._conv_session_immediate, "replace_session_recovery", write
+        )
+
     def list_host_conversation_ids(
         self,
         host_id: str,
@@ -3112,6 +3157,14 @@ class SqlAlchemyConversationStore(ConversationStore):
         # FOR UPDATE lock while it round-trips. strip_nul_bytes runs here so a
         # Postgres text column never sees a NUL (tool output can embed one, e.g.
         # reading a binary file), which would abort the whole INSERT.
+        for item in items:
+            if (
+                isinstance(item.data, MessageData)
+                and item.data.role == "user"
+                and not item.data.user_authored
+                and item.data.content == [{"type": "input_text", "text": RECOVERY_PROMPT}]
+            ):
+                item.data = item.data.model_copy(update={"is_meta": True})
         raw_jsons = [
             strip_nul_bytes(json.dumps(item.data.model_dump(exclude_none=True))) for item in items
         ]
@@ -3207,6 +3260,21 @@ class SqlAlchemyConversationStore(ConversationStore):
                         for item in items
                         if item.stable_id is not None
                     ]
+
+            # Accepted new input cancels a pending continuation in the same transaction.
+            if any(
+                item.stable_id not in existing_by_id
+                and isinstance(item.data, MessageData)
+                and item.data.role == "user"
+                and not item.data.is_meta
+                for item in items
+            ):
+                session.execute(
+                    delete(SqlSessionRecovery).where(
+                        SqlSessionRecovery.workspace_id == workspace_id,
+                        SqlSessionRecovery.conversation_id == conversation_id,
+                    )
+                )
 
             replacements: dict[str, tuple[int, int]] = {}
             for item, prepared, _ in prepared_rows:
@@ -4637,6 +4705,13 @@ class SqlAlchemyConversationStore(ConversationStore):
                             SqlConversationLabel.key == ARCHIVED_AT_LABEL_KEY,
                         )
                     )
+                if archived:
+                    recovery_row = ap_sess.get(
+                        SqlSessionRecovery, (current_workspace_id(), conversation_id)
+                    )
+                    if recovery_row is not None:
+                        recovery = SessionRecovery(**json.loads(recovery_row.state))
+                        recovery_row.state = json.dumps(asdict(replace(recovery, phase="stopped")))
                 row.archived = archived
                 ap_changed = True
             if label_updates:
@@ -7268,6 +7343,12 @@ class SqlAlchemyConversationStore(ConversationStore):
                 delete(SqlConversationItem).where(
                     SqlConversationItem.workspace_id == current_workspace_id(),
                     SqlConversationItem.conversation_id.in_(subtree_ids),
+                )
+            )
+            ap_sess.execute(
+                delete(SqlSessionRecovery).where(
+                    SqlSessionRecovery.workspace_id == current_workspace_id(),
+                    SqlSessionRecovery.conversation_id.in_(subtree_ids),
                 )
             )
             ap_sess.execute(

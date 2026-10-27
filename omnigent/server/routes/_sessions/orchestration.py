@@ -923,6 +923,13 @@ async def _stop_host_runner_intentionally(
                     completed_stop_relays[related_id] = (handle, handle.running_event_count)
                 handle.intentional_stop_turn_ended = False
 
+        from omnigent.server.host_session_recovery import stop_recovery
+
+        for related_id in stop_targets:
+            related = await asyncio.to_thread(conversation_store.get_conversation, related_id)
+            if related is not None:
+                await asyncio.to_thread(stop_recovery, conversation_store, related)
+
         acknowledged = False
         attempt = _HostRunnerStopAttempt()
         try:
@@ -4863,6 +4870,9 @@ async def _mark_runner_sessions_offline_once(
                 conv.id,
             )
             continue
+        from omnigent.server.host_session_recovery import record_interruption
+
+        await asyncio.to_thread(record_interruption, conversation_store, conv)
         _publish_status(
             conv.id,
             "failed",
