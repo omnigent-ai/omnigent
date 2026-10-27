@@ -38,8 +38,8 @@ from fakes import (
     sse_delta,
     sse_status,
 )
+from omnigent_bot_core.omnigent import OmnigentClientPool
 from omnigent_slack.models import UserConfig
-from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
 from omnigent_slack.store import SQLiteStore
 

@@ -4,6 +4,7 @@ import logging
 import sys
 from typing import Any
 
+from omnigent_bot_core.omnigent import OmnigentClientPool
 from slack_bolt.adapter.socket_mode.aiohttp import AsyncSocketModeHandler
 from slack_bolt.async_app import AsyncApp
 
@@ -18,7 +19,6 @@ from omnigent_slack.approvals import (
 from omnigent_slack.auth_manager import AuthManager, pack_user_key
 from omnigent_slack.config import ConfigError, load_settings
 from omnigent_slack.databricks_oauth import DatabricksOAuthClient
-from omnigent_slack.omnigent import OmnigentClientPool
 from omnigent_slack.service import SlackOmnigentService
 from omnigent_slack.setup import SetupFlow
 from omnigent_slack.store import SQLiteStore

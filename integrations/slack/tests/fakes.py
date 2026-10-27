@@ -26,7 +26,7 @@ from typing import Any
 
 import httpx
 import respx
-from omnigent_slack.omnigent import ClientAuth
+from omnigent_bot_core.omnigent import ClientAuth
 
 # The placeholder text the bot posts as its "Working on it…" ack. Kept in sync
 # with the service module so a recorded ack is recognizable.
