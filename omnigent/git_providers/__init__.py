@@ -33,6 +33,7 @@ PROVIDER_MODULES: tuple[str, ...] = (
     "omnigent.git_providers.github",
     "omnigent.git_providers.gitlab",
     "omnigent.git_providers.azure_devops",
+    "omnigent.git_providers.forgejo",
 )
 ENTRY_POINT_GROUP = "omnigent.git_providers"
 

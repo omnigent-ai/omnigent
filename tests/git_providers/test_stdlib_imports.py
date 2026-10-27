@@ -50,6 +50,7 @@ def test_descriptors_import_only_the_standard_library() -> None:
         "import omnigent.git_providers.github\n"
         "import omnigent.git_providers.gitlab\n"
         "import omnigent.git_providers.azure_devops\n"
+        "import omnigent.git_providers.forgejo\n"
         "omnigent.git_providers.providers()\n"
         "print('\\n'.join(sorted(set(sys.modules) - before)))\n"
     )
@@ -59,6 +60,7 @@ def test_descriptors_import_only_the_standard_library() -> None:
     assert "omnigent.git_providers.github" in loaded
     assert "omnigent.git_providers.gitlab" in loaded
     assert "omnigent.git_providers.azure_devops" in loaded
+    assert "omnigent.git_providers.forgejo" in loaded
     assert [name for name in loaded if not _allowed(name)] == []
 
 
