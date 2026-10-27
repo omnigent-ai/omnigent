@@ -404,7 +404,10 @@ def test_rollout_records_do_not_carry_interrupted_call_across_compaction() -> No
     )
 
 
-def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> None:
+@pytest.mark.parametrize(
+    "item_type", ["message", "function_call_output", "custom_tool_call_output"]
+)
+def test_rollout_records_downgrade_image_stripped_by_compaction_storage(item_type: str) -> None:
     """A stored Responses image marker cannot poison Codex replacement history."""
     pixels = bytes(range(256)) * 3
     png = BytesIO()
@@ -428,6 +431,13 @@ def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> Non
             "content": [{"type": "output_text", "text": "answer"}],
         },
     ]
+    content_field = "content" if item_type == "message" else "output"
+    if item_type != "message":
+        messages[0] = {
+            "type": item_type,
+            "call_id": "call_image",
+            "output": messages[0]["content"],
+        }
     stored = CompactionData(
         summary="summary",
         last_item_id="msg_before",
@@ -435,7 +445,7 @@ def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> Non
         compacted_messages=messages,
     )
     assert stored.compacted_messages is not None
-    stored_content = stored.compacted_messages[0]["content"]
+    stored_content = stored.compacted_messages[0][content_field]
     assert stored_content[1]["image_url"] == (
         "[image/png content omitted from the compaction snapshot]"
     )
@@ -452,8 +462,11 @@ def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> Non
     history = next(record for record in records if record["type"] == "compacted")["payload"][
         "replacement_history"
     ]
-    assert [message["role"] for message in history] == ["user", "assistant"]
-    replayed_content = history[0]["content"]
+    assert history[0]["type"] == item_type
+    assert history[1] == messages[1]
+    if item_type != "message":
+        assert history[0]["call_id"] == "call_image"
+    replayed_content = history[0][content_field]
     assert [block["type"] for block in replayed_content] == [
         "input_text",
         "input_text",
@@ -463,7 +476,87 @@ def test_rollout_records_downgrade_image_stripped_by_compaction_storage() -> Non
     ]
     assert "image/png" in replayed_content[1]["text"]
     assert replayed_content[2:] == stored_content[2:]
-    assert messages[0]["content"][1]["image_url"] == data_uri
+    assert messages[0][content_field][1]["image_url"] == data_uri
+
+
+def test_compacted_tool_images_preserve_snapshot_and_late_output_order() -> None:
+    """Sanitizing a snapshot preserves ordered results and calls with late outputs."""
+    call_ids = ["call_image", "call_text", "call_late_a", "call_late_b"]
+    calls = [
+        {
+            "type": "function_call",
+            "call_id": call_id,
+            "name": "exec_command",
+            "arguments": "{}",
+        }
+        for call_id in call_ids
+    ]
+    image_output = {
+        "type": "function_call_output",
+        "call_id": "call_image",
+        "output": [
+            {
+                "type": "input_image",
+                "image_url": "[image/png content omitted from the compaction snapshot]",
+            }
+        ],
+    }
+    text_output = {
+        "type": "function_call_output",
+        "call_id": "call_text",
+        "output": "text result",
+    }
+    late_outputs = [
+        {"type": "function_call_output", "call_id": call_id, "output": call_id}
+        for call_id in ["call_late_b", "call_late_a"]
+    ]
+    records = codex_native._codex_rollout_records_from_session_items(
+        [
+            {
+                "type": "compaction",
+                "compacted_messages": [*calls, text_output, image_output],
+            },
+            *late_outputs,
+        ],
+        session_id="conv_test",
+        external_session_id="019f-thread",
+        cwd=Path("/tmp/test"),
+        model_provider="openai",
+        cli_version="0.154.0",
+    )
+
+    history = next(record for record in records if record["type"] == "compacted")["payload"][
+        "replacement_history"
+    ]
+    assert history[:4] == calls
+    assert [item["call_id"] for item in history[4:]] == ["call_image", "call_text"]
+    assert history[4]["output"][0]["type"] == "input_text"
+    assert "image/png" in history[4]["output"][0]["text"]
+    assert history[5] == text_output
+    assert image_output["output"][0]["type"] == "input_image"
+    replayed_outputs = [
+        record["payload"]
+        for record in records
+        if record["type"] == "response_item"
+        and record["payload"].get("type") == "function_call_output"
+    ]
+    assert [item["call_id"] for item in replayed_outputs] == ["call_late_a", "call_late_b"]
+    assert [item["output"] for item in replayed_outputs] == ["call_late_a", "call_late_b"]
+
+
+@pytest.mark.parametrize(
+    "item",
+    [
+        {"type": "function_call_output", "output": "literal output"},
+        {"type": "function_call", "arguments": '{"type":"input_image","image_url":"text"}'},
+        {"type": "custom_tool_call", "input": [{"type": "input_image", "image_url": "text"}]},
+        {"type": []},
+        None,
+    ],
+)
+def test_compacted_image_sanitization_preserves_non_content_values(item: object) -> None:
+    """Tool arguments, plain outputs, and unknown records are left intact."""
+    assert codex_native._sanitize_compacted_item(item) == item
 
 
 def test_codex_event_msg_record_ignores_non_list_content() -> None:

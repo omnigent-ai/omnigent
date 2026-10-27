@@ -18,6 +18,7 @@ from typing import Any
 
 import pytest
 
+from omnigent.entities.conversation import CompactionData
 from tests.e2e._codex_loopback_resume import run_cold_resume_turn, write_cold_resume_rollout
 from tests.e2e._harness_probes import cli_unavailable_reason
 
@@ -47,6 +48,22 @@ def _stored_session_items() -> list[dict[str, Any]]:
             "call_id": _CALL_ID,
         },
         {
+            "id": "fc_2",
+            "response_id": "codex_turn_sleep",
+            "type": "function_call",
+            "name": "get_status",
+            "namespace": _NAMESPACE,
+            "arguments": "{}",
+            "call_id": "call_status",
+        },
+        {
+            "id": "fco_2",
+            "response_id": "codex_turn_sleep",
+            "type": "function_call_output",
+            "call_id": "call_status",
+            "output": "ready",
+        },
+        {
             "id": "fco_1",
             "response_id": "codex_turn_sleep",
             "type": "function_call_output",
@@ -65,11 +82,15 @@ def _stored_session_items() -> list[dict[str, Any]]:
 
 @pytest.mark.posix_only
 @pytest.mark.timeout(300)
+@pytest.mark.parametrize(
+    "history_layout", ["flat", "compacted", "open_compacted", "partial_compacted"]
+)
 async def test_native_cold_resume_replays_namespaced_tool_call_with_namespace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    history_layout: str,
 ) -> None:
-    """The model receives the replayed call with the namespace it was issued under."""
+    """The model receives namespaced calls and their parallel outputs in call order."""
     reason = cli_unavailable_reason("codex")
     if reason is not None:
         pytest.skip(f"requires a runnable 'codex' CLI; {reason}")
@@ -87,8 +108,24 @@ async def test_native_cold_resume_replays_namespaced_tool_call_with_namespace(
     codex = shutil.which("codex")
     assert codex is not None
 
+    items = _stored_session_items()
+    if history_layout != "flat":
+        snapshot_items = items if history_layout == "compacted" else items[:3]
+        if history_layout == "partial_compacted":
+            snapshot_items = [items[0], items[2]]
+        snapshot = CompactionData(
+            summary="Parallel tools are running.",
+            last_item_id=snapshot_items[-1]["id"],
+            token_count=1,
+            compacted_messages=snapshot_items,
+        )
+        items = [
+            *(items[:3] if history_layout == "partial_compacted" else []),
+            {"type": "compaction", **snapshot.model_dump(exclude_none=True)},
+            *items[3 if history_layout == "partial_compacted" else len(snapshot_items) :],
+        ]
     rollout = await write_cold_resume_rollout(
-        _stored_session_items(),
+        items,
         session_id=_SESSION_ID,
         thread_id=_THREAD_ID,
         codex_home=codex_home,
@@ -126,3 +163,19 @@ async def test_native_cold_resume_replays_namespaced_tool_call_with_namespace(
         "cold resume dropped the tool namespace the Responses backend requires: "
         f"call={json.dumps(replayed_calls[0])}; stderr={turn.stderr!r}"
     )
+    calls = [item for item in actual_input if item.get("type") == "function_call"]
+    outputs = [item for item in actual_input if item.get("type") == "function_call_output"]
+    expected_order = (
+        ["call_status", _CALL_ID]
+        if history_layout == "partial_compacted"
+        else [_CALL_ID, "call_status"]
+    )
+    assert [item["call_id"] for item in calls] == expected_order
+    assert [item["call_id"] for item in outputs] == expected_order
+    assert {item["call_id"]: item["output"] for item in outputs} == {
+        _CALL_ID: "slept for 2s",
+        "call_status": "ready",
+    }
+    status_call = next(item for item in calls if item["call_id"] == "call_status")
+    assert status_call["name"] == "get_status"
+    assert status_call["namespace"] == _NAMESPACE

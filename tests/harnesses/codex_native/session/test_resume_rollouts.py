@@ -1254,10 +1254,24 @@ def test_rollout_records_replay_parallel_tool_outputs_in_call_order(
         {"type": "native_tool", "name": "view_image"},
         {"type": "compaction", "summary": "compacted"},
         {"type": "unknown_future_item"},
+        None,
+        "opaque item",
     ],
-    ids=["image", "developer", "reasoning", "native_tool", "compaction", "unknown"],
+    ids=[
+        "image",
+        "developer",
+        "reasoning",
+        "native_tool",
+        "compaction",
+        "unknown",
+        "null",
+        "opaque",
+    ],
 )
-def test_replay_output_order_preserves_content_boundaries(boundary: dict[str, Any]) -> None:
+@pytest.mark.parametrize("history_layout", ["flat", "compacted"])
+def test_replay_output_order_preserves_content_boundaries(
+    boundary: Any, history_layout: str
+) -> None:
     """Output ordering never moves results across content or a compaction snapshot."""
     items = [
         {"type": "function_call", "call_id": "call_a"},
@@ -1268,3 +1282,13 @@ def test_replay_output_order_preserves_content_boundaries(boundary: dict[str, An
     ]
 
     assert codex_native._codex_items_with_outputs_in_call_order(items) == items
+    if history_layout == "compacted":
+        records = codex_native._codex_rollout_records_from_session_items(
+            [{"type": "compaction", "compacted_messages": items}],
+            session_id="conv_test",
+            external_session_id="019f-thread",
+            cwd=Path("/workspace"),
+            model_provider="openai",
+            cli_version="0.154.0",
+        )
+        assert records[1]["payload"]["replacement_history"] == items
