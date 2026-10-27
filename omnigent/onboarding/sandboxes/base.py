@@ -1063,7 +1063,8 @@ class ExecModelHostLauncher(SandboxHostLauncher, SandboxExecTransport):
             for destination in _CAPTURED_PROCESS_LOG_DESTINATIONS
         ]
         command = "; ".join(
-            f'{section}; [ -f "$f" ] && {{ echo "## $f"; {tail}; }}' for section in sections
+            f'{section}; [ -f "$f" ] && {{ printf "\\n## %s\\n" "$f"; {tail}; }}'
+            for section in sections
         )
         output = self.run(sandbox_id, command, check=False).stdout.strip()
         return output or None

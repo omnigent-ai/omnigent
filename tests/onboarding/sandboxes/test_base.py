@@ -204,14 +204,15 @@ def test_capture_logs_tails_host_stdout_and_newest_process_logs(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     """``capture_logs`` returns the end of the host stdout log and of the newest
-    host and runner process logs, each under a ``## <path>`` header."""
+    host and runner process logs, each under a ``## <path>`` header on its own
+    line even when the previous log lacks a trailing newline."""
     stdout_log = tmp_path / "omnigent-host.log"
     stdout_log.write_text("host exiting (fatal_connect)\n")
     monkeypatch.setattr(base_module, "HOST_STDOUT_LOG_PATH", str(stdout_log))
     logs = tmp_path / "home" / ".omnigent" / "logs"
     (logs / "host").mkdir(parents=True)
     (logs / "runner").mkdir()
-    (logs / "host" / "host-1.log").write_text("connecting\n")
+    (logs / "host" / "host-1.log").write_text("connecting")
     older_runner = logs / "runner" / "runner-old.log"
     older_runner.write_text("stale runner\n")
     os.utime(older_runner, (1, 1))
@@ -232,6 +233,23 @@ def test_capture_logs_tails_host_stdout_and_newest_process_logs(
     runner_lines = captured.split(f"## {newest_runner}\n", 1)[1].splitlines()
     assert runner_lines[0] == "runner line 201"
     assert runner_lines[-1] == "runner line 300"
+
+
+def test_capture_logs_keeps_only_the_last_bytes_of_each_log(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A log under the line limit but over the byte limit keeps its last bytes."""
+    stdout_log = tmp_path / "omnigent-host.log"
+    stdout_log.write_text("".join(f"{n:03d}" + "x" * 396 + "\n" for n in range(50)))
+    monkeypatch.setattr(base_module, "HOST_STDOUT_LOG_PATH", str(stdout_log))
+
+    captured = _ShellLauncher(tmp_path / "home").capture_logs("sb-1")
+
+    assert captured is not None
+    body = captured.split(f"## {stdout_log}\n", 1)[1]
+    assert len(body.encode()) <= base_module._LOG_TAIL_MAX_BYTES
+    assert body.endswith("049" + "x" * 396)
+    assert "000" + "x" * 396 not in body
 
 
 def test_capture_logs_returns_none_when_no_log_exists(

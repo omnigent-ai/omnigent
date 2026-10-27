@@ -331,6 +331,10 @@ KUBERNETES_MANAGED_TOKEN_TTL_S = 7 * 24 * 3600
 # errors so an operator knows where to look inside the sandbox.
 _HOST_LOG_PATH = "/tmp/omnigent-host.log"
 
+# Deadline for reading a sandbox's logs before teardown, so a hung exec channel
+# cannot stall the delete or leave the sandbox running.
+SANDBOX_LOG_CAPTURE_TIMEOUT_S = 15.0
+
 # How long a message POST waits for an in-flight managed launch to
 # settle before giving up (see ManagedLaunchTracker). Covers the full
 # launch/wake pipeline ON TOP OF the host-registration wait
@@ -4555,7 +4559,18 @@ async def _log_sandbox_logs_best_effort(
 ) -> None:
     """Log a sandbox's host and runner log tails; never raises."""
     try:
-        logs = await asyncio.to_thread(launcher.capture_logs, sandbox_id)
+        logs = await asyncio.wait_for(
+            asyncio.to_thread(launcher.capture_logs, sandbox_id),
+            timeout=SANDBOX_LOG_CAPTURE_TIMEOUT_S,
+        )
+    except TimeoutError:
+        _logger.warning(
+            "Timed out after %ss capturing logs from managed sandbox %s for host %s",
+            SANDBOX_LOG_CAPTURE_TIMEOUT_S,
+            sandbox_id,
+            host_id,
+        )
+        return
     except Exception:  # diagnostics must not block teardown.
         _logger.warning(
             "Failed to capture logs from managed sandbox %s for host %s",
