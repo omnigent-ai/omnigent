@@ -236,18 +236,17 @@ def _tea_operation(tokens: Sequence[str]) -> ShellPrOp | None:
     parsed = _arguments(rest[1:], verb)
     if parsed is None or not verb.tracks:
         return ShellPrOp(False, False, None, parsed is None)
-    positional, verb_flags = parsed
-    flags = {**flags, **verb_flags}
+    flags = {**flags, **parsed[1]}
     if _HELP & flags.keys():
         return ShellPrOp(False, False, None, False)
-    target = None if verb.creates else reference(next(iter(positional), None))
+    # tea names a pull request only by its index, so the printed URL is its identity.
     if not verb.prints_url:
         parse = _no_identity
     elif "--output" in flags or "-o" in flags:
         parse = None
     else:
         parse = _tea_printed
-    return ShellPrOp(True, verb.creates, target, False, parse_output=parse)
+    return ShellPrOp(True, verb.creates, None, False, parse_output=parse)
 
 
 def _push_output(text: str) -> list[PullRequestRef]:

@@ -186,10 +186,6 @@ def test_tea_json_output_uses_the_returned_url() -> None:
     assert urls(shell("tea pr create --title T --output json", printed)) == ([URL], True)
 
 
-def test_tea_merge_with_a_pull_request_url_tracks_it() -> None:
-    assert urls(shell(f"tea pr merge {URL} --style squash")) == ([URL], False)
-
-
 @pytest.mark.parametrize(
     "command",
     [
@@ -200,6 +196,7 @@ def test_tea_merge_with_a_pull_request_url_tracks_it() -> None:
         "tea pr review-comments 7",
         "tea pr create --title T --help",
         "tea pr merge 7",
+        f"tea pr close {URL}",
         "tea issues create --title T",
     ],
 )
