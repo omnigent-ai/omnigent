@@ -45,6 +45,10 @@ type FrameListener = (frame: SessionUpdatesFrame) => void;
 // threshold rather than hard-coding the literal.
 export const HEARTBEAT_WATCHDOG_MS = 70_000;
 
+// A socket must stay open this long before its close earns the fast retry while
+// hidden, so a server that accepts and then drops every socket still backs off.
+export const HEALTHY_CONNECTION_MS = 5_000;
+
 /**
  * Build the `ws(s)://` URL for the session-updates endpoint.
  *
@@ -94,6 +98,8 @@ class SessionUpdatesSocket {
   private connected = false;
   private failedAttempts = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // When the current socket opened; null until its handshake completes.
+  private openedAt: number | null = null;
   // Set when the pending reconnect timer was scheduled on the hidden cadence.
   private hiddenRetryPending = false;
   private watchdogTimer: ReturnType<typeof setTimeout> | null = null;
@@ -203,7 +209,9 @@ class SessionUpdatesSocket {
       return;
     }
     this.ws = ws;
+    this.openedAt = null;
     ws.onopen = () => {
+      this.openedAt = Date.now();
       this.failedAttempts = 0;
       this.setConnected(true);
       // Start the silence watchdog: from here we expect at least a
@@ -216,11 +224,12 @@ class SessionUpdatesSocket {
       // `onerror` is always followed by `onclose`; let close drive retry.
     };
     ws.onclose = () => {
-      const wasOpen = this.connected;
+      const wasHealthy =
+        this.openedAt !== null && Date.now() - this.openedAt >= HEALTHY_CONNECTION_MS;
       this.ws = null;
       this.clearWatchdog();
       this.setConnected(false);
-      if (this.started) this.scheduleReconnect(wasOpen);
+      if (this.started) this.scheduleReconnect(wasHealthy);
     };
   }
 
@@ -275,14 +284,14 @@ class SessionUpdatesSocket {
   };
 
   /**
-   * @param afterOpen - The closed socket had opened. Its first retry keeps the
-   *   visible ramp even while hidden: the socket is a hidden tab's only feed for
-   *   notifications, so only failed opens wait the hidden cadence.
+   * @param afterHealthyConnection - The closed socket stayed open for
+   *   {@link HEALTHY_CONNECTION_MS}. Its retry keeps the visible ramp even while
+   *   hidden: the socket is a hidden tab's only feed for notifications.
    */
-  private scheduleReconnect(afterOpen = false): void {
+  private scheduleReconnect(afterHealthyConnection = false): void {
     if (!this.started || this.reconnectTimer !== null) return;
     this.failedAttempts += 1;
-    const hidden = !afterOpen && isPageHidden();
+    const hidden = !afterHealthyConnection && isPageHidden();
     this.hiddenRetryPending = hidden;
     const delay = nextReconnectDelay(this.failedAttempts, hidden);
     this.reconnectTimer = setTimeout(() => {

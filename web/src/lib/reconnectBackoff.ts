@@ -31,8 +31,8 @@ export function nextReconnectDelay(failedAttempts: number, hidden = isPageHidden
 
 /**
  * Wait out the next reconnect delay. Ends early when `signal` aborts and, for
- * a wait scheduled while hidden, as soon as the page becomes visible, so a
- * foregrounded page reconnects at once instead of sitting out the stretch.
+ * a wait scheduled while hidden, within the first visible-ramp delay after the
+ * page becomes visible, instead of sitting out the stretch.
  *
  * @param failedAttempts - Consecutive failed opens so far, starting at 1.
  * @param signal - Aborting it ends the wait immediately.
@@ -48,9 +48,14 @@ export function awaitReconnectDelay(failedAttempts: number, signal: AbortSignal)
       resolve();
     };
     const onVisibilityChange = (): void => {
-      if (!document.hidden) finish();
+      if (document.hidden) return;
+      // Every waiting pump wakes on this one event; a short jittered delay
+      // keeps them from redialing a just-failing server in the same tick.
+      document.removeEventListener("visibilitychange", onVisibilityChange);
+      clearTimeout(timer);
+      timer = setTimeout(finish, nextReconnectDelay(1, false));
     };
-    const timer = setTimeout(finish, nextReconnectDelay(failedAttempts, hidden));
+    let timer = setTimeout(finish, nextReconnectDelay(failedAttempts, hidden));
     signal.addEventListener("abort", finish, { once: true });
     if (hidden) document.addEventListener("visibilitychange", onVisibilityChange);
     // Register first, then re-check: an abort that fired before the listener

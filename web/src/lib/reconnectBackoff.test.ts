@@ -69,19 +69,28 @@ describe("awaitReconnectDelay", () => {
     return done;
   }
 
-  it("ends a hidden wait as soon as the page becomes visible", async () => {
+  it("ends a hidden wait within a jittered first-retry delay once the page is visible", async () => {
     setPageHidden(true);
-    const wait = awaitReconnectDelay(1, new AbortController().signal);
+    const first = awaitReconnectDelay(1, new AbortController().signal);
+    const second = awaitReconnectDelay(1, new AbortController().signal);
     await vi.advanceTimersByTimeAsync(RECONNECT_MAX_MS);
-    expect(await settled(wait)).toBe(false);
+    expect(await settled(first)).toBe(false);
 
     // A visibility event that leaves the page hidden changes nothing.
     fireVisibilityChange();
-    expect(await settled(wait)).toBe(false);
+    expect(await settled(first)).toBe(false);
 
+    // Waits woken by the same event spread over the visible first-retry window
+    // instead of all ending in that tick.
     setPageHidden(false);
+    vi.spyOn(Math, "random").mockReturnValueOnce(0).mockReturnValueOnce(0.999);
     fireVisibilityChange();
-    expect(await settled(wait)).toBe(true);
+    expect(await settled(first)).toBe(false);
+    await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS / 2);
+    expect(await settled(first)).toBe(true);
+    expect(await settled(second)).toBe(false);
+    await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS / 2);
+    expect(await settled(second)).toBe(true);
   });
 
   it("lets a hidden wait run out on its own timer when the page stays hidden", async () => {

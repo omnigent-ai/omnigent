@@ -5,6 +5,7 @@ import {
   RECONNECT_BASE_MS,
 } from "./reconnectBackoff";
 import {
+  HEALTHY_CONNECTION_MS,
   HEARTBEAT_WATCHDOG_MS,
   nextPushedSession,
   sessionUpdatesSocket,
@@ -212,6 +213,7 @@ describe("sessionUpdatesSocket visibility-aware reconnect", () => {
   it("redials a healthy close at once while hidden and stretches only failed reopens", () => {
     sessionUpdatesSocket.start();
     latestWs().open();
+    vi.advanceTimersByTime(HEALTHY_CONNECTION_MS);
 
     // A clean drop while hidden (e.g. the ingress recycle) keeps the visible
     // first-retry delay, so background notifications aren't held back.
@@ -227,6 +229,21 @@ describe("sessionUpdatesSocket visibility-aware reconnect", () => {
     expect(FakeWebSocket.instances.length).toBe(dialsBefore + 1);
     vi.advanceTimersByTime(HIDDEN_RECONNECT_MS - HIDDEN_FLOOR_MS + 1);
     expect(FakeWebSocket.instances.length).toBe(dialsBefore + 2);
+  });
+
+  it("stretches retries while hidden when the server drops every socket right after it opens", () => {
+    setPageHidden(true);
+    sessionUpdatesSocket.start();
+
+    // Accepted, then closed before it proved healthy (e.g. a crash loop): this
+    // is a failed connection, so it waits the hidden cadence like a refused one.
+    latestWs().open();
+    vi.advanceTimersByTime(HEALTHY_CONNECTION_MS - 1);
+    latestWs().close();
+    vi.advanceTimersByTime(HIDDEN_FLOOR_MS - 1);
+    expect(FakeWebSocket.instances.length).toBe(1);
+    vi.advanceTimersByTime(HIDDEN_RECONNECT_MS - HIDDEN_FLOOR_MS + 1);
+    expect(FakeWebSocket.instances.length).toBe(2);
   });
 
   it("reconnects at once when the page becomes visible with a hidden retry pending", () => {

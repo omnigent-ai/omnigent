@@ -32,6 +32,7 @@ import type {
 } from "@/lib/blocks";
 import type { ConversationItem, MessageItem } from "@/lib/conversationItems";
 import { itemsToBlocks } from "@/lib/itemsToBlocks";
+import { RECONNECT_BASE_MS } from "@/lib/reconnectBackoff";
 import { buildBubbles } from "@/lib/renderItems";
 import { getSessionSlim, INITIAL_WINDOW_ITEMS, SESSION_HISTORY_PAGE_SIZE } from "@/lib/sessionsApi";
 import { SSE_STALL_TIMEOUT_MS } from "@/lib/sse";
@@ -12968,10 +12969,10 @@ describe("chatStore — startStreamPump reconnect loop", () => {
       await vi.advanceTimersByTimeAsync(20_000);
       expect(openAttempts).toBe(2);
 
-      // Back in the foreground the stretched wait ends at once.
+      // Back in the foreground the stretched wait ends within a first-retry delay.
       serverUp = true;
       setPageHidden(false);
-      await vi.advanceTimersByTimeAsync(1);
+      await vi.advanceTimersByTimeAsync(RECONNECT_BASE_MS);
       expect(openAttempts).toBe(3);
       expect(sinks).toHaveLength(2);
 
