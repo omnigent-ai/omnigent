@@ -1169,6 +1169,17 @@ class SqlConversationItem(ConversationBase):
 LABEL_VALUE_MAX_LEN = 256
 
 
+class SqlSessionRecovery(ConversationBase):
+    """Private recovery intent, serialized with conversation input acceptance."""
+
+    __tablename__ = "session_recovery"
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger, primary_key=True, default=current_workspace_id, server_default="0"
+    )
+    conversation_id: Mapped[str] = mapped_column(Uuid16(), primary_key=True)
+    state: Mapped[str] = mapped_column(CompressedText, nullable=False)
+
+
 class SqlConversationLabel(ConversationBase):
     """
     SQLAlchemy model for the ``conversation_labels`` table.

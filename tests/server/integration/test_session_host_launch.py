@@ -5504,3 +5504,51 @@ async def test_switch_host_stops_before_releasing_the_old_binding(
     moved = (await client.get(f"/v1/sessions/{session['id']}")).json()
     assert moved["host_id"] == target_host_id
     assert moved["runner_id"] == launched.json()["runner_id"]
+
+
+async def test_recovery_binding_is_durable_before_host_receives_launch(
+    app: FastAPI, client: httpx.AsyncClient, db_uri: str
+) -> None:
+    from dataclasses import replace
+
+    from omnigent.runner.identity import token_bound_runner_id
+    from omnigent.server.routes.sessions import _launch_runner_on_host
+    from omnigent.session_recovery import SessionRecovery
+
+    comm = await _connect_host(app)
+    agent = await create_test_agent(client)
+    responder = asyncio.create_task(_serve_one_launch(comm, launch_status="launched"))
+    response = await client.post(
+        "/v1/sessions",
+        json={"agent_id": agent["id"], "host_id": _HOST_ID, "workspace": _WORKSPACE},
+    )
+    await responder
+    assert response.status_code == 201
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.get_conversation(response.json()["id"])
+    assert conv is not None and conv.runner_id is not None
+    intent = SessionRecovery(
+        _HOST_ID, conv.runner_id, 100, phase="launching", attempts=1, attempt_id="interruption"
+    )
+    assert store.replace_session_recovery(conv.id, None, intent)
+    registry = app.state.host_registry
+    task = asyncio.create_task(
+        _launch_runner_on_host(conv, store, registry, registry.get(_HOST_ID), recovery=intent)
+    )
+    frame = await _wait_for_launch(comm, budget_s=5)
+    assert frame is not None and frame.recovery
+    bound_id = token_bound_runner_id(frame.binding_token)
+    assert store.get_session_recovery(conv.id) == replace(intent, runner_id=bound_id)
+    assert store.get_conversation(conv.id).runner_id == bound_id
+    await comm.send_input(
+        {
+            "type": "websocket.receive",
+            "text": encode_host_frame(
+                HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id, status="launched", runner_id=bound_id
+                )
+            ),
+        }
+    )
+    assert (await task).runner_id == bound_id
+    await comm.send_input({"type": "websocket.disconnect", "code": 1000})

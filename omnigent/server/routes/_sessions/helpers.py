@@ -356,6 +356,7 @@ if TYPE_CHECKING:
     from concurrent.futures import Future
 
     from omnigent.inner.native_attachments import FilesystemAttachmentPolicy
+    from omnigent.session_recovery import SessionRecovery
 
 
 def _codex_plan_mode_enabled(mode: str) -> bool:
@@ -5399,8 +5400,13 @@ def reconcile_orphaned_running_status(
     :param stale_before: Runner stamps at or after this epoch are fresh.
     :returns: Whether this call performed the transition.
     """
+    from omnigent.server.host_session_recovery import record_interruption
+
+    interrupted = conversation_store.get_conversation(session_id)
     if not conversation_store.settle_orphaned_live_status(session_id, stale_before):
         return False
+    if interrupted is not None:
+        record_interruption(conversation_store, interrupted)
     _publish_status(
         session_id,
         "idle",
@@ -6549,6 +6555,7 @@ async def _launch_runner_on_host_impl(
     host_conn: HostConnection,
     *,
     replace_move_claim: bool = False,
+    recovery: SessionRecovery | None = None,
 ) -> _HostLaunchAttempt:
     """
     Ask a host to spawn a runner for a session and capture the result.
@@ -6619,6 +6626,7 @@ async def _launch_runner_on_host_impl(
             host_registry,
             host_conn,
             replace_move_claim=replace_move_claim,
+            recovery=recovery,
         )
         # Re-insert so the plain dict's insertion order is newest-last, then
         # evict from the front once past the cap.
@@ -6650,6 +6658,7 @@ async def _launch_runner_on_host_locked(
     host_conn: HostConnection,
     *,
     replace_move_claim: bool = False,
+    recovery: SessionRecovery | None = None,
 ) -> _HostLaunchAttempt:
     """The launch round-trip proper; runs under the conversation's lock."""
     from omnigent.host.frames import HostLaunchRunnerFrame, encode_host_frame
@@ -6661,6 +6670,14 @@ async def _launch_runner_on_host_locked(
         # The session is moving onto a new sandbox; that launch starts its runner.
         return _move_in_progress_attempt(conv.runner_id or "")
     await host_registry.admit_launch(host_conn, conv.id)
+    if recovery is not None and (
+        await asyncio.to_thread(conversation_store.get_session_recovery, conv.id) != recovery
+    ):
+        return _HostLaunchAttempt(
+            runner_id=conv.runner_id or "",
+            error_code="recovery_cancelled",
+            error="Recovery was superseded before runner launch",
+        )
     superseded_runner_id = conv.runner_id
     reap_superseded = await _owns_host_runner(conv, conversation_store)
     binding_token = secrets.token_urlsafe(32)
@@ -6682,6 +6699,20 @@ async def _launch_runner_on_host_locked(
             error_code="session_binding_changed",
             error="the session's host or runner changed before the runner could start",
         )
+    if recovery:
+        from dataclasses import replace
+
+        if not await asyncio.to_thread(
+            conversation_store.replace_session_recovery,
+            conv.id,
+            recovery,
+            replace(recovery, runner_id=new_runner_id),
+        ):
+            return _HostLaunchAttempt(
+                runner_id=new_runner_id,
+                error_code="recovery_cancelled",
+                error="Recovery was superseded before runner launch",
+            )
     if bound_conv.runner_last_seen is not None:
         # The new token has not reached the host, so this stamp can only
         # belong to the previous runner. Clear it before launching.
@@ -6743,6 +6774,7 @@ async def _launch_runner_on_host_locked(
                 # Only the binding we just replaced: an unbound session's old
                 # runner may now serve its /clear or /switch successor.
                 superseded_runner_ids=(superseded_runner_id,) if superseded_runner_id else (),
+                recovery=recovery is not None,
             )
         )
         for enqueue_attempt in range(2):

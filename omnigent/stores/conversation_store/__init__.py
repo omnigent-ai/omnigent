@@ -16,6 +16,7 @@ from omnigent.entities import (
     PagedList,
 )
 from omnigent.session_import import IMPORT_PROVENANCE_LABEL_KEYS
+from omnigent.session_recovery import SessionRecovery
 from omnigent.stores.conversation_store.activity_error import (
     LATEST_ACTIVITY_ERROR_LABEL_KEY,
     LATEST_ACTIVITY_ERROR_RESPONSE_LABEL_KEY,
@@ -579,6 +580,23 @@ class ConversationStore(ABC):
     ) -> bool:
         """Compare-and-set delivery state; None discards a canceled, unsent input."""
         raise NotImplementedError
+
+    supports_session_recovery = False
+
+    def get_session_recovery(self, conversation_id: str) -> SessionRecovery | None:
+        """Read private recovery intent; unsupported stores do not opt in."""
+        del conversation_id
+        return None
+
+    def replace_session_recovery(
+        self,
+        conversation_id: str,
+        expected: SessionRecovery | None,
+        recovery: SessionRecovery | None,
+    ) -> bool:
+        """Compare and replace recovery intent under the conversation input lock."""
+        del conversation_id, expected, recovery
+        return False
 
     def list_host_conversation_ids(
         self,

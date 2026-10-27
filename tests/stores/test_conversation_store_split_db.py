@@ -878,3 +878,36 @@ def test_get_conversation_takes_one_checkout_per_engine(
         "runner_split",
         "a6bfc420101272fcd5906a9eff904dfd",
     )
+
+
+def test_recovery_state_shares_input_transaction_and_workspace_scope(
+    store: SqlAlchemyConversationStore, conv_db: Path
+) -> None:
+    from omnigent.db.db_models import workspace_scope
+    from omnigent.entities import MessageData, NewConversationItem
+    from omnigent.session_recovery import SessionRecovery
+
+    conv = store.create_conversation(host_id="a" * 32, runner_id="old", workspace="/restored")
+    intent = SessionRecovery("a" * 32, "old", 100)
+    assert store.replace_session_recovery(conv.id, None, intent)
+    assert _count(conv_db, "session_recovery") == 1
+    with workspace_scope(42):
+        assert store.get_session_recovery(conv.id) is None
+        assert not store.replace_session_recovery(conv.id, None, intent)
+    store.append(
+        conv.id,
+        [
+            NewConversationItem(
+                response_id="user",
+                type="message",
+                data=MessageData(
+                    role="user", content=[{"type": "input_text", "text": "new work"}]
+                ),
+            )
+        ],
+    )
+    assert store.get_session_recovery(conv.id) is None
+    assert not store.replace_session_recovery(conv.id, intent, None)
+    assert store.replace_session_recovery(conv.id, None, intent)
+    asyncio.run(store.delete_conversation(conv.id))
+    assert _count(conv_db, "session_recovery") == 0

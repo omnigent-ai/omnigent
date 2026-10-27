@@ -186,6 +186,7 @@ class RunnerSessionInitializer:
         timeout: float,
         suppress_recovery_turn: bool = False,
         resume_interrupted_turn: bool = False,
+        recovery_id: str | None = None,
         generation: int | None = None,
         store_slots: asyncio.Semaphore | None = None,
         trigger: str = "unspecified",
@@ -254,7 +255,7 @@ class RunnerSessionInitializer:
         if task is None:
             decision = "start"
             init_attempt_id = uuid4().hex
-            recovery_id = (
+            recovery_id = recovery_id or (
                 self._recovery_ids.setdefault(key, uuid4().hex)
                 if resume_interrupted_turn
                 else None
