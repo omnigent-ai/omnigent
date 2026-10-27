@@ -8,10 +8,13 @@ is built, giving each one an immutable snapshot.
 
 from __future__ import annotations
 
+import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from enum import StrEnum
+
+_logger = logging.getLogger(__name__)
 
 FEATURES_ENV_VAR = "OMNIGENT_FEATURES"
 _REMOVED_HARNESS_INSTALL_ENV_VAR = "OMNIGENT_HARNESS_INSTALL_ENABLED"
@@ -157,6 +160,18 @@ class FeatureFlags:
     def enabled_names(self) -> tuple[str, ...]:
         """Return enabled canonical names in stable order."""
         return tuple(sorted(feature.value for feature in self.enabled_features))
+
+
+HarnessInstallGate = bool | Callable[[], bool]
+
+
+def harness_install_enabled(gate: HarnessInstallGate) -> bool:
+    """Resolve the harness-install gate for the current request."""
+    try:
+        return bool(gate() if callable(gate) else gate)
+    except Exception:  # deployment gates fail closed
+        _logger.warning("harness_install gate failed; disabling harness setup", exc_info=True)
+        return False
 
 
 def resolve_feature_flags(environ: Mapping[str, str] | None = None) -> FeatureFlags:

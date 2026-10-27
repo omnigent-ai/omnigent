@@ -15,7 +15,9 @@ import { showToast } from "@/components/ui/toast";
 import {
   fetchHosts,
   refreshHarnessesOnHost,
+  useDetectedCredentials,
   useInstallHarness,
+  type HarnessAccount,
   type Host,
   type StoreCredentialResult,
 } from "@/hooks/useHosts";
@@ -27,10 +29,9 @@ import {
   harnessAuthableOnHost,
   harnessCredentialFamily,
   harnessInstallableOnHost,
-  isCodexHarness,
   type HarnessCredentialKind,
 } from "@/lib/harnessSetup";
-import { canonicalNativeHarness } from "@/lib/nativeHarnessModes";
+import { canonicalNativeHarness, harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { ApiError } from "@/lib/sessionsApi";
 import { cn } from "@/lib/utils";
 import { HarnessCredentialForm } from "@/shell/HarnessCredentialForm";
@@ -42,6 +43,7 @@ export interface HarnessFixResult {
   credentialKind?: HarnessCredentialKind;
   version?: string;
   gatewayInference?: Record<string, boolean> | null;
+  harnessAccounts?: Record<string, HarnessAccount> | null;
 }
 
 export interface HarnessFixDialogProps {
@@ -57,6 +59,16 @@ export interface HarnessFixDialogProps {
 type Phase =
   "install" | "choose" | "progress" | "isaac" | "personal" | "credentials" | "setup" | "error";
 
+interface FinishOptions {
+  configuredHarnesses: Record<string, boolean | string>;
+  credentialKind?: HarnessCredentialKind;
+  version?: string | null;
+  announce?: boolean;
+  gatewayInference?: Record<string, boolean> | null;
+  harnessAccounts?: Record<string, HarnessAccount> | null;
+  successMessage?: string;
+}
+
 export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const { open, onOpenChange, mode, host, harness, harnessLabel, onFixed } = props;
   const hostId = host.host_id;
@@ -66,25 +78,34 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   const info = useServerInfo();
   const setupSteps = useHarnessSetupSteps();
   const canonicalHarness = canonicalNativeHarness(harness);
+  const accountKey = harnessAccountKey(harness);
   const credentialFamily = harnessCredentialFamily(harness);
+  const detectedCredentials = useDetectedCredentials(hostId, open && credentialFamily !== null);
   const loginCommand = useMemo(() => {
-    if (isCodexHarness(harness)) return "codex login --device-auth";
-    if (canonicalHarness === "pi" || canonicalHarness === "pi-native") return null;
-    return setupSteps[canonicalHarness]?.find((step) => step.kind === "auth")?.command ?? null;
-  }, [canonicalHarness, harness, setupSteps]);
-  const isaacSupported = credentialFamily !== null;
+    if (accountKey === "codex") return "codex login --device-auth";
+    if (accountKey === "pi") return null;
+    const configuredCommand = setupSteps[canonicalHarness]?.find(
+      (step) => step.kind === "auth",
+    )?.command;
+    if (accountKey === "claude") return configuredCommand ?? "claude auth login --claudeai";
+    return configuredCommand ?? null;
+  }, [accountKey, canonicalHarness, setupSteps]);
+  const isaacSupported =
+    credentialFamily !== null &&
+    (host.harness_accounts_supported !== true ||
+      detectedCredentials.isError ||
+      detectedCredentials.data?.some((credential) => credential.family === "databricks") === true);
+  const credentialDecisionPending = credentialFamily !== null && detectedCredentials.isPending;
   const personalSupported =
-    loginCommand !== null &&
-    (isCodexHarness(harness) ||
-      canonicalHarness === "claude" ||
-      canonicalHarness === "claude-native");
+    loginCommand !== null && (accountKey === "codex" || accountKey === "claude");
   const hasCredentialCards = isaacSupported || personalSupported;
   const canUseCredentialForm = harnessAuthableOnHost(info, harness, host);
-  const credentialChoicePhase: Phase = hasCredentialCards
-    ? "choose"
-    : canUseCredentialForm
-      ? "credentials"
-      : "setup";
+  const credentialChoicePhase: Phase =
+    credentialDecisionPending || hasCredentialCards
+      ? "choose"
+      : canUseCredentialForm
+        ? "credentials"
+        : "setup";
   const installable = harnessInstallableOnHost(info, harness, host);
   const requiresManualSetup = !installable && (mode === "install" || mode === "update");
   const initialPhase: Phase = requiresManualSetup
@@ -96,31 +117,40 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
         : credentialChoicePhase;
 
   const [phase, setPhase] = useState<Phase>(initialPhase);
-  const [choice, setChoice] = useState<HarnessCredentialKind>(
-    isaacSupported ? "isaac" : "personal",
-  );
+  const [choice, setChoice] = useState<HarnessCredentialKind>("personal");
   const [error, setError] = useState("");
   const [stillNotReady, setStillNotReady] = useState(false);
   const [updatedNeedsSetup, setUpdatedNeedsSetup] = useState(false);
   const [checking, setChecking] = useState(false);
   const runId = useRef(0);
+  const credentialDefaultSettled = useRef(false);
+  const initialPhaseRef = useRef(initialPhase);
+  initialPhaseRef.current = initialPhase;
+  const installableRef = useRef(installable);
+  installableRef.current = installable;
 
   const finish = useCallback(
-    (
-      configuredHarnesses: Record<string, boolean | string>,
-      credentialKind?: HarnessCredentialKind,
-      version?: string | null,
+    ({
+      configuredHarnesses,
+      credentialKind,
+      version,
       announce = true,
-      gatewayInference?: Record<string, boolean> | null,
-    ) => {
+      gatewayInference,
+      harnessAccounts,
+      successMessage,
+    }: FinishOptions) => {
       onFixed({
         configuredHarnesses,
         credentialKind,
         ...(version ? { version } : {}),
         ...(gatewayInference !== undefined ? { gatewayInference } : {}),
+        ...(harnessAccounts !== undefined ? { harnessAccounts } : {}),
       });
       if (announce) {
-        showToast(`${harnessLabel}${version ? ` ${version}` : ""} is ready on ${hostName}`);
+        showToast(
+          successMessage ??
+            `${harnessLabel}${version ? ` ${version}` : ""} is ready on ${hostName}`,
+        );
       }
       onOpenChange(false);
     },
@@ -160,7 +190,10 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
       const result = await installHarness(harness);
       if (runId.current !== id) return;
       if (result.configured_harnesses[harness] === true) {
-        finish(result.configured_harnesses, undefined, result.version);
+        finish({
+          configuredHarnesses: result.configured_harnesses,
+          version: result.version,
+        });
         return;
       }
       if (mode === "update") needsSetup();
@@ -188,17 +221,39 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   useEffect(() => {
     if (!open) return;
     runId.current += 1;
-    setChoice(isaacSupported ? "isaac" : "personal");
+    credentialDefaultSettled.current = false;
+    setChoice("personal");
     setError("");
     setStillNotReady(false);
     setUpdatedNeedsSetup(false);
     setChecking(false);
-    setPhase(initialPhase);
-    if (mode === "update" && installable) void startRef.current();
+    setPhase(initialPhaseRef.current);
+    if (mode === "update" && installableRef.current) void startRef.current();
     return () => {
       runId.current += 1;
     };
-  }, [harness, hostId, initialPhase, installable, isaacSupported, mode, open]);
+  }, [mode, open]);
+
+  useEffect(() => {
+    if (
+      !open ||
+      phase !== "choose" ||
+      credentialDecisionPending ||
+      credentialDefaultSettled.current
+    ) {
+      return;
+    }
+    credentialDefaultSettled.current = true;
+    setChoice(isaacSupported ? "isaac" : "personal");
+    if (!hasCredentialCards) setPhase(canUseCredentialForm ? "credentials" : "setup");
+  }, [
+    canUseCredentialForm,
+    credentialDecisionPending,
+    hasCredentialCards,
+    isaacSupported,
+    open,
+    phase,
+  ]);
 
   const setOpen = (nextOpen: boolean) => {
     if (!nextOpen) runId.current += 1;
@@ -226,6 +281,7 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
     return {
       configured_harnesses: refreshed.configured_harnesses ?? {},
       gateway_inference: refreshed.gateway_inference ?? null,
+      harness_accounts: refreshed.harness_accounts,
     };
   }, [hostId, hostName, queryClient]);
 
@@ -257,13 +313,12 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
           : phase === "personal"
             ? "personal"
             : undefined;
-        finish(
-          result.configured_harnesses,
+        finish({
+          configuredHarnesses: result.configured_harnesses,
           credentialKind,
-          undefined,
-          true,
-          result.gateway_inference,
-        );
+          gatewayInference: result.gateway_inference,
+          harnessAccounts: result.harness_accounts,
+        });
       } else {
         setStillNotReady(true);
       }
@@ -275,12 +330,15 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
   };
 
   const onCredentialStored = (result: StoreCredentialResult) => {
-    finish(result.configured_harnesses, undefined, undefined, false);
+    finish({
+      configuredHarnesses: result.configured_harnesses,
+      announce: false,
+      harnessAccounts: result.harness_accounts,
+    });
   };
-
   return (
     <Dialog open={open} onOpenChange={setOpen}>
-      <DialogContent className="gap-0 overflow-hidden rounded-[20px] p-0 sm:max-w-[440px]">
+      <DialogContent className="gap-0 overflow-hidden rounded-[20px] bg-background p-0 text-foreground sm:max-w-[440px]">
         <DialogHeader className="px-6 pt-6 pb-4">
           <DialogTitle>{dialogTitle(mode, phase, harnessLabel, hostName)}</DialogTitle>
         </DialogHeader>
@@ -295,6 +353,8 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
             <DialogDescription>
               Install {harnessLabel} on {hostName}.
             </DialogDescription>
+          ) : phase === "choose" && credentialDecisionPending ? (
+            <CredentialDetectionState hostName={hostName} />
           ) : phase === "choose" ? (
             <ChooseCredential
               choice={choice}
@@ -353,8 +413,20 @@ export function HarnessFixDialog(props: HarnessFixDialogProps) {
               <Button variant="outline" onClick={() => setOpen(false)}>
                 Cancel
               </Button>
-              <Button onClick={() => (mode === "install" ? void start() : authenticate(choice))}>
-                {mode === "install" ? "Install" : "Authenticate"}
+              <Button
+                disabled={credentialDecisionPending}
+                onClick={() => (mode === "install" ? void start() : authenticate(choice))}
+              >
+                {credentialDecisionPending ? (
+                  <>
+                    <Loader2Icon className="size-4 animate-spin" />
+                    Checking…
+                  </>
+                ) : mode === "install" ? (
+                  "Install"
+                ) : (
+                  "Authenticate"
+                )}
               </Button>
             </>
           ) : phase === "error" ? (
@@ -450,6 +522,17 @@ function ChooseCredential({
   );
 }
 
+function CredentialDetectionState({ hostName }: { hostName: string }) {
+  return (
+    <div className="flex items-center gap-3 rounded-xl border border-border bg-muted/40 px-4 py-3">
+      <Loader2Icon aria-label="Checking credentials" className="size-4 shrink-0 animate-spin" />
+      <p className="text-sm text-muted-foreground">
+        Checking which credentials are available on {hostName}…
+      </p>
+    </div>
+  );
+}
+
 function CredentialCard({
   selected,
   title,
@@ -538,7 +621,7 @@ function PersonalCommand({
       <DialogDescription>Run this in a terminal on {hostName}, then come back.</DialogDescription>
       <CommandRow command={command} label="Copy login command" />
       <p className="text-sm text-muted-foreground">
-        {harness.includes("claude")
+        {harnessAccountKey(harness) === "claude"
           ? "Open the link it prints, then paste the code from your browser back into the terminal."
           : "Open the link it prints and enter the one-time code."}
       </p>

@@ -945,6 +945,7 @@ export function ChatPage() {
       sessionId: urlConvId ?? null,
       hostId: reconnectHostId,
       hostName: hostRows?.find((row) => row.host_id === reconnectHostId)?.name,
+      hostResumable: activeSession?.hostResumable ?? false,
       isOwner: isOwnerLevel(permissionLevel),
     });
   // A message to an offline Arca host reconnects it from the desktop and waits

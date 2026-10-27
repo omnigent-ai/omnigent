@@ -45,6 +45,8 @@ from omnigent.host.frames import (
     HostModelOptionsResultFrame,
     HostPluginsFrame,
     HostPluginsResultFrame,
+    HostProbeAccountsFrame,
+    HostProbeAccountsResultFrame,
     HostRefreshHarnessesFrame,
     HostRefreshHarnessesResultFrame,
     HostRemoveWorktreeFrame,
@@ -1034,6 +1036,56 @@ def test_hello_frame_configured_harnesses_round_trip() -> None:
     # Exact map equality: both the True and the False must survive —
     # False is the actionable "warn the user" value.
     assert decoded.configured_harnesses == {"claude-sdk": True, "codex": "needs-auth"}
+
+
+def test_hello_and_readiness_frames_round_trip_harness_accounts() -> None:
+    accounts = {
+        "codex": {
+            "kind": "chatgpt",
+            "email": "person@example.test",
+            "plan": "pro",
+            "expired": False,
+        }
+    }
+    hello = decode_host_frame(
+        encode_host_frame(
+            HostHelloFrame(
+                version="0.1.0",
+                frame_protocol_version=1,
+                name="laptop",
+                configured_harnesses={"codex": True},
+                harness_accounts=accounts,
+            )
+        )
+    )
+    assert isinstance(hello, HostHelloFrame)
+    assert hello.harness_accounts == accounts
+
+    readiness = decode_host_frame(
+        encode_host_frame(
+            HostHarnessReadinessFrame(
+                configured_harnesses={"codex": True},
+                harness_accounts=accounts,
+            )
+        )
+    )
+    assert isinstance(readiness, HostHarnessReadinessFrame)
+    assert readiness.harness_accounts == accounts
+
+
+def test_legacy_hello_without_harness_accounts_decodes_to_none() -> None:
+    decoded = decode_host_frame(
+        json.dumps(
+            {
+                "kind": "host.hello",
+                "version": "0.1.0",
+                "frame_protocol_version": 1,
+                "name": "old-host",
+            }
+        )
+    )
+    assert isinstance(decoded, HostHelloFrame)
+    assert decoded.harness_accounts is None
 
 
 def test_connection_error_frame_round_trip() -> None:
@@ -2144,6 +2196,28 @@ def test_refresh_harnesses_frames_round_trip() -> None:
     assert isinstance(result, HostRefreshHarnessesResultFrame)
     assert result.configured_harnesses == {"codex-native": True}
     assert result.gateway_inference == {"codex-native": False}
+
+
+def test_probe_harness_accounts_frames_round_trip() -> None:
+    request = decode_host_frame(
+        encode_host_frame(HostProbeAccountsFrame(request_id="accounts-1", refresh_codex=True))
+    )
+    assert request == HostProbeAccountsFrame(request_id="accounts-1", refresh_codex=True)
+
+    result = decode_host_frame(
+        encode_host_frame(
+            HostProbeAccountsResultFrame(
+                request_id="accounts-1",
+                status="ok",
+                harness_accounts={"codex": {"kind": "chatgpt"}},
+            )
+        )
+    )
+    assert result == HostProbeAccountsResultFrame(
+        request_id="accounts-1",
+        status="ok",
+        harness_accounts={"codex": {"kind": "chatgpt"}},
+    )
 
 
 def test_result_frames_round_trip_gateway_inference() -> None:
