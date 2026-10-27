@@ -78,6 +78,10 @@ from omnigent.harnesses.claude_native.submit_verification import (
     capture_submit_boundary,
     has_matching_hook_refusal,
 )
+from omnigent.harnesses.claude_native.tmux_terminal import (
+    NativeTmuxTerminal,
+    capture_tmux_terminal,
+)
 from omnigent.harnesses.diagnostics import (
     detect_sign_in_prompt,
     launcher_password_prompt,
@@ -108,8 +112,27 @@ from omnigent.util.reasoning_effort import CLAUDE_EFFORTS
 CLAUDE_FRAMEWORK_CONTEXT_FILE = "pending_framework_context.txt"
 
 _logger = logging.getLogger(__name__)
-_INJECTION_CANCEL_EVENT: ContextVar[threading.Event | None] = ContextVar(
-    "claude_native_injection_cancel_event", default=None
+
+
+@dataclass(frozen=True)
+class BridgeOwner:
+    """One logical conversation's ownership of a native bridge."""
+
+    session_id: str
+    generation: str | None
+
+
+@dataclass
+class InjectionAttempt:
+    """Shared with the worker so cleanup retains its observed native generation."""
+
+    cancelled: threading.Event
+    terminal: NativeTmuxTerminal | None = None
+    owner: BridgeOwner | None = None
+
+
+_INJECTION_ATTEMPT: ContextVar[InjectionAttempt | None] = ContextVar(
+    "claude_native_injection_attempt", default=None
 )
 _INJECTION_LOCKS_GUARD = threading.Lock()
 _INJECTION_LOCKS: dict[str, threading.Lock] = {}
@@ -619,6 +642,9 @@ def validate_claude_hook_interpreter_compatibility(
 class ClaudePromptTimeout(RuntimeError):
     """Claude Code's input box did not render before delivery timed out."""
 
+    terminal: NativeTmuxTerminal | None = None
+    owner: BridgeOwner | None = None
+
 
 class ClaudeTerminalExited(ClaudePromptTimeout):
     """
@@ -700,19 +726,48 @@ class ClaudeSubmitBlockedUnconfirmed(RuntimeError):
 
 
 @contextlib.contextmanager
-def cancellable_injection(cancel_event: threading.Event) -> Iterator[None]:
+def cancellable_injection(
+    cancel_event: threading.Event,
+    *,
+    bridge_dir: Path | None = None,
+    request_session_id: str | None = None,
+) -> Iterator[InjectionAttempt]:
     """Bind a cancellation flag inherited by this delivery's ``asyncio.to_thread`` worker."""
-    token = _INJECTION_CANCEL_EVENT.set(cancel_event)
+    attempt = InjectionAttempt(cancel_event)
+    if bridge_dir is not None:
+        attempt.owner = _read_bridge_owner(bridge_dir)
+        if (
+            attempt.owner is not None
+            and request_session_id is not None
+            and attempt.owner.session_id != request_session_id
+        ):
+            attempt.owner = None
+    token = _INJECTION_ATTEMPT.set(attempt)
     try:
-        yield
+        yield attempt
     finally:
-        _INJECTION_CANCEL_EVENT.reset(token)
+        _INJECTION_ATTEMPT.reset(token)
 
 
 def _check_injection_cancelled() -> None:
-    cancel_event = _INJECTION_CANCEL_EVENT.get()
-    if cancel_event is not None and cancel_event.is_set():
+    attempt = _INJECTION_ATTEMPT.get()
+    if attempt is not None and attempt.cancelled.is_set():
         raise ClaudeInjectionCancelled("Claude Code message delivery was cancelled")
+
+
+def _capture_injection_terminal(socket_path: str, tmux_target: str) -> None:
+    attempt = _INJECTION_ATTEMPT.get()
+    if attempt is None:
+        return
+    attempt.terminal = capture_tmux_terminal(
+        socket_path, tmux_target, timeout_s=_TMUX_SEND_TIMEOUT_S
+    )
+    if attempt.terminal is None:
+        _logger.warning(
+            "claude-native: could not pin the identity of tmux target %s; a failed "
+            "delivery will leave this terminal running",
+            tmux_target,
+        )
 
 
 class TmuxSessionNotAdvertised(RuntimeError):
@@ -1811,6 +1866,7 @@ def prepare_bridge_dir(
         payload: dict[str, object] = {
             "bridge_id": resolved_bridge_id,
             "active_session_id": conversation_id,
+            "active_session_generation": secrets.token_hex(16),
             "conversation_id": conversation_id,
             "workspace": str(workspace),
             "token": token,
@@ -2215,14 +2271,38 @@ def record_model_vocabulary(
 
 
 @contextlib.contextmanager
-def _bridge_metadata_write_lock(bridge_dir: Path) -> Iterator[None]:
+def _bridge_metadata_write_lock(bridge_dir: Path, *, timeout_s: float = -1) -> Iterator[None]:
     """Cross-process mutual exclusion for bridge metadata read-modify-writes.
 
     Shares bridge-dir preparation's on-disk lock, so metadata updates and
     :func:`prepare_bridge_dir` exclude each other across processes.
     """
-    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir):
+    with native_bridge_common.bridge_dir_preparation_lock(bridge_dir, timeout_s=timeout_s):
         yield
+
+
+def _read_bridge_owner(bridge_dir: Path) -> BridgeOwner | None:
+    config = _read_json_file(bridge_dir / _CONFIG_FILE)
+    session_id = config.get("active_session_id") or config.get("conversation_id")
+    generation = config.get("active_session_generation")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    if generation is not None and (not isinstance(generation, str) or not generation):
+        return None
+    return BridgeOwner(session_id, generation)
+
+
+@contextlib.contextmanager
+def native_terminal_cleanup_lock(bridge_dir: Path, owner: BridgeOwner | None) -> Iterator[bool]:
+    """Exclude ownership writers until an owned terminal's cleanup finishes."""
+    if owner is None:
+        yield False
+        return
+    try:
+        with _bridge_metadata_write_lock(bridge_dir, timeout_s=1.0):
+            yield _read_bridge_owner(bridge_dir) == owner
+    except FileLockTimeout as exc:
+        raise RuntimeError("Native terminal ownership lock is busy; cleanup refused") from exc
 
 
 def read_bridge_id(bridge_dir: Path) -> str | None:
@@ -2255,6 +2335,7 @@ def write_active_session_id(bridge_dir: Path, session_id: str) -> None:
         if not config:
             raise RuntimeError(f"bridge config missing: {bridge_dir / _CONFIG_FILE}")
         config["active_session_id"] = session_id
+        config["active_session_generation"] = secrets.token_hex(16)
         config["conversation_id"] = session_id
         config["updated_at"] = time.time()
         _write_json_file(bridge_dir / _CONFIG_FILE, config)
@@ -4274,6 +4355,7 @@ def inject_user_message(
     """
     delivery_diagnostics.set_stage("waiting_for_tmux")
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
+    _capture_injection_terminal(info["socket_path"], info["tmux_target"])
     delivery_diagnostics.set_stage("restoring_input")
     # A surface left occupying the composer swallows everything typed
     # below — and hides the input box, wedging the readiness gate — so
@@ -4885,6 +4967,7 @@ def inject_slash_command(
     info = _wait_for_tmux_info(bridge_dir, timeout_s=timeout_s)
     socket_path = info["socket_path"]
     tmux_target = info["tmux_target"]
+    _capture_injection_terminal(socket_path, tmux_target)
     # Same reclaim-then-wait as inject_user_message: a surface left occupying
     # the composer would swallow the clearing keys and command, and a TUI that
     # has not mounted its input box yet would drop them.
