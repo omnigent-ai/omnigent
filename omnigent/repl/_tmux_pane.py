@@ -156,15 +156,15 @@ def _resolve_omnigent_argv() -> list[str]:
        :func:`shutil.which` against the running process's PATH.
        The Python process inherits PATH from the user's shell at
        launch, so an activated venv typically resolves correctly.
-    3. Fallback — ``[sys.executable, "-m", "omnigent.cli"]``.
+    3. Fallback — ``[sys.executable, "-P", "-m", "omnigent.cli"]``.
        Always works because if Python is running this code, the
        ``omnigent.cli`` module is importable. Trades aesthetics
        (the binding shows ``python -m omnigent.cli``) for
        reliability across exotic launch shapes.
 
-    :returns: A list of one or two argv elements. Length-1 means
-        a single executable; length-3 means
-        ``[python, "-m", "omnigent.cli"]``. The caller appends
+    :returns: A list of one or four argv elements. Length-1 means
+        a single executable; length-4 means
+        ``[python, "-P", "-m", "omnigent.cli"]``. The caller appends
         the subcommand and its args (e.g. ``["pane-split", "-v",
         ...]``) to this prefix.
     """
@@ -176,7 +176,7 @@ def _resolve_omnigent_argv() -> list[str]:
     # so the recursive case (split → picker → new REPL → which
     # itself wants to install wrappers in tmux) keeps working.
     if argv0.endswith(".py"):
-        return [sys.executable, "-m", "omnigent.cli"]
+        return [sys.executable, "-P", "-m", "omnigent.cli"]
     if argv0 and ("/" in argv0 or os.sep in argv0):
         # Path-shaped — make absolute. ``abspath`` handles relative
         # paths against the current working directory.
@@ -188,7 +188,7 @@ def _resolve_omnigent_argv() -> list[str]:
     # Last resort: invoke via the running interpreter. The
     # ``omnigent.cli`` module is importable since we're running
     # inside it, so this exec form always succeeds.
-    return [sys.executable, "-m", "omnigent.cli"]
+    return [sys.executable, "-P", "-m", "omnigent.cli"]
 
 
 # User-facing click subcommand names that mark the start of the
@@ -455,7 +455,7 @@ def _wrap_binding(binding: SplitBinding, omnigent_argv: list[str]) -> None:
         omnigent installation, as returned by
         :func:`_resolve_omnigent_argv`. Length 1 (e.g.
         ``["/venv/bin/omnigent"]``) for a direct binary
-        invocation, or length 3 (``[sys.executable, "-m",
+        invocation, or length 4 (``[sys.executable, "-P", "-m",
         "omnigent.cli"]``) for the python-m fallback. Either
         works because the entire prefix is shlex-quoted into
         the chooser shell command. The absolute path bypasses

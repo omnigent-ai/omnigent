@@ -481,7 +481,9 @@ export function WorkspacePicker({
     isPlaceholderData,
     refetch: refetchListing,
   } = useHostFilesystem(hostId, path);
-  const navigationPending = Boolean(isLoading || isFetching || isPlaceholderData);
+  // A background refetch of a cached listing keeps its rows on screen; only a
+  // first load or a navigation still showing the previous folder is pending.
+  const navigationPending = Boolean(isLoading || isPlaceholderData);
 
   // Resolve the host's home dir independently of where the picker is
   // browsing, so a typed "~"-relative path can be expanded even when the
@@ -848,7 +850,7 @@ export function WorkspacePicker({
             label="Refresh"
             icon={<RefreshCwIcon className={showGitDialog ? "size-4" : "size-5"} />}
             onClick={refreshListing}
-            disabled={hostId === null || navigationPending || worktreesFetching}
+            disabled={hostId === null || navigationPending || isFetching || worktreesFetching}
             testId="workspace-picker-refresh"
           />
           {onClose && (
@@ -876,7 +878,7 @@ export function WorkspacePicker({
             data-testid="workspace-picker-search-row"
           >
             <div
-              className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-transparent px-2.5 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input/30"
+              className="flex h-8 min-w-0 flex-1 items-center gap-2 rounded-lg border border-input bg-transparent px-2.5 transition-colors focus-within:border-ring focus-within:ring-3 focus-within:ring-ring/50 dark:bg-input"
               data-testid="workspace-picker-search-field"
             >
               <SearchIcon

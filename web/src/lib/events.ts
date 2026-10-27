@@ -1,3 +1,5 @@
+import type { AssistantMessagePhase } from "./conversationItems";
+import type { NativePermissionDelivery } from "./nativePermissionDelivery";
 // Mirrors sdks/python-client/omnigent_client/_events.py.
 //
 // Hand-ported. When _events.py changes, update this file and the
@@ -180,6 +182,7 @@ export interface PolicyDenied {
 }
 
 export interface ElicitationRequest {
+  nativeDelivery?: NativePermissionDelivery;
   type: "elicitation_request";
   elicitationId: string;
   /**
@@ -263,6 +266,8 @@ export interface ElicitationRequest {
    * ``setMode(auto)`` in the hook decision.
    */
   allowAutoMode?: boolean;
+  /** Native directories the user may explicitly allow for this session. */
+  permissionDirectories?: string[];
   /**
    * Producer-supplied extra (claude-native non-edit tool prompts only):
    * present when the PermissionRequest endpoint is gating a tool that
@@ -329,6 +334,8 @@ export interface MessageDone {
   responseId: string;
   /** Native live-preview stream finalized by this item. */
   messageId?: string;
+  /** Harness label for the message, when the harness reports one (Codex). */
+  phase?: AssistantMessagePhase;
 }
 
 /**
@@ -719,6 +726,8 @@ export interface SessionSandboxStatusEvent {
   error: string | null;
   /** Sandbox provider being launched, e.g. `"arclet"`, when the server reports it. */
   provider?: string;
+  /** What the user needs to do when `stage === "action_required"`; `null` otherwise. */
+  details?: string | null;
 }
 
 /** Startup state of one harness MCP server (Codex's `McpServerStartupState`). */
@@ -979,6 +988,11 @@ export interface BrowserActionRequestEvent {
   args: Record<string, unknown>;
 }
 
+export interface UiOpenFileEvent {
+  type: "ui_open_file";
+  path: string;
+}
+
 // ── Union type for all events ────────────────────────────
 
 export type StreamEvent =
@@ -1037,4 +1051,5 @@ export type StreamEvent =
   | SessionModelOptionsEvent
   | SessionPresenceEvent
   | SessionBtwSidechatEvent
-  | BrowserActionRequestEvent;
+  | BrowserActionRequestEvent
+  | UiOpenFileEvent;

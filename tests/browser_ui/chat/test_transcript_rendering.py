@@ -2,12 +2,19 @@
 
 from __future__ import annotations
 
+import json
+import re
 from pathlib import Path
 
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
 
-from tests.browser_ui.chat.session_contract import ChatSessionContract, message_item
+from tests.browser_ui.chat._geometry_helpers import open_live, settled_geometry
+from tests.browser_ui.chat.session_contract import (
+    ChatSessionContract,
+    message_item,
+    tool_call_items,
+)
 
 _CODE_BODY = '[data-streamdown="code-block-body"]'
 _LONG_WORD = "horizontalScrolling" * 14
@@ -304,3 +311,190 @@ def test_external_link_falls_back_inside_a_popup_blocked_host(
     expect(page).to_have_url(host_url)
     assert len(page.context.pages) == 1
     assert any(frame.url == _TARGET for frame in page.frames)
+
+
+_CLOSING_LINE = "Short closing line for turn 2."
+_DRAG_POINTS = """(line, releaseAt) => {
+    const content = line.closest('.chat-conversation-content');
+    let list = line;
+    while (list.parentElement !== content) list = list.parentElement;
+    let row = line;
+    while (row.parentElement !== list) row = row.parentElement;
+    const text = line.getBoundingClientRect();
+    const y = text.top + text.height / 2;
+    const start = [text.left + 1, y];
+    if (releaseAt === 'right_margin') {
+        const scroller = line.closest('[role="log"] > div').getBoundingClientRect();
+        return {start, end: [(list.getBoundingClientRect().right + scroller.right) / 2, y]};
+    }
+    const next = row.nextElementSibling.getBoundingClientRect();
+    return {start, end: [text.left + 40, (row.getBoundingClientRect().bottom + next.top) / 2]};
+}"""
+
+
+def _seed_pull_request_reviews(chat: ChatSessionContract) -> None:
+    chronological: list[dict] = []
+    for turn in (1, 2, 3):
+        response_id = f"selection-response-{turn}"
+        pull_requests = "\n".join(
+            f"- [#{turn}0{number} Update docs](https://github.com/example/repo/pull/{turn}0{number})"
+            for number in (1, 2, 3)
+        )
+        reply = (
+            f"Turn {turn} summary: I checked the open pull requests for the review queue "
+            "and wrote down what each one changes so you can decide which to merge first."
+            f"\n\n{pull_requests}\n\nShort closing line for turn {turn}."
+        )
+        chronological += [
+            message_item(
+                f"selection-user-{turn}",
+                "user",
+                f"Check the open pull requests, round {turn}",
+                response_id=response_id,
+            ),
+            message_item(
+                f"selection-assistant-{turn}", "assistant", reply, response_id=response_id
+            ),
+        ]
+    chat.set_items(list(reversed(chronological)))
+
+
+@pytest.mark.parametrize("release_at", ["right_margin", "gap_below_message"])
+def test_single_line_drag_selects_only_that_line(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    release_at: str,
+) -> None:
+    """A drag released beside or below a line does not extend the selection to other turns."""
+    chat = chat_session_contract
+    _seed_pull_request_reviews(chat)
+    open_live(page, chat)
+    line = page.get_by_text(_CLOSING_LINE, exact=True)
+    line.scroll_into_view_if_needed()
+    expect(line).to_be_visible()
+    settled_geometry(page)
+
+    points = line.evaluate(_DRAG_POINTS, release_at)
+    page.mouse.move(*points["start"])
+    page.mouse.down()
+    page.mouse.move(*points["end"], steps=12)
+    page.mouse.up()
+
+    assert page.evaluate("() => window.getSelection().toString()").strip() == _CLOSING_LINE
+
+
+def test_virtualized_transcript_returns_after_losing_layout(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+) -> None:
+    """Restoring a zero-size transcript keeps its current virtual rows visible."""
+    chat = chat_session_contract
+    chat.seed_transcript(60)
+    open_live(page, chat)
+    newest_reply = page.get_by_text("Turn 60 response with", exact=False)
+    expect(newest_reply).to_be_visible(timeout=20_000)
+
+    transcript = page.locator('[role="log"]')
+    for _ in range(2):
+        transcript.evaluate("element => { element.style.display = 'none'; }")
+        expect(transcript).to_be_hidden()
+        page.wait_for_timeout(100)  # Let ResizeObserver record the zero-size viewport.
+        transcript.evaluate("element => { element.style.display = ''; }")
+        page.wait_for_timeout(150)  # Let restored layout observers settle.
+        expect(newest_reply).to_be_visible(timeout=5_000)
+
+
+_ISSUE_TITLE = "Claude mod replaces tmux paste for native turns"
+_PR_ERROR = "Error: 422 Validation Failed: A pull request already exists"
+
+
+def _seed_tool_calls(chat: ChatSessionContract) -> None:
+    """One settled turn: a plan update, an MCP lookup, and a failing MCP call."""
+    response_id = "tool-rows-response"
+    issue = {"id": "OMNI-12243", "title": _ISSUE_TITLE, "state": "In Review"}
+    todo_list = [
+        {"id": 1, "title": "Find review workflow", "status": "completed"},
+        {"id": 2, "title": "Fetch open PRs", "status": "in-progress"},
+    ]
+    chronological = [
+        message_item("tool-rows-user", "user", "Plan, then open the PR.", response_id=response_id),
+        *tool_call_items(
+            "call-plan",
+            "manage_todo_list",
+            {"operation": "write", "todoList": todo_list},
+            "Task plan updated (2 tasks).",
+            response_id=response_id,
+        ),
+        # Claude-native stores MCP results as content blocks around the server's JSON.
+        *tool_call_items(
+            "call-issue",
+            "mcp__linear__get_issue",
+            {"id": "OMNI-12243", "includeComments": False},
+            json.dumps([{"type": "text", "text": json.dumps(issue)}]),
+            response_id=response_id,
+        ),
+        *tool_call_items(
+            "call-pr",
+            "mcp__github__create_pull_request",
+            {"owner": "omnigent-ai", "repo": "omnigent", "draft": True},
+            _PR_ERROR,
+            response_id=response_id,
+        ),
+        message_item(
+            "tool-rows-assistant", "assistant", "The PR already exists.", response_id=response_id
+        ),
+    ]
+    chat.set_items(list(reversed(chronological)))
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_tool_rows_read_as_actions_with_their_outcome(
+    page: Page,
+    chat_session_contract: ChatSessionContract,
+    width: int,
+) -> None:
+    """Tool rows show a humanized title, MCP server, and result line instead of raw JSON."""
+    chat = chat_session_contract
+    _seed_tool_calls(chat)
+    page.set_viewport_size({"width": width, "height": 844})
+    page.goto(chat.url)
+
+    expect(page.get_by_text("The PR already exists.")).to_be_visible(timeout=20_000)
+    worked = page.get_by_role("button", name=re.compile(r"^Worked"))
+    expect(worked).to_have_attribute("aria-expanded", "false")
+    worked.click()
+    page.get_by_text("Called 3 tools", exact=True).click()
+
+    plan = page.get_by_role("button", name=re.compile(r"^Manage todo list"))
+    expect(plan).to_contain_text("write · 2 items")
+    plan_result = plan.get_by_test_id("tool-result-line")
+    expect(plan_result).to_have_text("Task plan updated (2 tasks).")
+    issue = page.get_by_role("button", name=re.compile(r"^Get issue"))
+    # Known MCP servers carry their brand spelling, not the config name.
+    expect(issue.get_by_text("Linear", exact=True)).to_be_visible()
+    expect(issue.get_by_test_id("tool-result-line")).to_have_text(f"{_ISSUE_TITLE} · In Review")
+    failure = page.get_by_role("button", name=re.compile(r"^Create pull request"))
+    expect(failure.get_by_text("GitHub", exact=True)).to_be_visible()
+    failure_result = failure.get_by_test_id("tool-result-line")
+    expect(failure_result).to_have_text(_PR_ERROR)
+    color = "el => getComputedStyle(el).color"
+    assert failure_result.evaluate(color) != plan_result.evaluate(color)
+
+    transcript = page.locator('[role="log"]')
+    expect(transcript).not_to_contain_text("mcp__linear__")
+    expect(transcript).not_to_contain_text('{"operation"')
+    # The result sits under its title row, and long rows truncate rather than widen the page.
+    assert plan.evaluate(
+        "row => row.lastElementChild.getBoundingClientRect().top"
+        " >= row.firstElementChild.getBoundingClientRect().bottom - 1"
+    )
+    assert page.evaluate("document.documentElement.scrollWidth <= innerWidth")
+
+    issue.click()
+    fields = issue.locator("xpath=..").get_by_test_id("tool-value-view")
+    expect(fields.last).to_contain_text(f"Title{_ISSUE_TITLE}")
+    raw = page.get_by_role("tab", name="Raw")
+    expect(page.get_by_role("tab", name="Fields")).to_have_attribute("aria-selected", "true")
+    raw.click()
+    expect(raw).to_have_attribute("aria-selected", "true")
+    expect(transcript).to_contain_text('"includeComments": false')

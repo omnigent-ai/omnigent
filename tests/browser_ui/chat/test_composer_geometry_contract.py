@@ -263,10 +263,10 @@ def test_attachment_chips_follow_the_row_grid(
         if rail.is_visible():
             page.keyboard.press("Control+Alt+BracketRight")
             expect(rail).not_to_be_visible()
-    names = ["alpha.txt", "beta.txt", "gamma.txt"]
+    names = [f"notes-{index:02}.md" for index in range(37)]
     _attach(page, names)
     chips = [
-        box(page.get_by_role("button", name=f"Remove {name}").locator("..")) for name in names
+        box(page.get_by_role("button", name=f"Remove {name}").locator("..")) for name in names[:3]
     ]
     for chip in chips[1:]:
         assert chip["height"] == pytest.approx(chips[0]["height"], abs=TOLERANCE)
@@ -276,6 +276,24 @@ def test_attachment_chips_follow_the_row_grid(
     ]
     assert gaps[0] == pytest.approx(gaps[1], abs=TOLERANCE)
     assert chips[0]["x"] == pytest.approx(box(_input(page, surface))["x"], abs=TOLERANCE)
+    for control in (_input(page, surface), _submit(page, surface)):
+        bounds = box(control)
+        assert bounds["y"] >= -TOLERANCE, bounds
+        assert bounds["y"] + bounds["height"] <= DESKTOP["height"] + TOLERANCE, bounds
+    if surface == "live":
+        transcript = box(page.locator('[role="log"]'))
+        visible = min(transcript["y"] + transcript["height"], DESKTOP["height"]) - max(
+            transcript["y"], 0
+        )
+        assert visible >= DESKTOP["height"] / 4, transcript
+    first_remove = page.get_by_role("button", name=f"Remove {names[0]}")
+    expect(first_remove).to_be_in_viewport(ratio=1)
+    tray = first_remove.locator("../..")
+    last_remove = page.get_by_role("button", name=f"Remove {names[-1]}")
+    expect(last_remove).not_to_be_in_viewport()
+    tray.hover()
+    page.mouse.wheel(0, 1000)
+    expect(last_remove).to_be_in_viewport(ratio=1)
 
 
 def test_wrapped_attachment_rows_keep_the_grid(
@@ -574,7 +592,12 @@ def test_workspace_tray_aligns_with_the_card(
     expected = input_box["x"] - card["x"]
     assert tray_box["x"] - card["x"] == pytest.approx(12, abs=TOLERANCE)
     assert right_inset(card, tray_box) == pytest.approx(12, abs=TOLERANCE)
-    assert box(chip)["x"] - tray_box["x"] == pytest.approx(expected, abs=TOLERANCE)
+    compact_inset = tray.evaluate(
+        "el => parseFloat(getComputedStyle(el).paddingLeft) + "
+        "parseFloat(getComputedStyle(el).borderLeftWidth)"
+    )
+    assert compact_inset < expected
+    assert box(chip)["x"] - tray_box["x"] == pytest.approx(compact_inset, abs=TOLERANCE)
 
 
 def test_queued_rows_and_nested_workspace_share_the_tray_grid(
@@ -610,7 +633,9 @@ def test_queued_rows_and_nested_workspace_share_the_tray_grid(
         assert columns[0][name]["x"] == pytest.approx(columns[1][name]["x"], abs=TOLERANCE)
     assert_primitive_inset(columns[0]["status"]["x"] - box(strip)["x"])
     tray = page.get_by_test_id("composer-workspace-controls")
-    assert tray.evaluate("el => getComputedStyle(el).borderTopWidth") == "0px"
+    assert tray.evaluate("el => parseFloat(getComputedStyle(el).borderTopWidth)") == pytest.approx(
+        0
+    )
     assert box(strip)["x"] == pytest.approx(box(tray)["x"], abs=TOLERANCE)
     card = box(page.locator("[data-composer-card]"))
     input_box = box(composer)

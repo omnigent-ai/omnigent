@@ -383,6 +383,7 @@ electron/
   src/browserViewRegistry.js  # per-conversation WebContentsView registry (browser pane)
   src/browserViewBounds.js    # CSS-px → window-DIP bounds conversion (browser pane)
   src/browserIpc.js           # omnigent:browser-* IPC handlers (extracted from main.js)
+  src/chromeCookieStore.js    # per-site Chrome cookie import for the browser pane
   src/loopback-oauth.js       # RFC 8252 loopback listener shared by browser sign-ins
   src/oidc-credentials.js     # OIDC loopback sign-in, refresh, and revoke
   src/oidc-auth.js            # OIDC window session lifecycle (cookie, renewal, sign-out)
@@ -467,7 +468,8 @@ dismisses.
 ## Embedded browser pane
 
 The desktop shell hosts an **embedded browser pane**: a real Chromium page the
-user can drive (URL bar + toolbar) and point-and-prompt in design mode. This PR
+user can drive (URL bar + toolbar), point-and-prompt in design mode, and sign in
+with cookies imported from the local Chrome profile. This PR
 covers that user-facing pane plus the Electron/renderer plumbing; the
 agent-facing builtin `browser_*` tools (navigate / snapshot / click / type /
 screenshot) that can also drive the pane land in a separate PR. A
@@ -668,10 +670,15 @@ against its local Chromium, and the result is posted back.
   listeners that push `browser-url-changed` + `browser-nav-state` to the renderer
   so the toolbar's URL bar live-tracks the real URL (redirects, in-page link
   clicks, agent navigation) instead of going stale.
+- `src/chromeCookieStore.js` — reads the current site's cookies out of a local
+  Chrome profile for the toolbar's **Import cookies from Chrome** action (below).
+  Electron-free, so it is unit-tested with a stub session and a synthetic
+  `Cookies` DB.
 - `src/preload.js` — adds `browserOpenOrNavigate/SetActive/Resize/Screenshot/`
   `Execute/Close` + `browserHasView`, the toolbar methods
   `browserGoBack/GoForward/Reload` + `openBrowserDevTools`, the design-mode
-  methods `browserEnableDesignMode/DisableDesignMode/SignalDesignResult`, and the
+  methods `browserEnableDesignMode/DisableDesignMode/SignalDesignResult`, the
+  Chrome cookie methods `browserChromeCookiePreview/Import`, and the
   subscriptions `onBrowserViewCreated` / `onBrowserHostActiveChanged` /
   `onBrowserViewClosed` / `onBrowserUrlChanged` / `onBrowserNavState` +
   `onBrowserElementSelected` / `onBrowserElementPromptSubmit` /
@@ -735,6 +742,75 @@ A renderer's `agent: false` flag does not exempt a tab from address checks.
 Main-owned Arca preview eligibility still applies. Other internal sites must be
 opened in a separate browser; this also keeps later redirects in these tabs
 under the same policy.
+
+**Importing cookies from Chrome (macOS).** Sites that reject embedded browsers
+(Google sign-in is the common one) can't be signed in from this pane, so the
+toolbar's cookie button copies the **current site's** cookies out of a local
+Chrome profile into this conversation's in-memory session and reloads the page.
+Scope is deliberately narrow:
+
+- Only cookies inside the page's own domain tree: its host, its subdomains, and
+  the leading-dot parent domains that reach it (`.google.com` for
+  `mail.google.com`). Nothing else in the jar is read into the app.
+- When the host has parent domains the dialog offers them as _Site scope_, each
+  labelled with its own count (`accounts.google.com (25)` vs `google.com (64)`, the
+  wider scope being a superset because it covers every subdomain's cookies).
+  Cookies for other subdomains stay bound to their own host in the cookie store,
+  so they only apply once the tab visits them — which is what makes a sign-in
+  flow that bounces across subdomains work. The choice is validated main-side
+  against the ancestors of the view's current host, so the renderer can never
+  name an unrelated site.
+- A scope is only offered when that Chrome profile holds a `.<scope>` domain
+  cookie for it. Chrome refuses domain cookies on public suffixes, so `co.uk` and
+  `github.io` never appear in the picker; the page's own host is always offered.
+  The cost is that a host-only cookie on an ancestor domain (`example.com` set
+  for `example.com` exactly) can't widen the offer to `example.com` from
+  `mail.example.com` — such a cookie would not have reached the page anyway.
+- The page's own host always includes its subdomains, which is the point of a
+  site tree. On a public suffix people can host under (`github.io`,
+  `blogspot.com`) that reads every tenant's cookies for the suffix; the dialog
+  names the scope before anything is read, and the user has to confirm.
+- `browser-chrome-cookie-preview` reports only counts and profile names, and
+  touches no Keychain, so the confirmation dialog opens without a system prompt.
+  The import re-derives the host from the view's own URL main-side and refuses if
+  the tab navigated away while the dialog was open — including after the Keychain
+  prompt, before anything is written (navigation after the write starts is not
+  re-checked; the cookies are already domain-scoped). The renderer's scope string
+  is normalized main-side and must be one the profile offers, so a mixed-case or
+  trailing-dot value can't dodge the count the dialog shows.
+- The secret-copying step itself needs consent from the main process, not just
+  the pane's dialog: the connected page holds the bridge and could call it
+  directly, so `browser-chrome-cookie-import` runs a native
+  `dialog.showMessageBox` naming the scope, the tab's host (when an ancestor
+  scope was picked), the Chrome profile and the count (that count comes from
+  main's own preview, never from the renderer). Like the shell's other consent
+  dialogs it is parented to the sender's window, so it can't be approved while
+  the tab it describes is hidden behind another app, and Chrome's profile name —
+  a plain file on disk — is flattened to one short line so it can't add its own
+  text. Cancel is the default and a declined prompt returns
+  `{ ok: false, cancelled: true }`.
+- Values are decrypted with `v10`/`v11` (AES-128-CBC, key from the login
+  Keychain's "Chrome Safe Storage" item) and never shown, logged, or persisted.
+  App-bound `v20` values and non-macOS platforms are refused with a message, not
+  guessed at. The Keychain prompt is attributed to `security`; choose **Allow**
+  rather than **Always Allow**, because Always Allow adds `/usr/bin/security` to
+  the item's ACL, and any local process can then read Chrome's key without a
+  prompt. Partitioned (CHIPS) cookies are skipped rather than replayed
+  unpartitioned, which would widen the site they were scoped to.
+- Reading never touches Chrome's live database: `Cookies` (plus any
+  `Cookies-wal` / `Cookies-journal`) is copied into a private temp directory and
+  `sqlite3` only opens that copy, so Chrome's file is never locked or rewritten.
+  `sqlite3` and `security` are spawned by absolute path (`/usr/bin/...`, the
+  macOS system copies) instead of being resolved through `PATH`, so nothing on
+  the user's path can intercept Chrome's key or jar. Failures surface as a fixed
+  message, never the command line.
+- Cookies land in the conversation's existing in-memory partition, so they
+  disappear when the app quits; nothing is written back to Chrome, and there is
+  no background sync.
+- Cookies alone don't always reproduce a sign-in (localStorage, device checks,
+  `HttpOnly` site state), and an agent-controlled tab means the agent can act as
+  you on that site while they're loaded — the dialog says so. For real SSO use
+  system-browser sign-in above.
 
 **JS trust boundary:** `omnigent:browser-perform-action` accepts only snapshot,
 click and type requests. Main validates their arguments and builds fixed scripts,

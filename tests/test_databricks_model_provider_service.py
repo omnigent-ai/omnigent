@@ -151,17 +151,23 @@ def test_runner_rejects_a_malformed_provider_service() -> None:
 @pytest.mark.parametrize(
     ("model", "expected"),
     [
-        ("databricks-claude-sonnet-5", True),
+        ("system.ai.claude-opus-5", True),
         ("system.ai.gpt-6-luna", True),
+        (" SYSTEM.AI.claude-sonnet-5 ", True),
+        ("databricks-claude-sonnet-5", True),
         ("databricks/databricks-claude-opus-5-5", True),
         ("us.anthropic.claude-sonnet-5", False),
         ("gpt-6-astra", False),
+        ("", False),
+        (None, False),
     ],
 )
-def test_databricks_catalog_model_detection(model: str, expected: bool) -> None:
-    from omnigent.databricks_ai_gateway import is_databricks_catalog_model
+def test_provider_pinned_override_ignored(model: str | None, expected: bool) -> None:
+    """Pinned agents drop every Databricks-hosted spelling and keep provider ids."""
+    from omnigent.databricks_ai_gateway import provider_pinned_override_ignored
 
-    assert is_databricks_catalog_model(model) is expected
+    assert provider_pinned_override_ignored(_BEDROCK, model) is expected
+    assert provider_pinned_override_ignored(None, model) is False
 
 
 def _env_with_override(config: dict[str, str], model_override: str) -> dict[str, str]:
@@ -196,8 +202,9 @@ def test_provider_pinned_agent_accepts_a_provider_model_override() -> None:
     assert env[MODEL_PROVIDER_SERVICE_ENV_VAR] == _BEDROCK
 
 
-def test_unpinned_agent_still_takes_a_databricks_hosted_override() -> None:
-    env = _env_with_override({"harness": "claude-sdk"}, "databricks-claude-opus-5-5")
+@pytest.mark.parametrize("override", ["system.ai.claude-opus-5", "databricks-claude-opus-5-5"])
+def test_unpinned_agent_still_takes_a_databricks_hosted_override(override: str) -> None:
+    env = _env_with_override({"harness": "claude-sdk"}, override)
 
-    assert env["HARNESS_CLAUDE_SDK_MODEL"] == "databricks-claude-opus-5-5"
+    assert env["HARNESS_CLAUDE_SDK_MODEL"] == override
     assert MODEL_PROVIDER_SERVICE_ENV_VAR not in env

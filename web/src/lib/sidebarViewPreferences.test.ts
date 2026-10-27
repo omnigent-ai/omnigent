@@ -14,11 +14,14 @@ describe("sidebarViewPreferences", () => {
     expect(readSidebarViewPreferences()).toEqual(DEFAULT_SIDEBAR_VIEW);
   });
 
-  it.each(["status", "created", "updated"] as const)("round-trips %s grouping", (grouping) => {
-    const view = { grouping, ordering: "created", show: ["updated", "branch"] } as const;
-    writeSidebarViewPreferences(view);
-    expect(readSidebarViewPreferences()).toEqual(view);
-  });
+  it.each(["status", "created", "updated", "harness"] as const)(
+    "round-trips %s grouping",
+    (grouping) => {
+      const view = { grouping, ordering: "created", show: ["updated", "branch"] } as const;
+      writeSidebarViewPreferences(view);
+      expect(readSidebarViewPreferences()).toEqual(view);
+    },
+  );
 
   it("restores saved Status grouping while preserving ordering and metadata", () => {
     localStorage.setItem(

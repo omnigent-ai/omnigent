@@ -115,6 +115,60 @@ async def _drive_claude_pane(
         return await asyncio.to_thread(function, *args, **kwargs)
 
 
+def _claude_waits_on_person(exc: BaseException) -> bool:
+    """Whether the switch was refused only because the pane awaits the person's answer."""
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudeSignInPending,
+        ClaudeTerminalDialog,
+        ClaudeUserPromptPending,
+    )
+
+    return isinstance(exc, ClaudeSignInPending | ClaudeTerminalDialog | ClaudeUserPromptPending)
+
+
+def _claude_model_change_blocked_detail(exc: BaseException) -> str | None:
+    """
+    Return a model-switch next step when the terminal is waiting on the person, else ``None``.
+
+    :param exc: The exception the prompt wait or ``/model`` injection raised.
+    :returns: Client-facing detail ending with the pane tail the bridge
+        captured, or ``None`` for failures with no person-actionable cause.
+    """
+    from omnigent.harnesses.claude_native.bridge import (
+        ClaudePromptTimeout,
+        ClaudeSignInPending,
+        ClaudeTerminalDialog,
+        ClaudeTerminalExited,
+        ClaudeUserPromptPending,
+        terminal_failure_tail,
+    )
+
+    if isinstance(exc, ClaudeSignInPending):
+        # The bridge's remediation targets the chat card's live link, which this reply lacks.
+        return f"{exc.title}. Finish the sign-in in the terminal, then switch models again."
+    if isinstance(exc, ClaudeUserPromptPending):
+        next_step = (
+            "Claude is waiting for an answer to a question or prompt. "
+            "Answer it, then switch models again."
+        )
+    elif isinstance(exc, ClaudeTerminalDialog):
+        next_step = (
+            "Claude Code's terminal is showing a prompt or dialog. Open the terminal, "
+            "answer or dismiss it, then switch models again."
+        )
+    elif isinstance(exc, ClaudeTerminalExited):
+        next_step = "The Claude Code terminal has exited. Relaunch it, then switch models again."
+    elif isinstance(exc, ClaudePromptTimeout):
+        # Also raised for a slow boot or a startup crash, so hint rather than prescribe.
+        next_step = (
+            "Claude Code's input box never appeared. It may still be starting, or waiting "
+            "on a prompt such as a password. Check the terminal, then switch models again."
+        )
+    else:
+        return None
+    return next_step + terminal_failure_tail(str(exc))
+
+
 # How long the detached watcher keeps answering a /model confirm dialog that
 # pops after the active turn settles (a mid-turn switch queues in the
 # composer), and how often it looks. Long turns are common; the watch is
@@ -240,6 +294,7 @@ class NativeControls:
 
     codex_native_model_options: Callable[[str], Coroutine[Any, Any, list[_JsonObject]]]
     handle_claude_native_btw_dismiss: Callable[[str], Coroutine[Any, Any, Response]]
+    handle_claude_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_claude_native_cost_popup: _HandleClaudeNativeCostPopupFn
     handle_claude_native_effort_change: Callable[[str, str | None], Coroutine[Any, Any, Response]]
@@ -249,6 +304,7 @@ class NativeControls:
     ]
     handle_claude_sdk_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_approval_mode_change: Callable[[str, str], Coroutine[Any, Any, Response]]
+    handle_codex_native_clear: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_compact: Callable[[str], Coroutine[Any, Any, Response]]
     handle_codex_native_cost_popup: _HandleCodexNativeCostPopupFn
     handle_codex_native_plan_mode_change: _HandleCodexNativePlanModeChangeFn
@@ -296,6 +352,7 @@ def build_native_controls(
     _model_dialog_watchers: set[asyncio.Task[None]],
     _native_cost_popup_config_file: Callable[[str, str], Coroutine[Any, Any, Path]],
     _native_pane_status: dict[str, str],
+    _opencode_terminal_ensure_locks: dict[str, asyncio.Lock],
     _publish_event: Callable[[str, Mapping[str, object]], None],
     _publish_turn_status: _PublishTurnStatusFn,
     _resolve_session_agent_spec: Callable[[str], Coroutine[Any, Any, AgentSpec | None]],
@@ -456,18 +513,29 @@ def build_native_controls(
 
         if ready_deadline is None:
             ready_deadline = asyncio.get_running_loop().time() + _CODEX_SETTINGS_READY_TIMEOUT_S
+        backend_before_ready = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+        process_before_ready = getattr(backend_before_ready, "proc", None)
         try:
             state = await asyncio.wait_for(
                 _ready_codex_bridge_for_settings(conv_id),
                 timeout=ready_deadline - asyncio.get_running_loop().time(),
             )
         except TimeoutError:
+            # A cold relaunch can outlast the budget. The next web turn applies the
+            # persisted selection, so report it unconfirmed instead of refusing it.
             _logger.warning(
-                "Codex-native runtime was not ready for settings update for session=%s",
+                "Codex-native runtime was not ready for settings update for session=%s; "
+                "the next turn applies it",
                 conv_id,
                 extra={"session_id": conv_id},
             )
-            state = None
+            return JSONResponse(
+                status_code=504,
+                content={
+                    "error": "codex_native_settings_update_timeout",
+                    "detail": "Codex was still starting; the next turn applies the settings.",
+                },
+            ), settings
         if state is None:
             # No loaded Codex bridge means nothing applied the settings; a
             # silent 204 here would let the caller claim a switch the
@@ -479,6 +547,13 @@ def build_native_controls(
                     "detail": "Codex-native settings update requires a loaded Codex bridge.",
                 },
             ), settings
+
+        backend_after_ready = _AUTO_CODEX_APP_SERVERS.get(conv_id)
+        if backend_after_ready is not backend_before_ready or (
+            getattr(backend_after_ready, "proc", None) is not process_before_ready
+        ):
+            # Readiness already launched a replacement; keep one recovery per request.
+            retry_unreachable = False
 
         bridge_dir = bridge_dir_for_codex_home(Path(state.codex_home))
         settings = dict(settings)
@@ -598,7 +673,7 @@ def build_native_controls(
                         "detail": "Codex did not confirm the settings update in time.",
                     },
                 ), settings
-        except Exception as exc:  # noqa: BLE001 - surface app-server settings failures.
+        except Exception as exc:  # surface app-server settings failures.
             _logger.warning(
                 "Codex-native thread/settings/update failed for session=%s thread=%s settings=%s",
                 conv_id,
@@ -923,7 +998,7 @@ def build_native_controls(
             await asyncio.to_thread(
                 model_catalog_store.write_catalog, "codex-native", fingerprint, shaped
             )
-        except Exception:  # noqa: BLE001 — write-back is best-effort
+        except Exception:  # write-back is best-effort
             _logger.debug(
                 "codex model-catalog write-back skipped",
                 exc_info=True,
@@ -1243,7 +1318,7 @@ def build_native_controls(
                 await asyncio.to_thread(
                     confirm_dialog_if_open, bridge_dir, hint=SWITCH_MODEL_DIALOG_HINT
                 )
-            except Exception:  # noqa: BLE001 — best-effort; the report reconciles
+            except Exception:  # best-effort; the report reconciles
                 _logger.debug(
                     "late model-dialog watch errored for session=%s",
                     conv_id,
@@ -1264,6 +1339,7 @@ def build_native_controls(
     ) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             SWITCH_MODEL_DIALOG_HINT,
+            ClaudeInjectionCancelled,
             ClaudePromptTimeout,
             bridge_dir_for_bridge_id,
             confirm_dialog_if_open,
@@ -1284,6 +1360,8 @@ def build_native_controls(
             resolve_bound_model,
         )
         from omnigent.models.claude_model_vocabulary import (
+            alias_pins,
+            canonical_claude_id,
             claude_model_command_arg,
             picker_command_values,
         )
@@ -1323,7 +1401,8 @@ def build_native_controls(
                     picker_values = stored_claude_picker_values(claude_config, stored_rows)
         model_arg = claude_model_command_arg(resolved_model, env, picker_values=picker_values)
         inference_config = load_runtime_inference_config()
-        if binding_for_harness(inference_config, "claude-native") is not None:
+        bound_model = binding_for_harness(inference_config, "claude-native") is not None
+        if bound_model:
             resolved_model = resolve_bound_model(inference_config, "claude-native", selected_model)
             model_arg = resolved_model
         if model_arg is None:
@@ -1349,11 +1428,14 @@ def build_native_controls(
         command = f"/model {model_arg}"
 
         def _model_failed(exc: BaseException) -> JSONResponse:
+            # Always log the full cause; the reply carries it only when actionable.
+            safe_detail = _client_safe_error_detail(exc, context="claude-native model change")
             return JSONResponse(
                 status_code=503,
                 content={
                     "error": "claude_native_model_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native model change"),
+                    "detail": _claude_model_change_blocked_detail(exc) or safe_detail,
+                    **({"waiting_on_person": True} if _claude_waits_on_person(exc) else {}),
                 },
             )
 
@@ -1391,25 +1473,6 @@ def build_native_controls(
         if wait_error is not None:
             return _model_failed(wait_error)
         baseline = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-        try:
-            # Accepted trade-off: ``/model <id>`` also saves the pick as the
-            # person's global default in ``~/.claude/settings.json``. Driving
-            # the interactive picker instead avoided that write but needed
-            # ~35s of fragile tmux automation, so the write stands.
-            await _drive_claude_pane(
-                deadline,
-                inject_slash_command,
-                bridge_dir,
-                command=command,
-                timeout_s=1.0,
-                # A boot that used the prompt budget still leaves the injection a
-                # short wait for a torn capture right after the prompt rendered.
-                ready_timeout_s=min(deadline.remaining_s(), max(1.0, prompt_budget_s - waited_s)),
-                auto_confirm=True,
-                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
-            )
-        except (RuntimeError, ValueError, OSError) as exc:
-            return _model_failed(exc)
         # Verify against the statusLine snapshot the forwarder already polls:
         # Claude rewrites it on every render, including right after ``/model``.
         # Expected spellings come from this session's own catalog rows (every
@@ -1427,6 +1490,60 @@ def build_native_controls(
                 row_model = row.get("model")
                 if isinstance(row_model, str) and row_model:
                     expected.add(row_model)
+        if not bound_model:
+            # A repeated alias pick keeps the same model; its launch pin proves
+            # the exact generation even when the options cache is cold.
+            long_context_requested = any(
+                value.lower().endswith("[1m]")
+                for value in (selected_model, resolved_model or "", model_arg)
+            )
+            pinned = alias_pins(env or {}).get(model_arg.lower().removesuffix("[1m]"))
+            if pinned:
+                if long_context_requested and not pinned.lower().endswith("[1m]"):
+                    pinned += "[1m]"
+                expected.add(pinned)
+            if long_context_requested:
+                expected = {value for value in expected if value.lower().endswith("[1m]")}
+            expected.update(
+                canonical for value in tuple(expected) if (canonical := canonical_claude_id(value))
+            )
+
+        def _switched(current: str | None) -> bool:
+            comparable = current if bound_model or not current else canonical_claude_id(current)
+            return bool(
+                current
+                and (
+                    current in expected
+                    or comparable in expected
+                    or (baseline and current != baseline)
+                )
+            )
+
+        try:
+            # Accepted trade-off: ``/model <id>`` also saves the pick as the
+            # person's global default in ``~/.claude/settings.json``. Driving
+            # the interactive picker instead avoided that write but needed
+            # ~35s of fragile tmux automation, so the write stands.
+            await _drive_claude_pane(
+                deadline,
+                inject_slash_command,
+                bridge_dir,
+                command=command,
+                timeout_s=1.0,
+                # A boot that used the prompt budget still leaves the injection a
+                # short wait for a torn capture right after the prompt rendered.
+                ready_timeout_s=min(deadline.remaining_s(), max(1.0, prompt_budget_s - waited_s)),
+                auto_confirm=True,
+                confirm_hint=SWITCH_MODEL_DIALOG_HINT,
+            )
+        except ClaudeInjectionCancelled as exc:
+            # The budget can lapse in the dialog watch after ``/model`` was submitted;
+            # a pane that already switched must not be rolled back. Read only, no keys.
+            if _switched(await asyncio.to_thread(read_claude_status_model, bridge_dir)):
+                return Response(status_code=204)
+            return _model_failed(exc)
+        except (RuntimeError, ValueError, OSError) as exc:
+            return _model_failed(exc)
         # The prompt wait comes out of this window, keeping the whole request
         # inside the server's forward timeout.
         confirm_window_s = min(_CLAUDE_MODEL_CONFIRM_TIMEOUT_S, deadline.remaining_s())
@@ -1435,7 +1552,7 @@ def build_native_controls(
         was_busy = _native_pane_status.get(conv_id) in ("running", "waiting")
         while True:
             current = await asyncio.to_thread(read_claude_status_model, bridge_dir)
-            if current and (current in expected or (baseline and current != baseline)):
+            if _switched(current):
                 # The pane switched. When it landed somewhere other than the
                 # expected spelling, the forwarder's verbatim report is the
                 # truth the UI will settle on — the command still took effect.
@@ -1690,7 +1807,7 @@ def build_native_controls(
             )
         return Response(status_code=200)
 
-    async def _handle_claude_native_compact(conv_id: str) -> Response:
+    async def _inject_claude_native_slash(conv_id: str, *, command: str, action: str) -> Response:
         from omnigent.harnesses.claude_native.bridge import (
             bridge_dir_for_bridge_id,
             inject_slash_command,
@@ -1708,7 +1825,7 @@ def build_native_controls(
                 deadline,
                 inject_slash_command,
                 bridge_dir,
-                command="/compact",
+                command=command,
                 timeout_s=1.0,
                 ready_timeout_s=min(_CLAUDE_CONTROL_PROMPT_WAIT_S, deadline.remaining_s()),
             )
@@ -1716,20 +1833,26 @@ def build_native_controls(
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "claude_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="claude-native compact"),
+                    "error": f"claude_native_{action}_failed",
+                    "detail": _client_safe_error_detail(exc, context=f"claude-native {action}"),
                 },
             )
         return Response(status_code=200)
 
-    async def _handle_codex_native_compact(conv_id: str) -> Response:
+    async def _handle_claude_native_compact(conv_id: str) -> Response:
+        return await _inject_claude_native_slash(conv_id, command="/compact", action="compact")
+
+    async def _handle_claude_native_clear(conv_id: str) -> Response:
+        return await _inject_claude_native_slash(conv_id, command="/clear", action="clear")
+
+    async def _inject_codex_native_slash(conv_id: str, *, command: str, action: str) -> Response:
         registry = resource_registry.terminal_registry
         instance = registry.get(conv_id, "codex", "main") if registry is not None else None
         if instance is None or not instance.running:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "codex_native_compact_failed",
+                    "error": f"codex_native_{action}_failed",
                     "detail": "Codex terminal is not running; reconnect first.",
                 },
             )
@@ -1738,16 +1861,22 @@ def build_native_controls(
         target = instance.tmux_target
 
         try:
-            await asyncio.to_thread(_inject_codex_compact, socket_path, target)
+            await asyncio.to_thread(_inject_codex_slash_command, socket_path, target, command)
         except (RuntimeError, ValueError) as exc:
             return JSONResponse(
                 status_code=503,
                 content={
-                    "error": "codex_native_compact_failed",
-                    "detail": _client_safe_error_detail(exc, context="codex-native compact"),
+                    "error": f"codex_native_{action}_failed",
+                    "detail": _client_safe_error_detail(exc, context=f"codex-native {action}"),
                 },
             )
         return Response(status_code=200)
+
+    async def _handle_codex_native_compact(conv_id: str) -> Response:
+        return await _inject_codex_native_slash(conv_id, command="/compact", action="compact")
+
+    async def _handle_codex_native_clear(conv_id: str) -> Response:
+        return await _inject_codex_native_slash(conv_id, command="/clear", action="clear")
 
     async def _handle_opencode_native_compact(conv_id: str) -> Response:
         from omnigent.harnesses.opencode_native.bridge import (
@@ -1871,14 +2000,16 @@ def build_native_controls(
         except OmnigentError:
             spec = None
         try:
-            await _auto_create_opencode_terminal(
-                conv_id,
-                resource_registry,
-                _publish_event,
-                agent_spec=spec,
-                server_client=server_client,
-                ensure_comment_relay=_ensure_comment_relay_started,
-            )
+            # The idle pane reaper holds this lock while it releases the relay this reuses.
+            async with _opencode_terminal_ensure_locks.setdefault(conv_id, asyncio.Lock()):
+                await _auto_create_opencode_terminal(
+                    conv_id,
+                    resource_registry,
+                    _publish_event,
+                    agent_spec=spec,
+                    server_client=server_client,
+                    ensure_comment_relay=_ensure_comment_relay_started,
+                )
         except Exception as exc:  # noqa: BLE001 - report relaunch failure to caller.
             return JSONResponse(
                 status_code=503,
@@ -1939,14 +2070,14 @@ def build_native_controls(
             )
         return Response(status_code=200)
 
-    def _inject_codex_compact(socket_path: str, target: str) -> None:
-        # Typing "/compact" opens Codex's slash-command popup, which draws
+    def _inject_codex_slash_command(socket_path: str, target: str, command: str) -> None:
+        # Typing a slash command opens Codex's slash-command popup, which draws
         # asynchronously: an Enter sent back-to-back is swallowed by the
         # still-opening popup and the command never submits, so settle first.
         from omnigent.harnesses.claude_native.bridge import _run_tmux
 
         _run_tmux(socket_path, "send-keys", "-t", target, "C-u")
-        _run_tmux(socket_path, "send-keys", "-l", "-t", target, "/compact")
+        _run_tmux(socket_path, "send-keys", "-l", "-t", target, command)
         time.sleep(_CODEX_POPUP_RENDER_S)
         _run_tmux(socket_path, "send-keys", "-t", target, "Enter")
 
@@ -2341,6 +2472,7 @@ def build_native_controls(
     return NativeControls(
         codex_native_model_options=_codex_native_model_options,
         handle_claude_native_btw_dismiss=_handle_claude_native_btw_dismiss,
+        handle_claude_native_clear=_handle_claude_native_clear,
         handle_claude_native_compact=_handle_claude_native_compact,
         handle_claude_native_cost_popup=_handle_claude_native_cost_popup,
         handle_claude_native_effort_change=_handle_claude_native_effort_change,
@@ -2348,6 +2480,7 @@ def build_native_controls(
         handle_claude_native_permission_mode_change=_handle_claude_native_permission_mode_change,
         handle_claude_sdk_compact=_handle_claude_sdk_compact,
         handle_codex_native_approval_mode_change=_handle_codex_native_approval_mode_change,
+        handle_codex_native_clear=_handle_codex_native_clear,
         handle_codex_native_compact=_handle_codex_native_compact,
         handle_codex_native_cost_popup=_handle_codex_native_cost_popup,
         handle_codex_native_plan_mode_change=_handle_codex_native_plan_mode_change,

@@ -45,6 +45,7 @@ import { useAvailableAgents } from "@/hooks/useAvailableAgents";
 import { NewChatLandingScreen } from "./NewChatDialog";
 
 vi.mock("@/lib/routing", () => ({
+  useLocation: () => ({ hash: "", state: null }),
   useNavigate: () => vi.fn(),
   useSearchParams: () => [new URLSearchParams(), vi.fn()],
 }));

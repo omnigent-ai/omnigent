@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import os
 
+import pytest
 from playwright.sync_api import Browser, Route, expect
 
 _MSG1 = "sentinel-steer-dock-msg1 holds the turn open"
@@ -142,9 +143,19 @@ def test_queued_strip_attaches_to_composer(
                     """element => {
                         const style = getComputedStyle(element);
                         return {
+                            left: parseFloat(style.paddingLeft),
                             right:
                                 parseFloat(style.paddingRight) +
                                 parseFloat(style.borderRightWidth),
+                        };
+                    }"""
+                )
+                strip_insets = strip.evaluate(
+                    """element => {
+                        const style = getComputedStyle(element);
+                        return {
+                            left: parseFloat(style.paddingLeft),
+                            right: parseFloat(style.paddingRight),
                         };
                     }"""
                 )
@@ -212,18 +223,19 @@ def test_queued_strip_attaches_to_composer(
                 )
                 drag_handle_center = drag_handle_box["x"] + drag_handle_box["width"] / 2
                 workspace_icon_center = workspace_icon_box["x"] + workspace_icon_box["width"] / 2
-                assert abs(workspace_icon_center - drag_handle_center) <= _EPSILON, (
-                    "workspace icon and queued drag handles share the tray's icon "
-                    f"column: drag={drag_handle_center:.1f}, "
-                    f"workspace={workspace_icon_center:.1f}"
+                compact_inset_delta = strip_insets["left"] - bar_insets["left"]
+                assert drag_handle_center - workspace_icon_center == pytest.approx(
+                    compact_inset_delta, abs=_EPSILON
+                ), (
+                    "workspace icon follows the compact context-bar inset relative to "
+                    f"the queued drag column: drag={drag_handle_center:.1f}, "
+                    f"workspace={workspace_icon_center:.1f}, inset={compact_inset_delta:.1f}"
                 )
-                assert (
-                    abs(
-                        strip_list_box["x"]
-                        + strip_list_box["width"]
-                        - (bar_box["x"] + bar_box["width"] - bar_insets["right"])
-                    )
-                    <= _EPSILON
+                strip_content_right = strip_list_box["x"] + strip_list_box["width"]
+                bar_content_right = bar_box["x"] + bar_box["width"] - bar_insets["right"]
+                compact_right_delta = strip_insets["right"] - bar_insets["right"]
+                assert bar_content_right - strip_content_right == pytest.approx(
+                    compact_right_delta, abs=_EPSILON
                 )
                 bar_bottom = bar_box["y"] + bar_box["height"]
                 covers_left = bar_box["x"] <= strip_box["x"] + _EPSILON

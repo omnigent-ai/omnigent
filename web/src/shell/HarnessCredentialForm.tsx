@@ -25,6 +25,7 @@ import {
   useStoreCredential,
   type DetectedCredential,
   type Host,
+  type StoreCredentialResult,
   type StoreCredentialInput,
 } from "@/hooks/useHosts";
 import { harnessCredentialAdoptFamilies } from "@/lib/harnessSetup";
@@ -45,7 +46,7 @@ export function HarnessCredentialForm({
   /** The server's subscription-login command (e.g. `codex login`), shown as a
    *  copy signpost — the UI can't drive browser OAuth. `null` for Pi. */
   command: string | null;
-  onDone: () => void;
+  onDone: (result: StoreCredentialResult) => void;
 }) {
   // What the user sees in toasts — the friendly name, not the canonical id.
   const display = label ?? harness;
@@ -57,7 +58,12 @@ export function HarnessCredentialForm({
   // (and persist) a cross-family key, e.g. an Anthropic key for Codex. Pi
   // consumes both families, so it can adopt an openai OR an anthropic key.
   const adoptFamilies = harnessCredentialAdoptFamilies(harness);
-  const adoptable = (detected ?? []).find((d) => d.env_var && adoptFamilies.includes(d.family));
+  const adoptable = (detected ?? []).find(
+    (credential) =>
+      credential.family !== "databricks" &&
+      credential.env_var &&
+      adoptFamilies.includes(credential.family),
+  );
 
   const [apiKey, setApiKey] = useState("");
   const [gatewayUrl, setGatewayUrl] = useState("");
@@ -86,7 +92,7 @@ export function HarnessCredentialForm({
         setGatewayKey("");
         if (ready) {
           showToast(`${display} is ready on ${host.name}.`);
-          onDone();
+          onDone(result);
         } else {
           showToast(
             `Saved, but ${display} still needs setup on ${host.name}. Try another option.`,

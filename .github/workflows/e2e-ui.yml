@@ -34,6 +34,11 @@ on:
   schedule:
     - cron: "0 9 * * *"
   workflow_dispatch:
+    inputs:
+      parallelism:
+        description: "Number of pytest workers per shard (-n flag). Empty uses the E2E_UI_PARALLELISM repository variable, else 1 (serial)."
+        required: false
+        default: ""
 
 permissions:
   contents: read
@@ -68,14 +73,15 @@ jobs:
   # (security-gate.yml); trusted authors and non-PR events pass instantly.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
-  # Compute the shard matrix once. A skipped run (draft / fork pull_request)
-  # yields an EMPTY matrix -> zero shard jobs -> no skipped placeholder check.
   # Shared with e2e.yml via e2e-shard-matrix.sh (only NUM_SHARDS differs).
   setup:
-    name: UI scope
+    name: UI coverage scope
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.matrix.outputs.matrix }}
@@ -114,7 +120,7 @@ jobs:
     name: build codex-parity sidecar
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
       - name: Checkout
@@ -145,7 +151,7 @@ jobs:
             --manifest-path tests/codex_parity/sidecar/Cargo.toml \
             --target-dir .tmp-codex-parity-target
       - name: Upload sidecar binary
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: codex-parity-sidecar
           path: .tmp-codex-parity-target/debug/codex-parity-sidecar
@@ -158,14 +164,14 @@ jobs:
     # omits the server, runner, harness CLIs, bubblewrap, tmux, and sidecar.
     needs: setup
     if: needs.setup.outputs.matrix != '{"include":[]}' && (needs.setup.outputs.ui == 'full' || needs.setup.outputs.ui == 'dependency')
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 25
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -184,7 +190,7 @@ jobs:
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
 
       - name: Install project + test dependencies
-        run: uv sync --locked --extra all --group test
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
       # ci.yml skips UI-only changes, so check here that the verify-omnigent
       # feature map still names tests that exist after UI test renames.
@@ -229,7 +235,7 @@ jobs:
 
       - name: Upload Playwright artifacts on failure
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: browser-contract-playwright-${{ github.run_id }}
           path: test-results/
@@ -238,11 +244,10 @@ jobs:
 
   e2e-ui:
     name: E2E UI Tests (shard ${{ matrix.shard_id }}/${{ matrix.num_shards }})
-    # Draft PRs resolve to an EMPTY matrix in `setup`, so no shard runs for
-    # them. Fork PRs DO run (mock LLM, no secrets) -- same as ci.yml.
-    # `ready_for_review` re-fires when a draft is converted.
+    # Skip before matrix expansion: GitHub rejects an empty include list.
     needs: [setup, build-sidecar]
-    runs-on: ubuntu-latest
+    if: needs.setup.outputs.matrix != '{"include":[]}'
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
       # One red shard shouldn't cancel siblings -- we want every shard's signal.
@@ -259,7 +264,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -277,7 +282,7 @@ jobs:
           path: .venv
           key: venv-${{ runner.os }}-${{ hashFiles('.python-version') }}-${{ hashFiles('uv.lock') }}
       - name: Install project + test dependencies
-        run: uv sync --locked --extra all --group test
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test
 
       - name: Install bubblewrap + tmux
         # bubblewrap: the UI tests open terminals under os_env, whose
@@ -296,7 +301,7 @@ jobs:
       # build. The mocked_native_codex_goal_session fixture uses this binary
       # via CODEX_PARITY_SIDECAR_BIN (set on the pytest step below).
       - name: Download codex-parity sidecar binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           name: codex-parity-sidecar
           path: .tmp-codex-parity-target/debug
@@ -330,12 +335,12 @@ jobs:
       # native render-parity tests boot a real Claude Code / Codex CLI. The
       # rest of the e2e-ui suite (openai-agents) ignores them.
       - name: Install Claude Code CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
         with:
           harness: claude
 
       - name: Install Codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
         with:
           harness: codex
 
@@ -359,6 +364,9 @@ jobs:
           SHARD_ID: ${{ matrix.shard_id }}
           NUM_SHARDS: ${{ matrix.num_shards }}
           UI_SCOPE: ${{ needs.setup.outputs.ui }}
+          # Dispatch input, else the E2E_UI_PARALLELISM repository variable (unset on
+          # fork PRs), else serial.
+          PARALLELISM_INPUT: ${{ inputs.parallelism || vars.E2E_UI_PARALLELISM || '1' }}
           OMNIGENT_E2E_ANTIGRAVITY: mock
           # Prebuilt sidecar from build-sidecar; the codex goal-mode fixture
           # uses this instead of running cargo build. Absolute path: the
@@ -367,11 +375,21 @@ jobs:
         run: |
           # Always exclude @visual: the UI diff snapshot runs in its own
           # pinned-runner gate (ui-snapshot.yml) so its baseline matches the
-          # comparison environment; on this unpinned ubuntu-latest it would
+          # comparison environment; on this standard runner image it would
           # flake on font drift. Add the nightly exclusion for PR/push runs.
           MARKER="not visual"
           if [[ "$NIGHTLY_FULL" != "true" ]]; then
             MARKER="$MARKER and not nightly"
+          fi
+          if ! [[ "$PARALLELISM_INPUT" =~ ^[1-9]$ ]]; then
+            echo "Invalid parallelism input: $PARALLELISM_INPUT (expected 1-9)" >&2
+            exit 1
+          fi
+          # Each xdist worker boots its own server; loadscope keeps a module's
+          # tests, and so its module-scoped fixtures, on one worker.
+          worker_args=()
+          if [[ "$PARALLELISM_INPUT" -gt 1 ]]; then
+            worker_args+=(-n "$PARALLELISM_INPUT" --dist=loadscope)
           fi
           scope_args=()
           if [[ "$UI_SCOPE" == "sidecar" ]]; then
@@ -389,7 +407,7 @@ jobs:
           # Retry every otherwise-unmarked failure once for transient CI races;
           # per-test @pytest.mark.flaky settings still take precedence.
           # Keep the failed attempt's traceback even when its retry passes.
-          uv run pytest tests/e2e_ui "${scope_args[@]}" \
+          uv run pytest tests/e2e_ui "${scope_args[@]}" "${worker_args[@]}" \
             -v --tb=long --showlocals --log-level=INFO -r a \
             --durations=25 --durations-min=1.0 \
             --reruns=1 --reruns-delay=5 --rerun-show-tracebacks \
@@ -405,17 +423,17 @@ jobs:
 
       - name: Upload UI test timings and shard assignment
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: e2e-ui-timings-${{ github.run_id }}-${{ github.run_attempt }}-shard${{ matrix.shard_id }}
-          path: artifacts/ui-timings.jsonl
+          path: artifacts/ui-timings*.jsonl
           retention-days: 14
           if-no-files-found: warn
 
       - name: Upload Playwright traces / videos / screenshots on failure
         id: upload_playwright
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           # Shard suffix avoids the matrix's parallel uploads colliding (v4
           # 409s on dupe names).
@@ -452,7 +470,7 @@ jobs:
       - name: Upload server logs on failure
         id: upload_server_logs
         if: failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: e2e-ui-server-logs-${{ github.run_id }}-shard${{ matrix.shard_id }}
           # server.log + runner.log from the live_server and mocked-Codex
@@ -504,7 +522,7 @@ jobs:
     name: E2E UI result
     if: always()
     needs: [setup, build-sidecar, browser-contract, e2e-ui]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require successful test selection

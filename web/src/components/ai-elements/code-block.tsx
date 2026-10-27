@@ -9,9 +9,10 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 import { copyText } from "@/lib/clipboard";
+import { stripAnsi } from "@/lib/ansi";
 import { cn } from "@/lib/utils";
 import { CheckIcon, CopyIcon } from "lucide-react";
-import type { ComponentProps, CSSProperties, HTMLAttributes } from "react";
+import type { ComponentProps, CSSProperties, HTMLAttributes, ReactNode } from "react";
 import {
   createContext,
   memo,
@@ -22,7 +23,13 @@ import {
   useRef,
   useState,
 } from "react";
-import type { BundledLanguage, BundledTheme, HighlighterGeneric, ThemedToken } from "shiki";
+import type {
+  BundledLanguage,
+  BundledTheme,
+  HighlighterGeneric,
+  SpecialLanguage,
+  ThemedToken,
+} from "shiki";
 
 // Shiki uses bitflags for font styles: 1=italic, 2=bold, 4=underline
 // oxlint-disable-next-line eslint(no-bitwise)
@@ -52,10 +59,21 @@ const addKeysToTokens = (lines: ThemedToken[][]): KeyedLine[] =>
     })),
   }));
 
+/** A scheme that token colors are pinned to instead of following the app's `.dark` class. */
+export type CodeColorScheme = "light" | "dark";
+
+const DARK_TOKEN_CLASSES = "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)]";
+
 // Token rendering component
-const TokenSpan = ({ token }: { token: ThemedToken }) => (
+const TokenSpan = ({
+  token,
+  colorScheme,
+}: {
+  token: ThemedToken;
+  colorScheme: CodeColorScheme | undefined;
+}) => (
   <span
-    className="dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)]"
+    className={colorScheme === undefined ? DARK_TOKEN_CLASSES : undefined}
     style={
       {
         backgroundColor: token.bgColor,
@@ -64,6 +82,10 @@ const TokenSpan = ({ token }: { token: ThemedToken }) => (
         fontWeight: isBold(token.fontStyle) ? "bold" : undefined,
         textDecoration: isUnderline(token.fontStyle) ? "underline" : undefined,
         ...token.htmlStyle,
+        ...(colorScheme === "dark" && {
+          color: token.htmlStyle?.["--shiki-dark"],
+          backgroundColor: token.htmlStyle?.["--shiki-dark-bg"],
+        }),
       } as CSSProperties
     }
   >
@@ -89,21 +111,28 @@ const LINE_NUMBER_CLASSES = cn(
 const LineSpan = ({
   keyedLine,
   showLineNumbers,
+  colorScheme,
 }: {
   keyedLine: KeyedLine;
   showLineNumbers: boolean;
+  colorScheme: CodeColorScheme | undefined;
 }) => (
   <span className={showLineNumbers ? LINE_NUMBER_CLASSES : "block"}>
     {keyedLine.tokens.length === 0
       ? "\n"
-      : keyedLine.tokens.map(({ token, key }) => <TokenSpan key={key} token={token} />)}
+      : keyedLine.tokens.map(({ token, key }) => (
+          <TokenSpan key={key} token={token} colorScheme={colorScheme} />
+        ))}
   </span>
 );
 
 // Types
+/** A bundled grammar, or one of Shiki's built-ins (`text`, `ansi` for terminal colors). */
+export type CodeLanguage = BundledLanguage | SpecialLanguage;
+
 type CodeBlockProps = HTMLAttributes<HTMLDivElement> & {
   code: string;
-  language: BundledLanguage;
+  language: CodeLanguage;
   showLineNumbers?: boolean;
   /** Soft-wrap long lines instead of horizontal scrolling. */
   wrap?: boolean;
@@ -136,14 +165,14 @@ const tokensCache = new Map<string, TokenizedCode>();
 // Subscribers for async token updates
 const subscribers = new Map<string, Set<(result: TokenizedCode) => void>>();
 
-const getTokensCacheKey = (code: string, language: BundledLanguage) => {
+const getTokensCacheKey = (code: string, language: CodeLanguage) => {
   const start = code.slice(0, 100);
   const end = code.length > 100 ? code.slice(-100) : "";
   return `${language}:${code.length}:${start}:${end}`;
 };
 
 const getHighlighter = (
-  language: BundledLanguage,
+  language: CodeLanguage,
 ): Promise<HighlighterGeneric<BundledLanguage, BundledTheme>> => {
   const cached = highlighterCache.get(language);
   if (cached) {
@@ -182,7 +211,7 @@ const createRawTokens = (code: string): TokenizedCode => ({
 // Synchronous highlight with callback for async results
 export const highlightCode = (
   code: string,
-  language: BundledLanguage,
+  language: CodeLanguage,
   // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-callbacks)
   callback?: (result: TokenizedCode) => void,
 ): TokenizedCode | null => {
@@ -207,7 +236,9 @@ export const highlightCode = (
     // oxlint-disable-next-line eslint-plugin-promise(prefer-await-to-then)
     .then((highlighter) => {
       const availableLangs = highlighter.getLoadedLanguages();
-      const langToUse = availableLangs.includes(language) ? language : "text";
+      // Shiki's built-in `ansi` renders terminal colors but is never listed as loaded.
+      const langToUse =
+        language === "ansi" || availableLangs.includes(language) ? language : "text";
 
       const result = highlighter.codeToTokens(code, {
         lang: langToUse,
@@ -249,10 +280,12 @@ const CodeBlockBody = memo(
     tokenized,
     showLineNumbers,
     className,
+    colorScheme,
   }: {
     tokenized: TokenizedCode;
     showLineNumbers: boolean;
     className?: string;
+    colorScheme?: CodeColorScheme;
   }) => {
     const preStyle = useMemo(
       () => ({
@@ -267,7 +300,8 @@ const CodeBlockBody = memo(
     return (
       <pre
         className={cn(
-          "dark:!bg-[var(--shiki-dark-bg)] dark:!text-[var(--shiki-dark)] m-0 p-4 text-ui",
+          colorScheme === undefined && DARK_TOKEN_CLASSES,
+          "m-0 p-4 text-ui",
           className,
         )}
         style={preStyle}
@@ -279,7 +313,12 @@ const CodeBlockBody = memo(
           )}
         >
           {keyedLines.map((keyedLine) => (
-            <LineSpan key={keyedLine.key} keyedLine={keyedLine} showLineNumbers={showLineNumbers} />
+            <LineSpan
+              key={keyedLine.key}
+              keyedLine={keyedLine}
+              showLineNumbers={showLineNumbers}
+              colorScheme={colorScheme}
+            />
           ))}
         </code>
       </pre>
@@ -288,7 +327,8 @@ const CodeBlockBody = memo(
   (prevProps, nextProps) =>
     prevProps.tokenized === nextProps.tokenized &&
     prevProps.showLineNumbers === nextProps.showLineNumbers &&
-    prevProps.className === nextProps.className,
+    prevProps.className === nextProps.className &&
+    prevProps.colorScheme === nextProps.colorScheme,
 );
 
 CodeBlockBody.displayName = "CodeBlockBody";
@@ -361,15 +401,28 @@ export const CodeBlockContent = ({
   language,
   showLineNumbers = false,
   wrap = false,
+  className,
+  leading,
+  colorScheme,
 }: {
   code: string;
-  language: BundledLanguage;
+  language: CodeLanguage;
   showLineNumbers?: boolean;
   /** Soft-wrap long lines instead of horizontal scrolling. */
   wrap?: boolean;
+  /** Extra classes for the `<pre>`, e.g. to override its padding or background. */
+  className?: string;
+  /** Rendered before the code in the same box, e.g. a floated toolbar the first line wraps around. */
+  leading?: ReactNode;
+  /** Pin token colors to one scheme; by default they follow the app's. */
+  colorScheme?: CodeColorScheme;
 }) => {
   // Memoized raw tokens for immediate display
-  const rawTokens = useMemo(() => createRawTokens(code), [code]);
+  // Raw ANSI escapes would flash on screen until the highlighter loads.
+  const rawTokens = useMemo(
+    () => createRawTokens(language === "ansi" ? stripAnsi(code) : code),
+    [code, language],
+  );
 
   // Synchronous cache lookup — avoids setState in effect for cached results
   const syncTokens = useMemo(
@@ -408,10 +461,12 @@ export const CodeBlockContent = ({
       className="relative overflow-auto"
       data-code-highlighted={tokenized === rawTokens ? "false" : "true"}
     >
+      {leading}
       <CodeBlockBody
-        className={wrap ? "whitespace-pre-wrap wrap-anywhere" : undefined}
+        className={cn(wrap && "whitespace-pre-wrap wrap-anywhere", className)}
         showLineNumbers={showLineNumbers}
         tokenized={tokenized}
+        colorScheme={colorScheme}
       />
     </div>
   );

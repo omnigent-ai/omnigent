@@ -33,8 +33,8 @@ async def generate_background_title(context: BackgroundTitleContext) -> str | No
     from omnigent.runner.native.orchestration import _claude_terminal_env_unset
 
     try:
-        claude_config = resolve_native_claude_config(spec=None)
-    except Exception:  # noqa: BLE001 - match the native terminal's auth fallback
+        claude_config = await asyncio.to_thread(resolve_native_claude_config, spec=None)
+    except Exception:  # match the native terminal's auth fallback
         _logger.warning(
             "background Claude Code title could not resolve provider config; "
             "falling back to Claude Code's native login",

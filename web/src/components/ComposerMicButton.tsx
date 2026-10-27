@@ -207,17 +207,19 @@ export const ComposerMicButton = ({
       if (serverTakeOwnsState()) return;
       transitionRef.current = false;
       const err = (event as SpeechRecognitionErrorEventLike).error;
-      // "network" means the recognizer's cloud backend refused us —
-      // always the case in Electron/plain Chromium, occasionally a
-      // transient blip in real Chrome. Serve THIS take from the server
-      // instead; the next take tries Web Speech again.
-      if (err === "network" && serverAvailableRef.current && !disabledRef.current) {
+      // An unavailable or blocked speech service can still use client mic
+      // capture with server transcription. getUserMedia checks mic permission.
+      if (
+        (err === "network" || err === "service-not-allowed") &&
+        serverAvailableRef.current &&
+        !disabledRef.current
+      ) {
         setIsListening(false);
         void toggleServerRef.current();
         return;
       }
       // "no-speech" / "aborted" are routine (silence timeout, user stop).
-      if (err === "not-allowed" || err === "service-not-allowed") {
+      if (err === "not-allowed") {
         reportError("Microphone access denied. Allow access and try again.");
       } else if (err && err !== "no-speech" && err !== "aborted") {
         reportError("Voice input isn't available on this device.");
@@ -527,6 +529,7 @@ export const ComposerMicButton = ({
       aria-pressed={isListening}
       aria-busy={connecting}
       aria-label={a11yLabel}
+      data-server-dictation-available={serverAvailable}
       title={tooltip}
       className={cn(
         "size-9 md:size-8",

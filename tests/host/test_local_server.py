@@ -341,18 +341,20 @@ def test_ensure_local_omnigent_server_respawn_injects_persisted_base_path(
     assert env["OMNIGENT_WEB_BASE_PATH"] == "/proxy/6767"
 
 
+@pytest.mark.parametrize("features", ["usage_page", "-claude_osc_status"])
 def test_server_config_signature_changes_with_features(
     monkeypatch: pytest.MonkeyPatch,
+    features: str,
 ) -> None:
     """Changing the startup feature set forces a managed-server respawn."""
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
-    sig_off = local_server.server_config_signature()
+    default_signature = local_server.server_config_signature()
 
-    monkeypatch.setenv("OMNIGENT_FEATURES", "usage_page")
-    sig_on = local_server.server_config_signature()
+    monkeypatch.setenv("OMNIGENT_FEATURES", features)
+    overridden_signature = local_server.server_config_signature()
 
-    assert sig_off != sig_on
-    assert sig_on == local_server.server_config_signature()
+    assert default_signature != overridden_signature
+    assert overridden_signature == local_server.server_config_signature()
 
 
 def test_server_config_signature_changes_with_session_title_instructions(
@@ -486,10 +488,11 @@ def test_ensure_local_omnigent_server_spawns_when_none_healthy(
     assert env["DATABRICKS_CONFIG_PROFILE"] == "ambient"
 
 
+@pytest.mark.parametrize("entrypoint", ["module", "console", "runner"])
 def test_spawn_local_server_preserves_runtime_and_workspace(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, entrypoint: str
 ) -> None:
-    """Keep the selected runtime and workspace tools, cwd, and state paths."""
+    """Keep the selected runtime, cwd, and state paths without workspace imports."""
     workspace = tmp_path / "workspace"
     workspace.mkdir()
     (workspace / "workspace_tool_module.py").write_text("def echo(message):\n    return message\n")
@@ -521,7 +524,7 @@ def test_spawn_local_server_preserves_runtime_and_workspace(
     }
     probe_env.update(HOME=str(tmp_path), USERPROFILE=str(tmp_path))
     probe = textwrap.dedent("""\
-        import contextlib, io, json, os, runpy, sys
+        import contextlib, importlib.util, io, json, os, runpy, sys
 
         startup_path = list(sys.path)
         import omnigent
@@ -532,14 +535,23 @@ def test_spawn_local_server_preserves_runtime_and_workspace(
         with contextlib.redirect_stdout(io.StringIO()):
             try:
                 sys.argv = ["omnigent.cli", "--help"]
-                runpy.run_module("omnigent.cli", run_name="__main__")
+                if os.environ["OMNIGENT_TEST_ENTRYPOINT"] == "module":
+                    runpy.run_module("omnigent.cli", run_name="__main__")
+                elif os.environ["OMNIGENT_TEST_ENTRYPOINT"] == "runner":
+                    from omnigent.runner import _entry
+                    async def complete():
+                        pass
+                    _entry._run_tunnel_from_env = complete
+                    _entry.main()
+                else:
+                    from omnigent.cli import main
+                    main()
             except SystemExit as exc:
                 assert exc.code == 0, exc.code
 
-        import workspace_tool_module
-
         print(json.dumps(dict(
-            tool=workspace_tool_module.echo("ok"),
+            workspace_module_found=importlib.util.find_spec("workspace_tool_module") is not None,
+            dispatch_path=list(sys.path),
             safe_path=sys.flags.safe_path,
             startup_path=startup_path,
             cwd=os.getcwd(),
@@ -551,7 +563,7 @@ def test_spawn_local_server_preserves_runtime_and_workspace(
     result = subprocess.run(
         [*args[:module_index], "-c", probe],
         cwd=kwargs.get("cwd"),
-        env=probe_env,
+        env={**probe_env, "OMNIGENT_TEST_ENTRYPOINT": entrypoint},
         capture_output=True,
         text=True,
         check=True,
@@ -561,7 +573,11 @@ def test_spawn_local_server_preserves_runtime_and_workspace(
     assert "" not in observed["startup_path"]
     assert workspace.resolve() not in {Path(entry).resolve() for entry in observed["startup_path"]}
     assert observed["safe_path"] is True
-    assert observed["tool"] == "ok"
+    assert not observed["workspace_module_found"]
+    assert "" not in observed["dispatch_path"]
+    assert workspace.resolve() not in {
+        Path(entry).resolve() for entry in observed["dispatch_path"]
+    }
     assert Path(observed["runtime"]).resolve() == Path(omnigent.__file__).resolve()
     assert Path(observed["cwd"]) == workspace.resolve()
     assert Path(observed["config"]) == local_server.global_config_path()
@@ -1737,3 +1753,45 @@ def test_local_server_base_path_empty_when_no_local_server(
     monkeypatch.setattr(local_server, "_read_local_server_pid_file", lambda: None)
     monkeypatch.setenv("OMNIGENT_WEB_BASE_PATH", "/proxy/6767")
     assert local_server.local_server_base_path("http://127.0.0.1:6767") == ""
+
+
+def test_runtime_module_subprocesses_use_safe_import_paths() -> None:
+    """Keep every runtime Python module launch from adding its inherited cwd."""
+    import ast
+
+    import omnigent_client
+
+    violations = []
+    launches = 0
+    for package in (omnigent, omnigent_client):
+        root = Path(package.__file__).parent
+        for path in root.rglob("*.py"):
+            for node in ast.walk(ast.parse(path.read_text())):
+                if isinstance(node, (ast.List, ast.Tuple)):
+                    args = node.elts
+                elif isinstance(node, ast.Call):
+                    args = node.args
+                else:
+                    continue
+                for i, arg in enumerate(args):
+                    if not (
+                        isinstance(arg, ast.Attribute)
+                        and arg.attr == "executable"
+                        and isinstance(arg.value, ast.Name)
+                        and arg.value.id == "sys"
+                    ):
+                        continue
+                    options = []
+                    for option in args[i + 1 :]:
+                        if not isinstance(option, ast.Constant) or not isinstance(
+                            option.value, str
+                        ):
+                            break
+                        if option.value == "-m":
+                            launches += 1
+                            if not {"-P", "-I"}.intersection(options):
+                                violations.append(f"{path.relative_to(root)}:{arg.lineno}")
+                            break
+                        options.append(option.value)
+    assert launches > 0
+    assert violations == []

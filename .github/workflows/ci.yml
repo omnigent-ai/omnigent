@@ -51,11 +51,14 @@ jobs:
   # scan; trusted authors / non-PR events pass through.
   gate:
     uses: ./.github/workflows/security-gate.yml
+    permissions:
+      contents: read
+      pull-requests: read
 
   scope:
-    name: CI scope
+    name: CI coverage scope
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
       dependency: ${{ steps.scope.outputs.dependency }}
@@ -79,7 +82,8 @@ jobs:
     name: Pytest (${{ matrix.group }})
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.backend == 'true' }}
-    runs-on: ubuntu-latest
+    # coreutils on ubuntu-26.04 differs from what host env-wrapper tests compare against; keep 24.04 until tests are updated.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -90,7 +94,7 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -99,11 +103,25 @@ jobs:
         with:
           enable-cache: true
 
-      - name: Set up Node.js for local relay tests
-        if: matrix.group == 'misc'
+      - name: Set up Node.js for local relay and harness CLI tests
+        if: matrix.group == 'misc' || matrix.group == 'inner-rest'
         uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
+
+      # Tests that exercise a real harness CLI skip without it; install the
+      # pinned CLI only in the lanes that run them.
+      - name: Install Codex CLI
+        if: matrix.group == 'misc'
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
+        with:
+          harness: codex
+
+      - name: Install Pi CLI
+        if: matrix.group == 'inner-rest'
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
+        with:
+          harness: pi
 
       - name: Install test system dependencies
         # ripgrep: the Grep tool prefers it. bubblewrap: the linux_bwrap sandbox
@@ -127,7 +145,21 @@ jobs:
       - name: Install dependencies
         # matrix.extra (e.g. "databricks") adds an extra for lanes that need it;
         # empty for the default lanes.
-        run: uv sync --locked --extra all --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+        run: uv sync --locked --extra all --extra openshell --extra kubernetes --group test ${{ matrix.extra && format('--extra {0}', matrix.extra) || '' }}
+
+      - name: Check installed sandbox SDK consumers
+        if: matrix.group == 'server-rest'
+        run: |
+          uv run python - <<'PYTHON'
+          from openshell import ExecChunk, ExecResult, SandboxClient, SandboxError
+          from openshell._proto import openshell_pb2, openshell_pb2_grpc
+          from kubernetes import client, config
+          from kubernetes.stream import stream
+          from omnigent.onboarding.sandboxes import kubernetes, openshell
+
+          openshell._ensure_sdk()
+          kubernetes._ensure_sdk()
+          PYTHON
 
       - name: Run pytest
         shell: bash
@@ -175,7 +207,7 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-${{ matrix.group }}-${{ github.run_id }}
           # A retry must replace the failed attempt's partial coverage.
@@ -188,7 +220,7 @@ jobs:
     name: Pytest (stores-postgres)
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       postgres:
@@ -205,7 +237,7 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version-file: ".python-version"
       - uses: ./.github/actions/setup-uv
@@ -224,7 +256,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-postgres.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-stores-postgres-${{ github.run_id }}
           path: artifacts/
@@ -236,7 +268,7 @@ jobs:
     name: Pytest (stores-crdb-${{ matrix.crdb_version }})
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -247,7 +279,7 @@ jobs:
             crdb_port: 26323
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version-file: ".python-version"
       - uses: ./.github/actions/setup-uv
@@ -275,7 +307,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-crdb.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-stores-crdb-${{ matrix.crdb_version }}-${{ github.run_id }}
           path: artifacts/
@@ -285,7 +317,7 @@ jobs:
     name: Pytest (stores-mysql)
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.database == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
       mysql:
@@ -302,7 +334,7 @@ jobs:
           --health-retries 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97
         with:
           python-version-file: ".python-version"
       - uses: ./.github/actions/setup-uv
@@ -323,7 +355,7 @@ jobs:
             --timeout=300 \
             --junitxml=artifacts/pytest-stores-mysql.xml
       - if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9
         with:
           name: pytest-stores-mysql-${{ github.run_id }}
           path: artifacts/
@@ -333,7 +365,7 @@ jobs:
     name: Rust tests (omnidev)
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.omnidev == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
@@ -355,14 +387,14 @@ jobs:
     name: Pytest (codex-parity)
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.sidecar == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Check out repo
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -380,16 +412,13 @@ jobs:
         id: rustc
         run: echo "version=$(rustc --version | tr ' ' '-')" >> "$GITHUB_OUTPUT"
 
-      # The sidecar source is frozen and its deps are rev-pinned, so the binary is
-      # a pure function of sidecar/** + the toolchain. Cache the built binary (not
-      # the 1.6 GB target dir) and skip the ~3 min compile below on a hit; the key
-      # self-invalidates when the source, Cargo.lock, or rustc changes.
-      - name: Cache parity sidecar binary
+      # Cache compiled dependencies and test binaries, but execute tests on every run.
+      - name: Cache parity sidecar build
         id: sidecar-cache
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
-          path: .tmp-codex-parity-target/debug/codex-parity-sidecar
-          key: codex-parity-bin-locked-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
+          path: .tmp-codex-parity-target
+          key: codex-parity-tests-${{ runner.os }}-${{ steps.rustc.outputs.version }}-${{ hashFiles('tests/codex_parity/sidecar/**') }}
 
       - name: Set up pnpm
         # This job never runs pnpm install, so caching the (empty) pnpm store
@@ -399,7 +428,7 @@ jobs:
           cache: ""
 
       - name: Install codex CLI
-        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@395b8b175c17c1d8f393f82dddd15222c6200e74
+        uses: omnigent-ai/omnigent/.github/actions/setup-harness-cli@ae21cbfdc82bc8e97a7443aa07df2772ec127453
         with:
           harness: codex
 
@@ -411,6 +440,12 @@ jobs:
 
       - name: Install dependencies
         run: uv sync --locked --extra all --group test
+
+      - name: Test parity sidecar
+        run: |
+          cargo test --locked \
+            --manifest-path tests/codex_parity/sidecar/Cargo.toml \
+            --target-dir .tmp-codex-parity-target
 
       - name: Build parity sidecar
         if: steps.sidecar-cache.outputs.cache-hit != 'true'
@@ -437,7 +472,7 @@ jobs:
 
       - name: Upload pytest artifacts
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: pytest-codex-parity-${{ github.run_id }}
           path: artifacts/
@@ -447,7 +482,7 @@ jobs:
     name: CI result
     if: always()
     needs: [scope, pytest, stores-postgres, stores-cockroachdb, stores-mysql, omnidev, codex-parity]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require successful test selection
@@ -475,7 +510,7 @@ jobs:
     # and a red run gets re-run anyway, re-triggering this.
     needs: [pytest, scope]
     if: ${{ success() && !github.event.pull_request.draft && needs.scope.outputs.dependency != 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
       - name: Check out repo
@@ -484,7 +519,7 @@ jobs:
           persist-credentials: false
 
       - name: Set up Python
-        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97  # v7.0.0
         with:
           python-version-file: ".python-version"
 
@@ -492,7 +527,7 @@ jobs:
         run: pip install "coverage>=7"
 
       - name: Download shard coverage data
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c  # v8.0.1
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333  # v8.0.2
         with:
           pattern: pytest-*
           path: covdata
@@ -519,7 +554,7 @@ jobs:
 
       - name: Upload coverage summary
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9  # v7.0.2
         with:
           name: coverage-summary-${{ github.run_id }}
           # The status workflow must consume the recomputed summary on retries.

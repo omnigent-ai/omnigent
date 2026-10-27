@@ -47,14 +47,27 @@ const PERMISSION_MODE_CONCEPTS: Record<string, Record<string, PermissionModeConc
   },
 };
 
-const PERMISSION_HARNESS_ALIASES: Record<string, string> = {
+const NATIVE_HARNESS_ALIASES: Record<string, string> = {
   "native-claude": "claude-native",
   "native-codex": "codex-native",
+  "native-pi": "pi-native",
   "native-cursor": "cursor-native",
   "native-antigravity": "antigravity-native",
   "agy-native": "antigravity-native",
   "native-agy": "antigravity-native",
 };
+
+export function canonicalNativeHarness(harness: string): string {
+  return NATIVE_HARNESS_ALIASES[harness] ?? harness;
+}
+
+/** Canonical key used by host account metadata and login/logout routes. */
+export function harnessAccountKey(harness: string): string {
+  const canonical = canonicalNativeHarness(harness);
+  if (canonical.endsWith("-native")) return canonical.slice(0, -"-native".length);
+  if (canonical.startsWith("native-")) return canonical.slice("native-".length);
+  return canonical;
+}
 
 /** Shared permission concept for presentation across native harness vocabularies. */
 export function permissionModeConcept(
@@ -62,7 +75,7 @@ export function permissionModeConcept(
   value: string | null | undefined,
 ): PermissionModeConcept {
   if (!harness || !value) return "default";
-  const canonicalHarness = PERMISSION_HARNESS_ALIASES[harness] ?? harness;
+  const canonicalHarness = canonicalNativeHarness(harness);
   return PERMISSION_MODE_CONCEPTS[canonicalHarness]?.[value] ?? "default";
 }
 

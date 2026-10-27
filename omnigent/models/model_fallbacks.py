@@ -1,4 +1,4 @@
-"""Owned static model tables for Smart Routing and background titles.
+"""Owned static model tables for routing, background titles and Pi compatibility.
 
 Pre-launch picker listings carry no static stand-ins anymore — the live
 harness probes (see ``omnigent.host.connect``) are their source of truth.
@@ -22,6 +22,45 @@ class StaticModelFallback:
     owner: str
     provenance: str
     discovery_gap: str
+
+
+# The gateway catalog does not yet describe whether thinking can be disabled.
+PI_ANTHROPIC_THINKING_REQUIRED = StaticModelFallback(
+    model_ids=("claude-opus-5-5", "claude-sonnet-5-5", "claude-fable-5-1"),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Measured Databricks Anthropic endpoints rejecting thinking.type.disabled",
+    discovery_gap="model listings advertise reasoning but not the supported thinking levels",
+)
+
+
+# Custom providers do not inherit Pi's built-in per-model compatibility flags.
+# On Pi upgrades, refresh adaptive/budget entries from pi-ai/dist/providers/data/anthropic.json.
+# Keep the thinking-required list above limited to gateway-verified restrictions.
+PI_ANTHROPIC_ADAPTIVE_THINKING = StaticModelFallback(
+    model_ids=(
+        "claude-opus-5-5",
+        "claude-sonnet-5-5",
+        "claude-fable-5-1",
+        "claude-fable-5",
+        "claude-opus-4-6",
+        "claude-opus-4-7",
+        "claude-opus-4-8",
+        "claude-opus-5",
+        "claude-sonnet-4-6",
+        "claude-sonnet-5",
+    ),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Pi 1.0.4 Anthropic catalog forceAdaptiveThinking entries",
+    discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
+)
+
+
+PI_ANTHROPIC_BUDGET_THINKING = StaticModelFallback(
+    model_ids=("claude-haiku-4-5", "claude-opus-4-5", "claude-sonnet-4-5"),
+    owner="Pi model compatibility (omnigent.models.pi_model_compatibility)",
+    provenance="Pi 1.0.4 Anthropic catalog reasoning entries without forceAdaptiveThinking",
+    discovery_gap="gateway model listings do not advertise adaptive versus budget thinking",
+)
 
 
 #: Curated preference ORDER for codex's current arms — a ranking hint only
@@ -74,13 +113,13 @@ CODEX_DEFAULT_MODEL = _CODEX_LAUNCH_DEFAULT.model_ids[0]
 _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
     "claude_ladder": StaticModelFallback(
         model_ids=(
-            "databricks-claude-haiku-4-5",
-            "databricks-claude-sonnet-4-6",
-            "databricks-claude-sonnet-5",
-            "databricks-claude-opus-4-8",
+            "system.ai.claude-haiku-4-5",
+            "system.ai.claude-sonnet-4-6",
+            "system.ai.claude-sonnet-5",
+            "system.ai.claude-opus-4-8",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="Unity Gateway Claude serving endpoints, cheapest → most powerful",
+        provenance="Unity Catalog Claude model services, cheapest → most powerful",
         discovery_gap=(
             "the router picks before a session's live model catalog is reachable, "
             "and a gateway listing ranks models by neither cost nor capability"
@@ -88,13 +127,13 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
     ),
     "gpt_ladder": StaticModelFallback(
         model_ids=(
-            "databricks-gpt-5-4-nano",
-            "databricks-gpt-5-4-mini",
-            "databricks-gpt-5-4",
-            "databricks-gpt-5-5",
+            "system.ai.gpt-5-4-nano",
+            "system.ai.gpt-5-4-mini",
+            "system.ai.gpt-5-4",
+            "system.ai.gpt-5-5",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
-        provenance="Unity Gateway GPT serving endpoints, cheapest → most powerful",
+        provenance="Unity Catalog GPT model services, cheapest → most powerful",
         discovery_gap=(
             "the router picks before a session's live model catalog is reachable, "
             "and a gateway listing ranks models by neither cost nor capability"
@@ -102,14 +141,14 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
     ),
     "pi_ladder": StaticModelFallback(
         model_ids=(
-            "databricks-gpt-5-4-nano",
-            "databricks-claude-haiku-4-5",
-            "databricks-gpt-5-4-mini",
-            "databricks-claude-sonnet-4-6",
-            "databricks-claude-sonnet-5",
-            "databricks-gpt-5-4",
-            "databricks-gpt-5-5",
-            "databricks-claude-opus-4-8",
+            "system.ai.gpt-5-4-nano",
+            "system.ai.claude-haiku-4-5",
+            "system.ai.gpt-5-4-mini",
+            "system.ai.claude-sonnet-4-6",
+            "system.ai.claude-sonnet-5",
+            "system.ai.gpt-5-4",
+            "system.ai.gpt-5-5",
+            "system.ai.claude-opus-4-8",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
         provenance="the Claude and GPT ladders interleaved by cost, for multi-model pi",
@@ -120,9 +159,9 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
     ),
     "current_generation_gpt": StaticModelFallback(
         model_ids=(
-            "databricks-glm-5-2",
-            "databricks-gpt-5-6-luna",
-            "databricks-gpt-5-6-sol",
+            "system.ai.glm-5-2",
+            "system.ai.gpt-5-6-luna",
+            "system.ai.gpt-5-6-sol",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
         provenance="the external router's own current arms, offered so a pick keeps its endpoint",
@@ -151,12 +190,12 @@ _SMART_ROUTING_FALLBACKS: dict[str, StaticModelFallback] = {
     ),
     "pi_excluded": StaticModelFallback(
         model_ids=(
-            "databricks-claude-haiku-4-5",
-            "databricks-gpt-5-5",
-            "databricks-gpt-5-5-pro",
-            "databricks-gpt-5-6-luna",
-            "databricks-gpt-5-6-terra",
-            "databricks-gpt-5-6-sol",
+            "system.ai.claude-haiku-4-5",
+            "system.ai.gpt-5-5",
+            "system.ai.gpt-5-5-pro",
+            "system.ai.gpt-5-6-luna",
+            "system.ai.gpt-5-6-terra",
+            "system.ai.gpt-5-6-sol",
         ),
         owner="Smart Routing (omnigent.server.smart_routing)",
         provenance="probed: pi's own gateway 400s on each of these",

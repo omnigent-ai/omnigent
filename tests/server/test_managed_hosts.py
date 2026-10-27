@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import asyncio
 import datetime
+import logging
 import re
 import subprocess
 import sys
+import threading
 import types
 import uuid
 from collections.abc import Sequence
@@ -234,6 +236,52 @@ def test_parse_reaper_rejects_per_provider_override() -> None:
                     {"provider": "modal", "reaper": {"enabled": True}},
                     {"provider": "e2b"},
                 ],
+            }
+        )
+
+
+def test_parse_shutdown_drain_defaults_to_no_wait() -> None:
+    """A single replica has nowhere for an in-flight launch to bind, so shutdown doesn't wait."""
+    config = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    assert config is not None
+    assert config.shutdown_drain_s == 0.0
+
+
+@pytest.mark.parametrize("providers", [False, True])
+def test_parse_shutdown_drain_is_deployment_wide(providers: bool) -> None:
+    raw: dict[str, object] = {"server_url": "https://s.example.com", "shutdown_drain_s": 240}
+    if providers:
+        raw["providers"] = [{"provider": "modal"}, {"provider": "e2b"}]
+    else:
+        raw["provider"] = "modal"
+    config = parse_sandbox_config(raw)
+    assert config is not None
+    assert config.shutdown_drain_s == 240.0
+
+
+@pytest.mark.parametrize("value", [-1, True, "240s", float("inf"), float("nan"), 10**400])
+def test_parse_shutdown_drain_rejects_malformed_value(value: object) -> None:
+    with pytest.raises(ValueError, match=r"shutdown_drain_s.*non-negative"):
+        parse_sandbox_config(
+            {"provider": "modal", "server_url": "https://s.example.com", "shutdown_drain_s": value}
+        )
+
+
+@pytest.mark.parametrize("value", [-1.0, float("inf"), float("nan")])
+def test_directly_built_deployment_rejects_malformed_shutdown_drain(value: float) -> None:
+    """Embedders build the deployment in code, so it validates the drain itself."""
+    config = parse_sandbox_config({"provider": "modal", "server_url": "https://s.example.com"})
+    assert config is not None
+    with pytest.raises(ValueError, match=r"shutdown_drain_s.*non-negative"):
+        ManagedSandboxDeployment(configs=config.configs, shutdown_drain_s=value)
+
+
+def test_parse_shutdown_drain_rejects_per_provider_override() -> None:
+    with pytest.raises(ValueError, match="deployment-wide"):
+        parse_sandbox_config(
+            {
+                "server_url": "https://s.example.com",
+                "providers": [{"provider": "modal", "shutdown_drain_s": 240}],
             }
         )
 
@@ -711,6 +759,8 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
                 "env": ["OPENAI_API_KEY", "GIT_TOKEN"],
                 "cluster": "my-gateway",
                 "workspace": "team-alpha",
+                "node_selector": {"kata-install": "true"},
+                "runtime_class": "kata-containers",
             },
         }
     )
@@ -727,6 +777,8 @@ def test_parse_valid_openshell_config_builds_parameterized_factory(
     assert fake.env == ["OPENAI_API_KEY", "GIT_TOKEN"]
     assert fake.cluster == "my-gateway"
     assert fake.workspace == "team-alpha"
+    assert fake.node_selector == {"kata-install": "true"}
+    assert fake.runtime_class == "kata-containers"
 
 
 def test_parse_openshell_without_section_defaults(
@@ -4060,6 +4112,108 @@ async def test_terminate_managed_host_terminates_and_deletes_row(db_uri: str) ->
     )
 
 
+class _LogCapturingFakeLauncher(FakeSandboxLauncher):
+    """Fake launcher that records log captures in order with terminates."""
+
+    def __init__(
+        self,
+        *,
+        capture_error: Exception | None = None,
+        capture_blocks: threading.Event | None = None,
+    ) -> None:
+        super().__init__()
+        self.events: list[tuple[str, str]] = []
+        self._capture_error = capture_error
+        self._capture_blocks = capture_blocks
+
+    def capture_logs(self, sandbox_id: str) -> str | None:
+        self.events.append(("capture", sandbox_id))
+        if self._capture_blocks is not None:
+            self._capture_blocks.wait()
+        if self._capture_error is not None:
+            raise self._capture_error
+        return "## /tmp/omnigent-host.log\nhost exiting (fatal_connect)"
+
+    def terminate(self, sandbox_id: str) -> None:
+        self.events.append(("terminate", sandbox_id))
+        super().terminate(sandbox_id)
+
+
+def _register_capture_host(host_store: HostStore, host_id: str) -> Host:
+    return host_store.register_managed_host(
+        host_id=host_id,
+        name="managed-capture",
+        user_id=_OWNER,
+        token="tok-capture",
+        provider="modal",
+        sandbox_id="sb-capture",
+        token_expires_at=now_epoch() + 3600,
+    )
+
+
+async def test_terminate_managed_host_capture_logs_logs_before_terminating(
+    db_uri: str, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An opted-in teardown logs the sandbox's log tails, then terminates it."""
+    fake = _LogCapturingFakeLauncher()
+    host_store = HostStore(db_uri)
+    host = _register_capture_host(host_store, "0f7c1e9a2b3d4c5e8f9a0b1c2d3e4f5a")
+
+    with caplog.at_level(logging.ERROR, logger="omnigent.server.managed_hosts"):
+        await terminate_managed_host(host, host_store, _injected_config(fake), capture_logs=True)
+
+    assert fake.events == [("capture", "sb-capture"), ("terminate", "sb-capture")]
+    assert "Managed sandbox sb-capture logs before teardown" in caplog.text
+    assert "host exiting (fatal_connect)" in caplog.text
+    assert host_store.get_host(host.host_id) is None
+
+
+async def test_terminate_managed_host_skips_log_capture_by_default(db_uri: str) -> None:
+    """Teardown without ``capture_logs`` never reads the sandbox's logs."""
+    fake = _LogCapturingFakeLauncher()
+    host_store = HostStore(db_uri)
+    host = _register_capture_host(host_store, "1a2b3c4d5e6f40718293a4b5c6d7e8f9")
+
+    await terminate_managed_host(host, host_store, _injected_config(fake))
+
+    assert fake.events == [("terminate", "sb-capture")]
+
+
+async def test_terminate_managed_host_terminates_when_log_capture_fails(db_uri: str) -> None:
+    """A failed log read is only diagnostics; the sandbox is still terminated."""
+    fake = _LogCapturingFakeLauncher(capture_error=click.ClickException("exec failed"))
+    host_store = HostStore(db_uri)
+    host = _register_capture_host(host_store, "2b3c4d5e6f7a48129304b5c6d7e8f9a0")
+
+    await terminate_managed_host(host, host_store, _injected_config(fake), capture_logs=True)
+
+    assert fake.events == [("capture", "sb-capture"), ("terminate", "sb-capture")]
+    assert host_store.get_host(host.host_id) is None
+
+
+async def test_terminate_managed_host_terminates_when_log_capture_hangs(
+    db_uri: str, monkeypatch: pytest.MonkeyPatch, caplog: pytest.LogCaptureFixture
+) -> None:
+    """A capture that never returns times out and the sandbox is still terminated."""
+    monkeypatch.setattr("omnigent.server.managed_hosts.SANDBOX_LOG_CAPTURE_TIMEOUT_S", 0.05)
+    release = threading.Event()
+    fake = _LogCapturingFakeLauncher(capture_blocks=release)
+    host_store = HostStore(db_uri)
+    host = _register_capture_host(host_store, "4d5e6f7a8b9c40d1a2b3c4d5e6f7a8b9")
+
+    try:
+        with caplog.at_level(logging.WARNING, logger="omnigent.server.managed_hosts"):
+            await terminate_managed_host(
+                host, host_store, _injected_config(fake), capture_logs=True
+            )
+    finally:
+        release.set()
+
+    assert fake.events == [("capture", "sb-capture"), ("terminate", "sb-capture")]
+    assert "Timed out after 0.05s capturing logs from managed sandbox sb-capture" in caplog.text
+    assert host_store.get_host(host.host_id) is None
+
+
 async def test_terminate_managed_host_cleans_active_and_pending_generations(db_uri: str) -> None:
     """Full host teardown best-effort terminates both persisted sandbox ids."""
     fake = FakeSandboxLauncher()
@@ -4896,7 +5050,7 @@ async def test_kick_managed_relaunch_defers_the_classifier_to_the_launch_task(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="modal"),
         sandbox_config=SimpleNamespace(configs=()),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
@@ -4948,7 +5102,7 @@ async def test_relaunch_claim_and_launch_task_are_one_synchronous_step(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="modal"),
         sandbox_config=SimpleNamespace(configs=()),
         tracker=tracker,
         conversation_store=SimpleNamespace(),
@@ -4981,7 +5135,7 @@ async def test_kick_managed_relaunch_without_agent_store_threads_none(
     orchestration._kick_managed_relaunch(
         session_id="conv_1",
         conv=conv,
-        host=SimpleNamespace(user_id=_OWNER),
+        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="modal"),
         sandbox_config=SimpleNamespace(configs=()),
         tracker=ManagedLaunchTracker(),
         conversation_store=SimpleNamespace(),
@@ -5167,6 +5321,84 @@ async def test_kick_managed_wake_defers_the_classifier_to_the_wake_task(
     assert reads == [], "the kick must not read the agent store; the wake task does"
     assert captured["agent_store"] is store
     assert captured["agent_id"] == builtin.id
+
+
+async def test_relaunch_and_wake_seed_the_launch_status_with_the_host_provider(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """
+    A relaunch and a wake seed ``provisioning`` with the host's provider, so the
+    launch's stage rows name it even on a replica that never cached the launch.
+    """
+    from omnigent.server.routes._sessions import orchestration
+
+    async def _noop(**kwargs: object) -> None:
+        return None
+
+    published: list[tuple[str, str, str | None]] = []
+    monkeypatch.setattr(orchestration, "_run_managed_launch", _noop)
+    monkeypatch.setattr(orchestration, "_run_managed_wake", _noop)
+    monkeypatch.setattr(
+        orchestration,
+        "_publish_sandbox_status",
+        lambda session_id, stage, error=None, *, provider=None: published.append(
+            (session_id, stage, provider)
+        ),
+    )
+    shared = {
+        "sandbox_config": SimpleNamespace(configs=()),
+        "conversation_store": SimpleNamespace(),
+        "host_store": SimpleNamespace(),
+        "app_state": SimpleNamespace(agent_store=_StubAgentStore()),
+    }
+    before = set(orchestration._managed_launch_tasks)
+    orchestration._kick_managed_relaunch(
+        session_id="conv_relaunch",
+        conv=SimpleNamespace(labels={}, host_id="host_1", agent_id=None),
+        host=SimpleNamespace(user_id=_OWNER, sandbox_provider="arclet"),
+        tracker=ManagedLaunchTracker(),
+        **shared,
+    )
+    orchestration._kick_managed_wake_impl(
+        session_id="conv_wake",
+        conv=SimpleNamespace(labels={}, host_id="host_2", agent_id=None),
+        tracker=ManagedLaunchTracker(),
+        provider="arclet",
+        **shared,
+    )
+    await asyncio.gather(*(set(orchestration._managed_launch_tasks) - before))
+    assert published == [
+        ("conv_relaunch", "provisioning", "arclet"),
+        ("conv_wake", "provisioning", "arclet"),
+    ]
+
+
+def test_launch_stage_rows_name_the_provider(caplog: pytest.LogCaptureFixture) -> None:
+    """
+    Each launch-stage debug row names the provider, and later stages and a failure
+    keep the one the launch started with.
+    """
+    from omnigent.server.routes._sessions import helpers
+    from omnigent.server.routes._sessions.common import _session_sandbox_status_cache
+
+    session_id = "conv_provider_rows"
+    try:
+        with caplog.at_level(logging.INFO):
+            helpers._publish_sandbox_status_impl(session_id, "provisioning", provider="arclet")
+            helpers._publish_sandbox_status_impl(session_id, "starting")
+            helpers._publish_sandbox_status_impl(session_id, "failed", "host never connected")
+    finally:
+        _session_sandbox_status_cache.pop(session_id, None)
+    rows = [
+        (record.event_name, record.attributes)
+        for record in caplog.records
+        if getattr(record, "event_name", None) in {"sandbox_launch_stage", "sandbox_launch_failed"}
+    ]
+    assert rows == [
+        ("sandbox_launch_stage", {"stage": "provisioning", "provider": "arclet"}),
+        ("sandbox_launch_stage", {"stage": "starting", "provider": "arclet"}),
+        ("sandbox_launch_failed", {"stage": "starting", "provider": "arclet"}),
+    ]
 
 
 async def test_run_managed_wake_re_stamps_the_woken_runner(
