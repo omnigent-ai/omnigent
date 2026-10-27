@@ -5,9 +5,10 @@
 
 import type { MouseEvent } from "react";
 import { showToast } from "@/components/ui/toast";
-import { browserViewId } from "./browserTabs";
+import { AGENT_BROWSER_TAB_ID, browserViewId } from "./browserTabs";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
 import { isNativeShell, supportsBrowser } from "./nativeBridge";
+import { readSessionWorkspaceState } from "./sessionWorkspaceState";
 
 type OpenOrNavigate = (
   conversationId: string,
@@ -16,7 +17,15 @@ type OpenOrNavigate = (
   opts: { agent: boolean },
 ) => Promise<{ ok: boolean; error?: string }>;
 
+interface BrowserBridge {
+  browserOpenOrNavigate: OpenOrNavigate;
+  browserHasView?: (
+    viewId: string,
+  ) => Promise<{ exists: boolean; url?: string; pendingUrl?: string }>;
+}
+
 const listeners = new Set<(conversationId: string, tabId: string) => void>();
+const pendingLinks = new Set<string>();
 
 /** Subscribe to links the embedded browser accepted; returns an unsubscribe. */
 export function onInAppLinkOpen(
@@ -27,11 +36,30 @@ export function onInAppLinkOpen(
 }
 
 async function openInApp(conversationId: string, url: string): Promise<void> {
-  const bridge = (
-    window as unknown as { omnigentDesktop: { browserOpenOrNavigate: OpenOrNavigate } }
-  ).omnigentDesktop;
+  const bridge = (window as unknown as { omnigentDesktop: BrowserBridge }).omnigentDesktop;
   let error: string | undefined;
   try {
+    // The reserved agent view may navigate independently of the user's tabs.
+    const tabs = (readSessionWorkspaceState(conversationId).openBrowsers ?? []).filter(
+      (tabId) => tabId !== AGENT_BROWSER_TAB_ID,
+    );
+    if (bridge.browserHasView && tabs.length > 0) {
+      const probes = await Promise.allSettled(
+        tabs.map(async (tabId) => {
+          const view = await bridge.browserHasView!(browserViewId(conversationId, tabId));
+          const currentUrl = view.url && view.url !== "about:blank" ? view.url : view.pendingUrl;
+          return view.exists && currentUrl && parseHttpUrl(currentUrl)?.href === url ? tabId : null;
+        }),
+      );
+      const stillOpen = readSessionWorkspaceState(conversationId).openBrowsers ?? [];
+      const match = probes.find(
+        (probe) => probe.status === "fulfilled" && probe.value && stillOpen.includes(probe.value),
+      );
+      if (match?.status === "fulfilled" && match.value) {
+        for (const listener of listeners) listener(conversationId, match.value);
+        return;
+      }
+    }
     const tabId = crypto.randomUUID();
     // Chat and workspace-file links are agent- or repo-authored and the agent can
     // read the view, so they get the agent's navigation policy (no loopback/private
@@ -73,14 +101,18 @@ export function parseHttpUrl(href: string): URL | null {
 }
 
 /**
- * Open an http(s) `href` in a new in-app browser tab when the user
+ * Open an http(s) `href` in a matching or new in-app browser tab when the user
  * opted in. Returns true when routed (the caller cancels the default click).
  */
 export function maybeOpenLinkInApp(conversationId: string | undefined, href: string): boolean {
   if (!conversationId || !supportsBrowser() || !readOpenLinksInApp()) return false;
   const url = parseHttpUrl(href);
   if (!url) return false;
-  void openInApp(conversationId, url.toString());
+  const key = JSON.stringify([conversationId, url.href]);
+  if (!pendingLinks.has(key)) {
+    pendingLinks.add(key);
+    void openInApp(conversationId, url.href).finally(() => pendingLinks.delete(key));
+  }
   return true;
 }
 
@@ -94,7 +126,7 @@ export function maybeOpenLinkInApp(conversationId: string | undefined, href: str
  * In a native shell the default path is the
  * shell's window-open policy (external browser / system handlers) — except
  * when the user opted in to the in-app browser: plain and Cmd/Ctrl clicks open
- * new in-app tabs, while Shift-click opens externally. The web
+ * matching or new in-app tabs, while Shift-click opens externally. The web
  * popup fallback never runs natively: the shell's policy reports `null` from
  * window.open regardless, so it would navigate twice.
  */

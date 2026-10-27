@@ -1725,7 +1725,7 @@ function OpenLinksInAppControl() {
         labelId={labelId}
         descriptionId={descriptionId}
         className="flex-1"
-        description={`Open web links from chat in new in-app browser tabs. ${MOD_KEY}+click also opens a new in-app tab; Shift+click opens your default browser.`}
+        description={`Open web links from chat in in-app browser tabs, reusing a tab already showing the same URL. ${MOD_KEY}+click also opens in-app; Shift+click opens your default browser.`}
         descriptionClassName="text-ui"
       />
       <Switch

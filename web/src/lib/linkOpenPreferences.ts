@@ -1,4 +1,4 @@
-// Per-device preference: open chat links in new in-app browser tabs on desktop
+// Per-device preference: open chat links in in-app browser tabs on desktop
 // instead of the default external browser. Off by default.
 
 const STORAGE_KEY = "omnigent:open-links-in-app";

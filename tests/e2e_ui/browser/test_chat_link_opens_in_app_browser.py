@@ -17,6 +17,7 @@ from tests.e2e_ui.conftest import seed_committed_turn
 # Loopback, so a click that leaks to a real navigation never leaves the host.
 LINK_URL = "http://127.0.0.1:9/product-docs"
 SECOND_LINK_URL = "http://127.0.0.1:9/release-notes"
+THIRD_LINK_URL = "http://127.0.0.1:9/api-guide"
 
 _NOOP_SUBSCRIPTIONS = ", ".join(
     f"{name}: () => () => {{}}"
@@ -54,12 +55,15 @@ window.omnigentDesktop = {{
 
 
 def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[str, str]) -> None:
-    """Opted-in links open independent tabs; Shift-click keeps the external path."""
+    """Opted-in links reuse matching tabs; distinct URLs open independently."""
     base_url, session_id = seeded_session
     seed_committed_turn(
         session_id,
         prompt="links?",
-        reply=f"[Product docs]({LINK_URL}) and [Release notes]({SECOND_LINK_URL})",
+        reply=(
+            f"[Product docs]({LINK_URL}), [Release notes]({SECOND_LINK_URL}), "
+            f"and [API guide]({THIRD_LINK_URL})"
+        ),
     )
     page.add_init_script(_SHELL_STUB)
     page.goto(f"{base_url}/c/{session_id}")
@@ -97,11 +101,24 @@ def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[st
     expect(second_tab).to_have_attribute("aria-selected", "true")
     expect(first_tab).to_have_attribute("aria-selected", "false")
     expect(rail.get_by_placeholder("Enter a URL")).to_have_value(SECOND_LINK_URL)
-    first_tab.click()
-    expect(rail.get_by_placeholder("Enter a URL")).to_have_value(LINK_URL)
 
-    # Cmd/Ctrl-click also stays in the app and creates another independent view.
+    # Reopening the first URL selects its existing tab without reloading the page.
     link.click(modifiers=["ControlOrMeta"])
+    expect(first_tab).to_have_attribute("aria-selected", "true")
+    expect(second_tab).to_have_attribute("aria-selected", "false")
+    expect(rail.get_by_role("tab", name=re.compile(r"^Browser"))).to_have_count(2)
+    expect(rail.get_by_placeholder("Enter a URL")).to_have_value(LINK_URL)
+    assert page.evaluate("window.__calls.length") == 2
+
+    second_tab.click()
+    link.click()
+    expect(first_tab).to_have_attribute("aria-selected", "true")
+    expect(rail.get_by_role("tab", name=re.compile(r"^Browser"))).to_have_count(2)
+    expect(rail.get_by_placeholder("Enter a URL")).to_have_value(LINK_URL)
+    assert page.evaluate("window.__calls.length") == 2
+
+    # Cmd/Ctrl-click on a distinct URL opens another independent view.
+    page.get_by_role("link", name="API guide", exact=True).click(modifiers=["ControlOrMeta"])
     page.wait_for_function("window.__calls.length === 3")
     third_view = page.evaluate("window.__calls[2].conversationId")
     expect(rail.get_by_role("tab", name="Browser 3", exact=True)).to_have_attribute(
@@ -115,7 +132,7 @@ def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[st
     assert page.evaluate("window.__views") == {
         first_view: LINK_URL,
         second_view: SECOND_LINK_URL,
-        third_view: LINK_URL,
+        third_view: THIRD_LINK_URL,
     }
 
     with page.context.expect_page() as popup:
