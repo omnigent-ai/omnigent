@@ -3622,13 +3622,11 @@ async def _execute_session_create(
                 headers=headers,
                 timeout=_SESSION_CREATE_TIMEOUT if placement == "child" else 30.0,
             )
-    except httpx.TimeoutException as exc:
-        if placement != "child" and create_requested:
-            return json.dumps(unconfirmed_creation)
-        return _session_create_timeout_error(exc)
     except Exception as exc:  # noqa: BLE001
         if placement != "child" and create_requested:
             return json.dumps(unconfirmed_creation)
+        if placement == "child" and isinstance(exc, httpx.TimeoutException):
+            return _session_create_timeout_error(exc)
         return json.dumps(
             {"error": f"sys_session_create failed: {str(exc) or type(exc).__name__}"}
         )

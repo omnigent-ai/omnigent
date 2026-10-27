@@ -8358,6 +8358,18 @@ async def test_sys_session_create_requires_exactly_one_mode(
             id="connect-timeout",
         ),
         pytest.param(
+            httpx.WriteTimeout(""),
+            "sys_session_create timed out after 240 s (WriteTimeout): "
+            "the request did not complete, so no child was created by it.",
+            id="write-timeout",
+        ),
+        pytest.param(
+            httpx.PoolTimeout(""),
+            "sys_session_create timed out after 240 s (PoolTimeout): "
+            "the request did not complete, so no child was created by it.",
+            id="pool-timeout",
+        ),
+        pytest.param(
             RuntimeError(""),
             "sys_session_create failed: RuntimeError",
             id="empty-error",
@@ -8407,6 +8419,31 @@ async def test_sys_session_create_reports_post_error(
         "write": 240.0,
         "pool": 240.0,
     }
+
+
+@pytest.mark.asyncio
+async def test_sys_session_create_managed_preflight_timeout_is_not_a_create() -> None:
+    """A failed preflight never implies a child or independent session was created."""
+    from omnigent.runner.tool_dispatch import _execute_session_create
+
+    requests: list[httpx.Request] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(request)
+        raise httpx.ReadTimeout("preflight unavailable", request=request)
+
+    async with httpx.AsyncClient(
+        transport=httpx.MockTransport(handler), base_url="http://server"
+    ) as client:
+        output = await _execute_session_create(
+            {"agent_id": "worker", "placement": "managed"},
+            server_client=client,
+            conversation_id="caller",
+            publish_event=None,
+        )
+
+    assert json.loads(output) == {"error": "sys_session_create failed: preflight unavailable"}
+    assert [(request.method, request.url.path) for request in requests] == [("GET", "/v1/info")]
 
 
 def _parse_multipart_create(request: httpx.Request) -> dict[str, Any]:
