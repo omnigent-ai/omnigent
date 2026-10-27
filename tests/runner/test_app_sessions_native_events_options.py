@@ -2516,7 +2516,8 @@ async def _post_model_change_through_a_boot(
 
 def _injection_deadline() -> float | None:
     """The instant the bridge call running now stops sending keys at, if bound."""
-    flag = claude_native_bridge._INJECTION_CANCEL_EVENT.get()
+    attempt = claude_native_bridge._INJECTION_ATTEMPT.get()
+    flag = attempt.cancelled if attempt is not None else None
     return flag.at if isinstance(flag, native_controls._ClaudeControlDeadline) else None
 
 

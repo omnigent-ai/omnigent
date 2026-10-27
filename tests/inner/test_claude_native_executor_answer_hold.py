@@ -56,8 +56,8 @@ class _Pane:
             return True
         return False
 
-    def kill_session(self, bridge_dir: Path, *, timeout_s: float) -> None:
-        del bridge_dir, timeout_s
+    def reap_failed_turn(self, *observed: object) -> None:
+        del observed
         self.kills += 1
 
 
@@ -72,7 +72,11 @@ def pane(monkeypatch: pytest.MonkeyPatch) -> _Pane:
         fake.has_pending_user_prompt,
         raising=False,
     )
-    monkeypatch.setattr(claude_native_executor, "kill_session", fake.kill_session)
+    monkeypatch.setattr(
+        ClaudeNativeExecutor,
+        "_reap_failed_turn",
+        lambda _executor, *observed: fake.reap_failed_turn(*observed),
+    )
     monkeypatch.setattr(claude_native_executor, "_ANSWER_POLL_S", 0.0, raising=False)
     return fake
 
