@@ -356,7 +356,7 @@ function withoutCode(text: string): string {
       kept.push(line);
     } else if (HTML_BLOCK_START.test(content)) {
       if (!content.startsWith("<!--")) htmlBlockEnd = "blank line";
-      else if (!content.includes("-->", 4)) htmlBlockEnd = "-->";
+      else if (!content.includes("-->", 2)) htmlBlockEnd = "-->";
       kept.push(line);
     } else if (spansClear) {
       const { text: withoutSpans, clear } = withoutCodeSpans(line);
@@ -419,12 +419,13 @@ function hidesInHtmlBlock(text: string): boolean {
 }
 
 // `text` without its closed `<!-- -->` comments, which markdown hides; linear in its length.
+// As in markdown, `<!-->` and `<!--->` close at once.
 function withoutHtmlComments(text: string): string {
   let kept = "";
   let position = 0;
   for (;;) {
     const open = text.indexOf("<!--", position);
-    const close = open < 0 ? -1 : text.indexOf("-->", open + 4);
+    const close = open < 0 ? -1 : text.indexOf("-->", open + 2);
     if (close < 0) return kept + text.slice(position);
     kept += text.slice(position, open);
     position = close + 3;
