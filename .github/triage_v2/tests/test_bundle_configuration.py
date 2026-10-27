@@ -56,6 +56,7 @@ def test_v2_mirrors_priority_onto_linked_prs() -> None:
     assert "needs: prioritize" in sync
     assert "if: inputs.apply && vars.ISSUE_PRIORITIZATION_V2_ENABLED == 'true'" in sync
     assert "ISSUE_NUMBER: ${{ inputs.issue_number }}" in sync
+    assert "pull-requests: write" in sync
     assert "pull-requests" not in grading
     # A called workflow cannot exceed its caller's token, so a caller without
     # this grant fails every V2 run at startup.

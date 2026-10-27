@@ -4,10 +4,8 @@ name: Sync PR Priority
 # Only closing links (closes/fixes/resolves #n) count -- a plain "related to
 # #n" mention is ignored. Runs on PR events and re-syncs when an issue's labels
 # change. Uses only default-branch code and never checks out or executes PR
-# files; it edits labels through the API.
-#
-# Issue triage's own labels (written with GITHUB_TOKEN) never trigger this, so
-# issue-prioritization-v2.yml runs the same script after labeling.
+# files; it edits labels through the API. Labels set via GITHUB_TOKEN never
+# trigger this, so issue-prioritization-v2.yml syncs the ones it sets.
 
 on:
   # No `synchronize`: priority is derived from the linked issue's label and the
