@@ -315,16 +315,31 @@ const REFERENCE_DEFINITION = new RegExp(
   "m",
 );
 
-// Drops closed fences, and code spans outside HTML blocks; from an unclear fence, keeps the rest.
+// Drops closed fences, the comments markdown hides, and code spans outside HTML blocks; from an
+// unclear fence, keeps the rest.
 function withoutCode(text: string): string {
   const lines = text.split("\n");
   const kept: string[] = [];
   let fence: { start: number; indent: string; marker: string } | null = null;
   // What ends the HTML block in progress, in which fences and code spans are raw HTML.
   let htmlBlockEnd: "blank line" | "-->" | null = null;
+  // Where a comment opening an unindented line began; markdown hides it, blank lines too, to `-->`.
+  let commentStart: number | null = null;
   // Whether the paragraph so far leaves no code span or HTML tag open.
   let spansClear = true;
   for (const [index, line] of lines.entries()) {
+    if (commentStart !== null) {
+      const close = line.indexOf("-->");
+      if (close < 0) {
+        kept.push(line);
+        continue;
+      }
+      kept.length = commentStart;
+      kept.push(withoutHtmlComments(line.slice(close + 3)));
+      commentStart = null;
+      htmlBlockEnd = null;
+      continue;
+    }
     const content = line.replace(CONTAINER_PREFIX, "");
     const fenceLike = /^(?:`{3}|~{3})/.test(content);
     const [, indent = "", marker = "", info = ""] = PLAIN_FENCE.exec(line) ?? [];
@@ -353,11 +368,12 @@ function withoutCode(text: string): string {
       kept.push(line);
     } else if (htmlBlockEnd !== null) {
       if (htmlBlockEnd === "-->" ? line.includes("-->") : line.trim() === "") htmlBlockEnd = null;
-      kept.push(line);
+      kept.push(htmlBlockEnd === "blank line" ? withoutHtmlComments(line) : line);
     } else if (HTML_BLOCK_START.test(content)) {
       if (!content.startsWith("<!--")) htmlBlockEnd = "blank line";
       else if (!content.includes("-->", 2)) htmlBlockEnd = "-->";
-      kept.push(line);
+      if (htmlBlockEnd === "-->" && line.startsWith("<!--")) commentStart = kept.length;
+      kept.push(withoutHtmlComments(line));
     } else if (spansClear) {
       const { text: withoutSpans, clear } = withoutCodeSpans(line);
       kept.push(withoutSpans);
@@ -370,16 +386,24 @@ function withoutCode(text: string): string {
   return kept.join("\n");
 }
 
-// `line` without its code spans, read left to right as markdown does. From an HTML tag, a link
-// target that may hold a backtick or tag, or a backtick run with no partner on the line, the
-// rest stays and `clear` is false.
+// `line` without its code spans and closed comments, read left to right as markdown does. From
+// an HTML tag or open comment, a link target that may hold a backtick or tag, or a backtick run
+// with no partner on the line, the rest stays and `clear` is false.
 function withoutCodeSpans(line: string): { text: string; clear: boolean } {
-  const special = /\\|<[A-Za-z/!?]|\]\(|`+/g;
+  const special = /\\|<!--|<[A-Za-z/!?]|\]\(|`+/g;
   let text = "";
   let position = 0;
   for (let match = special.exec(line); match !== null; match = special.exec(line)) {
     if (match[0] === "\\") {
       special.lastIndex = match.index + 2;
+      continue;
+    }
+    if (match[0] === "<!--") {
+      const close = line.indexOf("-->", match.index + 2);
+      if (close < 0) return { text: text + line.slice(position), clear: false };
+      text += line.slice(position, match.index);
+      position = close + 3;
+      special.lastIndex = position;
       continue;
     }
     if (match[0] === "](") {
@@ -418,16 +442,16 @@ function hidesInHtmlBlock(text: string): boolean {
   return false;
 }
 
-// `text` without its closed `<!-- -->` comments, which markdown hides; linear in its length.
+// A raw HTML `line` without the comments that close on it; linear in its length.
 // As in markdown, `<!-->` and `<!--->` close at once.
-function withoutHtmlComments(text: string): string {
+function withoutHtmlComments(line: string): string {
   let kept = "";
   let position = 0;
   for (;;) {
-    const open = text.indexOf("<!--", position);
-    const close = open < 0 ? -1 : text.indexOf("-->", open + 2);
-    if (close < 0) return kept + text.slice(position);
-    kept += text.slice(position, open);
+    const open = line.indexOf("<!--", position);
+    const close = open < 0 ? -1 : line.indexOf("-->", open + 2);
+    if (close < 0) return kept + line.slice(position);
+    kept += line.slice(position, open);
     position = close + 3;
   }
 }
@@ -454,10 +478,10 @@ export function isProseText(text: string, key?: string): boolean {
   if (!keyWords.some((word) => hasKeyWord(PROSE_KEY_WORDS, word))) return false;
   if (keyWords.some((word) => hasKeyWord(CODE_KEY_WORDS, word))) return false;
   if (isPathologicalText(text) || looksLikeData(text)) return false;
-  // Fenced and inline code render literally as markdown too, so only the rest is checked.
-  const outsideCode = withoutHtmlComments(withoutCode(text));
+  // Code renders literally and closed comments render as nothing, so only the rest is checked.
+  const outsideCode = withoutCode(text);
   const markup = outsideCode.replace(GITHUB_BODY_TAG, "");
-  // A markup tag, an unclosed `<!--`, `<?`, `<![CDATA[` or `<!X`, or a raw HTML block hides text.
+  // A markup tag, a `<!--` that may stay open, `<?`, `<![CDATA[`, `<!X` or an HTML block hide text.
   if (MARKUP_TAG.test(markup) || /<[?!]/.test(markup) || hidesInHtmlBlock(outsideCode)) {
     return false;
   }
