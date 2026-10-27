@@ -1,4 +1,4 @@
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { createPortal } from "react-dom";
 import { StrictMode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -6,6 +6,7 @@ import type { ReactNode } from "react";
 import type { ComposerMicButtonProps } from "@/components/ComposerMicButton";
 import { toast } from "sonner";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { writeAlwaysSteer } from "@/lib/alwaysSteerPreferences";
 import * as filesApi from "@/lib/filesApi";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import { FALLBACK_SERVER_INFO } from "@/lib/capabilities";
@@ -788,7 +789,7 @@ describe("side-chat interrupt", () => {
     expect(useChatStore.getState().activeResponse?.responseId).toBe("resp_main");
   });
 
-  it("interrupts only the child, coalesces clicks, and preserves the unsent draft", async () => {
+  it("interrupts only the child, coalesces repeats, and preserves the unsent draft", async () => {
     let finishInterrupt: ((result: sessionsApi.PostEventResponse) => void) | undefined;
     vi.mocked(sessionsApi.interrupt).mockImplementationOnce(
       () =>
@@ -799,14 +800,14 @@ describe("side-chat interrupt", () => {
     useChatStore.setState({ sessionStatus: "running" });
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
-    fireEvent.change(input, { target: { value: "Keep this follow-up" } });
-    fireEvent.keyDown(input, { key: "Enter" });
     const interrupt = screen.getByRole("button", { name: "Interrupt side chat" });
     fireEvent.click(interrupt);
     fireEvent.click(interrupt);
+    expect(interrupt).toBeDisabled();
+    fireEvent.change(input, { target: { value: "Keep this follow-up" } });
+    fireEvent.keyDown(input, { key: "Escape" });
 
     expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, "codex_turn_side");
-    expect(interrupt).toBeDisabled();
     expect(input).toHaveValue("Keep this follow-up");
     expect(send).not.toHaveBeenCalled();
     expect(useChatStore.getState().sessionStatus).toBe("running");
@@ -823,23 +824,194 @@ describe("side-chat interrupt", () => {
     expect(useChatStore.getState().sessionStatus).toBe("running");
   });
 
+  it("interrupts from Escape and keeps the draft", () => {
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Keep this draft" } });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(sessionsApi.interrupt).toHaveBeenCalledExactlyOnceWith(childId, "codex_turn_side");
+    expect(send).not.toHaveBeenCalled();
+    expect(input).toHaveValue("Keep this draft");
+  });
+
+  it("steers a follow-up into the running side chat when Always steer is on", () => {
+    writeAlwaysSteer(true);
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Steer this side answer" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      "Steer this side answer",
+      "agent_side",
+      undefined,
+      expect.objectContaining({ pinnedConversationId: childId }),
+    );
+    expect(input).toHaveValue("");
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+  });
+
   it("reports a failed interrupt and allows retry without clearing the draft", async () => {
     vi.mocked(sessionsApi.interrupt).mockRejectedValueOnce(new Error("Host unavailable"));
     renderPane(<SideChatPane childId={childId} />);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Keep this draft" } });
-    fireEvent.click(screen.getByRole("button", { name: "Interrupt side chat" }));
+    fireEvent.keyDown(input, { key: "Escape" });
 
     await waitFor(() => expect(toast.error).toHaveBeenCalledOnce());
     expect(toast.error).toHaveBeenCalledWith(expect.stringMatching(/interrupt.*try again/i));
-    const interrupt = screen.getByRole("button", { name: "Interrupt side chat" });
-    await waitFor(() => expect(interrupt).toBeEnabled());
+    await act(async () => {});
     expect(input).toHaveValue("Keep this draft");
     expect(send).not.toHaveBeenCalled();
 
-    fireEvent.click(interrupt);
+    fireEvent.keyDown(input, { key: "Escape" });
     await waitFor(() => expect(sessionsApi.interrupt).toHaveBeenCalledTimes(2));
     expect(sessionsApi.interrupt).toHaveBeenLastCalledWith(childId, "codex_turn_side");
+  });
+
+  it("queues a follow-up while the side chat runs and sends it when the turn ends", async () => {
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    expect(screen.queryByTestId("side-chat-send")).toBeNull();
+    fireEvent.change(input, { target: { value: "Also check the tests" } });
+    expect(screen.queryByTestId("side-chat-interrupt")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+
+    expect(send).not.toHaveBeenCalled();
+    expect(input).toHaveValue("");
+    expect(screen.getByRole("list", { name: "Queued messages" })).toHaveTextContent(
+      "Also check the tests",
+    );
+    expect(screen.getByRole("button", { name: "Interrupt side chat" })).toBeEnabled();
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ conversationId: childId, agentId: "agent_side" }),
+    ]);
+
+    act(() => conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" }));
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith(
+      "Also check the tests",
+      "agent_side",
+      undefined,
+      expect.objectContaining({ pinnedConversationId: childId }),
+    );
+    expect(screen.queryByRole("list", { name: "Queued messages" })).toBeNull();
+  });
+
+  it("drains a queued follow-up after its side-chat tab unmounts", async () => {
+    const view = renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Send after I switch tabs" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    view.unmount();
+    expect(send).not.toHaveBeenCalled();
+
+    conversationRegistry.acquire(childId).setState({ sessionStatus: "idle" });
+    await waitFor(() => expect(send).toHaveBeenCalledOnce());
+    expect(send).toHaveBeenCalledWith(
+      "Send after I switch tabs",
+      "agent_side",
+      undefined,
+      expect.objectContaining({ pinnedConversationId: childId }),
+    );
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("edits, steers, and steers all queued follow-ups like the main composer", () => {
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    for (const text of ["first", "second", "third"]) {
+      fireEvent.change(input, { target: { value: text } });
+      fireEvent.keyDown(input, { key: "Enter" });
+    }
+    const rows = () => screen.getAllByRole("listitem");
+    expect(rows().map((row) => row.textContent)).toEqual(["first", "second", "third"]);
+
+    fireEvent.click(within(rows()[2]!).getByRole("button", { name: "Edit queued message" }));
+    expect(input).toHaveValue("third");
+    fireEvent.click(within(rows()[0]!).getByRole("button", { name: "Send queued message now" }));
+    expect(send).toHaveBeenCalledExactlyOnceWith(
+      "first",
+      "agent_side",
+      undefined,
+      expect.objectContaining({ pinnedConversationId: childId }),
+    );
+
+    fireEvent.keyDown(input, { key: "Enter", ctrlKey: true });
+    expect(send.mock.calls.map(([text]) => text)).toEqual(["first", "second", "third"]);
+    expect(input).toHaveValue("");
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("restores a queued follow-up's quote when it is edited", () => {
+    useChatStore.setState({
+      sideChatComposers: {
+        [childId]: {
+          text: "Follow up",
+          files: [],
+          quotes: [{ id: "quote", before: "Earlier answer", text: "Quoted passage" }],
+        },
+      },
+    });
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.keyDown(input, { key: "Enter" });
+    expect(screen.queryByRole("textbox", { name: "Reply text before quote 1" })).toBeNull();
+
+    fireEvent.click(screen.getByRole("button", { name: "Edit queued message" }));
+    expect(screen.getByRole("textbox", { name: "Reply text before quote 1" })).toHaveValue(
+      "Earlier answer",
+    );
+    expect(useChatStore.getState().sideChatComposers[childId]).toEqual({
+      text: "Follow up",
+      files: [],
+      quotes: [expect.objectContaining({ before: "Earlier answer", text: "Quoted passage" })],
+    });
+    expect(input).toHaveValue("Follow up");
+    expect(useChatStore.getState().queuedMessages).toEqual([]);
+  });
+
+  it("queues /compact for a running Codex side chat with Always steer off", () => {
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "/compact" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
+    expect(useChatStore.getState().queuedMessages).toEqual([
+      expect.objectContaining({ text: "/compact", command: "compact", conversationId: childId }),
+    ]);
+  });
+
+  it("keeps a /compact draft that a running Codex side chat refuses to steer", () => {
+    writeAlwaysSteer(true);
+    renderPane(<SideChatPane childId={childId} />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "/compact" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith(
+      "Compact is disabled while a chat is in progress",
+      { richColors: true },
+    );
+    expect(input).toHaveValue("/compact");
+  });
+
+  it("keeps a running grid session's draft until its turn ends", () => {
+    renderPane(<SideChatPane childId={childId} fullSession />);
+    const input = screen.getByTestId("side-chat-input");
+    fireEvent.change(input, { target: { value: "Wait for this turn" } });
+    fireEvent.keyDown(input, { key: "Enter" });
+    fireEvent.keyDown(input, { key: "Escape" });
+
+    expect(send).not.toHaveBeenCalled();
+    expect(sessionsApi.interrupt).not.toHaveBeenCalled();
+    expect(input).toHaveValue("Wait for this turn");
+    expect(screen.queryByTestId("side-chat-send")).toBeNull();
+    expect(screen.getByRole("button", { name: "Interrupt session" })).toBeEnabled();
   });
 
   it.each([
@@ -1066,20 +1238,23 @@ describe("side-chat slash commands", () => {
     expect(sendSlashCommand).not.toHaveBeenCalled();
   });
 
-  it("routes a known skill through the slash_command path on an in-process harness", () => {
-    conversationRegistry
-      .acquire(childId)
-      .setState({ sessionHarness: "claude-sdk", sessionStatus: "idle" });
-    skillsFixture.current = { skills: [review], skillsStatus: "ready" };
-    renderPane(<SideChatPane childId={childId} />);
-    typeSlash("/review 123");
-    fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
-    expect(sendSlashCommand).toHaveBeenCalledExactlyOnceWith("review", "123", "agent_side", {
-      pinnedConversationId: childId,
-    });
-    expect(send).not.toHaveBeenCalled();
-    expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
-  });
+  it.each(["idle", "running"] as const)(
+    "routes a known skill through the slash_command path on an in-process harness (%s)",
+    (sessionStatus) => {
+      conversationRegistry
+        .acquire(childId)
+        .setState({ sessionHarness: "claude-sdk", sessionStatus });
+      skillsFixture.current = { skills: [review], skillsStatus: "ready" };
+      renderPane(<SideChatPane childId={childId} />);
+      typeSlash("/review 123");
+      fireEvent.click(screen.getByRole("button", { name: "Send side question" }));
+      expect(sendSlashCommand).toHaveBeenCalledExactlyOnceWith("review", "123", "agent_side", {
+        pinnedConversationId: childId,
+      });
+      expect(send).not.toHaveBeenCalled();
+      expect(useChatStore.getState().sideChatComposers[childId]).toBeUndefined();
+    },
+  );
 
   it("prefers a multi-word skill over a built-in matching only its first word", () => {
     conversationRegistry

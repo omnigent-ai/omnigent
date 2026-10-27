@@ -809,6 +809,30 @@ _LOGIN_PROBE_CACHE_TTL_S = 120.0
 _PROBE_CACHE_MAX_ENTRIES = 64
 
 
+def _cli_probe_cwd() -> str | None:
+    """Return a stable cwd for a harness CLI probe, or ``None`` to inherit it.
+
+    A long-lived daemon can outlive the directory it was started from (a temp
+    checkout or a removed git worktree). A probe subprocess inherits that
+    deleted cwd, where ``claude`` exits non-zero, so a present CLI reads as
+    unavailable. Return ``None`` while the cwd is intact; once it is gone, fall
+    back to the home directory, else the filesystem root.
+    """
+    try:
+        os.getcwd()
+        return None
+    except OSError:
+        pass
+    try:
+        # Path.home() raises RuntimeError, not OSError, when HOME is unset.
+        home = Path.home()
+        if home.is_dir():
+            return str(home)
+    except (OSError, RuntimeError):
+        pass
+    return os.path.abspath(os.sep)
+
+
 def invalidate_harness_probe_caches() -> None:
     """Force fresh CLI version and login probes after refresh or installation."""
     with _PROBE_CACHE_LOCK:
@@ -1002,6 +1026,12 @@ def _harness_cli_version_string(
     :param timeout: Seconds to wait for the ``--version`` subprocess, e.g.
         :data:`READINESS_CLI_PROBE_TIMEOUT_S` on the readiness path.
     """
+    probe_cwd = _cli_probe_cwd()
+    if probe_cwd is not None and not os.path.isabs(binary):
+        # The daemon's starting cwd is gone, so the probe would run under a
+        # fallback dir; a relative discovered path re-resolves there to a
+        # different executable, so report unverifiable instead of probing it.
+        return None
     sig = _binary_signature(binary)
     if sig is not None:
         with _PROBE_CACHE_LOCK:
@@ -1016,6 +1046,7 @@ def _harness_cli_version_string(
             text=True,
             timeout=timeout,
             check=False,
+            cwd=probe_cwd,
         )
     except (OSError, subprocess.SubprocessError):
         return None
@@ -1202,6 +1233,12 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     binary = resolve_cli_binary(spec.binary) if key == GEMINI_FAMILY else shutil.which(spec.binary)
     if binary is None:
         return False
+    probe_cwd = _cli_probe_cwd()
+    if probe_cwd is not None and not os.path.isabs(binary):
+        # The daemon's starting cwd is gone, so the probe would run under a
+        # fallback dir; a relative discovered path re-resolves there to a
+        # different executable, so report not-logged-in instead of probing it.
+        return False
     # Positive verdicts are TTL-cached (see the cache block above): logins
     # are sticky, and the readiness loop re-probing a logged-in CLI every
     # refresh is the ambient storm. Negatives always re-probe so a login
@@ -1210,16 +1247,16 @@ def harness_cli_logged_in(key: str, timeout: float = _DEFAULT_CLI_PROBE_TIMEOUT_
     with _PROBE_CACHE_LOCK:
         if time.monotonic() < _LOGIN_PROBE_CACHE.get(cache_key, 0.0):
             return True
-    argv_binary = binary if key == GEMINI_FAMILY else spec.binary
     try:
         result = subprocess.run(
-            [argv_binary, *spec.status_args],
+            [binary, *spec.status_args],
             check=False,
             timeout=timeout,
             # Concurrent probes must not change or restore a shared terminal's input mode.
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
+            cwd=probe_cwd,
         )
     except (OSError, subprocess.TimeoutExpired):
         return False

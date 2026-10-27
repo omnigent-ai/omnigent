@@ -5204,6 +5204,7 @@ async def test_relay_dedupes_duplicate_error_persistence_but_forwards_live_frame
                 "exception_cause_type": "FileNotFoundError",
                 "native_launch_os_errno": 2,
                 "native_launch_os_errno_name": "ENOENT",
+                "native_launch_code_origin": "omnigent.runner.native.orchestration.launch:42",
                 "origin": "forged",
                 "exception_message": "private launch path",
             },
@@ -5289,6 +5290,7 @@ async def test_native_dispatch_fast_fails_and_consumes_message_on_terminal_error
         assert record.attributes["exception_cause_type"] == "FileNotFoundError"
         assert record.attributes["native_launch_os_errno"] == "2"
         assert record.attributes["native_launch_os_errno_name"] == "ENOENT"
+        assert record.attributes["native_launch_code_origin"].endswith(".launch:42")
         assert "private launch path" not in str(record.attributes)
     else:
         assert "failure_id" not in record.attributes
@@ -6742,7 +6744,10 @@ async def test_claude_native_reformatted_mirror_never_brands_later_messages_unde
 
 
 @pytest.mark.asyncio
-async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
+@pytest.mark.parametrize("with_context", [False, True])
+async def test_native_dispatch_reports_malformed_runner_error_body(
+    caplog: pytest.LogCaptureFixture, with_context: bool
+) -> None:
     """Opaque framework 500 bodies become explicit ensure errors.
 
     If the runner/tunnel returns a plain ``Internal Server Error`` body
@@ -6756,11 +6761,25 @@ async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
     store = _ConversationStore()
     conv = store.get_conversation("64a784c3aa907d1774f44313546947c6")
     assert conv is not None
+    response_text = "Internal Server Error"
+    if with_context:
+        response_text = json.dumps(
+            {
+                "error": "runner_request_failed",
+                "failure_context": {
+                    "failure_id": "err_opaque_startup",
+                    "failure_source": "runner_request",
+                    "exception_type": "RuntimeError",
+                    "native_launch_code_origin": "omnigent.runner.native.orchestration.launch:42",
+                    "origin": "forged",
+                },
+            }
+        )
     client = _FakeRunnerClient(
         text_responses={
             "/v1/sessions/64a784c3aa907d1774f44313546947c6/resources/terminals": (
                 500,
-                "Internal Server Error",
+                response_text,
                 {"content-type": "text/plain"},
             )
         }
@@ -6793,6 +6812,15 @@ async def test_native_dispatch_reports_malformed_runner_error_body() -> None:
         errors[0].data.message
         == "Native Claude terminal ensure failed with malformed runner response (HTTP 500)."
     )
+    [record] = [
+        r for r in caplog.records if getattr(r, "event_name", None) == "session_turn_failed"
+    ]
+    assert record.attributes["origin"] == "native_terminal_boot_failed"
+    if with_context:
+        assert record.attributes["failure_id"] == "err_opaque_startup"
+        assert record.attributes["native_launch_code_origin"].endswith(".launch:42")
+    else:
+        assert "failure_id" not in record.attributes
 
 
 @pytest.mark.asyncio

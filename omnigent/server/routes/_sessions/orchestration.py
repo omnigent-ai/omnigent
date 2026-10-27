@@ -3412,8 +3412,16 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
     """Retain an identity-linked runner lifecycle edge on its queued web input."""
     event_type = event.get("type")
     stage = _NATIVE_INPUT_LIFECYCLE_STAGES.get(event_type) if isinstance(event_type, str) else None
-    stable_id = input_attributes(event).get("input_stable_id")
-    if stage is None or not isinstance(stable_id, str):
+    identity = input_attributes(event)
+    if any(
+        key in event and key not in identity
+        for key in ("input_stable_id", "pending_id", "delivery_attempt_id")
+    ):
+        return
+    stable_id = identity.get("input_stable_id")
+    pending_id = identity.get("pending_id")
+    delivery_attempt_id = identity.get("delivery_attempt_id")
+    if stage is None:
         return
     raw_response = event.get("response")
     response_id = raw_response.get("id") if isinstance(raw_response, dict) else None
@@ -3426,7 +3434,11 @@ def _record_native_input_lifecycle(session_id: str, event: Mapping[str, Any]) ->
         cause_class = "interrupted_or_lifecycle"
     pending_inputs.mark_lifecycle(
         session_id,
-        stable_id,
+        stable_id if isinstance(stable_id, str) else None,
+        pending_id=pending_id if isinstance(pending_id, str) else None,
+        delivery_attempt_id=(
+            delivery_attempt_id if isinstance(delivery_attempt_id, str) else None
+        ),
         stage=stage,
         cause_class=cause_class,
         reason_code=_native_input_reason_code(event),
@@ -7705,6 +7717,17 @@ async def _dispatch_session_event_to_runner(*args: Any, **kwargs: Any) -> Any:
         return await _facade._dispatch_session_event_to_runner(*args, **kwargs)
 
 
+def _codex_side_chat_thread_id(conv: Conversation) -> str | None:
+    """Return the parent app-server thread that runs a Codex child's turns, if forwardable."""
+    from omnigent.server.routes._sessions.common import (
+        _CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY,
+    )
+
+    if not _is_codex_native_subagent(conv) or not conv.parent_conversation_id:
+        return None
+    return (conv.labels or {}).get(_CODEX_NATIVE_SUBAGENT_THREAD_ID_LABEL_KEY) or None
+
+
 async def _forward_codex_side_chat_turn(
     conv: Conversation,
     body: SessionEventInput,
@@ -7878,7 +7901,7 @@ async def _dispatch_session_event_to_runner_impl(
         await asyncio.to_thread(runner_router.require_mcp_registry_support, conv)
     if body.type == "message":
         disconnect_outcome.note_user_turn(conv.id)
-    if body.type == "message" and conv.kind == "sub_agent" and _is_codex_native_subagent(conv):
+    if body.type == "message" and _codex_side_chat_thread_id(conv) is not None:
         # Codex /side follow-up: drive the child on its own Codex thread via the
         # parent's runner/bridge; do not persist AP-side (the forwarder mirrors
         # the child thread echo, staying the single writer).

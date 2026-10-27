@@ -1745,6 +1745,10 @@ def _handle_loop_exception(
     callback = getattr(handle, "_callback", None)
     while isinstance(callback, functools.partial):
         callback = callback.func
+    # Callback failures carry a Handle, but usually omit the receiver Future.
+    callback_future = getattr(callback, "__self__", None)
+    if future is None and isinstance(callback_future, asyncio.Future):
+        future = callback_future
     coroutine = future.get_coro() if isinstance(future, asyncio.Task) else None
     extra = debug_event(
         "runner_async_failure",

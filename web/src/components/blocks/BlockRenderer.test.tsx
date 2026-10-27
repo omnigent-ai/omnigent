@@ -8,6 +8,7 @@ import { fileURLToPath } from "node:url";
 import type { ReactNode } from "react";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { MemoryRouter } from "react-router-dom";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type { RenderItem } from "@/lib/renderItems";
 import { ConversationScrollLockContext } from "@/components/ai-elements/conversation";
@@ -502,45 +503,56 @@ describe("BlockRenderer dispatch", () => {
     expect(sections[1]!).not.toHaveClass("mt-2");
   });
 
-  it("labels the fold with only the hidden count while the tail streams", () => {
-    // The most-recent tools render as a visible tail OUTSIDE the fold, so
-    // the fold line describes only what's hidden ("Called 2 tools") — a
-    // whole-run count would double-count the tool cards visible below.
-    const tool = (n: number): RenderItem => ({
-      kind: "tool",
-      itemId: `fc_${n}`,
-      execution: {
-        name: `tool_${n}`,
-        arguments: {},
-        argsSummary: "",
-        callId: `c_${n}`,
-        agentName: "nessie",
-        executedBy: "server",
+  it.each([false, true])(
+    "labels the fold with only the hidden count while the tail streams (notice after = %s)",
+    (noticeAfter) => {
+      // The most-recent tools render as a visible tail OUTSIDE the fold, so
+      // the fold line describes only what's hidden ("Called 2 tools") — a
+      // whole-run count would double-count the tool cards visible below.
+      // A sub-agent notice landing after the run doesn't end that live edge.
+      const tool = (n: number): RenderItem => ({
+        kind: "tool",
+        itemId: `fc_${n}`,
+        execution: {
+          name: `tool_${n}`,
+          arguments: {},
+          argsSummary: "",
+          callId: `c_${n}`,
+          agentName: "nessie",
+          executedBy: "server",
+          output: "ok",
+        },
         output: "ok",
-      },
-      output: "ok",
-      state: "output-available",
-      startedAt: null,
-      duration: undefined,
-    });
-    const items: RenderItem[] = [
-      { kind: "text", itemId: "m0", text: "Dispatching.", final: true },
-      tool(1),
-      tool(2),
-      tool(3),
-      tool(4),
-      tool(5),
-    ];
-    render(<BlockRenderer items={items} sessionStatus="running" />);
-    expect(screen.getByText("Called 2 tools")).toBeDefined();
-    expect(screen.queryByText("Called 5 tools")).toBeNull();
-    // The recent tools must be visible as a tail OUTSIDE the collapsed
-    // group — the most-recent tool renders (the collapsed group's content
-    // is unmounted), while an older one stays folded. Guards against a
-    // regression that folds everything.
-    expect(screen.getByText(/tool_5/)).toBeDefined();
-    expect(screen.queryByText(/tool_1/)).toBeNull();
-  });
+        state: "output-available",
+        startedAt: null,
+        duration: undefined,
+      });
+      const items: RenderItem[] = [
+        { kind: "text", itemId: "m0", text: "Dispatching.", final: true },
+        tool(1),
+        tool(2),
+        tool(3),
+        tool(4),
+        tool(5),
+        ...(noticeAfter
+          ? [{ kind: "subagent_activity", itemId: "n1", data: {} } satisfies RenderItem]
+          : []),
+      ];
+      render(
+        <MemoryRouter>
+          <BlockRenderer items={items} sessionStatus="running" />
+        </MemoryRouter>,
+      );
+      expect(screen.getByText("Called 2 tools")).toBeDefined();
+      expect(screen.queryByText("Called 5 tools")).toBeNull();
+      // The recent tools must be visible as a tail OUTSIDE the collapsed
+      // group — the most-recent tool renders (the collapsed group's content
+      // is unmounted), while an older one stays folded. Guards against a
+      // regression that folds everything.
+      expect(screen.getByText(/tool_5/)).toBeDefined();
+      expect(screen.queryByText(/tool_1/)).toBeNull();
+    },
+  );
 
   describe("settled-turn process fold (Worked row)", () => {
     const tool = (n: number, name = `tool_${n}`): RenderItem => ({
@@ -1341,6 +1353,170 @@ describe("BlockRenderer dispatch", () => {
       fireEvent.click(screen.getByText("Worked for 42s"));
       expect(screen.getByText("Dispatching two sub-agents.")).toBeDefined();
       expect(screen.getByText("Called 2 tools")).toBeDefined();
+    });
+
+    describe("sub-agent notices", () => {
+      const notice = (itemId: string, phase: "delegated" | "returned"): RenderItem => ({
+        kind: "subagent_activity",
+        itemId,
+        data: {
+          type: "resource_event",
+          event_type: `session.subagent.${phase}`,
+          resource_type: "session",
+          resource_id: "conv_child",
+          resource: { title: "Peirce" },
+        },
+      });
+      const text = (itemId: string, value: string): RenderItem => ({
+        kind: "text",
+        itemId,
+        text: value,
+        final: true,
+      });
+      const renderTurn = (items: RenderItem[], continued = false) =>
+        render(
+          <MemoryRouter>
+            <BlockRenderer items={items} sessionStatus="idle" continued={continued} />
+          </MemoryRouter>,
+        );
+      const noticeLabels = () =>
+        screen.queryAllByTestId("subagent-activity").map((node) => node.textContent);
+
+      it("folds mid-turn notices into the work around them", () => {
+        renderTurn([
+          tool(1, "spawn_agent"),
+          notice("n1", "delegated"),
+          tool(2, "wait"),
+          notice("n2", "returned"),
+          text("m1", "Peirce finished the recording."),
+        ]);
+        expect(screen.getByText("Peirce finished the recording.")).toBeDefined();
+        expect(noticeLabels()).toEqual([]);
+
+        fireEvent.click(screen.getByRole("button", { name: "Worked" }));
+        expect(noticeLabels()).toEqual(["Started Peirce", "Completed Peirce"]);
+      });
+
+      it.each([false, true])(
+        "shows trailing notices only until the turn continues (continued = %s)",
+        (continued) => {
+          renderTurn(
+            [text("m1", "Starting Peirce."), tool(1, "spawn_agent"), notice("n1", "delegated")],
+            continued,
+          );
+          expect(screen.getAllByRole("button", { name: "Worked" })).toHaveLength(1);
+          expect(noticeLabels()).toEqual(continued ? [] : ["Started Peirce"]);
+        },
+      );
+
+      it.each([
+        {
+          shape: "between two messages",
+          continued: false,
+          items: [
+            tool(1, "spawn_agent"),
+            text("m1", "Peirce is recording."),
+            notice("n1", "returned"),
+            text("m2", "Peirce finished."),
+          ],
+          labels: ["Completed Peirce"],
+        },
+        {
+          shape: "before a wake marker",
+          continued: true,
+          items: [
+            tool(1, "spawn_agent"),
+            notice("n1", "delegated"),
+            text("m1", "Waiting on Peirce."),
+            notice("n2", "returned"),
+            {
+              kind: "reasoning",
+              itemId: null,
+              text: "Reading the result.",
+              duration: 2,
+            } satisfies RenderItem,
+          ],
+          labels: ["Started Peirce", "Completed Peirce"],
+        },
+        {
+          shape: "opening a woken response",
+          continued: false,
+          items: [
+            notice("n1", "returned"),
+            text("m1", "Peirce reported back."),
+            tool(1, "Bash"),
+            text("m2", "The clip checks out."),
+          ],
+          labels: ["Completed Peirce"],
+        },
+      ])("folds a notice run into the nearest work, $shape", ({ continued, items, labels }) => {
+        render(
+          <MemoryRouter>
+            <BlockRenderer
+              items={items}
+              sessionStatus="idle"
+              continued={continued}
+              workedForS={42}
+            />
+          </MemoryRouter>,
+        );
+        expect(noticeLabels()).toEqual([]);
+        // One timed row: the notices add no row of their own.
+        fireEvent.click(screen.getByRole("button", { name: "Worked for 42s" }));
+        expect(noticeLabels()).toEqual(labels);
+      });
+
+      it("keeps notices visible in a turn with no work to fold them into", () => {
+        renderTurn([
+          text("m1", "Peirce is recording."),
+          notice("n1", "returned"),
+          text("m2", "Peirce finished."),
+        ]);
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
+      });
+
+      it("keeps a terminal error unfolded when a notice lands after it", () => {
+        renderTurn([
+          text("m0", "Trying the build."),
+          tool(1, "Bash"),
+          { kind: "error", itemId: "err_1", source: "", code: "server_error", message: "Failed." },
+          notice("n1", "returned"),
+        ]);
+        expect(screen.queryByTestId("turn-worked-fold")).toBeNull();
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
+      });
+
+      it("streams a woken lead's unnamed output after its settled fold", () => {
+        const settled = [tool(1, "spawn_agent"), text("m1", "Waiting on Peirce.")];
+        // A native bubble's lifecycle always reads completed; only the session status moves.
+        const view = (items: RenderItem[], sessionStatus: "idle" | "running") => (
+          <MemoryRouter>
+            <BlockRenderer
+              items={items}
+              sessionStatus={sessionStatus}
+              turnLifecycle="completed"
+              isLastAssistant
+            />
+          </MemoryRouter>
+        );
+        const { rerender } = render(view(settled, "idle"));
+        expect(screen.getByRole("button", { name: "Worked" })).toBeDefined();
+        // The result wakes the lead, whose first reasoning has no committed item yet.
+        const reasoning: RenderItem = {
+          kind: "reasoning",
+          itemId: null,
+          text: "Reading Peirce's result.",
+          duration: undefined,
+        };
+        rerender(view([...settled, notice("n1", "returned"), reasoning], "running"));
+        expect(screen.getByRole("button", { name: "Worked" })).toHaveAttribute(
+          "aria-expanded",
+          "false",
+        );
+        expect(noticeLabels()).toEqual(["Completed Peirce"]);
+        expect(screen.getByText("Reading Peirce's result.")).toBeDefined();
+      });
     });
 
     it("never folds the last assistant bubble while the session is running", async () => {

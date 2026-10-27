@@ -275,7 +275,7 @@ def _resolve_extension_state(
     # Distribution metadata is an external installation boundary. Preserve the
     # rest of the server if global discovery itself fails before per-plugin
     # failure isolation can apply.
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         _logger.warning("could not discover installed extensions (%s)", exc, exc_info=True)
         return ExtensionPluginState(manifests=(), load_errors={"registry": str(exc)})
 
@@ -294,7 +294,7 @@ def _resolve_extension_assets(
                 ", ".join(sorted(overrides)),
             )
         return build_asset_index(state, overrides=overrides)
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001
         _logger.warning("could not build extension asset index (%s)", exc, exc_info=True)
         return {}, {"registry": str(exc)}
 
@@ -971,7 +971,7 @@ def _ensure_default_agents(
     """
     Register all built-in agents that should always be available.
 
-    Called on every server lifespan startup. Each helper is
+    Called during server startup. Each helper is
     content-aware via :func:`_ensure_builtin_agent`: it creates the
     agent if missing and refreshes it in place when the packaged
     bundle changed, so a redeploy picks up a new spec instead of
@@ -1221,7 +1221,7 @@ def _ensure_default_acp_agents(
 
         configured = list(acp_agents())
         shadowed: frozenset[str] = shadowed_builtin_acp_rows(configured)
-    except Exception:  # a malformed acp: block must never break startup
+    except Exception:  # a malformed acp: block must never break startup  # noqa: BLE001
         _logger.debug("acp agent seeding skipped (config unreadable)", exc_info=True)
         configured = []
         shadowed = frozenset()
@@ -1411,6 +1411,7 @@ def create_app(
     base_path: str | None = None,
     host_sharded: bool = False,
     *,
+    default_agents_seeded: bool = False,
     preference_store: PreferenceStore | None = None,
     preference_policy: PreferencePolicy = DEFAULT_PREFERENCE_POLICY,
     scheduled_task_dispatch: ScheduledTaskDispatchHooks | None = None,
@@ -1431,6 +1432,8 @@ def create_app(
         file content).
     :param agent_cache: Cache for loaded agent specs and working
         directories.
+    :param default_agents_seeded: The CLI already refreshed built-ins before
+        registering explicit agent bundles; skip a second refresh at startup.
     :param runner_tunnel_tokens: Optional allow-list of binding
         tokens accepted by the runner WebSocket tunnel route, e.g.
         ``frozenset({"uA6Zz..."})``. ``None`` accepts any
@@ -1858,7 +1861,8 @@ def create_app(
         # SessionFilesystemRegistry moved to the runner. Both
         # warmup blocks deleted here.
 
-        _ensure_default_agents(agent_store, artifact_store, agent_cache)
+        if not default_agents_seeded:
+            _ensure_default_agents(agent_store, artifact_store, agent_cache)
 
         # Populate the policy registry (builtins + user-configured
         # modules) so GET /v1/policy-registry serves the catalog.
@@ -3511,7 +3515,7 @@ def create_app(
             try:
                 await asyncio.to_thread(permission_store.ensure_user, user_id)
                 await asyncio.to_thread(promote_if_listed, admin_list, permission_store, user_id)
-            except Exception:
+            except Exception:  # noqa: BLE001
                 _logger.warning("Could not promote listed admin %s", user_id, exc_info=True)
         # Still report the list, so admin chrome shows even if promotion failed.
         return {"user_id": user_id, "is_admin": flagged or listed}
@@ -3954,7 +3958,7 @@ def create_app(
             return own
         try:
             return await asyncio.to_thread(routing_host_id, convs[0], conversation_store)
-        except Exception:  # an unreadable ancestor leaves the host unknown
+        except Exception:  # an unreadable ancestor leaves the host unknown  # noqa: BLE001
             _logger.warning("Host lookup failed for session=%s", convs[0].id, exc_info=True)
             return None
 

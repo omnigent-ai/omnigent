@@ -13,8 +13,9 @@
 //    routing/fan-out cards never fold regardless of position.
 //
 // 2. Turn folding: once settled, each work run collapses behind a
-//    "Worked" row. Pending elicitations, routing cards and assistant
-//    messages stay visible (all but the last with opt-in `foldNarration`).
+//    "Worked" row, sub-agent notices included. Pending elicitations,
+//    routing cards, the newest notices and assistant messages stay
+//    visible (all but the last message with opt-in `foldNarration`).
 
 import type { ReactNode } from "react";
 import { useContext, useEffect, useLayoutEffect, useRef, useState } from "react";
@@ -31,6 +32,7 @@ import { ElicitationCard } from "./ApprovalCard";
 import { ReasoningView } from "./ReasoningView";
 import { SlashCommandCard } from "./SlashCommandCard";
 import { SmartRoutingCard } from "./SmartRoutingCard";
+import { SubagentActivityMessage } from "./SubagentActivityMessage";
 import { TerminalCommandCard } from "./TerminalCommandCard";
 import { ErrorBanner, PolicyDeniedBanner, RetryIndicator } from "./StatusBlocks";
 import { ToolCard, ToolGroupSummary } from "./ToolCard";
@@ -172,10 +174,12 @@ function foldsNarration({
 /** Work folds after an assistant message or in a tool-bearing continuation. */
 function hasFoldableShape(
   items: RenderItem[],
-  { segments }: TurnPartition,
+  { segments, latest }: TurnPartition,
   continued = false,
 ): boolean {
-  const lastItem = items.findLast((item) => !isTrailingWrapup(item));
+  const lastItem = items
+    .slice(0, latest?.startIndex)
+    .findLast((item) => !isTrailingWrapup(item) && item.kind !== "subagent_activity");
   // A terminal failure or denial must stay visible beside the assistant text.
   if (isFailureItem(lastItem)) return false;
   return (
@@ -192,10 +196,11 @@ export function rendersOnlyWorkedFold(inputs: FoldInputs): boolean {
   if (inputs.defaultExpanded) return false;
   const { isOwnTurnLive, possiblyLive } = turnLiveness(inputs);
   if (isOwnTurnLive || possiblyLive) return false;
-  const partition = partitionTurn(inputs.items, foldsNarration(inputs));
+  const partition = partitionTurn(inputs.items, foldsNarration(inputs), inputs.continued);
   return (
     hasFoldableShape(inputs.items, partition, inputs.continued) &&
-    partition.segments.every((segment) => segment.kind === "work")
+    partition.segments.every((segment) => segment.kind === "work") &&
+    partition.latest === null
   );
 }
 
@@ -235,7 +240,11 @@ export function BlockRenderer({
   // A native assistant message has no reliable final-answer marker.
   // Keep each message visible even when a later tool call follows it,
   // unless the user opted into folding all but the last message.
-  const partition = partitionTurn(items, foldsNarration({ items, turnLifecycle, foldNarration }));
+  const partition = partitionTurn(
+    items,
+    foldsNarration({ items, turnLifecycle, foldNarration }),
+    continued,
+  );
   const workRunCount = partition.segments.filter((segment) => segment.kind === "work").length;
   // Once the fold has SHOWN on a settled bubble, possibly-live no
   // longer reopens it. A scheduled wake (a /loop cron or wakeup
@@ -334,6 +343,18 @@ export function BlockRenderer({
         </TurnWorkedFold>,
       );
     }
+    // A woken lead's output streams here, after the fold that has shown,
+    // until committed work moves it into the new response's own bubble.
+    if (partition.latest) {
+      rendered.push(
+        ...renderSequence(partition.latest.items, {
+          liveEdge: isTurnLive,
+          suppressReasoningDuration: showsWorking,
+          indexBase: partition.latest.startIndex,
+          onRetryError,
+        }),
+      );
+    }
     return rendered;
   }
 
@@ -362,7 +383,7 @@ function renderSequence(
   // reasoning is the very last item in the bubble. Mirrors the
   // `streamingRunStart` rule for tool runs: the trailing live edge stays
   // expanded; once anything else lands after it, it collapses.
-  const lastIdx = items.length - 1;
+  const lastIdx = lastWorkIndex(items);
   const reasoningStreamingIdx =
     liveEdge && lastIdx >= 0 && items[lastIdx]!.kind === "reasoning" ? lastIdx : -1;
 
@@ -435,6 +456,8 @@ interface TurnSequenceOptions {
 
 interface TurnPartition {
   segments: TurnSegment[];
+  /** The turn's latest news, shown after the fold (see `latestNewsStart`). */
+  latest: { items: RenderItem[]; startIndex: number } | null;
 }
 
 type TurnSegment =
@@ -455,41 +478,93 @@ function isTrailingWrapup(item: RenderItem): boolean {
  * reliable final-answer marker, so every completed message stays visible
  * unless `foldNarration` asks to keep only the last one.
  */
-function partitionTurn(items: RenderItem[], foldNarration = false): TurnPartition {
-  let end = items.length;
+function partitionTurn(
+  items: RenderItem[],
+  foldNarration = false,
+  continued = false,
+): TurnPartition {
+  const latestStart = continued ? items.length : latestNewsStart(items);
+  const settled = items.slice(0, latestStart);
+  let end = settled.length;
   const wrapup: RenderItem[] = [];
-  while (end > 0 && isTrailingWrapup(items[end - 1]!)) {
-    wrapup.unshift(items[end - 1]!);
+  while (end > 0 && isTrailingWrapup(settled[end - 1]!)) {
+    wrapup.unshift(settled[end - 1]!);
     end -= 1;
   }
   // Keep the last non-blank message visible, even in a continued bubble.
   const answerIndex = foldNarration
-    ? items.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
+    ? settled.findLastIndex((item) => item.kind === "text" && item.text.trim() !== "")
     : -1;
-  const segments: TurnSegment[] = [];
+  const built: TurnSegment[] = [];
   for (let i = 0; i < end; i += 1) {
-    const item = items[i]!;
+    const item = settled[i]!;
     if (
       isPendingElicitation(item) ||
       isPersistentToolCard(item) ||
       isInProgressTool(item) ||
       isSlashCommandCard(item)
     ) {
-      segments.push({ kind: "exempt", item, index: i });
+      built.push({ kind: "exempt", item, index: i });
       continue;
     }
     // Blank text after the answer stays with it rather than opening a second fold.
     const kind = item.kind === "text" && (answerIndex < 0 || i >= answerIndex) ? "text" : "work";
-    const previous = segments[segments.length - 1];
+    const previous = built[built.length - 1];
     if (previous?.kind === kind) previous.items.push(item);
-    else segments.push({ kind, items: [item], startIndex: i });
+    else built.push({ kind, items: [item], startIndex: i });
   }
+  const segments = foldNoticeRuns(built);
   if (wrapup.length > 0) {
     const lastWork = segments.findLast((segment) => segment.kind === "work");
     if (lastWork?.kind === "work") lastWork.items.push(...wrapup);
     else segments.push({ kind: "work", items: wrapup, startIndex: end });
   }
-  return { segments };
+  const latest =
+    latestStart < items.length
+      ? { items: items.slice(latestStart), startIndex: latestStart }
+      : null;
+  return { segments, latest };
+}
+
+/**
+ * Where the turn's latest news starts: trailing sub-agent notices and the
+ * uncommitted output after them, which may belong to a response not named
+ * yet. It stays visible after the fold until committed output follows.
+ */
+function latestNewsStart(items: RenderItem[]): number {
+  let start = items.length;
+  while (start > 0 && isNoticeOrUncommitted(items[start - 1]!)) start -= 1;
+  const notice = items.findIndex((item, i) => i >= start && item.kind === "subagent_activity");
+  return notice < 0 ? items.length : notice;
+}
+
+function isNoticeOrUncommitted(item: RenderItem): boolean {
+  return item.kind === "subagent_activity" || (!isFailureItem(item) && isProvisionalItem(item));
+}
+
+/**
+ * A run of only notices folds with the nearest work, earlier first. With no
+ * work in the turn there is no row to fold into, so the notices stay visible.
+ */
+function foldNoticeRuns(segments: TurnSegment[]): TurnSegment[] {
+  const isNoticeRun = (segment: TurnSegment): boolean =>
+    segment.kind === "work" && segment.items.every((item) => item.kind === "subagent_activity");
+  const workRuns = segments.filter((segment) => segment.kind === "work" && !isNoticeRun(segment));
+  return segments.flatMap((segment, index): TurnSegment[] => {
+    if (segment.kind !== "work" || !isNoticeRun(segment)) return [segment];
+    const earlier = workRuns.findLast((run) => segments.indexOf(run) < index);
+    const target = earlier ?? workRuns[0];
+    if (target?.kind !== "work") {
+      return segment.items.map((item, k) => ({
+        kind: "exempt",
+        item,
+        index: segment.startIndex + k,
+      }));
+    }
+    if (earlier) target.items.push(...segment.items);
+    else target.items.unshift(...segment.items);
+    return [];
+  });
 }
 
 function isPendingElicitation(item: RenderItem): boolean {
@@ -512,10 +587,14 @@ function isSlashCommandCard(item: RenderItem): boolean {
  * That is what made the fold flicker on codex: a reasoning burst plus a
  * narration preview folded mid-turn, then the fold vanished when the
  * preview merged into the real bubble. A genuine turn always carries at
- * least one server-assigned item id.
+ * least one server-assigned item id; a sub-agent notice is not turn work.
  */
 function isProvisionalTrace(items: RenderItem[]): boolean {
-  return items.every((item) => item.itemId === null || item.itemId.startsWith(LIVE_ITEM_PREFIX));
+  return items.every((item) => item.kind === "subagent_activity" || isProvisionalItem(item));
+}
+
+function isProvisionalItem(item: RenderItem): boolean {
+  return item.itemId === null || item.itemId.startsWith(LIVE_ITEM_PREFIX);
 }
 
 /**
@@ -729,18 +808,22 @@ function isToolItem(item: RenderItem): boolean {
 }
 
 /**
- * If the transcript ends in a contiguous tool run, return its start
- * index — that run is the live activity and should keep its
- * streaming tail. Otherwise return -1: the agent has spoken (or
- * reasoned) after the most recent tools, so they're no longer
- * "current".
+ * If the transcript ends in a contiguous tool run (trailing sub-agent
+ * notices aside), return its start index: that run is the live
+ * activity and should keep its streaming tail. Otherwise return -1:
+ * the agent has spoken (or reasoned) after the most recent tools, so
+ * they're no longer "current".
  */
 function findStreamingRunStart(items: RenderItem[]): number {
-  if (items.length === 0) return -1;
-  if (!isToolItem(items[items.length - 1]!)) return -1;
-  let i = items.length - 1;
+  let i = lastWorkIndex(items);
+  if (i < 0 || !isToolItem(items[i]!)) return -1;
   while (i > 0 && isToolItem(items[i - 1]!)) i -= 1;
   return i;
+}
+
+/** The live edge: a sub-agent notice landing after it doesn't end it. */
+function lastWorkIndex(items: RenderItem[]): number {
+  return items.findLastIndex((item) => item.kind !== "subagent_activity");
 }
 
 /**
@@ -895,6 +978,8 @@ function renderItem(
       );
     case "elicitation":
       return <ElicitationCard key={key} item={item} />;
+    case "subagent_activity":
+      return <SubagentActivityMessage key={key} data={item.data} />;
   }
 }
 

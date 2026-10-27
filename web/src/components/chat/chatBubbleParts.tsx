@@ -1111,6 +1111,7 @@ function AssistantBubble({
   // failed turn that still produced tool or reasoning output keeps the assistant role.
   const errorNotice = hasError && bubble.items.every((it) => it.kind === "error");
   const spansFullColumn = isWide || hasError;
+  const hasSubagentNotice = bubble.items.some((it) => it.kind === "subagent_activity");
 
   return (
     <>
@@ -1122,10 +1123,10 @@ function AssistantBubble({
         data-message-id={bubble.responseId}
         className={spansFullColumn ? "max-w-full" : "max-w-[var(--chat-prose-width)]"}
       >
-        {/* Fold-only rows fill the prose width so their hairlines remain visible. */}
+        {/* Fold-only rows and notices fill the prose width so their hairlines stay visible. */}
         <MessageContent
           className={cn(
-            (spansFullColumn || foldOnly) && "w-full",
+            (spansFullColumn || foldOnly || hasSubagentNotice) && "w-full",
             flashing && "animate-message-highlight rounded-lg",
           )}
         >
