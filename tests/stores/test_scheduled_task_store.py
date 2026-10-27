@@ -1936,7 +1936,11 @@ def test_final_claim_completes_schedule_and_schedule_edits_reopen_it(store):
         task, now=now, next_run_at=None, host_id=task.host_id, lease_seconds=120
     )
     completed = store.get(task.id)
-    assert (completed.state, completed.next_run_at) == ("completed", None)
+    assert (completed.state, completed.next_run_at, completed.updated_at) == (
+        "completed",
+        None,
+        now,
+    )
     assert store.list_uninitialized_tasks() == []
     assert store.list_due_tasks(now + 7200) == []
     assert store.update(task.id, prompt="edited").state == "completed"
@@ -1951,6 +1955,29 @@ def test_final_claim_completes_schedule_and_schedule_edits_reopen_it(store):
     assert store.update(task.id, state="active").state == "completed"
     reopened = store.update(task.id, rrule="FREQ=DAILY")
     assert reopened.state == "active" and reopened.next_run_at is not None
+
+    # A time zone edit also re-evaluates a completed schedule.
+    store.update(task.id, rrule="FREQ=DAILY;BYHOUR=9;BYMINUTE=30")
+    daily = store.get(task.id)
+    assert store.claim_scheduled_run(
+        daily, now=daily.next_run_at, next_run_at=None, host_id=task.host_id, lease_seconds=120
+    )
+    assert store.get(task.id).state == "completed"
+    retimed = store.update(task.id, timezone="America/New_York")
+    assert retimed.state == "active" and retimed.next_run_at not in (None, daily.next_run_at)
+
+    # A schedule that has already ended is completed as soon as it is created.
+    ended = store.create(
+        _uid("ended_at_creation"),
+        "ended",
+        "prompt",
+        "FREQ=HOURLY;UNTIL=20200101T000000Z",
+        None,
+        _uid("agent"),
+        "UTC",
+        host_id=_uid("host"),
+    )
+    assert (ended.state, ended.next_run_at) == ("completed", None)
 
     # Legacy timers never complete schedules; an edit returns the task to them.
     store.update(task.id, rrule="FREQ=HOURLY;UNTIL=20200101T000000Z")
@@ -1987,7 +2014,9 @@ def test_final_claim_of_recorded_occurrence_still_completes_schedule(store):
     assert store.list_runs(task.id)[0] == [run]
 
 
-def test_schedule_completion_does_not_overwrite_edits_or_other_workspace(store):
+def test_schedule_completion_does_not_overwrite_edits_or_other_workspace(store, monkeypatch):
+    from omnigent.stores.scheduled_task_store import sqlalchemy_store
+
     store.configure_dispatch(False)
     created = store.create(
         _uid("ended"),
@@ -2005,7 +2034,10 @@ def test_schedule_completion_does_not_overwrite_edits_or_other_workspace(store):
         assert not store.complete_schedule(snapshot)
     store.update(created.id, prompt="edited")
     assert not store.complete_schedule(snapshot)
-    assert store.get(created.id).state == "active"
-    assert store.complete_schedule(store.get(created.id))
-    assert store.get(created.id).state == "completed"
-    assert not store.complete_schedule(store.get(created.id))
+    edited = store.get(created.id)
+    assert edited.state == "active"
+    monkeypatch.setattr(sqlalchemy_store, "now_epoch", lambda: edited.updated_at + 60)
+    assert store.complete_schedule(edited)
+    completed = store.get(created.id)
+    assert (completed.state, completed.updated_at) == ("completed", edited.updated_at + 60)
+    assert not store.complete_schedule(completed)

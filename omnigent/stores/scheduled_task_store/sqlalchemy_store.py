@@ -946,6 +946,7 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             if row is None or _to_entity(row) != task:
                 return False
             row.state = encode_scheduled_task_state("completed")
+            row.updated_at = now_epoch()
             return True
 
         return run_write_transaction(self._session_immediate, "complete_schedule", write)
@@ -1021,7 +1022,9 @@ class SqlAlchemyScheduledTaskStore(ScheduledTaskStore):
             )
             row.next_run_at = next_run_at
             if next_run_at is None:
+                # Completing changes the task's visible state, unlike advancing the cursor.
                 row.state = encode_scheduled_task_state("completed")
+                row.updated_at = now
             if existing is not None:
                 return None
             run = SqlScheduledTaskRun(
