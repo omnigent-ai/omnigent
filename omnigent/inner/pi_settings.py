@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from collections.abc import Mapping
 from pathlib import Path
 from typing import TypeAlias, cast
@@ -76,9 +77,10 @@ def _relocate_resource_settings(
             # Keep relative patterns for auto-discovery through the managed symlink.
             if prefix:
                 relocated.append(entry)
-                if Path(path).is_absolute() and Path(path).is_relative_to(agent_root):
+                normalized_path = Path(os.path.normpath(path))
+                if normalized_path.is_absolute() and normalized_path.is_relative_to(agent_root):
                     relocated.append(
-                        prefix + str(managed_dir / Path(path).relative_to(agent_root))
+                        prefix + str(managed_dir / normalized_path.relative_to(agent_root))
                     )
             relocated.append(prefix + str(agent_root / path))
         settings[kind] = list(dict.fromkeys(relocated))
@@ -147,11 +149,8 @@ def prepare_managed_pi_agent_dir(
     :param global_agent_dir: Caller-resolved source root; defaults to
         :data:`DEFAULT_PI_AGENT_DIR`.
     """
-    agent_root = (
-        (global_agent_dir if global_agent_dir is not None else DEFAULT_PI_AGENT_DIR)
-        .expanduser()
-        .absolute()
-    )
+    agent_root = global_agent_dir if global_agent_dir is not None else DEFAULT_PI_AGENT_DIR
+    agent_root = Path(os.path.abspath(agent_root.expanduser()))
     if managed_dir.resolve() == agent_root.resolve():
         return
     settings = _relocate_resource_settings(

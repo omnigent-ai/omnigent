@@ -57,7 +57,12 @@ def _seed_pi_extension_home(home: Path, agent_dir: Path, python: Path) -> Path:
         json.dumps(
             {
                 "packages": ["./local-package"],
-                "extensions": ["!extensions/*.js", "+extensions/marker.js", "-" + str(disabled)],
+                "extensions": [
+                    "!extensions/*.js",
+                    "+extensions/marker.js",
+                    "+extensions/disabled.js",
+                    "-" + str(disabled),
+                ],
             }
         ),
         encoding="utf-8",
@@ -106,7 +111,7 @@ def test_pi_gateway_run_loads_global_extensions(
 
     fake_home = tmp_path / "home"
     fake_home.mkdir()
-    agent_dir = fake_home / "custom-agent" if explicit_root else fake_home / ".pi" / "agent"
+    agent_dir = tmp_path / "custom-agent" if explicit_root else fake_home / ".pi" / "agent"
     marker_path = _seed_pi_extension_home(fake_home, agent_dir, omnigent_python)
     assert not marker_path.exists()
 
@@ -120,7 +125,7 @@ def test_pi_gateway_run_loads_global_extensions(
     env["PI_OFFLINE"] = "1"
     env.pop("PI_CODING_AGENT_DIR", None)
     if explicit_root:
-        env["PI_CODING_AGENT_DIR"] = "custom-agent"
+        env["PI_CODING_AGENT_DIR"] = "../custom-agent"
 
     yaml_path = omnigent_repo_root / "tests" / "resources" / "examples" / "hello_world.yaml"
     command = [

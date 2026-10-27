@@ -167,7 +167,10 @@ def test_prepare_managed_pi_agent_dir_replaces_stale_links_on_reuse(tmp_path: Pa
     assert not (managed / "npm").is_symlink() and (managed / "npm").is_dir()
 
 
-def test_relative_settings_keep_their_original_root(tmp_path: Path) -> None:
+@pytest.mark.parametrize("parent_relative_root", [False, True])
+def test_relative_settings_keep_their_original_root(
+    tmp_path: Path, parent_relative_root: bool
+) -> None:
     global_agent = tmp_path / "global-agent"
     global_agent.mkdir()
     settings = {
@@ -176,6 +179,7 @@ def test_relative_settings_keep_their_original_root(tmp_path: Path) -> None:
             "!custom/disabled.js",
             "-extensions/off.js",
             "-builtin:mcp",
+            "-" + str(global_agent / "extensions/disabled.js"),
         ],
         "skills": ["../shared-skills", "/absolute/skills", "~/skills"],
         "packages": [
@@ -190,7 +194,9 @@ def test_relative_settings_keep_their_original_root(tmp_path: Path) -> None:
     managed.mkdir()
     (managed / "settings.json").symlink_to(settings_path)
 
-    prepare_managed_pi_agent_dir(managed, global_agent_dir=global_agent)
+    (tmp_path / "workspace").mkdir()
+    root = tmp_path / "workspace/../global-agent" if parent_relative_root else global_agent
+    prepare_managed_pi_agent_dir(managed, global_agent_dir=root)
 
     written = json.loads((managed / "settings.json").read_text())
     assert written["extensions"] == [
@@ -200,6 +206,8 @@ def test_relative_settings_keep_their_original_root(tmp_path: Path) -> None:
         "-extensions/off.js",
         "-" + str(global_agent / "extensions/off.js"),
         "-builtin:mcp",
+        "-" + str(global_agent / "extensions/disabled.js"),
+        "-" + str(managed / "extensions/disabled.js"),
     ]
     assert written["skills"] == [
         str(global_agent / "../shared-skills"),
