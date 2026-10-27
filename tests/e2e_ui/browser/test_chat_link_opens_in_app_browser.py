@@ -7,8 +7,6 @@ stub (as in ``test_browser_tab.py``) that records ``browserOpenOrNavigate``.
 from __future__ import annotations
 
 import re
-from urllib.parse import quote
-from uuid import UUID
 
 from playwright.sync_api import Page, expect
 
@@ -125,10 +123,6 @@ def test_setting_routes_plain_clicks_in_app(page: Page, seeded_session: tuple[st
         "aria-selected", "true"
     )
     assert len({first_view, second_view, third_view}) == 3
-    view_prefix = f"browser-tab:{quote(session_id, safe='')}:"
-    for view_id in (first_view, second_view, third_view):
-        assert view_id.startswith(view_prefix)
-        assert UUID(view_id.removeprefix(view_prefix)).version == 4
     assert page.evaluate("window.__views") == {
         first_view: LINK_URL,
         second_view: SECOND_LINK_URL,

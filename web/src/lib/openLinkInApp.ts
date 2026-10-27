@@ -8,6 +8,7 @@ import { showToast } from "@/components/ui/toast";
 import { AGENT_BROWSER_TAB_ID, browserViewId } from "./browserTabs";
 import { readOpenLinksInApp } from "./linkOpenPreferences";
 import { isNativeShell, supportsBrowser } from "./nativeBridge";
+import { randomUUID } from "./randomUUID";
 import { readSessionWorkspaceState } from "./sessionWorkspaceState";
 
 type OpenOrNavigate = (
@@ -19,6 +20,7 @@ type OpenOrNavigate = (
 
 interface BrowserBridge {
   browserOpenOrNavigate: OpenOrNavigate;
+  browserClose?: (viewId: string) => Promise<{ ok: boolean }>;
   browserHasView?: (
     viewId: string,
   ) => Promise<{ exists: boolean; url?: string; pendingUrl?: string }>;
@@ -38,6 +40,7 @@ export function onInAppLinkOpen(
 async function openInApp(conversationId: string, url: string): Promise<void> {
   const bridge = (window as unknown as { omnigentDesktop: BrowserBridge }).omnigentDesktop;
   let error: string | undefined;
+  let newViewId: string | undefined;
   try {
     // The reserved agent view may navigate independently of the user's tabs.
     const tabs = (readSessionWorkspaceState(conversationId).openBrowsers ?? []).filter(
@@ -60,17 +63,14 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
         return;
       }
     }
-    const tabId = crypto.randomUUID();
+    const tabId = randomUUID();
+    newViewId = browserViewId(conversationId, tabId);
     // Chat and workspace-file links are agent- or repo-authored and the agent can
     // read the view, so they get the agent's navigation policy (no loopback/private
     // hosts, even via redirect).
-    const result = await bridge.browserOpenOrNavigate(
-      browserViewId(conversationId, tabId),
-      url,
-      undefined,
-      { agent: true },
-    );
+    const result = await bridge.browserOpenOrNavigate(newViewId, url, undefined, { agent: true });
     if (result?.ok) {
+      newViewId = undefined;
       for (const listener of listeners) listener(conversationId, tabId);
       return;
     }
@@ -86,6 +86,13 @@ async function openInApp(conversationId: string, url: string): Promise<void> {
     `Couldn't open this link in the in-app browser (${error?.trim() || "unknown error"}). ` +
       "It opened in your default browser instead.",
   );
+  if (newViewId) {
+    try {
+      await bridge.browserClose?.(newViewId);
+    } catch (err) {
+      console.warn("[openLinkInApp] browserClose failed:", err);
+    }
+  }
 }
 
 /** Resolve `href` against the page, or null unless it is an http(s) URL — so a

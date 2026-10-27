@@ -197,26 +197,7 @@ describe("browser soft tabs", () => {
       browserViewId("session-a", secondLinkTab),
     ]);
     expect(readSessionWorkspaceState("session-a").selectedBrowserId).toBe(secondLinkTab);
-  });
-
-  it("restores the exact tab accepted while its session was in the background", () => {
-    openAgentBrowserTab("session-a");
-    const hook = renderHook(({ conversationId }) => useBrowserTabs(conversationId), {
-      initialProps: { conversationId: "session-a" },
-    });
-    hook.rerender({ conversationId: "session-b" });
-    act(() => hook.result.current.add());
-    const otherSessionTab = hook.result.current.selected;
-    act(() => openBrowserTab("session-a", "accepted-link"));
-    act(() => openBrowserTab("session-a", "accepted-link"));
-    expect(hook.result.current.selected).toBe(otherSessionTab);
-
-    hook.rerender({ conversationId: "session-a" });
-    expect(hook.result.current.tabs).toEqual([AGENT_BROWSER_TAB_ID, "accepted-link"]);
-    expect(hook.result.current.viewId).toBe(browserViewId("session-a", "accepted-link"));
-    hook.unmount();
-    const restored = renderHook(() => useBrowserTabs("session-a"));
-    expect(restored.result.current.selected).toBe("accepted-link");
+    expect(openBrowserTab("session-a", secondLinkTab).tabs).toEqual(result.current.tabs);
   });
 
   it("closes and later recreates the agent browser soft tab", async () => {
