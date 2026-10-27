@@ -63,7 +63,7 @@ window.arcaConnect.onStarted(({ login, command }) => {
   confirmBtn.textContent = login ? "Signing in…" : "Connecting…";
   statusEl.dataset.kind = "";
   statusEl.textContent = login
-    ? "Complete sign-in in your browser. If no browser opened, check that Arca Companion is running. Credentials stay on the Arca instance."
+    ? "If sign-in is needed, a browser opens on your laptop. Finish signing in to continue connecting. Keep Arca Companion running."
     : "A cold instance can take a few minutes to start.";
 });
 

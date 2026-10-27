@@ -350,12 +350,12 @@ const arcaConnectFlow = createArcaConnectFlow({
   pagePath: path.join(__dirname, "..", "arca-connect", "index.html"),
   preloadPath: path.join(__dirname, "arca_connect_preload.js"),
   startConnect: (serverUrl, onOutput) => startArcaHostConnect(serverUrl, { onOutput }),
-  startLogin: (serverUrl) => arca.startArcaLogin(serverUrl),
-  loginCommandLine: (serverUrl) => {
+  startSetup: (serverUrl) => arca.startArcaSetup(serverUrl),
+  setupCommandLine: (serverUrl) => {
     try {
-      return `arca ${arca.buildLoginArgs(serverUrl).join(" ")}`;
+      return `arca ${arca.buildSetupArgs(serverUrl).join(" ")}`;
     } catch {
-      return "arca ssh isaac omni login …";
+      return "arca ssh isaac omni host …";
     }
   },
   commandLine: (serverUrl) => {
@@ -452,15 +452,15 @@ const arcaPreviewDeclinedUntil = new Map();
  * succeeded.
  */
 const onboardingArcaOptIn = { pending: 0, baseline: undefined, succeeded: false };
-const onboardingArcaLogins = new Map();
+const onboardingArcaSetups = new Map();
 
 /**
  * Onboarding's Arca connect, run through the auto-connect state machine so
  * the window's own launch-time connect joins it instead of racing a second
  * `arca ssh`. Picking Arca opts into auto-connect; overlapping attempts share
  * the opt-in, and the last to finish keeps it only if any of them succeeded.
- * Like any auto-connect, a started run finishes in the background even if
- * setup closes; nothing starts once it has.
+ * Browser sign-in is canceled when the last setup window closes; a started
+ * noninteractive connection may finish in the background.
  *
  * @param {string} serverUrl
  * @param {(line: string) => void} log
@@ -484,65 +484,62 @@ async function connectOnboardingArca(serverUrl, log, sender) {
     if (isClosed()) {
       result = { ok: false, canceled: true };
     } else {
-      const current = arcaAutoConnect.getStatus(serverUrl);
-      // Joining a run already in flight streams nothing, so only a new run shows its command.
-      if (current.command && (current.state === "idle" || current.state === "failed")) {
-        log(`$ ${current.command}`);
-      }
-      let status =
-        current.state === "failed"
-          ? await arcaAutoConnect.retry(serverUrl, log)
-          : await arcaAutoConnect.ensure(serverUrl, log);
-      if (status.state === "failed" && status.errorKind === "omni-auth" && !isClosed()) {
-        // The setup page's Install click authorizes sign-in; passive auto-connect never does.
-        log(`$ arca ${arca.buildLoginArgs(serverUrl).join(" ")}`);
-        log("Signing in on Arca. If a browser window opens, finish signing in there.");
-        const target = omnigentCli.normalizeServerUrl(new URL(serverUrl).href);
-        let login = onboardingArcaLogins.get(target);
-        if (!login) {
-          login = { ...arca.startArcaLogin(serverUrl), waiters: 0 };
-          onboardingArcaLogins.set(target, login);
-          login.promise = login.promise.finally(() => {
-            if (onboardingArcaLogins.get(target) === login) onboardingArcaLogins.delete(target);
-          });
-        }
-        login.waiters += 1;
-        let onClosed;
-        const closed = new Promise((resolve) => {
-          onClosed = () => resolve({ ok: false, canceled: true });
-          sender.once("destroyed", onClosed);
+      // The setup page's Install click authorizes browser sign-in before host startup.
+      log(`$ arca ${arca.buildSetupArgs(serverUrl).join(" ")}`);
+      log("If sign-in is needed, a browser opens on your laptop. Finish signing in to continue.");
+      const target = omnigentCli.normalizeServerUrl(new URL(serverUrl).href);
+      let setup = onboardingArcaSetups.get(target);
+      if (!setup) {
+        setup = { ...arca.startArcaSetup(serverUrl), waiters: 0 };
+        onboardingArcaSetups.set(target, setup);
+        setup.promise = setup.promise.finally(() => {
+          if (onboardingArcaSetups.get(target) === setup) onboardingArcaSetups.delete(target);
         });
-        let auth;
-        try {
-          auth = await Promise.race([login.promise, closed]);
-        } finally {
-          sender.removeListener("destroyed", onClosed);
-          login.waiters -= 1;
-          // A closed setup window must not cancel another window's sign-in.
-          if (login.waiters === 0 && onboardingArcaLogins.get(target) === login) {
-            onboardingArcaLogins.delete(target);
-            login.cancel();
-          }
-        }
-        if (isClosed()) {
-          result = { ok: false, canceled: true };
-        } else if (auth.ok) {
-          log("Signed in. Connecting Arca…");
-          status = await arcaAutoConnect.retry(serverUrl, log);
-        } else {
-          result = auth;
+      }
+      setup.waiters += 1;
+      let onClosed;
+      const closed = new Promise((resolve) => {
+        onClosed = () => resolve({ ok: false, canceled: true });
+        sender.once("destroyed", onClosed);
+      });
+      let prepared;
+      try {
+        prepared = await Promise.race([setup.promise, closed]);
+      } finally {
+        sender.removeListener("destroyed", onClosed);
+        setup.waiters -= 1;
+        // A closed setup window must not cancel another window's sign-in.
+        if (setup.waiters === 0 && onboardingArcaSetups.get(target) === setup) {
+          onboardingArcaSetups.delete(target);
+          setup.cancel();
         }
       }
-      result ??=
-        status.state === "online"
-          ? { ok: true, alreadyRunning: status.alreadyRunning === true }
-          : {
-              ok: false,
-              error:
-                status.state === "unavailable"
-                  ? "The arca CLI was not found on this machine."
-                  : (status.error ?? "Couldn't connect Arca."),
-            };
+      if (isClosed()) {
+        result = { ok: false, canceled: true };
+      } else if (!prepared.ok) {
+        result = prepared;
+      } else {
+        log("Sign-in ready. Connecting Arca…");
+        const current = arcaAutoConnect.getStatus(serverUrl);
+        // Joining a run already in flight streams nothing, so only a new run shows its command.
+        if (current.command && (current.state === "idle" || current.state === "failed")) {
+          log(`$ ${current.command}`);
+        }
+        const status =
+          current.state === "failed"
+            ? await arcaAutoConnect.retry(serverUrl, log)
+            : await arcaAutoConnect.ensure(serverUrl, log);
+        result =
+          status.state === "online"
+            ? { ok: true, alreadyRunning: status.alreadyRunning === true }
+            : {
+                ok: false,
+                error:
+                  status.state === "unavailable"
+                    ? "The arca CLI was not found on this machine."
+                    : (status.error ?? "Couldn't connect Arca."),
+              };
+      }
     }
   } catch (error) {
     result = { ok: false, error: error instanceof Error ? error.message : String(error) };
@@ -4885,9 +4882,10 @@ function registerIpc() {
     const autoRun = arcaAutoConnect.inFlight(arcaServerUrl);
     if (autoRun) {
       const status = await autoRun;
+      // A passive Isaac sign-in can time out before reporting an authentication error.
       if (
         status.state === "failed" &&
-        status.errorKind === "omni-auth" &&
+        (status.errorKind === "omni-auth" || status.errorKind === "timeout") &&
         isPinnedOriginSender(event) &&
         !win.isDestroyed()
       ) {

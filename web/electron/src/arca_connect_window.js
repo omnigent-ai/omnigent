@@ -36,8 +36,8 @@ const { arcaTarget } = require("./arcaIdentity");
  *   startConnect: (serverUrl: string, onOutput: (text: string) => void) =>
  *     ReturnType<typeof import("./arca").startArcaConnect>,
  *   commandLine: (serverUrl: string) => string,
- *   startLogin: (serverUrl: string) => ReturnType<typeof import("./arca").startArcaLogin>,
- *   loginCommandLine: (serverUrl: string) => string,
+ *   startSetup: (serverUrl: string) => ReturnType<typeof import("./arca").startArcaSetup>,
+ *   setupCommandLine: (serverUrl: string) => string,
  *   log?: (message: string) => void,
  * }} deps
  * @returns {{ run: (parentWin: unknown, serverUrl: string, options?: { reason?: "preview-reconnect" }) => Promise<object> }}
@@ -49,8 +49,8 @@ function createArcaConnectFlow({
   preloadPath,
   startConnect,
   commandLine,
-  startLogin,
-  loginCommandLine,
+  startSetup,
+  setupCommandLine,
   log = () => {},
 }) {
   /**
@@ -153,7 +153,6 @@ function createArcaConnectFlow({
       // and the closed handler needs the id to unregister the console.
       const consoleId = win.webContents.id;
       let phase = "asking";
-      let loginAttempted = false;
       let connect = null;
       let settled = false;
       const sendInit = (reason) => {
@@ -162,7 +161,7 @@ function createArcaConnectFlow({
           win.setTitle?.(reason === "preview-reconnect" ? "Reconnect Arca" : "Connect Arca");
           win.webContents.send("arca-connect:init", {
             serverUrl,
-            command: commandLine(serverUrl),
+            command: setupCommandLine(serverUrl),
             reason: reason ?? null,
           });
         } catch {
@@ -184,27 +183,20 @@ function createArcaConnectFlow({
         }
       };
 
-      const runCommand = (login = false) => {
+      const runCommand = (setup = false) => {
         phase = "running";
-        connect = login
-          ? startLogin(serverUrl)
+        connect = setup
+          ? startSetup(serverUrl)
           : startConnect(serverUrl, (text) => send("arca-connect:output", text));
         send("arca-connect:started", {
-          login,
-          command: login ? loginCommandLine(serverUrl) : commandLine(serverUrl),
+          login: setup,
+          command: setup ? setupCommandLine(serverUrl) : commandLine(serverUrl),
         });
         void connect.promise.then((result) => {
           // Closing the console must not start the next command after a late exit.
           if (settled) return;
-          if (login && result.ok) {
+          if (setup && result.ok) {
             runCommand();
-            return;
-          }
-          // The user's Connect click covers sign-in, so it starts without its own prompt.
-          if (!login && result.authError && !loginAttempted) {
-            loginAttempted = true;
-            log(`arca connect: ${serverUrl} needs sign-in; starting it`);
-            runCommand(true);
             return;
           }
           phase = "done";
@@ -222,7 +214,7 @@ function createArcaConnectFlow({
         onConfirm: () => {
           if (phase !== "asking") return;
           log(`arca connect: user confirmed; running against ${serverUrl}`);
-          runCommand();
+          runCommand(true);
         },
         onCancel: () => {
           // Cancel button (or Close after a run) — just close; the close

@@ -6,6 +6,7 @@ const { EventEmitter } = require("node:events");
 const {
   buildConnectArgs,
   buildLoginArgs,
+  buildSetupArgs,
   connectArcaHost,
   describeConnectFailure,
   checkDbcert,
@@ -16,6 +17,9 @@ const {
   runDbcertArcaSync,
   startArcaConnect,
   startArcaLogin,
+  startArcaSetup,
+  CONNECT_TIMEOUT_MS,
+  SETUP_TIMEOUT_MS,
 } = require("../src/arca");
 const { IDENTITY_START, IDENTITY_END } = require("../src/arcaIdentity");
 
@@ -323,6 +327,29 @@ describe("arca binary resolution", () => {
 });
 
 describe("arca connect command", () => {
+  it("prepares both sign-ins in a remote TTY through the laptop browser helper", () => {
+    const server = "https://account.databricks.com/omnigent?o=123&test=value";
+    const args = buildSetupArgs(server);
+    assert.deepEqual(args.slice(0, 12), [
+      "ssh",
+      "-tt",
+      "-o",
+      "ClearAllForwardings=yes",
+      "env",
+      'BROWSER="$HOME/.arca-client/tools/www-browser"',
+      "isaac",
+      "omni",
+      "host",
+      "--server",
+      `'${server}'`,
+      "--background",
+    ]);
+    assert.equal(args.includes("--non-interactive"), false);
+    assert.equal(buildConnectArgs(server).includes("--non-interactive"), true);
+    assert.equal(buildConnectArgs(server).includes("-tt"), false);
+    assert.throws(() => buildSetupArgs("https://example.com/a$(id)"));
+    assert.ok(SETUP_TIMEOUT_MS >= CONNECT_TIMEOUT_MS + 2 * 300_000);
+  });
   it("binds remote login and noninteractive startup to the same SPOG workspace", () => {
     const server = "https://account.databricks.com/omnigent?o=123&test=value";
     const args = buildLoginArgs(server);
@@ -385,6 +412,10 @@ describe("arca connect failures", () => {
       "Authentication failed (HTTP 401): rejected",
     ]) {
       assert.equal(describeConnectFailure({ code: 1, stdout: "", stderr }).errorKind, "omni-auth");
+      assert.equal(
+        describeConnectFailure({ code: null, stdout: "", stderr, timedOut: true }).errorKind,
+        "omni-auth",
+      );
     }
   });
   it("maps a timeout, sign-in, missing-CLI, and unreachable instance", () => {
@@ -449,6 +480,83 @@ describe("arca connect failures", () => {
 });
 
 describe("startArcaConnect / connectArcaHost", () => {
+  it("keeps both setup sign-ins private and reports completion only after the process closes", async () => {
+    const child = fakeConnectChild();
+    const output = [];
+    const run = startArcaSetup("https://account.databricks.com/omnigent?o=123", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: (_file, args, options) => {
+        assert.ok(args.includes("-tt"));
+        assert.ok(args.some((arg) => arg.startsWith("BROWSER=")));
+        assert.equal(options.detached, true);
+        return child;
+      },
+      onOutput: (text) => output.push(text),
+    });
+    child.stdout.emit("data", "Isaac login: https://example.com/oauth?state=SECRET");
+    child.stderr.emit("data", "Omnigent login: https://example.com/auth/login?ticket=SECRET");
+    let result;
+    void run.promise.then((value) => {
+      result = value;
+    });
+    await Promise.resolve();
+    assert.equal(result, undefined);
+    child.emit("exit", 0);
+    child.emit("close", 0);
+    assert.deepEqual(await run.promise, { ok: true, alreadyRunning: false });
+    assert.deepEqual(output, []);
+    assert.doesNotMatch(JSON.stringify(result), /SECRET|ticket=|state=/);
+  });
+
+  it("kills stubborn descendants when setup is canceled after the outer process exits", async () => {
+    const child = fakeConnectChild();
+    const run = startArcaSetup("https://account.databricks.com/omnigent?o=123", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+      killGraceMs: 600,
+    });
+    child.emit("exit", 0);
+    run.cancel();
+    assert.equal((await run.promise).canceled, true);
+    assert.deepEqual(child.signals, ["SIGTERM"]);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 650);
+    });
+    assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+    child.emit("close", 0);
+    assert.equal((await run.promise).ok, false);
+  });
+
+  it("still escalates cancellation after the parent closes its pipes", async () => {
+    const child = fakeConnectChild();
+    const run = startArcaSetup("https://srv.example.com", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+      killGraceMs: 5,
+    });
+    run.cancel();
+    child.emit("exit", null);
+    child.emit("close", null);
+    assert.equal((await run.promise).canceled, true);
+    await new Promise((resolve) => {
+      setTimeout(resolve, 10);
+    });
+    assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  });
+
+  it("preserves an authentication failure when a stalled SSH process times out", async () => {
+    const child = fakeConnectChild();
+    const run = startArcaConnect("https://srv.example.com", {
+      resolveArcaPath: () => "/bin/arca",
+      spawn: () => child,
+      timeoutMs: 5,
+      killGraceMs: 5,
+    });
+    child.stderr.emit("data", "install notices\n".repeat(25_000));
+    child.stderr.emit("data", "Error: OMNIGENT_AUTH_REQUIRED: no saved Omnigent app login");
+    assert.equal((await run.promise).authError, true);
+    assert.deepEqual(child.signals, ["SIGTERM", "SIGKILL"]);
+  });
   it("reports unavailable identity without changing a successful older connect result", async () => {
     const child = fakeConnectChild();
     const reasons = [];
@@ -512,6 +620,7 @@ describe("startArcaConnect / connectArcaHost", () => {
       resolveArcaPath: () => "/bin/arca",
       spawn: () => child,
       timeoutMs: 1,
+      killGraceMs: 1,
     });
     const keepAlive = setTimeout(() => {}, 1000);
     try {
@@ -566,6 +675,7 @@ describe("startArcaConnect / connectArcaHost", () => {
       resolveArcaPath: () => "/bin/arca",
       spawn: () => child,
     });
+    child.stdout.emit("data", "install notices\n".repeat(25_000));
     child.stdout.emit("data", "Host daemon already running.\n");
     child.stdout.emit(
       "data",

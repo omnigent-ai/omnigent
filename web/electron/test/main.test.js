@@ -149,7 +149,7 @@ function loadNavigationHarness({
   dbcertRefreshResult = { ok: true },
   dbcertSyncResult = { ok: true },
   dbcertPreflightResult = { ok: true, valid: true },
-  arcaLoginResult = { ok: true },
+  arcaSetupResult = { ok: true },
   arcaConsentResult,
   loadServer = async () => {},
   loadURL = null,
@@ -190,8 +190,8 @@ function loadNavigationHarness({
     arcaConsentRuns: [],
     cookiesSet: [],
     oidc: { refresh: 0, signIn: 0, signOut: 0 },
-    arcaLogins: [],
-    arcaLoginCancels: 0,
+    arcaSetups: [],
+    arcaSetupCancels: 0,
   };
   const pickers = [];
   const findBars = [];
@@ -501,14 +501,14 @@ function loadNavigationHarness({
         const result = typeof arcaResult === "function" ? arcaResult(url) : arcaResult;
         return { command: "arca ssh", promise: Promise.resolve(result), cancel: () => {} };
       },
-      startArcaLogin: (url) => {
-        calls.arcaLogins.push(url);
+      startArcaSetup: (url) => {
+        calls.arcaSetups.push(url);
         const result =
-          typeof arcaLoginResult === "function" ? arcaLoginResult(url) : arcaLoginResult;
+          typeof arcaSetupResult === "function" ? arcaSetupResult(url) : arcaSetupResult;
         return {
           promise: Promise.resolve(result),
           cancel: () => {
-            calls.arcaLoginCancels += 1;
+            calls.arcaSetupCancels += 1;
           },
         };
       },
@@ -646,6 +646,8 @@ function loadNavigationHarness({
               ? await arcaConsentResult(consentServerUrl, options)
               : arcaConsentResult;
           if (consent?.ok !== true) return consent;
+          const setup = await deps.startSetup(consentServerUrl).promise;
+          if (!setup.ok) return { ...setup, shownInConsole: true };
           const connect = deps.startConnect(consentServerUrl, () => {});
           return { ...(await connect.promise), shownInConsole: true };
         },
@@ -1065,6 +1067,44 @@ describe("Arca auto-connect wiring", () => {
     assert.deepEqual(h.calls.arcaConnects, [workspace]);
   });
 
+  for (const errorKind of ["omni-auth", "timeout"]) {
+    it(`offers consented setup when an explicit connect joins a passive ${errorKind}`, async (t) => {
+      let finishPassive;
+      let attempts = 0;
+      const h = loadNavigationHarness({
+        serverUrl: workspace,
+        databricksMode: "browser",
+        internalFeatures: true,
+        arcaPath,
+        arcaConsentResult: { ok: true },
+        arcaResult: () =>
+          ++attempts === 1
+            ? new Promise((resolve) => {
+                finishPassive = resolve;
+              })
+            : { ok: true },
+      });
+      t.after(h.cleanup);
+      h.api.registerIpc();
+      enableFeature(h);
+      await h.api.loadServerUrl(h.win, workspace);
+      await until(() => h.calls.arcaConnects.length === 1, "passive Arca connection");
+
+      const requested = h.ipc.get("omnigent:arca-connect")({
+        sender: h.webContents,
+        senderFrame: { url: workspace },
+      });
+      assert.deepEqual(h.calls.arcaConsentRuns, []);
+      assert.deepEqual(h.calls.arcaSetups, []);
+      finishPassive({ ok: false, errorKind, error: "Browser sign-in did not complete." });
+
+      assert.equal((await requested).ok, true);
+      assert.deepEqual(h.calls.arcaConsentRuns, [{ serverUrl: workspace, options: undefined }]);
+      assert.deepEqual(h.calls.arcaSetups, [workspace]);
+      assert.deepEqual(h.calls.arcaConnects, [workspace, workspace]);
+    });
+  }
+
   it("keeps one Arca host for a pick whose sign-in moves to the workspace host", async (t) => {
     const picked = "https://accounts.cloud.databricks.com/omnigent?o=123";
     const workspaceOrigin = new URL(workspace).origin;
@@ -1144,42 +1184,48 @@ describe("Arca auto-connect wiring", () => {
       );
     const failed = { ok: false, errorKind: "timeout", error: "timed out" };
 
-    it("prepares the remote grant after an auth failure and retries the same SPOG workspace", async (t) => {
+    it("prepares sign-in before connecting to the identical SPOG workspace", async (t) => {
       const spog = "https://account.databricks.com/omnigent?o=123";
-      let attempts = 0;
+      let prepared = false;
       const h = harness(t, {
-        arcaResult: () =>
-          ++attempts === 1 ? { ok: false, errorKind: "omni-auth", authError: true } : { ok: true },
+        arcaSetupResult: () => {
+          assert.deepEqual(h.calls.arcaConnects, []);
+          prepared = true;
+          return { ok: true };
+        },
+        arcaResult: () => {
+          assert.equal(prepared, true);
+          return { ok: true };
+        },
       });
       assert.equal((await connect(h, spog)).ok, true);
-      assert.deepEqual(h.calls.arcaLogins, [spog]);
-      assert.deepEqual(h.calls.arcaConnects, [spog, spog]);
+      assert.deepEqual(h.calls.arcaSetups, [spog]);
+      assert.deepEqual(h.calls.arcaConnects, [spog]);
       assert.equal(saved(h).arca_auto_connect, true);
     });
 
     it("never prompts from passive auto-connect and never loops after rejected login", async (t) => {
       const h = harness(t, {
         arcaResult: { ok: false, errorKind: "omni-auth", authError: true },
-        arcaLoginResult: { ok: false, authError: true, error: "Sign-in canceled" },
+        arcaSetupResult: { ok: false, authError: true, error: "Sign-in canceled" },
       });
       enableFeature(h);
       await h.api.loadServerUrl(h.win, workspace);
       await tick();
-      assert.deepEqual(h.calls.arcaLogins, []);
+      assert.deepEqual(h.calls.arcaSetups, []);
       assert.equal((await connect(h)).error, "Sign-in canceled");
-      assert.deepEqual(h.calls.arcaLogins, [workspace]);
-      assert.equal(h.calls.arcaConnects.length, 2);
+      assert.deepEqual(h.calls.arcaSetups, [workspace]);
+      assert.equal(h.calls.arcaConnects.length, 1);
     });
 
-    it("cancels onboarding login when setup closes and does not retry", async (t) => {
+    it("cancels onboarding preparation when setup closes and never starts the connection", async (t) => {
       let finishLogin;
       let loginStarted;
       const started = new Promise((resolve) => {
         loginStarted = resolve;
       });
       const h = harness(t, {
-        arcaResult: { ok: false, errorKind: "omni-auth" },
-        arcaLoginResult: () =>
+        arcaSetupResult: () =>
           new Promise((resolve) => {
             finishLogin = resolve;
             loginStarted();
@@ -1193,18 +1239,16 @@ describe("Arca auto-connect wiring", () => {
       closed = true;
       page.emit("destroyed");
       assert.equal((await result).canceled, true);
-      assert.equal(h.calls.arcaLoginCancels, 1);
+      assert.equal(h.calls.arcaSetupCancels, 1);
       finishLogin({ ok: true });
-      assert.equal(h.calls.arcaConnects.length, 1);
+      assert.equal(h.calls.arcaConnects.length, 0);
       assert.equal(saved(h).arca_auto_connect, undefined);
     });
 
     it("shares sign-in across setup windows without letting one closure cancel the other", async (t) => {
       let finishLogin;
-      let attempts = 0;
       const h = harness(t, {
-        arcaResult: () => (++attempts === 1 ? { ok: false, errorKind: "omni-auth" } : { ok: true }),
-        arcaLoginResult: () =>
+        arcaSetupResult: () =>
           new Promise((resolve) => {
             finishLogin = resolve;
           }),
@@ -1214,15 +1258,15 @@ describe("Arca auto-connect wiring", () => {
       const first = connect(h, workspace, page);
       const second = connect(h);
       await tick();
-      assert.deepEqual(h.calls.arcaLogins, [workspace]);
+      assert.deepEqual(h.calls.arcaSetups, [workspace]);
       closed = true;
       page.emit("destroyed");
       assert.equal((await first).canceled, true);
-      assert.equal(h.calls.arcaLoginCancels, 0);
+      assert.equal(h.calls.arcaSetupCancels, 0);
       finishLogin({ ok: true });
       assert.equal((await second).ok, true);
-      assert.deepEqual(h.calls.arcaConnects, [workspace, workspace]);
-      assert.equal(h.calls.arcaLoginCancels, 0);
+      assert.deepEqual(h.calls.arcaConnects, [workspace]);
+      assert.equal(h.calls.arcaSetupCancels, 0);
       assert.equal(page.listenerCount("destroyed"), 0);
       assert.equal(saved(h).arca_auto_connect, true);
     });
@@ -1235,7 +1279,7 @@ describe("Arca auto-connect wiring", () => {
       const h = harness(t, {
         arcaResult: (url) =>
           authenticated.has(url) ? { ok: true } : { ok: false, errorKind: "omni-auth" },
-        arcaLoginResult: (url) =>
+        arcaSetupResult: (url) =>
           new Promise((resolve) => {
             finishLogin.set(url, resolve);
           }),
@@ -1243,13 +1287,13 @@ describe("Arca auto-connect wiring", () => {
       const first = connect(h, firstTarget);
       const second = connect(h, secondTarget);
       await tick();
-      assert.deepEqual(h.calls.arcaLogins, [firstTarget, secondTarget]);
+      assert.deepEqual(h.calls.arcaSetups, [firstTarget, secondTarget]);
       authenticated.add(firstTarget);
       finishLogin.get(firstTarget)({ ok: true });
       assert.equal((await first).ok, true);
       finishLogin.get(secondTarget)({ ok: false, errorKind: "omni-auth", error: "Canceled" });
       assert.equal((await second).ok, false);
-      assert.deepEqual(h.calls.arcaConnects, [firstTarget, secondTarget, firstTarget]);
+      assert.deepEqual(h.calls.arcaConnects, [firstTarget]);
     });
 
     it("keeps the auto-connect opt-in only when the connect succeeds", async (t) => {
@@ -1280,6 +1324,7 @@ describe("Arca auto-connect wiring", () => {
       // Open at the check after URL resolution, closed at the one after the lookup.
       const result = await connect(h, workspace, setupPage(1));
       assert.equal(result.canceled, true);
+      assert.deepEqual(h.calls.arcaSetups, []);
       assert.deepEqual(h.calls.arcaConnects, []);
       assert.equal(saved(h).arca_auto_connect, undefined);
     });
