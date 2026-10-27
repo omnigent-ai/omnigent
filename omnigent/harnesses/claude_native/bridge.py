@@ -85,6 +85,7 @@ from omnigent.harnesses.diagnostics import (
     sign_in_running_elsewhere,
 )
 from omnigent.harnesses.kiro_native import bridge as kiro_bridge
+from omnigent.llms.errors import CONTEXT_OVERFLOW_GUIDANCE
 from omnigent.models.claude_model_vocabulary import MODEL_VOCABULARY_ENV_VARS
 from omnigent.models.model_metadata import concrete_reported_model
 from omnigent.native.failure_telemetry import FailureContext
@@ -9964,11 +9965,7 @@ _CONTEXT_OVERFLOW_RE = re.compile(
     re.IGNORECASE,
 )
 
-_CONTEXT_OVERFLOW_REPLACEMENT = (
-    "Context limit reached — the conversation has grown too long for "
-    "the model’s context window. Use /compact to summarize and free up "
-    "space, or /clear to start a new conversation."
-)
+_CONTEXT_OVERFLOW_REPLACEMENT = CONTEXT_OVERFLOW_GUIDANCE
 
 # Claude Code points its auth failures at ``/login`` — a dead end in the
 # web chat, where ``/login`` is a dropped command: it is escaped into
