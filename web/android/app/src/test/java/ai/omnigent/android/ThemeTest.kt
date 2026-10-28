@@ -48,7 +48,7 @@ class ThemeTest {
                 ).getChildAt(0)
                 .background
         assertTrue(background is ColorDrawable)
-        assertEquals(Color.rgb(14, 16, 19), (background as ColorDrawable).color)
+        assertEquals(Color.rgb(14, 11, 25), (background as ColorDrawable).color)
     }
 
     @Test
