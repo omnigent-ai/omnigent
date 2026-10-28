@@ -289,7 +289,8 @@ export function CreateScheduledTaskDialog({
   const projectName = pickedProject?.name ?? projectChoice ?? savedProjectName ?? "";
   const projectIcon = (pickedProject ?? projects.find((p) => p.name === projectName))?.icon;
   // The saved project has no name while the list loads, if it fails to load,
-  // or once the project is deleted. Only a loaded list proves it is deleted.
+  // or once the project is deleted. Only a loaded list proves it is deleted,
+  // and a deleted one reads as "No project": runs already file nothing there.
   const savedProjectUnresolved = projectChoice === null && savedProjectName === undefined;
   const savedProjectDeleted = savedProjectUnresolved && projectsLoaded;
   const unresolvedProjectLabel = unresolvedProjectText(
@@ -381,7 +382,8 @@ export function CreateScheduledTaskDialog({
           : {}),
       };
       const projectInput = await projectChangeInput(
-        projectChoice,
+        // Saving over a deleted project clears it, matching the "No project" shown.
+        projectChoice ?? (savedProjectDeleted ? "" : null),
         pickedProjectId,
         savedProjectId,
         resolveProjectId,
@@ -613,7 +615,7 @@ export function CreateScheduledTaskDialog({
                 </DropdownMenuTrigger>
                 <DropdownMenuContent align="start" className="min-w-56">
                   {/* The picker's "Remove from" row needs the name; this works without it. */}
-                  {savedProjectUnresolved && (
+                  {savedProjectUnresolved && !savedProjectDeleted && (
                     <DropdownMenuItem
                       className="px-2 py-1"
                       onSelect={() => {
@@ -768,14 +770,13 @@ export function CreateScheduledTaskDialog({
   );
 }
 
-/** Label for a saved project the list can't name yet, or `null` once it can. */
+/** Label for a saved project the list can't name yet; `null` once named or deleted. */
 function unresolvedProjectText(
   unresolved: boolean,
   deleted: boolean,
   failed: boolean,
 ): string | null {
-  if (!unresolved) return null;
-  if (deleted) return "Deleted project";
+  if (!unresolved || deleted) return null;
   if (failed) return "Project unavailable";
   return "Loading…";
 }

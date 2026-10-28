@@ -1110,7 +1110,7 @@ describe("CreateScheduledTaskDialog project", () => {
     expect(input).not.toHaveProperty("projectId");
   });
 
-  it("labels a deleted saved project and lets the edit unfile the task", async () => {
+  it("shows a deleted saved project as no project and clears it on save", async () => {
     renderWithProjects(
       <CreateScheduledTaskDialog
         open
@@ -1118,9 +1118,11 @@ describe("CreateScheduledTaskDialog project", () => {
         editingTask={scheduledTask({ projectId: "proj_deleted" })}
       />,
     );
-    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("Deleted project");
+    expect(screen.getByTestId("task-project-trigger")).toHaveTextContent("No project");
     openProjectMenu();
-    fireEvent.click(await screen.findByRole("menuitem", { name: "No project" }));
+    expect(await screen.findByLabelText("Search or create project")).toBeInTheDocument();
+    expect(screen.queryByRole("menuitem", { name: "No project" })).not.toBeInTheDocument();
+    fireEvent.keyDown(screen.getByLabelText("Search or create project"), { key: "Escape" });
     fireEvent.click(screen.getByTestId("create-scheduled-task-submit"));
     await waitFor(() => expect(updateMutateAsync).toHaveBeenCalledTimes(1));
     expect(updateMutateAsync.mock.calls[0][0].input).toMatchObject({ projectId: null });
