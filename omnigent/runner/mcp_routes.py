@@ -171,16 +171,6 @@ def register_mcp_routes(
             return JSONResponse(status_code=retained.status_code, content=retained.content)
 
         if method == "tools/list":
-            if mcp_manager is None:
-                return JSONResponse(
-                    status_code=503,
-                    content={
-                        "error": {
-                            "code": -32000,
-                            "message": "Runner MCP manager not configured",
-                        }
-                    },
-                )
             spec_entry = _session_spec_cache.get(session_id)
             spec = _unwrap_resolved_spec(spec_entry)
             if spec is None and spec_resolver is not None:
@@ -195,8 +185,25 @@ def register_mcp_routes(
                         }
                     },
                 )
+            if mcp_manager is None and getattr(spec, "mcp_servers", None):
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "code": -32000,
+                            "message": "Runner MCP manager not configured",
+                        }
+                    },
+                )
             try:
-                result = await mcp_manager.schemas_for(spec)
+                from omnigent.runner.tool_dispatch import build_mcp_local_tool_schemas
+
+                result = None
+                if mcp_manager is not None:
+                    result = await mcp_manager.schemas_for(spec)
+                local_schemas = build_mcp_local_tool_schemas(
+                    spec, _session_harness_name(session_id)
+                )
             except Exception as exc:  # noqa: BLE001
                 return JSONResponse(
                     status_code=200,
@@ -210,9 +217,15 @@ def register_mcp_routes(
             return JSONResponse(
                 content={
                     "result": {
-                        "schemas": result.schemas,
-                        "tool_names": list(result.tool_names),
-                        "failures": result.failures,
+                        "schemas": [
+                            *(result.schemas if result is not None else []),
+                            *local_schemas,
+                        ],
+                        "tool_names": list(
+                            (result.tool_names if result is not None else set())
+                            | {s["name"] for s in local_schemas}
+                        ),
+                        "failures": result.failures if result is not None else {},
                     }
                 }
             )
@@ -220,7 +233,11 @@ def register_mcp_routes(
         if method == "tools/call":
             import json as _json
 
-            from omnigent.runner.tool_dispatch import execute_tool
+            from omnigent.runner.tool_dispatch import (
+                _ungranted_tool_reason,
+                client_runtime_tool_names,
+                execute_tool,
+            )
 
             tool_name = cast(str, params.get("name") or "")
             arguments = cast(_JsonObject, params.get("arguments") or {})
@@ -327,8 +344,42 @@ def register_mcp_routes(
                         spec_workdir = _resolved_workdir_for_spec(resolved_entry, runner_workspace)
                         spec = _unwrap_resolved_spec(resolved_entry)
                     except (OmnigentError, httpx.HTTPError, RuntimeError):
-                        pass
+                        # Resolution failure falls through to the fail-closed branch
+                        # below; log so it's distinguishable from a spec-less session.
+                        _logger.warning(
+                            "MCP tools/call spec resolution failed for session %r; failing closed",
+                            session_id,
+                            exc_info=True,
+                        )
                 _agent_id_local = _session_agent_ids.get(session_id)
+                if spec is None:
+                    return JSONResponse(
+                        status_code=200,
+                        content={
+                            "error": {
+                                "code": -32000,
+                                "message": f"No spec available for session {session_id!r}",
+                            }
+                        },
+                    )
+                # A bare name outside the granted surface is an MCP invalid-params
+                # error, never a tool result that merely carries an error string.
+                refusal = _ungranted_tool_reason(
+                    tool_name, spec, _session_harness_name(session_id)
+                )
+                if refusal is None and tool_name in client_runtime_tool_names(spec):
+                    # Client-runtime tools are granted but have no server-side
+                    # dispatch, so running them here would return success with an
+                    # error string. Refuse with the same invalid-params contract.
+                    refusal = (
+                        f"tool {tool_name!r} runs on the client and cannot be "
+                        f"dispatched through the session MCP endpoint"
+                    )
+                if refusal is not None:
+                    return JSONResponse(
+                        status_code=200,
+                        content={"error": {"code": -32602, "message": refusal}},
+                    )
                 try:
                     dispatch_workspace = await _session_runtime_cwd(session_id)
                     output = await execute_tool(

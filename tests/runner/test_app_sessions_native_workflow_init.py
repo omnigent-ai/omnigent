@@ -21,6 +21,7 @@ from omnigent.errors import ErrorCode, OmnigentError
 from omnigent.harnesses.codex_native.bridge import CODEX_NATIVE_BRIDGE_ID_LABEL_KEY
 from omnigent.inference_config import ModelNotAllowedError
 from omnigent.inner.databricks_executor import DatabricksAuthError
+from omnigent.inner.datamodel import OSEnvSpec
 from omnigent.native import native_dispatch
 from omnigent.runner import create_runner_app
 from omnigent.runner import tool_dispatch as _tool_dispatch
@@ -35,13 +36,20 @@ from omnigent.runner.native import NativeLaunchContext, _resolve_native_spawn_en
 from omnigent.runner.resource_registry import (
     SessionResourceRegistry,
 )
-from omnigent.spec.types import AgentSpec, ExecutorSpec, LocalToolInfo
+from omnigent.spec.types import (
+    AgentSpec,
+    ExecutorSpec,
+    LocalToolInfo,
+    MCPServerConfig,
+    ToolRuntime,
+)
 from tests.runner.conftest import (
     _build_app_for_spec,
     _build_app_with_mcp_tool,
     _build_interrupt_app,
     _build_lifecycle_app,
     _FakeFileServerClient,
+    _FakeMcpManager,
     _FakeProcessManager,
     _ReadTimeoutTransport,
     _runner_client,
@@ -2087,7 +2095,11 @@ async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
     bundle_dir.mkdir()
     workspace = tmp_path / "workspace"
     workspace.mkdir()
-    spec = AgentSpec(spec_version=1, name="bundle-agent")
+    spec = AgentSpec(
+        spec_version=1,
+        name="bundle-agent",
+        os_env=OSEnvSpec(type="caller_process", cwd=str(bundle_dir)),
+    )
 
     captured_workspaces: list[Path | None] = []
 
@@ -2147,6 +2159,221 @@ async def test_mcp_execute_dispatches_builtin_tool_with_runner_workspace(
 
 
 @pytest.mark.asyncio
+async def test_mcp_execute_unknown_local_tool_returns_protocol_error() -> None:
+    """An unregistered tool must not look like a successful tool result."""
+    app, _ = await _build_app_for_spec(AgentSpec(spec_version=1, name="qa-agent"))
+    session_id = "77a8c01d832e4d0587d76028956eab07"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/call", "params": {"name": "qa_missing_tool", "arguments": {}}},
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert "result" not in payload, payload
+    assert payload["error"]["code"] == -32602
+    assert "qa_missing_tool" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_list_advertises_callable_native_local_tools() -> None:
+    """Native MCP clients can discover the local tools that tools/call accepts."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="qa-native-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+    mcp_manager = _FakeMcpManager(tool_name="jira__search_issues")
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        mcp_manager=mcp_manager,  # type: ignore[arg-type]
+    )
+    session_id = "a7b8c9d0e1f23456789a0b1c2d3e4f50"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+        )
+
+    assert response.status_code == 200
+    schemas = response.json()["result"]["schemas"]
+    by_name = {schema["name"]: schema for schema in schemas}
+    assert len(by_name) == len(schemas)
+    assert "jira__search_issues" in by_name
+    assert "sys_os_read" in by_name
+    assert "path" in by_name["sys_os_read"]["parameters"]["properties"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_list_local_only_without_external_manager() -> None:
+    """An agent with no MCP servers still advertises its callable local tools."""
+    app, _ = await _build_app_for_spec(AgentSpec(spec_version=1, name="qa-agent"))
+    session_id = "f752d68321fb401b8442959c983c7db4"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+        )
+
+    assert response.status_code == 200
+    schemas = response.json()["result"]["schemas"]
+    names = {schema["name"] for schema in schemas}
+    assert "sys_session_list" in names
+    assert "sys_os_read" not in names
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_list_requires_manager_when_servers_configured() -> None:
+    """Configured external servers with no runner MCP manager fail with 503."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="qa-agent",
+        mcp_servers=[MCPServerConfig(name="github", transport="http", url="http://x")],
+    )
+    app, _ = await _build_app_for_spec(spec)
+    session_id = "b1a2c3d4e5f60718293a4b5c6d7e8f90"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+        )
+
+    assert response.status_code == 503, response.text
+    assert response.json()["error"]["code"] == -32000
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_lists_and_dispatches_granted_spec_local_tool(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A granted spec-local tool outside the builtin tables is listed and reaches dispatch."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="qa-agent",
+        local_tools=[
+            LocalToolInfo(
+                name="classify_sentiment",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.UC_FUNCTION,
+                catalog_path="main.nlp.classify_sentiment",
+                warehouse_id="wh_test",
+                parameters={"type": "object", "properties": {"text": {"type": "string"}}},
+            )
+        ],
+    )
+    dispatched: list[str] = []
+
+    async def _fake_execute_tool(*, tool_name: str, **kwargs: Any) -> str:
+        del kwargs
+        dispatched.append(tool_name)
+        return "positive"
+
+    monkeypatch.setattr(_tool_dispatch, "execute_tool", _fake_execute_tool)
+    app, _ = await _build_app_for_spec(spec)
+    session_id = "c1d2e3f4a5b6478899aabbccddeeff00"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        listed = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+        )
+        called = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {"name": "classify_sentiment", "arguments": {"text": "great"}},
+            },
+        )
+
+    assert listed.status_code == 200, listed.text
+    assert "classify_sentiment" in listed.json()["result"]["tool_names"]
+    assert called.status_code == 200, called.text
+    assert called.json() == {"result": {"output": "positive"}}
+    assert dispatched == ["classify_sentiment"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_refuses_local_tool_outside_granted_surface() -> None:
+    """A non-native session cannot invoke an OS tool absent from its tool surface."""
+    app, _ = await _build_app_for_spec(AgentSpec(spec_version=1, name="qa-agent"))
+    session_id = "8d8c5d37ae154bb09cf0b307e095f644"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {"name": "sys_os_read", "arguments": {"path": "canary.txt"}},
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["error"]["code"] == -32602
+    assert "not enabled" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_refuses_local_tool_without_session_spec() -> None:
+    """Missing agent context cannot bypass the local tool grant check."""
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+    )
+    session_id = "2ef95c280e534e5c8965b1236c78faae"
+    async with _runner_client(app) as client:
+        response = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {"name": "sys_os_read", "arguments": {"path": "canary.txt"}},
+            },
+        )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["error"]["code"] == -32000
+    assert "No spec available" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
 async def test_mcp_execute_dispatches_full_namespaced_mcp_tool_name() -> None:
     """``/mcp/execute`` must not strip the MCP server prefix before dispatch."""
     app, mcp_manager, _harness_client, _server_client = _build_app_with_mcp_tool(
@@ -2178,6 +2405,279 @@ async def test_mcp_execute_dispatches_full_namespaced_mcp_tool_name() -> None:
     assert mcp_manager.call_tool_invocations == [("jira__search_issues", {"query": "asyncio"})]
 
 
+async def _seed_native_session_without_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> tuple[Any, str]:
+    """Runner app holding a registered codex-native session whose spec has no MCP servers."""
+    from omnigent.runner.mcp_manager import RunnerMcpManager
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="codex-native-ui",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        mcp_manager=RunnerMcpManager(),
+    )
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        seed_resp = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seed_resp.status_code == 201, seed_resp.text
+    return app, session_id
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_tools_list_includes_granted_local_tools_without_mcp_servers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """``tools/list`` advertises the local tools that ``tools/call`` accepts for the session."""
+    app, session_id = await _seed_native_session_without_mcp_servers(monkeypatch)
+
+    async with _runner_client(app) as client:
+        list_resp = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+        )
+
+    assert list_resp.status_code == 200, list_resp.text
+    payload = list_resp.json()
+    assert "error" not in payload, payload
+    result = payload["result"]
+    assert result["failures"] == {}
+    assert "sys_os_read" in result["tool_names"], (
+        f"catalog omits granted local tools: tool_names={result['tool_names']!r}"
+    )
+    schema_names = {schema["name"] for schema in result["schemas"]}
+    assert "sys_os_read" in schema_names, result["schemas"]
+    assert "sys_no_such_tool" not in result["tool_names"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_unknown_bare_tool_returns_protocol_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``tools/call`` for an unknown bare tool is a JSON-RPC error, not a tool result."""
+    app, session_id = await _seed_native_session_without_mcp_servers(monkeypatch)
+
+    async with _runner_client(app) as client:
+        call_resp = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/call", "params": {"name": "sys_no_such_tool", "arguments": {}}},
+        )
+
+    assert call_resp.status_code == 200, call_resp.text
+    payload = call_resp.json()
+    assert "result" not in payload, (
+        f"unknown tool produced a successful envelope instead of an error: {payload!r}"
+    )
+    assert payload["error"]["code"] == -32602, payload
+    assert "sys_no_such_tool" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_omits_and_refuses_client_runtime_local_tool() -> None:
+    """A client-runtime tool is neither advertised nor dispatchable via the endpoint."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="qa-agent",
+        local_tools=[
+            LocalToolInfo(
+                name="client_pick_file",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.CLIENT,
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+    )
+    app, _ = await _build_app_for_spec(spec)
+    session_id = "d4c3b2a1908f7e6d5c4b3a2918f7e6d5"
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        listed = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+        )
+        called = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {"name": "client_pick_file", "arguments": {}},
+            },
+        )
+
+    assert listed.status_code == 200, listed.text
+    assert "client_pick_file" not in listed.json()["result"]["tool_names"], (
+        "client-runtime tool must not be advertised: it cannot be dispatched here"
+    )
+    assert called.status_code == 200, called.text
+    payload = called.json()
+    assert "result" not in payload, (
+        f"client tool produced a successful envelope instead of an error: {payload!r}"
+    )
+    assert payload["error"]["code"] == -32602
+    assert "client_pick_file" in payload["error"]["message"]
+
+
+@pytest.mark.asyncio
+async def test_mcp_execute_omits_local_tool_name_containing_double_underscore(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A ``__``-named local tool is not advertised and does not round-trip as success."""
+    from omnigent.runner.mcp_manager import RunnerMcpManager
+
+    spec = AgentSpec(
+        spec_version=1,
+        name="qa-agent",
+        executor=ExecutorSpec(type="omnigent", config={"harness": "codex-native"}),
+        local_tools=[
+            LocalToolInfo(
+                name="local__search",
+                path=None,
+                language="python",
+                runtime=ToolRuntime.UC_FUNCTION,
+                catalog_path="main.nlp.local_search",
+                warehouse_id="wh_test",
+                parameters={"type": "object", "properties": {}},
+            )
+        ],
+    )
+
+    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
+        del agent_id, session_id
+        return spec
+
+    async def _no_op_auto_create(*args: Any, **kwargs: Any) -> None:
+        del args, kwargs
+
+    monkeypatch.setattr(
+        "omnigent.runner.native.orchestration._auto_create_codex_terminal", _no_op_auto_create
+    )
+    app = create_runner_app(
+        process_manager=_FakeProcessManager(_ScriptedHarnessClient([])),  # type: ignore[arg-type]
+        spec_resolver=_resolver,
+        server_client=NullServerClient(),  # type: ignore[arg-type]
+        mcp_manager=RunnerMcpManager(),
+    )
+    session_id = uuid.uuid4().hex
+    async with _runner_client(app) as client:
+        seeded = await client.post(
+            "/v1/sessions",
+            json={"session_id": session_id, "agent_id": "0e36e3219954d2deaef06b8e2a936f38"},
+        )
+        assert seeded.status_code == 201, seeded.text
+        listed = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={"method": "tools/list", "params": {}},
+        )
+        called = await client.post(
+            f"/v1/sessions/{session_id}/mcp/execute",
+            json={
+                "method": "tools/call",
+                "params": {"name": "local__search", "arguments": {}},
+            },
+        )
+
+    assert listed.status_code == 200, listed.text
+    assert "local__search" not in listed.json()["result"]["tool_names"], (
+        "a '__'-named local tool routes to the external MCP manager, so it must not "
+        "be advertised as a dispatchable local tool"
+    )
+    payload = called.json()
+    assert "result" not in payload, (
+        f"a '__'-named local tool produced a successful envelope: {payload!r}"
+    )
+    # The ``__`` name routes to the external MCP manager, which has no server
+    # serving it, so dispatch fails with the MCP-manager error code.
+    assert payload["error"]["code"] == -32000, payload
+
+
+def _nb2_echo_callable(text: str = "") -> str:
+    """Return the text unchanged (test fixture for a dotted callable tool)."""
+    return text
+
+
+def test_build_mcp_local_tool_schemas_lists_callable_omits_file_local() -> None:
+    """A dotted callable is listed; a file-local tool that needs a workdir is not."""
+    spec = AgentSpec(
+        spec_version=1,
+        name="qa-agent",
+        local_tools=[
+            LocalToolInfo(
+                name="echo_callable",
+                path=f"{__name__}._nb2_echo_callable",
+                language="omnigent-python-callable",
+                runtime=ToolRuntime.SERVER,
+                parameters={"type": "object", "properties": {"text": {"type": "string"}}},
+            ),
+            LocalToolInfo(
+                name="file_local_tool",
+                path="tools/python/file_local_tool.py",
+                language="python",
+                runtime=ToolRuntime.SERVER,
+            ),
+        ],
+    )
+
+    names = {schema["name"] for schema in _tool_dispatch.build_mcp_local_tool_schemas(spec)}
+
+    assert "echo_callable" in names, "a dotted callable tool resolves without a workdir"
+    assert "file_local_tool" not in names, (
+        "a file-local tool needs the agent workdir to load, so it is not advertised"
+    )
+
+
+def test_build_mcp_local_tool_schemas_ignores_non_agent_spec_stand_in() -> None:
+    """A resolver stand-in that is not an ``AgentSpec`` yields no local schemas.
+
+    ``_unwrap_resolved_spec`` passes legacy or test resolver objects through
+    unchanged, so ``tools/list`` must not try to build a ``ToolManager`` from
+    one and fail the whole listing (including external MCP schemas).
+    """
+
+    class _StandInSpec:
+        mcp_servers: list[object] = []
+        local_tools: list[object] = []
+
+    assert _tool_dispatch.build_mcp_local_tool_schemas(_StandInSpec()) == []
+
+
+def test_client_runtime_tool_names_ignores_non_agent_spec_stand_in() -> None:
+    """The client-runtime gate tolerates a stand-in like its sibling gates.
+
+    The bare ``tools/call`` route calls ``client_runtime_tool_names`` after
+    ``_ungranted_tool_reason`` skips a non-``AgentSpec`` stand-in, so it must
+    not raise on an object lacking ``local_tools``.
+    """
+
+    class _StandInSpec:
+        pass
+
+    assert _tool_dispatch.client_runtime_tool_names(_StandInSpec()) == frozenset()
+    assert _tool_dispatch.client_runtime_tool_names(None) == frozenset()
+
+
 @pytest.mark.asyncio
 async def test_sessions_native_path_injects_mcp_schemas() -> None:
     """``POST /v1/sessions/{conv}/events`` with a message body injects MCP schemas.
@@ -2207,7 +2707,7 @@ async def test_sessions_native_path_injects_mcp_schemas() -> None:
     assert harness_client.posted_bodies, "harness must receive at least one event"
     body = harness_client.posted_bodies[0]
     schemas = body.get("tools") or []
-    assert any(s.get("name") == "jira_search_issues" for s in schemas), (
+    assert any(s.get("name") == "jira__search_issues" for s in schemas), (
         f"MCP schema must be injected on sessions-native path; got {schemas}"
     )
 
@@ -2245,7 +2745,7 @@ async def test_action_required_marker_round_trips_to_relayed_frame() -> None:
         f"stream text was {stream_text!r}"
     )
     # Runner dispatched the MCP tool through the Omnigent server proxy (AP mode).
-    assert server_client.call_tool_invocations == [("jira_search_issues", {})], (
+    assert server_client.call_tool_invocations == [("jira__search_issues", {})], (
         f"runner must dispatch the MCP tool via ProxyMcpManager (AP server); "
         f"got {server_client.call_tool_invocations}"
     )
