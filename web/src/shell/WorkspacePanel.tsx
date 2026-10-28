@@ -642,13 +642,14 @@ function RailTerminals({
 }) {
   const [recentKeys, setRecentKeys] = useState<string[]>([]);
   const liveKeys = recentKeys.filter((key) => openTerminals.includes(key));
-  if (shownKey !== null && liveKeys[liveKeys.length - 1] !== shownKey) {
-    // Adjusting state during render mounts the newly shown shell in this same commit.
-    setRecentKeys(
-      [...liveKeys.filter((key) => key !== shownKey), shownKey].slice(-MAX_WARM_RAIL_TERMINALS),
-    );
-  }
-  return liveKeys.map((key) => (
+  const nextKeys =
+    shownKey === null || liveKeys[liveKeys.length - 1] === shownKey
+      ? liveKeys
+      : [...liveKeys.filter((key) => key !== shownKey), shownKey].slice(-MAX_WARM_RAIL_TERMINALS);
+  // Persist closed-tab pruning too, so a relaunched terminal id stays unmounted until shown.
+  // Adjusting state during render mounts a newly shown shell in this same commit.
+  if (nextKeys !== liveKeys || liveKeys.length !== recentKeys.length) setRecentKeys(nextKeys);
+  return nextKeys.map((key) => (
     <RailTerminalView
       key={key}
       {...viewProps}

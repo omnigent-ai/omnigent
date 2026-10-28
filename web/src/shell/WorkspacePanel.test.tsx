@@ -765,6 +765,9 @@ describe("WorkspacePanel shell tabs", () => {
 
     rerender({ openTerminals: [termKey] });
     expect(screen.queryByText("terminal_zsh_s2")).toBeNull();
+    // Terminal ids are deterministic, so a relaunch can reuse the closed id; it waits to be shown.
+    rerender({ openTerminals: [termKey, otherKey] });
+    expect(screen.queryByText("terminal_zsh_s2")).toBeNull();
   });
 
   it("starts each session with fresh shell mounts", async () => {
