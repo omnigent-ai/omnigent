@@ -1,0 +1,242 @@
+import { useRef, useState } from "react";
+import { useQueryClient } from "@tanstack/react-query";
+import { toast } from "sonner";
+import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
+import {
+  HarnessPicker,
+  HarnessPickerConfigRow,
+  HarnessPickerConfigPage,
+} from "@/components/composer/HarnessPicker";
+import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import {
+  compactModelTriggerLabel,
+  defaultModelLabel,
+  formatStatusEffortLabel,
+  nativeModelLabel,
+  nativeModelTooltip,
+} from "@/lib/composerModelLabel";
+import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
+import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { useConversationEntryState } from "@/hooks/useConversationEntryState";
+import { useSession } from "@/hooks/useSession";
+import { useHostModelOptions } from "@/hooks/useHosts";
+import { useHarnessEffortFamilies } from "@/lib/agentLabels";
+import {
+  effortLevelsForConv,
+  modelPickerKindForConv,
+  shouldShowEffortPicker,
+} from "@/lib/composerCapabilities";
+import { findNativeModelOption } from "@/lib/codexNativeModels";
+import { isEditorLevel } from "@/lib/permissionsApi";
+import { updateSession } from "@/lib/sessionsApi";
+import { parentIdFromLabels } from "@/lib/sessionHost";
+import type { SideChatModelSettings } from "@/lib/sideChat";
+import type { Session } from "@/lib/types";
+
+/** Model controls always address this pane's session, independent of the active main chat. */
+export function SideChatSettings({
+  session,
+  draft,
+}: {
+  session: Session;
+  draft?: {
+    settings?: SideChatModelSettings;
+    onChange: (updates: SideChatModelSettings) => void;
+    disabled: boolean;
+  };
+}) {
+  const queryClient = useQueryClient();
+  const state = useConversationEntryState(session.id);
+  const nativeSide = session.labels?.["omnigent.codex_native.agent_nickname"] === "Side chat";
+  const settingsSupported =
+    !nativeSide &&
+    session.harness !== "codex-native" &&
+    session.labels?.["omnigent.wrapper"] !== "codex-native-ui";
+  const sourceId = session.parentSessionId ?? parentIdFromLabels(session.labels);
+  const { session: parent } = useSession(sourceId);
+  const families = useHarnessEffortFamilies();
+  const isMobile = useIsMobileViewport();
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [configOpen, setConfigOpen] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const savingRef = useRef(false);
+  const [error, setError] = useState<string | null>(null);
+  const catalogs = [state.codexModelOptions, session.codexModelOptions];
+  const sessionOptions = catalogs.find((catalog) => catalog?.length) ?? [];
+  const kind = modelPickerKindForConv(session, sessionOptions);
+  const probeHarness =
+    kind === "codex" || kind === "claude" || kind === "devin" ? `${kind}-native` : null;
+  const { data: hostOptions } = useHostModelOptions(
+    session.hostId ?? parent?.hostId ?? null,
+    probeHarness ?? "",
+    settingsSupported &&
+      !session.inferenceConfigured &&
+      probeHarness !== null &&
+      sessionOptions.length === 0,
+  );
+  // Share the main composer's host catalog while the session has no model list.
+  const options =
+    !session.inferenceConfigured && sessionOptions.length === 0
+      ? (hostOptions ?? sessionOptions)
+      : sessionOptions;
+  const family = session.harness ? (families[session.harness] ?? null) : null;
+  const model =
+    draft?.settings?.modelOverride ??
+    session.modelOverride ??
+    state.llmModel ??
+    session.llmModel ??
+    null;
+  const selectedModel = findNativeModelOption(options, model);
+  const nativeAgent =
+    nativeCodingAgentForHarness(session.harness) ??
+    (kind ? nativeCodingAgentForHarness(`${kind}-native`) : undefined);
+  const harnessLabel = nativeAgent?.displayName ?? session.agentName ?? "Session";
+  const modelLabel = selectedModel
+    ? nativeModelLabel(selectedModel)
+    : (model ?? defaultModelLabel(options));
+  const effort =
+    draft?.settings?.reasoningEffort !== undefined
+      ? draft.settings.reasoningEffort
+      : (session.reasoningEffort ?? null);
+  const supportsEffort = shouldShowEffortPicker(session, family);
+  const efforts = supportsEffort ? effortLevelsForConv(session, options, model, family) : [];
+  const showModels = kind !== null && options.length > 0;
+  if (!settingsSupported || (!showModels && efforts.length === 0)) return null;
+  const disabled =
+    saving ||
+    draft?.disabled ||
+    !isEditorLevel(session.permissionLevel) ||
+    session.labels?.["omnigent.closed"] === "true";
+
+  async function save(updates: SideChatModelSettings) {
+    if (disabled || savingRef.current) return;
+    if (draft) {
+      draft.onChange(updates);
+      return;
+    }
+    savingRef.current = true;
+    setSaving(true);
+    setError(null);
+    try {
+      const updated = await updateSession(session.id, updates);
+      queryClient.setQueryData<Session>(["session", session.id], (previous) => ({
+        ...previous,
+        ...updated,
+      }));
+    } catch (cause) {
+      const message =
+        cause instanceof Error ? cause.message : "Couldn't update side chat settings.";
+      setError(message);
+      toast.error(message);
+    } finally {
+      savingRef.current = false;
+      setSaving(false);
+    }
+  }
+
+  const configContent = (
+    <>
+      {error && (
+        <p role="alert" className="px-2 py-1 text-xs text-destructive whitespace-normal">
+          {error}
+        </p>
+      )}
+      <ComposerConfigSections
+        models={
+          showModels
+            ? {
+                testId: "side-chat-models",
+                header: "Models",
+                choices: options.map((option) => ({
+                  key: option.id,
+                  label: nativeModelLabel(option),
+                  checked:
+                    option.id === selectedModel?.id || (model === null && !!option.isDefault),
+                  title: nativeModelTooltip(option),
+                  className: "whitespace-normal break-words",
+                  disabled,
+                  onSelect: () => {
+                    const nextEfforts = supportsEffort
+                      ? effortLevelsForConv(session, options, option.id, family)
+                      : [];
+                    let nextEffort = option.defaultReasoningEffort ?? nextEfforts[0] ?? null;
+                    if (effort && nextEfforts.includes(effort)) nextEffort = effort;
+                    void save({
+                      modelOverride: option.id,
+                      ...(supportsEffort ? { reasoningEffort: nextEffort } : {}),
+                    });
+                  },
+                  data: { "data-model-id": option.id },
+                })),
+              }
+            : undefined
+        }
+        efforts={
+          efforts.length
+            ? {
+                testId: "side-chat-efforts",
+                header: "Effort",
+                choices: efforts.map((level) => ({
+                  key: level,
+                  label: formatStatusEffortLabel(level) ?? level,
+                  checked: effort === level,
+                  disabled,
+                  onSelect: () => void save({ reasoningEffort: level }),
+                  data: { "data-effort-level": level },
+                })),
+              }
+            : undefined
+        }
+      />
+    </>
+  );
+  return (
+    <HarnessPicker
+      open={menuOpen}
+      onOpenChange={(open) => {
+        if (!open || !disabled) setMenuOpen(open);
+        if (!open) setConfigOpen(false);
+      }}
+      trigger={{
+        label: "Side chat model and effort",
+        model: compactModelTriggerLabel(modelLabel),
+        effort: formatStatusEffortLabel(effort) ?? undefined,
+        icon: (
+          <ComposerAgentIcon
+            agent={{
+              name: nativeAgent?.agentName ?? session.agentName ?? "",
+              harness: nativeAgent?.harness ?? session.harness ?? null,
+            }}
+          />
+        ),
+        disabled,
+        testIdPrefix: "side-chat",
+        "data-testid": "side-chat-settings",
+      }}
+      testId="side-chat-model-menu"
+    >
+      {isMobile && configOpen ? (
+        <HarnessPickerConfigPage
+          backTestId="side-chat-model-back"
+          testId="side-chat-model-config"
+          onBack={() => setConfigOpen(false)}
+        >
+          {configContent}
+        </HarnessPickerConfigPage>
+      ) : (
+        <HarnessPickerConfigRow
+          label={harnessLabel}
+          value={modelLabel}
+          open={configOpen}
+          onOpenChange={setConfigOpen}
+          isMobile={isMobile}
+          disabled={disabled}
+          testId="side-chat-model-edit"
+          configTestId="side-chat-model-config"
+        >
+          {configContent}
+        </HarnessPickerConfigRow>
+      )}
+    </HarnessPicker>
+  );
+}

@@ -188,6 +188,10 @@ describe("side-chat working indicator", () => {
     const pane = (
       <SideChatPane childId="pending:side" selectionParentId="conv_main" onStart={onStart} />
     );
+    const settings = { modelOverride: "gpt-6-sol", reasoningEffort: "max" };
+    useChatStore
+      .getState()
+      .updateSideChatComposer("pending:side", (draft) => ({ ...draft, settings }));
     const view = renderPane(pane);
     const input = screen.getByTestId("side-chat-input");
     fireEvent.change(input, { target: { value: "Explain the approach" } });
@@ -205,6 +209,7 @@ describe("side-chat working indicator", () => {
     expect(useChatStore.getState().sideChatSelectionTarget).toBeNull();
 
     await act(async () => rejectStart?.(new Error("Fork creation failed")));
+    expect(useChatStore.getState().sideChatComposers["pending:side"].settings).toEqual(settings);
 
     expect(screen.queryByTestId("working-indicator")).toBeNull();
     expect(screen.getByTestId("side-chat-input")).toBeEnabled();

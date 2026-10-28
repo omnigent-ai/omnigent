@@ -244,6 +244,8 @@ def test_side_chat_sends_with_stale_branch_metadata(
     assert child.json()["runner_id"] == runner_id
     expect(pane.get_by_text(parent_reply, exact=True)).to_have_count(0)
 
+    expect(pane.get_by_role("button", name="Side chat model and effort")).to_have_count(0)
+
     expect(pane.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     page.get_by_test_id("side-chat-input").fill(followup)
     expect(page.get_by_test_id("side-chat-send")).to_be_enabled(timeout=30_000)
@@ -485,6 +487,8 @@ def test_side_chat_opens_in_a_drawer_on_mobile(
     expect(drawer.locator(_ASSISTANT).filter(has_text=side_reply)).to_be_visible(timeout=30_000)
     expect(drawer.get_by_test_id("working-indicator")).to_have_count(0, timeout=30_000)
     assert len(side_chat_forks) == 1
+
+    expect(drawer.get_by_role("button", name="Side chat model and effort")).to_have_count(0)
 
     drawer.locator(_ASSISTANT).get_by_text(side_reply, exact=True).select_text()
     reply_popup = page.get_by_role("button", name="Reply ↵", exact=True)

@@ -1,4 +1,5 @@
 import { SelectionPopup } from "./SelectionPopup";
+import { SideChatSettings } from "./SideChatSettings";
 import {
   useCallback,
   useEffect,
@@ -161,6 +162,7 @@ export function SideChatPane({
   const starting = useChatStore((s) => s.sideChatComposers[childId]?.starting ?? false);
   // The server seals a side chat whose fork died with its runner.
   const { session } = useSession(pending ? null : childId);
+  const { session: draftSource } = useSession(pending ? (selectionParentId ?? null) : null);
   const readOnly = restoredReadOnly || session?.labels?.["omnigent.closed"] === "true";
   useLayoutEffect(() => {
     if (!selectionParentId || readOnly || starting) return;
@@ -412,6 +414,7 @@ export function SideChatPane({
                 childId={childId}
                 harness={sessionHarness}
                 session={session}
+                settingsSession={pending ? draftSource : session}
                 agentId={boundAgentId}
                 responseId={activeResponse?.responseId}
                 interruptReady={interruptReady}
@@ -432,14 +435,15 @@ export function SideChatPane({
  * The side chat's composer. On a live tab it sends to the child via
  * `pinnedConversationId` (so turns land on the side thread, not the main one)
  * with the main composer's affordances (attach, dictation). On a pending tab it
- * has just text + send: the first message creates the fork via `onStart`, and
- * the text is kept if creation fails so it isn't lost.
+ * lets the user draft text and choose settings before `onStart` creates the fork.
+ * The draft is kept if creation fails.
  */
 function SideChatComposer({
   fullSession,
   childId,
   harness,
   session,
+  settingsSession,
   agentId,
   responseId,
   interruptReady,
@@ -452,6 +456,7 @@ function SideChatComposer({
   childId: string;
   harness: string | null | undefined;
   session: Session | null | undefined;
+  settingsSession: Session | null | undefined;
   agentId: string | null;
   responseId: string | undefined;
   interruptReady: boolean;
@@ -998,6 +1003,25 @@ function SideChatComposer({
           ),
           trailing: (
             <>
+              {!fullSession && settingsSession?.id && (
+                <SideChatSettings
+                  key={childId}
+                  session={settingsSession}
+                  draft={
+                    pending
+                      ? {
+                          settings: composer?.settings,
+                          disabled: starting,
+                          onChange: (updates) =>
+                            updateComposer(childId, (current) => ({
+                              ...current,
+                              settings: { ...current.settings, ...updates },
+                            })),
+                        }
+                      : undefined
+                  }
+                />
+              )}
               <ComposerMicButton
                 className="size-8 md:size-7"
                 disabled={!ready}

@@ -37,6 +37,9 @@ the header menu), and each place is a separate entry point.
   parent relaunches the parent first, then shares its replacement runner. An
   existing side chat whose shared runner exited does the same on its next
   message or Resume.
+- `side-chat-settings`: before or after the first message, choose a supported model or effort
+  in the side-chat composer; selections apply to that chat's next turn independently
+  of its parent, in the desktop panel and mobile drawer.
 - `side-chat-quotes`: Ask in side chat adds selected parent text to the visible,
   writable side chat; Reply on side-chat text quotes it in that chat. Both preserve
   interleaved comments and existing attachments; removing a quote keeps its comments.
@@ -376,6 +379,19 @@ session's skills: `/help` is answered locally and a recognised skill runs
 in-process through `slash_command`; a native terminal side chat shows no menu
 and forwards slash text to the vendor TUI.
 
+**Side-chat settings:** open an unsent side chat from the Workspace menu,
+composer add tray, or Ask in side chat. Before sending, open the model pill
+beside the microphone, open its configuration row, and select a model or effort.
+Switch tabs and return to confirm the draft keeps the choice. Send the first
+question and check it uses that selection. Change it again before a follow-up;
+the parent's selection should stay unchanged. Repeat in the mobile drawer.
+If the native session's model list is empty, the picker uses the same host
+catalog as the main composer until the session's list arrives.
+Available choices follow the harness's capabilities; viewers and closed chats
+cannot change them. A failed start keeps the draft and selections for retry
+without changing the parent's settings. Native Codex retains its existing
+side-thread flow and does not expose these controls; it is a separate follow-up.
+
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
 an unsent tab, while keeping the draft. With no eligible tab visible, it opens a
@@ -670,6 +686,18 @@ plain `uv run pytest`, which starts a private server for the test.
   mobile side-chat drawer. Its stale-branch scenarios simulate a stopped parent
   runner and verify parent recovery before binding; the hosted lifecycle test
   above proves live-parent reuse with actual runner processes.
+- **`side-chat-settings`, desktop panel and mobile drawer:**
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_sends_with_stale_branch_metadata`
+  checks that a legacy harness without advertised picker capabilities hides the
+  control after slash and Workspace creation;
+  `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_side_chat_opens_in_a_drawer_on_mobile`
+  checks the same gate in the mobile drawer.
+  `tests/browser_ui/chat/test_model_catalog.py::test_side_chat_model_settings_before_and_after_first_message`
+  checks the add tray and Workspace entry points on desktop and mobile with mocked
+  session APIs, including fork-time draft settings and later child-only updates.
+  `web/src/components/chat/SideChatSettings.test.tsx`
+  covers explicit child targeting, compatible effort choices, rejected updates,
+  harness capabilities, and viewer/closed states.
 - **`side-chat-quotes`, desktop Ask in side chat and Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
   checks pending/live tab reuse, interleaved comments, pasted images, and replies

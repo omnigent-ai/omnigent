@@ -56,3 +56,9 @@ export function isSideChatCommand(text: string): boolean {
   if (!text.startsWith(SIDE_CHAT_COMMAND_PREFIX)) return false;
   return text.slice(SIDE_CHAT_COMMAND_PREFIX.length).trim().length > 0;
 }
+
+/** Optional model and effort picks for a side chat’s first turn. */
+export interface SideChatModelSettings {
+  modelOverride?: string;
+  reasoningEffort?: string | null;
+}

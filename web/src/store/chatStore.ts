@@ -113,7 +113,11 @@ import {
 import { recordOptimisticTitle } from "@/lib/optimisticTitles";
 import { getSessionDraft, setSessionDraft } from "@/lib/sessionDrafts";
 import { forgetUnsentSend, peekUnsentSend, rememberUnsentSend } from "@/lib/unsentSends";
-import { isSideChatCommand, usesNativeSideChatFork } from "@/lib/sideChat";
+import {
+  isSideChatCommand,
+  usesNativeSideChatFork,
+  type SideChatModelSettings,
+} from "@/lib/sideChat";
 // Re-exported below so existing `@/store/chatStore` importers keep working; the
 // pure helpers live in a leaf module so low-level session hooks can gate on temp
 // ids without an import cycle back to the store.
@@ -1101,6 +1105,7 @@ export interface ConversationState {
  */
 /** One side chat's unsent composer contents. */
 export interface SideChatComposerDraft {
+  settings?: SideChatModelSettings;
   starting?: boolean;
   quotes?: ReplyQuote[];
   text: string;

@@ -11,6 +11,7 @@
 // wire fields.
 
 import type { ConversationItem } from "./conversationItems";
+import type { SideChatModelSettings } from "./sideChat";
 import type { MessageContentBlock } from "./blocks";
 import type { McpServerStartup } from "./events";
 import { authenticatedFetch } from "./identity";
@@ -820,7 +821,7 @@ export async function forkSession(
     upToResponseId?: string;
     config?: {
       modelOverride?: string;
-      reasoningEffort?: string;
+      reasoningEffort?: string | null;
       terminalLaunchArgs?: string[];
       codexBypassSandbox?: boolean;
     };
@@ -835,7 +836,7 @@ export async function forkSession(
     agent_id?: string;
     up_to_response_id?: string;
     model_override?: string;
-    reasoning_effort?: string;
+    reasoning_effort?: string | null;
     terminal_launch_args?: string[];
     codex_bypass_sandbox?: boolean;
     host_type?: "managed";
@@ -906,7 +907,10 @@ export async function forkSession(
  * @returns The new side-chat session id.
  * @throws Error when the source is disconnected or the fork / runner launch fails.
  */
-export async function createSideChat(sourceId: string): Promise<{ childSessionId: string }> {
+export async function createSideChat(
+  sourceId: string,
+  settings?: SideChatModelSettings,
+): Promise<{ childSessionId: string }> {
   let source = await getSession(sourceId);
   if (
     source.runnerOnline === false &&
@@ -922,7 +926,11 @@ export async function createSideChat(sourceId: string): Promise<{ childSessionId
   if (!canUseRunner) {
     throw new Error("This session is disconnected. Reconnect it before starting a side chat.");
   }
-  const fork = await forkSession(sourceId, { title: "Side chat", sideChat: true });
+  const fork = await forkSession(sourceId, {
+    title: "Side chat",
+    sideChat: true,
+    config: settings,
+  });
   if (runnerId) {
     await updateSession(fork.id, { runnerId });
   }
