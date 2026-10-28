@@ -343,6 +343,9 @@ host; with a single replica, that is the restarted server.
 
 ### How recovery decides
 
+When a startup's lease expires, recovery inspects what the run saved and chooses its
+final status without resending the prompt, as shown below.
+
 ```mermaid
 flowchart TD
     A["Run's startup lease expired"] --> Own{"Does this server<br/>own the run's host?"}
