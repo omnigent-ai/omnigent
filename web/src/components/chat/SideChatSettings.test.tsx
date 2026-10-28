@@ -9,7 +9,7 @@ import * as identity from "@/lib/identity";
 import type { Session, NativeModelOption } from "@/lib/types";
 import type * as AgentLabels from "@/lib/agentLabels";
 import { conversationRegistry } from "@/store/conversationRegistry";
-import { useChatStore } from "@/store/chatStore";
+import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { SideChatSettings } from "./SideChatSettings";
 
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
@@ -136,6 +136,52 @@ it("keeps the saved selection when the server rejects a change", async () => {
   await user.click(screen.getByRole("button", { name: "Side chat model and effort" }));
   await user.click(screen.getByTestId("side-chat-model-edit"));
   expect(screen.queryByRole("alert")).not.toBeInTheDocument();
+});
+
+it("keeps the reported Claude model when a saved request is not applied", async () => {
+  conversationRegistry.acquire("side").setState({ llmModel: "model-a" });
+  mount({
+    ...child,
+    harness: "claude-native",
+    hostId: null,
+    labels: { ...child.labels, "omnigent.wrapper": "claude-code-native-ui" },
+  });
+  const user = userEvent.setup();
+  const picker = screen.getByRole("button", { name: "Side chat model and effort" });
+  await user.click(picker);
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  await user.click(screen.getByRole("menuitemcheckbox", { name: "Model B" }));
+  await waitFor(() =>
+    expect(cache.getQueryData<Session>(["session", "side"])?.modelOverride).toBe("model-b"),
+  );
+  act(() =>
+    handleSessionEvent(
+      {
+        type: "error",
+        source: "execution",
+        toolName: null,
+        error: { code: "model_change_not_applied", message: "The terminal was not switched." },
+      },
+      "side",
+    ),
+  );
+  expect(picker).toHaveTextContent("Model A");
+  expect(screen.getByRole("menuitemcheckbox", { name: "Model A" })).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
+  expect(screen.getByRole("menuitemcheckbox", { name: "Model B" })).toHaveAttribute(
+    "aria-checked",
+    "false",
+  );
+  act(() =>
+    handleSessionEvent({ type: "session_model", conversationId: "side", model: "model-b" }, "side"),
+  );
+  expect(picker).toHaveTextContent("Model B");
+  expect(screen.getByRole("menuitemcheckbox", { name: "Model B" })).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
 });
 
 it("offers SDK effort controls without inventing a model catalog", async () => {
@@ -270,6 +316,32 @@ it("does not pin a runner-reported model when changing only draft effort", async
   await user.click(screen.getByTestId("side-chat-model-edit"));
   await user.click(screen.getByRole("menuitemcheckbox", { name: "Low" }));
   expect(onChange).toHaveBeenCalledWith({ reasoningEffort: "low" });
+  expect(sessionsApi.updateSession).not.toHaveBeenCalled();
+});
+
+it("shows an explicit draft model ahead of the source Claude report", async () => {
+  render(
+    <QueryClientProvider client={cache}>
+      <SideChatSettings
+        session={{
+          ...child,
+          harness: "claude-native",
+          labels: { "omnigent.wrapper": "claude-code-native-ui" },
+          llmModel: "model-a",
+        }}
+        draft={{ settings: { modelOverride: "model-b" }, onChange: vi.fn(), disabled: false }}
+      />
+    </QueryClientProvider>,
+  );
+  const picker = screen.getByRole("button", { name: "Side chat model and effort" });
+  expect(picker).toHaveTextContent("Model B");
+  const user = userEvent.setup();
+  await user.click(picker);
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  expect(screen.getByRole("menuitemcheckbox", { name: "Model B" })).toHaveAttribute(
+    "aria-checked",
+    "true",
+  );
   expect(sessionsApi.updateSession).not.toHaveBeenCalled();
 });
 
@@ -451,7 +523,7 @@ it.each([false, true])(
   },
 );
 
-it.each([false, true])("hides unsupported custom native effort (draft=%s)", (draft) => {
+it("hides unsupported custom native effort", () => {
   render(
     <QueryClientProvider client={cache}>
       <SideChatSettings
@@ -461,7 +533,6 @@ it.each([false, true])("hides unsupported custom native effort (draft=%s)", (dra
           labels: { "omnigent.ui": "terminal" },
           codexModelOptions: [],
         }}
-        draft={draft ? { onChange: vi.fn(), disabled: false } : undefined}
       />
     </QueryClientProvider>,
   );

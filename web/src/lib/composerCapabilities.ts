@@ -1,6 +1,6 @@
 import type { NativeModelOption } from "./types";
 import { nativeCodingAgentForHarness } from "./nativeCodingAgents";
-import { codexEffortLevelsForModel } from "./codexNativeModels";
+import { codexEffortLevelsForModel, findNativeModelOption } from "./codexNativeModels";
 import { effortLevelsForFamily, supportsEffortControl } from "./sessionCapabilities";
 
 const EFFORT_LEVELS = ["low", "medium", "high"] as const;
@@ -21,6 +21,20 @@ const PI_NATIVE_EFFORT_LEVELS = [
 
 export type NativeModelPickerKind =
   "claude" | "codex" | "cursor" | "kiro" | "opencode" | "pi" | "devin" | "acp" | "configured";
+
+/** Claude/Codex reports win over requests that the runner may not have applied. */
+export function selectedModelForPicker(
+  kind: NativeModelPickerKind | null,
+  options: readonly NativeModelOption[],
+  requestedModel: string | null,
+  reportedModel: string | null,
+): string | null {
+  if (kind === "claude" || kind === "codex") {
+    const model = reportedModel || requestedModel;
+    return model ? (findNativeModelOption(options, model)?.id ?? model) : null;
+  }
+  return requestedModel ?? (kind === "configured" ? reportedModel : null);
+}
 
 /** Resolve unlabeled native sessions from their harness; children keep their own capabilities. */
 function effectiveWrapperLabel(

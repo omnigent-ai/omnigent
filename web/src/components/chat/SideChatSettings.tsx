@@ -26,6 +26,7 @@ import { useHarnessEffortFamilies } from "@/lib/agentLabels";
 import {
   effortLevelsForConv,
   sdkEffortFamilyForHarness,
+  selectedModelForPicker,
   modelPickerKindForConv,
   shouldShowEffortPicker,
 } from "@/lib/composerCapabilities";
@@ -83,12 +84,11 @@ export function SideChatSettings({
       ? (hostOptions ?? sessionOptions)
       : sessionOptions;
   const family = sdkEffortFamilyForHarness(session.harness, families);
+  const reportedModel = state.llmModel ?? session.llmModel ?? null;
   const model =
     draft?.settings?.modelOverride ??
-    session.modelOverride ??
-    state.llmModel ??
-    session.llmModel ??
-    null;
+    selectedModelForPicker(kind, options, session.modelOverride ?? null, reportedModel) ??
+    reportedModel;
   const fusionModel =
     kind === "devin" && isFusionModelUid(model) ? fusionOption(options) : undefined;
   const selectedModel = fusionModel ?? findNativeModelOption(options, model);
