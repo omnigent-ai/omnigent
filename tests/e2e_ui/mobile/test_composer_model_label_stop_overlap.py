@@ -420,7 +420,7 @@ def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
     seeded_session: tuple[str, str],
 ) -> None:
     """Keep Goal and Plan reachable in the shared Add menu at both widths, with
-    no row text cut off; the side-chat description shows only on desktop."""
+    no row text cut off and only the side-chat description hidden on a phone."""
     base_url, session_id = seeded_session
     page.set_viewport_size(_IPHONE_VIEWPORT)
     _patch_session_as_databricks_codex_native(page, session_id)
@@ -444,7 +444,11 @@ def test_composer_plan_and_goal_actions_fit_mobile_and_desktop(
                 assert bounds["x"] >= 0
                 assert bounds["x"] + bounds["width"] <= viewport["width"]
             shown = _menu_row_texts_shown(page.get_by_test_id("composer-add-menu"))
-            assert "Start a new side chat" in shown
+            assert {
+                "Start a new side chat",
+                "Set a goal for this session",
+                "Turn plan mode on",
+            } <= shown
             description_shown = "Ask without affecting this conversation" in shown
             assert description_shown == (viewport["width"] >= 1200)
             page.keyboard.press("Escape")
