@@ -33,7 +33,7 @@ function setup(t, platform = "darwin", overrides = {}) {
     getAppIcon: async () => null,
     getServerContext: () => serverContext,
     confirmDefaultOpen: async () => true,
-    resolveSshHost: () => "arca.ssh",
+    getVerifiedSshHost: () => "arca.ssh",
     appDirectories: [directory],
     ...overrides,
   });
@@ -66,7 +66,7 @@ test("discovers SSH connections only for trusted requests without a known mappin
   let knownHost = null;
   let discoveries = 0;
   const { resolve } = setup(t, "darwin", {
-    resolveSshHost: () => knownHost,
+    getVerifiedSshHost: () => knownHost,
     discoverSshHost: async (keys) => {
       discoveries++;
       assert.deepEqual(keys, fingerprints);
@@ -84,7 +84,7 @@ test("discovers SSH connections only for trusted requests without a known mappin
 test("opens remote files and folders with the same SSH authority as Arca Companion", async (t) => {
   let alias = "arca.ssh";
   const { directory, openRemote, calls, resolve } = setup(t, "darwin", {
-    resolveSshHost: () => alias,
+    getVerifiedSshHost: () => alias,
   });
   fs.mkdirSync(path.join(directory, "Cursor.app"));
   const remotePath = "/home/user/my repo/file #1.ts";
@@ -108,7 +108,7 @@ test("opens remote files and folders with the same SSH authority as Arca Compani
 });
 
 test("supports VS Code SSH workspaces without probing remote paths on the laptop", async (t) => {
-  const { openRemote, calls, resolve } = setup(t, "darwin", { resolveSshHost: () => "devbox" });
+  const { openRemote, calls, resolve } = setup(t, "darwin", { getVerifiedSshHost: () => "devbox" });
   await resolve();
   assert.equal(await openRemote("/remote/only/repo", "vscode", "devbox", true), true);
   assert.deepEqual(calls.at(-1), [
@@ -139,53 +139,67 @@ test("does not inherit another editor's IPC connection and reports CLI errors", 
   assert.equal(receivedEnv.CURSOR_CLI_BLOCK_CURSOR_AGENT, "true");
 });
 
-for (const [source, change] of ["verified", "discovered"].flatMap((mappingSource) =>
-  ["unchanged lookup", "alias change", "alias restoration", "server change"].map(
-    (mappingChange) => [mappingSource, mappingChange],
+for (const [source, stage, change] of ["verified", "discovered"].flatMap((mappingSource) =>
+  ["app discovery", "foregrounding"].flatMap((pendingStage) =>
+    [
+      "unchanged lookup",
+      "alias change",
+      "alias restoration",
+      "server change",
+      ...(mappingSource === "verified" ? ["identity removed", "identity replaced"] : []),
+    ].map((mappingChange) => [mappingSource, pendingStage, mappingChange]),
   ),
 )) {
-  test(`remote opening with ${source} SSH mapping during foregrounding handles ${change}`, async (t) => {
+  test(`remote opening with ${source} SSH mapping during ${stage} handles ${change}`, async (t) => {
     const calls = [];
+    const pendingCommand = stage === "app discovery" ? "/usr/bin/mdfind" : "/usr/bin/open";
     let alias = "arca.ssh";
     let context = {};
-    const foregroundStarted = Promise.withResolvers();
-    const foregroundComplete = Promise.withResolvers();
-    t.after(() => foregroundComplete.resolve({ stdout: "" }));
+    const operationStarted = Promise.withResolvers();
+    const operationComplete = Promise.withResolvers();
+    t.after(() => operationComplete.resolve({ stdout: "" }));
     const { directory, openRemote, resolve } = setup(t, "darwin", {
-      resolveSshHost: () => (source === "verified" ? alias : null),
+      getVerifiedSshHost: () => (source === "verified" ? alias : null),
       discoverSshHost: () => alias,
       getServerContext: () => context,
       run: async (command) => {
         calls.push(command);
-        if (command === "/usr/bin/open") {
-          foregroundStarted.resolve();
-          return foregroundComplete.promise;
+        if (command === pendingCommand) {
+          operationStarted.resolve();
+          return operationComplete.promise;
         }
         return { stdout: "" };
       },
     });
-    fs.mkdirSync(path.join(directory, "Cursor.app"));
+    const appPath = path.join(directory, "Cursor.app");
+    if (stage === "foregrounding") fs.mkdirSync(appPath);
     await resolve([alias]);
     const opening = openRemote("/remote/workspace");
-    await foregroundStarted.promise;
-    assert.deepEqual(calls, ["/usr/bin/open"]);
+    await operationStarted.promise;
+    assert.deepEqual(calls, [pendingCommand]);
 
     if (change === "server change") context = {};
     if (change === "alias change" || change === "alias restoration") alias = "other.ssh";
-    assert.equal(await resolve([alias]), alias);
+    if (change === "identity removed") alias = null;
+    if (change === "identity replaced") alias = "other.ssh";
+    if (!change.startsWith("identity ")) assert.equal(await resolve([alias]), alias);
     if (change === "alias restoration") {
       alias = "arca.ssh";
       assert.equal(await resolve([alias]), alias);
     }
 
-    foregroundComplete.resolve({ stdout: "" });
+    operationComplete.resolve({ stdout: `${appPath}\0` });
     const unchanged = change === "unchanged lookup";
     assert.equal(await opening, unchanged);
     assert.deepEqual(
       calls,
       unchanged
-        ? ["/usr/bin/open", path.join(directory, "Cursor.app/Contents/Resources/app/bin/cursor")]
-        : ["/usr/bin/open"],
+        ? [
+            ...(stage === "app discovery" ? ["/usr/bin/mdfind"] : []),
+            "/usr/bin/open",
+            path.join(appPath, "Contents/Resources/app/bin/cursor"),
+          ]
+        : [pendingCommand],
     );
   });
 }
@@ -227,7 +241,7 @@ test("binds remote opening to the resolved host, sender, and server connection",
   let alias = "arca.ssh";
   const { directory, openRemote, resolve, event, calls } = setup(t, "darwin", {
     getServerContext: () => context,
-    resolveSshHost: () => alias,
+    getVerifiedSshHost: () => alias,
   });
   fs.mkdirSync(path.join(directory, "Cursor.app"));
   assert.equal(await openRemote("/repo"), false);
@@ -257,7 +271,7 @@ test("shares discovered aliases and drops in-flight results after a server chang
   });
   const { resolve, openRemote, directory } = setup(t, "darwin", {
     getServerContext: () => context,
-    resolveSshHost: () => null,
+    getVerifiedSshHost: () => null,
     discoverSshHost: () => {
       discoveries++;
       return pending;
@@ -285,7 +299,7 @@ test("requires fresh host fingerprints after discovered SSH mappings expire", as
   const newKeys = ["SHA256:new-host-key"];
   const { resolve, openRemote, directory, calls } = setup(t, "darwin", {
     now: () => time,
-    resolveSshHost: () => null,
+    getVerifiedSshHost: () => null,
     discoverSshHost: async (keys) => {
       discoveries.push(keys);
       return keys?.[0] === newKeys[0] ? "arca_new.ssh" : "arca.ssh";
@@ -449,35 +463,79 @@ for (const platform of ["darwin", "win32", "linux"]) {
   });
 }
 
-test("waits for native approval and rejects a changed server while the dialog is open", async (t) => {
-  let context = {};
-  let approve;
-  let requested;
-  const started = new Promise((resolve) => {
-    requested = resolve;
+for (const [appId, change] of ["vscode", "default"].flatMap((app) =>
+  ["server", "sender", "local host"].map((binding) => [app, binding]),
+)) {
+  test(`rejects ${appId} opening when ${change} changes during stat`, async (t) => {
+    let context = {};
+    let localHost = "local";
+    const effects = [];
+    const { open, file, event, calls, shell } = setup(t, "darwin", {
+      getServerContext: () => context,
+      localHostId: () => localHost,
+      confirmDefaultOpen: async () => {
+        effects.push("consent");
+        return true;
+      },
+    });
+    shell.openPath = async () => {
+      effects.push("openPath");
+      return "";
+    };
+    const started = Promise.withResolvers();
+    const complete = Promise.withResolvers();
+    t.after(() => complete.resolve({ isDirectory: () => false }));
+    t.mock.method(require("node:fs/promises"), "stat", () => {
+      started.resolve();
+      return complete.promise;
+    });
+    const opening = open(file, appId);
+    await started.promise;
+    if (change === "server") context = {};
+    if (change === "sender") event.trusted = false;
+    if (change === "local host") localHost = "other";
+    complete.resolve({ isDirectory: () => false });
+    assert.equal(await opening, false);
+    assert.deepEqual(effects, []);
+    assert.deepEqual(calls, []);
   });
-  const opened = [];
-  const { open, file, shell } = setup(t, "darwin", {
-    getServerContext: () => context,
-    confirmDefaultOpen: () => {
-      requested();
-      return new Promise((resolve) => {
-        approve = resolve;
-      });
-    },
+}
+
+for (const change of ["server", "sender", "local host"]) {
+  test(`rejects opening when ${change} changes while the consent dialog is open`, async (t) => {
+    let context = {};
+    let localHost = "local";
+    let approve;
+    let requested;
+    const started = new Promise((resolve) => {
+      requested = resolve;
+    });
+    const opened = [];
+    const { open, file, shell, event } = setup(t, "darwin", {
+      getServerContext: () => context,
+      localHostId: () => localHost,
+      confirmDefaultOpen: () => {
+        requested();
+        return new Promise((resolve) => {
+          approve = resolve;
+        });
+      },
+    });
+    shell.openPath = async (value) => {
+      opened.push(value);
+      return "";
+    };
+    const pending = open(file, "default");
+    await started;
+    assert.deepEqual(opened, []);
+    if (change === "server") context = {};
+    if (change === "sender") event.trusted = false;
+    if (change === "local host") localHost = "other";
+    approve(true);
+    assert.equal(await pending, false);
+    assert.deepEqual(opened, []);
   });
-  shell.openPath = async (value) => {
-    opened.push(value);
-    return "";
-  };
-  const pending = open(file, "default");
-  await started;
-  assert.deepEqual(opened, []);
-  context = {};
-  approve(true);
-  assert.equal(await pending, false);
-  assert.deepEqual(opened, []);
-});
+}
 
 test("rejects unknown apps, remote hosts, untrusted senders, and invalid paths", async (t) => {
   const { open, list, file, calls } = setup(t);

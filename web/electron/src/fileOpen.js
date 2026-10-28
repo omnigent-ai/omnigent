@@ -44,7 +44,8 @@ function registerFileOpen({
   confirmDefaultOpen = async () => false,
   getServerContext = () => null,
   now = Date.now,
-  resolveSshHost = () => null,
+  // Read native identities synchronously; validation must not yield before launch.
+  getVerifiedSshHost = () => null,
   discoverSshHost = discoverArcaSshHost,
   appDirectories = [
     "/Applications",
@@ -132,12 +133,18 @@ function registerFileOpen({
     const selectedApp = platform === "darwin" && MAC_APPS.find((app) => app.id === appId);
     if (appId !== "default" && !selectedApp) return false;
     try {
+      const context = getServerContext(event);
+      const stillAuthorized = () =>
+        !!context &&
+        isPinnedOriginSender(event) &&
+        getServerContext(event) === context &&
+        hostId === localHostId();
+      if (!stillAuthorized()) return false;
       const filePath = path.normalize(rawPath);
       const stat = await fs.stat(filePath);
+      if (!stillAuthorized()) return false;
       if (appId === "default") {
-        const context = getServerContext(event);
-        if (!context || !(await confirmDefaultOpen(event, filePath))) return false;
-        if (!isPinnedOriginSender(event) || getServerContext(event) !== context) return false;
+        if (!(await confirmDefaultOpen(event, filePath)) || !stillAuthorized()) return false;
         return (await shell.openPath(filePath)) === "";
       }
       const target =
@@ -154,7 +161,7 @@ function registerFileOpen({
     const state = sshContext(event);
     if (!state || platform !== "darwin" || hostId === localHostId()) return null;
     try {
-      const verifiedAlias = await resolveSshHost(event, hostId);
+      const verifiedAlias = getVerifiedSshHost(event, hostId);
       if (!isPinnedOriginSender(event) || sshContext(event) !== state) return null;
       const previous = state.hosts.get(hostId);
       if (verifiedAlias) {
@@ -218,11 +225,13 @@ function registerFileOpen({
         const entry = state?.hosts.get(hostId);
         if (!entry?.alias || entry.alias !== sshHost) return false;
         if (!entry.verified && now() >= entry.expiresAt) return false;
-        if (entry.verified && (await resolveSshHost(event, hostId)) !== entry.alias) return false;
         const stillAuthorized = () =>
           isPinnedOriginSender(event) &&
           sshContext(event) === state &&
-          state.hosts.get(hostId) === entry;
+          hostId !== localHostId() &&
+          state.hosts.get(hostId) === entry &&
+          (!entry.verified || getVerifiedSshHost(event, hostId) === entry.alias);
+        if (!stillAuthorized()) return false;
         const selectedApp = MAC_APPS.find((app) => app.id === appId);
         const appPath = await findApp(selectedApp);
         if (!appPath || !stillAuthorized()) return false;

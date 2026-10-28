@@ -4683,7 +4683,7 @@ function registerIpc() {
         ? requestExternalProtocolConsent(win, pathToFileURL(filePath).href, "file:")
         : false;
     },
-    resolveSshHost: (event, hostId) => {
+    getVerifiedSshHost: (event, hostId) => {
       const win = BrowserWindow.fromWebContents(event.sender);
       if (!win) return null;
       const identity = arcaIdentities.get(windowArcaServerUrl(win));
