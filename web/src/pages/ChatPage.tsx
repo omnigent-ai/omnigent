@@ -268,6 +268,7 @@ import { ReconnectSessionDialog } from "@/shell/ReconnectSessionDialog";
 import { useTerminalFirst } from "@/shell/TerminalFirstContext";
 import {
   effortLevelsForConv,
+  sdkEffortFamilyForHarness,
   modelPickerKindForConv,
   shouldShowEffortPicker,
   type NativeModelPickerKind,
@@ -1125,13 +1126,10 @@ export function ChatPage() {
   // on MainAgentSurface/Composer on every unrelated store tick (mirrors the
   // codexModelOptions rationale).
   const harnessEffortFamilies = useHarnessEffortFamilies();
-  // Declared effort family for a non-native harness (claude-sdk, codex, …), whose
-  // effort rides ``reasoning_effort`` into the SDK executor. Native harnesses keep
-  // their label-driven ladders, so a label-less native row never reads this.
-  const sdkEffortFamily =
-    capabilitySource.harness && !nativeCodingAgentForHarness(capabilitySource.harness)
-      ? (harnessEffortFamilies[capabilitySource.harness] ?? null)
-      : null;
+  const sdkEffortFamily = sdkEffortFamilyForHarness(
+    capabilitySource.harness,
+    harnessEffortFamilies,
+  );
   const effortLevels = useMemo(
     () =>
       effortLevelsForConv(

@@ -14,7 +14,11 @@ import { SideChatSettings } from "./SideChatSettings";
 
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabels>()),
-  useHarnessEffortFamilies: () => ({ "claude-sdk": "anthropic", codex: "openai" }),
+  useHarnessEffortFamilies: () => ({
+    "claude-sdk": "anthropic",
+    codex: "openai",
+    "antigravity-native": "gemini",
+  }),
 }));
 
 const models: NativeModelOption[] = [
@@ -355,9 +359,10 @@ it("keeps unsent settings per draft across remounts without updating the parent"
   );
 });
 
-it.each([false, true])(
-  "uses the host catalog when session models are empty (draft=%s)",
-  async (draft) => {
+it.each(["live", "draft", "nested-draft"] as const)(
+  "uses the shared host catalog when session models are empty (%s)",
+  async (mode) => {
+    const draft = mode !== "live";
     const source = { ...parent, hostId: "host", codexModelOptions: [] };
     cache.setQueryData(["session", "parent"], source);
     const fetch = vi
@@ -367,10 +372,11 @@ it.each([false, true])(
     const session = draft
       ? {
           ...child,
-          id: "parent",
+          id: mode === "nested-draft" ? "side" : "parent",
           parentSessionId: null,
-          hostId: "host",
-          labels: { "omnigent.wrapper": "devin-native-ui" },
+          hostId: mode === "nested-draft" ? null : "host",
+          labels:
+            mode === "nested-draft" ? child.labels : { "omnigent.wrapper": "devin-native-ui" },
           codexModelOptions: [],
         }
       : { ...child, codexModelOptions: [] };
@@ -444,3 +450,71 @@ it.each([false, true])(
     else expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", updates);
   },
 );
+
+it.each([false, true])("hides unsupported custom native effort (draft=%s)", (draft) => {
+  render(
+    <QueryClientProvider client={cache}>
+      <SideChatSettings
+        session={{
+          ...child,
+          harness: "antigravity-native",
+          labels: { "omnigent.ui": "terminal" },
+          codexModelOptions: [],
+        }}
+        draft={draft ? { onChange: vi.fn(), disabled: false } : undefined}
+      />
+    </QueryClientProvider>,
+  );
+  expect(
+    screen.queryByRole("button", { name: "Side chat model and effort" }),
+  ).not.toBeInTheDocument();
+});
+
+it.each([false, true])("preserves an inherited Devin Fusion pairing (draft=%s)", async (draft) => {
+  const model = "fusion-lead-high-sidekick-helper";
+  const onChange = vi.fn();
+  const session = {
+    ...child,
+    modelOverride: model,
+    reasoningEffort: null,
+    codexModelOptions: [
+      {
+        id: "fusion",
+        displayName: "Fusion",
+        fusion: {
+          default: "fusion-lead-medium-sidekick-helper",
+          combos: ["medium", "high"].map((effort) => ({
+            modelUid: `fusion-lead-${effort}-sidekick-helper`,
+            lead: "lead",
+            leadLabel: "Lead",
+            effort,
+            fast: false,
+            sidekick: "helper",
+            sidekickLabel: "Helper",
+            priority: false,
+          })),
+        },
+      },
+    ],
+  };
+  render(
+    <QueryClientProvider client={cache}>
+      <SideChatSettings
+        session={session}
+        draft={draft ? { onChange, disabled: false } : undefined}
+      />
+    </QueryClientProvider>,
+  );
+  const picker = screen.getByRole("button", { name: "Side chat model and effort" });
+  expect(picker).toHaveTextContent("Fusion · Lead High + Helper");
+  const user = userEvent.setup();
+  await user.click(picker);
+  await user.click(screen.getByTestId("side-chat-model-edit"));
+  const fusion = screen.getByRole("menuitemcheckbox", { name: "Fusion" });
+  expect(fusion).toHaveAttribute("aria-checked", "true");
+  expect(screen.queryByTestId("side-chat-efforts")).not.toBeInTheDocument();
+  await user.click(fusion);
+  const updates = { modelOverride: model, reasoningEffort: null };
+  if (draft) expect(onChange).toHaveBeenCalledWith(updates);
+  else expect(sessionsApi.updateSession).toHaveBeenCalledWith("side", updates);
+});

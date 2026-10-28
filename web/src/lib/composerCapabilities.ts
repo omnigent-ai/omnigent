@@ -39,6 +39,14 @@ function effectiveWrapperLabel(
   return nativeCodingAgentForHarness(conv?.harness)?.wrapperLabel;
 }
 
+/** Declared effort families apply to SDK harnesses; native bridges define their own support. */
+export function sdkEffortFamilyForHarness(
+  harness: string | null | undefined,
+  families: Readonly<Record<string, string>>,
+): string | null {
+  return harness && !nativeCodingAgentForHarness(harness) ? (families[harness] ?? null) : null;
+}
+
 export function effortLevelsForConv(
   conv:
     | {

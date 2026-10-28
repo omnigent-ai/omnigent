@@ -12,9 +12,11 @@ import {
   compactModelTriggerLabel,
   defaultModelLabel,
   formatStatusEffortLabel,
+  formatStatusModelLabel,
   nativeModelLabel,
   nativeModelTooltip,
 } from "@/lib/composerModelLabel";
+import { fusionOption, isFusionModelUid } from "@/lib/devinFusion";
 import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
@@ -23,6 +25,7 @@ import { useHostModelOptions } from "@/hooks/useHosts";
 import { useHarnessEffortFamilies } from "@/lib/agentLabels";
 import {
   effortLevelsForConv,
+  sdkEffortFamilyForHarness,
   modelPickerKindForConv,
   shouldShowEffortPicker,
 } from "@/lib/composerCapabilities";
@@ -79,21 +82,25 @@ export function SideChatSettings({
     !session.inferenceConfigured && sessionOptions.length === 0
       ? (hostOptions ?? sessionOptions)
       : sessionOptions;
-  const family = session.harness ? (families[session.harness] ?? null) : null;
+  const family = sdkEffortFamilyForHarness(session.harness, families);
   const model =
     draft?.settings?.modelOverride ??
     session.modelOverride ??
     state.llmModel ??
     session.llmModel ??
     null;
-  const selectedModel = findNativeModelOption(options, model);
+  const fusionModel =
+    kind === "devin" && isFusionModelUid(model) ? fusionOption(options) : undefined;
+  const selectedModel = fusionModel ?? findNativeModelOption(options, model);
   const nativeAgent =
     nativeCodingAgentForHarness(session.harness) ??
     (kind ? nativeCodingAgentForHarness(`${kind}-native`) : undefined);
   const harnessLabel = nativeAgent?.displayName ?? session.agentName ?? "Session";
-  const modelLabel = selectedModel
-    ? nativeModelLabel(selectedModel)
-    : (model ?? defaultModelLabel(options));
+  const modelLabel = fusionModel
+    ? (formatStatusModelLabel(model, options) ?? nativeModelLabel(fusionModel))
+    : selectedModel
+      ? nativeModelLabel(selectedModel)
+      : (model ?? defaultModelLabel(options));
   const effort =
     draft?.settings?.reasoningEffort !== undefined
       ? draft.settings.reasoningEffort
@@ -156,8 +163,9 @@ export function SideChatSettings({
                   className: "whitespace-normal break-words",
                   disabled,
                   onSelect: () => {
+                    const nextModel = option === fusionModel && model ? model : option.id;
                     const nextEfforts = supportsEffort
-                      ? effortLevelsForConv(session, options, option.id, family)
+                      ? effortLevelsForConv(session, options, nextModel, family)
                       : [];
                     const defaultEffort = option.defaultReasoningEffort;
                     let nextEffort =
@@ -166,7 +174,7 @@ export function SideChatSettings({
                         : (nextEfforts[0] ?? null);
                     if (effort && nextEfforts.includes(effort)) nextEffort = effort;
                     void save({
-                      modelOverride: option.id,
+                      modelOverride: nextModel,
                       ...(supportsEffort ? { reasoningEffort: nextEffort } : {}),
                     });
                   },
