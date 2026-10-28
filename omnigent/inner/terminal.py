@@ -42,6 +42,7 @@ if TYPE_CHECKING:
 
 from . import _proc
 from .agent_env import strip_desktop_session_env
+from .async_utils import run_sync_on_thread
 from .datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from .egress import EgressProxyHandle, apply_egress_env, start_egress_proxy
 from .git_ssh import GitSshBroker, apply_git_ssh_env, start_git_ssh_broker
@@ -1659,7 +1660,8 @@ class TerminalInstance:
             inner_cmd = [launcher_path, *self.args]
         else:
             # A Windows tmux refuses a .cmd shim, which needs cmd.exe to parse its arguments.
-            inner_cmd = [*(node_cmd_shim_argv(self.command) or [self.command]), *self.args]
+            shim_argv = await run_sync_on_thread(node_cmd_shim_argv, self.command)
+            inner_cmd = [*(shim_argv or [self.command]), *self.args]
         if self.program_status_app is not None:
             status_path = self.private_dir / "program-status.json"
             status_path.unlink(missing_ok=True)

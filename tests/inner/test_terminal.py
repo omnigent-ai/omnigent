@@ -2242,11 +2242,13 @@ async def test_launch_on_windows_runs_a_node_cmd_shim_as_its_node_script(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, shim_argv: list[str] | None
 ) -> None:
     """A Windows tmux refuses a .cmd pane program, which needs cmd.exe to parse its arguments."""
-    monkeypatch.setattr(
-        terminal_mod,
-        "node_cmd_shim_argv",
-        lambda path: shim_argv if path == "C:/pnpm/pi.CMD" else None,
-    )
+    probe_threads: list[int] = []
+
+    def _node_cmd_shim_argv(path: str) -> list[str] | None:
+        probe_threads.append(threading.get_ident())
+        return shim_argv if path == "C:/pnpm/pi.CMD" else None
+
+    monkeypatch.setattr(terminal_mod, "node_cmd_shim_argv", _node_cmd_shim_argv)
 
     cmd = await _capture_launch_argv(
         tmp_path,
@@ -2259,6 +2261,8 @@ async def test_launch_on_windows_runs_a_node_cmd_shim_as_its_node_script(
 
     program = shim_argv or ["C:/pnpm/pi.CMD"]
     assert _new_session_command(cmd)[-len(program) - 3 :] == ["--", *program, "--mode", "rpc"]
+    assert probe_threads
+    assert threading.get_ident() not in probe_threads
 
 
 async def test_launch_on_windows_gives_panes_a_term_windows_programs_know(

@@ -4,11 +4,16 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
+import psutil
 import pytest
 
 from omnigent.inner import node_cmd_shim
+from tests._helpers.polling import poll_until
 
 _PNPM_SHIM_TEXT = '@SETLOCAL\r\n"%~dp0\\node.exe"  "%~dp0\\..\\pkg\\cli.js" %*\r\n'
 
@@ -32,14 +37,24 @@ def _node_cmd_shim(
     output = json.dumps([str(bin_dir / "node.exe"), str(tmp_path / "pkg" / "cli.js")])
     reported = f"noise\r\n{node_cmd_shim._PROBE_SENTINEL}{output}\r\n".encode()
 
-    def _run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[bytes]:
-        probes.append({"argv": argv, **kwargs})
-        if failure is not None:
+    def _popen(argv: list[str], **kwargs: object) -> SimpleNamespace:
+        probe = {"argv": argv, **kwargs}
+        probes.append(probe)
+        if isinstance(failure, OSError):
             raise failure
-        return subprocess.CompletedProcess(argv, 0, stdout=stdout or reported, stderr=b"")
+
+        def _communicate(timeout: float) -> tuple[bytes, None]:
+            probe["timeout"] = timeout
+            if failure is not None:
+                raise failure
+            return stdout or reported, None
+
+        return SimpleNamespace(
+            pid=None, returncode=None, kill=lambda: None, communicate=_communicate
+        )
 
     monkeypatch.setattr(node_cmd_shim, "IS_WINDOWS", True)
-    monkeypatch.setattr(node_cmd_shim.subprocess, "run", _run)
+    monkeypatch.setattr(node_cmd_shim.subprocess, "Popen", _popen)
     return probes
 
 
@@ -126,3 +141,26 @@ def test_node_cmd_shim_argv_returns_none_when_the_shim_is_not_resolved(
 
     assert node_cmd_shim.node_cmd_shim_argv(path) is None
     assert bool(probes) is shim_runs
+
+
+@pytest.mark.skipif(sys.platform != "win32", reason="cmd.exe runs .cmd shims only on Windows")
+def test_node_cmd_shim_argv_ends_a_timed_out_probe_and_the_child_holding_its_pipe(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pid_file = tmp_path / "child.pid"
+    child = (
+        "import os, pathlib, sys, time; "
+        "pathlib.Path(sys.argv[1]).write_text(str(os.getpid())); time.sleep(60)"
+    )
+    shim = tmp_path / "pi.cmd"
+    shim.write_text(f'@echo off\r\nrem node\r\n"{sys.executable}" -c "{child}" "{pid_file}"\r\n')
+    monkeypatch.setattr(node_cmd_shim, "_PROBE_TIMEOUT_S", 2.0)
+
+    started = time.monotonic()
+    argv = node_cmd_shim.node_cmd_shim_argv(str(shim))
+    elapsed = time.monotonic() - started
+
+    assert argv is None
+    assert elapsed < 15.0
+    child_pid = int(pid_file.read_text())
+    poll_until(lambda: not psutil.pid_exists(child_pid), timeout_s=5.0, interval_s=0.1)

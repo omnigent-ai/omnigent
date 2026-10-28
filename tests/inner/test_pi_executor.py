@@ -9,6 +9,7 @@ import shutil
 import socket
 import tempfile
 import textwrap
+import threading
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
@@ -4391,11 +4392,12 @@ def test_rpc_start_runs_a_node_cmd_shim_as_its_node_script(monkeypatch, shim_arg
     """cmd.exe would end pi's command line at the first newline of the system prompt."""
     from omnigent.inner import pi_executor as pi_mod
 
-    probed: list[str] = []
+    probed: list[tuple[str, int]] = []
     captured: dict[str, tuple[str, ...]] = {}
+    loop_threads: list[int] = []
 
     def _node_cmd_shim_argv(path: str) -> list[str] | None:
-        probed.append(path)
+        probed.append((path, threading.get_ident()))
         return shim_argv
 
     async def _fake_spawn(*args, **kwargs):
@@ -4406,6 +4408,7 @@ def test_rpc_start_runs_a_node_cmd_shim_as_its_node_script(monkeypatch, shim_arg
     monkeypatch.setattr(pi_mod, "_create_subprocess_exec", _fake_spawn)
 
     async def _test():
+        loop_threads.append(threading.get_ident())
         rpc = _PiRpcSession()
         await rpc.start(
             "C:/pnpm/pi.CMD",
@@ -4418,7 +4421,9 @@ def test_rpc_start_runs_a_node_cmd_shim_as_its_node_script(monkeypatch, shim_arg
     _run(_test())
 
     launcher = shim_argv or ["C:/pnpm/pi.CMD"]
-    assert probed == ["C:/pnpm/pi.CMD"]
+    ((probed_path, probe_thread),) = probed
+    assert probed_path == "C:/pnpm/pi.CMD"
+    assert probe_thread not in loop_threads
     assert captured["args"][: len(launcher) + 2] == (*launcher, "--mode", "rpc")
     assert captured["args"][-1] == "--no-tools"
 

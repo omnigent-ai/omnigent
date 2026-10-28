@@ -1192,7 +1192,7 @@ class _PiRpcSession:
             ``--tools``, ...). ``None`` appends nothing.
         """
         # A .cmd shim would run through cmd.exe, which ends the command line at a newline.
-        launcher = node_cmd_shim_argv(pi_path) or [pi_path]
+        launcher = await run_sync_on_thread(node_cmd_shim_argv, pi_path) or [pi_path]
         args = [*launcher, "--mode", "rpc", "--no-session"]
         if model:
             pi_coding_agent_dir = env.get("PI_CODING_AGENT_DIR")

@@ -14,13 +14,16 @@ import json
 import os
 import re
 import subprocess
+from contextlib import suppress
 from importlib.resources import as_file, files
 from pathlib import Path
 
 from omnigent._platform import IS_WINDOWS
+from omnigent.inner._proc import kill_tree
 
 _PROBE_SENTINEL = "omnigent-node-cmd-shim-probe:"
 _PROBE_TIMEOUT_S = 5.0
+_PROBE_REAP_TIMEOUT_S = 2.0
 _NAMES_NODE = re.compile(rb"\bnode\b", re.IGNORECASE)
 
 
@@ -58,16 +61,23 @@ def _probe(shim: str, mtime_ns: int, size: int) -> tuple[str, str] | None:
             # Node reads a backslash in NODE_OPTIONS as an escape.
             require = f'--require "{probe_path.as_posix()}"'
             node_options = f"{os.environ.get('NODE_OPTIONS', '')} {require}".lstrip()
-            completed = subprocess.run(
+            process = subprocess.Popen(
                 [shim],
                 stdin=subprocess.DEVNULL,
-                capture_output=True,
-                timeout=_PROBE_TIMEOUT_S,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 env={**os.environ, "NODE_OPTIONS": node_options},
                 creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-                check=False,
             )
-        output = completed.stdout.decode("utf-8", errors="replace")
+            try:
+                stdout, _ = process.communicate(timeout=_PROBE_TIMEOUT_S)
+            except subprocess.TimeoutExpired:
+                # Killing cmd.exe alone leaves node holding the pipe; never wait on it.
+                kill_tree(process)
+                with suppress(subprocess.TimeoutExpired):
+                    process.communicate(timeout=_PROBE_REAP_TIMEOUT_S)
+                return None
+        output = stdout.decode("utf-8", errors="replace")
         _, found, reported = output.partition(_PROBE_SENTINEL)
         if not found:
             return None
