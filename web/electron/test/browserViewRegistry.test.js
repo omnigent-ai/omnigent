@@ -631,6 +631,33 @@ function makeNetworkGuardRegistry({ proxy = "DIRECT", ...extra } = {}) {
 }
 
 describe("browserViewRegistry — network-layer agent guard (DNS + connected address)", () => {
+  it("restricts unattributed worker requests using their owning partition", async () => {
+    const context = {};
+    const { registry } = makeNetworkGuardRegistry({
+      isLocalAgentContext: (ctx) => ctx === context,
+    });
+    const partition = agentPartition("w-test", "conv");
+    const request = { webContentsId: -1, url: "http://localhost/data", ip: "127.0.0.1" };
+    assert.equal(await registry.shouldCancelAgentRequest(request, partition), true);
+    registry.openOrNavigate("conv", "http://localhost", undefined, {
+      agent: true,
+      agentContext: context,
+    });
+    assert.equal(await registry.shouldCancelAgentRequest(request, partition), false);
+    registry.openOrNavigate("browser-tab:conv:t1", "https://example.com", undefined, {
+      agent: true,
+    });
+    assert.equal(await registry.shouldCancelAgentRequest(request, partition), true);
+    assert.equal(await registry.shouldCancelAgentResponse(request, partition), true);
+    assert.equal(
+      await registry.shouldCancelAgentRequest(
+        { ...request, url: "https://example.com" },
+        partition,
+      ),
+      false,
+    );
+  });
+
   it("applies public/private address checks to WebSockets", async () => {
     const { registry, idOf } = makeNetworkGuardRegistry();
     registry.openOrNavigate("conv", "https://example.com", undefined, { agent: true });

@@ -3751,13 +3751,13 @@ function guardAgentPartitionRequests(partition, registry) {
       () => callback({ cancel: true }),
     );
   ses.webRequest.onBeforeRequest(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentRequest(details), callback),
+    answer(registry.shouldCancelAgentRequest(details, partition), callback),
   );
   ses.webRequest.onBeforeSendHeaders(filter, (details, callback) =>
-    callback(registry.agentRequestHeaders(details)),
+    callback(registry.agentRequestHeaders(details, partition)),
   );
   ses.webRequest.onHeadersReceived(filter, (details, callback) =>
-    answer(registry.shouldCancelAgentResponse(details), callback),
+    answer(registry.shouldCancelAgentResponse(details, partition), callback),
   );
 }
 

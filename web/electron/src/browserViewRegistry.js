@@ -402,15 +402,19 @@ function createBrowserViewRegistry({
   // DNS-aware check for an agent's first hop. openOrNavigate stays synchronous
   // (literal checks only), so browserIpc awaits this before it: a name that
   // resolves internally fails with an error instead of creating a blank view.
-  function checkAgentNavigationFor(conversationId, url, agentContext) {
-    const partition = agentPartition(partitionScope, conversationId);
+  function checkAgentNavigationFor(
+    conversationId,
+    url,
+    agentContext,
+    partition = agentPartition(partitionScope, conversationId),
+  ) {
     return checkAgentNavigation(url, {
       allowPrivateNetwork: isLocalAgentContext(agentContext),
       resolveHost: (hostname) => resolveHost(hostname, partition),
     });
   }
 
-  function agentLockedEntryFor(webContentsId) {
+  function agentLockedEntryFor(webContentsId, partition) {
     for (const entry of entries.values()) {
       let id;
       try {
@@ -420,7 +424,20 @@ function createBrowserViewRegistry({
       }
       if (id === webContentsId) return entry.agentNavLocked ? entry : null;
     }
-    return null;
+    if (!partition) return null;
+    // Worker requests may have no WebContents ID. Use the most restrictive
+    // view in the owning partition; an orphaned worker gets public access only.
+    const owners = [...entries.values()].filter(
+      (entry) => agentPartition(partitionScope, entry.conversationId) === partition,
+    );
+    return (
+      owners.find((entry) => !allowsPrivateNetwork(entry)) ??
+      owners[0] ?? {
+        conversationId: "",
+        agentContext: null,
+        privateNetworkAllowed: false,
+      }
+    );
   }
 
   // SECURITY (SSRF): network-layer half of the agent guard, wired by main.js
@@ -428,13 +445,14 @@ function createBrowserViewRegistry({
   // partitions. Resolves true to cancel. Unlike the will-* guards it sees every
   // hop — redirects, window-open loads, history navigations — and can wait on
   // DNS, so a public name pointing at an internal address is refused too.
-  async function shouldCancelAgentRequest({ webContentsId, url }) {
-    const entry = agentLockedEntryFor(webContentsId);
+  async function shouldCancelAgentRequest({ webContentsId, url }, partition) {
+    const entry = agentLockedEntryFor(webContentsId, partition);
     if (!entry) return false; // user-driven or unattributed: permissive
     const verdict = await checkAgentNavigationFor(
       entry.conversationId,
       url.replace(/^ws(s?):/, "http$1:"),
       allowsPrivateNetwork(entry) ? entry.agentContext : null,
+      partition,
     );
     if (verdict.ok) return false;
     sendToRenderer("browser-nav-blocked", {
@@ -449,8 +467,8 @@ function createBrowserViewRegistry({
   // connected address (Chromium's HttpCache::Transaction::GetRemoteEndpoint),
   // so agent requests skip cache reads (`no-cache`, per http_cache_util's
   // GetLoadFlagsForExtraHeaders) and every response checked below carries one.
-  function agentRequestHeaders({ webContentsId, requestHeaders }) {
-    if (!agentLockedEntryFor(webContentsId)) return {};
+  function agentRequestHeaders({ webContentsId, requestHeaders }, partition) {
+    if (!agentLockedEntryFor(webContentsId, partition)) return {};
     const headers = {};
     const directives = new Map(); // lowercased → as sent, keeping e.g. no-store
     for (const [name, value] of Object.entries(requestHeaders ?? {})) {
@@ -471,8 +489,8 @@ function createBrowserViewRegistry({
 
   // Check Chromium's connected endpoint to catch DNS rebinding.
   // Electron 42 supplies details.ip despite stale typings.
-  async function shouldCancelAgentResponse({ webContentsId, url, ip }) {
-    const entry = agentLockedEntryFor(webContentsId);
+  async function shouldCancelAgentResponse({ webContentsId, url, ip }, partition) {
+    const entry = agentLockedEntryFor(webContentsId, partition);
     if (!entry) return false;
     const verdict = isAgentConnectionAllowed(url.replace(/^ws(s?):/, "http$1:"), ip, {
       allowPrivateNetwork: allowsPrivateNetwork(entry),
@@ -480,11 +498,11 @@ function createBrowserViewRegistry({
     if (verdict.ok) return false;
     // Through a proxy `ip` is the proxy's address; accept it only if it is one
     // (same-IP limit documented on isProxyAddress).
-    const partition = agentPartition(partitionScope, entry.conversationId);
+    const requestPartition = partition ?? agentPartition(partitionScope, entry.conversationId);
     const proxied =
       !!ip &&
-      (await isProxyAddress(ip, await resolveProxy(url, partition), (hostname) =>
-        resolveHost(hostname, partition),
+      (await isProxyAddress(ip, await resolveProxy(url, requestPartition), (hostname) =>
+        resolveHost(hostname, requestPartition),
       ));
     if (proxied) return false;
     sendToRenderer("browser-nav-blocked", {
