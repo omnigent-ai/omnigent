@@ -1,5 +1,5 @@
 import { createRef, useState, type FormEvent, type ReactNode } from "react";
-import { fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
   ChatComposer,
@@ -9,7 +9,7 @@ import {
 } from "./ChatComposer";
 
 describe("ChatComposer", () => {
-  function renderEditor(initial: string, submitWithModEnter = false) {
+  function renderEditor(initial: string, submitWithModEnter = false, onPaste = vi.fn()) {
     const onKeyDown = vi.fn();
     function Editor() {
       const [value, setValue] = useState(initial);
@@ -21,6 +21,7 @@ describe("ChatComposer", () => {
             value,
             onChange: (event) => setValue(event.target.value),
             onKeyDown,
+            onPaste,
           }}
           actions={{ leading: null, trailing: null }}
         />
@@ -33,6 +34,52 @@ describe("ChatComposer", () => {
   function caretToEnd(input: HTMLTextAreaElement) {
     input.setSelectionRange(input.value.length, input.value.length);
   }
+
+  function richPaste(html: string) {
+    return {
+      clipboardData: {
+        getData: (type: string) => (type === "text/html" ? html : "plain text"),
+        items: [],
+      },
+    };
+  }
+
+  it("pastes rich content at the selection and previews the editable Markdown draft", () => {
+    const { input } = renderEditor("Before old after");
+    input.setSelectionRange(7, 10);
+    expect(fireEvent.paste(input, richPaste('<a href="https://example.com">a link</a>'))).toBe(
+      false,
+    );
+    expect(input).toHaveValue("Before [a link](https://example.com) after");
+    expect(input.selectionStart).toBe(36);
+    const preview = screen.getByRole("region", { name: "Message preview" });
+    expect(within(preview).getByRole("link", { name: "a link" })).toHaveAttribute(
+      "href",
+      "https://example.com/",
+    );
+    fireEvent.change(input, { target: { value: "**Edited**" } });
+    expect(within(preview).getByText("Edited")).toHaveAttribute("data-streamdown", "strong");
+    fireEvent.click(screen.getByRole("button", { name: "Hide preview" }));
+    expect(screen.queryByRole("region", { name: "Message preview" })).toBeNull();
+    expect(input).toHaveValue("**Edited**");
+  });
+
+  it("can preview pasted Markdown source without rewriting it", () => {
+    const { input } = renderEditor("**A draft**");
+    fireEvent.click(screen.getByRole("button", { name: "Preview" }));
+    expect(screen.getByRole("region", { name: "Message preview" })).toHaveTextContent("A draft");
+    expect(input).toHaveValue("**A draft**");
+    expect(fireEvent.paste(input, richPaste(""))).toBe(true);
+  });
+
+  it("lets attachment handlers claim a paste before reading HTML", () => {
+    const onPaste = vi.fn((event) => event.preventDefault());
+    const { input } = renderEditor("Draft", false, onPaste);
+    expect(fireEvent.paste(input, richPaste("<strong>Replace</strong>"))).toBe(false);
+    expect(onPaste).toHaveBeenCalledOnce();
+    expect(input).toHaveValue("Draft");
+    expect(screen.queryByRole("region", { name: "Message preview" })).toBeNull();
+  });
 
   it.each([
     ["1.", "  1. "],

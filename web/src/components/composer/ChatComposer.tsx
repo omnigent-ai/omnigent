@@ -2,6 +2,8 @@ import {
   forwardRef,
   useLayoutEffect,
   useRef,
+  useState,
+  useId,
   type ComponentPropsWithRef,
   type ComponentPropsWithoutRef,
   type KeyboardEvent,
@@ -10,6 +12,8 @@ import {
 } from "react";
 import { ArrowUpIcon, Loader2Icon, SquareIcon } from "lucide-react";
 import { Button } from "@/components/ui/button";
+import { MessageResponse } from "@/components/ai-elements/message";
+import { clipboardHtmlToMarkdown } from "@/lib/pasteMarkdown";
 import { cn } from "@/lib/utils";
 import { isImeCompositionKeyEvent } from "@/lib/ime";
 import {
@@ -257,9 +261,21 @@ export function ComposerTextInput({
   input,
   keyboard,
 }: Pick<ChatComposerProps, "input" | "keyboard">) {
-  return (
+  const [showPreview, setShowPreview] = useState(false);
+  const previewId = useId();
+  const text = String(input.value ?? input.defaultValue ?? "");
+  const textInput = (
     <ComposerTextarea
       {...input}
+      onPaste={(event) => {
+        input.onPaste?.(event);
+        if (event.defaultPrevented || input.disabled || input.readOnly) return;
+        const markdown = clipboardHtmlToMarkdown(event.clipboardData.getData?.("text/html"));
+        if (!markdown) return;
+        event.preventDefault();
+        insertComposerText(event.currentTarget, markdown);
+        setShowPreview(true);
+      }}
       onKeyDown={(event) => {
         // A newline in every mode and on touch devices; completion menus never see it.
         if (isComposerAltNewlineKey({ ...event, isComposing: event.nativeEvent.isComposing })) {
@@ -302,6 +318,38 @@ export function ComposerTextInput({
         }
       }}
     />
+  );
+  return (
+    <>
+      {textInput}
+      {text.trim() && (
+        <div className="pb-2">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            className="h-6 px-1 text-xs text-muted-foreground"
+            aria-expanded={showPreview}
+            aria-controls={previewId}
+            onClick={() => setShowPreview((visible) => !visible)}
+          >
+            {showPreview ? "Hide preview" : "Preview"}
+          </Button>
+          {showPreview && (
+            <div
+              id={previewId}
+              role="region"
+              aria-label="Message preview"
+              className="mt-1 max-h-48 overflow-y-auto rounded-md border bg-muted/30 p-2 text-ui"
+            >
+              <MessageResponse mode="static" parseIncompleteMarkdown={false} controls={false}>
+                {text}
+              </MessageResponse>
+            </div>
+          )}
+        </div>
+      )}
+    </>
   );
 }
 
