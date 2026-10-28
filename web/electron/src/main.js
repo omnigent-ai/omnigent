@@ -37,6 +37,7 @@ const { createUpdateOverlay } = require("./update_overlay");
 const { createConnectionLoading } = require("./connection_loading");
 const { createAboutWindow, resolveAppIconDataUrl } = require("./about_window");
 const { registerFileReveal } = require("./fileReveal");
+const { registerFolderChooser } = require("./folderChooser");
 const fs = require("node:fs");
 const path = require("node:path");
 const { pathToFileURL } = require("node:url");
@@ -4659,6 +4660,13 @@ function registerIpc() {
     shell,
     isPinnedOriginSender,
     localHostId: () => omnigentCli.localHostId(),
+  });
+
+  registerFolderChooser({
+    ipcMain,
+    dialog,
+    windowFor: (event) => BrowserWindow.fromWebContents(event.sender) ?? undefined,
+    isPinnedOriginSender,
   });
 
   // SPA → this machine's identity: is the CLI installed, and its host id. Both

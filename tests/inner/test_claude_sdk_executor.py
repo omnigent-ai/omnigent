@@ -2535,6 +2535,19 @@ async def test_output_token_cap_reaches_cli_and_keeps_thinking_when_a_budget_fit
     assert options.thinking == expected_thinking
 
 
+async def test_retry_policy_reaches_cli_options() -> None:
+    from omnigent.spec.types import RetryPolicy
+
+    options = await _turn_options(
+        _default_executor(retry_policy=RetryPolicy(max_retries=2, timeout_per_request_s=45.5))
+    )
+
+    assert options.env["CLAUDE_CODE_MAX_RETRIES"] == "2"
+    assert options.env["API_TIMEOUT_MS"] == "45500"
+    assert "ANTHROPIC_MAX_RETRIES" not in options.env
+    assert "ANTHROPIC_REQUEST_TIMEOUT_SECONDS" not in options.env
+
+
 async def test_turn_without_output_cap_keeps_cli_defaults() -> None:
     options = await _turn_options(_default_executor())
 

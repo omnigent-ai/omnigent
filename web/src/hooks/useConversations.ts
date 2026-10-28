@@ -1,4 +1,4 @@
-import { useContext, useEffect, useRef } from "react";
+import { useCallback, useContext, useEffect, useRef } from "react";
 import { useViewerId } from "./useViewerId";
 import { SidebarConfigContext, sidebarConfig } from "@/lib/sidebarConfig";
 import { revokePermission } from "@/lib/permissionsApi";
@@ -2182,7 +2182,7 @@ export interface ProjectSummary {
  * dual-reads first-class projects (with id, incl. empty ones) and legacy
  * label-projects (id=null), unioned by name and sorted.
  */
-export function useProjects() {
+export function useProjects({ enabled = true }: { enabled?: boolean } = {}) {
   return useQuery<ProjectSummary[]>({
     queryKey: ["projects"],
     queryFn: async ({ signal }) => {
@@ -2191,6 +2191,7 @@ export function useProjects() {
       return (await res.json()) as ProjectSummary[];
     },
     staleTime: 30_000,
+    enabled,
   });
 }
 
@@ -2298,6 +2299,22 @@ export async function resolveOrCreateProjectId(name: string): Promise<string> {
     if (created) return created.id;
     throw err;
   }
+}
+
+/**
+ * {@link resolveOrCreateProjectId}, then refresh the cached project list so
+ * pickers and the sidebar show a project it just created.
+ */
+export function useResolveOrCreateProjectId(): (name: string) => Promise<string> {
+  const queryClient = useQueryClient();
+  return useCallback(
+    async (name: string) => {
+      const id = await resolveOrCreateProjectId(name);
+      void queryClient.invalidateQueries({ queryKey: ["projects"] });
+      return id;
+    },
+    [queryClient],
+  );
 }
 
 /**

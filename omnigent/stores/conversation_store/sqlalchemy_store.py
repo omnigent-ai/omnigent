@@ -108,6 +108,7 @@ from omnigent.stores.conversation_store import (
     ConversationUpdateResult,
     CreatedSession,
     DailyCostState,
+    SessionActivity,
     SessionConnectivity,
     pinned_label_key,
 )
@@ -1379,6 +1380,39 @@ class SqlAlchemyConversationStore(ConversationStore):
             )
             for row in meta_rows
         }
+
+    def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SessionActivity]:
+        """One ``SELECT`` per database for the ids' update times and live statuses."""
+        if not conversation_ids:
+            return {}
+        unique_ids = list(set(conversation_ids))
+        with self._conv_session("get_session_activity") as session:
+            updated = session.execute(
+                select(SqlConversation.id, SqlConversation.updated_at).where(
+                    SqlConversation.workspace_id == current_workspace_id(),
+                    SqlConversation.id.in_(unique_ids),
+                )
+            ).all()
+        if not updated:
+            return {}
+        with self._session("get_session_activity") as session:
+            meta_rows = session.execute(
+                select(SqlConversationMetadata.id, SqlConversationMetadata.live_status).where(
+                    SqlConversationMetadata.workspace_id == current_workspace_id(),
+                    SqlConversationMetadata.id.in_([row.id for row in updated]),
+                )
+            ).all()
+        statuses = {row.id: row.live_status for row in meta_rows}
+        activity: dict[str, SessionActivity] = {}
+        for row in updated:
+            status = statuses.get(row.id)
+            try:
+                live_status = decode_session_live_status(status) if status is not None else None
+            except ValueError:
+                # A newer replica's status must not drop the rest of the batch.
+                live_status = None
+            activity[row.id] = SessionActivity(updated_at=row.updated_at, live_status=live_status)
+        return activity
 
     def get_conversations(self, conversation_ids: list[str]) -> dict[str, Conversation]:
         """
@@ -3528,6 +3562,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        label_updates: dict[str, str] | None = None,
     ) -> ConversationUpdateResult | None:
         """
         Update mutable fields on a conversation.
@@ -3573,6 +3608,8 @@ class SqlAlchemyConversationStore(ConversationStore):
             append). JSON-encoded into the column.
         :param archived: New archived state. ``True`` archives,
             ``False`` unarchives, ``None`` leaves unchanged.
+        :param label_updates: Labels to merge in the same transaction as model
+            and effort settings. Omitted labels remain unchanged.
         :returns: The updated conversation and requested model-setting change
             flags, or ``None`` if the conversation does not exist.
         """
@@ -3669,6 +3706,9 @@ class SqlAlchemyConversationStore(ConversationStore):
                         )
                     )
                 row.archived = archived
+                ap_changed = True
+            if label_updates:
+                _upsert_labels(ap_sess, conversation_id, label_updates, now)
                 ap_changed = True
             if ap_changed:
                 row.updated_at = now

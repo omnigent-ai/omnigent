@@ -3,8 +3,10 @@
 // optional, and whatever a view leaves out uses the generic rendering.
 
 import type { ComponentType } from "react";
-import type { ToolCall, ToolResultSummary } from "@/lib/toolResultSummary";
+import { FILE_EDIT_TOOL_NAMES } from "@/lib/toolEditDiff";
+import { type ToolCall, type ToolResultSummary, summarizeFileEdit } from "@/lib/toolResultSummary";
 import { type ToolTitle, splitToolName } from "@/lib/toolTitle";
+import { FileEditBody } from "./FileEditBody";
 
 export interface ToolBodyProps {
   call: ToolCall;
@@ -17,16 +19,30 @@ export interface ToolView {
   title?: (args: Record<string, unknown>) => ToolTitle | null;
   /** Line under the row; returning `null` hides it. Replaces `summarizeToolResult`. */
   summary?: (call: ToolCall) => ToolResultSummary | null;
-  /** Expanded content, in place of the generic Input / Result fields. */
+  /**
+   * Expanded content in place of the generic Input / Result fields; Raw stays available.
+   * The card adds a state only while `output` is null, so the view must render any output, errors included.
+   */
   Body?: ComponentType<ToolBodyProps>;
+  /** Name of the `Body` view on the switch to Raw; defaults to "Fields". */
+  bodyLabel?: string;
 }
+
+/** File edits: added/removed line counts on the result line, and the diff when expanded. */
+const FILE_EDIT_VIEW: ToolView = {
+  summary: summarizeFileEdit,
+  Body: FileEditBody,
+  bodyLabel: "Diff",
+};
 
 /**
  * Views keyed by the tool name a harness reports, e.g. `TodoWrite`,
  * `manage_todo_list`, or `mcp__linear__get_issue`. Register one view under
  * every harness's name for the same kind of tool.
  */
-const TOOL_VIEWS = new Map<string, ToolView>();
+const TOOL_VIEWS = new Map<string, ToolView>(
+  FILE_EDIT_TOOL_NAMES.map((name) => [name, FILE_EDIT_VIEW]),
+);
 
 /** The registered view for a tool; Omnigent's `mcp__omnigent__x` tools resolve to `x`. */
 export function toolViewFor(
