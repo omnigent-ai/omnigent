@@ -122,7 +122,9 @@ def native_cost_with_requests(
     """
     base = context_window.compute_llm_cost(current, pricing)
     adjustment = float(current.get("codex_cost_adjustment", 0.0))
-    fallback = max(old_cost, base + adjustment)
+    # The flat estimate of the reported totals is a floor, so no snapshot can
+    # leave a negative adjustment that freezes cost below its flat growth.
+    fallback = max(old_cost, base, base + adjustment)
     updates = data.get("codex_pricing_updates")
     source = data.get("codex_pricing_source")
     if not isinstance(updates, list) or not isinstance(source, str):
@@ -181,6 +183,9 @@ def native_cost_with_requests(
             for part in request_usage_delta(final_total, None, baseline)
         )
         baseline = final_total
+    # Same floor as the legacy path: an overstated snapshot total can skip
+    # request charges, but never hold cost below the reported tokens' flat price.
+    cost = max(old_cost, cost, base)
     checkpoints[source] = sequence
     current["codex_pricing_sequences"] = checkpoints
     current["codex_pricing_total"] = dict(
@@ -190,4 +195,4 @@ def native_cost_with_requests(
     current["codex_cost_adjustment"] = cost - context_window.compute_llm_cost(
         usage_from_counts(baseline), pricing
     )
-    return max(old_cost, cost)
+    return cost

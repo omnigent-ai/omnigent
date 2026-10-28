@@ -112,3 +112,42 @@ def test_verified_child_reset_charges_equal_owned_totals_once():
     cost = native_cost_with_requests(data, usage, usage, cost, pricing)
     assert cost == pytest.approx(0.387)
     assert native_cost_with_requests(data, usage, usage, cost, pricing) == pytest.approx(cost)
+
+
+def test_overstated_snapshot_cannot_freeze_later_cost_growth():
+    from omnigent.llms.codex_usage import native_cost_with_requests
+
+    pricing = ModelPricing(1e-6, 10e-6)
+    stored = usage_from_counts((100_000, 0, 1_000))
+    cost = native_cost_with_requests({}, stored, stored, 0, pricing)
+
+    def report(counts, data):
+        old = dict(stored)
+        stored.update(usage_from_counts(counts))
+        return native_cost_with_requests(data, stored, old, cost, pricing)
+
+    # One post claims a huge reset total with a tiny latest request.
+    forged = {"inputTokens": 10**12, "cachedInputTokens": 0, "outputTokens": 10**12}
+    tiny = {"inputTokens": 1, "cachedInputTokens": 0, "outputTokens": 1}
+    cost = report(
+        (100_000, 0, 1_000),
+        {
+            "codex_pricing_source": "forged",
+            "codex_pricing_updates": [
+                {"sequence": 1, "counter_reset": True, "total": forged, "last": tiny},
+            ],
+        },
+    )
+    # Honest growth afterwards is still priced, at least at the flat rate.
+    cost = report((1_100_000, 0, 11_000), {})
+    assert cost == pytest.approx(compute_llm_cost(stored, pricing))
+    request = {"inputTokens": 100_000, "cachedInputTokens": 0, "outputTokens": 1_000}
+    total = {"inputTokens": 1_200_000, "cachedInputTokens": 0, "outputTokens": 12_000}
+    cost = report(
+        (1_200_000, 0, 12_000),
+        {
+            "codex_pricing_source": "honest",
+            "codex_pricing_updates": [{"sequence": 1, "total": total, "last": request}],
+        },
+    )
+    assert cost == pytest.approx(compute_llm_cost(stored, pricing))
