@@ -163,7 +163,9 @@ def register_items_routes(
             filtering.
         :param session_name: When set alongside ``tool``, only
             return children whose title matches
-            ``"{tool}:{session_name}"`` exactly.
+            ``"{tool}:{session_name}"`` exactly. The pair addresses
+            framework-named titles; a verbatim ``sys_session_create``
+            child's bound-agent ``tool`` is not part of its stored title.
         :returns: A :class:`PaginatedList` of
             :class:`ChildSessionSummary` objects.
         :raises OmnigentError: 403 if the caller lacks READ on
