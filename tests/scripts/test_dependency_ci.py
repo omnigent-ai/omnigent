@@ -202,22 +202,26 @@ def test_configuration_changes_keep_full_coverage(scope_module, path, before, af
 
 
 @pytest.mark.parametrize(
-    "path,runs_tooling",
+    "path,status,runs_tooling",
     [
-        ("omnigent/server/app.py", False),
-        ("web/src/App.tsx", False),
-        ("tests/server/test_app.py", False),
-        (".github/workflows/merge-ready.yml", True),
-        (".github/scripts/merge-ready/required.sh", True),
-        ("scripts/install_oss.sh", True),
-        ("dev/lint/custom_lint.py", True),
-        ("tests/scripts/test_dependency_ci.py", True),
-        ("tests/conftest.py", True),
-        ("uv.lock", True),
+        ("omnigent/server/app.py", "modified", False),
+        ("web/src/App.tsx", "modified", False),
+        ("tests/server/test_app.py", "A", False),
+        (".github/workflows/merge-ready.yml", "modified", True),
+        (".github/scripts/merge-ready/required.sh", "modified", True),
+        ("scripts/install_oss.sh", "modified", True),
+        ("dev/lint/custom_lint.py", "modified", True),
+        ("tests/scripts/test_dependency_ci.py", "modified", True),
+        ("tests/conftest.py", "modified", True),
+        ("uv.lock", "modified", True),
+        ("deploy/docker/Dockerfile.alpine", "A", True),
+        ("examples/new-extension/web/package.json", "D", True),
     ],
 )
-def test_ci_tooling_tests_run_only_when_tooling_can_change(scope_module, path, runs_tooling):
-    selection = scope_module.select_scope([{"filename": path, "status": "modified"}])
+def test_ci_tooling_tests_run_only_when_tooling_can_change(
+    scope_module, path, status, runs_tooling
+):
+    selection = scope_module.select_scope([{"filename": path, "status": status}])
     groups = [row["group"] for row in json.loads(selection["python_matrix"])["include"]]
     assert ("ci-tooling" in groups) == runs_tooling
     assert "misc" in groups

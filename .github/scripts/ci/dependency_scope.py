@@ -48,9 +48,12 @@ DEPENDENCY_SCOPES = {
     "deploy/hf-spaces/Dockerfile": "docker",
 }
 # Tests of CI, release and dev tooling run only when a change can affect them.
+# Manifests match by file name, so an added or removed one still runs the tests
+# that check every manifest is configured for Dependabot and CI.
 TOOLING_GROUP = "ci-tooling"
 TOOLING_PREFIXES = (".github/", "scripts/", "dev/", "tests/scripts/")
-TOOLING_FILES = {"tests/conftest.py", *DEPENDENCY_SCOPES}
+TOOLING_FILES = {"tests/conftest.py"}
+TOOLING_FILE_NAMES = {Path(path).name for path in DEPENDENCY_SCOPES}
 
 
 def pin_only(before: str, after: str, pattern: str) -> bool:
@@ -137,7 +140,13 @@ def file_scope(path: str, read=None) -> str:
 
 
 def touches_tooling(paths: set[str]) -> bool:
-    return any(path.startswith(TOOLING_PREFIXES) or path in TOOLING_FILES for path in paths)
+    return any(
+        path.startswith(TOOLING_PREFIXES)
+        or path in TOOLING_FILES
+        or Path(path).name in TOOLING_FILE_NAMES
+        or Path(path).name.startswith("Dockerfile")
+        for path in paths
+    )
 
 
 def python_matrix(backend: bool, *, tooling: bool = True) -> str:
