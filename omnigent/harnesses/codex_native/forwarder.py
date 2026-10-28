@@ -10,6 +10,7 @@ import logging
 import re
 import urllib.error
 import urllib.request
+import uuid
 from collections import deque
 from collections.abc import AsyncIterator, Callable, Collection
 from contextvars import ContextVar
@@ -66,6 +67,7 @@ from omnigent.harnesses.codex_native.elicitation import (
 from omnigent.harnesses.codex_native.elicitation import (
     is_codex_request_id as _is_codex_request_id,
 )
+from omnigent.llms.codex_usage import token_counts
 from omnigent.native._native_forwarder_health import (
     note_post_success as note_native_post_success,
 )
@@ -327,6 +329,7 @@ class _CodexChildStream:
 
     state: _CodexForwarderState
     delta_coalescer: _OutputTextDeltaCoalescer
+    usage_coalescer: _SessionUsageCoalescer | None = None
     active_turn_id: str | None = None
     terminal_turn_ids: set[str] = field(default_factory=set)
 
@@ -633,6 +636,9 @@ class _CodexForwarderState:
             return
         turn_id = params.get("turnId")
         frame: _UsageFrame = (turn_id if isinstance(turn_id, str) else None, total)
+        recent = self.recent_usage_frames.get(thread_id)
+        if recent and frame in recent:
+            return
         if thread_id != parent_thread_id and thread_id not in self.child_usage_baselines:
             source_thread_id = self.usage_source_threads.get(thread_id, parent_thread_id)
             source_frames = (
@@ -646,6 +652,17 @@ class _CodexForwarderState:
             self.child_usage_baselines[thread_id] = baseline
             if self.child_usage_baseline_dir is not None:
                 record_child_usage_baseline(self.child_usage_baseline_dir, thread_id, baseline)
+        recent = self.recent_usage_frames.get(thread_id)
+        if (
+            thread_id != parent_thread_id
+            and recent
+            and any(new < old for new, old in zip(total, recent[-1][1], strict=True))
+        ):
+            self.child_usage_baselines[thread_id] = _NO_INHERITED_USAGE
+            if self.child_usage_baseline_dir is not None:
+                record_child_usage_baseline(
+                    self.child_usage_baseline_dir, thread_id, _NO_INHERITED_USAGE
+                )
         self.recent_usage_frames.setdefault(
             thread_id, deque(maxlen=_RECENT_USAGE_FRAMES_PER_THREAD)
         ).append(frame)
@@ -783,6 +800,13 @@ class _CodexForwarderState:
         """Drain child output while the forwarder's HTTP client is still open."""
         await asyncio.gather(
             *(stream.delta_coalescer.close() for stream in self.child_streams.values())
+        )
+        await asyncio.gather(
+            *(
+                stream.usage_coalescer.close()
+                for stream in self.child_streams.values()
+                if stream.usage_coalescer is not None
+            )
         )
         self.child_streams.clear()
 
@@ -1903,6 +1927,18 @@ class _SessionUsageCoalescer:
         self._last_posted: dict[str, int] = {}
         self._model: str | None = model
         self._baseline = baseline
+        self._last_raw_usage = baseline
+        self._pricing_source = uuid.uuid4().hex
+        self._pricing_sequence = 0
+        self._pricing_updates: list[_JsonObject] = []
+        self._pricing_seen: deque[tuple[object, ...]] = deque(maxlen=256)
+        self._flush_lock = asyncio.Lock()
+
+    def seed_baseline(self, baseline: _UsageTotals | None) -> None:
+        """Learn a child's inherited counters before its first usage notification."""
+        if self._last_raw_usage is None:
+            self._baseline = baseline
+            self._last_raw_usage = baseline
 
     def record(self, params: _JsonObject, model: str | None = None) -> None:
         """
@@ -1922,30 +1958,70 @@ class _SessionUsageCoalescer:
         data = _session_usage_data_from_params(params)
         if data is None:
             return
+        token_usage = params.get("tokenUsage", {})
+        if not isinstance(token_usage, dict):
+            return
+        total = token_counts(token_usage.get("total"))
+        last = token_counts(token_usage.get("last"))
+        frame = (params.get("turnId"), total, last)
+        if frame in self._pricing_seen:
+            return
+        counter_reset = False
+        if total is not None:
+            if self._last_raw_usage is not None and any(
+                new < old for new, old in zip(total, self._last_raw_usage, strict=True)
+            ):
+                self._baseline = None
+                counter_reset = True
+            self._last_raw_usage = total
         if self._baseline is not None:
             for key, inherited in zip(_CUMULATIVE_TOKEN_KEYS, self._baseline, strict=True):
                 if key in data:
                     data[key] = max(0, data[key] - inherited)
         self._pending.update(data)
+        if total is not None and last is not None:
+            self._pricing_seen.append(frame)
+            self._pricing_sequence += 1
+            self._pricing_updates.append(
+                {
+                    "sequence": self._pricing_sequence,
+                    "counter_reset": counter_reset,
+                    "model": self._model,
+                    "total": dict(
+                        zip(
+                            ("inputTokens", "cachedInputTokens", "outputTokens"),
+                            (data[key] for key in _CUMULATIVE_TOKEN_KEYS),
+                            strict=True,
+                        )
+                    ),
+                    "last": token_usage["last"],
+                }
+            )
 
     async def flush(self) -> None:
+        """Serialize live and replay flushes so one cannot retire another's requests."""
+        async with self._flush_lock:
+            await self._flush_pending()
+
+    async def _flush_pending(self) -> None:
         """
         Post changed pending usage values to AP.
 
         :returns: None after the pending usage update has been
             attempted.
         """
-        if not self._pending:
+        if not self._pending and not self._pricing_updates:
             return
+        pending = dict(self._pending)
         data = {
             key: value
             for key, value in self._pending.items()
             if self._last_posted.get(key) != value
         }
-        if not data:
+        if not data and not self._pricing_updates:
             self._pending.clear()
             return
-        if data.keys() & _CUMULATIVE_TOKEN_KEYS:
+        if data.keys() & _CUMULATIVE_TOKEN_KEYS or self._pricing_updates:
             # Re-attach every cumulative count so the post stays self-contained:
             # the latest pending value, else the last posted one when this frame
             # omitted the field (older servers read an omitted count as zero).
@@ -1959,6 +2035,10 @@ class _SessionUsageCoalescer:
         # counts changed) — the server reprices cumulative tokens into
         # ``total_cost_usd`` per turn and needs the model each time.
         payload: _JsonObject = dict(data)
+        pricing_updates = list(self._pricing_updates)
+        if pricing_updates:
+            payload["codex_pricing_source"] = self._pricing_source
+            payload["codex_pricing_updates"] = pricing_updates
         if self._model:
             payload["model"] = self._model
         response = await _post_session_event(
@@ -1970,7 +2050,10 @@ class _SessionUsageCoalescer:
         _log_failed_session_event_post("external_session_usage", response)
         if response is not None and response.status_code < 400:
             self._last_posted.update(data)
-            self._pending.clear()
+            del self._pricing_updates[: len(pricing_updates)]
+            for key, value in pending.items():
+                if self._pending.get(key) == value:
+                    self._pending.pop(key, None)
 
     async def close(self) -> None:
         """
@@ -3274,6 +3357,7 @@ async def _handle_event(
     event_state = forwarder_state
     event_bridge_dir = bridge_dir if not is_child else None
     child_usage_baseline: _UsageTotals | None = None
+    child_stream: _CodexChildStream | None = None
     if is_child and forwarder_state is not None:
         child_thread_id = _thread_id_from_params(params)
         assert child_thread_id is not None
@@ -3351,19 +3435,18 @@ async def _handle_event(
         forwarder_state=event_state,
     ):
         return
-    # Child token-usage events post to the child session through a per-event
-    # coalescer, flushed immediately and seeded with the session model for
-    # pricing and with the usage the child inherited at its fork.
-    child_coalescer = (
-        _SessionUsageCoalescer(
-            client,
-            route_session_id,
-            model=event_state.model if event_state is not None else None,
-            baseline=child_usage_baseline,
-        )
-        if is_child
-        else None
-    )
+    child_coalescer = None
+    if child_stream is not None:
+        # Live notifications and resume replay must share retry/reset state.
+        if child_stream.usage_coalescer is None:
+            child_stream.usage_coalescer = _SessionUsageCoalescer(
+                client,
+                route_session_id,
+                model=event_state.model if event_state is not None else None,
+                baseline=child_usage_baseline,
+            )
+        child_coalescer = child_stream.usage_coalescer
+        child_coalescer.seed_baseline(child_usage_baseline)
     if await _maybe_handle_turn_event(
         client,
         session_id=route_session_id,

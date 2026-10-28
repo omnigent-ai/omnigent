@@ -982,6 +982,10 @@ class Usage(BaseModel):
         (e.g. supervisors that delegate / use the harness default).
         ``None`` when the executor doesn't report it; the cost path
         then falls back to the session override / spec model.
+    :param pricing_requests: Optional verified per-request token breakdowns for
+        catalog tier selection. Counts are additive subsets of this turn's totals;
+        unclassified tokens retain flat estimates. Each item carries inclusive
+        ``request_input_tokens`` plus non-cached input, cache-read and output counts.
     :param cost_usd: Authoritative per-turn cost in USD reported
         directly by the harness/provider (e.g. GitHub Copilot's
         AI-credit total). When present, the server-side cost path uses
@@ -999,6 +1003,7 @@ class Usage(BaseModel):
     cache_creation_input_tokens: int = 0
     model: str | None = None
     cost_usd: float | None = None
+    pricing_requests: list[dict[str, int]] | None = None
 
 
 class ErrorDetail(BaseModel):

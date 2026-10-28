@@ -13380,3 +13380,51 @@ async def test_external_error_item_model_unavailable_card_live_and_after_reload(
         assert shown["message"] == item_data["message"]
         for field, value in card.items():
             assert shown.get(field) == value, (field, shown)
+
+
+async def test_accumulate_codex_usage_prices_requests_before_turn_aggregation(
+    client: httpx.AsyncClient,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.server.routes import sessions as sessions_routes
+
+    pricing = ModelPricing(
+        2e-6, 10e-6, 0.2e-6, long_context=((272_000, ModelPricing(4e-6, 15e-6, 0.4e-6)),)
+    )
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing_with_provider",
+        lambda *args, **kwargs: pricing,
+    )
+    agent = await create_test_agent(client)
+    session = await _create_session(client, agent["id"])
+    sessions_routes._accumulate_session_usage(
+        {
+            "usage": {
+                "model": "gpt-6-sol",
+                "input_tokens": 220_000,
+                "cache_read_input_tokens": 280_000,
+                "output_tokens": 200,
+                "total_tokens": 500_200,
+                "pricing_requests": [
+                    {
+                        "input_tokens": 200_000,
+                        "cache_read_input_tokens": 0,
+                        "output_tokens": 100,
+                        "request_input_tokens": 200_000,
+                    },
+                    {
+                        "input_tokens": 20_000,
+                        "cache_read_input_tokens": 280_000,
+                        "output_tokens": 100,
+                        "request_input_tokens": 300_000,
+                    },
+                ],
+            }
+        },
+        session["id"],
+        SqlAlchemyConversationStore(db_uri),
+    )
+    usage = _read_session_usage(db_uri, session["id"])
+    assert usage["total_cost_usd"] == pytest.approx(0.5945)
+    assert usage["by_model"]["gpt-6-sol"]["total_cost_usd"] == pytest.approx(0.5945)

@@ -27,11 +27,52 @@ from collections.abc import Callable, Collection
 from contextlib import suppress
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, TypeGuard
+from typing import Any, TypeGuard, cast
 
 import cachetools
 
 _logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class LongContextPricing:
+    """Catalog rates per million for requests exceeding an input threshold."""
+
+    threshold_tokens: int
+    input_price: float
+    output_price: float
+    cache_read_price: float | None = None
+    cache_write_price: float | None = None
+
+
+def _long_context_pricing(pricing: dict[str, Any]) -> tuple[LongContextPricing, ...]:
+    """Keep only complete, finite catalog tiers; never infer tiers from model ids."""
+    result = []
+    entries = pricing.get("long_context", [])
+    if not isinstance(entries, list):
+        return ()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        threshold = entry.get("threshold_tokens")
+        rates = [
+            entry.get(f"{kind}_per_million_tokens")
+            for kind in ("input", "output", "cache_read", "cache_write")
+        ]
+        if type(threshold) is not int or threshold < 0 or None in rates[:2]:
+            continue
+        if any(
+            rate is not None
+            and (type(rate) not in (int, float) or not math.isfinite(rate) or rate < 0)
+            for rate in rates
+        ):
+            continue
+        result.append(
+            LongContextPricing(
+                threshold, cast(float, rates[0]), cast(float, rates[1]), rates[2], rates[3]
+            )
+        )
+    return tuple(sorted(result, key=lambda tier: tier.threshold_tokens))
 
 
 @dataclass
@@ -71,6 +112,7 @@ class ModelInfo:
     output_price: float | None = None
     cache_read_price: float | None = None
     cache_write_price: float | None = None
+    long_context: tuple[LongContextPricing, ...] = ()
 
 
 @dataclass
@@ -594,6 +636,7 @@ def get_models(provider: str) -> list[ModelInfo]:
                     output_price=pricing.get("output_per_million_tokens"),
                     cache_read_price=pricing.get("cache_read_per_million_tokens"),
                     cache_write_price=pricing.get("cache_write_per_million_tokens"),
+                    long_context=_long_context_pricing(pricing),
                 )
             )
 

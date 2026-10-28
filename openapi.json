@@ -10501,6 +10501,26 @@
             "$ref": "#/components/schemas/UsageDetails",
             "description": "Breakdown of output token usage (e.g. reasoning tokens)."
           },
+          "pricing_requests": {
+            "anyOf": [
+              {
+                "items": {
+                  "additionalProperties": {
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "description": "Optional verified per-request token breakdowns for catalog tier selection. Counts are additive subsets of this turn's totals; unclassified tokens retain flat estimates. Each item carries inclusive `request_input_tokens` plus non-cached input, cache-read and output counts.",
+            "title": "Pricing Requests"
+          },
           "total_tokens": {
             "default": 0,
             "description": "Sum of input and output tokens across all LLM sub-calls for this turn (billing total).",

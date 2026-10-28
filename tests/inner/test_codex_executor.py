@@ -1746,6 +1746,12 @@ class TestCodexExecutor(unittest.TestCase):
 
             self.assertEqual(len(events), 1)
             self.assertIsInstance(events[0], TurnComplete)
+            requests = events[0].usage.pop("pricing_requests")
+            self.assertEqual(
+                sum(item["request_input_tokens"] for item in requests),
+                events[0].usage["input_tokens"]
+                + events[0].usage.get("cache_read_input_tokens", 0),
+            )
             self.assertEqual(
                 events[0].usage,
                 {
@@ -1783,7 +1789,7 @@ class TestCodexExecutor(unittest.TestCase):
         request. The turn's billing usage must instead be the growth of the
         cumulative ``tokenUsage.total`` counters across the whole turn, while
         ``context_tokens`` (window fill) stays the latest ``last`` snapshot
-        (1350 here) — not the billed total (2450).
+        (300100 here) — not the billed total (500200).
         """
 
         async def _t():
@@ -1800,45 +1806,37 @@ class TestCodexExecutor(unittest.TestCase):
 
             async def _inject_events() -> None:
                 await asyncio.sleep(0.01)
+                short = {
+                    "inputTokens": 200_000,
+                    "cachedInputTokens": 0,
+                    "outputTokens": 100,
+                    "totalTokens": 200_100,
+                }
+                long = {
+                    "inputTokens": 300_000,
+                    "cachedInputTokens": 280_000,
+                    "outputTokens": 100,
+                    "totalTokens": 300_100,
+                }
+                total = {
+                    "inputTokens": 500_000,
+                    "cachedInputTokens": 280_000,
+                    "outputTokens": 200,
+                    "totalTokens": 500_200,
+                }
+                first = self._usage_update_event("turn-1", short, short)
+                second = self._usage_update_event("turn-1", long, total)
+                for event in (first, second, first, second):
+                    session._events.put_nowait(event)
                 session._events.put_nowait(
                     self._usage_update_event(
                         "turn-1",
-                        last={
-                            "inputTokens": 1000,
-                            "cachedInputTokens": 800,
-                            "outputTokens": 100,
-                            "totalTokens": 1100,
-                        },
-                        total={
-                            "inputTokens": 1000,
-                            "cachedInputTokens": 800,
-                            "outputTokens": 100,
-                            "totalTokens": 1100,
-                        },
+                        {"inputTokens": 100_000, "outputTokens": 100, "totalTokens": 100_100},
+                        {"inputTokens": 600_000, "outputTokens": 300, "totalTokens": 600_300},
                     )
                 )
                 session._events.put_nowait(
-                    self._usage_update_event(
-                        "turn-1",
-                        last={
-                            "inputTokens": 1200,
-                            "cachedInputTokens": 1000,
-                            "outputTokens": 150,
-                            "totalTokens": 1350,
-                        },
-                        total={
-                            "inputTokens": 2200,
-                            "cachedInputTokens": 1800,
-                            "outputTokens": 250,
-                            "totalTokens": 2450,
-                        },
-                    )
-                )
-                session._events.put_nowait(
-                    {
-                        "method": "turn/completed",
-                        "params": {"turn": {"id": "turn-1"}},
-                    }
+                    {"method": "turn/completed", "params": {"turn": {"id": "turn-1"}}}
                 )
 
             inject_task = asyncio.create_task(_inject_events())
@@ -1857,14 +1855,31 @@ class TestCodexExecutor(unittest.TestCase):
 
             self.assertEqual(len(events), 1)
             self.assertIsInstance(events[0], TurnComplete)
+            requests = events[0].usage.pop("pricing_requests")
+            from omnigent.llms.codex_usage import compute_itemized_cost
+            from omnigent.llms.context_window import ModelPricing
+
+            pricing = ModelPricing(
+                2e-6, 10e-6, 0.2e-6, long_context=((272_000, ModelPricing(4e-6, 15e-6, 0.4e-6)),)
+            )
+            self.assertEqual(
+                [item["request_input_tokens"] for item in requests], [200_000, 300_000]
+            )
+            self.assertAlmostEqual(
+                compute_itemized_cost(events[0].usage, pricing, requests), 0.7955
+            )
+            self.assertEqual(
+                sum(item["request_input_tokens"] for item in requests),
+                500_000,
+            )
             self.assertEqual(
                 events[0].usage,
                 {
-                    "input_tokens": 400,
-                    "output_tokens": 250,
-                    "total_tokens": 2450,
-                    "cache_read_input_tokens": 1800,
-                    "context_tokens": 1350,
+                    "input_tokens": 320_000,
+                    "output_tokens": 300,
+                    "total_tokens": 600_300,
+                    "cache_read_input_tokens": 280_000,
+                    "context_tokens": 100_100,
                     "model": "gpt-5.4-mini",
                 },
             )
@@ -1930,6 +1945,17 @@ class TestCodexExecutor(unittest.TestCase):
                     "outputTokens": 100,
                     "totalTokens": 1100,
                 }
+            )
+            self.assertEqual(
+                first.usage.pop("pricing_requests"),
+                [
+                    {
+                        "input_tokens": 200,
+                        "cache_read_input_tokens": 800,
+                        "output_tokens": 100,
+                        "request_input_tokens": 1000,
+                    }
+                ],
             )
             self.assertEqual(
                 first.usage,

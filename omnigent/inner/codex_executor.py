@@ -59,6 +59,7 @@ from omnigent.harnesses.codex_egress import (
 )
 from omnigent.inner.agent_env import clean_agent_env, declared_passthrough
 from omnigent.llms._usage_observer import notify_from_dict as _notify_usage_from_dict
+from omnigent.llms.codex_usage import request_usage_delta, token_counts
 from omnigent.models import model_catalog
 from omnigent.models.codex_model_vocabulary import (
     EXTENDED_CATALOG_MODELS,
@@ -2875,6 +2876,9 @@ class _CodexAppServerSession:
         # plus a ``context_tokens`` window-fill snapshot from ``last``.
         # Consumed (and cleared) on the next ``turn/completed``.
         self._last_turn_usage: dict[str, object] | None = None
+        self._turn_pricing_requests: list[dict[str, int]] = []
+        self._turn_billing_usage: dict[str, int] = {}
+        self._turn_usage_frames: set[tuple[int, int, int]] = set()
         # Raw cumulative ``tokenUsage.total`` counters: the newest observed
         # values, and the snapshot consumed at the last turn boundary.
         self._thread_usage_total_raw: dict[str, int] | None = None
@@ -3504,6 +3508,11 @@ class _CodexAppServerSession:
         """Return the finished turn's usage and advance the thread baseline
         so the next turn's delta excludes everything reported so far."""
         usage = self._last_turn_usage
+        if usage is not None and self._turn_pricing_requests:
+            usage["pricing_requests"] = self._turn_pricing_requests
+        self._turn_pricing_requests = []
+        self._turn_billing_usage = {}
+        self._turn_usage_frames = set()
         self._last_turn_usage = None
         if self._thread_usage_total_raw is not None:
             self._thread_usage_baseline_raw = self._thread_usage_total_raw
@@ -3696,6 +3705,9 @@ class _CodexAppServerSession:
             # Fresh thread: cumulative usage counters restart at zero.
             self._thread_usage_total_raw = None
             self._thread_usage_baseline_raw = None
+            self._turn_pricing_requests = []
+            self._turn_billing_usage = {}
+            self._turn_usage_frames = set()
             self._last_turn_usage = None
 
         assert self.thread_id is not None
@@ -4105,10 +4117,47 @@ class _CodexAppServerSession:
                 if method == "thread/tokenUsage/updated":
                     total_raw = _extract_codex_thread_total_usage(params)
                     if total_raw is not None:
+                        token_usage = params.get("tokenUsage", {})
+                        raw_total = token_usage.get("total", {})
+                        complete_total = token_counts(raw_total)
+                        if self._thread_usage_total_raw is not None:
+                            for key, value in self._thread_usage_total_raw.items():
+                                if key not in raw_total:
+                                    total_raw[key] = value
+                        total_counts = complete_total or token_counts(total_raw)
+                        last_counts = (
+                            token_counts(token_usage.get("last"))
+                            if complete_total is not None
+                            else None
+                        )
+                        previous = token_counts(self._thread_usage_total_raw) or (0, 0, 0)
+                        if total_counts is not None:
+                            if total_counts in self._turn_usage_frames:
+                                continue
+                            self._turn_usage_frames.add(total_counts)
+                            parts = request_usage_delta(total_counts, last_counts, previous)
+                            for part in parts:
+                                for key in (
+                                    "input_tokens",
+                                    "cache_read_input_tokens",
+                                    "output_tokens",
+                                ):
+                                    self._turn_billing_usage[key] = (
+                                        self._turn_billing_usage.get(key, 0) + part[key]
+                                    )
+                                if "request_input_tokens" in part:
+                                    self._turn_pricing_requests.append(part)
                         self._thread_usage_total_raw = total_raw
                         self._last_turn_usage = _codex_turn_usage_from_totals(
                             total_raw, self._thread_usage_baseline_raw, model
                         )
+                        if total_counts is not None and self._turn_billing_usage:
+                            self._last_turn_usage.update(self._turn_billing_usage)
+                            self._last_turn_usage["total_tokens"] = sum(
+                                self._turn_billing_usage.values()
+                            )
+                            if not self._last_turn_usage.get("cache_read_input_tokens"):
+                                self._last_turn_usage.pop("cache_read_input_tokens", None)
                     else:
                         # No cumulative breakdown — fall back to the newest
                         # request's ``last`` (under-reports multi-request turns).

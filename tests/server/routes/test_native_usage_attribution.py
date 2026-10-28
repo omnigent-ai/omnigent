@@ -545,3 +545,182 @@ async def test_flush_telemetry_reports_the_callers_installation_id(db_uri: str) 
         )
 
     assert [e.host_installation_id for e in events] == ["inst-host-9", None]
+
+
+@pytest.mark.asyncio
+async def test_codex_coalesced_request_cost_survives_replay_resume_and_reset(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.harnesses.codex_native.forwarder import _SessionUsageCoalescer
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient, _usage_event
+
+    pricing = ModelPricing(
+        2e-6, 10e-6, 0.2e-6, long_context=((272_000, ModelPricing(4e-6, 15e-6, 0.4e-6)),)
+    )
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing_with_provider",
+        lambda *args, **kwargs: pricing,
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="codex-long-context", agent_id=_AGENT_ID)
+    client = _RecordingClient()
+    coalescer = _SessionUsageCoalescer(client, conv.id, model="gpt-6-sol")
+    short = _usage_event("thread", (200_000, 0, 100), (200_000, 0, 100))["params"]
+    long = _usage_event("thread", (500_000, 280_000, 200), (300_000, 280_000, 100))["params"]
+    coalescer.record(short)
+    coalescer.record(long)
+    coalescer.record(short)  # A repeated older frame must not become a counter reset.
+    coalescer.record(long)
+    await coalescer.flush()
+    payload = client.posts[-1][1]["data"]
+    assert len(payload["codex_pricing_updates"]) == 2
+    _persist_native_cumulative_usage(conv.id, payload, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(0.5945)
+    _persist_native_cumulative_usage(conv.id, payload, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(0.5945)
+
+    resumed = _SessionUsageCoalescer(client, conv.id, model="gpt-6-sol")
+    resumed.record(long)
+    await resumed.flush()
+    _persist_native_cumulative_usage(conv.id, client.posts[-1][1]["data"], store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(0.5945)
+    reset = _usage_event("thread", (300_000, 280_000, 100), (300_000, 280_000, 100), "new-turn")[
+        "params"
+    ]
+    resumed.record(reset)
+    await resumed.flush()
+    payload = client.posts[-1][1]["data"]
+    _persist_native_cumulative_usage(conv.id, payload, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(0.788)
+    _persist_native_cumulative_usage(conv.id, payload, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(0.788)
+
+
+@pytest.mark.asyncio
+async def test_codex_inherited_totals_and_missing_request_keep_flat_estimate(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from omnigent.harnesses.codex_native.forwarder import _SessionUsageCoalescer
+    from tests.harnesses.codex_native.forwarder._support import _RecordingClient, _usage_event
+
+    pricing = ModelPricing(
+        2e-6, 10e-6, 0.2e-6, long_context=((272_000, ModelPricing(4e-6, 15e-6, 0.4e-6)),)
+    )
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing_with_provider",
+        lambda *args, **kwargs: pricing,
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="codex-child", agent_id=_AGENT_ID)
+    client = _RecordingClient()
+    coalescer = _SessionUsageCoalescer(
+        client, conv.id, model="gpt-6-sol", baseline=(500_000, 280_000, 200)
+    )
+    coalescer.record(
+        _usage_event("child", (500_000, 280_000, 200), (300_000, 280_000, 100))["params"]
+    )
+    coalescer.record(
+        _usage_event("child", (800_000, 560_000, 300), (300_000, 280_000, 100))["params"]
+    )
+    missing = _usage_event("child", (1_100_000, 560_000, 400), (300_000, 0, 100))["params"]
+    missing["tokenUsage"].pop("last")
+    coalescer.record(missing)
+    await coalescer.flush()
+    _persist_native_cumulative_usage(conv.id, client.posts[-1][1]["data"], store)
+    # Only the child's observed long request gets its tier; the missing request
+    # remains an explicitly approximate flat estimate, not a guessed long tier.
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(0.1935 + 0.601)
+
+    for index in (1, 2):
+        coalescer.record(
+            _usage_event(
+                "child",
+                (300_000 * index, 280_000 * index, 100 * index),
+                (300_000, 280_000, 100),
+                f"reset-turn-{index}",
+            )["params"]
+        )
+        await coalescer.flush()
+        _persist_native_cumulative_usage(conv.id, client.posts[-1][1]["data"], store)
+        assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(
+            0.1935 + 0.601 + index * 0.1935
+        )
+
+
+def test_codex_retry_with_incomplete_growth_and_stale_fallback(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pricing = ModelPricing(
+        2e-6, 10e-6, 0.2e-6, long_context=((272_000, ModelPricing(4e-6, 15e-6, 0.4e-6)),)
+    )
+    monkeypatch.setattr(
+        "omnigent.llms.context_window.fetch_model_pricing_with_provider",
+        lambda *args, **kwargs: pricing,
+    )
+    store = SqlAlchemyConversationStore(db_uri)
+    conv = store.create_conversation(title="codex-retry-gap", agent_id=_AGENT_ID)
+    request = {"inputTokens": 300_000, "cachedInputTokens": 0, "outputTokens": 100}
+    payload = {
+        "model": "gpt-6-sol",
+        "cumulative_input_tokens": 300_000,
+        "cumulative_cache_read_input_tokens": 0,
+        "cumulative_output_tokens": 100,
+        "codex_pricing_source": "source",
+        "codex_pricing_updates": [{"sequence": 1, "total": request, "last": request}],
+    }
+    _persist_native_cumulative_usage(conv.id, payload, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1.2015)
+    # The first POST reached the server but its response was lost. A later
+    # incomplete request only updates the totals while the first snapshot retries.
+    payload["cumulative_input_tokens"] = 400_000
+    payload["cumulative_output_tokens"] = 200
+    _persist_native_cumulative_usage(conv.id, payload, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1.4025)
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "gpt-6-sol",
+            "cumulative_input_tokens": 100_000,
+            "cumulative_cache_read_input_tokens": 0,
+            "cumulative_output_tokens": 50,
+        },
+        store,
+    )
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1.4025)
+    request = {"inputTokens": 100_000, "cachedInputTokens": 0, "outputTokens": 100}
+    payload.update(
+        cumulative_input_tokens=500_000,
+        cumulative_output_tokens=300,
+        codex_pricing_updates=[
+            {
+                "sequence": 2,
+                "last": request,
+                "total": {"inputTokens": 500_000, "cachedInputTokens": 0, "outputTokens": 300},
+            }
+        ],
+    )
+    _persist_native_cumulative_usage(conv.id, payload, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1.6035)
+
+    stale = {
+        **payload,
+        "cumulative_input_tokens": 100_000,
+        "cumulative_output_tokens": 50,
+        "codex_pricing_updates": [{"sequence": 1, "total": request, "last": request}],
+    }
+    _persist_native_cumulative_usage(conv.id, stale, store)
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1.6035)
+    _persist_native_cumulative_usage(
+        conv.id,
+        {
+            "model": "gpt-6-sol",
+            "cumulative_input_tokens": 600_000,
+            "cumulative_cache_read_input_tokens": 0,
+            "cumulative_output_tokens": 400,
+        },
+        store,
+    )
+    assert _usage(store, conv.id)["total_cost_usd"] == pytest.approx(1.8045)
