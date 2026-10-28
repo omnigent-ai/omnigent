@@ -156,6 +156,27 @@ def test_resolve_interactive_shell_rejects_paths_and_unknown_names(
     assert _platform._resolve_interactive_shell(name) is None
 
 
+@pytest.mark.parametrize("windows", [False, True])
+def test_windows_shells_are_honored_and_resolved_only_on_windows(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    windows: bool,
+) -> None:
+    """A POSIX ``$SHELL`` naming a Windows shell still falls back to bash."""
+    pwsh = tmp_path / "pwsh"
+    pwsh.write_text("#!/bin/sh\n")
+    pwsh.chmod(0o755)
+    monkeypatch.setattr(_platform, "IS_WINDOWS", windows)
+    monkeypatch.setenv("SHELL", str(pwsh))
+    monkeypatch.setattr("shutil.which", lambda name: str(tmp_path / name))
+
+    assert _platform.default_interactive_shell() == ("pwsh" if windows else "bash")
+    resolved = [
+        _platform._resolve_interactive_shell(shell) for shell in ("pwsh", "powershell", "cmd")
+    ]
+    assert [path is not None for path in resolved] == [windows] * 3
+
+
 def _fake_resolver(installed: set[str]):
     """A ``_resolve_interactive_shell`` stand-in: resolve only *installed*.
 

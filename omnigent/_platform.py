@@ -214,9 +214,11 @@ def default_shell_argv(command: str) -> list[str]:
 #: Interactive shells we honor from ``$SHELL`` for a user terminal. Anything
 #: outside this set (or a ``$SHELL`` that doesn't resolve on PATH) falls back to
 #: bash for a predictable pane.
-_KNOWN_INTERACTIVE_SHELLS = frozenset(
-    {"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh", "pwsh", "powershell", "cmd"}
-)
+_KNOWN_INTERACTIVE_SHELLS = frozenset({"bash", "zsh", "fish", "sh", "dash", "ksh", "tcsh"})
+
+#: Windows shells. Only a Windows host resolves them, but any host's shell
+#: inventory may name them.
+_WINDOWS_INTERACTIVE_SHELLS = frozenset({"pwsh", "powershell", "cmd"})
 
 #: Mainstream interactive shells we proactively offer as launch choices (the
 #: "New shell" picker), in display order. The user's ``$SHELL`` is always
@@ -237,7 +239,7 @@ def normalize_interactive_shells(shells: object) -> list[str]:
     for shell in shells:
         if (
             isinstance(shell, str)
-            and shell in _KNOWN_INTERACTIVE_SHELLS
+            and shell in _KNOWN_INTERACTIVE_SHELLS | _WINDOWS_INTERACTIVE_SHELLS
             and shell not in normalized
         ):
             normalized.append(shell)
@@ -267,7 +269,10 @@ def _resolve_interactive_shell(name: str) -> str | None:
     """
     import shutil
 
-    if name not in _KNOWN_INTERACTIVE_SHELLS or os.path.basename(name) != name:
+    known = name in _KNOWN_INTERACTIVE_SHELLS or (
+        IS_WINDOWS and name in _WINDOWS_INTERACTIVE_SHELLS
+    )
+    if not known or os.path.basename(name) != name:
         return None
 
     login_shell = os.environ.get("SHELL", "").strip()
