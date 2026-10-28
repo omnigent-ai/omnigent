@@ -2,6 +2,7 @@
 // hooks and the heavy MonacoDiffViewer are mocked; IntersectionObserver (absent
 // in jsdom) is stubbed to fire immediately so lazy sections mount.
 
+import { MobilePanelDrawer } from "./MobilePanelDrawer";
 import { act, render, screen, fireEvent, waitFor, within } from "@testing-library/react";
 import { parsePatchFiles } from "@pierre/diffs";
 import type * as DiffsModule from "@pierre/diffs";
@@ -217,13 +218,21 @@ function file(
   };
 }
 
-function renderPanel(active?: boolean) {
+function renderPanel(mobile = false, active?: boolean) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } });
   return {
     client,
     ...render(<PullRequestPanel conversationId="conv_1" active={active} />, {
       wrapper: ({ children }) => (
-        <QueryClientProvider client={client}>{children}</QueryClientProvider>
+        <QueryClientProvider client={client}>
+          {mobile ? (
+            <MobilePanelDrawer open title="Pull Requests" onClose={() => {}}>
+              {children}
+            </MobilePanelDrawer>
+          ) : (
+            children
+          )}
+        </QueryClientProvider>
       ),
     }),
   };
@@ -354,6 +363,35 @@ afterEach(() => {
 });
 
 describe("PullRequestPanel", () => {
+  it("uses one mobile heading with working header actions in list and details", async () => {
+    const user = userEvent.setup();
+    state.storesPrs = false;
+    const url = state.info!.data!.pr!.url;
+    Object.assign(state.info!.data!, {
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: [
+        { url, host: "github.com", repository: "acme/app", number: 6000, relationship: "attached" },
+      ],
+    });
+    const { client } = renderPanel(true);
+    const invalidate = vi.spyOn(client, "invalidateQueries");
+    const heading = screen.getByRole("heading", { name: "Pull Requests" });
+    const header = heading.closest("header")!;
+    expect(screen.getAllByRole("heading", { name: "Pull Requests" })).toHaveLength(1);
+    await user.click(within(header).getByRole("button", { name: "Refresh" }));
+    expect(invalidate).toHaveBeenCalledWith({ queryKey: ["session-pull-requests", "conv_1"] });
+    await user.click(within(header).getByRole("button", { name: "Link a PR" }));
+    expect(screen.getByRole("textbox", { name: "Pull request URL" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Cancel" }));
+    await user.click(screen.getByRole("button", { name: "acme/app #6000 — chore: dummy PR" }));
+    expect(screen.getAllByRole("heading", { name: "Pull Requests" })).toHaveLength(1);
+    expect(within(header).getByRole("button", { name: "Unlink PR" })).toBeEnabled();
+    await user.click(screen.getByRole("button", { name: "All pull requests (1)" }));
+    expect(within(header).queryByRole("button", { name: "Unlink PR" })).toBeNull();
+    expect(screen.getByRole("list", { name: "Pull requests" })).toBeVisible();
+  });
+
   it("shows the PR title in the header and CI check pills on the Summary tab", async () => {
     renderPanel();
     // The header names the panel, never the provider.
@@ -380,7 +418,7 @@ describe("PullRequestPanel", () => {
   it("polls only while active and refreshes stale info on reactivation", async () => {
     const refetchQueries = vi.spyOn(QueryClient.prototype, "refetchQueries");
     onTestFinished(() => refetchQueries.mockRestore());
-    const { rerender } = renderPanel(false);
+    const { rerender } = renderPanel(false, false);
 
     // A collapsed rail keeps the panel mounted but must not poll.
     expect(await screen.findByText("chore: dummy PR")).toBeInTheDocument();

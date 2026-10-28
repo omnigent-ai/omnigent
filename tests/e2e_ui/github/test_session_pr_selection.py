@@ -234,6 +234,13 @@ def test_session_pr_list_long_title(
         if viewport_width < 768
         else page.get_by_role("complementary", name="Workspace")
     )
+    if viewport_width < 768:
+        expect(panel.get_by_role("heading", name="Pull Requests", exact=True)).to_have_count(1)
+        header = panel.locator("header")
+        header.get_by_role("button", name="Refresh", exact=True).click()
+        header.get_by_role("button", name="Link a PR", exact=True).click()
+        expect(panel.get_by_role("textbox", name="Pull request URL")).to_be_visible()
+        panel.get_by_role("button", name="Cancel", exact=True).click()
     row = panel.get_by_role("button", name=label, exact=True)
     expect(row).to_have_attribute("title", label)
     title_text = row.locator(".truncate")
@@ -253,6 +260,9 @@ def test_session_pr_list_long_title(
     row.press("Enter")
     expect(panel.get_by_role("button", name="All pull requests (2)")).to_be_visible()
     expect(panel.get_by_role("link", name=f"{title} #42")).to_be_visible()
+    if viewport_width < 768:
+        expect(panel.get_by_role("heading", name="Pull Requests", exact=True)).to_have_count(1)
+        expect(header.get_by_role("button", name="Unlink PR", exact=True)).to_be_visible()
 
 
 def test_session_pr_account_fallback(

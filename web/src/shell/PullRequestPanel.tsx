@@ -24,6 +24,8 @@
 // PR each render their own empty state, and an associated PR falls through to
 // the header + stacked diff.
 
+import { createPortal } from "react-dom";
+import { useMobilePanelHeaderTarget } from "./MobilePanelDrawer";
 import { PullRequestCommentComposer } from "./PullRequestCommentComposer";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useQueryClient } from "@tanstack/react-query";
@@ -1264,6 +1266,8 @@ export function PullRequestPanel({
   active?: boolean;
 }) {
   const isMobileViewport = useIsMobileViewport();
+  const mobileHeaderTarget = useMobilePanelHeaderTarget();
+  const inMobileDrawer = mobileHeaderTarget !== undefined;
   const [selection, setSelection] = useState<{ sessionId: string; url?: string }>();
   const [detailsSession, setDetailsSession] = useState<string>();
   const showingDetails = detailsSession === conversationId;
@@ -1451,43 +1455,51 @@ export function PullRequestPanel({
       </div>
     ) : undefined;
   const showTrackingControls = !!associations?.tracking_available && !linkInEmptyState;
+  const headerActions = (
+    <TooltipProvider delayDuration={0}>
+      <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
+        {refreshIcon}
+      </IconButton>
+      {showTrackingControls && (
+        <IconButton
+          label={linkNeedsHost ? "Link a PR (needs the host online)" : "Link a PR"}
+          disabled={linkNeedsHost}
+          onClick={() => setLinking(!linking)}
+        >
+          <PlusIcon className="size-3.5" aria-hidden="true" />
+        </IconButton>
+      )}
+      {showTrackingControls && selectedPr && showingDetails && (
+        <IconButton
+          label="Unlink PR"
+          disabled={unlink.isPending}
+          onClick={() => unlinkPr(selectedPr.url)}
+        >
+          <Trash2Icon className="size-3.5" aria-hidden="true" />
+        </IconButton>
+      )}
+    </TooltipProvider>
+  );
   return (
     <div className="flex h-full min-h-0 flex-col">
+      {mobileHeaderTarget && createPortal(headerActions, mobileHeaderTarget)}
       {showTrackingControls ? (
-        <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
-          <PanelTitle showTitle={!showingDetails} />
-          <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
-            {prs.length > 0 && showingDetails && (
-              <Button variant="ghost" size="sm" onClick={() => setDetailsSession(undefined)}>
-                <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
-              </Button>
-            )}
-            <div className="ml-auto flex shrink-0 items-center gap-1">
-              <TooltipProvider delayDuration={0}>
-                <IconButton label="Refresh" disabled={refreshing} onClick={refresh}>
-                  {refreshIcon}
-                </IconButton>
-                <IconButton
-                  label={linkNeedsHost ? "Link a PR (needs the host online)" : "Link a PR"}
-                  disabled={linkNeedsHost}
-                  onClick={() => setLinking(!linking)}
-                >
-                  <PlusIcon className="size-3.5" aria-hidden="true" />
-                </IconButton>
-                {selectedPr && showingDetails && (
-                  <IconButton
-                    label="Unlink PR"
-                    disabled={unlink.isPending}
-                    onClick={() => unlinkPr(selectedPr.url)}
-                  >
-                    <Trash2Icon className="size-3.5" aria-hidden="true" />
-                  </IconButton>
-                )}
-              </TooltipProvider>
+        (!inMobileDrawer || showingDetails) && (
+          <div className="flex h-11 shrink-0 items-center gap-2 border-b border-border px-2">
+            {!inMobileDrawer && <PanelTitle showTitle={!showingDetails} />}
+            <div className="ml-auto flex min-w-0 flex-1 items-center gap-2">
+              {prs.length > 0 && showingDetails && (
+                <Button variant="ghost" size="sm" onClick={() => setDetailsSession(undefined)}>
+                  <ArrowLeftIcon className="size-3.5" /> All pull requests ({prs.length})
+                </Button>
+              )}
+              <div className="ml-auto flex shrink-0 items-center gap-1">
+                {!inMobileDrawer && headerActions}
+              </div>
             </div>
           </div>
-        </div>
-      ) : panelState.kind !== "ready" ? (
+        )
+      ) : !inMobileDrawer && panelState.kind !== "ready" ? (
         <div className="flex h-11 shrink-0 items-center justify-between gap-2 border-b border-border px-2">
           <PanelTitle showTitle />
           {refreshButton}
@@ -1542,8 +1554,8 @@ export function PullRequestPanel({
             info={detailsInfo}
             storedPr={storesPrs && hostOffline ? selectedPr : undefined}
             notSynced={notSynced && !selectedPr}
-            showHeading={!showTrackingControls}
-            refreshButton={!showTrackingControls ? refreshButton : undefined}
+            showHeading={!inMobileDrawer && !showTrackingControls}
+            refreshButton={!inMobileDrawer && !showTrackingControls ? refreshButton : undefined}
             emptyStateAction={
               associations?.tracking_available && linkInEmptyState ? (
                 <div className="mt-2 w-full max-w-sm">
