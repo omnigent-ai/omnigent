@@ -394,9 +394,10 @@ def test_side_chat_model_settings_before_and_after_first_message(
     for resource in ("items", "child_sessions", "resources/terminals"):
         contract.json(f"{path}/{resource}", list_payload([]))
     contract.response(f"{path}/read-state", method="PUT")
-    contract.sse(f"{path}/stream")
+    contract.route(f"**{path}/stream*", lambda route: route.continue_(url=chat.stream.url))
 
     page.goto(chat.url)
+    chat.wait_for_stream()
     expect(page.get_by_placeholder("Send a message…")).to_be_visible()
     if entrypoint == "tray":
         page.get_by_test_id("composer-attach").click()
@@ -420,7 +421,8 @@ def test_side_chat_model_settings_before_and_after_first_message(
     page.get_by_role("menuitemcheckbox", name="Opus", exact=True).click()
     page.get_by_role("menuitemcheckbox", name="Low", exact=True).click()
     page.keyboard.press("Escape")
-    expect(picker).to_contain_text("Opus")
+    # The tray creates a live fork; only an unsent draft displays the requested model.
+    expect(picker).to_contain_text("Sonnet" if entrypoint == "tray" else "Opus")
     expect(picker).to_contain_text("Low")
     assert len(forks) == (1 if entrypoint == "tray" else 0)
     assert chat.session_patches == []
@@ -440,8 +442,21 @@ def test_side_chat_model_settings_before_and_after_first_message(
     assert child["reasoning_effort"] == "low"
     assert forks[0]["side_chat"] is True
     assert len(messages) == 1
+    chat.wait_for_stream()
+    child["llm_model"] = "opus"
+    chat.emit(
+        {
+            "event": "session.model",
+            "data": {"conversation_id": child_id, "model": "opus"},
+        }
+    )
+    expect(picker).to_contain_text("Opus")
+    expect(page.get_by_test_id("composer-config-gear")).to_contain_text("Sonnet")
     picker.click()
     page.get_by_test_id("side-chat-model-edit").click()
+    expect(page.get_by_role("menuitemcheckbox", name="Opus", exact=True)).to_have_attribute(
+        "aria-checked", "true"
+    )
     page.get_by_role("menuitemcheckbox", name="High", exact=True).click()
     expect(picker).to_contain_text("High")
     assert patches[-1] == {"reasoning_effort": "high"}
