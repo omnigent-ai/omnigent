@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { NativeModelOption } from "@/lib/types";
 
 import {
   compactModelTriggerLabel,
@@ -140,6 +141,17 @@ describe("catalog model labels", () => {
     expect(formatStatusModelLabel("provider-a/custom", [{ id: "provider-b/custom" }])).toBe(
       "provider-a/custom",
     );
+  });
+
+  it("resolves Cursor labels without crashing on null model IDs", () => {
+    const rows = [
+      { id: "auto", model: null, displayName: "Auto" },
+      { id: "claude-opus-4-8", model: null, displayName: "Claude Opus 4.8" },
+      { id: null, model: null, displayName: "Broken row" },
+    ] as unknown as NativeModelOption[];
+    expect(formatStatusModelLabel("default", rows)).toBe("default");
+    expect(formatStatusModelLabel("databricks-claude-opus-4-8", rows)).toBe("Claude Opus 4.8");
+    expect(formatStatusModelLabel("claude-opus-4-8[1m]", rows)).toBe("claude-opus-4-8[1m]");
   });
 
   it("names the exact model a row launches in its hover text", () => {

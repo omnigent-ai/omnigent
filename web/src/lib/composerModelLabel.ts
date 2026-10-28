@@ -69,7 +69,8 @@ export function findModelLabelOption(
   const extendedContext = raw.toLowerCase().endsWith("[1m]");
   return findNativeModelOption(
     options.filter(
-      (option) => (option.model ?? option.id).toLowerCase().endsWith("[1m]") === extendedContext,
+      (option) =>
+        (option.model ?? option.id ?? "").toLowerCase().endsWith("[1m]") === extendedContext,
     ),
     raw,
   );
