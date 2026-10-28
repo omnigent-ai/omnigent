@@ -41,6 +41,8 @@ _EXTENDED_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_EXTENDED_MODEL", "gpt-6-so
 _SWITCH_MODEL = os.environ.get("OMNIGENT_TEST_CODEX_SWITCH_MODEL", "gpt-5.6-sol")
 
 _REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
 pytestmark = [
     pytest.mark.posix_only,
     pytest.mark.timeout(240),
@@ -595,3 +597,113 @@ def test_codex_resume_clamps_persisted_effort(codex_effort_rig: _Rig) -> None:
         assert resumed.socket_path != original.socket_path, "A new app-server must own the resume"
         assert resumed.thread_id == original.thread_id, "Resume must retain the existing thread"
         _assert_turn(rig, session, _STANDARD_MODEL, "low", terminal=True)
+
+
+def test_fresh_terminal_turn_reports_running_before_first_model_output(
+    codex_effort_rig: _Rig,
+) -> None:
+    """Fresh subscription recovers running status before any model output arrives."""
+    rig = codex_effort_rig
+    with _session(rig, _STANDARD_MODEL, "medium") as session:
+        marker = f"FRESH_QUIET_{uuid.uuid4().hex}"
+        _json(rig.model.post("/mock/reset"))
+        _json(
+            rig.model.post(
+                "/mock/configure",
+                json={"key": _STANDARD_MODEL, "responses": [{"text": marker, "block": True}] * 12},
+            )
+        )
+        logs = rig.stack.runner_home / ".omnigent/logs/runner"
+        deadline = time.monotonic() + 10
+        while time.monotonic() < deadline:
+            if any(
+                "not ready yet (no/empty rollout)" in path.read_text()
+                for path in logs.glob("*.log")
+            ):
+                break
+            time.sleep(0.1)
+        else:
+            pytest.fail("The fresh native thread never reached its no-rollout subscription wait")
+        session.tmux("send-keys", "-l", f"Reply with {marker}")
+        time.sleep(0.5)
+        session.tmux("send-keys", "Enter")
+        try:
+            deadline = time.monotonic() + 20
+            requests = []
+            while time.monotonic() < deadline:
+                state = read_bridge_state(session.bridge)
+                requests = [
+                    request
+                    for request in _json(rig.model.get("/mock/requests"))["requests"]
+                    if state is not None and request.get("prompt_cache_key") == state.thread_id
+                ]
+                if requests:
+                    break
+                time.sleep(0.1)
+            assert len(requests) == 1, session.tmux("capture-pane", "-p")
+            assert state is not None
+
+            async def native_snapshot() -> dict[str, Any]:
+                observer = client_for_transport(
+                    state.socket_path, client_name="fresh-turn-observer"
+                )
+                await observer.connect()
+                try:
+                    response = await observer.request(
+                        "thread/read", {"threadId": state.thread_id, "includeTurns": True}
+                    )
+                    return response["result"]["thread"]
+                finally:
+                    await observer.close()
+
+            native = asyncio.run(native_snapshot())
+            (rig.stack.root / "fresh-native-thread.json").write_text(json.dumps(native, indent=2))
+            assert len(native["turns"]) == 1
+            turn = native["turns"][0]
+            assert turn["status"] == "inProgress", native
+            deadline = time.monotonic() + 10
+            while time.monotonic() < deadline:
+                snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+                bridge = read_bridge_state(session.bridge)
+                if (
+                    snapshot.get("status") == "running"
+                    and bridge is not None
+                    and bridge.active_turn_id == turn["id"]
+                ):
+                    break
+                time.sleep(0.1)
+            (rig.stack.root / "fresh-quiet-terminal.txt").write_text(
+                session.tmux("capture-pane", "-p")
+            )
+            (rig.stack.root / "fresh-session-before-output.json").write_text(
+                json.dumps(snapshot, indent=2)
+            )
+            assert snapshot.get("status") == "running", snapshot.get("status")
+            assert bridge is not None and bridge.active_turn_id == turn["id"]
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            assert len([item for item in items if item.get("role") == "user"]) == 1
+            assert not any(item.get("role") == "assistant" for item in items)
+        finally:
+            while _json(rig.model.post("/gate/release"))["released"]:
+                pass
+        deadline = time.monotonic() + 20
+        while time.monotonic() < deadline:
+            snapshot = _json(rig.api.get(f"/v1/sessions/{session.id}"))
+            items = _json(rig.api.get(f"/v1/sessions/{session.id}/items", params={"limit": 100}))[
+                "data"
+            ]
+            replies = [
+                item
+                for item in items
+                if item.get("role") == "assistant" and marker in json.dumps(item.get("content"))
+            ]
+            if snapshot.get("status") == "idle" and replies:
+                break
+            time.sleep(0.1)
+        assert len(replies) == 1
+        assert len([item for item in items if item.get("role") == "user"]) == 1
+        assert snapshot.get("status") == "idle"
+        bridge = read_bridge_state(session.bridge)
+        assert bridge is not None and bridge.active_turn_id is None

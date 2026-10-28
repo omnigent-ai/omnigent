@@ -23,10 +23,13 @@ import type { Comment } from "@/hooks/useComments";
 import type { ActiveSelection } from "./codeViewerHelpers";
 import { useCanEdit } from "@/hooks/usePermissions";
 import { useSessionActive } from "@/hooks/useWorkspaceChangedFiles";
+import { followLinkWithPopupFallback } from "@/lib/openLinkInApp";
+import { useFileViewer } from "./FileViewerContext";
+import { isWorkspaceRelativeSrc, resolveWorkspacePath } from "./TipTapWorkspaceImage";
 import { ToolbarPlugin } from "./MarkdownEditorToolbar";
 import { TableHandles } from "./TableBubbleMenu";
 import { TruncatedBanner } from "./TruncatedBanner";
-import { useMarkdownEditorSync } from "./useMarkdownEditorSync";
+import { type FinishServerCheck, useMarkdownEditorSync } from "./useMarkdownEditorSync";
 import { useScrollRestore } from "./useScrollRestore";
 import { useEditorAutoSave } from "./useEditorAutoSave";
 import { MarkdownCommentPlugin } from "./MarkdownCommentPlugin";
@@ -42,6 +45,7 @@ import {
 } from "./TipTapSearchExtension";
 import { createMarkdownDocumentExtensions } from "./markdownDocumentExtensions";
 import { isUserEditUpdate } from "./codeBlockLanguageEdit";
+import { applyExternalMarkdown } from "./TipTapEditorHelpers";
 import {
   installMarkdownParserPatch,
   installMarkdownSerializerPatch,
@@ -122,7 +126,7 @@ export function MarkdownRichTextViewer({
     discardAndApplyExternal,
     dismissExternalUpdate,
     markSaved,
-    reconcileServerContent,
+    beginServerCheck,
   } = useMarkdownEditorSync({
     content,
     path,
@@ -155,7 +159,7 @@ export function MarkdownRichTextViewer({
       discardAndApplyExternal={discardAndApplyExternal}
       dismissExternalUpdate={dismissExternalUpdate}
       markSaved={markSaved}
-      reconcileServerContent={reconcileServerContent}
+      beginServerCheck={beginServerCheck}
       comments={comments}
       activeSelection={activeSelection}
       onSetActiveSelection={onSetActiveSelection}
@@ -188,7 +192,7 @@ interface InnerProps {
   discardAndApplyExternal: () => void;
   dismissExternalUpdate: () => void;
   markSaved: (content: string) => void;
-  reconcileServerContent: (serverContent: string) => boolean;
+  beginServerCheck: () => FinishServerCheck;
   comments: Comment[];
   activeSelection: ActiveSelection | null;
   onSetActiveSelection: (sel: ActiveSelection | null) => void;
@@ -214,7 +218,7 @@ function MarkdownRichTextViewerInner({
   discardAndApplyExternal,
   dismissExternalUpdate,
   markSaved,
-  reconcileServerContent,
+  beginServerCheck,
   comments,
   activeSelection,
   onSetActiveSelection,
@@ -226,6 +230,7 @@ function MarkdownRichTextViewerInner({
   searchInputRef,
   setContentRef,
 }: InnerProps) {
+  const openFile = useFileViewer();
   const [isCopied, setIsCopied] = useState(false);
   const copyTimeoutRef = useRef<number>(0);
   useEffect(
@@ -235,6 +240,7 @@ function MarkdownRichTextViewerInner({
     [],
   );
   const scrollContainerRef = useRef<HTMLDivElement>(null);
+  const linkMouseDownRef = useRef<{ x: number; y: number } | null>(null);
   // Persist/restore the editor's scroll position across unmount/remount and
   // session switches. Content is present at mount (the parent gates on the
   // file query), so the restore is ready immediately.
@@ -315,7 +321,7 @@ function MarkdownRichTextViewerInner({
     [markSaved],
   );
 
-  // All save orchestration — write mutation, mid-turn conflict check, teardown
+  // All save orchestration — write mutation, pre-write conflict check, teardown
   // guard, and debounce/flush wiring — lives in the shared hook, identical to
   // the Monaco editor. This surface only supplies its own content access.
   const { autoSave, saveDisabled, writeFile } = useEditorAutoSave({
@@ -326,7 +332,7 @@ function MarkdownRichTextViewerInner({
     setDirty,
     hasExternalUpdate,
     markSaved: markDocumentSaved,
-    reconcileServerContent,
+    beginServerCheck,
     dismissExternalUpdate,
     baselineRef,
     getContent,
@@ -408,21 +414,15 @@ function MarkdownRichTextViewerInner({
     };
   }, [editor, autoSave]);
 
-  // Register an in-place content setter so the outer sync hook can update
-  // the editor without triggering a full remount (preserves scroll/cursor).
-  // emitUpdate=false suppresses onUpdate so we recapture baseline manually,
-  // preventing the editor from being incorrectly flagged as dirty.
-  //
-  // Scroll is saved and restored via requestAnimationFrame: ProseMirror's
-  // selectionToDOM re-establishes the cursor in the new DOM, which can cause
-  // the browser to scroll the selection into view after the full-document
-  // replace — undoing the user's scroll position.
+  // In-place setter for the sync hook; skipping a remount keeps scroll and caret.
+  // It emits no onUpdate, so re-baseline here, and restore scroll next frame
+  // because selectionToDOM can scroll the caret into view.
   useEffect(() => {
     if (!editor) return;
     setContentRef.current = (newContent: string) => {
       if (editor.isDestroyed) return;
       const savedScroll = scrollContainerRef.current?.scrollTop ?? 0;
-      editor.commands.setContent(newContent, { emitUpdate: false, contentType: "markdown" });
+      applyExternalMarkdown(editor, newContent);
       baselineRef.current = editor.getMarkdown();
       baselineDocRef.current = editor.state.doc;
       // Programmatic replace establishes a fresh baseline — no user edits relative to it.
@@ -475,17 +475,47 @@ function MarkdownRichTextViewerInner({
         ref={scrollContainerRef}
         onScroll={handleScrollPersist}
         className="relative flex-1 overflow-auto px-8 py-6"
-        // Link following. The Link extension runs with openOnClick:false so a
-        // plain click in edit mode positions the cursor instead of navigating.
-        // Read-only: any click on a link opens it. Edit mode: a modifier-click
-        // (⌘/Ctrl) opens it, and the caret in a link shows MarkdownLinkBubble's
-        // Open action, so plain-click-to-edit is preserved (incl. in tables).
-        onClick={(e) => {
-          if (canEdit && !e.metaKey && !e.ctrlKey) return;
-          const anchor = (e.target as Element).closest("a[href]");
-          if (anchor) {
-            e.preventDefault();
-            window.open(anchor.getAttribute("href")!, "_blank", "noopener,noreferrer");
+        onMouseDown={(event) => {
+          linkMouseDownRef.current = { x: event.clientX, y: event.clientY };
+        }}
+        // Follow links with one click in both modes. Alt-click places the
+        // editing caret; Shift-click and dragging retain text selection.
+        onClick={(event) => {
+          const mouseDown = linkMouseDownRef.current;
+          linkMouseDownRef.current = null;
+          if (event.defaultPrevented || event.button !== 0) return;
+          const anchor = (event.target as Element).closest("a[href]");
+          if (!anchor) return;
+          const href = anchor.getAttribute("href");
+          // The editor may collapse a previous selection only after click.
+          // Suppress navigation for a selection gesture, not that stale range.
+          const selectingText =
+            window.getSelection()?.isCollapsed === false &&
+            (event.detail > 1 ||
+              (mouseDown &&
+                (Math.abs(event.clientX - mouseDown.x) > 4 ||
+                  Math.abs(event.clientY - mouseDown.y) > 4)));
+          if (
+            !href ||
+            /^[?#]/.test(href) ||
+            selectingText ||
+            (canEdit && !event.metaKey && !event.ctrlKey && (event.altKey || event.shiftKey))
+          ) {
+            event.preventDefault();
+            return;
+          }
+          if (isWorkspaceRelativeSrc(href)) {
+            event.preventDefault();
+            const filePath = resolveWorkspacePath(path, href);
+            if (filePath) openFile?.(filePath);
+            return;
+          }
+          followLinkWithPopupFallback(event, href, conversationId);
+          // Contenteditable anchors have no native navigation, including
+          // modified clicks and the desktop shell's external-browser path.
+          if (!event.defaultPrevented) {
+            event.preventDefault();
+            window.open(href, "_blank", "noopener,noreferrer");
           }
         }}
       >

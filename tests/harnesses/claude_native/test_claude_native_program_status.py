@@ -3,24 +3,35 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import pytest
+
+from omnigent.debug_logging import record_to_row
 from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
 from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 from omnigent.terminals.program_status import ProgramStatusReader
 
 
-def test_error_report_leaves_the_failed_edge_to_the_stop_failure_hook(tmp_path: Path) -> None:
+def test_error_report_leaves_the_failed_edge_to_the_stop_failure_hook(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
     """An error report publishes nothing, so the hook's detailed failure is the turn's only one."""
+    caplog.set_level(logging.INFO)
     path = tmp_path / "program-status.json"
     path.write_text(
         json.dumps(
             {
                 "relay_pid": os.getpid(),
-                "status": {"state": "error", "app": "claude-code", "message": "API Error: 499"},
+                "status": {
+                    "state": "error",
+                    "app": "claude-code",
+                    "message": "private-synthetic-error-text",
+                },
             }
         )
     )
@@ -38,15 +49,44 @@ def test_error_report_leaves_the_failed_edge_to_the_stop_failure_hook(tmp_path: 
             config_dir=tmp_path,
         ),
         on_status,
+        omnigent_session_id="synthetic-session",
+        terminal_instance_id="synthetic-terminal",
+        terminal_launch_id="synthetic-launch",
     )
     poller.tick()
     poller.resync()
     poller.tick()
     assert published == []
+    observations = [
+        record
+        for record in caplog.records
+        if getattr(record, "event_name", None) == "claude_program_error_observed"
+    ]
+    assert len(observations) == 1
+    assert observations[0].levelno == logging.INFO
+    row = record_to_row(observations[0], source="runner")
+    assert row["session_id"] == "synthetic-session"
+    assert row["attributes"]["terminal_instance_id"] == "synthetic-terminal"
+    assert row["attributes"]["terminal_launch_id"] == "synthetic-launch"
+    assert row["attributes"]["status_publication"] == "deferred_to_stop_failure"
+    assert "private-synthetic-error-text" not in json.dumps(row)
 
     path.write_text(json.dumps({"relay_pid": os.getpid(), "status": {"state": "working"}}))
     poller.tick()
     assert published == ["running"]
+    path.write_text(json.dumps({"relay_pid": os.getpid(), "status": {"state": "error"}}))
+    poller.tick()
+    poller.tick()
+    poller.retire()
+    poller.tick()
+    assert published == ["running"]
+    assert (
+        sum(
+            getattr(record, "event_name", None) == "claude_program_error_observed"
+            for record in caplog.records
+        )
+        == 2
+    )
 
 
 def test_resync_during_tick_survives_the_in_flight_read(tmp_path: Path, monkeypatch) -> None:

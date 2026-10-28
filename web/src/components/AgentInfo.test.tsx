@@ -231,7 +231,11 @@ describe("AgentInfoButton hover behavior", () => {
     mousePointerEnter(screen.getByTestId("agent-info-trigger"));
 
     // The panel is now open — the agent name proves the content mounted.
-    expect(screen.getByTestId("agent-info-panel")).toBeInTheDocument();
+    expect(screen.getByTestId("agent-info-panel")).toHaveClass(
+      "menu-surface",
+      "rounded-[12px]",
+      "ring-0",
+    );
     expect(screen.getByText("Databricks_coding_agent")).toBeInTheDocument();
   });
 

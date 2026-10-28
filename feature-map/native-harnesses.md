@@ -21,6 +21,25 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker. When harness repair is
   enabled, Settings → Harnesses shows the missing credential as an actionable
   card; its Reconfigure control and full-card click replace a separate banner action.
+- `account-management`: Settings harness cards show the non-secret account label
+  reported by the connected host (email, plan, organization, or provider names).
+  An expired Codex account offers **Sign in again**. Codex sign-in opens a
+  device-code modal with an HTTPS sign-in link, one-time code and copy actions,
+  expiration countdown, Cancel, and Try again; a `login_busy` response resumes
+  polling the active login. Configured Codex and Claude subscriptions offer
+  **Switch account** behind a confirmation; Claude includes an optional email
+  hint that is copied into the `--email` command. The server owns the
+  `/v1/hosts/{host}/harnesses/{harness}/login` start/status/cancel routes and
+  `/logout`, plus `/v1/hosts/{host}/harnesses/accounts/refresh`. Hosts never
+  probe accounts on their own: an enabled server requests one probe after
+  connection, and Settings requests one when Harnesses opens or its selected
+  host changes. The server reuses a successful result for 60 seconds. Account
+  metadata and these routes are available only while harness repair is enabled
+  and the connected host advertises support; older hosts receive no probe, and
+  older servers or flag-off servers never cause a new host to spawn one.
+- `isaac-credential-detection`: harness setup offers Isaac when host-side
+  Databricks detection finds a matching credential, and fails open for older
+  hosts or servers that cannot report detection results.
 - `model-and-effort`: the harness's own model catalog, and reasoning effort where
   the harness declares it. The web picker should offer what the CLI offers.
 - `smart-routing`: Pi applies the chosen route before inference from the
@@ -36,8 +55,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `chat-render`: the harness's output renders in chat like other harnesses.
   A single-file tool row (Read, Write, Edit) shows its path as a dotted link;
   clicking it opens that file in the workspace viewer without expanding the
-  row. Absolute paths open workspace-relative under the session root and
-  host-absolute outside it; they stay plain text until the root is known.
+  row. Absolute paths show and open workspace-relative under the session root
+  and host-absolute outside it; they stay plain text until the root is known.
+  Other tool rows follow [Tool calls in chat](./tool-calls.md).
   Shell commands and multi-file patches have no file link. A shell row shows
   the command (a script's first line and "+N lines") and expands to a
   terminal panel with the command, its output and exit status, in the
@@ -45,16 +65,17 @@ implements them separately, so a fix for one harness does not reach the others.
 - `working-status`: quiet work stays working; waiting for input is explained;
   completion, interruption and process exit settle the indicator. A following
   turn and reconnect must not leave a stale idle or working state.
-- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups
-  stay in that thread, and closing it leaves the parent usable.
+- `side-chat`: Codex forks an ephemeral native thread through `/side`; follow-ups,
+  including those sent while it works, stay in that thread, and closing it
+  leaves the parent usable.
 - `cleanup`: stopping, cancelling, or idling a session reaps the harness's
   helper processes and per-session files.
 - `idle-reap`: a finished native pane left alone past the idle window closes
   with its forwarder, helper server and tool relay; the next message brings it
   back with the conversation. Kimi is exempt; live work and open prompts stay.
 - `subagent-discovery`: Claude children appear under the agent that spawned
-  them, including delayed spawns; an unresolved spawn does not keep an idle
-  runner re-reading unchanged conversations.
+  them, including forked slash commands and delayed spawns; an unresolved
+  spawn does not keep an idle runner re-reading unchanged conversations.
 - `disconnect`: startup waits and active operations settle when their native
   connection ends; reconnect can receive fresh events. Distinguish a native
   CLI disconnect, a runner going offline, and a browser stream reconnect.
@@ -65,6 +86,8 @@ implements them separately, so a fix for one harness does not reach the others.
   Env wrappers are split into these fields, without a duplicate raw invocation.
   Sessions can add to or override these host defaults. Project config can
   choose the default harness, but commands and arguments come only from user config.
+  Codex's `harness.codex-native.app_server` (`command` plus `args`) is a separate,
+  config-file-only wrapper for its session app-servers; unset runs Codex directly.
   Other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
@@ -112,7 +135,9 @@ without a session ID to resume.
 `omnigent claude` session, ask Claude to delegate through its Agent tool. Open
 the linked session's Agents panel and check the child under its parent. Ask a
 child to delegate again to check nested ownership; completed children remain
-visible while the runner idles.
+visible while the runner idles. Also invoke an installed skill configured with
+`context: fork`, such as `/code-review`, from Chat or the native terminal.
+The skill's agent and any helpers it delegates should appear in the same tree.
 
 **Native Gemini setup:** run `omni setup` → Antigravity → Configure native agy
 API key / gateway. If existing providers conflict, choose the Gemini default
@@ -148,6 +173,16 @@ only when the server enables the `import_review` release feature.
 **Harness credential repair:** Settings → Harnesses → a needs-auth harness →
 Settings. Activate either the credential card or its Reconfigure affordance;
 both open the same repair flow.
+
+**Harness account sign-in and switching:** Settings → Harnesses → Codex or
+Claude. Use **Sign in again** on an expired Codex card, or open the configured
+harness and choose **Switch account**. For Codex, open or copy the HTTPS device
+link, copy the one-time code, and wait for the countdown/poller to finish; use
+Cancel to stop the host login or Try again after a terminal error. If another
+Codex login is already active, the dialog resumes its status instead of starting
+a second one. For Claude, confirm the sign-out and optionally enter the target
+email; the dialog presents the supported login command with a shell-quoted
+`--email` hint. Older hosts and servers fall back to the copyable CLI command.
 
 **Idle reap:** finish a turn, then leave the session alone past the idle window:
 a web session with its Terminal view open but untouched or its tabs closed, a
@@ -371,6 +406,29 @@ Cross-harness journeys:
   `tests/e2e_ui/start_session/test_harness_credential.py::test_needs_auth_harness_is_disabled_with_repair_tooltip`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_harnesses_filters_the_picker`,
   `tests/e2e_ui/chat/test_hide_unconfigured_harnesses.py::test_hide_unconfigured_hides_a_harness_missing_from_the_host_map`
+- **`model-and-effort`, Claude runtime selection (own environment):**
+  `tests/e2e/test_claude_native_managed_model_switch.py::test_runner_switches_managed_glm_in_a_real_claude_terminal`
+  uses real Claude catalog discovery, tmux, statusLine and the runner event
+  endpoint. With the per-session options cache still cold, repeated `opus` and
+  `opus[1m]` selections retain the exact launch-pinned generation and context.
+  It then switches to a managed GLM picker ID and back, opens Claude's model
+  picker, and confirms another switch reclaims that surface successfully.
+  Run `OMNIGENT_E2E_CLAUDE_NATIVE=1 uv run --no-sync pytest tests/e2e/test_claude_native_managed_model_switch.py --reruns 0`.
+  Requires Claude Code and tmux; use a clean container if machine-managed
+  settings override the fixture's picker. It makes no model calls and does not
+  verify browser rendering or live gateway servability.
+- **`model-and-effort`, Claude browser selection and refusal (nightly):**
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_picker_repeated_pins_reach_the_real_terminal`
+  proves alias picks through the gear, model pill and Ctrl+Shift+M using
+  the real browser, server, owned isolated host, runner and CLI. Subsequent
+  mock requests preserve the wire model's generation; native status and
+  `requestedModel` retain `[1m]`, with a correlated `context-1m` request beta.
+  Chat and the transcript each contain the reply once.
+  `tests/e2e_ui/chat/test_claude_model_picker.py::test_claude_native_refusal_preserves_a_newer_same_model_selection`
+  pauses its owned CLI to force a real unconfirmed switch; a late 503 preserves
+  a newer same-value model write and its effort while the applied model stays
+  unchanged. See [Composer](./composer.md) for visible outcomes and prerequisites.
+  These cases do not cover live providers or a post-refusal retry.
 - **`model-and-effort`, Pi inference bindings (component):**
   `tests/runtime/test_inference_routing.py::test_pi_single_model_policy_preserves_literal_ids_and_stays_curated`
   checks default/literal inputs and generated picker options, including a literal
@@ -558,6 +616,20 @@ Cross-harness journeys:
   terminal. Check retained history and cumulative input usage 1,000 → 1,100 →
   1,200. The provider replies and usage are scripted; this does not prove live
   billing or recovery after the runner deletes the bridge directory.
+- **`resume`, Pi user setup (own environment):**
+  `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` drives native startup
+  and process resume through the server/host/runner. User skills/extensions and
+  relative settings must survive relocation of the agent root, including a
+  relative custom root. Existing context/prompt opt-outs remain independent.
+  This is not Claude marketplace or Managed deployment coverage.
+- **`resume`, Pi cost reporting (component boundaries):**
+  `tests/harnesses/pi_native/test_pi_native_extension.py` exercises Pi-reported
+  dollars, duplicate callbacks, local/server restart baselines and missing pricing.
+  `tests/server/routes/test_sessions_usage_loading.py` checks the real HTTP
+  snapshot-to-runner handoff, excluding child-session cost. An incomplete or
+  older reporter keeps server pricing; its last display subtotal is not a complete
+  cost baseline. Check the session cost before and after a resumed turn; provider
+  pricing must be available to compare dollars. These tests do not prove live billing.
 - **`resume`, bare picker scoped to this host:**
   `tests/e2e/test_native_resume_picker_cross_host_e2e.py::test_bare_resume_picker_excludes_other_hosts_sessions`
 - **`approvals`, Pi extension dialogs:**
@@ -774,8 +846,11 @@ Cross-harness journeys:
   transcripts, then registration under the right parent when the spawn arrives.
   The same module covers cache invalidation on append and same-size rewrites,
   eviction, deleted files, transient read failures, and existing Task/fork and
-  restart behavior. These use real transcript files and forwarder code with a
-  mocked HTTP peer; they do not measure runner CPU or prove browser rendering.
+  restart behavior. The `slash_command` variant of
+  `test_subagent_watcher_preserves_nested_parent_graph_across_restart`
+  checks a forked skill without a tool-call ID and its nested helpers.
+  These use real transcript files and forwarder code with a mocked HTTP peer;
+  they do not measure runner CPU or prove browser rendering.
 - **`subagent-discovery`, Claude (manual runner performance):** use an isolated
   server/runner from this checkout, with real Claude Code and tmux and a scripted
   model endpoint. Follow the native prerequisites above; do not use a developer

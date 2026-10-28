@@ -18,27 +18,38 @@ import {
   type LucideIcon,
   Monitor,
   Plug,
+  Search,
   Send,
   Terminal,
   Timer,
   Wrench,
 } from "lucide-react";
-import { isShellTool } from "@/lib/toolTitle";
+import { isShellTool, splitToolName, toolCallCategory } from "@/lib/toolTitle";
+
+const WEB_TOOLS = new Set(["web_search", "web_fetch", "web_read", "WebSearch", "WebFetch"]);
+// Plan / todo-list tools across harnesses (Claude, Codex, Pi, OpenCode).
+const PLAN_TOOLS = new Set(["TodoWrite", "update_plan", "manage_todo_list", "todowrite"]);
 
 /**
- * @param name - the tool name as it arrives in the call (e.g.
+ * @param fullName - the tool name as it arrives in the call (e.g.
  *   "sys_os_read", "web_search", "my_custom_tool").
  * @param nativeToolType - present only for native (provider-managed)
  *   tools (e.g. "web_search_call"). Takes priority over `name`.
  */
-export function iconForTool(name: string, nativeToolType?: string): LucideIcon {
+export function iconForTool(fullName: string, nativeToolType?: string): LucideIcon {
   if (nativeToolType !== undefined) {
     return NATIVE_ICONS[nativeToolType] ?? Wrench;
   }
+  const { server, tool: name } = splitToolName(fullName);
+  if (server !== undefined) return Plug;
   // Order matters: more specific names (`sys_terminal_close`,
   // `sys_session_close`) must match before the broader category prefix.
   if (isShellTool(name)) return Terminal;
-  if (/^sys_os_(read|write|edit)$/.test(name)) return FileText;
+  if (WEB_TOOLS.has(name)) return Globe;
+  if (PLAN_TOOLS.has(name)) return ListTodo;
+  const category = toolCallCategory({ name });
+  if (category === "read" || category === "edit") return FileText;
+  if (category === "search" || category === "list") return Search;
   if (name === "sys_terminal_close") return Ban;
   if (name.startsWith("sys_terminal_")) return Terminal;
   if (name === "sys_session_close") return Ban;
@@ -49,7 +60,6 @@ export function iconForTool(name: string, nativeToolType?: string): LucideIcon {
   if (name.startsWith("sys_cancel_")) return Ban;
   if (name === "sys_timer_set") return Timer;
   if (name === "sys_timer_cancel") return Ban;
-  if (name === "web_search" || name === "web_fetch") return Globe;
   return Wrench;
 }
 

@@ -17,6 +17,7 @@ from unittest.mock import Mock
 
 import pytest
 
+from omnigent.debug_logging import record_to_row
 from omnigent.entities import DEFAULT_ENVIRONMENT_ID
 from omnigent.inner.datamodel import OSEnvSandboxSpec, OSEnvSpec, TerminalEnvSpec
 from omnigent.inner.os_env import EditEntry, OpResult, OSEnvironment
@@ -56,9 +57,14 @@ from tests.runner.helpers import make_test_terminal_instance
     ],
 )
 async def test_claude_program_status_real_launch_and_fallback(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, protocol: str, sandbox_type: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+    protocol: str,
+    sandbox_type: str,
 ) -> None:
     """Exercise startup negotiation, raw PTY transport, status arbitration and cleanup."""
+    caplog.set_level(logging.INFO)
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     if protocol == "disabled":
         monkeypatch.setenv("OMNIGENT_FEATURES", "-claude_osc_status")
@@ -192,6 +198,18 @@ async def test_claude_program_status_real_launch_and_fallback(
                 await asyncio.sleep(0.02)
         await asyncio.sleep(0.3)  # Longer than a poll, so a published failure would show here.
         assert statuses[-1] == ("running", None)
+        observations = [
+            record_to_row(record, source="runner")
+            for record in caplog.records
+            if getattr(record, "event_name", None) == "claude_program_error_observed"
+        ]
+        assert len(observations) == 1
+        assert observations[0]["session_id"] == "osc-test"
+        assert observations[0]["attributes"]["terminal_instance_id"] == instance.diagnostic_id
+        assert (
+            observations[0]["attributes"]["terminal_launch_id"]
+            == instance.lifecycle_trace.launch_id
+        )
         reader.path.unlink()
         reader.path.mkdir()  # Make snapshot replacement fail while the command keeps running.
         await instance.send(keys="b")
@@ -1177,6 +1195,62 @@ async def test_required_terminal_exit_while_idle_is_clean_shutdown(
     assert record.session_id == "conv_idle"
     assert record.attributes["terminal_lifecycle"] == "required"
     assert record.attributes["session_status_before_exit"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_required_terminal_exit_after_omnigent_reap_is_expected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A pane Omnigent killed to fail its turn exits as an expected close.
+
+    The delivery-timeout reap ends the pane while its turn is still running,
+    so the exit would otherwise look like a crash and fail the turn a second
+    time. The reap leaves a marker in the pane's private dir before the kill;
+    the exit event must carry it so the runner does not report the exit.
+
+    :param tmp_path: Temporary directory for fake terminal paths.
+    :param monkeypatch: Pytest fixture that stubs the tmux subprocess.
+    """
+    from omnigent.harnesses.claude_native import bridge as claude_bridge
+
+    monkeypatch.setattr(claude_bridge, "_TRUSTED_PARENT", tmp_path)
+    monkeypatch.setattr(claude_bridge, "_BRIDGE_ROOT", tmp_path)
+    terminal_registry = TerminalRegistry()
+    registry = SessionResourceRegistry(terminal_registry=terminal_registry)
+    instance = make_test_terminal_instance("claude", "main", tmp_path)
+    instance.private_dir.mkdir(parents=True)
+    bridge_dir = tmp_path / "bridge"
+    claude_bridge.write_tmux_target(
+        bridge_dir, socket_path=instance.private_dir / "tmux.sock", tmux_target="main"
+    )
+    monkeypatch.setattr(
+        "subprocess.run",
+        lambda cmd, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    terminal_registry._by_conversation.setdefault("conv_reap", {})[("claude", "main")] = instance
+    exits: list[TerminalExitEvent] = []
+    exit_published = asyncio.Event()
+
+    def _publish_exit(event: TerminalExitEvent) -> None:
+        exits.append(event)
+        exit_published.set()
+
+    registry.set_terminal_exit_publisher(_publish_exit)
+    callbacks = await _observe_native_agent_terminal_and_capture(
+        registry, terminal_registry, instance, "conv_reap"
+    )
+    on_activity = callbacks["on_activity"]
+    on_exit = callbacks["on_exit"]
+    assert callable(on_activity) and callable(on_exit)
+    on_activity()
+    claude_bridge.kill_session(bridge_dir, expected_close=True)
+    on_exit()
+    await asyncio.wait_for(exit_published.wait(), timeout=1.0)
+
+    assert len(exits) == 1
+    assert exits[0].lifecycle == TerminalLifecycle.REQUIRED
+    assert exits[0].session_was_idle is False
+    assert exits[0].expected_close is True
 
 
 @pytest.mark.asyncio

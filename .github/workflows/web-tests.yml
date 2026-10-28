@@ -58,7 +58,7 @@ jobs:
   scope:
     name: Web coverage scope
     needs: gate
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     outputs:
       web: ${{ steps.scope.outputs.web }}
       ios: ${{ steps.scope.outputs.ios }}
@@ -74,7 +74,7 @@ jobs:
     name: web test
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.web == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 20
 
     steps:
@@ -173,7 +173,7 @@ jobs:
     name: iOS dependency tools
     needs: scope
     if: ${{ !github.event.pull_request.draft && needs.scope.outputs.ios == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 15
     env:
       BUNDLE_FROZEN: 'true'
@@ -198,7 +198,7 @@ jobs:
     name: Web result
     if: always()
     needs: [scope, web-test, ios]
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     steps:
       - name: Require successful test selection

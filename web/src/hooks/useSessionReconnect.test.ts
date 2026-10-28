@@ -5,8 +5,16 @@ import { toast } from "sonner";
 import { fetchHosts } from "@/hooks/useHosts";
 import type { Host } from "@/hooks/useHosts";
 import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
-import { connectArcaHost, controlHost, getHostIdentity, isElectronShell } from "@/lib/nativeBridge";
+import {
+  connectArcaHost,
+  controlHost,
+  getHostIdentity,
+  isElectronShell,
+  supportsArcaConnect,
+} from "@/lib/nativeBridge";
 import type { ArcaConnectResult, HostActionResult, HostIdentity } from "@/lib/nativeBridge";
+import { retrySession } from "@/lib/sessionsApi";
+import type { PostEventResponse } from "@/lib/sessionsApi";
 import { useSessionReconnect } from "./useSessionReconnect";
 
 vi.mock("@/hooks/useHosts", () => ({ fetchHosts: vi.fn() }));
@@ -15,12 +23,20 @@ vi.mock("@/lib/nativeBridge", () => ({
   controlHost: vi.fn(),
   getHostIdentity: vi.fn(),
   isElectronShell: vi.fn(),
+  supportsArcaConnect: vi.fn(),
 }));
+vi.mock("@/lib/sessionsApi", () => ({ retrySession: vi.fn() }));
 vi.mock("sonner", () => ({
-  toast: { loading: vi.fn(() => "progress"), success: vi.fn(), dismiss: vi.fn() },
+  toast: { loading: vi.fn(() => "progress"), success: vi.fn(), error: vi.fn(), dismiss: vi.fn() },
 }));
 
 const localSession = { sessionId: "session", hostId: "this-mac", isOwner: true };
+const asleepSandbox = {
+  sessionId: "session",
+  hostId: "arclet-host",
+  hostResumable: true,
+  isOwner: false,
+};
 
 function hostRow(hostId: string, status: Host["status"]): Host {
   return { host_id: hostId, name: hostId, owner: "e2e", status };
@@ -37,6 +53,7 @@ function deferred<T>() {
 beforeEach(() => {
   vi.clearAllMocks();
   vi.mocked(isElectronShell).mockReturnValue(true);
+  vi.mocked(supportsArcaConnect).mockReturnValue(true);
   vi.mocked(getHostIdentity).mockResolvedValue({ cliInstalled: true, hostId: "this-mac" });
   vi.mocked(controlHost).mockResolvedValue({ ok: true });
   vi.mocked(connectArcaHost).mockResolvedValue({ ok: true });
@@ -280,6 +297,41 @@ describe("useSessionReconnect", () => {
     expect(toast.dismiss).toHaveBeenCalledWith("progress");
   });
 
+  it.each([
+    { label: "the remembered Arca host", props: { hostId: "arca-host" }, expected: true },
+    {
+      label: "an Isaac-named Arca host",
+      props: { hostId: "box", hostName: "e2e's arca" },
+      expected: true,
+    },
+    {
+      label: "another remote host",
+      props: { hostId: "devbox", hostName: "arca-devbox" },
+      expected: false,
+    },
+    {
+      label: "a non-owner",
+      props: { hostId: "arca-host", isOwner: false },
+      expected: false,
+    },
+    { label: "the browser", props: { hostId: "arca-host" }, desktop: false, expected: false },
+    {
+      label: "a desktop without the Arca connect",
+      props: { hostId: "arca-host" },
+      arcaConnect: false,
+      expected: false,
+    },
+  ])(
+    "reports whether reconnecting runs the desktop's Arca connect for $label",
+    ({ props, desktop = true, arcaConnect = true, expected }) => {
+      writeArcaHostId("arca-host");
+      vi.mocked(isElectronShell).mockReturnValue(desktop);
+      vi.mocked(supportsArcaConnect).mockReturnValue(desktop && arcaConnect);
+      const { result } = renderHook(() => useSessionReconnect({ ...localSession, ...props }));
+      expect(result.current.reconnectsArca).toBe(expected);
+    },
+  );
+
   it("does not treat another remote host as Arca", async () => {
     const { result } = renderHook(() =>
       useSessionReconnect({ ...localSession, hostId: "devbox", hostName: "arca-devbox" }),
@@ -404,6 +456,83 @@ describe("useSessionReconnect", () => {
     expect(result.current.dialogOpen).toBe(false);
     expect(result.current.arcaReconnect).toBeUndefined();
     expect(toast.success).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    {
+      response: { queued: false, recovered: true, recovery: "runner_relaunched" },
+      message: "Sandbox is back online.",
+    },
+    {
+      response: { queued: false, recovered: false, recovery: "already_connected" },
+      message: "Sandbox is already online.",
+    },
+  ] satisfies { response: PostEventResponse; message: string }[])(
+    "has the server wake an asleep sandbox for an editor in a browser: $message",
+    async ({ response, message }) => {
+      vi.mocked(isElectronShell).mockReturnValue(false);
+      const pending = deferred<PostEventResponse>();
+      vi.mocked(retrySession).mockReturnValue(pending.promise);
+      const { result } = renderHook(() => useSessionReconnect(asleepSandbox));
+
+      let reconnect!: Promise<void>;
+      await act(async () => {
+        reconnect = result.current.reconnect();
+        await result.current.reconnect();
+      });
+      expect(retrySession).toHaveBeenCalledExactlyOnceWith("session");
+      expect(toast.loading).toHaveBeenCalledWith("Reconnecting sandbox…");
+      expect(result.current.dialogOpen).toBe(false);
+      expect(getHostIdentity).not.toHaveBeenCalled();
+      expect(connectArcaHost).not.toHaveBeenCalled();
+
+      await act(async () => {
+        pending.resolve(response);
+        await reconnect;
+      });
+      expect(toast.success).toHaveBeenCalledExactlyOnceWith(message);
+      expect(toast.dismiss).toHaveBeenCalledWith("progress");
+      expect(result.current.dialogOpen).toBe(false);
+    },
+  );
+
+  it("shows why a sandbox wake failed and lets the next action retry it", async () => {
+    vi.mocked(retrySession).mockRejectedValueOnce(new Error("managed host wake timed out"));
+    vi.mocked(retrySession).mockResolvedValueOnce({ queued: false, recovered: true });
+    const { result } = renderHook(() => useSessionReconnect(asleepSandbox));
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(toast.error).toHaveBeenCalledExactlyOnceWith(
+      "Couldn't reconnect the sandbox: managed host wake timed out",
+    );
+    expect(toast.dismiss).toHaveBeenCalledWith("progress");
+    expect(result.current.dialogOpen).toBe(false);
+
+    await act(async () => {
+      await result.current.reconnect();
+    });
+    expect(retrySession).toHaveBeenCalledTimes(2);
+    expect(toast.success).toHaveBeenCalledExactlyOnceWith("Sandbox is back online.");
+  });
+
+  it("ignores a sandbox wake's result after navigating to another session", async () => {
+    const pending = deferred<PostEventResponse>();
+    vi.mocked(retrySession).mockReturnValue(pending.promise);
+    const { result, rerender } = renderHook(useSessionReconnect, { initialProps: asleepSandbox });
+    let reconnect!: Promise<void>;
+    await act(async () => {
+      reconnect = result.current.reconnect();
+    });
+    rerender({ ...asleepSandbox, sessionId: "other-session", hostId: "other-host" });
+    expect(toast.dismiss).toHaveBeenCalledWith("progress");
+
+    await act(async () => {
+      pending.resolve({ queued: false, recovered: true });
+      await reconnect;
+    });
+    expect(toast.success).not.toHaveBeenCalled();
+    expect(toast.error).not.toHaveBeenCalled();
   });
 
   it.each([

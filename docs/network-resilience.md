@@ -143,6 +143,13 @@ that `native_turn_error`, which the web UI does not offer Retry for. Shorter
 model outages of up to 60 s were retried and completed. Claude's retrying is
 not surfaced anywhere in the session while it happens.
 
+Claude's standalone "API Error: The response stopped arriving. The response
+above may be incomplete." failure uses `transient_upstream_error` and offers
+the existing user-triggered Retry. The turn stays failed, and its partial output
+and original error detail remain available. Classification does not replay the
+request or repair the upstream stream loss. Metrics grouped by error code may
+shift without any reduction in the underlying failures.
+
 ### R8: Codex status sticks on running after a reconnect
 
 Codex only, and intermittent. After the host's links drop and return, the next

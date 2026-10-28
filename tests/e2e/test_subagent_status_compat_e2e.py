@@ -9,6 +9,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import subprocess
+import sys
 import uuid
 from pathlib import Path
 from typing import Any
@@ -19,6 +22,138 @@ from packaging.version import Version
 
 from omnigent.harnesses.claude_native import forwarder
 from tests.e2e.conftest import create_runner_bound_session, register_inline_agent
+
+
+@pytest.mark.parametrize("character,encoded_bytes", [("x", 1), ("\x00", 6), ("€", 3)])
+def test_large_tool_mirror_crosses_real_server_body_limit(
+    http_client: httpx.Client,
+    live_runner_id: str,
+    mock_llm_server_url: str,
+    tmp_path: Path,
+    character: str,
+    encoded_bytes: int,
+) -> None:
+    """A separate forwarder process uploads once, then resumes its durable cursor."""
+    from omnigent.session_event_batch import MAX_SESSION_EVENT_REQUEST_BYTES
+
+    agent_name = register_inline_agent(
+        http_client,
+        name=f"large-output-{uuid.uuid4().hex[:8]}",
+        harness="openai-agents",
+        model="mock-model",
+        profile="",
+        prompt="Acknowledge.",
+        mock_llm_base_url=f"{mock_llm_server_url}/v1",
+    )
+    session_id = create_runner_bound_session(
+        http_client, agent_name=agent_name, runner_id=live_runner_id
+    )
+    http_client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"omnigent.wrapper": "claude-code-native-ui"}},
+    ).raise_for_status()
+    output = character * (MAX_SESSION_EVENT_REQUEST_BYTES // encoded_bytes + 1)
+    records = [
+        {
+            "type": "user",
+            "uuid": "tool-result",
+            "message": {
+                "role": "user",
+                "content": [
+                    {"type": "tool_result", "tool_use_id": "large-call", "content": output}
+                ],
+            },
+        },
+        {
+            "type": "assistant",
+            "uuid": "after-tool",
+            "message": {
+                "role": "assistant",
+                "content": [{"type": "text", "text": "AFTER_LARGE_TOOL"}],
+            },
+        },
+    ]
+    transcript = tmp_path / "session.jsonl"
+    original = "".join(
+        json.dumps(record, ensure_ascii=False) + "\n" for record in records
+    ).encode()
+    transcript.write_bytes(original)
+    rejected = http_client.post(
+        f"/v1/sessions/{session_id}/events",
+        content=b" " * (MAX_SESSION_EVENT_REQUEST_BYTES + 1),
+        headers={"Content-Type": "application/json"},
+    )
+    assert rejected.status_code == 400, rejected.text
+    assert "session event request exceeds the 10 MiB limit" in rejected.text
+    config = tmp_path / "forwarder-input.json"
+    config.write_text(
+        json.dumps(
+            {
+                "server": str(http_client.base_url),
+                "headers": dict(http_client.headers),
+                "session_id": session_id,
+                "transcript": str(transcript),
+                "bridge": str(tmp_path / "bridge"),
+                "receipt": str(tmp_path / "forwarder-receipt.json"),
+            }
+        )
+    )
+    script = """
+import asyncio, json, sys
+from pathlib import Path
+import httpx
+from omnigent.harnesses.claude_native import forwarder
+config = json.loads(Path(sys.argv[1]).read_text())
+async def run():
+    bridge = Path(config["bridge"])
+    state = forwarder._read_forward_state(bridge) or forwarder.TranscriptForwardState(
+        transcript_path=Path(config["transcript"]), line_cursor=0, byte_offset=0)
+    delivered = []
+    async def capture(response):
+        delivered.append({"bytes": len(response.request.content), "status": response.status_code})
+    async with httpx.AsyncClient(base_url=config["server"], headers=config["headers"],
+        trust_env=False, timeout=30, event_hooks={"response": [capture]}) as client:
+        state = await forwarder._forward_available_items(
+            client=client, session_id=config["session_id"],
+            bridge_dir=bridge, agent_name="claude-native-ui", state=state,
+            retry_tracker=forwarder._PostRetryTracker(), dedupe=forwarder._ForwardDedupeState())
+    Path(config["receipt"]).write_text(json.dumps(
+        {"byte_offset": state.byte_offset, "requests": delivered}))
+asyncio.run(run())
+"""
+    for cycle in range(2):
+        result = subprocess.run(
+            [sys.executable, "-c", script, str(config)],
+            env=os.environ.copy(),
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            timeout=60,
+        )
+        (tmp_path / f"forwarder-{cycle}.log").write_text(result.stdout)
+        assert result.returncode == 0, result.stdout
+        receipt = json.loads((tmp_path / "forwarder-receipt.json").read_text())
+        (tmp_path / f"forwarder-{cycle}-receipt.json").write_text(json.dumps(receipt, indent=2))
+        assert receipt["byte_offset"] == len(original), receipt
+        if cycle == 0:
+            assert len(receipt["requests"]) == 2, receipt
+            assert all(
+                request["status"] == 202 and request["bytes"] <= MAX_SESSION_EVENT_REQUEST_BYTES
+                for request in receipt["requests"]
+            ), receipt
+        else:
+            assert receipt["requests"] == [], "a restarted forwarder must not duplicate delivery"
+        items = http_client.get(f"/v1/sessions/{session_id}/items", params={"limit": 100})
+        items.raise_for_status()
+        stored = items.json()["data"]
+        (tmp_path / f"items-{cycle}.json").write_text(items.text)
+        tool_items = [item for item in stored if item.get("type") == "function_call_output"]
+        replies = [item for item in stored if item.get("role") == "assistant"]
+        assert len(tool_items) == len(replies) == 1, stored
+        assert "output truncated by omnigent" in tool_items[0]["output"]
+        assert "AFTER_LARGE_TOOL" in json.dumps(replies[0]["content"])
+        assert transcript.read_bytes() == original
+        assert not (tmp_path / "bridge" / "dead_letter.jsonl").exists()
 
 
 @pytest.mark.compat_smoke
