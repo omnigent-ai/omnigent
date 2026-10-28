@@ -84,6 +84,7 @@ from tests.harnesses.claude_native.test_claude_native_shell_mode_draft import _I
 
 STALL_TRIGGER = sys.argv[1] if len(sys.argv) > 1 else None
 STALL_S = float(sys.argv[2]) if len(sys.argv) > 2 else 0.0
+INITIAL_READ_STALL_S = float(sys.argv[3]) if len(sys.argv) > 3 else 0.0
 
 
 def main():
@@ -95,6 +96,7 @@ def main():
     pending = ""
     pasted = False
     stalled = False
+    read_started = False
     keys = ("\x1b[107;5u", "\x1b[117;5u", "\x1b[200~", "\x1b[201~")
 
     def render():
@@ -112,6 +114,9 @@ def main():
             data = os.read(fd, 65536)
             if not data:
                 break
+            if not read_started:
+                read_started = True
+                time.sleep(INITIAL_READ_STALL_S)
             pending += decoder.decode(data)
             while pending:
                 token = next((key for key in keys if pending.startswith(key)), None)
@@ -182,6 +187,7 @@ def stalling_claude_pane() -> Iterator[tuple[Path, str]]:
             str(tui_path),
             _MESSAGE,
             str(_TUI_STALL_S),
+            "0.9",
         ],
         check=True,
         timeout=30.0,

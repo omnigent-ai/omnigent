@@ -12302,17 +12302,24 @@ def test_inject_slash_command_clears_every_line_of_a_leftover_draft(
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
 @pytest.mark.parametrize("clears", [False, True], ids=["ignored-clear", "first-clear-ignored"])
+@pytest.mark.parametrize("clear_delay_s", [0.0, 0.9], ids=["responsive", "busy-terminal"])
 def test_delivery_verifies_clear_keys_emptied_the_composer(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slash: bool, clears: bool
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    slash: bool,
+    clears: bool,
+    clear_delay_s: float,
 ) -> None:
     """A swallowed clear cannot submit the old draft with the next input."""
     composer = _EditableComposer("unsent terminal draft", cursor=7)
     composer.install(monkeypatch)
     clear_attempts = 0
     operations: list[tuple[str, ...]] = []
+    pending_keys: list[tuple[str, ...]] = []
+    resumes_at: float | None = None
 
     def run_tmux(socket_path: str, *args: str) -> None:
-        nonlocal clear_attempts
+        nonlocal clear_attempts, resumes_at
         operations.append(args)
         if args[0] == "send-keys" and args[-1].startswith(
             claude_native_bridge._COMPOSER_KILL_TO_LINE_END
@@ -12320,11 +12327,22 @@ def test_delivery_verifies_clear_keys_emptied_the_composer(
             # A successful tmux command does not prove the TUI handled its keys.
             clear_attempts += 1
             if clears and clear_attempts > 1:
-                composer._run_tmux(socket_path, *args)
+                if resumes_at is None:
+                    resumes_at = claude_native_bridge.time.monotonic() + clear_delay_s
+                pending_keys.append(args)
         else:
+            assert not pending_keys, "Pending clear keys must settle before input is pasted"
             composer._run_tmux(socket_path, *args)
 
+    def capture(socket_path: str, target: str) -> str:
+        if resumes_at is not None and claude_native_bridge.time.monotonic() >= resumes_at:
+            for args in pending_keys:
+                composer._run_tmux(socket_path, *args)
+            pending_keys.clear()
+        return composer._capture_pane(socket_path, target)
+
     monkeypatch.setattr(claude_native_bridge, "_run_tmux", run_tmux)
+    monkeypatch.setattr(claude_native_bridge, "_capture_pane", capture)
     bridge_dir = _picker_bridge_dir(tmp_path)
 
     def inject() -> None:
@@ -12349,7 +12367,9 @@ def test_delivery_verifies_clear_keys_emptied_the_composer(
 
 @pytest.mark.parametrize("slash", [False, True], ids=["web-message", "slash-command"])
 @pytest.mark.parametrize("probe_round", [1, 3], ids=["early-probe", "last-round-probe"])
-@pytest.mark.parametrize("removal", ["handled", "delayed", "late", "ignored", "unavailable"])
+@pytest.mark.parametrize(
+    "removal", ["handled", "delayed", "late", "busy", "ignored", "unavailable"]
+)
 def test_delivery_waits_for_probe_removal_acknowledgment(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, slash: bool, probe_round: int, removal: str
 ) -> None:
@@ -12376,7 +12396,7 @@ def test_delivery_waits_for_probe_removal_acknowledgment(
             removal_polls += 1
             if removal == "unavailable":
                 return None
-            delay = {"delayed": 2, "late": 3}.get(removal)
+            delay = {"delayed": 2, "late": 3, "busy": 7}.get(removal)
             if delay is not None and removal_polls == delay:
                 composer._run_tmux(socket_path, *backspace)
         else:
@@ -12398,10 +12418,10 @@ def test_delivery_waits_for_probe_removal_acknowledgment(
         else:
             inject_user_message(bridge_dir, content="hello from the web")
 
-    if removal in {"handled", "delayed", "late"}:
+    if removal in {"handled", "delayed", "late", "busy"}:
         inject()
         assert composer.submitted == ["/effort high" if slash else "hello from the web\n"]
-        assert removal_polls == {"handled": 1, "delayed": 2, "late": 3}[removal]
+        assert removal_polls == {"handled": 1, "delayed": 2, "late": 3, "busy": 7}[removal]
     else:
         with pytest.raises(
             claude_native_bridge.ClaudeComposerNotCleared, match="nothing was sent"
@@ -12554,7 +12574,7 @@ def test_a_draft_the_clearing_budget_cannot_empty_is_refused_not_submitted(
 )
 @pytest.mark.parametrize(
     "unavailable_clear_captures",
-    [1, claude_native_bridge._COMPOSER_CLEAR_MAX_ROUNDS + 1],
+    [1, 100],
     ids=["one-failed-capture", "persistent-failed-captures"],
 )
 def test_unavailable_composer_capture_never_submits_the_leftover_draft(

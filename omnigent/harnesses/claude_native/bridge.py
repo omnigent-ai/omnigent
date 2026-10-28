@@ -341,6 +341,8 @@ _COMPOSER_KILL_TO_LINE_END = "\x1b[107;5u"
 _COMPOSER_KILL_TO_LINE_START = "\x1b[117;5u"
 # Retry rounds when the capture cannot show the whole box.
 _COMPOSER_CLEAR_MAX_ROUNDS = 3
+# Let queued clearing keys and their redraw settle without sending more keys.
+_COMPOSER_CLEAR_ACK_TIMEOUT_S = 2.0
 # Footer rows Claude Code draws under the input box (mode hints, status line).
 _SCROLLED_DRAFT_MAX_FOOTER_ROWS = 4
 # How long to wait for the pasted draft to visibly land in Claude's
@@ -6765,8 +6767,9 @@ def _clear_composer(socket_path: str, tmux_target: str, *, preserve_draft: bool 
     or one the pane cut off (a draft taller than the pane, or a sliver-height
     pane with no room for the closing rule),
     may still hold lines the capture did not show, so it is cleared again,
-    up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. Probe removal gets
-    its own bounded acknowledgment window after the clear is verified. A box still in that
+    up to :data:`_COMPOSER_CLEAR_MAX_ROUNDS` rounds. Wait up to
+    :data:`_COMPOSER_CLEAR_ACK_TIMEOUT_S` for those keys to be acknowledged;
+    probe removal gets its own window after the clear is verified. A box still in that
     state afterwards is refused rather than pasted into: an exhausted budget
     is no evidence the box is empty, and a paste beside leftover text would
     submit the person's draft along with the injected input. An unavailable
@@ -6786,7 +6789,8 @@ def _clear_composer(socket_path: str, tmux_target: str, *, preserve_draft: bool 
     if not preserve_draft:
         _run_tmux(socket_path, "send-keys", "-t", tmux_target, "Space")
     removing_probe = False
-    round_no = 0
+    clear_attempts = 0
+    deadline = time.monotonic() + _COMPOSER_CLEAR_ACK_TIMEOUT_S
     while True:
         pane = _capture_pane(socket_path, tmux_target)
         _raise_if_composer_frame_ambiguous(pane)
@@ -6810,17 +6814,17 @@ def _clear_composer(socket_path: str, tmux_target: str, *, preserve_draft: bool 
             if cleared:
                 return
         cursor_offset = None
-        if removing_probe or (cleared and round_no > 0):
+        if removing_probe or (cleared and clear_attempts > 0):
             cursor_offset = _composer_cursor_offset(socket_path, tmux_target, pane)
         if removing_probe:
             if cursor_offset == 0:
                 return
-        elif cleared and round_no > 0:
+        elif cleared and clear_attempts > 0:
             if cursor_offset == 1:
                 _run_tmux(socket_path, "send-keys", "-t", tmux_target, "BSpace")
                 removing_probe = True
-                round_no = 0
-        if round_no == _COMPOSER_CLEAR_MAX_ROUNDS:
+                deadline = time.monotonic() + _COMPOSER_CLEAR_ACK_TIMEOUT_S
+        if time.monotonic() >= deadline:
             delivery_diagnostics.record_details(
                 composer_probe_removal_started=removing_probe,
                 composer_cursor_offset=cursor_offset,
@@ -6835,12 +6839,17 @@ def _clear_composer(socket_path: str, tmux_target: str, *, preserve_draft: bool 
                 "Claude Code's input box could not be verified clear, so nothing was sent. "
                 "Open the terminal, expand it and clear the input box, then retry."
             )
-        if box is not None and not preserve_draft and not removing_probe:
+        if (
+            box is not None
+            and not preserve_draft
+            and not removing_probe
+            and clear_attempts < _COMPOSER_CLEAR_MAX_ROUNDS
+        ):
             _send_composer_clear_keys(
                 socket_path, tmux_target, rows=len(box.rows), probe_empty=True
             )
+            clear_attempts += 1
         time.sleep(_CLAUDE_READY_POLL_INTERVAL_S)
-        round_no += 1
 
 
 def _composer_cursor_offset(socket_path: str, tmux_target: str, pane: str) -> int | None:
