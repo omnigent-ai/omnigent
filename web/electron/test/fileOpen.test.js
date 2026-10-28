@@ -273,6 +273,38 @@ test("shares discovered aliases and drops in-flight results after a server chang
   assert.equal(await openRemote("/repo"), true);
 });
 
+test("requires fresh host fingerprints after discovered SSH mappings expire", async (t) => {
+  let time = 0;
+  const discoveries = [];
+  const oldKeys = ["SHA256:old-host-key"];
+  const newKeys = ["SHA256:new-host-key"];
+  const { resolve, openRemote, directory } = setup(t, "darwin", {
+    now: () => time,
+    resolveSshHost: () => null,
+    discoverSshHost: async (keys) => {
+      discoveries.push(keys);
+      return keys?.[0] === newKeys[0] ? "arca_new.ssh" : "arca.ssh";
+    },
+  });
+  fs.mkdirSync(path.join(directory, "Cursor.app"));
+  assert.equal(await resolve(oldKeys), "arca.ssh");
+  time = 29_999;
+  assert.equal(await resolve(), "arca.ssh");
+  assert.equal(await openRemote("/repo"), true);
+
+  time = 30_000;
+  assert.equal(await resolve(), null);
+  assert.equal(await resolve(), null);
+  assert.deepEqual(discoveries, [oldKeys]);
+  assert.equal(await openRemote("/repo"), false);
+
+  assert.equal(await resolve(newKeys), "arca_new.ssh");
+  assert.equal(await resolve(), "arca_new.ssh");
+  assert.deepEqual(discoveries, [oldKeys, newKeys]);
+  assert.equal(await openRemote("/repo"), false);
+  assert.equal(await openRemote("/repo", "cursor", "arca_new.ssh"), true);
+});
+
 test("preserves remote filenames with numeric colon suffixes", async (t) => {
   const { directory, resolve, openRemote, calls } = setup(t);
   fs.mkdirSync(path.join(directory, "Cursor.app"));

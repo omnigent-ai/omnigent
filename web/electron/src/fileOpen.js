@@ -163,24 +163,23 @@ function registerFileOpen({
         }
         return verifiedAlias;
       }
-      const keys = fingerprints ?? previous?.fingerprints;
-      const fingerprintKey = JSON.stringify(keys);
-      if (
-        previous &&
-        !previous.verified &&
-        previous.fingerprintKey === fingerprintKey &&
-        now() < previous.expiresAt
-      )
-        return previous.promise;
+      const fresh = previous && !previous.verified && now() < previous.expiresAt;
+      if (fingerprints == null) {
+        if (fresh) return previous.promise;
+        // The renderer must fetch current host metadata before renewing discovery.
+        state.hosts.delete(hostId);
+        return null;
+      }
+      const fingerprintKey = JSON.stringify(fingerprints);
+      if (fresh && previous.fingerprintKey === fingerprintKey) return previous.promise;
       const entry = {
         alias: null,
-        fingerprints: keys,
         fingerprintKey,
         expiresAt: now() + DISCOVERY_TTL_MS,
       };
       state.hosts.set(hostId, entry);
       entry.promise = Promise.resolve()
-        .then(() => discoverSshHost(keys))
+        .then(() => discoverSshHost(fingerprints))
         .catch(() => null)
         .then((alias) => {
           if (
