@@ -629,8 +629,9 @@ Cross-harness journeys:
   replace the runner while its idle native pane is still alive, or remove native
   history before relaunch. Preserved files retain their checkpoint. Missing-file
   reconstruction and forks restore the shared compaction snapshot: Pi's summary,
-  retained native tool-call/result pairs and subsequent turns. The parent
-  transcript stays unchanged; resume keeps its native identity and forks mint one.
+  retained tool-call/result pairs and subsequent turns, stored in the item shapes
+  other harnesses replay. The parent transcript stays unchanged; resume keeps its
+  native identity and forks mint one.
   A scripted provider enforces the same 16,384 serialized-message-byte limit from
   the first request. Continuation, reconstruction and fork must fit it without
   resurrecting summarized reads or duplicating retained tools/replies.

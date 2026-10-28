@@ -7,7 +7,6 @@ the resume-file path resolution, and the end-to-end
 
 from __future__ import annotations
 
-import base64
 import itertools
 import json
 from pathlib import Path
@@ -16,7 +15,6 @@ from typing import Any
 import httpx
 import pytest
 
-from omnigent.entities import CompactionData
 from omnigent.harnesses.pi_native.resume import (
     ensure_local_pi_resume_session,
     fetch_all_session_items_for_pi_resume,
@@ -108,37 +106,21 @@ def test_mint_pi_session_id_is_safe() -> None:
 
 
 @pytest.mark.parametrize("with_tail", [False, True])
-def test_compaction_replaces_history_and_preserves_native_tail(with_tail: bool) -> None:
-    tail_items = [
+def test_compaction_snapshot_replaces_history_and_replays_retained_tail(with_tail: bool) -> None:
+    summary_text = "<summary>\nlatest checkpoint\n"
+    tail = [
         _user_item("retained user"),
-        *[
-            _function_call_item(
-                name="read", call_id=call_id, arguments='{"path":"test.txt"}', item_id=call_id
-            )
-            for call_id in ("call_a", "call_b")
-        ],
-        *[
-            _function_output_item(
-                call_id=call_id, output=f"contents {call_id}", item_id=f"out_{call_id}"
-            )
-            for call_id in ("call_a", "call_b")
-        ],
+        _function_call_item(name="read", call_id="call_a", arguments='{"path":"a.txt"}'),
+        _function_call_item(name="read", call_id="call_b", arguments='{"path":"b.txt"}'),
+        _function_output_item(call_id="call_a", output="contents call_a"),
+        _function_output_item(call_id="call_b", output="contents call_b"),
         _assistant_item("retained answer"),
     ]
-    tail_records = pi_session_records_from_session_items(
-        tail_items,
-        session_id="source",
-        external_session_id=_EXTERNAL_ID,
-        cwd=Path("/repo"),
-    )[1:]
-    messages = [entry["message"] for entry in tail_records] if with_tail else []
-    summary_message = {
-        "role": "compactionSummary",
-        "summary": "latest checkpoint",
-        "tokensBefore": 9000,
-        "timestamp": 0,
-    }
-    system_message = {"role": "system", "content": "native system", "timestamp": 0}
+    # The extension writes each snapshot entry without item ids or response ids.
+    snapshot = [
+        {key: value for key, value in item.items() if key not in {"id", "response_id", "model"}}
+        for item in [_user_item(summary_text), *(tail if with_tail else [])]
+    ]
     items = [
         _user_item("summarized raw history"),
         {"id": "old", "type": "compaction", "summary": "old checkpoint"},
@@ -147,7 +129,7 @@ def test_compaction_replaces_history_and_preserves_native_tail(with_tail: bool) 
             "id": "latest",
             "type": "compaction",
             "summary": "latest checkpoint",
-            "compacted_messages": [system_message, summary_message, *messages],
+            "compacted_messages": snapshot,
         },
         # A late duplicate must not replay a retained result twice.
         *(
@@ -165,90 +147,63 @@ def test_compaction_replaces_history_and_preserves_native_tail(with_tail: bool) 
         external_session_id=_EXTERNAL_ID,
         cwd=Path("/repo"),
     )
-    checkpoint = next(entry for entry in records if entry["type"] == "compaction")
-    assert checkpoint["summary"] == "latest checkpoint"
-    assert checkpoint["tokensBefore"] == 9000
-    assert checkpoint["systemMessage"] == system_message
-    boundary = records.index(checkpoint)
-    assert [entry["message"] for entry in records[1:boundary]] == messages
-    assert checkpoint["firstKeptEntryId"] == (records[1]["id"] if with_tail else checkpoint["id"])
-    assert [entry["message"]["content"][0]["text"] for entry in records[boundary + 1 :]] == [
-        "after checkpoint",
-        "after answer",
+    messages = [record["message"] for record in records[1:]]
+    assert [record["type"] for record in records[1:]] == ["message"] * len(messages)
+    replayed = [
+        (message["role"], [block.get("text") or block.get("id") for block in message["content"]])
+        for message in messages
     ]
+    retained = [
+        ("user", ["retained user"]),
+        ("assistant", ["call_a", "call_b"]),
+        ("toolResult", ["contents call_a"]),
+        ("toolResult", ["contents call_b"]),
+        ("assistant", ["retained answer"]),
+    ]
+    assert replayed == [
+        ("user", [summary_text]),
+        *(retained if with_tail else []),
+        ("user", ["after checkpoint"]),
+        ("assistant", ["after answer"]),
+    ]
+    if with_tail:
+        assert messages[2]["content"][0]["arguments"] == {"path": "a.txt"}
+        assert [message.get("toolName") for message in messages[3:5]] == ["read", "read"]
     assert "summarized" not in json.dumps(records)
     assert "old checkpoint" not in json.dumps(records)
     assert json.dumps(items) == original
     for previous, current in itertools.pairwise(records[1:]):
         assert current["parentId"] == previous["id"]
     assert records[1]["parentId"] is None
-
-
-def test_compaction_replays_stored_images_as_text_placeholders() -> None:
-    image = {
-        "type": "image",
-        "data": base64.b64encode(b"\x89PNG\r\n\x1a\n" + bytes(64)).decode(),
-        "mimeType": "image/png",
-    }
-    stored = CompactionData(
-        summary="checkpoint",
-        last_item_id="before",
-        token_count=1,
-        compacted_messages=[
-            {"role": "compactionSummary", "summary": "checkpoint", "tokensBefore": 1},
-            {"role": "user", "content": [{"type": "text", "text": "see this"}, image]},
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "toolCall", "id": "call_img", "name": "read", "arguments": {}}
-                ],
-            },
-            {
-                "role": "toolResult",
-                "toolCallId": "call_img",
-                "toolName": "read",
-                "content": [image],
-            },
-        ],
-    )
-    records = pi_session_records_from_session_items(
-        [{"id": "compact", "type": "compaction", **stored.model_dump(exclude_none=True)}],
-        session_id="conv_images",
-        external_session_id=_EXTERNAL_ID,
-        cwd=Path("/repo"),
-    )
-    user, _, result = (entry["message"] for entry in records if entry["type"] == "message")
-    placeholders = [user["content"][1], result["content"][0]]
-    assert user["content"][0] == {"type": "text", "text": "see this"}
-    assert all(block["type"] == "text" for block in placeholders)
-    assert all("image/png image omitted" in block["text"] for block in placeholders)
+    assert len({record["id"] for record in records[1:]}) == len(records) - 1
 
 
 @pytest.mark.parametrize(
     "compacted_messages",
     [
         None,
-        # Claude-native snapshot.
-        [
-            {"role": "user", "content": [{"type": "text", "text": "foreign retained"}]},
-            {
-                "role": "assistant",
-                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}],
-            },
-        ],
-        # Codex-native and Pi executor snapshots use Omnigent-style message items.
+        # Claude-native content in the shared message envelope.
         [
             {
                 "type": "message",
                 "role": "user",
-                "content": [{"type": "input_text", "text": "foreign retained"}],
+                "content": [{"type": "text", "text": "foreign retained"}],
             },
-            {"role": "assistant", "content": [{"type": "output_text", "text": "foreign"}]},
+            {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}],
+            },
+        ],
+        # Raw Pi messages, as stored by earlier builds of the Pi extension.
+        [
+            {"role": "compactionSummary", "summary": "foreign summary", "tokensBefore": 1},
+            {"role": "user", "content": [{"type": "text", "text": "foreign retained"}]},
         ],
     ],
-    ids=["legacy", "claude", "omnigent-items"],
+    ids=["legacy", "claude", "raw-pi"],
 )
-def test_non_pi_compaction_snapshot_restores_only_summary(
+def test_unconvertible_compaction_snapshot_restores_only_summary(
     compacted_messages: list[dict[str, Any]] | None,
 ) -> None:
     compaction: dict[str, Any] = {"id": "compact", "type": "compaction", "summary": "summary"}
@@ -267,6 +222,7 @@ def test_non_pi_compaction_snapshot_restores_only_summary(
     assert [record["type"] for record in records] == ["session", "compaction", "message"]
     assert records[1]["summary"] == "summary"
     assert records[1]["firstKeptEntryId"] == records[1]["id"]
+    assert records[2]["parentId"] == records[1]["id"]
     assert records[2]["message"]["content"][0]["text"] == "after checkpoint"
     assert "old raw transcript" not in json.dumps(records)
     assert "foreign" not in json.dumps(records)
@@ -278,13 +234,8 @@ def test_late_result_for_retained_compaction_call_keeps_tool_name() -> None:
         "type": "compaction",
         "summary": "checkpoint",
         "compacted_messages": [
-            {"role": "compactionSummary", "summary": "checkpoint", "tokensBefore": 1},
-            {
-                "role": "assistant",
-                "content": [
-                    {"type": "toolCall", "id": "call_late", "name": "read", "arguments": {}}
-                ],
-            },
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "s"}]},
+            {"type": "function_call", "call_id": "call_late", "name": "read", "arguments": "{}"},
         ],
     }
     records = pi_session_records_from_session_items(
@@ -294,6 +245,7 @@ def test_late_result_for_retained_compaction_call_keeps_tool_name() -> None:
         cwd=Path("/repo"),
     )
     result = records[-1]["message"]
+    assert records[-2]["message"]["content"][0]["id"] == "call_late"
     assert result["role"] == "toolResult"
     assert result["toolCallId"] == "call_late"
     assert result["toolName"] == "read"

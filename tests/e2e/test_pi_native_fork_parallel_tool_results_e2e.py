@@ -549,19 +549,31 @@ def test_pi_native_compacted_restart_then_fork(
             for entry in native_entries[first_kept : native_entries.index(latest)]
             if entry["type"] == "message"
         ]
+        snapshot = checkpoints[-1]["compacted_messages"]
+        assert {item["type"] for item in snapshot} <= {
+            "message",
+            "function_call",
+            "function_call_output",
+        }
+        assert summary in snapshot[0]["content"][0]["text"]
+        assert [item["call_id"] for item in snapshot if item["type"] == "function_call"] == [
+            block["id"]
+            for message in expected_tail
+            if message["role"] == "assistant"
+            for block in message["content"]
+            if block["type"] == "toolCall"
+        ]
+        retained_results = [
+            (message["toolCallId"], message["content"][0]["text"])
+            for message in expected_tail
+            if message["role"] == "toolResult"
+        ]
         assert [
-            message
-            for message in checkpoints[-1]["compacted_messages"]
-            if message["role"] in {"user", "assistant", "toolResult"}
-        ] == expected_tail
-        assert (
-            sorted(
-                message["toolCallId"]
-                for message in expected_tail
-                if message["role"] == "toolResult"
-            )
-            == _RETAINED_CALL_IDS
-        )
+            (item["call_id"], item["output"])
+            for item in snapshot
+            if item["type"] == "function_call_output"
+        ] == retained_results
+        assert sorted(call_id for call_id, _ in retained_results) == _RETAINED_CALL_IDS
         (tmp_path / "before-restart.jsonl").write_bytes(compacted)
         first_summarizer = next(request for request in requests if _is_summarizer_request(request))
         assert all(

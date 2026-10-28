@@ -32,7 +32,6 @@ it for free from Pi's event semantics.
 from __future__ import annotations
 
 import contextlib
-import copy
 import json
 import os
 import re
@@ -47,7 +46,6 @@ import httpx
 
 from omnigent.host.daemon_launch import error_text
 from omnigent.native.native_terminal import url_component
-from omnigent.runtime.tool_result_replay import sanitize_replayed_image_blocks
 from omnigent.util.json_types import JsonObject as _JsonObject
 
 # Pi session ids are UUIDv7 hex with dashes (e.g.
@@ -245,10 +243,9 @@ def pi_session_records_from_session_items(
       rejects a replayed result whose name is empty. Only the first output
       committed for a ``call_id`` is replayed: Anthropic rejects a history with
       two ``tool_result`` blocks for one ``tool_use``.
-    - latest ``compaction`` -> Pi checkpoint with the actual summary and, for
-      Pi's own snapshots, the projected native messages Pi retained. It
-      replaces earlier history; subsequent items still use the normal
-      tool-pairing conversion.
+    - latest ``compaction`` -> its snapshot replaces earlier history and is
+      converted like the items above. A snapshot with nothing to convert (none,
+      or another harness's native shape) becomes a Pi checkpoint with the summary.
 
     Interrupted assistant turns (and the rest of their response group) are
     skipped so a cancelled turn isn't restored as completed history.
@@ -291,29 +288,28 @@ def pi_session_records_from_session_items(
         item = items[index]
         if item.get("type") != "compaction" or not isinstance(item.get("summary"), str):
             continue
-        checkpoint, entries = _pi_compaction_records(
-            item,
-            session_id=session_id,
-            external_session_id=external_session_id,
-            timestamp=timestamp,
-        )
-        items = items[index + 1 :]
+        snapshot = _compaction_snapshot_items(item)
+        if not snapshot:
+            checkpoint_id = _synthetic_pi_entry_id(
+                session_id=session_id,
+                external_session_id=external_session_id,
+                item=item,
+                index=index,
+                suffix="compaction",
+            )
+            checkpoint = {
+                "type": "compaction",
+                "id": checkpoint_id,
+                "timestamp": timestamp,
+                "summary": item["summary"],
+                "firstKeptEntryId": checkpoint_id,
+                "tokensBefore": 0,
+            }
+        items = [*snapshot, *items[index + 1 :]]
         break
-    kept_ids = {entry["id"] for entry in entries}
     skip_response_ids = _interrupted_response_ids(items)
     tool_names = _function_call_names(items)
-    for entry in entries:
-        content = cast(_JsonObject, entry["message"]).get("content")
-        for block in content if isinstance(content, list) else []:
-            if isinstance(block, dict) and block.get("type") == "toolCall":
-                call_id, name = block.get("id"), block.get("name")
-                if isinstance(call_id, str) and isinstance(name, str) and name:
-                    tool_names.setdefault(call_id, name)
-    replayed_call_ids: set[str] = {
-        cast(str, message["toolCallId"])
-        for entry in entries
-        if (message := cast(_JsonObject, entry["message"])).get("role") == "toolResult"
-    }
+    replayed_call_ids: set[str] = set()
     group: _AssistantResponseGroup | None = None
 
     def flush_group() -> None:
@@ -382,16 +378,8 @@ def pi_session_records_from_session_items(
                 model=eff_model,
             )
     flush_group()
-    entries = _pair_pi_tool_results(entries)
-    if checkpoint is not None:
-        # Pi places the checkpoint after its retained entries on disk, but
-        # projects its summary before them. Later turns follow the checkpoint.
-        boundary = max(
-            (i + 1 for i, entry in enumerate(entries) if entry["id"] in kept_ids), default=0
-        )
-        checkpoint["firstKeptEntryId"] = entries[0]["id"] if boundary else checkpoint["id"]
-        entries.insert(boundary, checkpoint)
-    records: list[_JsonObject] = [header, *entries]
+    checkpoints = [] if checkpoint is None else [checkpoint]
+    records: list[_JsonObject] = [header, *checkpoints, *_pair_pi_tool_results(entries)]
     parent_id: str | None = None
     for entry in records[1:]:
         entry["parentId"] = parent_id
@@ -399,89 +387,42 @@ def pi_session_records_from_session_items(
     return records
 
 
-def _pi_compaction_records(
-    item: _JsonObject,
-    *,
-    session_id: str,
-    external_session_id: str,
-    timestamp: str,
-) -> tuple[_JsonObject, list[_JsonObject]]:
-    """Restore Pi's projected messages from the shared compaction snapshot.
+def _compaction_snapshot_items(item: _JsonObject) -> list[_JsonObject]:
+    """Return a compaction snapshot as session items for the normal conversion.
+
+    Each run of assistant entries shares one synthetic response, so it becomes
+    one Pi assistant message with its parallel tool calls.
 
     :param item: A shared compaction item, possibly written by another harness.
-    :param session_id: Omnigent conversation identity for generated entry ids.
-    :param external_session_id: Destination native identity, distinct for forks.
-    :param timestamp: Timestamp for the rebuilt entries.
-    :returns: Native checkpoint and retained messages. Only Pi's own projection
-        has a retained tail; legacy and other harnesses' snapshots keep the summary.
+    :returns: The snapshot items, or ``[]`` when none converts to a Pi entry.
     """
-
-    def entry_id(index: int) -> str:
-        return _synthetic_pi_entry_id(
-            session_id=session_id,
-            external_session_id=external_session_id,
-            item=item,
-            index=0,
-            suffix=f"compaction-{index}",
-        )
-
-    checkpoint: _JsonObject = {
-        "type": "compaction",
-        "id": entry_id(-1),
-        "timestamp": timestamp,
-        "summary": item["summary"],
-        "tokensBefore": 0,
-    }
-    entries: list[_JsonObject] = []
-    messages = item.get("compacted_messages")
-    if not isinstance(messages, list) or not any(
-        isinstance(message, dict) and message.get("role") == "compactionSummary"
-        for message in messages
-    ):
-        return checkpoint, entries
-    for index, message in enumerate(messages):
+    snapshot = item.get("compacted_messages")
+    if not isinstance(snapshot, list):
+        return []
+    snapshot_items: list[_JsonObject] = []
+    response_index = 0
+    for index, message in enumerate(snapshot):
         if not isinstance(message, dict):
             continue
-        role = message.get("role")
-        if role == "compactionSummary":
-            checkpoint["tokensBefore"] = message.get("tokensBefore", 0)
-        elif role == "system":
-            checkpoint["systemMessage"] = copy.deepcopy(message)
-        elif role in {
-            "user",
-            "assistant",
-            "toolResult",
-            "custom",
-            "bashExecution",
-            "branchSummary",
-        }:
-            restored = copy.deepcopy(message)
-            if "content" in restored:
-                restored["content"] = _pi_replayable_content(restored["content"])
-            entries.append(
-                {
-                    "type": "message",
-                    "id": entry_id(index),
-                    "timestamp": timestamp,
-                    "message": restored,
-                }
-            )
-    return checkpoint, entries
-
-
-def _pi_replayable_content(content: object) -> object:
-    """Replace snapshot images whose payload storage stripped with text placeholders.
-
-    :param content: A Pi message ``content`` value.
-    :returns: The content; usable images keep Pi's ``data``/``mimeType`` shape.
-    """
-    if not isinstance(content, list):
-        return content
-    sanitized = cast(list[object], sanitize_replayed_image_blocks(content))
-    return [
-        original if isinstance(block, dict) and block.get("type") == "image" else block
-        for original, block in zip(content, sanitized, strict=True)
-    ]
+        replay: _JsonObject = {**message, "id": f"{item.get('id')}:snapshot:{index}"}
+        if _pi_assistant_blocks_from_item(message) is None:
+            response_index += 1
+        else:
+            replay["response_id"] = f"{item.get('id')}:snapshot-response:{response_index}"
+        snapshot_items.append(replay)
+    converts = any(
+        _pi_assistant_blocks_from_item(snapshot_item)
+        or _pi_non_assistant_entry(
+            snapshot_item,
+            session_id="",
+            external_session_id="",
+            index=0,
+            timestamp="",
+            tool_names={},
+        )
+        for snapshot_item in snapshot_items
+    )
+    return snapshot_items if converts else []
 
 
 def _pair_pi_tool_results(entries: list[_JsonObject]) -> list[_JsonObject]:

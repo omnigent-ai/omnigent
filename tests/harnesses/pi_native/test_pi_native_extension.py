@@ -1274,14 +1274,41 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
 (async () => {
   const receiptMode = process.argv[3];
   const messages = [
+    { role: "system", content: "", sections: {tools: "read"} },
     { role: "compactionSummary", summary: "checkpoint", tokensBefore: 9000 },
+    { role: "branchSummary", summary: "branch work", fromId: "branch-1" },
+    { role: "user", content: [
+      {type: "text", text: "look"}, {type: "image", data: "SU1BR0U=", mimeType: "image/png"},
+    ] },
+    { role: "custom", customType: "note", content: "extension note", display: true },
     { role: "assistant", content: [
+      { type: "thinking", thinking: "hidden reasoning" },
+      { type: "text", text: "reading" },
       { type: "toolCall", id: "read-1", name: "read", arguments: {path: "a"} },
     ] },
     { role: "toolResult", toolCallId: "read-1", toolName: "read",
       content: [{type: "text", text: "retained result"}] },
     { role: "bashExecution", command: "ls", output: "in context", exitCode: 0 },
     { role: "bashExecution", command: "cat .env", output: "excluded", excludeFromContext: true },
+  ];
+  const userText = (text) => ({
+    type: "message", role: "user", content: [{type: "input_text", text}],
+  });
+  const expectedSnapshot = [
+    userText(
+      "The conversation history before this point was compacted into the following summary:" +
+      "\n\n<summary>\ncheckpoint\n</summary>",
+    ),
+    userText(
+      "The following is a summary of a branch that this conversation came back from:" +
+      "\n\n<summary>\nbranch work</summary>",
+    ),
+    userText("look"),
+    userText("extension note"),
+    { type: "message", role: "assistant", content: [{type: "output_text", text: "reading"}] },
+    { type: "function_call", call_id: "read-1", name: "read", arguments: '{"path":"a"}' },
+    { type: "function_call_output", call_id: "read-1", output: "retained result" },
+    userText("Ran `ls`\n```\nin context\n```"),
   ];
   ctx.sessionManager = {
     getSessionId: () => "native-1",
@@ -1301,19 +1328,20 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
     if (receiptMode !== "absent") response.json = async () => {
       if (receiptMode === "unreadable") throw new Error("receipt truncated after commit");
       if (receiptMode === "timeout") await new Promise((_resolve, reject) => {
-        request.signal.addEventListener("abort", () => reject(new Error("receipt timed out")));
+        const fail = () => reject(new Error("receipt timed out"));
+        if (request.signal.aborted) return fail();
+        request.signal.addEventListener("abort", fail);
       });
       return { item_id: "persisted-user" };
     };
     return response;
   };
   await handlers.input({text: "covered input", source: "extension"}, ctx);
-  const expectedSnapshot = structuredClone(messages.slice(0, -1));
   // Repeated summary text can make Pi's event point at an older checkpoint.
   const compacting = handlers.session_compact(
     {compactionEntry: {id: "old", summary: "checkpoint"}}, ctx,
   );
-  messages[2].content[0].text = "later mutation";
+  messages[6].content[0].text = "later mutation";
   assert.equal(posted.length, 1, "checkpoint cannot overtake pending history");
   release();
   await compacting;
@@ -1336,7 +1364,17 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
     assert result.returncode == 0, result.stdout + result.stderr
 
 
-@pytest.mark.parametrize("failure", ["unsupported", "projection_error", "uncloneable", "stalled"])
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "unsupported",
+        "projection_error",
+        "unreadable_message",
+        "no_checkpoint",
+        "session_id_error",
+        "stalled",
+    ],
+)
 def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: str) -> None:
     script = (
         _ASSISTANT_DURABILITY_HARNESS
@@ -1347,14 +1385,20 @@ def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: s
     entries: [{ sourceEntry: { type: "compaction", id: "latest", summary: "checkpoint" } }],
     messages: [{ role: "compactionSummary", summary: "checkpoint", tokensBefore: 1 }],
   };
-  ctx.sessionManager = { getSessionId: () => "native-1" };
+  ctx.sessionManager = { getSessionId: () => {
+    if (failure === "session_id_error") throw new Error("session id unavailable");
+    return "native-1";
+  } };
+  if (failure === "no_checkpoint") projection.entries = [{ sourceEntry: { type: "message" } }];
   if (failure !== "unsupported") {
     ctx.sessionManager.buildSessionProjection = () => {
       if (failure === "projection_error") throw new Error("projection failed");
       return projection;
     };
   }
-  if (failure === "uncloneable") projection.messages.push({ role: "custom", content: () => {} });
+  if (failure === "unreadable_message") {
+    projection.messages.push({ role: "custom", get content() { throw new Error("unreadable"); } });
+  }
   let budgetWaits = 0;
   if (failure === "stalled") {
     global.fetch = async (_url, request) => {
@@ -1381,7 +1425,7 @@ def test_compaction_snapshot_failures_do_not_block_pi(tmp_path: Path, failure: s
   const itemTypes = items.map((body) => body.data.item_type);
   assert.deepEqual(itemTypes, failure === "stalled" ? ["message"] : []);
   assert.equal(budgetWaits, failure === "stalled" ? 1 : 0);
-  const failed = failure === "projection_error" || failure === "uncloneable";
+  const failed = failure !== "unsupported" && failure !== "stalled";
   assert.deepEqual(notices, failed ? ["Omnigent could not save the compaction checkpoint."] : []);
   if (failed) assert.match(diagnostics.join("\n"), /Compaction snapshot failed/);
 })().catch((error) => { process.stderr.write(String(error)); process.exit(1); });

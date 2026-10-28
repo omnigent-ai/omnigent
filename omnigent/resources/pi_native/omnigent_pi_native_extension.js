@@ -767,6 +767,85 @@ function contentBlocks(message) {
   return message.content;
 }
 
+// Pi's convertToLlm renders these messages as user text.
+const _PI_COMPACTION_SUMMARY_PREFIX =
+  "The conversation history before this point was compacted into the following summary:" +
+  "\n\n<summary>\n";
+const _PI_COMPACTION_SUMMARY_SUFFIX = "\n</summary>";
+const _PI_BRANCH_SUMMARY_PREFIX =
+  "The following is a summary of a branch that this conversation came back from:\n\n<summary>\n";
+const _PI_BRANCH_SUMMARY_SUFFIX = "</summary>";
+
+function bashExecutionText(message) {
+  let text = `Ran \`${message.command}\`\n`;
+  text += message.output ? `\`\`\`\n${message.output}\n\`\`\`` : "(no output)";
+  if (message.cancelled) text += "\n\n(command cancelled)";
+  else if (message.exitCode !== null && message.exitCode !== undefined && message.exitCode !== 0)
+    text += `\n\nCommand exited with code ${message.exitCode}`;
+  if (message.truncated && message.fullOutputPath)
+    text += `\n\n[Output truncated. Full output: ${message.fullOutputPath}]`;
+  return text;
+}
+
+// The model-visible projection in the item shapes forwarded live, replayable by any harness.
+function compactionSnapshotItems(messages) {
+  const items = [];
+  const addUserText = (text) => {
+    if (!text) return;
+    items.push({ type: "message", role: "user", content: [{ type: "input_text", text }] });
+  };
+  for (const message of messages) {
+    switch (message?.role) {
+      case "compactionSummary":
+        addUserText(
+          _PI_COMPACTION_SUMMARY_PREFIX + message.summary + _PI_COMPACTION_SUMMARY_SUFFIX,
+        );
+        break;
+      case "branchSummary":
+        addUserText(_PI_BRANCH_SUMMARY_PREFIX + message.summary + _PI_BRANCH_SUMMARY_SUFFIX);
+        break;
+      case "bashExecution":
+        // `!!` shell output never reaches the model.
+        if (!message.excludeFromContext) addUserText(bashExecutionText(message));
+        break;
+      case "user":
+      case "custom":
+        addUserText(textFromMessage(message));
+        break;
+      case "assistant": {
+        const text = textFromMessage(message);
+        if (text) {
+          items.push({
+            type: "message",
+            role: "assistant",
+            content: [{ type: "output_text", text }],
+          });
+        }
+        for (const block of contentBlocks(message)) {
+          if (block?.type !== "toolCall" || !block.id || !block.name) continue;
+          items.push({
+            type: "function_call",
+            call_id: String(block.id),
+            name: String(block.name),
+            arguments: safeJsonStringify(block.arguments ?? {}),
+          });
+        }
+        break;
+      }
+      case "toolResult":
+        if (message.toolCallId) {
+          items.push({
+            type: "function_call_output",
+            call_id: String(message.toolCallId),
+            output: textFromToolResult(message),
+          });
+        }
+        break;
+    }
+  }
+  return items;
+}
+
 function fingerprint(text) {
   let hash = 5381;
   for (let i = 0; i < text.length; i += 1) {
@@ -1596,25 +1675,23 @@ module.exports = function (pi) {
     if (typeof manager?.buildSessionProjection !== "function") return;
     const notifyFailure = () =>
       ctx.ui?.notify?.("Omnigent could not save the compaction checkpoint.", "error");
-    let projection;
+    let checkpoint;
     let compactedMessages;
+    let sourceId;
     try {
-      projection = manager.buildSessionProjection();
-      // `!!` shell output never reaches the model, so recovery does not need it.
-      compactedMessages = structuredClone(
-        (projection?.messages ?? []).filter(
-          message => !(message?.role === "bashExecution" && message.excludeFromContext),
-        ),
-      );
+      const projection = manager.buildSessionProjection();
+      // Pi 1.3's event can name an older entry when summaries repeat.
+      checkpoint = projection?.entries?.[0]?.sourceEntry;
+      if (checkpoint?.type !== "compaction" || typeof checkpoint.summary !== "string") {
+        throw new Error("Pi's projection does not start with a compaction checkpoint");
+      }
+      sourceId = `pi:compaction:${manager.getSessionId()}:${checkpoint.id}`;
+      compactedMessages = compactionSnapshotItems(projection.messages ?? []);
     } catch (error) {
       console.error("[pi-native] Compaction snapshot failed:", error);
       notifyFailure();
       return;
     }
-    // Pi 1.3's event can name an older entry when summaries repeat.
-    const checkpoint = projection?.entries?.[0]?.sourceEntry;
-    if (checkpoint?.type !== "compaction" || typeof checkpoint.summary !== "string") return;
-    const sourceId = `pi:compaction:${manager.getSessionId()}:${checkpoint.id}`;
     const item = history.enqueue(
       {
         item_type: "compaction",
