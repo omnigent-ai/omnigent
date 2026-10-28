@@ -374,7 +374,7 @@ def _native_input_ready_probe(
         return None
     try:
         return resolve_hook_for_key(agent.key, "input_ready_probe")
-    except Exception:  # see docstring.
+    except Exception:
         _logger.warning(
             "Native input-ready probe unavailable for %s; native_input_ready will not be logged",
             resource_role,
@@ -1561,7 +1561,7 @@ class SessionResourceRegistry:
                             expected_socket_path=str(instance.socket_path),
                             expected_tmux_target=instance.tmux_target,
                         )
-                except Exception:  # keep lifecycle observation running.
+                except Exception:
                     _logger.debug(
                         "Claude auto-mode billing notice acknowledgement failed",
                         exc_info=True,
@@ -1738,7 +1738,14 @@ class SessionResourceRegistry:
         if reader is not None:
             from omnigent.harnesses.claude_native.program_status import ClaudeProgramStatusPoller
 
-            return ClaudeProgramStatusPoller(reader, fallback, on_status)
+            return ClaudeProgramStatusPoller(
+                reader,
+                fallback,
+                on_status,
+                omnigent_session_id=session_id,
+                terminal_instance_id=instance.diagnostic_id,
+                terminal_launch_id=instance.lifecycle_trace.launch_id,
+            )
         return fallback
 
     async def _handle_terminal_exit(

@@ -1930,14 +1930,16 @@ html[data-electron-mac] .breadcrumb-folder {
  * static-state declarations (class specificity beats * for those visible
  * properties); this universal rule collapses every other transition-* and
  * animate-* timer so users who request reduced motion don't see any
- * sweeping change we forgot to scope. */
+ * sweeping change we forgot to scope. Transitions get 0s, not a tiny
+ * duration: `transition-property` defaults to `all`, so any nonzero duration
+ * lands every style change on every element a frame late. */
 @media (prefers-reduced-motion: reduce) {
   *,
   *::before,
   *::after {
     animation-duration: 0.01ms !important;
     animation-iteration-count: 1 !important;
-    transition-duration: 0.01ms !important;
+    transition-duration: 0s !important;
     scroll-behavior: auto !important;
   }
 }

@@ -242,6 +242,11 @@ export interface ServerInfo {
   /** Types the session events route accepts; empty on older servers. */
   session_event_types?: readonly string[];
   /**
+   * True when the server stores session PRs (``/v1/sessions/{id}/pull-requests``
+   * and ``Conversation.pull_request``); absent on older servers (off).
+   */
+  session_pull_requests?: boolean;
+  /**
    * Which uploads Claude Code and Codex sessions receive as files. Null on
    * older servers, whose policy is the default extension list.
    */
@@ -446,6 +451,7 @@ export async function resolveServerInfo(): Promise<ServerInfo> {
           session_event_types: Array.isArray(data.session_event_types)
             ? data.session_event_types.filter((t): t is string => typeof t === "string")
             : [],
+          session_pull_requests: data.session_pull_requests === true,
           filesystem_attachments: parseFilesystemAttachments(data.filesystem_attachments),
           branding: parseBranding(data.branding),
         };
