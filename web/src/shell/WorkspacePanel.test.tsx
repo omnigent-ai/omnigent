@@ -19,7 +19,7 @@ import {
   writeDefaultWorkspaceTab,
   writePinnedWorkspaceTabs,
 } from "@/lib/workspaceTabPreferences";
-import { WorkspacePanel } from "./WorkspacePanel";
+import { MAX_WARM_RAIL_TERMINALS, updateWarmRailTerminals, WorkspacePanel } from "./WorkspacePanel";
 
 // The rail's content children are exercised by their own suites; stub them so
 // these tests focus on WorkspacePanel's own logic (the open-file/shell tab
@@ -739,6 +739,41 @@ describe("WorkspacePanel shell tabs", () => {
     expect(await screen.findByTestId("terminal-view-stub")).toBeInTheDocument();
     expect(screen.getByTestId("files-panel-stub")).toBe(panel);
     expect(panel.parentElement).toHaveClass("invisible");
+  });
+
+  it("keeps a shell's xterm mounted while another shell tab is shown", async () => {
+    const otherTerm = { ...term, id: "terminal_zsh_s2", session: "u-second" };
+    const otherKey = "terminal:terminal_zsh_s2";
+    useTerminalsMock.mockReturnValue({
+      terminals: [term, otherTerm],
+      isLoading: false,
+      error: null,
+    });
+    const { rerender } = renderWorkspace({
+      openTerminals: [termKey, otherKey],
+      selectedTerminalKey: termKey,
+    });
+    const firstView = await screen.findByText("terminal_zsh_s1");
+
+    rerender({ openTerminals: [termKey, otherKey], selectedTerminalKey: otherKey });
+    expect(await screen.findByText("terminal_zsh_s2")).toBeVisible();
+    // Same DOM node means the first shell's attach was never torn down.
+    expect(screen.getByText("terminal_zsh_s1")).toBe(firstView);
+    expect(firstView.parentElement).toHaveClass("invisible");
+
+    rerender({ openTerminals: [termKey, otherKey], selectedTerminalKey: termKey });
+    expect(screen.getByText("terminal_zsh_s1")).toBe(firstView);
+    expect(firstView.parentElement).not.toHaveClass("invisible");
+  });
+
+  it("bounds warm rail shells to the most recently shown", () => {
+    const keys = ["a", "b", "c", "d"];
+    const warm = keys.reduce(updateWarmRailTerminals, [] as string[]);
+    expect(warm).toEqual(keys);
+    expect(updateWarmRailTerminals(warm, "d")).toBe(warm);
+    expect(updateWarmRailTerminals(warm, "a")).toEqual(["b", "c", "d", "a"]);
+    expect(updateWarmRailTerminals(warm, "e")).toEqual(["b", "c", "d", "e"]);
+    expect(MAX_WARM_RAIL_TERMINALS).toBe(keys.length);
   });
 
   it("activates a shell via openTerminalTab when its tab body is clicked", () => {
