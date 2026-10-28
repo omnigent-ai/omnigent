@@ -226,7 +226,7 @@ def _is_summarization(entry: dict[str, Any]) -> bool:
     return any(prompt in text for prompt in _SUMMARY_PROMPTS)
 
 
-def _wait_for_turn_outcome(page: Page, replies_before: int) -> str:
+def _wait_for_turn_outcome(page: Page, replies_before: int, errors_before: int) -> str:
     replies = page.locator(_ASSISTANT)
     error_pill = page.get_by_test_id("error-pill")
     deadline = time.monotonic() + _TURN_TIMEOUT_MS / 1000
@@ -234,7 +234,7 @@ def _wait_for_turn_outcome(page: Page, replies_before: int) -> str:
         if replies.count() > replies_before and page.locator(_WORKING).count() == 0:
             replies.last.scroll_into_view_if_needed()
             return f"reply: {replies.last.inner_text()[:300]}"
-        if error_pill.count():
+        if error_pill.count() > errors_before:
             pill = error_pill.last
             pill.scroll_into_view_if_needed()
             pill.get_by_role("button", expanded=False).first.click()
@@ -363,8 +363,9 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
             mark("session reopened")
             script_reply(resume_marker)
             replies_before = page.locator(_ASSISTANT).count()
+            errors_before = page.get_by_test_id("error-pill").count()
             _send(page, f"Turn {resume_marker}: which worker was slowest?")
-            outcome = _wait_for_turn_outcome(page, replies_before)
+            outcome = _wait_for_turn_outcome(page, replies_before, errors_before)
             mark(f"resume turn outcome: {outcome}")
             page.wait_for_timeout(4_000)
         finally:
@@ -400,6 +401,7 @@ def test_pi_compacted_session_resumes_compacted_after_restart(
         f"turns Pi had already summarized were replayed after restart: {summarized_markers}"
     )
     assert summary.split()[0] in resumed_text, "the resumed context lost Pi's compaction summary"
+    assert compacting_markers, "no observed turn sent Pi's summarization request"
     # The last compacting turn's prompt is stored before its compaction item, so only
     # the kept context can replay it.
     assert f"Turn {compacting_markers[-1]}:" in resumed_text, (

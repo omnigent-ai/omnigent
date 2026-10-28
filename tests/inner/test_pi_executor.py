@@ -41,6 +41,7 @@ from omnigent.inner.pi_executor import (
     _databricks_model_wire_catalog,
     _generate_extension_js,
     _only_configured_family,
+    _pi_compacted_history,
     _pi_provider_for_model,
     _PiRpcSession,
     _redact_argv_for_log,
@@ -6457,6 +6458,26 @@ def test_settled_overflow_compaction_retry_reports_compacted_context() -> None:
         assert _SESSION_KEY in executor._session_states
 
     _run(_test())
+
+
+def test_pi_compacted_history_leaves_out_reply_of_a_turn_without_tools() -> None:
+    """With no tool result in this turn, its reply is stored after the
+    compaction item, so only the prompt is kept."""
+    history = _pi_compacted_history(
+        [
+            {"role": "compactionSummary", "summary": "SUMMARY"},
+            {"role": "user", "content": "hello"},
+            _assistant_message("RECOVERED"),
+        ]
+    )
+
+    assert history[1:] == [
+        {
+            "type": "message",
+            "role": "user",
+            "content": [{"type": "input_text", "text": "hello"}],
+        }
+    ]
 
 
 def test_settled_compaction_without_exported_context_reports_summary_only() -> None:
