@@ -32,10 +32,13 @@ A readiness handshake (a ``touch`` that must land before the scenario) makes
 sure the PTY's shell is accepting and executing input before any Cmd keys are
 sent, so the assertions can only fail on the shortcut behavior itself.
 
-All three tests use the function-scoped ``terminal_session`` fixture (the
+All tests use the function-scoped ``terminal_session`` fixture (the
 ``zsh``-declaring agent, runner-bound session); the launched shell is
 actually ``bash --noprofile --norc``, whose default emacs bindings implement
 Ctrl-A / Ctrl-E / Ctrl-U — exactly what the fix is expected to send.
+
+Ctrl+/ must likewise reach the shell as Ctrl-_ instead of opening Omnigent's
+Keyboard shortcuts dialog over the terminal.
 """
 
 from __future__ import annotations
@@ -52,6 +55,7 @@ from tests.e2e_ui.conftest import open_right_rail
 CTRL_A = b"\x01"  # cursor to line start (Cmd+Left)
 CTRL_E = b"\x05"  # cursor to line end   (Cmd+Right)
 CTRL_U = b"\x15"  # kill to line start   (Cmd+Backspace)
+CTRL_UNDERSCORE = b"\x1f"  # Ctrl+/ (Codex's side/main thread toggle)
 
 
 def _open_new_shell(page: Page) -> None:
@@ -265,3 +269,30 @@ def test_cmd_right_moves_cursor_to_line_end(
     page.keyboard.press("Meta+ArrowRight")
     page.keyboard.type(".ok")
     _run_line_and_expect_file(page, marker, frames, CTRL_E, "Cmd+Right")
+
+
+def test_ctrl_slash_reaches_the_shell_as_ctrl_underscore(
+    page: Page, terminal_session: tuple[str, str], tmp_path: Path
+) -> None:
+    """Ctrl+/ in a focused shell runs the shell's Ctrl-_ binding and opens no Omnigent dialog."""
+    base_url, session_id = terminal_session
+    frames = _capture_attach_frames(page)
+    page.goto(f"{base_url}/c/{session_id}")
+    textarea = _connected_shell_textarea(page)
+    _await_shell_ready(page, textarea, tmp_path)
+
+    bound = tmp_path / "ctrl_underscore_bound.txt"
+    marker = tmp_path / "ctrl_slash.ok"
+    page.keyboard.type(f"bind -x '\"\\C-_\": touch {marker}' && touch {bound}")
+    page.keyboard.press("Enter")
+    assert _wait_for_file(bound, timeout_s=10.0), "bash did not accept the Ctrl-_ binding"
+
+    page.keyboard.press("Control+Slash")
+    file_created = _wait_for_file(marker, timeout_s=10.0)
+    dialog_open = page.get_by_role("dialog", name="Keyboard shortcuts").is_visible()
+    sent = b"".join(frames)
+    assert CTRL_UNDERSCORE in sent and file_created and not dialog_open, (
+        f"Ctrl+/ did not reach the shell as {CTRL_UNDERSCORE!r}: binding ran={file_created}, "
+        f"Keyboard shortcuts dialog open={dialog_open}; bytes sent on the attach "
+        f"WebSocket: {sent!r}"
+    )

@@ -302,6 +302,8 @@ export function KeyboardShortcutsDialog() {
       // trigger, so require the platform command modifier and no Shift/Alt to
       // avoid clashing (only ⌘/ on macOS, only Ctrl+/ on Win/Linux).
       if (hasCommandModifier(e) && !e.altKey && !e.shiftKey && e.key === "/") {
+        // Yield when a focused widget (e.g. a terminal) already claimed the chord.
+        if (e.defaultPrevented) return;
         e.preventDefault();
         setOpen((prev) => !prev);
       }
