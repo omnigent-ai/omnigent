@@ -1,5 +1,4 @@
-import { useSideChatSettingsSupport } from "@/hooks/useSideChatSettingsSupport";
-import { useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { useIsMutating, useMutation, useQueryClient } from "@tanstack/react-query";
 import { toast } from "sonner";
 import { ComposerAgentIcon } from "@/components/ComposerAgentIcon";
@@ -22,6 +21,7 @@ import { nativeCodingAgentForHarness } from "@/lib/nativeCodingAgents";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
 import { useConversationEntryState } from "@/hooks/useConversationEntryState";
 import { useSession } from "@/hooks/useSession";
+import { useRunnerHealthRegistration } from "@/hooks/RunnerHealthProvider";
 import { useHostModelOptions } from "@/hooks/useHosts";
 import { useHarnessEffortFamilies } from "@/lib/agentLabels";
 import {
@@ -59,10 +59,20 @@ export function SideChatSettings({
     nativeSide ||
     session.harness === "codex-native" ||
     session.labels?.["omnigent.wrapper"] === "codex-native-ui";
-  const settingsSupported = useSideChatSettingsSupport(
-    nativeSide && !draft ? (sourceId ?? session.id) : null,
-    nativeSession,
+  const settingsSupported = !nativeSession || session.sideChatSettingsSupported === true;
+  const settingsParentId = nativeSide && !draft ? sourceId : null;
+  const healthSessions = useMemo(
+    () => (settingsParentId ? [{ id: settingsParentId }] : []),
+    [settingsParentId],
   );
+  const runnerHealth = useRunnerHealthRegistration(healthSessions);
+  const runnerOnline = settingsParentId ? runnerHealth.get(settingsParentId) : undefined;
+  useEffect(() => {
+    // The parent runner can reconnect without interrupting the child's browser stream.
+    if (runnerOnline !== undefined) {
+      void queryClient.invalidateQueries({ queryKey: ["session", session.id] });
+    }
+  }, [queryClient, session.id, runnerOnline]);
   const { session: parent } = useSession(sourceId);
   const parentState = useConversationEntryState(nativeSide ? sourceId : null);
   const families = useHarnessEffortFamilies();

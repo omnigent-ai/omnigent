@@ -504,6 +504,8 @@ export interface Session {
   }[];
   /** Runner-owned model picker rows for the active native session. */
   codexModelOptions?: NativeModelOption[];
+  /** Whether the connected runner supports settings on this native side chat. */
+  sideChatSettingsSupported?: boolean;
   /** A saved sandbox inference policy owns the model catalog. */
   inferenceConfigured?: boolean;
   inferenceError?: string | null;

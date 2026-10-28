@@ -411,7 +411,9 @@ cannot change them. A failed start keeps the draft and selections for retry
 without changing the parent's settings. Native Codex shows these controls only
 once the side-chat child exists, when both server and runner support them.
 The first message uses the existing native fork flow and inherited settings;
-later model and effort changes apply to the child's next turn.
+later model and effort changes apply to the child's next turn. Native Codex
+requires a concrete model selection; model-reset aliases are rejected without
+saving changes. Effort can still be reset to the selected model's default.
 
 **Side-chat quotes:** select text in the parent conversation and choose **Ask in
 side chat**. It appends a removable quote to the visible side-chat tab, including
@@ -719,7 +721,11 @@ plain `uv run pytest`, which starts a private server for the test.
   session APIs, including fork-time draft settings and later child-only updates.
   `web/src/components/chat/SideChatSettings.test.tsx`
   covers explicit child targeting, compatible effort choices, rejected updates,
-  harness capabilities, and viewer/closed states.
+  harness capabilities, parent-runner reconnect recovery, and viewer/closed states.
+  `tests/server/integration/test_sessions_child_sessions.py::test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn`
+  covers a parent whose live reported model differs from its saved web selection:
+  an untouched child follow-up retains the live model. It also checks that model
+  reset aliases fail without changing the saved model or effort.
 - **`side-chat-quotes`, desktop Ask in side chat and Reply:**
   `tests/e2e_ui/chat/test_side_chat_entrypoints.py::test_ask_in_side_chat_opens_a_quoted_side_chat_tab`
   checks pending/live tab reuse, interleaved comments, pasted images, and replies

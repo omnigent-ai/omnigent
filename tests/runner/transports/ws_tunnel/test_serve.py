@@ -1319,6 +1319,9 @@ async def test_serve_tunnel_once_sends_bearer_header(
     hello = decode_frame(captured["sent"])
     assert isinstance(hello, HelloFrame)
     assert CAP_FILESYSTEM_ATTACHMENTS in hello.capabilities
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
+
+    assert CAP_SIDE_CHAT_SETTINGS in hello.capabilities
 
     # A reconnect's row carries the id the loop minted, the streak position
     # and the outage it ended, measured from when the previous connection

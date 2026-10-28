@@ -2404,6 +2404,8 @@ class SessionResponse(BaseModel):
     labels: dict[str, str] = Field(default_factory=dict)
     runner_id: str | None = None
     host_id: str | None = None
+    # Derived from the parent runner's live handshake, never persisted on the child.
+    side_chat_settings_supported: bool = False
     runner_online: bool | None = None
     host_online: bool | None = None
     host_resumable: bool = False

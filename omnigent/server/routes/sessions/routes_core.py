@@ -136,6 +136,7 @@ from omnigent.server.routes._sessions.helpers import (
     _forward_session_change_to_runner,
     _get_runner_client,
     _grant_default_public,
+    _is_codex_native_subagent,
     _live_settings_change,
     _LiveSettingsChange,
     _multipart_missing_detail,
@@ -1574,27 +1575,6 @@ def register_core_routes(
         )
         _set_read_state(user_id, session_id, body.last_seen, body.unread)
         return Response(status_code=204)
-
-    @router.get("/sessions/{session_id}/side_chat_capabilities")
-    async def side_chat_capabilities(request: Request, session_id: str) -> dict[str, bool]:
-        """Report settings support only when both server and current runner implement it."""
-        user_id = _get_user_id(request, auth_provider)
-        access = await _require_access_and_level(
-            user_id, session_id, LEVEL_READ, permission_store, conversation_store
-        )
-        conv = access.conversation or await asyncio.to_thread(
-            conversation_store.get_conversation, session_id
-        )
-        if conv is None:
-            raise _session_not_found()
-        if is_side_chat_child(conv.labels) and conv.parent_conversation_id:
-            parent = await asyncio.to_thread(
-                conversation_store.get_conversation, conv.parent_conversation_id
-            )
-            if parent is not None:
-                conv = parent
-        client = await _get_runner_client(conv.id, runner_router, conversation=conv)
-        return {"settings": await _runner_supports_side_chat_settings(client)}
 
     # ── GET /sessions/{session_id} ───────────────────────────────
 
@@ -3209,16 +3189,23 @@ def register_core_routes(
         # Ephemeral side threads have no terminal; apply their saved picks on the next turn.
         defer_side_settings = (
             conv is not None
-            and conv.labels.get("omnigent.wrapper") == "codex-native-ui-subagent"
+            and _is_codex_native_subagent(conv)
             and is_side_chat_child(conv.labels)
         )
+        if defer_side_settings and clear_model:
+            raise OmnigentError(
+                "Choose a specific model for this side chat; resetting its model is not supported.",
+                code=ErrorCode.INVALID_INPUT,
+            )
         if (
             defer_side_settings
             and not body.silent
             and (model_override is not None or clear_model or effort is not None or clear_effort)
         ):
-            client = await _get_runner_client(session_id, runner_router, conversation=conv)
-            if not await _runner_supports_side_chat_settings(client):
+            assert conv is not None
+            if not await _runner_supports_side_chat_settings(
+                conv, conversation_store, getattr(request.app.state, "tunnel_registry", None)
+            ):
                 raise OmnigentError(
                     "This runner cannot apply side-chat settings. Update the host and restart the session.",
                     code=ErrorCode.RUNNER_UNAVAILABLE,

@@ -250,6 +250,7 @@ interface SessionResponseWire {
   }[];
   /** Runner-owned model picker rows for native sessions. */
   model_options?: NativeModelOption[];
+  side_chat_settings_supported?: boolean;
   /**
    * True while the runner is auto-creating a terminal-first session's
    * terminal. Drives the Terminal-pill spinner; absent on older
@@ -367,6 +368,7 @@ function sessionFromWire(wire: SessionResponseWire): Session {
     kind: wire.kind === "sub_agent" ? "sub_agent" : "default",
     todos: wire.todos ?? [],
     codexModelOptions: wire.model_options ?? [],
+    sideChatSettingsSupported: wire.side_chat_settings_supported === true,
     ...(wire.inference_configured !== undefined
       ? {
           inferenceConfigured: wire.inference_configured,

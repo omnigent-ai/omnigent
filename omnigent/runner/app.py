@@ -2329,11 +2329,6 @@ def create_runner_app(
             content={"error": error},
         )
 
-    @app.get("/v1/side_chat_capabilities")
-    async def side_chat_capabilities() -> dict[str, bool]:
-        """Advertise support for per-child native side-chat settings."""
-        return {"settings": True}
-
     @app.get("/health")
     async def health() -> dict[str, str]:
         return {"status": "ok"}

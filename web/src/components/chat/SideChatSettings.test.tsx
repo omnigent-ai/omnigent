@@ -1,10 +1,10 @@
-import { useSideChatSettingsSupport } from "@/hooks/useSideChatSettingsSupport";
 import { act, cleanup, render, screen, waitFor } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { afterEach, beforeEach, expect, it, vi } from "vitest";
 import { toast } from "sonner";
 import { useSession } from "@/hooks/useSession";
+import * as runnerHealth from "@/hooks/RunnerHealthProvider";
 import * as sessionsApi from "@/lib/sessionsApi";
 import * as identity from "@/lib/identity";
 import type { Session, NativeModelOption } from "@/lib/types";
@@ -12,10 +12,6 @@ import type * as AgentLabels from "@/lib/agentLabels";
 import { conversationRegistry } from "@/store/conversationRegistry";
 import { handleSessionEvent, useChatStore } from "@/store/chatStore";
 import { SideChatSettings } from "./SideChatSettings";
-
-vi.mock("@/hooks/useSideChatSettingsSupport", () => ({
-  useSideChatSettingsSupport: vi.fn(() => true),
-}));
 
 vi.mock("@/lib/agentLabels", async (importOriginal) => ({
   ...(await importOriginal<typeof AgentLabels>()),
@@ -78,7 +74,7 @@ function Pane() {
 function mount(session = child) {
   cache.setQueryData(["session", "side"], session);
   cache.setQueryData(["session", "parent"], parent);
-  render(
+  return render(
     <QueryClientProvider client={cache}>
       <Pane />
     </QueryClientProvider>,
@@ -96,7 +92,6 @@ beforeEach(() => {
 });
 
 afterEach(() => {
-  vi.mocked(useSideChatSettingsSupport).mockReturnValue(true);
   cleanup();
   cache.clear();
   conversationRegistry.clear();
@@ -495,7 +490,6 @@ it.each([
   { harness: null, labels: { "omnigent.wrapper": "codex-native-ui" } },
   { harness: null, labels: { "omnigent.codex_native.agent_nickname": "Side chat" } },
 ])("hides native Codex settings when unsupported (%j)", (metadata) => {
-  vi.mocked(useSideChatSettingsSupport).mockReturnValue(false);
   mount({ ...child, ...metadata } as Session);
   expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
 });
@@ -506,6 +500,7 @@ it.each([false, true])("hides native settings before a child exists (draft=%s)",
       <SideChatSettings
         session={{
           ...parent,
+          sideChatSettingsSupported: true,
           harness: "codex-native",
           labels: { "omnigent.wrapper": "codex-native-ui" },
         }}
@@ -514,7 +509,6 @@ it.each([false, true])("hides native settings before a child exists (draft=%s)",
     </QueryClientProvider>,
   );
   expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
-  expect(useSideChatSettingsSupport).toHaveBeenCalledWith(null, true);
 });
 
 it.each([false, true])(
@@ -628,6 +622,7 @@ it("uses the parent catalog while targeting a native Codex side thread", async (
   mount({
     ...child,
     harness: "codex-native",
+    sideChatSettingsSupported: true,
     parentSessionId: "parent",
     codexModelOptions: [],
     labels: {
@@ -646,5 +641,35 @@ it("uses the parent catalog while targeting a native Codex side thread", async (
     }),
   );
   expect(cache.getQueryData(["session", "parent"])).toEqual(parent);
-  expect(useSideChatSettingsSupport).toHaveBeenCalledWith("parent", true);
+});
+
+it("refreshes native settings support when the parent runner reconnects", async () => {
+  const session = {
+    ...child,
+    harness: "codex-native",
+    sideChatSettingsSupported: false,
+    parentSessionId: "parent",
+    labels: {
+      "omnigent.wrapper": "codex-native-ui-subagent",
+      "omnigent.codex_native.agent_nickname": "Side chat",
+    },
+  };
+  const health = vi
+    .spyOn(runnerHealth, "useRunnerHealthRegistration")
+    .mockReturnValue(new Map([["parent", false]]));
+  const snapshot = vi.spyOn(sessionsApi, "getSessionSlim").mockResolvedValue(session);
+  const view = mount(session);
+  await waitFor(() => expect(snapshot).toHaveBeenCalledTimes(1));
+  expect(screen.queryByRole("button", { name: "Side chat model and effort" })).toBeNull();
+
+  snapshot.mockResolvedValue({ ...session, sideChatSettingsSupported: true });
+  health.mockReturnValue(new Map([["parent", true]]));
+  view.rerender(
+    <QueryClientProvider client={cache}>
+      <Pane />
+    </QueryClientProvider>,
+  );
+  expect(await screen.findByRole("button", { name: "Side chat model and effort" })).toBeVisible();
+  expect(snapshot).toHaveBeenCalledTimes(2);
+  expect(cache.getQueryData(["session", "parent"])).toEqual(parent);
 });

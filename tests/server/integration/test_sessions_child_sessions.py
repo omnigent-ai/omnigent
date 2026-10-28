@@ -30,6 +30,7 @@ from typing import Any, NoReturn
 import httpx
 import pytest
 import yaml
+from fastapi import FastAPI
 
 from omnigent.entities import Conversation
 from omnigent.entities.conversation import MessageData, NewConversationItem
@@ -1907,18 +1908,37 @@ async def _create_native_child(client: httpx.AsyncClient, name: str) -> dict[str
     return child_resp.json()
 
 
-@pytest.mark.parametrize("effort", ["max", "default", None])
+@pytest.mark.parametrize(
+    "effort,reset_model", [("max", "default"), ("default", "off"), (None, "reset")]
+)
 async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
-    client: httpx.AsyncClient, db_uri: str, monkeypatch: pytest.MonkeyPatch, effort: str | None
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    effort: str | None,
+    reset_model: str,
 ) -> None:
     from unittest.mock import AsyncMock
 
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
     from omnigent.server.routes._sessions.orchestration import _forward_codex_side_chat_turn
     from omnigent.server.routes.sessions import routes_core
     from omnigent.server.schemas import SessionEventInput
 
-    support = AsyncMock(return_value=True)
-    monkeypatch.setattr(routes_core, "_runner_supports_side_chat_settings", support)
+    registry = TunnelRegistry()
+    monkeypatch.setattr(app.state, "tunnel_registry", registry)
+    connection = registry.register(
+        "runner_parent",
+        AsyncMock(),
+        HelloFrame(
+            runner_version="0.21.0",
+            frame_protocol_version=1,
+            capabilities=[CAP_SIDE_CHAT_SETTINGS],
+        ),
+    )
 
     parent = await _create_parent_session(client, agent_name="side-settings")
     store = SqlAlchemyConversationStore(db_uri)
@@ -1926,8 +1946,10 @@ async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
     store.update_conversation(
         parent["id"],
         model_override="gpt-5.5",
+        reported_model="gpt-5.6-luna",
         reasoning_effort="high" if effort is not None else None,
     )
+    store.set_runner_id(parent["id"], "runner_parent")
     created = await client.post(
         f"/v1/sessions/{parent['id']}/events",
         json={
@@ -1938,7 +1960,16 @@ async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
     assert created.status_code == 202, created.text
     child_id = created.json()["child_session_id"]
     child = (await client.get(f"/v1/sessions/{child_id}")).json()
-    assert child["model_override"] == "gpt-5.5"
+    assert child["side_chat_settings_supported"] is True
+    assert child["model_override"] == "gpt-5.6-luna"
+    initial_runner = AsyncMock(spec=httpx.AsyncClient)
+    initial_runner.post.return_value = httpx.Response(202)
+    await _forward_codex_side_chat_turn(
+        store.get_conversation(child_id),
+        SessionEventInput(type="message", data={"content": "Untouched follow-up"}),
+        initial_runner,
+    )
+    assert initial_runner.post.call_args.kwargs["json"]["model_override"] == "gpt-5.6-luna"
     assert child["reasoning_effort"] == ("high" if effort is not None else None)
     store.update_conversation(parent["id"], model_override="gpt-5.6-luna", reasoning_effort="low")
     parent_before = store.get_conversation(parent["id"])
@@ -1959,11 +1990,21 @@ async def test_codex_side_settings_are_saved_and_forwarded_only_to_child_turn(
     assert response.status_code == 200, response.text
     assert response.json()["model_override"] == "gpt-6-sol"
     assert response.json()["reasoning_effort"] == saved_effort
-    support.return_value = False
+    assert response.json()["side_chat_settings_supported"] is True
+    refused_reset = await client.patch(
+        f"/v1/sessions/{child_id}",
+        json={"model_override": reset_model, "reasoning_effort": "low"},
+    )
+    assert refused_reset.status_code == 400, refused_reset.text
+    assert "Choose a specific model" in refused_reset.text
+    after_reset = store.get_conversation(child_id)
+    assert after_reset.model_override == "gpt-6-sol"
+    assert after_reset.reasoning_effort == saved_effort
+    connection.hello.capabilities.clear()
     refused = await client.patch(f"/v1/sessions/{child['id']}", json={"reasoning_effort": "low"})
     assert refused.status_code == 503, refused.text
     assert store.get_conversation(child["id"]).reasoning_effort == saved_effort
-    support.return_value = True
+    connection.hello.capabilities.append(CAP_SIDE_CHAT_SETTINGS)
     repeated = await client.post(
         f"/v1/sessions/{parent['id']}/events",
         json={
@@ -2538,23 +2579,46 @@ async def test_fork_of_child_promotes_it_into_the_sidebar(
     )
 
 
-@pytest.mark.parametrize(
-    "runner_status,supported", [(404, False), (200, False), (200, True), (None, False)]
-)
-async def test_side_chat_capabilities_probe_current_runner(
+@pytest.mark.parametrize("runner_state", ["current", "old", "offline"])
+async def test_side_chat_settings_support_follows_parent_runner_handshake(
     client: httpx.AsyncClient,
+    app: FastAPI,
     db_uri: str,
     monkeypatch: pytest.MonkeyPatch,
-    runner_status: int | None,
-    supported: bool,
+    runner_state: str,
 ) -> None:
     from unittest.mock import AsyncMock
 
-    from omnigent.server.routes.sessions import routes_core
+    from omnigent.harnesses.codex_native.side_chat import CAP_SIDE_CHAT_SETTINGS
+    from omnigent.runner.transports.ws_tunnel.frames import HelloFrame
+    from omnigent.runner.transports.ws_tunnel.registry import TunnelRegistry
 
+    registry = TunnelRegistry()
+    monkeypatch.setattr(app.state, "tunnel_registry", registry)
+    supported = runner_state == "current"
+    if runner_state != "offline":
+        registry.register(
+            "runner_parent",
+            AsyncMock(),
+            HelloFrame(
+                runner_version="0.21.0",
+                frame_protocol_version=1,
+                capabilities=[CAP_SIDE_CHAT_SETTINGS] if supported else [],
+            ),
+        )
+    registry.register(
+        "runner_stale",
+        AsyncMock(),
+        HelloFrame(
+            runner_version="0.21.0",
+            frame_protocol_version=1,
+            capabilities=[] if supported else [CAP_SIDE_CHAT_SETTINGS],
+        ),
+    )
     parent = await _create_parent_session(client)
     store = SqlAlchemyConversationStore(db_uri)
     store.set_labels(parent["id"], {"omnigent.wrapper": "codex-native-ui"})
+    store.set_runner_id(parent["id"], "runner_parent")
     child = await client.post(
         f"/v1/sessions/{parent['id']}/events",
         json={
@@ -2567,13 +2631,39 @@ async def test_side_chat_capabilities_probe_current_runner(
     )
     assert child.status_code == 202, child.text
     child_id = child.json()["child_session_id"]
-    runner = AsyncMock()
-    if runner_status is None:
-        runner.get.side_effect = ConnectionError("tunnel closed")
-    else:
-        runner.get.return_value = httpx.Response(runner_status, json={"settings": supported})
-    monkeypatch.setattr(routes_core, "_get_runner_client", AsyncMock(return_value=runner))
-    response = await client.get(f"/v1/sessions/{child_id}/side_chat_capabilities")
-    assert response.status_code == 200
-    assert response.json() == {"settings": supported}
-    runner.get.assert_awaited_once_with("/v1/side_chat_capabilities")
+    store.set_runner_id(child_id, "runner_stale")
+    response = await client.get(f"/v1/sessions/{child_id}")
+    assert response.status_code == 200, response.text
+    assert response.json()["side_chat_settings_supported"] is supported
+    assert (await client.get(f"/v1/sessions/{parent['id']}")).json()[
+        "side_chat_settings_supported"
+    ] is False
+    if supported:
+        registry.deregister("runner_parent", retire=False)
+        assert (await client.get(f"/v1/sessions/{child_id}")).json()[
+            "side_chat_settings_supported"
+        ] is False
+        registry.register(
+            "runner_parent",
+            AsyncMock(),
+            HelloFrame(
+                runner_version="0.21.0",
+                frame_protocol_version=1,
+            ),
+        )
+    refused = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
+    assert refused.status_code == 503, refused.text
+    assert store.get_conversation(child_id).reasoning_effort is None
+    registry.register(
+        "runner_parent",
+        AsyncMock(),
+        HelloFrame(
+            runner_version="0.21.0",
+            frame_protocol_version=1,
+            capabilities=[CAP_SIDE_CHAT_SETTINGS],
+        ),
+    )
+    recovered = await client.patch(f"/v1/sessions/{child_id}", json={"reasoning_effort": "low"})
+    assert recovered.status_code == 200, recovered.text
+    assert recovered.json()["side_chat_settings_supported"] is True
+    assert recovered.json()["reasoning_effort"] == "low"

@@ -8558,6 +8558,11 @@
             "title": "Share Workspace Files",
             "type": "boolean"
           },
+          "side_chat_settings_supported": {
+            "default": false,
+            "title": "Side Chat Settings Supported",
+            "type": "boolean"
+          },
           "status": {
             "description": "Session lifecycle status. One of `\"idle\"` (no loop running), `\"running\"` (loop executing), `\"waiting\"` (loop parked on background work / sub-agents), or `\"failed\"` (terminal failure). Current read paths collapse `\"waiting\"` -> `\"running\"` before building this snapshot; the literal stays a superset of what the runtime can produce so a server that forwards the raw status never 500s on serialization.",
             "enum": [
@@ -18481,53 +18486,6 @@
         "summary": "Get Session Resource",
         "tags": [
           "session_resources"
-        ]
-      }
-    },
-    "/v1/sessions/{session_id}/side_chat_capabilities": {
-      "get": {
-        "description": "Report settings support only when both server and current runner implement it.",
-        "operationId": "side_chat_capabilities_v1_sessions__session_id__side_chat_capabilities_get",
-        "parameters": [
-          {
-            "in": "path",
-            "name": "session_id",
-            "required": true,
-            "schema": {
-              "title": "Session Id",
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "additionalProperties": {
-                    "type": "boolean"
-                  },
-                  "title": "Response Side Chat Capabilities V1 Sessions  Session Id  Side Chat Capabilities Get",
-                  "type": "object"
-                }
-              }
-            },
-            "description": "Successful Response"
-          },
-          "422": {
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/HTTPValidationError"
-                }
-              }
-            },
-            "description": "Validation Error"
-          }
-        },
-        "summary": "Side Chat Capabilities",
-        "tags": [
-          "sessions"
         ]
       }
     },

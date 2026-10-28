@@ -75,12 +75,6 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
 
     _send_parent(page, parent_question, parent_reply)
     parent_items = _items(base_url, session_id)
-    capabilities = httpx.get(
-        f"{base_url}/v1/sessions/{session_id}/side_chat_capabilities", timeout=10
-    )
-    assert capabilities.status_code == 200, capabilities.text
-    assert capabilities.json() == {"settings": True}, capabilities.text
-
     pane = page.locator(".side-chat-backdrop")
     if mobile:
         _start_side_chat(page, "slash", question)
@@ -112,6 +106,7 @@ def test_native_codex_side_chat_inherits_context_and_closes_independently(
     child_response.raise_for_status()
     parent, child = parent_response.json(), child_response.json()
     assert child["runner_id"] == parent["runner_id"]
+    assert child["side_chat_settings_supported"] is True
     first_requests = [
         request
         for request in get_mock_requests(mock_llm_server_url)
