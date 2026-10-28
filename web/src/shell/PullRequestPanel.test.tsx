@@ -55,6 +55,7 @@ const state = vi.hoisted(() => ({
   diffError: null as Error | null,
   canEdit: true,
   updateSessionPr: vi.fn(),
+  realPrHooks: false,
   repoLabels: {
     data: undefined as PullRequestRepoLabels | undefined,
     isPending: true,
@@ -93,8 +94,16 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     pullRequestLabelsMutationKey: original.pullRequestLabelsMutationKey,
     usePullRequestRepoLabels: vi.fn(() => state.repoLabels),
     useUpdatePullRequestLabels: () => state.updateLabels,
-    usePullRequestMergeOptions: () => ({ data: undefined, isPending: true, isError: false }),
-    useMergePullRequest: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
+    usePullRequestMergeOptions: (
+      ...args: Parameters<typeof original.usePullRequestMergeOptions>
+    ) =>
+      state.realPrHooks
+        ? original.usePullRequestMergeOptions(...args)
+        : { data: undefined, isPending: true, isError: false },
+    useMergePullRequest: (id: string) =>
+      state.realPrHooks
+        ? original.useMergePullRequest(id)
+        : { mutate: vi.fn(), isPending: false, isError: false },
     useDisablePullRequestAutoMerge: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
     applyPullRequestReviewerChange: original.applyPullRequestReviewerChange,
     pullRequestReviewerKey: original.pullRequestReviewerKey,
@@ -108,7 +117,9 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
       isError: false,
     }),
     uploadPullRequestAttachment: vi.fn(),
-    usePullRequestInfo: vi.fn(() => state.info),
+    usePullRequestInfo: vi.fn((...args: Parameters<typeof original.usePullRequestInfo>) =>
+      state.realPrHooks ? original.usePullRequestInfo(...args) : state.info,
+    ),
     usePullRequestChangedFiles: vi.fn(() => state.changes),
     usePullRequestDiff: () => ({
       data: state.diff,
@@ -119,7 +130,10 @@ vi.mock("@/hooks/usePullRequests", async (importOriginal) => {
     fetchPullRequestFileContents: async () => ({ before: "old", after: "new" }),
     // The account selector (shown in the repo-unresolved empty state) calls this;
     // stub the mutation shape it reads.
-    useUpdateSessionPr: () => ({ mutate: state.updateSessionPr, isPending: false, isError: false }),
+    useUpdateSessionPr: (id: string) =>
+      state.realPrHooks
+        ? original.useUpdateSessionPr(id)
+        : { mutate: state.updateSessionPr, isPending: false, isError: false },
     useSetPullRequestPreference: () => ({
       mutate: () => {},
       isPending: false,
@@ -276,6 +290,7 @@ let scrollIntoView: ReturnType<typeof vi.fn>;
 beforeEach(() => {
   // The diff-layout toggle seeds from persisted prefs; start each test clean.
   window.localStorage.clear();
+  state.realPrHooks = false;
   state.stored = {};
   state.unsynced = new Set();
   state.storedFetches = 0;
@@ -363,6 +378,160 @@ afterEach(() => {
 });
 
 describe("PullRequestPanel", () => {
+  it.each(["UNKNOWN", "BLOCKED", "error"])(
+    "keeps compact confirmation and pending refusal through a polling transition: %s",
+    async (transition) => {
+      state.realPrHooks = true;
+      const url = "https://github.com/acme/app/pull/6000";
+      const head = "a".repeat(40);
+      const payload = {
+        ...state.info!.data!,
+        tracking_available: true,
+        selected_pr_url: url,
+        prs: [
+          {
+            url,
+            host: "github.com",
+            repository: "acme/app",
+            number: 6000,
+            relationship: "attached",
+          },
+        ],
+        capabilities: { merging: true },
+        pr: { ...state.info!.data!.pr!, url, head_sha: head, merge_state_status: "CLEAN" },
+      };
+      let failed = false;
+      let respond: (response: Response) => void = () => {};
+      const requests: unknown[] = [];
+      vi.stubGlobal(
+        "fetch",
+        vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(input), "http://localhost").pathname;
+          if (path.endsWith("/merge-options"))
+            return new Response(JSON.stringify({ methods: ["squash"], default: "squash" }));
+          if (path.endsWith("/merge")) {
+            requests.push(JSON.parse(String(init?.body)));
+            return new Promise<Response>((resolve) => {
+              respond = resolve;
+            });
+          }
+          return new Response(
+            JSON.stringify(failed ? { error: { message: "Temporary failure" } } : payload),
+            { status: failed ? 502 : 200 },
+          );
+        }),
+      );
+      const user = userEvent.setup();
+      const { client } = renderPanel();
+      await user.click(await screen.findByRole("button", { name: "Merge" }));
+      const confirm = await screen.findByRole("button", { name: "Squash and merge" });
+      const dialog = screen.getByRole("dialog");
+      payload.pr.merge_state_status = transition === "error" ? "CLEAN" : transition;
+      payload.pr.head_sha = "b".repeat(40);
+      failed = transition === "error";
+      await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+      expect(screen.getByRole("dialog")).toBe(dialog);
+      if (failed) {
+        await waitFor(() => expect(confirm).toBeDisabled());
+        failed = false;
+        await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+      }
+      await user.click(confirm);
+      expect(requests).toEqual([{ pr_url: url, merge_method: "squash", expected_head: head }]);
+      payload.pr.merge_state_status = "BLOCKED";
+      await act(() => client.refetchQueries({ queryKey: ["github-info", "conv_1"] }));
+      expect(within(dialog).getByRole("button", { name: "Merging…" })).toBeDisabled();
+      await act(async () =>
+        respond(
+          new Response(JSON.stringify({ error: { message: "Head changed; refresh and retry" } }), {
+            status: 409,
+          }),
+        ),
+      );
+      expect(await within(dialog).findByRole("alert")).toHaveTextContent("Head changed");
+      expect(screen.getByRole("dialog")).toBe(dialog);
+    },
+  );
+
+  it("keeps a linked PR selected in details while an older stored-list read finishes", async () => {
+    state.realPrHooks = true;
+    const one = "https://github.com/acme/app/pull/1";
+    const two = "https://github.com/acme/app/pull/2";
+    const association = (url: string, number: number): PullRequestAssociation => ({
+      url,
+      number,
+      host: "github.com",
+      repository: "acme/app",
+      relationship: "attached",
+      title: `PR ${number}`,
+    });
+    const first = association(one, 1);
+    const second = association(two, 2);
+    state.stored.conv_1 = [first];
+    let attached = false;
+    const payload = (url: string) => ({
+      ...state.info!.data!,
+      tracking_available: true,
+      selected_pr_url: url,
+      prs: attached ? [first, second] : [first],
+      pr: {
+        ...state.info!.data!.pr!,
+        url,
+        number: url === two ? 2 : 1,
+        title: url === two ? "PR 2" : "PR 1",
+      },
+    });
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+        const request = new URL(String(input), "http://localhost");
+        if (init?.method === "POST") attached = true;
+        return new Response(
+          JSON.stringify(
+            payload(init?.method === "POST" ? two : (request.searchParams.get("pr_url") ?? one)),
+          ),
+        );
+      }),
+    );
+    const user = userEvent.setup();
+    const { client } = renderPanel();
+    await user.click(await screen.findByRole("button", { name: "acme/app #1 — PR 1" }));
+    await screen.findByRole("link", { name: /PR 1/ });
+    let resolveStored: (value: {
+      prs: PullRequestAssociation[];
+      synced: boolean;
+    }) => void = () => {};
+    const oldRead = client
+      .fetchQuery({
+        queryKey: ["session-pull-requests", "conv_1"],
+        queryFn: () =>
+          new Promise<{ prs: PullRequestAssociation[]; synced: boolean }>((resolve) => {
+            resolveStored = resolve;
+          }),
+      })
+      .catch(() => {});
+    await user.click(screen.getByRole("button", { name: "Link a PR" }));
+    await user.type(screen.getByRole("textbox", { name: "Pull request URL" }), two);
+    await user.click(screen.getByRole("button", { name: "Link" }));
+    await screen.findByRole("link", { name: /PR 2/ });
+    expect(client.getQueryData(["session-pull-requests", "conv_1"])).toMatchObject({
+      prs: [first, second],
+      synced: true,
+    });
+    await act(async () => {
+      resolveStored({ prs: [first], synced: true });
+      await oldRead;
+    });
+    expect(screen.getByRole("link", { name: /PR 2/ })).toBeVisible();
+    await act(async () => {
+      client.setQueryData(["session-pull-requests", "conv_1"], {
+        prs: [first, second],
+        synced: true,
+      });
+    });
+    expect(screen.getByRole("link", { name: /PR 2/ })).toBeVisible();
+  });
+
   it("uses one mobile heading with working header actions in list and details", async () => {
     const user = userEvent.setup();
     state.storesPrs = false;

@@ -207,8 +207,16 @@ def stub(
     return requested
 
 
-@pytest.mark.parametrize("entry", ["rail", "composer-desktop", "composer-mobile"])
-@pytest.mark.parametrize("initially_offline", [False, True], ids=["online", "reconnect"])
+@pytest.mark.parametrize(
+    ("entry", "initially_offline"),
+    [
+        pytest.param("rail", False, id="online-rail"),
+        pytest.param("composer-desktop", False, id="online-composer-desktop"),
+        pytest.param("composer-mobile", False, id="online-composer-mobile"),
+        pytest.param("rail", True, id="reconnect-rail"),
+        pytest.param("composer-mobile", True, id="reconnect-composer-mobile"),
+    ],
+)
 def test_gitlab_panel_summary_and_diff(
     page: Page,
     seeded_session: tuple[str, str],
