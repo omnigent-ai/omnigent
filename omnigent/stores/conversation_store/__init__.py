@@ -1098,8 +1098,12 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        label_updates: dict[str, str] | None = None,
     ) -> ConversationUpdateResult | None:
         """Update a conversation and report requested model-setting changes.
+
+        ``label_updates`` merges labels atomically with model and effort
+        settings; omitted labels remain unchanged.
 
         The returned change flags describe only the explicitly requested
         ``reasoning_effort`` and ``model_override`` updates. A request that

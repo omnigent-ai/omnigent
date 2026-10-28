@@ -587,7 +587,7 @@ def test_update_conversation_with_changes_missing_conversation(
 def test_update_conversation_with_changes_retries_commit(
     conversation_store: SqlAlchemyConversationStore,
 ) -> None:
-    conv = conversation_store.create_conversation()
+    conv = conversation_store.create_conversation(labels={"existing": "kept"})
     retrying_maker = _RetryOnceMaker(conversation_store._conv_session_immediate)
     conversation_store._conv_session_immediate = retrying_maker
 
@@ -595,6 +595,7 @@ def test_update_conversation_with_changes_retries_commit(
         conv.id,
         reasoning_effort="high",
         model_override="model-a",
+        label_updates={"effort_reset": "false"},
     )
 
     assert retrying_maker.attempts == 2
@@ -603,11 +604,13 @@ def test_update_conversation_with_changes_retries_commit(
     assert result.model_override_changed is True
     assert result.conversation.reasoning_effort == "high"
     assert result.conversation.model_override == "model-a"
+    assert result.conversation.labels == {"existing": "kept", "effort_reset": "false"}
 
     committed = conversation_store.get_conversation(conv.id)
     assert committed is not None
     assert committed.reasoning_effort == "high"
     assert committed.model_override == "model-a"
+    assert committed.labels == result.conversation.labels
 
 
 def test_reported_model_round_trips_beside_the_request(

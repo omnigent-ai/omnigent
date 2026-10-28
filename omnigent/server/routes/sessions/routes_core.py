@@ -41,7 +41,7 @@ from omnigent.entities import (
 )
 from omnigent.entities.permission import SessionPermission
 from omnigent.errors import ErrorCategory, ErrorCode, ErrorImpact, ErrorPhase, OmnigentError
-from omnigent.harnesses.codex_native.side_chat import is_side_chat_child
+from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL, is_side_chat_child
 from omnigent.models.model_override import validate_model_override
 from omnigent.runner.identity import (
     ORCHESTRATION_SOURCE_HEADER,
@@ -3246,18 +3246,15 @@ def register_core_routes(
             share_workspace_files=(body.share_workspace_files if set_share_workspace else None),
             terminal_launch_args=terminal_launch_args,
             archived=body.archived,
+            label_updates=(
+                {EFFORT_RESET_LABEL: "true" if clear_effort else "false"}
+                if defer_side_settings and (clear_effort or effort is not None)
+                else None
+            ),
         )
         if update_result is None:
             raise _session_not_found()
         updated = update_result.conversation
-        if defer_side_settings and (clear_effort or effort is not None):
-            from omnigent.harnesses.codex_native.side_chat import EFFORT_RESET_LABEL
-
-            await asyncio.to_thread(
-                conversation_store.set_labels,
-                session_id,
-                {EFFORT_RESET_LABEL: "true" if clear_effort else "false"},
-            )
         effort_changed = update_result.reasoning_effort_changed
         saved = live_change.position() if live_change is not None else 0
         if body.silent:
