@@ -1160,6 +1160,12 @@ describe("NewChatLandingScreen project prefill", () => {
   it.each([
     { label: "the catalog default", model: undefined, sentModel: undefined, sentEffort: "xhigh" },
     { label: "a pinned model", model: "gpt-mini", sentModel: "gpt-mini", sentEffort: undefined },
+    {
+      label: "an equivalent pinned model ID",
+      model: "databricks-gpt-mini",
+      sentModel: "gpt-mini",
+      sentEffort: undefined,
+    },
   ])(
     "checks a Codex project effort against $label's ladder",
     async ({ model, sentModel, sentEffort }) => {

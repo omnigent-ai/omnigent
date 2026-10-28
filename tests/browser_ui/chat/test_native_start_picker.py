@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import re
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -14,7 +15,12 @@ from tests.browser_ui.chat.session_contract import ChatSessionContract
 
 
 def _open_picker(
-    page: Page, chat: ChatSessionContract, harness: str, *, sdk_kimi: bool = False
+    page: Page,
+    chat: ChatSessionContract,
+    harness: str,
+    *,
+    sdk_kimi: bool = False,
+    models: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     agent_id = f"ag_{harness}_browser"
     wrapper = f"{harness}-ui"
@@ -58,6 +64,9 @@ def _open_picker(
     )
     contract.json(
         re.compile(r"/v1/hosts/[^/]+/harnesses/[^/]+/model-options(?:\?.*)?$"), {"models": []}
+    )
+    contract.json(
+        f"/v1/hosts/{chat.host_id}/harnesses/{harness}/model-options", {"models": models or []}
     )
     contract.json(
         re.compile(r"/v1/sandbox-providers/[^/]+/harnesses/[^/]+/model-options(?:\?.*)?$"),
@@ -136,3 +145,78 @@ def test_native_picker_hides_sdk_kimi(
     expect(page.get_by_test_id("new-chat-landing-harness-more")).to_have_count(0)
     expect(page.get_by_test_id("new-chat-landing-agent-ag_kimi_sdk")).to_have_count(0)
     expect(page.locator("[data-harness-menu-row]")).to_have_count(1)
+
+
+@pytest.mark.parametrize("width", [1280, 390], ids=["desktop", "mobile"])
+def test_codex_remembers_explicit_models_across_catalog_changes(
+    page: Page, chat_session_contract: ChatSessionContract, width: int, tmp_path: Path
+) -> None:
+    """A named default is pinned; missing catalogs cannot silently replace it."""
+    chat = chat_session_contract
+    page.set_viewport_size({"width": width, "height": 900})
+    preferred = {"id": "gpt-6.1-sol", "displayName": "GPT 6.1 Sol", "isDefault": True}
+    fallback = {"id": "gpt-5.6-sol", "displayName": "GPT 5.6 Sol"}
+    creates = _open_picker(page, chat, "codex-native", models=[preferred, fallback])
+    picker = page.get_by_test_id("new-chat-landing-agent-select")
+
+    def open_models() -> None:
+        picker.click()
+        page.get_by_test_id("new-chat-landing-agent-config-ag_codex-native_browser").click()
+
+    def close_models() -> None:
+        page.keyboard.press("Escape")
+        page.keyboard.press("Escape")
+
+    def remembered_model() -> str:
+        return page.evaluate(
+            "JSON.parse(localStorage.getItem('omnigent:last-mode-by-harness'))['codex-native'].model"
+        )
+
+    catalog_path = f"/v1/hosts/{chat.host_id}/harnesses/codex-native/model-options"
+    open_models()
+    page.get_by_role("menuitemcheckbox", name="GPT 6.1 Sol", exact=True).click()
+    close_models()
+    assert remembered_model() == preferred["id"]
+
+    # The provider changes its default and the spelling of the selected model.
+    renamed = {**preferred, "id": "system.ai.gpt-6-1-sol", "isDefault": False}
+    chat.contract.json(catalog_path, {"models": [{**fallback, "isDefault": True}, renamed]})
+    page.reload()
+    expect(picker).to_contain_text("GPT 6.1 Sol")
+    open_models()
+    expect(page.get_by_role("menuitemcheckbox", name="GPT 6.1 Sol", exact=True)).to_have_attribute(
+        "aria-checked", "true"
+    )
+    expect(page.get_by_role("menuitemcheckbox", name="Default", exact=True)).to_have_attribute(
+        "aria-checked", "false"
+    )
+    page.screenshot(path=tmp_path / "codex-remembered-model.png", animations="disabled")
+    close_models()
+
+    chat.contract.json(catalog_path, {"models": [{**fallback, "isDefault": True}]})
+    page.reload()
+    page.get_by_test_id("new-chat-landing-input").fill("Use my selected model")
+    expect(page.get_by_role("alert")).to_contain_text("Choose another model or Default")
+    expect(page.get_by_test_id("new-chat-landing-submit")).to_be_disabled()
+    assert remembered_model() == preferred["id"]
+    assert creates == []
+    page.screenshot(path=tmp_path / "codex-missing-model.png", animations="disabled")
+
+    chat.contract.json(catalog_path, {"models": [{**fallback, "isDefault": True}, renamed]})
+    page.reload()
+    expect(picker).to_contain_text("GPT 6.1 Sol")
+    page.get_by_test_id("new-chat-landing-input").fill("Use my selected model")
+    page.get_by_test_id("new-chat-landing-submit").click()
+    expect(page).to_have_url(chat.url)
+    assert len(creates) == 1
+    assert creates[0]["model_override"] == renamed["id"]
+
+    chat.contract.json(catalog_path, {"models": [{**fallback, "isDefault": True}]})
+    page.goto(chat.base_url)
+    expect(page.get_by_role("alert")).to_contain_text("Choose another model or Default")
+    open_models()
+    page.get_by_role("menuitemcheckbox", name="Default", exact=True).click()
+    close_models()
+    page.get_by_test_id("new-chat-landing-input").fill("Use the default this time")
+    expect(page.get_by_test_id("new-chat-landing-submit")).to_be_enabled()
+    assert remembered_model() == ""

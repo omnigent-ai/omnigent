@@ -42,6 +42,10 @@ apply only to that side chat. See the [side-chat settings recipe](sessions.md).
   States: catalog loading, delayed catalog,
   alias vs. full model ID, refused switch (the pill keeps the applied model),
   a managed sandbox launching before its host is bound (its provider's default catalog).
+  In New Chat, a named Codex model stays pinned even if it was the catalog default;
+  Default is a separate choice. Equivalent catalog IDs restore the saved model.
+  A missing remembered model blocks launch until it returns or the user chooses
+  another model or Default, without overwriting the saved choice.
 - `effort-picker`: reasoning effort for harnesses that support it (Codex, Claude,
   Pi, Devin). States: available, unavailable placeholder, max/ultra levels, refused
   change (the pill keeps the applied level).
@@ -438,6 +442,9 @@ Other connection providers alone do not enable the managed MCP picker.
   `tests/e2e_ui/start_session/test_codex_catalog_availability.py::test_codex_prelaunch_label_reflects_catalog_availability`
   (desktop and mobile; populated catalogs without a default, empty catalogs, and probe failures),
   `tests/e2e_ui/start_session/test_composer_transition.py::test_selected_model_survives_delayed_create`
+  and `tests/browser_ui/chat/test_native_start_picker.py::test_codex_remembers_explicit_models_across_catalog_changes`
+  (desktop and mobile browser contract: named default, equivalent IDs, missing
+  catalog entry, recovery, create payload, and explicit Default).
 - **`effort-picker`, new-session composer:**
   `tests/e2e_ui/start_session/test_codex_effort_prelaunch.py::test_new_codex_session_gear_offers_reasoning_effort`
 - **`project-session-defaults`:**

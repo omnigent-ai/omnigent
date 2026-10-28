@@ -1535,6 +1535,9 @@ describe("model picker hotkey", () => {
     fireEvent.change(input, { target: { value: "unfinished task" } });
     act(() => input.focus());
 
+    // Default and its named model are separate choices: the first press pins it.
+    fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
+    expect(readHarnessOptions("codex-native").model).toBe("databricks-gpt-5-5");
     fireEvent.keyDown(input, { code: "KeyM", ctrlKey: true, altKey: true });
     expect(screen.getByTestId("new-chat-landing-agent-model-value")).toHaveTextContent("GPT-5.6");
     expect(
@@ -2303,7 +2306,8 @@ describe("NewChatLandingScreen cached picker preview", () => {
         ]);
         mockModelQueries(() => ({ ...SUCCESS_QUERY_STATE, data: [] }));
         const first = renderLanding();
-        const expectedSummary = catalogState === "absent" ? "saved-model" : "Default";
+        const expectedSummary =
+          catalogState === "absent" || harness === "codex-native" ? "saved-model" : "Default";
         fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
         expect(screen.getByTestId("new-chat-landing-agent-summary-a1")).toHaveTextContent(
           expectedSummary,
@@ -5176,7 +5180,7 @@ describe("NewChatLandingScreen", () => {
           fireEvent.click(screen.getByTestId("new-chat-landing-harness-more"));
         }
         expect(screen.getByTestId(`new-chat-landing-agent-summary-${agent.id}`)).toHaveTextContent(
-          enabled ? "Default" : "saved-model",
+          enabled && agent.harness !== "codex-native" ? "Default" : "saved-model",
         );
       },
     );
@@ -5835,7 +5839,7 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(picker).toHaveFocus());
   });
 
-  it("names the default Codex model once and preserves default-following selection", async () => {
+  it("pins the named Codex default model and keeps Default as an explicit choice", async () => {
     authenticatedFetchMock.mockResolvedValue({
       ok: true,
       json: async () => ({ id: "conv_new" }),
@@ -5846,19 +5850,92 @@ describe("NewChatLandingScreen", () => {
     fireEvent.click(screen.getByTestId("new-chat-landing-agent-config-a2"));
 
     const models = within(screen.getByTestId("new-chat-landing-agent-models"));
-    expect(models.queryByText("Default")).not.toBeInTheDocument();
+    const followDefault = models.getByRole("menuitemcheckbox", { name: /^Default$/ });
+    expect(followDefault).toHaveAttribute("aria-checked", "true");
     expect(models.getAllByText("GPT-5.5")).toHaveLength(1);
     const defaultModel = models.getByRole("menuitemcheckbox", { name: "GPT-5.5" });
-    expect(defaultModel).toHaveAttribute("aria-checked", "true");
+    expect(defaultModel).toHaveAttribute("aria-checked", "false");
 
     fireEvent.click(models.getByRole("menuitemcheckbox", { name: "GPT-5.6" }));
     expect(defaultModel).toHaveAttribute("aria-checked", "false");
     fireEvent.click(defaultModel);
     expect(defaultModel).toHaveAttribute("aria-checked", "true");
+    expect(followDefault).toHaveAttribute("aria-checked", "false");
+    expect(readHarnessOptions("codex-native").model).toBe("databricks-gpt-5-5");
     closeMenu();
     const { body } = await submitAndReadBody();
     expect(body.agent_id).toBe("a2");
+    expect(body.model_override).toBe("databricks-gpt-5-5");
+  });
+
+  it("restores a remembered Codex model through an equivalent catalog ID", async () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "codex-native": { model: "system.ai.gpt-5-6", effort: "high" } }),
+    );
+    authenticatedFetchMock.mockResolvedValue(new Response(JSON.stringify({ id: "conv_new" })));
+    renderLanding();
+    openAgentModels("a2");
+    expect(selectedPickerModel()).toHaveTextContent("GPT-5.6");
+    closeMenu();
+    const { body } = await submitAndReadBody();
+    expect(body.model_override).toBe("databricks-gpt-5-6");
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("retains a remembered Codex model until a delayed or missing catalog lists it again", () => {
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "codex-native": { model: "databricks-gpt-5-6", routing: "off" } }),
+    );
+    localStorage.setItem(LAST_AGENT_KEY, "a2");
+    mockModelQueries(() => ({ ...PENDING_QUERY_STATE, data: undefined }));
+    renderLanding();
+    const input = screen.getByTestId("new-chat-landing-input");
+    fireEvent.change(input, { target: { value: "Keep my selected model" } });
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+
+    const missingModel = {
+      ...CODEX_MODEL_OPTIONS_RESULT,
+      data: CODEX_MODEL_OPTIONS_RESULT.data.slice(0, 1),
+    };
+    mockModelQueries(() => missingModel);
+    fireEvent.change(input, { target: { value: "Wait for my model to return" } });
+    expect(screen.getByRole("alert")).toHaveTextContent("Choose another model or Default");
+    expect(screen.getByTestId("new-chat-landing-agent-select")).not.toHaveTextContent("GPT-5.5");
+    fireEvent.submit(screen.getByTestId("new-chat-landing-composer"));
+    expect(authenticatedFetchMock).not.toHaveBeenCalled();
+    expect(readHarnessOptions("codex-native").model).toBe("databricks-gpt-5-6");
+
+    mockModelQueries(() => CODEX_MODEL_OPTIONS_RESULT);
+    fireEvent.change(input, { target: { value: "My model is available now" } });
+    expect(screen.queryByRole("alert")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+    expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent("GPT-5.6");
+  });
+
+  it("requires an explicit Default after the selected Codex model disappears", async () => {
+    authenticatedFetchMock.mockResolvedValue(new Response(JSON.stringify({ id: "conv_new" })));
+    renderLanding();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "GPT-5.6");
+    closeMenu();
+    const missingModel = {
+      ...CODEX_MODEL_OPTIONS_RESULT,
+      data: CODEX_MODEL_OPTIONS_RESULT.data.slice(0, 1),
+    };
+    mockModelQueries(() => missingModel);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Keep my model" },
+    });
+    expect(screen.getByRole("alert")).toHaveTextContent("Choose another model or Default");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Default");
+    closeMenu();
+    const { body } = await submitAndReadBody();
     expect(body.model_override).toBeUndefined();
+    expect(readHarnessOptions("codex-native").model).toBe("");
   });
 
   it("names Pi model and thinking-level details in the harness trigger", () => {
@@ -12066,7 +12143,7 @@ describe("managed sandbox inference models", () => {
     } as unknown as ReturnType<typeof useSandboxModelOptions>);
   }
 
-  it("omits a saved host model from a suppressed sandbox harness summary", async () => {
+  it("requires a new choice when the saved Codex host model is unavailable in the sandbox", async () => {
     localStorage.setItem(
       HARNESS_OPTIONS_KEY,
       JSON.stringify({ "codex-native": { model: "host-only-model" } }),
@@ -12085,8 +12162,14 @@ describe("managed sandbox inference models", () => {
     closeMenu();
     selectAgent("a2");
     expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveTextContent(
-      "Gateway default",
+      "host-only-model",
     );
+    expect(screen.getByRole("alert")).toHaveTextContent("Choose another model or Default");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeDisabled();
+    expect(readHarnessOptions("codex-native").model).toBe("host-only-model");
+    openAgentModels("a2");
+    pickPrimaryOption("model", "Default");
+    closeMenu();
     const { body } = await submitAndReadBody();
     expect(body.model_override).not.toBe("host-only-model");
   });

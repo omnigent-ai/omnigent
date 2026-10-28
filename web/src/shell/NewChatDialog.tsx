@@ -317,7 +317,7 @@ import { useNativeServerSwitcherForMainSurface } from "@/hooks/useNativeServerSw
 import type { WorkspaceFile } from "@/hooks/useWorkspaceChangedFiles";
 import type { Conversation } from "@/hooks/useConversations";
 import type { NativeModelOption } from "@/lib/types";
-import { codexEffortLevelsForModel } from "@/lib/codexNativeModels";
+import { codexEffortLevelsForModel, findNativeModelOption } from "@/lib/codexNativeModels";
 import {
   currentFusionCombo,
   fusionModelLabel,
@@ -3620,8 +3620,8 @@ export function NewChatLandingScreen() {
               {
                 label: "Model",
                 value: visibleModelLabel(
-                  pickedCodexRow
-                    ? nativeModelLabel(pickedCodexRow)
+                  pickedModel
+                    ? nativeModelLabel(pickedCodexRow ?? { id: pickedModel })
                     : defaultModelLabel(codexModelOptions),
                 ),
               },
@@ -4039,9 +4039,10 @@ export function NewChatLandingScreen() {
           choices: [
             // Default can't launch once the provider rules the harness out.
             ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
-            (!sandboxInferenceConfigured &&
-              pickerModelOptions.length > 0 &&
-              !pickerModelOptions.some((option) => option.isDefault))
+            (pickerModelOptions.length > 0 &&
+              (selectedNativeHarness === "codex-native" ||
+                (!sandboxInferenceConfigured &&
+                  !pickerModelOptions.some((option) => option.isDefault))))
               ? [
                   {
                     key: "__default__",
@@ -4060,13 +4061,21 @@ export function NewChatLandingScreen() {
                 (option.fusion !== undefined
                   ? isFusionModelUid(pickedModel) ||
                     (pickedModel === "" && option.isDefault === true)
-                  : pickedModel === option.id || (pickedModel === "" && option.isDefault === true)),
+                  : pickedModel === option.id ||
+                    (pickedModel === "" &&
+                      option.isDefault === true &&
+                      selectedNativeHarness !== "codex-native")),
               // The Fusion row always opens its Lead/Sidekick selectors,
               // even when Fusion is the catalog default (routing it
               // through MODEL_SELECT_DEFAULT would hide them).
               onSelect: option.fusion
                 ? () => selectFusionModel(option.fusion!.default)
-                : () => selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+                : () =>
+                    selectPickerModel(
+                      option.isDefault && selectedNativeHarness !== "codex-native"
+                        ? MODEL_SELECT_DEFAULT
+                        : option.id,
+                    ),
               testId: `new-chat-landing-agent-model-${option.id}`,
               title: nativeModelTooltip(option),
               className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
@@ -4333,9 +4342,11 @@ export function NewChatLandingScreen() {
             ? codexModelOptions
             : [];
   const projectDefaultModelValid =
-    projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
-      ? projectDefaultModel
-      : null;
+    selectedNativeHarness === "codex-native"
+      ? (findNativeModelOption(projectModelVocab, projectDefaultModel)?.id ?? null)
+      : projectDefaultModel != null && projectModelVocab.some((m) => m.id === projectDefaultModel)
+        ? projectDefaultModel
+        : null;
   // A project-configured default effort, scoped to the project's agent like the
   // model. The seeds below validate it against the harness's effort ladder.
   const projectDefaultEffort =
@@ -4388,9 +4399,9 @@ export function NewChatLandingScreen() {
     // already committed an explicit pick this visit, which always wins.
     const projectSeed = (options: readonly { id: string }[]) =>
       !userPickedModelRef.current &&
-      projectDefaultModel != null &&
-      options.some((m) => m.id === projectDefaultModel)
-        ? projectDefaultModel
+      projectDefaultModelValid != null &&
+      options.some((m) => m.id === projectDefaultModelValid)
+        ? projectDefaultModelValid
         : null;
     // Project effort outranks the remembered effort when the seeded model's ladder offers it.
     const projectEffortSeed = (
@@ -4454,16 +4465,11 @@ export function NewChatLandingScreen() {
           stored.mode === CODEX_NATIVE_BYPASS_APPROVAL_VALUE,
       );
       setApprovalMode(resolve(CODEX_NATIVE_APPROVAL_MODES, CODEX_NATIVE_DEFAULT_APPROVAL_MODE));
-      // A remembered routing "on" outranks a remembered concrete model, and
-      // also drops any model/effort left in the shared state (e.g. seeded for
-      // Claude Code before the harness switch).
+      // Routing clears the model; otherwise retain missing picks for validation.
       const seededCodexModel =
         (selectedNativeHarness === "codex-native" ? projectSeed(codexModelOptions) : null) ??
-        (!storedRoutingOn &&
-        selectedNativeHarness === "codex-native" &&
-        stored.model != null &&
-        codexModelOptions.some((m) => m.id === stored.model)
-          ? stored.model
+        (!storedRoutingOn && selectedNativeHarness === "codex-native"
+          ? (findNativeModelOption(codexModelOptions, stored.model)?.id ?? stored.model ?? "")
           : "");
       setPickedModel(seededCodexModel);
       // Restore the remembered Codex effort only while the seeded model's
@@ -4501,6 +4507,7 @@ export function NewChatLandingScreen() {
     codexModelOptions,
     piModelOptions,
     projectDefaultModel,
+    projectDefaultModelValid,
     projectDefaultEffort,
   ]);
   useEffect(() => {
@@ -4514,8 +4521,13 @@ export function NewChatLandingScreen() {
       !userPickedModelRef.current && projectDefaultModel != null
         ? projectDefaultModel
         : saved.model;
-    const model = sandboxCatalog?.find((row) => row.id === candidate);
-    setPickedModel(model?.id ?? "");
+    const model =
+      selectedNativeHarness === "codex-native"
+        ? findNativeModelOption(sandboxCatalog ?? [], candidate)
+        : sandboxCatalog?.find((row) => row.id === candidate);
+    setPickedModel(
+      model?.id ?? (selectedNativeHarness === "codex-native" ? (candidate ?? "") : ""),
+    );
     const effortLevels = codexEffortLevelsForModel(sandboxCatalog ?? [], model?.id);
     const effortCandidate =
       !userPickedEffortRef.current &&
@@ -4528,6 +4540,7 @@ export function NewChatLandingScreen() {
     );
   }, [
     sandboxDefaultModelsEnabled,
+    selectedNativeHarness,
     previewHarness,
     effectiveAgentId,
     sandboxCatalog,
@@ -4537,13 +4550,19 @@ export function NewChatLandingScreen() {
     setPickedModel,
   ]);
   useEffect(() => {
-    if (!sandboxInferenceConfigured || sandboxModels.data?.status !== "ready") return;
+    if (
+      selectedNativeHarness === "codex-native" ||
+      !sandboxInferenceConfigured ||
+      sandboxModels.data?.status !== "ready"
+    )
+      return;
     if (pickedModel && !sandboxCatalog?.some((row) => row.id === pickedModel)) {
       setPickedModel("");
       setPickedEffort("");
     }
   }, [
     sandboxInferenceConfigured,
+    selectedNativeHarness,
     sandboxModels.data?.configuration_revision,
     sandboxModels.data?.status,
     sandboxCatalog,
@@ -5232,20 +5251,23 @@ export function NewChatLandingScreen() {
   const visibleWorkspace = cachedWorkspace?.workspace ?? workspaceTrimmed;
   const visibleWorktreeHeader = cachedWorkspace ?? worktreeHeader;
 
+  const modelToValidate =
+    selectedNativeHarness === "codex-native" && !autoRoutingSelected && !routingOn
+      ? pickedModel
+      : sandboxDefaultModelsEnabled &&
+          pickerEdits?.agentId === effectiveAgentId &&
+          pickerEdits.harness === previewHarness
+        ? pickerEdits.options.model
+        : null;
   const pickerSelectionError =
-    sandboxDefaultModelsEnabled &&
-    !pickerLoading &&
-    pickerEdits?.agentId === effectiveAgentId &&
-    pickerEdits.harness === previewHarness &&
-    pickerEdits.options.model &&
-    !pickerModelOptions.some((option) => option.id === pickerEdits.options.model)
+    !pickerLoading && modelToValidate && !findNativeModelOption(pickerModelOptions, modelToValidate)
       ? "The selected model is unavailable. Choose another model or Default."
       : pickerLoading || !pickerEdits?.pendingValidation
         ? null
         : pickerEdits && pickerEdits.agentId !== effectiveAgentId
           ? "The selected agent is no longer available. Choose an agent to continue."
           : pickerEdits?.options.model &&
-              !pickerModelOptions.some((option) => option.id === pickerEdits.options.model)
+              !findNativeModelOption(pickerModelOptions, pickerEdits.options.model)
             ? "The selected model is no longer available. Choose a model to continue."
             : null;
   useEffect(() => {
