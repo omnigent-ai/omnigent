@@ -888,7 +888,7 @@ async def _persist_native_compaction_item(
                     )
         if msgs:
             compacted_messages = msgs
-    except Exception:  # noqa: BLE001 - compaction mirroring is best effort
+    except Exception:
         _logger.debug("Failed to read cursor store for compaction persist", exc_info=True)
 
     compaction_data = {
@@ -918,6 +918,7 @@ async def forward_cursor_store_to_session(
     launch_epoch_ms: int,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
+    turn_failure: cursor_native_status.CursorTurnFailure | None = None,
 ) -> None:
     """Tail the cursor chat store and mirror new messages into the AP session.
 
@@ -948,6 +949,9 @@ async def forward_cursor_store_to_session(
     :param auth: Optional refresh-capable httpx Auth for remote deployments.
     :returns: Never normally returns; cancel the task to stop it.
     """
+    failure = (
+        turn_failure if turn_failure is not None else cursor_native_status.CursorTurnFailure()
+    )
     persisted = _read_state(bridge_dir)
     store_path: Path | None = None
     last_rowid = 0
@@ -1066,6 +1070,16 @@ async def forward_cursor_store_to_session(
                             _read_new_items, store_path, last_rowid, agent_name
                         )
                         for item in items:
+                            if (
+                                item.item_type == "message"
+                                and item.item_data.get("role") == "user"
+                            ):
+                                async with failure.lock:
+                                    if (
+                                        failure.after_stop is not None
+                                        and item.rowid > failure.before_rowid
+                                    ):
+                                        failure.after_stop = None
                             if item.item_type == "compaction_completed":
                                 # cursor finished /summarize: tell the web UI so
                                 # its "Compacting…" spinner upgrades to the
@@ -1100,7 +1114,7 @@ async def forward_cursor_store_to_session(
                                         session_id=session_id,
                                         store_path=store_path,
                                     )
-                                except Exception:  # noqa: BLE001 - keep forwarding after compaction failure
+                                except Exception:
                                     _logger.warning(
                                         "cursor forwarder could not persist "
                                         "compaction item; session=%s",
@@ -1221,10 +1235,16 @@ async def forward_cursor_store_to_session(
                 # Deliver the hook outcome after its transcript, even without a
                 # bound store. Failed posts retain this snapshot for the next poll.
                 if not retrying_items and pending_turn_end is not None:
+                    stop_generation: object = None
                     try:
                         outcome = await asyncio.to_thread(
                             cursor_native_status.read_turn_outcome, bridge_dir, pending_turn_end
                         )
+                        stop_generation = (
+                            await asyncio.to_thread(
+                                cursor_native_status.read_turn_end, bridge_dir, pending_turn_end
+                            )
+                        ).get("generation_id")
                     except (ValueError, IndexError):
                         outcome_parse_failures += 1
                         if outcome_parse_failures < _TURN_OUTCOME_PARSE_ATTEMPTS:
@@ -1241,15 +1261,34 @@ async def forward_cursor_store_to_session(
                         outcome = "failed"
                     else:
                         outcome_parse_failures = 0
-                    await _post_external_session_status(
-                        client,
-                        session_id=session_id,
-                        status="failed" if outcome == "failed" else "idle",
-                        turn_outcome=outcome,
-                    )
-                    await asyncio.to_thread(
-                        cursor_native_status.write_posted_count, bridge_dir, pending_turn_end
-                    )
+                    async with failure.lock:
+                        suppressed = (
+                            isinstance(stop_generation, str)
+                            and stop_generation in failure.generations
+                        ) or (
+                            stop_generation is None
+                            and (
+                                pending_turn_end in failure.suppressed_stops
+                                or (
+                                    failure.after_stop is not None
+                                    and pending_turn_end > failure.after_stop
+                                    and outcome in ("cancelled", "failed")
+                                )
+                            )
+                        )
+                        if not suppressed:
+                            await _post_external_session_status(
+                                client,
+                                session_id=session_id,
+                                status="failed" if outcome == "failed" else "idle",
+                                turn_outcome=outcome,
+                            )
+                            if outcome == "completed":
+                                failure.after_stop = None
+                        await asyncio.to_thread(
+                            cursor_native_status.write_posted_count, bridge_dir, pending_turn_end
+                        )
+                        failure.suppressed_stops.discard(pending_turn_end)
                     pending_turn_end = None
                     outcome_parse_failures = 0
                 if fd_exhausted_since is not None:
@@ -1313,6 +1352,7 @@ async def supervise_cursor_forwarder(
     launch_epoch_ms: int,
     poll_interval_s: float = _DEFAULT_POLL_INTERVAL_S,
     auth: httpx.Auth | None = None,
+    turn_failure: cursor_native_status.CursorTurnFailure | None = None,
 ) -> None:
     """Run :func:`forward_cursor_store_to_session` under a restart supervisor.
 
@@ -1334,6 +1374,9 @@ async def supervise_cursor_forwarder(
     :param auth: Optional refresh-capable httpx Auth.
     :returns: Never normally returns; cancel the task to stop it.
     """
+    failure = (
+        turn_failure if turn_failure is not None else cursor_native_status.CursorTurnFailure()
+    )
     backoff_s = _SUPERVISOR_INITIAL_BACKOFF_S
     while True:
         run_started_at = _supervisor_monotonic()
@@ -1349,6 +1392,7 @@ async def supervise_cursor_forwarder(
                 launch_epoch_ms=launch_epoch_ms,
                 poll_interval_s=poll_interval_s,
                 auth=auth,
+                turn_failure=failure,
             )
             _logger.warning(
                 "cursor forwarder returned unexpectedly; restarting; session=%s bridge_dir=%s",

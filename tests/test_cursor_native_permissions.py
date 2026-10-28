@@ -141,14 +141,18 @@ def test_capture_cursor_pane_returns_pane_or_none(
     """Pane text when the TUI is live; ``None`` when absent or the pane is dead."""
     monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: {"socket_path": "s", "tmux_target": "t"})
     monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: True)
-    monkeypatch.setattr(cnb, "_capture_pane", lambda _s, _t: "PANE-TEXT")
+    monkeypatch.setattr(cnb, "_capture_pane_or_none", lambda _s, _t: "PANE-TEXT")
     assert cnb.capture_cursor_pane(tmp_path) == "PANE-TEXT"
+    monkeypatch.setattr(cnb, "_capture_pane_or_none", lambda _s, _t: "")
+    assert cnb.capture_cursor_pane(tmp_path) == ""
+    monkeypatch.setattr(cnb, "_capture_pane_or_none", lambda _s, _t: None)
+    assert cnb.capture_cursor_pane(tmp_path) is None
 
     monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: False)
     assert cnb.capture_cursor_pane(tmp_path) is None  # dead pane
 
     monkeypatch.setattr(cnb, "_session_alive", lambda _s, _t: None)
-    assert cnb.capture_cursor_pane(tmp_path) == ""
+    assert cnb.capture_cursor_pane(tmp_path) is None
 
     monkeypatch.setattr(cnb, "read_tmux_info", lambda _d: None)
     assert cnb.capture_cursor_pane(tmp_path) is None  # no tmux target advertised
@@ -645,6 +649,8 @@ def _install_supervisor_fakes(
     (tmp_path / "store.db").write_bytes(b"")
     monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", lambda _s: list(pending))
     monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: pane)
+    monkeypatch.setattr(cnp, "inject_interrupt", lambda _bridge, **_kwargs: None)
+    monkeypatch.setattr(cnp, "_YOLO_FAILURE_RETRY_S", 0.0)
 
     async def _fake_send(_bridge: Path, _session: str, *keys: str) -> bool:
         keys_sent.append(keys)
@@ -829,8 +835,11 @@ async def test_supervise_transcript_yolo_times_out_then_fails_turn(
     monkeypatch.setattr(cnp, "_send_cursor_keys", send_with_clock)
 
     task = _start_supervisor(tmp_path, session_id="conv_yolo_cap", auto_accept_approvals=True)
-    assert await _wait_for(task.done)
-    await task
+    try:
+        assert await _wait_for(lambda: bool(posts))
+        assert not task.done()
+    finally:
+        await _stop(task)
 
     assert sent_at == [0, 2, 6, 11, 16, 21, 26]
     assert keys_sent == [("y",)] * 7
@@ -889,27 +898,41 @@ async def test_yolo_auto_accept_recovers_after_transient_failure(
     assert keys_sent == [("y",)] * (2 if send_error is not None else 1)
 
 
+@pytest.mark.parametrize("pane", [_IDLE_PANE, "", " \n "])
 async def test_supervise_transcript_yolo_never_types_when_no_prompt_on_screen(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, pane: str
 ) -> None:
-    """A pending marker with no gate rendered produces no keys or cards.
-
-    This is the stale-marker case the feature exists for. ``tmux send-keys y``
-    against an idle pane types a literal ``y`` into cursor's composer, which
-    then prepends itself to whatever the user types next — so the accept only
-    fires while cursor is actually advertising its accept key.
-    """
+    """A stale checkpoint past the retry deadline does not fail a healthy turn."""
     monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
     posts, keys_sent = _install_supervisor_fakes(
-        monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=_IDLE_PANE
+        monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=pane
+    )
+    polls = 0
+
+    def read_pending(_store: Path) -> list[CursorPendingToolCall]:
+        nonlocal polls
+        polls += 1
+        return [_SHELL_CALL]
+
+    clock = SimpleNamespace(time=lambda: float(polls - 1) * 60.0)
+    async_facade = SimpleNamespace(**vars(asyncio))
+    async_facade.get_running_loop = lambda: clock
+    monkeypatch.setattr(cnp, "asyncio", async_facade)
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", read_pending)
+    monkeypatch.setattr(
+        cnp, "capture_cursor_pane", lambda _bridge: _ACCEPT_PANE if polls == 1 else pane
     )
 
     task = _start_supervisor(tmp_path, session_id="conv_yolo_idle", auto_accept_approvals=True)
-    await asyncio.sleep(0.1)
-    await _stop(task)
+    try:
+        assert await _wait_for(lambda: polls >= 3)
+        assert not task.done()
+    finally:
+        await _stop(task)
 
-    assert keys_sent == []
+    assert keys_sent == [("y",)]
     assert _hook_posts(posts) == []
+    assert posts == []
 
 
 async def test_supervise_transcript_yolo_fails_when_pane_stays_unavailable(
@@ -924,13 +947,17 @@ async def test_supervise_transcript_yolo_fails_when_pane_stays_unavailable(
     )
 
     task = _start_supervisor(tmp_path, session_id="conv_yolo_dead", auto_accept_approvals=True)
-    assert await _wait_for(task.done)
-    await task
+    try:
+        assert await _wait_for(lambda: bool(posts))
+        assert not task.done()
+    finally:
+        await _stop(task)
 
     assert keys_sent == []
     assert _hook_posts(posts) == []
     assert posts[-1][1]["data"]["status"] == "failed"
-    assert "tmux target was not advertised" in posts[-1][1]["data"]["output"]
+    assert "Cursor pane could not be captured" in posts[-1][1]["data"]["output"]
+    assert str(tmp_path) not in posts[-1][1]["data"]["output"]
 
 
 @pytest.mark.parametrize("send_error", [None, RuntimeError, OSError])
@@ -965,10 +992,13 @@ async def test_supervise_transcript_yolo_fails_when_keystroke_stays_undelivered(
     task = _start_supervisor(
         tmp_path, session_id="conv_yolo_undelivered", auto_accept_approvals=True
     )
-    assert await _wait_for(task.done)
-    await task
+    try:
+        assert await _wait_for(lambda: bool(posts))
+        assert not task.done()
+    finally:
+        await _stop(task)
 
-    assert len(keys_sent) >= 2
+    assert len(keys_sent) == 2
     assert _hook_posts(posts) == []
     assert posts[-1][1]["data"]["status"] == "failed"
     assert "tmux rejected the accept keystroke" in posts[-1][1]["data"]["output"]
@@ -991,6 +1021,201 @@ async def test_supervise_transcript_without_yolo_never_auto_accepts(
     await _stop(task)
 
     assert keys_sent == []
+
+
+async def test_yolo_failure_interrupts_then_supervises_a_fresh_turn(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    pending = [_SHELL_CALL]
+    posts, keys_sent = _install_supervisor_fakes(monkeypatch, tmp_path, pending=pending, pane=None)
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_TIMEOUT_S", 0.0)
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
+    interrupts: list[Path] = []
+    monkeypatch.setattr(
+        cnp, "inject_interrupt", lambda bridge, **kwargs: interrupts.append(bridge)
+    )
+    polls = 0
+
+    def read_pending(_store: Path) -> list[CursorPendingToolCall]:
+        nonlocal polls
+        polls += 1
+        return list(pending)
+
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", read_pending)
+    task = _start_supervisor(tmp_path, session_id="child", auto_accept_approvals=True)
+    try:
+        assert await _wait_for(lambda: bool(posts))
+        assert interrupts == [tmp_path]
+        assert posts[0][1]["data"]["status"] == "failed"
+        pending.clear()
+        last_poll = polls
+        assert await _wait_for(lambda: polls >= last_poll + 2)
+        pending.append(_SHELL_CALL)
+        last_poll = polls
+        assert await _wait_for(lambda: polls >= last_poll + 2)
+        assert len(posts) == 1
+        pending.append(CursorPendingToolCall("fresh-tool", "Shell", {"command": "pwd"}))
+        monkeypatch.setattr(cnp, "capture_cursor_pane", lambda bridge: _ACCEPT_PANE)
+        assert await _wait_for(lambda: bool(keys_sent))
+        assert not task.done()
+        assert keys_sent == [("y",)]
+        assert _hook_posts(posts) == []
+    finally:
+        await _stop(task)
+
+
+async def test_yolo_question_wait_does_not_consume_approval_deadline(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    question = CursorPendingToolCall("question", "AskQuestion", _ASKQUESTION_ARGS)
+    posts, keys_sent = _install_supervisor_fakes(
+        monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=_ACCEPT_PANE
+    )
+    polls = 0
+
+    def read_pending(_store: Path) -> list[CursorPendingToolCall]:
+        nonlocal polls
+        polls += 1
+        return [_SHELL_CALL, question] if 2 <= polls <= 5 else [_SHELL_CALL]
+
+    clock = SimpleNamespace(time=lambda: float(polls - 1) * 60.0)
+    async_facade = SimpleNamespace(**vars(asyncio))
+    async_facade.get_running_loop = lambda: clock
+    monkeypatch.setattr(cnp, "asyncio", async_facade)
+    monkeypatch.setattr(cnp, "read_cursor_pending_tool_calls", read_pending)
+    task = _start_supervisor(tmp_path, session_id="child", auto_accept_approvals=True)
+    try:
+        assert await _wait_for(lambda: len(keys_sent) == 2)
+        assert polls >= 6
+        assert not task.done()
+        assert len(_hook_posts(posts)) == 1
+        assert all(body.get("type") != "external_session_status" for _, body in posts)
+    finally:
+        await _stop(task)
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_attempts", "expected_delays"),
+    [
+        ("connection", 3, [0.5, 1.0]),
+        ("503", 3, [0.5, 1.0]),
+        ("401", 1, []),
+        ("408", 3, [0.5, 1.0]),
+        ("429", 3, [0.5, 1.0]),
+        ("timeout", 1, []),
+        ("read-timeout", 1, []),
+        ("hung", 1, []),
+        ("recover", 2, [0.5]),
+    ],
+)
+async def test_yolo_failure_delivery_is_bounded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_kind: str,
+    expected_attempts: int,
+    expected_delays: list[float],
+) -> None:
+    outputs: list[str] = []
+    delays: list[float] = []
+    interrupts: list[Path] = []
+
+    async def post_status(_client: object, **kwargs: str) -> None:
+        outputs.append(kwargs["output"])
+        if failure_kind == "recover" and len(outputs) > 1:
+            return
+        if failure_kind in ("connection", "recover"):
+            raise httpx.ConnectError("unavailable")
+        if failure_kind == "hung":
+            await asyncio.Event().wait()
+            return
+        if failure_kind == "timeout":
+            raise TimeoutError
+        if failure_kind == "read-timeout":
+            raise httpx.ReadTimeout(
+                "unavailable", request=httpx.Request("POST", "http://test/events")
+            )
+        response = httpx.Response(
+            int(failure_kind), request=httpx.Request("POST", "http://test/events")
+        )
+        response.raise_for_status()
+
+    async def sleep(delay: float) -> None:
+        delays.append(delay)
+
+    async_facade = SimpleNamespace(**vars(asyncio))
+    async_facade.sleep = sleep
+    monkeypatch.setattr(cnp, "asyncio", async_facade)
+    monkeypatch.setattr(
+        cnp, "inject_interrupt", lambda bridge, **kwargs: interrupts.append(bridge)
+    )
+    monkeypatch.setattr(cnp, "_post_external_session_status", post_status)
+    monkeypatch.setattr(cnp, "_YOLO_FAILURE_POST_TIMEOUT_S", 0.01)
+    await cnp._fail_yolo_turn(
+        _QueueClient([]),
+        session_id="child",
+        bridge_dir=tmp_path,
+        store_path=None,
+        active={},
+        failure=cnp.CursorTurnFailure(),
+        output="Error: approval recovery failed",
+    )
+    assert interrupts == [tmp_path]
+    assert len(outputs) == expected_attempts
+    assert all(output == outputs[0] and str(tmp_path) not in output for output in outputs)
+    assert delays == expected_delays
+
+
+async def test_yolo_interrupt_failure_does_not_expose_host_paths(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    def interrupt(*args, **kwargs) -> None:
+        raise RuntimeError(str(tmp_path))
+
+    client = _QueueClient(
+        [httpx.Response(200, request=httpx.Request("POST", "http://test/events"))]
+    )
+    monkeypatch.setattr(cnp, "inject_interrupt", interrupt)
+    await cnp._fail_yolo_turn(
+        client,
+        session_id="child",
+        bridge_dir=tmp_path,
+        store_path=None,
+        active={},
+        failure=cnp.CursorTurnFailure(),
+        output="Error: approval recovery failed",
+    )
+    output = client.posts[0][1]["data"]["output"]
+    assert "Cursor turn interruption also failed" in output
+    assert str(tmp_path) not in output
+
+
+async def test_yolo_failure_cleans_questions_and_preserves_cancellation(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    question = asyncio.create_task(asyncio.Event().wait())
+    active = {"question": {"task": question, "elicitation_id": "question"}}
+    client = _QueueClient([httpx.Response(200)])
+    failure = cnp.CursorTurnFailure()
+    monkeypatch.setattr(cnp, "inject_interrupt", lambda *args, **kwargs: None)
+
+    async def cancel_delivery(*args, **kwargs) -> None:
+        raise asyncio.CancelledError
+
+    monkeypatch.setattr(cnp, "_post_external_session_status", cancel_delivery)
+    with pytest.raises(asyncio.CancelledError):
+        await cnp._fail_yolo_turn(
+            client,
+            session_id="child",
+            bridge_dir=tmp_path,
+            store_path=None,
+            active=active,
+            failure=failure,
+            output="Error: approval recovery failed",
+        )
+    assert question.cancelled()
+    assert active == {}
+    assert not failure.lock.locked()
+    assert client.posts[0][1]["type"] == "external_elicitation_resolved"
 
 
 async def test_supervise_transcript_yolo_still_parks_askquestion(

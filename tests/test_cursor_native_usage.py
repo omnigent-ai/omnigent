@@ -118,7 +118,8 @@ class TestRecordUsageCli:
         assert capsys.readouterr().out == "{}"
         assert not (tmp_path / usage.USAGE_FILE).exists()
 
-    def test_module_main_entrypoint(self, tmp_path: Path) -> None:
+    @pytest.mark.parametrize("command", ["record-usage", "record-turn-start"])
+    def test_module_main_entrypoint(self, tmp_path: Path, command: str) -> None:
         # End-to-end through the real CLI the hooks.json command invokes. ``-I``
         # is dropped here (the worktree isn't pip-installed); PYTHONPATH makes it
         # importable, mirroring the installed-package resolution in production.
@@ -128,7 +129,7 @@ class TestRecordUsageCli:
                 sys.executable,
                 "-m",
                 "omnigent.harnesses.cursor_native.usage",
-                "record-usage",
+                command,
                 "--bridge-dir",
                 str(tmp_path),
             ],
@@ -138,8 +139,37 @@ class TestRecordUsageCli:
             env=env,
         )
         assert proc.returncode == 0, proc.stderr
-        assert proc.stdout == "{}"
-        assert (tmp_path / usage.USAGE_FILE).read_text().strip()
+        if command == "record-usage":
+            assert proc.stdout == "{}"
+            assert (tmp_path / usage.USAGE_FILE).read_text().strip()
+        else:
+            from omnigent.harnesses.cursor_native import status
+
+            assert json.loads(proc.stdout) == {"continue": True}
+            assert status.read_current_generation(tmp_path) == _TURN1["generation_id"]
+            assert (tmp_path / status._TURN_START_FILE).read_text() == _TURN1["generation_id"]
+
+    @pytest.mark.parametrize(
+        "payload", [{"generation_id": "turn-1", "prompt": "prompt content", "attachments": []}, {}]
+    )
+    def test_turn_start_records_only_identity_or_blocks_submission(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture,
+        payload: dict,
+    ) -> None:
+        import io
+
+        from omnigent.harnesses.cursor_native import status
+
+        monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(payload)))
+        assert usage._cli_record_turn_start(tmp_path) == 0
+        result = json.loads(capsys.readouterr().out)
+        assert result["continue"] is bool(payload)
+        assert status.read_current_generation(tmp_path) == payload.get("generation_id")
+        if payload:
+            assert (tmp_path / status._TURN_START_FILE).read_text() == "turn-1"
 
 
 class TestUsageAccumulator:

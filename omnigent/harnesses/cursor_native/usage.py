@@ -125,6 +125,22 @@ def record_usage_payload(bridge_dir: Path, payload: object) -> bool:
     return True
 
 
+def _cli_record_turn_start(bridge_dir: Path) -> int:
+    """Record the native turn identity without retaining the submitted prompt."""
+    from omnigent.harnesses.cursor_native.status import record_turn_start
+
+    try:
+        record_turn_start(bridge_dir, json.loads(sys.stdin.read()))
+    except (OSError, ValueError, TypeError) as exc:
+        sys.stderr.write(f"cursor turn-start recorder failed: {type(exc).__name__}\n")
+        sys.stdout.write(
+            '{"continue":false,"user_message":"Unable to record the Cursor turn identity."}'
+        )
+        return 0
+    sys.stdout.write('{"continue":true}')
+    return 0
+
+
 def _cli_record_usage(bridge_dir: Path) -> int:
     """Hook entrypoint: read the JSON payload from stdin and append it.
 
@@ -386,9 +402,13 @@ def _main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     rec = sub.add_parser("record-usage", help="Append a stop-hook usage payload (stdin JSON).")
     rec.add_argument("--bridge-dir", required=True, type=Path)
+    start = sub.add_parser("record-turn-start", help="Record the submitted generation ID.")
+    start.add_argument("--bridge-dir", required=True, type=Path)
     args = parser.parse_args(argv)
     if args.command == "record-usage":
         return _cli_record_usage(args.bridge_dir)
+    if args.command == "record-turn-start":
+        return _cli_record_turn_start(args.bridge_dir)
     return 1
 
 
