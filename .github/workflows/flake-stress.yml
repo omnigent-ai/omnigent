@@ -139,6 +139,7 @@ jobs:
         uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
+          version: "0.13.4"
 
       - name: Install ripgrep + bubblewrap
         # Inner tests need these (Grep fallback, linux_bwrap sandbox);

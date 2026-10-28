@@ -97,6 +97,7 @@ jobs:
         uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
         with:
           enable-cache: true
+          version: "0.13.4"
 
       - name: Cache virtualenv
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0

@@ -164,6 +164,8 @@ jobs:
       - name: Install uv
         if: ${{ steps.gate.outputs.scan == 'true' }}
         uses: omnigent-ai/omnigent/.github/actions/setup-uv@25521b2eb074b11ebe51fe5e3eaeb494e20101eb # self-contained setup
+        with:
+          version: "0.13.4"
 
       - name: OSV advisory scan (uv.lock)
         # Checks every package version pinned in the PR's uv.lock against the
