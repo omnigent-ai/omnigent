@@ -38,4 +38,8 @@ exclude-newer = "P7D"
 #   uses. Drop once aged past P7D (2026-10-22).
 # - certifi: 2026.10.19 (tagged 2026-10-20) removes the roots chaining to the
 #   compromised eMudhra intermediate CAs. Drop once aged past P7D (2026-10-28).
-exclude-newer-package = { certifi = "2026-10-21T00:00:00Z", databricks-sdk = "2026-10-16T00:00:00Z", cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }
+# - boxd: 0.2.20 (published 2026-10-27) is the first release with the
+#   filesystem API (`machines.fs`) the boxd launcher ships files with. The
+#   `boxd` extra keeps its 0.2.16 floor, and the launcher uploads the older
+#   way on an SDK without it. Drop once aged past P7D (2026-11-03).
+exclude-newer-package = { boxd = "2026-10-28T00:00:00Z", certifi = "2026-10-21T00:00:00Z", databricks-sdk = "2026-10-16T00:00:00Z", cwsandbox = "2026-06-12T00:00:00Z", google-antigravity = "2026-06-12T00:00:00Z", nimble-python = "2026-07-29T00:00:00Z", mlflow = "2026-09-05T00:00:00Z", mlflow-skinny = "2026-09-05T00:00:00Z", mlflow-tracing = "2026-09-05T00:00:00Z" }

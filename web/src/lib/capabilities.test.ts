@@ -87,6 +87,11 @@ describe("sandboxProviderOptions", () => {
     expect(options).toEqual([null]);
     expect(sandboxOptionLabel(options[0])).toBe("New Sandbox");
   });
+
+  it("keeps a provider's own casing instead of title-casing its id", () => {
+    // boxd writes its name in lowercase; the fallback would show "Boxd".
+    expect(sandboxOptionLabel("boxd")).toBe("boxd Sandbox");
+  });
 });
 
 describe("resolveServerInfo sandbox_providers", () => {

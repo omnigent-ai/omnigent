@@ -39,6 +39,7 @@ exclude-newer = "0001-01-01T00:00:00Z" # This has no effect and is included for 
 exclude-newer-span = "P7D"
 
 [options.exclude-newer-package]
+boxd = "2026-10-28T00:00:00Z"
 certifi = "2026-10-21T00:00:00Z"
 cwsandbox = "2026-06-12T00:00:00Z"
 databricks-sdk = "2026-10-16T00:00:00Z"
@@ -429,6 +430,23 @@ dependencies = [
 sdist = { url = "https://files.pythonhosted.org/packages/ad/03/9dc102506c3ebc3758a9e8602e7dafb78789993bcac5daa82398b56ae884/botocore-1.43.25.tar.gz", hash = "sha256:faab543ca6ae6f8fdc5f6318240bebfb8c05cd25823715fe02aad7edf0c4b383", size = 15478403, upload-time = "2026-06-08T19:49:13.505Z" }
 wheels = [
     { url = "https://files.pythonhosted.org/packages/41/a5/6ceef332b18c348be9ec26aeff0da5b3f7ea046bf3fc654feecf6974c4d9/botocore-1.43.25-py3-none-any.whl", hash = "sha256:ef1d210ac9085ea0e5fc6ad2e63f0c7e97103c74f52156bf944289aaf6278d1b", size = 15161721, upload-time = "2026-06-08T19:49:08.751Z" },
+]
+
+[[package]]
+name = "boxd"
+version = "0.2.20"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "grpcio" },
+    { name = "httpx" },
+    { name = "protobuf", version = "6.33.6", source = { registry = "https://pypi.org/simple" }, marker = "extra != 'extra-8-omnigent-antigravity' or extra == 'extra-8-omnigent-cwsandbox' or extra == 'extra-8-omnigent-modal' or extra == 'group-8-omnigent-dev' or extra == 'group-8-omnigent-lint'" },
+    { name = "protobuf", version = "7.35.1", source = { registry = "https://pypi.org/simple" }, marker = "extra == 'extra-8-omnigent-antigravity'" },
+    { name = "pydantic" },
+    { name = "typing-extensions" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/89/19/69db3c22bd64cf84f88855b5747496fa1b98e88424612c3581a38bf43150/boxd-0.2.20.tar.gz", hash = "sha256:697d23250a3c4fc7e30c4effa8d16c9ae6382b032b044590875eb1ab78060be4", size = 228125, upload-time = "2026-10-27T23:55:11.41Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/b4/d7/618f1fbc42b05de518a5379f3ce4b9e36726a123d3df9792a11fa2c17552/boxd-0.2.20-py3-none-any.whl", hash = "sha256:9ab22af1b759bea1d37dc82043dff54b642be13ddad77d775c10d64b035cb93c", size = 152475, upload-time = "2026-10-27T23:55:10.258Z" },
 ]
 
 [[package]]
@@ -3293,6 +3311,9 @@ bedrock = [
 blaxel = [
     { name = "blaxel" },
 ]
+boxd = [
+    { name = "boxd" },
+]
 boxlite = [
     { name = "boxlite" },
 ]
@@ -3443,6 +3464,7 @@ requires-dist = [
     { name = "botocore", marker = "extra == 'bedrock'", specifier = ">=1.30,<2" },
     { name = "botocore", marker = "extra == 'kms'", specifier = ">=1.30,<2" },
     { name = "botocore", marker = "extra == 's3'", specifier = ">=1.30,<2" },
+    { name = "boxd", marker = "extra == 'boxd'", specifier = ">=0.2.16,<0.3" },
     { name = "boxlite", marker = "extra == 'boxlite'", specifier = ">=0.9.5,<1" },
     { name = "cachetools", specifier = ">=5.0,<8" },
     { name = "cel-python", specifier = ">=0.5" },
@@ -3527,7 +3549,7 @@ requires-dist = [
     { name = "websockets", specifier = ">=10.4,<15" },
     { name = "zstandard", specifier = ">=0.22,<1" },
 ]
-provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "openshell", "kubernetes", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
+provides-extras = ["claude-sdk", "openai-agents", "cockroachdb", "all", "bedrock", "kms", "s3", "vertex", "modal", "daytona", "blaxel", "boxlite", "microsandbox", "cwsandbox", "e2b", "islo", "boxd", "openshell", "kubernetes", "vault", "tracing", "agents-sdk", "antigravity", "copilot", "dictation", "cursor", "hindsight", "nimble", "slack", "postgres", "databricks", "loadtest"]
 
 [package.metadata.requires-dev]
 dev = [

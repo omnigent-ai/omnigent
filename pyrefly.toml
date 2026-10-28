@@ -18,6 +18,8 @@ disable-search-path-heuristics = true
 # Optional/proprietary integrations are intentionally absent from the
 # standard development environment.
 ignore-missing-imports = [
+    "boxd",
+    "boxd.*",
     "boxlite",
     "boxlite.*",
     "blaxel",

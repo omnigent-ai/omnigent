@@ -211,6 +211,13 @@ def _builtin_contribution() -> SandboxProviderContribution:
                 ),
                 managed_token_ttl_s=7 * 24 * 3600,
             ),
+            # boxd hosted microVMs, reached over the boxd API. Distinct from
+            # `boxlite`, which runs micro-VMs on the server host or a self-hosted pool.
+            "boxd": SandboxProviderMetadata(
+                name="boxd",
+                launcher_class="omnigent.onboarding.sandboxes.boxd:BoxdSandboxLauncher",
+                managed_token_ttl_s=7 * 24 * 3600,
+            ),
         },
     )
 
