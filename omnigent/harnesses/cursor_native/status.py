@@ -50,6 +50,8 @@ class CursorTurnFailure:
     before_rowid: int = 0
     suppressed_stops: set[int] = field(default_factory=set)
     generations: set[str] = field(default_factory=set)
+    uncertain_generations: set[str] = field(default_factory=set)
+    uncertain_stops: dict[int, str | None] = field(default_factory=dict)
 
 
 def record_turn_start(bridge_dir: Path, payload: object) -> None:
@@ -86,7 +88,7 @@ def record_turn_end(bridge_dir: Path, payload: object | None = None) -> None:
     """
     line: dict[str, object] = {"ts": time.time()}
     if isinstance(payload, dict):
-        gen_id = payload.get("generation_id") or payload.get("conversation_id")
+        gen_id = payload.get("generation_id")
         if isinstance(gen_id, str) and gen_id:
             line["generation_id"] = gen_id
         hook_status = payload.get("status")

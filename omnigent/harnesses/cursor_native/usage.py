@@ -127,16 +127,14 @@ def record_usage_payload(bridge_dir: Path, payload: object) -> bool:
 
 def _cli_record_turn_start(bridge_dir: Path) -> int:
     """Record the native turn identity without retaining the submitted prompt."""
-    from omnigent.harnesses.cursor_native.status import record_turn_start
+    from omnigent.harnesses.cursor_native import status
 
     try:
-        record_turn_start(bridge_dir, json.loads(sys.stdin.read()))
+        status.record_turn_start(bridge_dir, json.loads(sys.stdin.read()))
     except (OSError, ValueError, TypeError) as exc:
+        with contextlib.suppress(OSError):
+            (bridge_dir / status._TURN_START_FILE).unlink(missing_ok=True)
         sys.stderr.write(f"cursor turn-start recorder failed: {type(exc).__name__}\n")
-        sys.stdout.write(
-            '{"continue":false,"user_message":"Unable to record the Cursor turn identity."}'
-        )
-        return 0
     sys.stdout.write('{"continue":true}')
     return 0
 

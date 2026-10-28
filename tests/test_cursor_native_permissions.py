@@ -836,7 +836,7 @@ async def test_supervise_transcript_yolo_times_out_then_fails_turn(
 
     task = _start_supervisor(tmp_path, session_id="conv_yolo_cap", auto_accept_approvals=True)
     try:
-        assert await _wait_for(lambda: bool(posts))
+        assert await _wait_for(lambda: bool(posts), timeout_s=5.0)
         assert not task.done()
     finally:
         await _stop(task)
@@ -993,7 +993,7 @@ async def test_supervise_transcript_yolo_fails_when_keystroke_stays_undelivered(
         tmp_path, session_id="conv_yolo_undelivered", auto_accept_approvals=True
     )
     try:
-        assert await _wait_for(lambda: bool(posts))
+        assert await _wait_for(lambda: bool(posts), timeout_s=5.0)
         assert not task.done()
     finally:
         await _stop(task)

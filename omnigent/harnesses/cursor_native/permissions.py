@@ -836,63 +836,85 @@ async def _fail_yolo_turn(
     failure: CursorTurnFailure,
     output: str,
 ) -> None:
-    """Interrupt the gated turn before reporting failure, preserving session supervision."""
-    async with failure.lock:
-        generation = await asyncio.to_thread(read_current_generation, bridge_dir)
-        if generation is not None:
-            failure.generations.add(generation)
-        failure.after_stop = await asyncio.to_thread(count_turn_ends, bridge_dir)
-        failure.before_rowid = (
-            await asyncio.to_thread(_get_current_rowid, store_path) if store_path else 0
-        )
-        tasks = [
-            task for entry in active.values() if isinstance(task := entry["task"], asyncio.Task)
-        ]
-        for task in tasks:
-            task.cancel()
+    """Interrupt the gated turn and suppress its stop only after acknowledged failure."""
+    tasks = [task for entry in active.values() if isinstance(task := entry["task"], asyncio.Task)]
+    elicitations = [str(entry["elicitation_id"]) for entry in active.values()]
+    active.clear()
+    for task in tasks:
+        task.cancel()
+    try:
         await asyncio.gather(*tasks, return_exceptions=True)
-        elicitations = [str(entry["elicitation_id"]) for entry in active.values()]
-        active.clear()
-        try:
-            await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=2.0)
-        except (RuntimeError, OSError):
-            _logger.exception("cursor YOLO turn interruption failed; bridge_dir=%s", bridge_dir)
-            output += "; Cursor turn interruption also failed"
-        observed_stops = await asyncio.to_thread(count_turn_ends, bridge_dir)
-        failure.suppressed_stops.update(range(failure.after_stop + 1, observed_stops + 1))
-        for elicitation_id in elicitations:
-            await _post_external_elicitation_resolved(client, session_id, elicitation_id)
-        for attempt in range(_YOLO_FAILURE_POST_ATTEMPTS):
+        async with failure.lock:
+            generation = await asyncio.to_thread(read_current_generation, bridge_dir)
+            after_stop = await asyncio.to_thread(count_turn_ends, bridge_dir)
+            before_rowid = (
+                await asyncio.to_thread(_get_current_rowid, store_path) if store_path else 0
+            )
+            failure.after_stop = None
+            try:
+                await asyncio.to_thread(inject_interrupt, bridge_dir, timeout_s=2.0)
+            except (RuntimeError, OSError):
+                _logger.exception(
+                    "cursor YOLO turn interruption failed; bridge_dir=%s", bridge_dir
+                )
+                output += "; Cursor turn interruption also failed"
+            observed_stops = await asyncio.to_thread(count_turn_ends, bridge_dir)
+            stopped_turns = range(after_stop + 1, observed_stops + 1)
+            for attempt in range(_YOLO_FAILURE_POST_ATTEMPTS):
+                try:
+                    async with asyncio.timeout(_YOLO_FAILURE_POST_TIMEOUT_S):
+                        await _post_external_session_status(
+                            client,
+                            session_id=session_id,
+                            status="failed",
+                            turn_outcome="failed",
+                            output=output,
+                        )
+                    if generation is not None:
+                        failure.generations.add(generation)
+                    failure.after_stop = after_stop
+                    failure.before_rowid = before_rowid
+                    failure.suppressed_stops.update(stopped_turns)
+                    break
+                except (httpx.HTTPError, TimeoutError) as exc:
+                    if isinstance(exc, TimeoutError) or post_may_have_been_delivered(exc):
+                        if generation is not None:
+                            failure.uncertain_generations.add(generation)
+                        failure.uncertain_stops.update(dict.fromkeys(stopped_turns, generation))
+                        failure.before_rowid = before_rowid
+                        _logger.warning(
+                            "cursor YOLO failure diagnostic delivery uncertain; session=%s",
+                            session_id,
+                        )
+                        break
+                    permanent = (
+                        isinstance(exc, httpx.HTTPStatusError)
+                        and 400 <= exc.response.status_code < 500
+                        and exc.response.status_code not in (408, 429)
+                    )
+                    if permanent or attempt + 1 == _YOLO_FAILURE_POST_ATTEMPTS:
+                        _logger.error(
+                            "cursor YOLO failure diagnostic delivery abandoned; session=%s",
+                            session_id,
+                        )
+                        break
+                    _logger.warning(
+                        "cursor YOLO failure diagnostic delivery will retry; session=%s",
+                        session_id,
+                    )
+                    await asyncio.sleep(_YOLO_FAILURE_RETRY_S * 2**attempt)
+    finally:
+        if elicitations:
             try:
                 async with asyncio.timeout(_YOLO_FAILURE_POST_TIMEOUT_S):
-                    await _post_external_session_status(
-                        client,
-                        session_id=session_id,
-                        status="failed",
-                        turn_outcome="failed",
-                        output=output,
+                    await asyncio.gather(
+                        *(
+                            _post_external_elicitation_resolved(client, session_id, elicitation_id)
+                            for elicitation_id in elicitations
+                        )
                     )
-                break
-            except (httpx.HTTPError, TimeoutError) as exc:
-                if isinstance(exc, TimeoutError) or post_may_have_been_delivered(exc):
-                    _logger.warning(
-                        "cursor YOLO failure diagnostic delivery uncertain; session=%s", session_id
-                    )
-                    break
-                permanent = (
-                    isinstance(exc, httpx.HTTPStatusError)
-                    and 400 <= exc.response.status_code < 500
-                    and exc.response.status_code not in (408, 429)
-                )
-                if permanent or attempt + 1 == _YOLO_FAILURE_POST_ATTEMPTS:
-                    _logger.error(
-                        "cursor YOLO failure diagnostic delivery abandoned; session=%s", session_id
-                    )
-                    break
-                _logger.warning(
-                    "cursor YOLO failure diagnostic delivery will retry; session=%s", session_id
-                )
-                await asyncio.sleep(_YOLO_FAILURE_RETRY_S * 2**attempt)
+            except TimeoutError:
+                _logger.warning("cursor YOLO card cleanup timed out; session=%s", session_id)
 
 
 def _resolve_elicitation_store(

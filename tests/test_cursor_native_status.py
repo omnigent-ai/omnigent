@@ -95,13 +95,32 @@ def test_cli_record_usage_records_turn_end_on_empty_stdin(tmp_path: Path, monkey
     assert status.count_turn_ends(bridge) == 1
 
 
+def test_conversation_identity_is_not_a_turn_generation(tmp_path: Path) -> None:
+    status.record_turn_end(tmp_path, {"conversation_id": "conversation", "status": "aborted"})
+    assert status.read_turn_end(tmp_path, 1).get("generation_id") is None
+    assert status.read_turn_outcome(tmp_path, 1) == "cancelled"
+
+
 # --- forwarder loop: idle POST is once-per-turn, deduped, restart-safe --------
 
 
-@pytest.mark.parametrize("hook_timing", ["during_cleanup", "delayed_after_fresh_input", "missing"])
+@pytest.mark.parametrize(
+    ("hook_timing", "stop_id"),
+    [
+        ("during_cleanup", "first"),
+        ("delayed_after_fresh_input", "first"),
+        ("missing", "first"),
+        ("during_cleanup", None),
+        ("during_cleanup", "conversation"),
+    ],
+)
 @pytest.mark.parametrize("next_outcome", ["completed", "aborted"])
 async def test_failed_turn_cleanup_does_not_lose_the_next_turn(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, hook_timing: str, next_outcome: str
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    hook_timing: str,
+    next_outcome: str,
+    stop_id: str | None,
 ) -> None:
     from omnigent.harnesses.cursor_native import permissions
 
@@ -123,7 +142,8 @@ async def test_failed_turn_cleanup_does_not_lose_the_next_turn(
                 ),
             ),
         )
-    status.record_turn_start(bridge, {"generation_id": "first"})
+    if stop_id is not None:
+        status.record_turn_start(bridge, {"generation_id": "first"})
     failure = status.CursorTurnFailure()
     delivered_rows: list[int] = []
     outcomes: list[tuple[str, str | None]] = []
@@ -134,7 +154,7 @@ async def test_failed_turn_cleanup_does_not_lose_the_next_turn(
     def interrupt(path: Path, **kwargs) -> None:
         interrupted.append(path)
         if hook_timing == "during_cleanup":
-            status.record_turn_end(bridge, {"generation_id": "first", "status": "aborted"})
+            status.record_turn_end(bridge, {"generation_id": stop_id, "status": "aborted"})
 
     async def post_status(client, *, session_id, status, turn_outcome, output=None):
         if output is not None:
@@ -191,7 +211,8 @@ async def test_failed_turn_cleanup_does_not_lose_the_next_turn(
             await cleanup
         if hook_timing == "missing":
             assert status.read_posted_count(bridge) == 0
-        status.record_turn_start(bridge, {"generation_id": "fresh"})
+        if stop_id is not None:
+            status.record_turn_start(bridge, {"generation_id": "fresh"})
         with sqlite3.connect(store) as db:
             db.execute(
                 "INSERT INTO blobs VALUES (?, ?)",

@@ -1075,11 +1075,12 @@ async def forward_cursor_store_to_session(
                                 and item.item_data.get("role") == "user"
                             ):
                                 async with failure.lock:
-                                    if (
-                                        failure.after_stop is not None
-                                        and item.rowid > failure.before_rowid
-                                    ):
+                                    if item.rowid > failure.before_rowid:
                                         failure.after_stop = None
+                                        failure.suppressed_stops.update(failure.uncertain_stops)
+                                        failure.uncertain_stops.clear()
+                                        failure.generations.update(failure.uncertain_generations)
+                                        failure.uncertain_generations.clear()
                             if item.item_type == "compaction_completed":
                                 # cursor finished /summarize: tell the web UI so
                                 # its "Compacting…" spinner upgrades to the
@@ -1262,18 +1263,37 @@ async def forward_cursor_store_to_session(
                     else:
                         outcome_parse_failures = 0
                     async with failure.lock:
-                        suppressed = (
+                        current_generation = await asyncio.to_thread(
+                            cursor_native_status.read_current_generation, bridge_dir
+                        )
+                        fresh_generation = (
                             isinstance(stop_generation, str)
-                            and stop_generation in failure.generations
-                        ) or (
-                            stop_generation is None
-                            and (
-                                pending_turn_end in failure.suppressed_stops
-                                or (
-                                    failure.after_stop is not None
-                                    and pending_turn_end > failure.after_stop
-                                    and outcome in ("cancelled", "failed")
-                                )
+                            and stop_generation == current_generation
+                            and stop_generation not in failure.generations
+                            and stop_generation not in failure.uncertain_generations
+                        )
+                        uncertain_old_turn = current_generation is not None and (
+                            (
+                                isinstance(stop_generation, str)
+                                and stop_generation in failure.uncertain_generations
+                                and stop_generation != current_generation
+                            )
+                            or (
+                                pending_turn_end in failure.uncertain_stops
+                                and current_generation != failure.uncertain_stops[pending_turn_end]
+                            )
+                        )
+                        suppressed = not fresh_generation and (
+                            uncertain_old_turn
+                            or (
+                                isinstance(stop_generation, str)
+                                and stop_generation in failure.generations
+                            )
+                            or pending_turn_end in failure.suppressed_stops
+                            or (
+                                failure.after_stop is not None
+                                and pending_turn_end > failure.after_stop
+                                and outcome in ("cancelled", "failed")
                             )
                         )
                         if not suppressed:
@@ -1289,6 +1309,7 @@ async def forward_cursor_store_to_session(
                             cursor_native_status.write_posted_count, bridge_dir, pending_turn_end
                         )
                         failure.suppressed_stops.discard(pending_turn_end)
+                        failure.uncertain_stops.pop(pending_turn_end, None)
                     pending_turn_end = None
                     outcome_parse_failures = 0
                 if fd_exhausted_since is not None:
