@@ -47,6 +47,10 @@ DEPENDENCY_SCOPES = {
     "deploy/cloudflare/Dockerfile": "docker",
     "deploy/hf-spaces/Dockerfile": "docker",
 }
+# Tests of CI, release and dev tooling run only when a change can affect them.
+TOOLING_GROUP = "ci-tooling"
+TOOLING_PREFIXES = (".github/", "scripts/", "dev/", "tests/scripts/")
+TOOLING_FILES = {"tests/conftest.py", *DEPENDENCY_SCOPES}
 
 
 def pin_only(before: str, after: str, pattern: str) -> bool:
@@ -132,8 +136,14 @@ def file_scope(path: str, read=None) -> str:
     return scope
 
 
-def python_matrix(backend: bool) -> str:
+def touches_tooling(paths: set[str]) -> bool:
+    return any(path.startswith(TOOLING_PREFIXES) or path in TOOLING_FILES for path in paths)
+
+
+def python_matrix(backend: bool, *, tooling: bool = True) -> str:
     groups = json.loads(Path(__file__).with_name("python-matrix.json").read_text())
+    if not tooling:
+        groups = [group for group in groups if group["group"] != TOOLING_GROUP]
     return json.dumps({"include": groups if backend else []}, separators=(",", ":"))
 
 
@@ -154,7 +164,10 @@ def select_scope(files: list[dict], *, read=None, reason: str = "") -> dict[str,
     return {
         "dependency": str(not full).lower(),
         "backend": str(backend).lower(),
-        "python_matrix": python_matrix(backend),
+        # No file list means a push, scheduled, manual or unscoped run: test everything.
+        "python_matrix": python_matrix(
+            backend, tooling=bool(reason) or not files or touches_tooling(paths)
+        ),
         "database": str(backend).lower(),
         "integration": str(backend).lower(),
         "e2e": str(backend or "javascript" in scopes).lower(),

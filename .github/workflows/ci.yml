@@ -6,7 +6,9 @@ name: CI
 # bottleneck one runner; the slowest groups use `--dist=worksteal` to fan tests
 # out within a file. The `misc` group is a catch-all so new top-level
 # tests/<dir>/ are picked up automatically (it ignores the dirs that have their
-# own group). Draft PRs are skipped (ready_for_review re-fires the workflow).
+# own group). `ci-tooling` (tests/scripts) runs only when a PR touches CI,
+# release or dev tooling (see dependency_scope.py), and always on main.
+# Draft PRs are skipped (ready_for_review re-fires the workflow).
 # A `coverage-report` job combines per-shard coverage for code-coverage.yml.
 
 on:

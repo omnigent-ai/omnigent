@@ -201,6 +201,45 @@ def test_configuration_changes_keep_full_coverage(scope_module, path, before, af
     )
 
 
+@pytest.mark.parametrize(
+    "path,runs_tooling",
+    [
+        ("omnigent/server/app.py", False),
+        ("web/src/App.tsx", False),
+        ("tests/server/test_app.py", False),
+        (".github/workflows/merge-ready.yml", True),
+        (".github/scripts/merge-ready/required.sh", True),
+        ("scripts/install_oss.sh", True),
+        ("dev/lint/custom_lint.py", True),
+        ("tests/scripts/test_dependency_ci.py", True),
+        ("tests/conftest.py", True),
+        ("uv.lock", True),
+    ],
+)
+def test_ci_tooling_tests_run_only_when_tooling_can_change(scope_module, path, runs_tooling):
+    selection = scope_module.select_scope([{"filename": path, "status": "modified"}])
+    groups = [row["group"] for row in json.loads(selection["python_matrix"])["include"]]
+    assert ("ci-tooling" in groups) == runs_tooling
+    assert "misc" in groups
+
+
+@pytest.mark.parametrize("reason", ["Push, scheduled and manual runs use full CI", ""])
+def test_unscoped_runs_include_ci_tooling(scope_module, reason):
+    selection = scope_module.select_scope([], reason=reason)
+    assert json.loads(selection["python_matrix"])["include"] == json.loads(
+        (CI / "python-matrix.json").read_text()
+    )
+
+
+def test_ci_tooling_tests_leave_the_catch_all_shard():
+    groups = {
+        row["group"]: row["paths"].split()
+        for row in json.loads((CI / "python-matrix.json").read_text())
+    }
+    assert groups["ci-tooling"] == ["tests/scripts"]
+    assert "--ignore=tests/scripts" in groups["misc"]
+
+
 def test_gradle_wrapper_bundle_keeps_the_android_profile(scope_module):
     paths = [
         "web/android/gradlew",
