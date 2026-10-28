@@ -936,7 +936,7 @@ def reap_orphaned_terminals() -> int:
                     "Could not reap terminal %s; preserving its socket for retry", entry
                 )
                 continue
-            if result.returncode != 0 and socket_path.exists():
+            if result.returncode != 0 and (socket_path.exists() or IS_WINDOWS):
                 detail = result.stderr.decode(errors="replace").strip()
                 if not _tmux_reports_target_gone(detail):
                     # Keep the control socket until cleanup is confirmed.

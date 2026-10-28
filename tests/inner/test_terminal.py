@@ -3354,17 +3354,29 @@ def test_reap_orphaned_terminals_reaps_only_dead_owner_dirs(
     assert unmarked_dir.exists()
 
 
-@pytest.mark.parametrize(("windows", "socket_file"), [(False, True), (True, False)])
+@pytest.mark.parametrize(
+    ("windows", "socket_file", "kill_returncode", "kill_stderr", "reaped_count"),
+    [
+        (False, True, 0, b"", 1),
+        (True, False, 0, b"", 1),
+        (True, False, 1, b"no server running on tmux.sock", 1),
+        (True, False, 1, b"error connecting to tmux.sock (Access is denied.)", 0),
+    ],
+)
 def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     windows: bool,
     socket_file: bool,
+    kill_returncode: int,
+    kill_stderr: bytes,
+    reaped_count: int,
 ) -> None:
     """
     A dead-owner instance with a socket gets ``tmux kill-server``.
 
     A Windows tmux names its server by the socket path but keeps no file there.
+    A kill that fails without confirming the server is gone keeps the dir for retry.
 
     Removing the dir alone leaves the detached tmux server running on
     the unlinked socket — the actual resource leak — so the sweep must
@@ -3377,9 +3389,9 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
     kill_calls: list[list[str]] = []
 
     def _record_run(argv: list[str], **kwargs: object) -> SimpleNamespace:
-        """Record the kill-server argv and report success."""
+        """Record the kill-server argv and report the parametrized result."""
         kill_calls.append(list(argv))
-        return SimpleNamespace(returncode=0)
+        return SimpleNamespace(returncode=kill_returncode, stderr=kill_stderr)
 
     monkeypatch.setattr(terminal_mod, "_terminals_tmp_root", lambda: tmp_path)
     monkeypatch.setattr(terminal_mod, "_tmux_available", lambda: True)
@@ -3397,8 +3409,8 @@ def test_reap_orphaned_terminals_kills_server_for_dead_owner_socket(
 
     reaped = terminal_mod.reap_orphaned_terminals()
 
-    assert reaped == 1
-    assert not dead_dir.exists()
+    assert reaped == reaped_count
+    assert dead_dir.exists() is (reaped_count == 0)
     # kill-server targeted exactly this instance's socket; a missing
     # call means the tmux server (the real leak) survives dir removal.
     assert kill_calls == [["tmux", "-S", str(socket_path), "kill-server"]]
