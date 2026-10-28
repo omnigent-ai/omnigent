@@ -2810,6 +2810,11 @@ async def _auto_create_pi_terminal(
         agent_dir=agent_dir,
     )
     pi_args.extend(provider_args)
+    from omnigent.harnesses.pi_native.auth_command import AUTH_DIR_ENV, refresh_model_auth
+
+    model_auth_dir = Path(pi_env[AUTH_DIR_ENV]) if AUTH_DIR_ENV in pi_env else None
+    if model_auth_dir is not None:
+        await refresh_model_auth(model_auth_dir)
     # Inherit the agent's os_env so its sandbox (e.g. ``type: none``),
     # egress_rules and env_passthrough are honoured. Without ``sandbox`` here
     # and ``parent_os_env`` below, launch_required_terminal falls back to
@@ -2904,13 +2909,18 @@ async def _auto_create_pi_terminal(
         )
     # TUI-typed turns bypass the executor's per-turn bearer refresh. Pi has no
     # transcript forwarder, so its slot owns this task until relaunch/teardown.
-    if auth_token:
-        from omnigent.harnesses.pi_native.auth_refresh import supervise_pi_auth_refresh
+    if auth_token or model_auth_dir is not None:
+        from omnigent.harnesses.pi_native.auth_refresh import supervise_pi_credentials
 
         _register_auto_forwarder_task(
             session_id,
             asyncio.create_task(
-                supervise_pi_auth_refresh(bridge_dir, launch_config.server_url),
+                supervise_pi_credentials(
+                    bridge_dir,
+                    launch_config.server_url,
+                    auth_dir=model_auth_dir,
+                    refresh_bridge=bool(auth_token),
+                ),
                 name=f"pi-auth-refresh-{session_id}",
             ),
         )
