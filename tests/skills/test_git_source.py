@@ -48,7 +48,13 @@ def test_non_github_sources_are_rejected(source: str) -> None:
 def test_clone_is_hardened(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
     seen: list[tuple[list[str], dict[str, str]]] = []
 
-    def run(cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None) -> object:
+    def run(
+        cmd: list[str],
+        env: dict[str, str],
+        dest: Path,
+        max_bytes: int | None,
+        max_entries: int | None,
+    ) -> object:
         seen.append((cmd, env))
         return subprocess.CompletedProcess(cmd, 128, "", "fatal: not found\n")
 
@@ -105,7 +111,13 @@ def test_isolated_clone_drops_inherited_git_config_and_helpers(
     monkeypatch.setenv("PATH", "/usr/bin")
     seen: list[tuple[list[str], dict[str, str], list[str]]] = []
 
-    def run(cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None) -> object:
+    def run(
+        cmd: list[str],
+        env: dict[str, str],
+        dest: Path,
+        max_bytes: int | None,
+        max_entries: int | None,
+    ) -> object:
         seen.append((cmd, env, os.listdir(env["HOME"])))
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
@@ -171,7 +183,13 @@ def test_token_travels_in_the_environment_not_the_command_line(
 ) -> None:
     seen: list[tuple[list[str], dict[str, str]]] = []
 
-    def run(cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None) -> object:
+    def run(
+        cmd: list[str],
+        env: dict[str, str],
+        dest: Path,
+        max_bytes: int | None,
+        max_entries: int | None,
+    ) -> object:
         seen.append((cmd, env))
         return subprocess.CompletedProcess(cmd, 0, "", "")
 
@@ -223,7 +241,7 @@ def test_a_clone_is_killed_once_it_exceeds_its_byte_budget(
             str(fake_git), None, dest, isolated=True, max_bytes=1024 * 1024
         )
     assert time.monotonic() - started < 10
-    assert git_source._tree_bytes(dest) < 4 * 1024 * 1024
+    assert git_source._tree_usage(dest).bytes < 4 * 1024 * 1024
 
     # Within the budget the stand-in finishes and the clone succeeds.
     small = tmp_path / "small-git.py"
@@ -233,3 +251,49 @@ def test_a_clone_is_killed_once_it_exceeds_its_byte_budget(
     git_source.clone_github_source(
         str(small), None, tmp_path / "ok", isolated=True, max_bytes=1024
     )
+
+
+def _stand_in_git(path: Path, body: str) -> Path:
+    """A script run in git's place; it receives git's arguments and the destination last."""
+    path.write_text(f"#!{sys.executable}\nimport os, sys\ndest = sys.argv[-1]\n{body}")
+    path.chmod(0o755)
+    return path
+
+
+def test_a_finished_checkout_over_budget_is_refused_too(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Crossing the budget and exiting before the next poll must not slip through.
+    fast = _stand_in_git(
+        tmp_path / "fast-git.py",
+        "os.makedirs(dest)\n"
+        "open(os.path.join(dest, 'blob'), 'wb').write(b'x' * (2 * 1024 * 1024))\n",
+    )
+    monkeypatch.setattr(git_source, "GIT", str(fast))
+    monkeypatch.setattr(git_source, "CHECKOUT_POLL_S", 5.0)
+    with pytest.raises(git_source.GitSourceError, match="exceeds 1 MB on disk"):
+        git_source.clone_github_source(
+            str(fast), None, tmp_path / "checkout", isolated=True, max_bytes=1024 * 1024
+        )
+
+
+def test_a_checkout_with_too_many_entries_is_refused(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    # Inodes are a budget too: thousands of empty files and directories weigh
+    # nothing in bytes and would otherwise pass.
+    many = _stand_in_git(
+        tmp_path / "many-git.py",
+        "import time\n"
+        "for i in range(300):\n"
+        "    os.makedirs(os.path.join(dest, f'd{i}'))\n"
+        "    open(os.path.join(dest, f'd{i}', 'f'), 'w').close()\n"
+        "    time.sleep(0.002)\n",
+    )
+    monkeypatch.setattr(git_source, "GIT", str(many))
+    monkeypatch.setattr(git_source, "CHECKOUT_POLL_S", 0.05)
+    with pytest.raises(git_source.GitSourceError, match="more than 100 files and directories"):
+        git_source.clone_github_source(
+            str(many), None, tmp_path / "checkout", isolated=True, max_entries=100
+        )
+    assert git_source._tree_usage(tmp_path / "checkout").entries < 600

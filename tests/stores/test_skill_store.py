@@ -102,6 +102,46 @@ def test_org_scope_ignores_the_owner_argument(store: SqlAlchemySkillStore) -> No
     assert row.owner_user_id is None and row.scope == "org"
 
 
+def test_the_principal_row_keeps_its_totals_through_every_write(
+    store: SqlAlchemySkillStore, db_uri: str
+) -> None:
+    # Quota checks read these totals under the lock instead of scanning rows,
+    # so every write path has to keep them exact.
+    from sqlalchemy.orm import Session as OrmSession
+
+    from omnigent.db.db_models import SqlInstalledSkill, SqlSkillPrincipal
+
+    def totals() -> tuple[int, int]:
+        with OrmSession(get_or_create_engine(db_uri)) as session:
+            lock = session.get(SqlSkillPrincipal, (0, "user:alice"))
+            rows = session.query(SqlInstalledSkill).filter_by(principal="user:alice").all()
+            expected = (len(rows), sum(r.bundle_bytes for r in rows if r.enabled))
+            assert lock is not None and (lock.installed_count, lock.enabled_bytes) == expected
+            return expected
+
+    a = _install(store, "a", bundle_bytes=10)
+    b = _install(store, "b", bundle_bytes=20)
+    assert totals() == (2, 30)
+    store.set_enabled(b.id, False)
+    assert totals() == (2, 10)
+    store.update(
+        a.id,
+        commit=None,
+        bundle_location="skills/a2.tar.gz",
+        bundle_bytes=15,
+        description="d",
+        display_name=None,
+    )
+    assert totals() == (2, 15)
+    _install(store, "a", bundle_bytes=5)  # a reinstall replaces the enabled row's bytes
+    assert totals() == (2, 5)
+    store.set_enabled(b.id, True)
+    assert totals() == (2, 25)
+    store.delete(a.id)
+    assert totals() == (1, 20)
+    assert store.count_installed("user", "alice") == 1
+
+
 def test_a_batch_installs_all_or_nothing_within_the_budgets(store: SqlAlchemySkillStore) -> None:
     results = store.install_many(
         [_item("a"), _item("b", bundle_bytes=30)],
@@ -167,22 +207,34 @@ def test_concurrent_installs_near_capacity_cannot_both_pass(
     # while the second starts, so the second counts after the first committed
     # and is refused; without the lock both would count one row and both pass.
     import threading
+    import time
 
     from omnigent.stores.skill_store import sqlalchemy_store as module
 
     _install(store, "first")
     real_lock = module.SqlAlchemySkillStore._lock_principal
+    real_ensure = module.SqlAlchemySkillStore._ensure_principal
     first_writer_holds = threading.Event()
-    second_writer_started = threading.Event()
+    second_writer_at_the_door = threading.Event()
     slow = [True]
 
-    def lock_slowly(session: Session, principal: str) -> None:
-        real_lock(session, principal)
+    def lock_slowly(session: Session, principal: str):  # type: ignore[no-untyped-def]
+        lock = real_lock(session, principal)
         if slow and slow.pop():
+            # Hold the principal inside the transaction until the other writer
+            # is past its own preamble and waiting on this very lock.
             first_writer_holds.set()
-            second_writer_started.wait(timeout=5)
+            second_writer_at_the_door.wait(timeout=5)
+            time.sleep(0.2)
+        return lock
+
+    def ensure_then_signal(self, principal: str) -> None:  # type: ignore[no-untyped-def]
+        real_ensure(self, principal)
+        if first_writer_holds.is_set():
+            second_writer_at_the_door.set()
 
     monkeypatch.setattr(module.SqlAlchemySkillStore, "_lock_principal", staticmethod(lock_slowly))
+    monkeypatch.setattr(module.SqlAlchemySkillStore, "_ensure_principal", ensure_then_signal)
     outcomes: dict[str, object] = {}
 
     def install(name: str) -> None:
@@ -203,40 +255,12 @@ def test_concurrent_installs_near_capacity_cannot_both_pass(
     assert first_writer_holds.wait(timeout=5)
     second = threading.Thread(target=install, args=("third",))
     second.start()
-    second_writer_started.set()
     first.join(timeout=10)
     second.join(timeout=10)
 
     assert outcomes["second"] == "ok"
     assert isinstance(outcomes["third"], SkillQuotaError)
     assert sorted(s.name for s in store.list_for_user("alice").data) == ["first", "second"]
-
-
-def test_concurrent_installs_of_one_identity_end_on_one_row(
-    store: SqlAlchemySkillStore, monkeypatch: pytest.MonkeyPatch
-) -> None:
-    # The pre-insert lookup misses while another writer inserts the same
-    # (principal, name); the unique index rejects the insert and the caller sees it.
-    first = _install(store, "review", commit="a" * 40)
-    real_scalars = Session.scalars
-    misses = [True]
-
-    def scalars_missing_once(self: Session, statement, *args, **kwargs):  # type: ignore[no-untyped-def]
-        result = real_scalars(self, statement, *args, **kwargs)
-        if misses and "installed_skills" in str(statement) and "name IN" in str(statement):
-            misses.pop()
-            return real_scalars(self, statement.where(False), *args, **kwargs)  # type: ignore[arg-type]
-        return result
-
-    monkeypatch.setattr(Session, "scalars", scalars_missing_once)
-    from sqlalchemy.exc import IntegrityError
-
-    with pytest.raises(IntegrityError):
-        _install(store, "review", commit="b" * 40)
-    monkeypatch.undo()
-    second = _install(store, "review", commit="b" * 40)
-    assert second.id == first.id and second.commit == "b" * 40
-    assert [s.name for s in store.list_for_user("alice").data] == ["review"]
 
 
 def test_visibility_reads_stay_on_the_principal_indexes(

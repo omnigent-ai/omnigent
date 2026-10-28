@@ -13,8 +13,10 @@ MAX_CATALOG_ENTRIES = 500
 MAX_SKILL_MD_BYTES = MIB
 MAX_MANIFEST_BYTES = MIB
 
-# Fetching: bytes a clone may write to disk before it is killed.
+# Fetching: what a clone may leave on disk (allocated bytes, and entries
+# including directories) before it is killed or refused.
 MAX_CHECKOUT_BYTES = 500 * MIB
+MAX_CHECKOUT_ENTRIES = 20_000
 
 # Packaging: per skill, checked while walking, and per install request
 # (compressed tarball bytes, since that is what is stored and delivered).

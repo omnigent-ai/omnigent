@@ -463,7 +463,18 @@ def _child_session(skills_app, db_uri: str, tmp_path: Path):  # type: ignore[no-
     """An agent with a real child under ``agents/child/`` and a session running that child."""
     _app, _registry, conn, _conv, _agent, _hosts = skills_app
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
-    artifacts.put("family", build_agent_bundle("family", sub_agents=[{"name": "child"}]))
+    artifacts.put(
+        "family",
+        build_agent_bundle(
+            "family",
+            sub_agents=[
+                {
+                    "name": "child",
+                    "skills": [{"name": "kid", "description": "Bundled kid", "content": "x"}],
+                }
+            ],
+        ),
+    )
     agents = SqlAlchemyAgentStore(db_uri)
     agent = agents.create(
         "8f2c1e0d4b6a4c1e9a7d5b3f2e1c0a9b", name="family", bundle_location="family"
@@ -475,6 +486,11 @@ def _child_session(skills_app, db_uri: str, tmp_path: Path):  # type: ignore[no-
         sub_agent_name="child",
     )
     permissions = SqlAlchemyPermissionStore(db_uri)
+    # Far more readers than one grant page, all sorting before the owner, so
+    # a lookup that walked the first page by user id would miss the owner.
+    for index in range(1_001):
+        permissions.ensure_user(f"a{index:04d}")
+        permissions.grant(f"a{index:04d}", conv.id, LEVEL_READ)
     permissions.grant("owner", conv.id, LEVEL_OWNER)
     permissions.grant("reader", conv.id, LEVEL_READ)
     permissions.grant("editor", conv.id, LEVEL_EDIT)
@@ -491,6 +507,8 @@ async def test_session_catalog_lists_the_owners_installed_skills_under_the_agent
     agent, conv = _child_session(skills_app, db_uri, tmp_path)
     _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
     _install_personal_skill(db_uri, tmp_path, "editor", "editors-skill")
+    # Collides with the child's own bundled skill: the bundle wins, as at delivery.
+    _install_personal_skill(db_uri, tmp_path, "owner", "kid", description="Installed kid")
     loaded = app.state.agent_cache.load(agent.id, agent.bundle_location)
     child = next(s for s in loaded.spec.sub_agents if s.name == "child")
     spec = replace(loaded.spec, sub_agents=[replace(child, skills_filter=skill_filter)])
@@ -517,9 +535,11 @@ async def test_session_catalog_lists_the_owners_installed_skills_under_the_agent
         )
         response = await task
     assert response.status_code == 200, response.text
-    names = [s["name"] for s in response.json()["skills"]]
+    listed = response.json()["skills"]
+    names = [s["name"] for s in listed]
     assert "child-review" in names and "editors-skill" not in names
     assert ("owners-skill" in names) is (skill_filter == "all")
+    assert not any(s["name"] == "kid" and s["source"] == "acme/skills" for s in listed)
     if skill_filter == "all":
         owners = next(s for s in response.json()["skills"] if s["name"] == "owners-skill")
         assert owners["source"] == "acme/skills"

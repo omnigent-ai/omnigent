@@ -57,10 +57,12 @@ include them.
   shared with downloads the agent's own files without them, and sees the
   owner's installs, not their own, in that session's slash menu.
 - Each user can hold at most 200 installed skills and 100 MB of enabled
-  skill tarballs, and so can **Everyone**; the limits are checked when a
-  skill is installed, updated or enabled, under one lock per owner, so two
-  requests cannot overrun them and a session's bundle (one user's set plus
-  Everyone's) always fits. An install of several skills is all or nothing.
+  skill tarballs, and so can **Everyone**; the totals live on a lock row per
+  owner and every install, update, enable, disable and removal adjusts them
+  in the same transaction, so a check is one locked read, two requests
+  cannot overrun the budget on any engine, and a session's bundle (one
+  user's set plus Everyone's) always fits. An install of several skills is
+  all or nothing.
   Delivery keeps a 200 MB backstop that answers with a message rather than
   a thinner bundle.
 - A session that runs a child agent gets installed skills under that child's
@@ -142,8 +144,10 @@ ssh or gpg settings, so neither git nor libcurl can find the operator's
 `.netrc`, `.config/git` or credential helpers: a user cannot reach a private
 repository through the operator's credentials, only through a token the
 [operator policy](#operator-policy) scopes to it. A clone is killed once it
-writes more than 500 MB to disk, each account has one fetch in flight at a
-time and the server two. Packaging limits are checked while packing, before
+occupies more than 500 MB on disk (allocated blocks, not just file sizes) or
+20,000 files and directories, and a checkout that crossed either budget just
+before finishing is refused the same way; each account has one fetch in
+flight at a time and the server two. Packaging limits are checked while packing, before
 more is read: at most 20 skills per request, 20 MB and 2,000 files per
 skill, and 100 MB of compressed tarballs per request (the stored and
 delivered form). A catalog opens at most 500 manifests, whatever the

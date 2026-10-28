@@ -328,7 +328,13 @@ def test_clone_github_source_translates_git_failures(
 ) -> None:
     # The clone flags are covered in tests/skills; here the CLI wraps the shared
     # error into a ClickException, keeping the SHA hint.
-    def run(cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None) -> object:
+    def run(
+        cmd: list[str],
+        env: dict[str, str],
+        dest: Path,
+        max_bytes: int | None,
+        max_entries: int | None,
+    ) -> object:
         return subprocess.CompletedProcess(cmd, 128, "", "fatal: not found\n")
 
     monkeypatch.setattr(git_source, "_run_clone", run)

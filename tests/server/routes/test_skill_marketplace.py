@@ -20,11 +20,7 @@ from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.app import create_app
 from omnigent.server.auth import UnifiedAuthProvider
 from omnigent.server.feature_flags import Feature, FeatureFlags
-from omnigent.server.skill_injection import (
-    effective_installed_skills,
-    skill_allowed,
-    with_installed_skills,
-)
+from omnigent.server.skill_injection import effective_installed_skills, with_installed_skills
 from omnigent.skills.service import SkillFetcher
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
@@ -234,7 +230,10 @@ async def test_feature_off_hides_routes_discovery_and_delivery_for_existing_inst
     # nothing reads them.
     store = SqlAlchemySkillStore(db_uri)
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
-    artifacts.put("skills/review.tar.gz", _tar({"SKILL.md": b"---\nname: review\n---\n"}))
+    artifacts.put(
+        "skills/review.tar.gz",
+        _tar({"SKILL.md": b"---\nname: review\n---\n", "notes.txt": b"supporting file\n"}),
+    )
     store.install(
         name="review",
         display_name=None,
@@ -249,7 +248,10 @@ async def test_feature_off_hides_routes_discovery_and_delivery_for_existing_inst
         bundle_bytes=1,
         installed_by=None,
     )
-    session_id = _bind_session(db_uri, artifacts, _tar({"config.yaml": b"name: bundled\n"}))
+    bundle = _tar(
+        {"config.yaml": b"name: bundled\n", "skills/own/SKILL.md": b"---\nname: own\n---\n"}
+    )
+    session_id = _bind_session(db_uri, artifacts, bundle)
 
     for enabled in (True, False):
         app, _ = _build(db_uri, tmp_path, enabled=enabled)
@@ -263,32 +265,19 @@ async def test_feature_off_hides_routes_discovery_and_delivery_for_existing_inst
             )
             contents = await client.get(f"/v1/sessions/{session_id}/agent/contents")
             assert contents.status_code == 200
-            assert ("skills/review/SKILL.md" in _names(contents.content)) is enabled
+            # With the feature on, the real agent-contents route carries the
+            # installed skill with its supporting file next to the bundle's own.
+            assert _names(contents.content) == (
+                [
+                    "config.yaml",
+                    "skills/own/SKILL.md",
+                    "skills/review/SKILL.md",
+                    "skills/review/notes.txt",
+                ]
+                if enabled
+                else ["config.yaml", "skills/own/SKILL.md"]
+            )
         assert (app.state.skill_store is not None) is enabled
-
-
-@pytest.mark.asyncio
-async def test_served_bundle_route_carries_installed_skills(
-    market, db_uri: str, tmp_path: Path
-) -> None:
-    client, _app, artifact_store = market
-    bundle = _tar(
-        {"config.yaml": b"name: bundled\n", "skills/own/SKILL.md": b"---\nname: own\n---\n"}
-    )
-    session_id = _bind_session(db_uri, artifact_store, bundle)
-    res = await client.post(
-        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
-    )
-    assert res.status_code == 201
-
-    contents = await client.get(f"/v1/sessions/{session_id}/agent/contents")
-    assert contents.status_code == 200
-    assert _names(contents.content) == [
-        "config.yaml",
-        "skills/own/SKILL.md",
-        "skills/triage/SKILL.md",
-        "skills/triage/notes.txt",
-    ]
 
 
 @pytest.mark.asyncio
@@ -442,8 +431,6 @@ async def test_installs_are_capped_per_owner_and_delivery_is_bounded(
 async def test_a_fetch_in_flight_refuses_a_second_from_the_same_account(market) -> None:
     import asyncio
 
-    from omnigent.server.routes import skill_marketplace
-
     client, app, _ = market
     started = asyncio.Event()
     release = asyncio.Event()
@@ -466,7 +453,6 @@ async def test_a_fetch_in_flight_refuses_a_second_from_the_same_account(market) 
     assert second.status_code == 409 and "still running" in second.text
     release.set()
     assert (await first).status_code == 201
-    assert skill_marketplace._FETCH_CONCURRENCY == 2
 
 
 def test_effective_skills_read_every_page_and_stop_at_the_delivery_limit(
@@ -584,18 +570,6 @@ def test_served_bundle_carries_the_owners_enabled_skills(db_uri: str, tmp_path: 
     assert "skills/shared/SKILL.md" not in _names(merged) and "skills/mine/SKILL.md" in _names(
         merged
     )
-
-
-class _Spec:
-    def __init__(self, skills_filter):
-        self.skills_filter = skills_filter
-
-
-def test_skill_allowed_honours_the_spec_filter() -> None:
-    assert skill_allowed(None, "x")
-    assert skill_allowed(_Spec("all"), "x")
-    assert not skill_allowed(_Spec("none"), "x")
-    assert skill_allowed(_Spec(["x"]), "x") and not skill_allowed(_Spec(["y"]), "x")
 
 
 @pytest.mark.parametrize("org_first", [True, False])

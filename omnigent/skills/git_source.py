@@ -148,28 +148,59 @@ def isolated_git_env(home: str) -> dict[str, str]:
     return env
 
 
-def _tree_bytes(path: Path) -> int:
-    """Bytes on disk under *path*, links counted by their own size, never followed."""
-    total = 0
-    for dirpath, _dirnames, filenames in os.walk(path):
+@dataclass(frozen=True)
+class TreeUsage:
+    """What a checkout occupies: allocated bytes and entries, directories included."""
+
+    bytes: int
+    entries: int
+
+
+def _tree_usage(path: Path) -> TreeUsage:
+    """Disk usage under *path*: allocated blocks where the OS reports them, links
+    counted by their own size and never followed, every file and directory an entry."""
+    total = entries = 0
+    for dirpath, dirnames, filenames in os.walk(path):
+        entries += len(dirnames)
         for filename in filenames:
+            entries += 1
             try:
-                total += os.lstat(os.path.join(dirpath, filename)).st_size
+                info = os.lstat(os.path.join(dirpath, filename))
             except OSError:
                 continue
-    return total
+            blocks = getattr(info, "st_blocks", None)
+            total += max(info.st_size, blocks * 512 if blocks is not None else 0)
+    return TreeUsage(bytes=total, entries=entries)
+
+
+def _over_budget(dest: Path, max_bytes: int | None, max_entries: int | None) -> str | None:
+    """A user-facing reason when *dest* exceeds either budget, else ``None``."""
+    if (max_bytes is None and max_entries is None) or not dest.exists():
+        return None
+    usage = _tree_usage(dest)
+    if max_bytes is not None and usage.bytes > max_bytes:
+        return f"The repository exceeds {max_bytes // (1024 * 1024)} MB on disk; refusing it."
+    if max_entries is not None and usage.entries > max_entries:
+        return f"The repository has more than {max_entries} files and directories; refusing it."
+    return None
 
 
 def _run_clone(
-    cmd: list[str], env: dict[str, str], dest: Path, max_bytes: int | None
+    cmd: list[str],
+    env: dict[str, str],
+    dest: Path,
+    max_bytes: int | None,
+    max_entries: int | None = None,
 ) -> subprocess.CompletedProcess[str]:
-    """Run git, killing it once *dest* holds more than *max_bytes* on disk.
+    """Run git, killing it once *dest* exceeds its byte or entry budget on disk.
 
     A shallow clone or a blob filter does not bound what the server writes,
-    since the checkout may fetch what the filter omitted; the watchdog does.
+    since the checkout may fetch what the filter omitted; the watchdog does,
+    and the finished checkout is measured once more, so a clone that crosses
+    the budget and exits before the next poll is refused too.
 
     :raises GitSourceError: When git is missing, the clone times out, or it
-        exceeds the byte budget.
+        exceeds a budget.
     """
     try:
         proc = subprocess.Popen(
@@ -182,22 +213,20 @@ def _run_clone(
     except FileNotFoundError:
         raise GitSourceError("Installing from GitHub needs git on your PATH.") from None
     deadline = time.monotonic() + CLONE_TIMEOUT_S
-    over_budget = False
+    refusal: str | None = None
     while True:
         try:
             stdout, stderr = proc.communicate(timeout=CHECKOUT_POLL_S)
             break
         except subprocess.TimeoutExpired:
-            if max_bytes is not None and dest.exists() and _tree_bytes(dest) > max_bytes:
-                over_budget = True
-            if over_budget or time.monotonic() > deadline:
+            refusal = _over_budget(dest, max_bytes, max_entries)
+            if refusal is not None or time.monotonic() > deadline:
                 proc.kill()
                 stdout, stderr = proc.communicate()
                 break
-    if over_budget:
-        raise GitSourceError(
-            f"The repository exceeds {max_bytes // (1024 * 1024)} MB on disk; refusing it."  # type: ignore[operator]
-        )
+    refusal = refusal or _over_budget(dest, max_bytes, max_entries)
+    if refusal is not None:
+        raise GitSourceError(refusal)
     if proc.returncode in (-9, 137) or time.monotonic() > deadline:
         raise GitSourceError(f"Timed out cloning {cmd[-2]}.")
     return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
@@ -211,6 +240,7 @@ def clone_github_source(
     isolated: bool = False,
     token: str | None = None,
     max_bytes: int | None = None,
+    max_entries: int | None = None,
 ) -> None:
     """Shallow-clone without submodules, hooks, or credential prompts.
 
@@ -219,8 +249,9 @@ def clone_github_source(
         developer's own git setup.
     :param token: An operator-scoped token for this host, sent as an
         authorization header through the environment (:func:`auth_header_env`).
-    :param max_bytes: Kill the clone once the checkout holds more than this on
-        disk; ``None`` for the developer's own CLI.
+    :param max_bytes: Kill or refuse the clone once the checkout holds more than
+        this on disk; ``None`` for the developer's own CLI.
+    :param max_entries: The same for files and directories together.
     :raises GitSourceError: When git is missing, the clone times out, exceeds
         *max_bytes*, or git fails.
     """
@@ -239,7 +270,7 @@ def clone_github_source(
         )
         if token:
             env.update(auth_header_env(clone_url, token))
-        proc = _run_clone([*cmd, "--", clone_url, str(dest)], env, dest, max_bytes)
+        proc = _run_clone([*cmd, "--", clone_url, str(dest)], env, dest, max_bytes, max_entries)
     if proc.returncode != 0:
         hint = (
             "\n(Only branch and tag names work as a ref, not commit SHAs.)"

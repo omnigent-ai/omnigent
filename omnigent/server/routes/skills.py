@@ -14,11 +14,7 @@ from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
-from omnigent.server.routes._auth_helpers import (
-    get_session_owner_id,
-    require_access_and_level,
-    require_user,
-)
+from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.schemas import SkillSummary
@@ -89,6 +85,7 @@ def create_skills_router(
         # Installed skills belong to a session's owner and follow the spec that
         # governs the session; pre-session discovery is the caller's own.
         installed_owner = user_id
+        installed_known = True
         installed_spec: AgentSpec | None = None
         if session_id is not None:
             if any(value is not None for value in (host_id, harness, path, agent_id)):
@@ -121,8 +118,10 @@ def create_skills_router(
             )
             if skill_store is not None:
                 installed_owner = await asyncio.to_thread(
-                    get_session_owner_id, conv.id, permission_store
+                    conversation_store.get_session_owner, conv.id, owner_only=True
                 )
+                # Unresolved ownership on a multi-user server lists nobody's installs.
+                installed_known = installed_owner is not None or permission_store is None
                 installed_spec = session_target(
                     await asyncio.to_thread(bundle_spec, agent_cache, agent), sub_agent_name
                 ).spec
@@ -188,8 +187,10 @@ def create_skills_router(
         if spec is not None and result.agent_id != agent_id:
             raise HTTPException(status_code=502, detail="update the host to discover agent skills")
         skills = [SkillSummary.model_validate(skill) for skill in result.skills]
-        # Hidden bundled skills also reserve their names against collisions.
-        bundled = {skill.name for skill in spec.skills} if spec is not None else set()
+        # Hidden bundled skills also reserve their names against collisions,
+        # from the spec the session runs: the host already lists them itself.
+        reserving = installed_spec if installed_spec is not None else spec
+        bundled = {skill.name for skill in reserving.skills} if reserving is not None else set()
         if spec is not None:
             skills = [
                 SkillSummary(
@@ -198,7 +199,7 @@ def create_skills_router(
                 for skill in spec.skills
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in bundled]
-        if skill_store is not None:
+        if skill_store is not None and installed_known:
             try:
                 installed = await asyncio.to_thread(
                     effective_installed_skills,

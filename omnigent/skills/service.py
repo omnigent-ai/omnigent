@@ -25,6 +25,7 @@ from omnigent.skills.git_source import (
 )
 from omnigent.skills.limits import (
     MAX_CHECKOUT_BYTES,
+    MAX_CHECKOUT_ENTRIES,
     MAX_INSTALL_BYTES,
     MAX_SKILL_BYTES,
     MAX_SKILL_ENTRIES,
@@ -48,7 +49,13 @@ class Cloner(Protocol):
 def server_clone(clone_url: str, ref: str | None, dest: Path, *, token: str | None = None) -> None:
     """The marketplace's clone: isolated from the server's own git credentials and disk-bounded."""
     clone_github_source(
-        clone_url, ref, dest, isolated=True, token=token, max_bytes=MAX_CHECKOUT_BYTES
+        clone_url,
+        ref,
+        dest,
+        isolated=True,
+        token=token,
+        max_bytes=MAX_CHECKOUT_BYTES,
+        max_entries=MAX_CHECKOUT_ENTRIES,
     )
 
 

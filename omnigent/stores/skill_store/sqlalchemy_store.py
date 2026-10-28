@@ -15,7 +15,7 @@ import contextlib
 import uuid
 from collections.abc import Collection, Iterable, Sequence
 
-from sqlalchemy import and_, func, or_, select
+from sqlalchemy import and_, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -233,31 +233,57 @@ class SqlAlchemySkillStore(SkillStore):
 
         def write(session: Session) -> None:
             if session.get(SqlSkillPrincipal, (current_workspace_id(), principal)) is None:
-                session.add(SqlSkillPrincipal(principal=principal, created_at=now_epoch()))
+                session.add(
+                    SqlSkillPrincipal(
+                        principal=principal,
+                        installed_count=0,
+                        enabled_bytes=0,
+                        created_at=now_epoch(),
+                    )
+                )
                 session.flush()
 
         with contextlib.suppress(IntegrityError):
             run_write_transaction(self._session_immediate, "ensure_skill_principal", write)
 
     @staticmethod
-    def _lock_principal(session: Session, principal: str) -> None:
-        """Hold the principal's row until the transaction ends; engines without
-        row locks (SQLite) serialize through the immediate transaction instead."""
-        session.get(SqlSkillPrincipal, (current_workspace_id(), principal), with_for_update=True)
+    def _lock_principal(session: Session, principal: str) -> SqlSkillPrincipal:
+        """Lock the principal's row until the transaction ends and return it.
 
-    @staticmethod
-    def _enabled_bytes(session: Session, principal: str) -> int:
-        """Compressed bytes of the principal's enabled skills (a partition of at most the cap)."""
-        return int(
-            session.scalar(
-                select(func.coalesce(func.sum(SqlInstalledSkill.bundle_bytes), 0)).where(
-                    SqlInstalledSkill.workspace_id == current_workspace_id(),
-                    SqlInstalledSkill.principal == principal,
-                    SqlInstalledSkill.enabled.is_(True),
-                )
-            )
-            or 0
+        A locking read returns the latest committed totals on every engine,
+        including MySQL's repeatable-read snapshot; engines without row locks
+        (SQLite) serialize through the immediate transaction instead.
+        """
+        lock = session.get(
+            SqlSkillPrincipal,
+            (current_workspace_id(), principal),
+            with_for_update=True,
+            populate_existing=True,
         )
+        if lock is None:
+            raise SkillValueError(f"no principal row for {principal}")
+        return lock
+
+    def _locked_skill(
+        self, session: Session, skill_id: str
+    ) -> tuple[SqlSkillPrincipal, SqlInstalledSkill] | None:
+        """Lock a skill's principal first, then re-read the skill under that lock.
+
+        The first read only learns the principal (immutable for a row); the
+        locked re-read is what the write and the budget check see, so a
+        concurrent change committed in between is never missed.
+        """
+        seen = session.get(SqlInstalledSkill, (current_workspace_id(), skill_id))
+        if seen is None:
+            return None
+        lock = self._lock_principal(session, seen.principal)
+        row = session.get(
+            SqlInstalledSkill,
+            (current_workspace_id(), skill_id),
+            with_for_update=True,
+            populate_existing=True,
+        )
+        return None if row is None else (lock, row)
 
     def install_many(
         self,
@@ -288,35 +314,27 @@ class SqlAlchemySkillStore(SkillStore):
         self._ensure_principal(principal)
 
         def write(session: Session) -> list[InstallResult]:
-            self._lock_principal(session, principal)
+            lock = self._lock_principal(session, principal)
             existing = {
                 row.name: row
                 for row in session.scalars(
-                    select(SqlInstalledSkill).where(
+                    select(SqlInstalledSkill)
+                    .where(
                         SqlInstalledSkill.workspace_id == current_workspace_id(),
                         SqlInstalledSkill.principal == principal,
                         SqlInstalledSkill.name.in_([item.name for item in items]),
                     )
+                    .with_for_update()
                 )
             }
-            held = len(
-                session.scalars(
-                    select(SqlInstalledSkill.id)
-                    .where(
-                        SqlInstalledSkill.workspace_id == current_workspace_id(),
-                        SqlInstalledSkill.principal == principal,
-                    )
-                    .limit(max_rows + 1)
-                ).all()
-            )
             adding = [item for item in items if item.name not in existing]
-            if held + len(adding) > max_rows:
+            if lock.installed_count + len(adding) > max_rows:
                 raise SkillQuotaError(
                     f"At most {max_rows} skills can be installed for {_who(scope)}; "
                     "remove some first."
                 )
             # A replaced row keeps its enabled flag; only enabled bytes count.
-            after = self._enabled_bytes(session, principal)
+            after = lock.enabled_bytes
             for item in items:
                 row = existing.get(item.name)
                 if row is None:
@@ -362,6 +380,9 @@ class SqlAlchemySkillStore(SkillStore):
                 row.bundle_bytes = item.bundle_bytes
                 session.flush()
                 results.append(InstallResult(skill=_skill_entity(row), replaced_location=replaced))
+            lock.installed_count += len(adding)
+            lock.enabled_bytes = after
+            session.flush()
             return results
 
         return run_write_transaction(self._session_immediate, "install_skills", write)
@@ -429,17 +450,12 @@ class SqlAlchemySkillStore(SkillStore):
         return found
 
     def count_installed(self, scope: SkillScope, owner_user_id: str | None) -> int:
-        """Rows of one principal, read no further than the cap."""
+        """Rows of one principal, from the total its lock row keeps."""
         with self._session("count_installed_skills") as session:
-            stmt = (
-                select(SqlInstalledSkill.id)
-                .where(
-                    SqlInstalledSkill.workspace_id == current_workspace_id(),
-                    SqlInstalledSkill.principal == principal_for(scope, owner_user_id),
-                )
-                .limit(MAX_INSTALLED_PER_OWNER + 1)
+            lock = session.get(
+                SqlSkillPrincipal, (current_workspace_id(), principal_for(scope, owner_user_id))
             )
-            return len(session.scalars(stmt).all())
+            return 0 if lock is None else lock.installed_count
 
     def update(
         self,
@@ -460,19 +476,18 @@ class SqlAlchemySkillStore(SkillStore):
         check_bound("path", path, MAX_PATH_CHARS)
 
         def write(session: Session) -> InstalledSkill | None:
-            row = session.get(SqlInstalledSkill, (current_workspace_id(), skill_id))
-            if row is None:
+            locked = self._locked_skill(session, skill_id)
+            if locked is None:
                 return None
-            self._lock_principal(session, row.principal)
+            lock, row = locked
             if row.enabled:
-                after = (
-                    self._enabled_bytes(session, row.principal) - row.bundle_bytes + bundle_bytes
-                )
+                after = lock.enabled_bytes - row.bundle_bytes + bundle_bytes
                 if after > max_bytes:
                     raise SkillQuotaError(
                         f"Updating {row.name} would take the installed skills past "
                         f"{max_bytes // (1024 * 1024)} MB together; remove or disable some first."
                     )
+                lock.enabled_bytes = after
             row.commit = commit
             row.bundle_location = bundle_location
             row.bundle_bytes = bundle_bytes
@@ -492,17 +507,20 @@ class SqlAlchemySkillStore(SkillStore):
         max_bytes = MAX_DELIVERY_BYTES_PER_SCOPE if max_bytes is None else max_bytes
 
         def write(session: Session) -> InstalledSkill | None:
-            row = session.get(SqlInstalledSkill, (current_workspace_id(), skill_id))
-            if row is None:
+            locked = self._locked_skill(session, skill_id)
+            if locked is None:
                 return None
+            lock, row = locked
             if enabled and not row.enabled:
-                self._lock_principal(session, row.principal)
-                after = self._enabled_bytes(session, row.principal) + row.bundle_bytes
+                after = lock.enabled_bytes + row.bundle_bytes
                 if after > max_bytes:
                     raise SkillQuotaError(
                         f"Enabling {row.name} would take the installed skills past "
                         f"{max_bytes // (1024 * 1024)} MB together; remove or disable some first."
                     )
+                lock.enabled_bytes = after
+            elif row.enabled and not enabled:
+                lock.enabled_bytes -= row.bundle_bytes
             row.enabled = enabled
             row.updated_at = now_epoch()
             session.flush()
@@ -512,11 +530,16 @@ class SqlAlchemySkillStore(SkillStore):
 
     def delete(self, skill_id: str) -> InstalledSkill | None:
         def write(session: Session) -> InstalledSkill | None:
-            row = session.get(SqlInstalledSkill, (current_workspace_id(), skill_id))
-            if row is None:
+            locked = self._locked_skill(session, skill_id)
+            if locked is None:
                 return None
+            lock, row = locked
             entity = _skill_entity(row)
+            lock.installed_count -= 1
+            if row.enabled:
+                lock.enabled_bytes -= row.bundle_bytes
             session.delete(row)
+            session.flush()
             return entity
 
         return run_write_transaction(self._session_immediate, "delete_installed_skill", write)

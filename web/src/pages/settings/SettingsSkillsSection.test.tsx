@@ -88,6 +88,7 @@ const state = {
   moreSources: null as SkillSource[] | "fail" | null,
   failPatch: false,
   failDeleteSource: false,
+  failDeleteSkill: false,
   secondPage: null as InstalledSkill[] | null,
 };
 const page = <T,>(data: T[], has_more = false, last_id: string | null = null) => ({
@@ -133,6 +134,8 @@ function script() {
     if (url === "/v1/installed-skills/sk1/content")
       return json({ markdown: "---\nname: review\n---\nReview it." });
     if (url === "/v1/installed-skills/sk1/update") return json(review);
+    if (url === "/v1/installed-skills/sk1" && method === "DELETE" && state.failDeleteSkill)
+      return json({ error: { message: "Not the owner of this skill" } }, 403);
     if (url === "/v1/installed-skills/sk1" && method === "DELETE")
       return new Response(null, { status: 204 });
     return json({ error: { message: `unexpected ${method} ${url}` } }, 500);
@@ -166,6 +169,7 @@ beforeEach(() => {
   state.moreSources = null;
   state.failPatch = false;
   state.failDeleteSource = false;
+  state.failDeleteSkill = false;
   state.secondPage = null;
   calls.length = 0;
   fetchMock.mockReset();
@@ -304,6 +308,22 @@ describe("SettingsSkillsSection", () => {
       await within(screen.getByTestId("catalog-skill-triage")).findByText("Installed"),
     ).toBeInTheDocument();
     expect(screen.queryByTestId("install-skill-triage")).toBeNull();
+
+    // Back on a source, its own same-named skill is what the server says: not installed.
+    fireEvent.click(screen.getByRole("button", { name: "Back to sources" }));
+    expect(await screen.findByTestId("install-skill-triage")).toBeInTheDocument();
+  });
+
+  it("shows a refused removal inside the confirmation dialog", async () => {
+    state.failDeleteSkill = true;
+    renderSection();
+    const row = await screen.findByTestId("installed-skill-review");
+    fireEvent.click(within(row).getByRole("button", { name: "Remove review" }));
+    const confirm = await screen.findByTestId("confirm-remove-skill");
+    fireEvent.click(confirm);
+    const dialog = screen.getByRole("dialog");
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("Not the owner");
+    expect(screen.getByTestId("installed-skill-review")).toBeInTheDocument();
   });
 
   it("updates, and removes behind a confirmation that can be cancelled", async () => {

@@ -97,7 +97,8 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
       </p>
     );
   }
-  const mutationError = toggle.error ?? update.error ?? remove.error;
+  // A failed removal is shown inside its confirmation dialog, where the user is.
+  const mutationError = toggle.error ?? update.error;
   return (
     <div className="flex flex-col gap-3" data-testid="installed-skills">
       {mutationError && <ErrorLine error={mutationError} />}
@@ -188,6 +189,7 @@ function InstalledSkillsTab({ isAdmin }: { isAdmin: boolean }) {
               with.
             </DialogDescription>
           </DialogHeader>
+          {remove.error && <ErrorLine error={remove.error} />}
           <DialogFooter>
             <Button variant="ghost" onClick={() => setRemoving(null)}>
               Cancel
@@ -280,6 +282,7 @@ function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: bool
                 }`}
                 onClick={() => {
                   setPreview(null);
+                  refresh.reset();
                   setSelectedId(source.id);
                 }}
               >
@@ -344,6 +347,9 @@ function BrowseTab({ isAdmin, urlInstall }: { isAdmin: boolean; urlInstall: bool
         {!preview && refresh.error && <ErrorLine error={refresh.error} />}
         {shown && (
           <CatalogGrid
+            // Local install state belongs to one repository: a same-named skill
+            // in another catalog is not installed just because this one was.
+            key={`${shown.url}@${shown.ref ?? ""}`}
             catalog={shown}
             isAdmin={isAdmin}
             onRefresh={!preview && activeId ? () => refresh.mutate(activeId) : undefined}

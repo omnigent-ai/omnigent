@@ -81,8 +81,14 @@ def test_package_bounds_the_whole_request(
 ) -> None:
     from omnigent.skills import service
 
-    monkeypatch.setattr(service, "MAX_INSTALL_BYTES", 10)
     fetcher = SkillFetcher(clone=fake_clone(plain_repo))
+    sizes = [
+        len(fetcher.package("acme/skills", None, [name])[1][0].tarball)
+        for name in ("review", "triage")
+    ]
+    # Either skill alone fits; the two together do not.
+    monkeypatch.setattr(service, "MAX_INSTALL_BYTES", max(sizes))
+    assert len(fetcher.package("acme/skills", None, ["triage"])[1]) == 1
     with pytest.raises(GitSourceError, match=r"exceed .* together"):
         fetcher.package("acme/skills", None, ["review", "triage"])
 
@@ -100,14 +106,20 @@ def test_fetcher_clones_isolated_from_server_credentials(monkeypatch: pytest.Mon
         isolated: bool = False,
         token: str | None = None,
         max_bytes: int | None = None,
+        max_entries: int | None = None,
     ) -> None:
-        seen["isolated"], seen["token"], seen["max_bytes"] = isolated, token, max_bytes
+        seen.update(isolated=isolated, token=token, max_bytes=max_bytes, max_entries=max_entries)
         raise GitSourceError("stop")
 
     monkeypatch.setattr(service, "clone_github_source", clone)
     with pytest.raises(GitSourceError):
         service.server_clone("https://github.com/a/b.git", None, Path("/nonexistent"), token="t")
-    assert seen == {"isolated": True, "token": "t", "max_bytes": service.MAX_CHECKOUT_BYTES}
+    assert seen == {
+        "isolated": True,
+        "token": "t",
+        "max_bytes": service.MAX_CHECKOUT_BYTES,
+        "max_entries": service.MAX_CHECKOUT_ENTRIES,
+    }
 
 
 def test_fetcher_refuses_a_source_outside_the_policy_before_cloning(

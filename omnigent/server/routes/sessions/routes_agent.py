@@ -44,9 +44,6 @@ from omnigent.server.routes._auth_helpers import (
     can_mutate_session_agent as _can_mutate_session_agent,
 )
 from omnigent.server.routes._auth_helpers import (
-    get_session_owner_id,
-)
-from omnigent.server.routes._auth_helpers import (
     require_access as _require_access,
 )
 from omnigent.server.routes._auth_helpers import (
@@ -272,8 +269,12 @@ def register_agent_routes(
             # The session owner's installed skills go to the runner (a managed
             # host, or the owner's own host fetching) and never into a bundle a
             # shared reader downloads, since personal installs are private.
-            owner_id = await asyncio.to_thread(get_session_owner_id, conv.id, permission_store)
-            if managed_token or user_id == owner_id:
+            owner_id = await asyncio.to_thread(
+                conversation_store.get_session_owner, conv.id, owner_only=True
+            )
+            # Unresolved ownership on a multi-user server delivers nobody's installs.
+            owner_known = owner_id is not None or permission_store is None
+            if owner_known and (managed_token or user_id == owner_id):
                 try:
                     bundle_bytes = await asyncio.to_thread(
                         with_installed_skills,
