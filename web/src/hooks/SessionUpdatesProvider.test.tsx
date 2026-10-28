@@ -12,7 +12,9 @@ import type { ContextType, ReactNode } from "react";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import {
+  clearRecentlyCreated,
   clearSessionTombstones,
+  undoArchiveConversations,
   useArchiveConversation,
   type Conversation,
   type ConversationsPage,
@@ -115,6 +117,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   clearSessionTombstones();
+  clearRecentlyCreated();
 });
 
 describe("SessionUpdatesProvider watch-set", () => {
@@ -440,6 +443,51 @@ describe("SessionUpdatesProvider archive tombstone", () => {
         .pages[0].data.find((row) => row.id === "conv_a"),
     ).toMatchObject({ title: "Late edit", archived: true });
     await waitFor(() => expect(archive.result.current.isSuccess).toBe(true));
+  });
+
+  it("does not let a stale archived frame re-hide a row restored by Undo", async () => {
+    let resolvePatch!: (value: unknown) => void;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockImplementation(
+        () =>
+          new Promise((resolve) => {
+            resolvePatch = resolve;
+          }),
+      ),
+    );
+    const client = new QueryClient();
+    seedConversations(client, ["conv_b"]);
+    renderProvider(client, ["/"]);
+    const handler = frameHandler();
+    const listedIds = () =>
+      client
+        .getQueryData<ConversationsInfiniteData>(["conversations", "", false])!
+        .pages[0].data.map((row) => row.id);
+
+    const undo = undoArchiveConversations(client, [{ ...conv("conv_a"), archived: true }]);
+    await waitFor(() => expect(listedIds()).toEqual(["conv_a", "conv_b"]));
+
+    // The stream re-reads the restored row before the unarchive write lands.
+    act(() =>
+      handler({
+        type: "snapshot",
+        items: [{ ...conv("conv_a"), archived: true }, conv("conv_b")],
+      }),
+    );
+    expect(listedIds()).toEqual(["conv_a", "conv_b"]);
+
+    resolvePatch({
+      ok: true,
+      status: 200,
+      json: async () => ({ ...conv("conv_a"), archived: false, updated_at: 10 }),
+    });
+    await undo;
+    expect(listedIds()).toEqual(["conv_a", "conv_b"]);
+
+    // The archive's own late frame can still land after the PATCH settled.
+    act(() => handler({ type: "changed", items: [{ ...conv("conv_a"), archived: true }] }));
+    expect(listedIds()).toEqual(["conv_a", "conv_b"]);
   });
 });
 

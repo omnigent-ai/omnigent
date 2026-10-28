@@ -25,6 +25,7 @@ import { childSessionsQueryKey, type ChildSessionInfo } from "@/hooks/useChildSe
 import {
   isSessionArchiving,
   isSessionDeleting,
+  isSessionUnarchiving,
   markRecentlyCreated,
 } from "@/hooks/useConversations";
 import {
@@ -74,10 +75,11 @@ function applyItemsToCache(
   const itemsById = new Map<string, SessionListWireItem>();
   for (const item of items) {
     if (isSessionDeleting(item.id)) continue;
-    itemsById.set(
-      item.id,
-      nullsToUndefined(isSessionArchiving(item.id) ? { ...item, archived: true } : item),
-    );
+    // The pending archive operation owns the flag while server signals lag.
+    let coerced = item;
+    if (isSessionArchiving(item.id)) coerced = { ...item, archived: true };
+    else if (isSessionUnarchiving(item.id)) coerced = { ...item, archived: false };
+    itemsById.set(item.id, nullsToUndefined(coerced));
   }
   const foundAnywhere = new Set<string>();
   let needsRefetch = false;
