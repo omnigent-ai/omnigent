@@ -22,10 +22,13 @@ export interface FileEditDiff {
   files: FileDiffSection[];
   additions: number;
   removals: number;
-  /** A replace-all edit is diffed once, so its counts cover a single match. */
-  countsAreMinimum: boolean;
-  /** A change too large to compare is a whole-block replacement, so its counts can be too high. */
-  countsAreMaximum: boolean;
+  /** A lone replace-all edit is diffed once, so its counts are for each match it replaced. */
+  countsArePerMatch: boolean;
+  /**
+   * The counts don't measure the change: a batch's replace-all edit counts one match, and a
+   * change too large to compare is a whole-block replacement, which can overstate it.
+   */
+  countsAreInexact: boolean;
 }
 
 interface EditPair {
@@ -99,12 +102,13 @@ function pairsDiff(pairs: EditPair[], path: string): FileEditDiff | null {
   const additions = countKind(lines, "added");
   const removals = countKind(lines, "removed");
   const text = lines.map(formatLine).join("\n");
+  const perMatch = pairs.length === 1 && pairs[0]?.replaceAll === true;
   return {
     files: [{ path, kind: "update", text, additions, removals }],
     additions,
     removals,
-    countsAreMinimum: pairs.some((pair) => pair.replaceAll),
-    countsAreMaximum: budget.exceeded,
+    countsArePerMatch: perMatch,
+    countsAreInexact: budget.exceeded || (!perMatch && pairs.some((pair) => pair.replaceAll)),
   };
 }
 
@@ -156,8 +160,8 @@ function patchChangesDiff(changes: unknown): FileEditDiff | null {
     files,
     additions: files.reduce((sum, file) => sum + file.additions, 0),
     removals: files.reduce((sum, file) => sum + file.removals, 0),
-    countsAreMinimum: false,
-    countsAreMaximum: false,
+    countsArePerMatch: false,
+    countsAreInexact: false,
   };
 }
 

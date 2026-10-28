@@ -167,15 +167,17 @@ describe("summarizeFileEdit", () => {
     ...overrides,
   });
 
-  it("reports added and removed line counts, each with its diff color", () => {
+  it("reports added and removed line counts, each number in its diff color", () => {
     expect(summarizeFileEdit(edit("The file a.py has been updated successfully."))).toEqual({
       text: "Updated with 1 addition and 3 removals",
       isError: false,
       segments: [
         { text: "Updated with " },
-        { text: "1 addition", tone: "added" },
+        { text: "1", tone: "added" },
+        { text: " addition" },
         { text: " and " },
-        { text: "3 removals", tone: "removed" },
+        { text: "3", tone: "removed" },
+        { text: " removals" },
       ],
     });
   });
@@ -253,16 +255,25 @@ describe("summarizeFileEdit", () => {
     expect(summarizeFileEdit(edit(overrides.output, overrides))).toBeNull();
   });
 
-  it("marks a replace-all edit's counts as a lower bound", () => {
-    const replaceAll = edit(
-      "The file a.py has been updated. All occurrences were successfully replaced.",
-      {
-        args: { file_path: "a.py", old_string: "x", new_string: "y", replace_all: true },
-      },
-    );
+  it("counts a replace-all edit per match, since its output does not say how many", () => {
+    const output = "The file a.py has been updated. All occurrences were successfully replaced.";
+    const replaceAll = edit(output, {
+      args: { file_path: "a.py", old_string: "x", new_string: "y", replace_all: true },
+    });
     expect(summarizeFileEdit(replaceAll)?.text).toBe(
-      "Updated with at least 1 addition and 1 removal",
+      "Updated each match with 1 addition and 1 removal",
     );
+    const batch = edit("Applied 2 edits to a.py:", {
+      name: "MultiEdit",
+      args: {
+        file_path: "a.py",
+        edits: [
+          { old_string: "x", new_string: "y", replace_all: true },
+          { old_string: "z", new_string: "w" },
+        ],
+      },
+    });
+    expect(summarizeFileEdit(batch)).toBeNull();
   });
 
   it("shows no counts for an edit too large to compare line by line", () => {

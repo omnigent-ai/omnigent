@@ -52,7 +52,7 @@ export function FileEditBody({ call }: { call: ToolCall }) {
           )}
           {diff.files.map((file) => (
             // A patch lists each file once, so its path names its panel.
-            <FileDiffPanel key={file.path} file={file} />
+            <FileDiffPanel key={file.path} file={file} perMatch={diff.countsArePerMatch} />
           ))}
         </>
       )}
@@ -61,7 +61,7 @@ export function FileEditBody({ call }: { call: ToolCall }) {
 }
 
 /** One file's diff, titled with its path, whether it is new, deleted or renamed, and its counts. */
-function FileDiffPanel({ file }: { file: FileDiffSection }) {
+function FileDiffPanel({ file, perMatch }: { file: FileDiffSection; perMatch: boolean }) {
   const { root, home } = useWorkspacePaths();
   const shown = (path: string) => resolveChatFilePath(path, root, home)?.path ?? path;
   // An edit call that names no file gets an untitled panel.
@@ -72,6 +72,7 @@ function FileDiffPanel({ file }: { file: FileDiffSection }) {
         {file.newPath !== undefined && ` renamed to ${shown(file.newPath)}`}
         {file.kind === "add" && " (new file)"}
         {file.kind === "delete" && " (deleted)"}
+        {perMatch && " (each match)"}
         {file.additions > 0 && (
           <span className={cn("ml-2", DIFF_TONE_CLASS.added)}>+{file.additions}</span>
         )}

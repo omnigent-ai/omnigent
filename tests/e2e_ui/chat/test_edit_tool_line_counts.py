@@ -154,10 +154,12 @@ def test_edit_rows_show_line_counts_and_diff(
     expect(failed_result).not_to_contain_text("Updated")
     color = "el => getComputedStyle(el).color"
     plain = applied_result.evaluate(color)
-    added = applied_result.get_by_text("2 additions", exact=True).evaluate(color)
-    removed = applied_result.get_by_text("3 removals", exact=True).evaluate(color)
-    # Additions and removals use diff colors, not the line's plain color.
+    added = applied_result.get_by_text("2", exact=True).evaluate(color)
+    removed = applied_result.get_by_text("3", exact=True).evaluate(color)
+    noun = applied_result.get_by_text("additions", exact=True).evaluate(color)
+    # The counts use diff colors; the words around them keep the line's plain color.
     assert len({plain, added, removed}) == 3
+    assert noun == plain
     assert failed_result.evaluate(color) != plain
 
     applied.click()

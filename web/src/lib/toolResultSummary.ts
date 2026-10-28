@@ -90,9 +90,9 @@ export function summarizeToolResult(call: ToolCall): ToolResultSummary | null {
 
 /**
  * A finished edit's added and removed line counts, e.g. "Updated with 2
- * additions and 3 removals". Failures keep the usual error line; running,
- * cancelled and unchanged edits (including pure renames) show none, as do
- * edits too large to compare, whose counts could overstate the change.
+ * additions and 3 removals" with the numbers in diff colors; a replace-all edit
+ * counts each match. Failures keep the usual error line; running, cancelled and
+ * unchanged edits (including pure renames) show none, as do inexact counts.
  */
 export function summarizeFileEdit(call: ToolCall): ToolResultSummary | null {
   const generic = summarizeToolResult(call);
@@ -101,20 +101,19 @@ export function summarizeFileEdit(call: ToolCall): ToolResultSummary | null {
   if (error !== null) return failure(firstLine(error));
   if (!editApplied(call.name, call.output)) return generic;
   const diff = getFileEditDiff(call.name, call.args);
-  if (diff === null || diff.countsAreMaximum || diff.additions + diff.removals === 0) {
+  if (diff === null || diff.countsAreInexact || diff.additions + diff.removals === 0) {
     return generic;
   }
-  const counts: ToolResultSegment[] = [];
-  if (diff.additions > 0) counts.push({ text: plural(diff.additions, "addition"), tone: "added" });
-  if (diff.removals > 0) counts.push({ text: plural(diff.removals, "removal"), tone: "removed" });
-  const target =
-    diff.files.length > 1 ? `Updated ${plural(diff.files.length, "file")} with ` : "Updated with ";
-  const segments: ToolResultSegment[] = [
-    { text: diff.countsAreMinimum ? `${target}at least ` : target },
-  ];
+  const counts: ToolResultSegment[][] = [];
+  if (diff.additions > 0) counts.push(countSegments(diff.additions, "addition", "added"));
+  if (diff.removals > 0) counts.push(countSegments(diff.removals, "removal", "removed"));
+  let target = "Updated with ";
+  if (diff.countsArePerMatch) target = "Updated each match with ";
+  else if (diff.files.length > 1) target = `Updated ${plural(diff.files.length, "file")} with `;
+  const segments: ToolResultSegment[] = [{ text: target }];
   counts.forEach((count, index) => {
     if (index > 0) segments.push({ text: " and " });
-    segments.push(count);
+    segments.push(...count);
   });
   return { text: segments.map((segment) => segment.text).join(""), isError: false, segments };
 }
@@ -208,5 +207,18 @@ function failure(text: string): ToolResultSummary {
 }
 
 function plural(count: number, noun: string): string {
-  return `${count.toLocaleString()} ${noun}${count === 1 ? "" : "s"}`;
+  return `${count.toLocaleString()} ${pluralNoun(count, noun)}`;
+}
+
+function pluralNoun(count: number, noun: string): string {
+  return count === 1 ? noun : `${noun}s`;
+}
+
+/** A count and its noun, with only the number in the diff color. */
+function countSegments(
+  count: number,
+  noun: string,
+  tone: ToolResultSegment["tone"],
+): ToolResultSegment[] {
+  return [{ text: count.toLocaleString(), tone }, { text: ` ${pluralNoun(count, noun)}` }];
 }

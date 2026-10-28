@@ -20,8 +20,8 @@ describe("getFileEditDiff", () => {
       ],
       additions: 1,
       removals: 1,
-      countsAreMinimum: false,
-      countsAreMaximum: false,
+      countsArePerMatch: false,
+      countsAreInexact: false,
     });
   });
 
@@ -110,7 +110,7 @@ describe("getFileEditDiff", () => {
       new_string: ["new start", ...shared].join("\n"),
     });
     // 501 × 501 lines exceeds the comparison budget, so no shared line is matched.
-    expect(diff).toMatchObject({ additions: 501, removals: 501, countsAreMaximum: true });
+    expect(diff).toMatchObject({ additions: 501, removals: 501, countsAreInexact: true });
   });
 
   it("shares the comparison budget across a call's edits", () => {
@@ -121,9 +121,9 @@ describe("getFileEditDiff", () => {
     };
     // Each 400 × 400 edit fits the budget alone; the second exceeds what the first left.
     const diff = getFileEditDiff("MultiEdit", { file_path: "a.py", edits: [pair, pair] });
-    expect(diff).toMatchObject({ additions: 1 + 400, removals: 1 + 400, countsAreMaximum: true });
+    expect(diff).toMatchObject({ additions: 1 + 400, removals: 1 + 400, countsAreInexact: true });
     const fits = getFileEditDiff("MultiEdit", { file_path: "a.py", edits: [pair] });
-    expect(fits).toMatchObject({ additions: 1, removals: 1, countsAreMaximum: false });
+    expect(fits).toMatchObject({ additions: 1, removals: 1, countsAreInexact: false });
   });
 
   it("returns null for a no-op, malformed, or non-edit call", () => {
@@ -226,10 +226,14 @@ describe("getFileEditDiff", () => {
     });
   });
 
-  it("flags replace-all edits, whose counts cover one match", () => {
+  it("counts a lone replace-all edit per match, and a batch with one as inexact", () => {
+    const perMatch = { countsArePerMatch: true, countsAreInexact: false };
     expect(
       getFileEditDiff("Edit", { old_string: "a", new_string: "b", replace_all: true }),
-    ).toMatchObject({ additions: 1, removals: 1, countsAreMinimum: true });
+    ).toMatchObject({ additions: 1, removals: 1, ...perMatch });
+    expect(
+      getFileEditDiff("edit", { oldString: "a", newString: "b", replaceAll: true }),
+    ).toMatchObject(perMatch);
     expect(
       getFileEditDiff("MultiEdit", {
         edits: [
@@ -237,13 +241,11 @@ describe("getFileEditDiff", () => {
           { old_string: "c", new_string: "d", replace_all: true },
         ],
       }),
-    ).toMatchObject({ countsAreMinimum: true });
+    ).toMatchObject({ countsArePerMatch: false, countsAreInexact: true });
     expect(getFileEditDiff("Edit", { old_string: "a", new_string: "b" })).toMatchObject({
-      countsAreMinimum: false,
+      countsArePerMatch: false,
+      countsAreInexact: false,
     });
-    expect(
-      getFileEditDiff("edit", { oldString: "a", newString: "b", replaceAll: true }),
-    ).toMatchObject({ countsAreMinimum: true });
   });
 
   it('keeps removed "-- comment" lines of an update diff without a hunk header', () => {

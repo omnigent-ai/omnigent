@@ -1,5 +1,5 @@
 import { createElement } from "react";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, onTestFinished, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import { FileViewerContext } from "@/shell/FileViewerContext";
@@ -493,8 +493,9 @@ describe("ToolCard registered views", () => {
     });
     const line = screen.getByTestId("tool-result-line");
     expect(line.textContent).toBe("Updated with 1 addition and 2 removals");
-    expect(screen.getByText("1 addition")).toHaveClass("text-green-600");
-    expect(screen.getByText("2 removals")).toHaveClass("text-red-600");
+    expect(within(line).getByText("1")).toHaveClass("text-green-600");
+    expect(within(line).getByText("2")).toHaveClass("text-red-600");
+    expect(within(line).getByText("addition")).not.toHaveClass("text-green-600");
     expect(line).not.toHaveClass("text-destructive");
 
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
@@ -512,6 +513,21 @@ describe("ToolCard registered views", () => {
     expect(screen.getByText("Input")).toBeInTheDocument();
     showView("Diff");
     expect(container.textContent).toContain("-RETRIES = 3");
+  });
+
+  it("labels a replace-all edit's counts as each match's", async () => {
+    await registerRealView("Edit");
+    const { container } = renderCard({
+      name: "Edit",
+      arguments: { file_path: "/repo/a.py", old_string: "x", new_string: "y", replace_all: true },
+      output: "The file /repo/a.py has been updated. All occurrences were successfully replaced.",
+      state: "output-available",
+    });
+    expect(screen.getByTestId("tool-result-line").textContent).toBe(
+      "Updated each match with 1 addition and 1 removal",
+    );
+    fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
+    expect(screen.getByText("+1").parentElement?.textContent).toBe("/repo/a.py (each match)+1-1");
   });
 
   it.each([
