@@ -24,6 +24,10 @@ from omnigent.skills import git_source
             ("https://github.com/acme/skills.git", "v2", "pack", None),
         ),
         ("github:acme/skills.git", ("https://github.com/acme/skills.git", None, "", None)),
+        (
+            "github:acme/skills/pack/sub@review",
+            ("https://github.com/acme/skills.git", None, "pack/sub", "review"),
+        ),
     ],
 )
 def test_parse_github_source(
@@ -56,6 +60,12 @@ def test_clone_is_hardened(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> N
     assert cmd[cmd.index("--branch") + 1] == "v1" and cmd[-3] == "--"
     assert env["GIT_TERMINAL_PROMPT"] == "0" and env["GIT_LFS_SKIP_SMUDGE"] == "1"
 
+    # A hex-looking ref is still passed through as a branch; the failure explains why.
+    with pytest.raises(git_source.GitSourceError, match="Only branch and tag names"):
+        git_source.clone_github_source("https://github.com/a/b.git", "deadbee", tmp_path / "r2")
+    cmd, _env = seen[1]
+    assert cmd[cmd.index("--branch") + 1] == "deadbee"
+
 
 def test_tar_untrusted_dir_refuses_symlinks_and_lfs(tmp_path: Path) -> None:
     src = tmp_path / "skill"
@@ -80,32 +90,42 @@ def test_tar_untrusted_dir_refuses_symlinks_and_lfs(tmp_path: Path) -> None:
 def test_isolated_clone_drops_inherited_git_config_and_helpers(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    # The operator's credential helper and global config must not serve a
-    # marketplace user's request.
+    # The operator's credential helper, global config and home directory
+    # (.netrc, .config/git) must not serve a marketplace user's request.
+    operator_home = tmp_path / "op"
+    operator_home.mkdir()
+    (operator_home / ".netrc").write_text("machine github.com login op password secret\n")
+    monkeypatch.setenv("HOME", str(operator_home))
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(operator_home / ".config"))
     monkeypatch.setenv("GIT_CONFIG_GLOBAL", "/home/op/.gitconfig")
     monkeypatch.setenv("GIT_ASKPASS", "/usr/bin/op-askpass")
     monkeypatch.setenv("SSH_AUTH_SOCK", "/tmp/op-agent")
     monkeypatch.setenv("PATH", "/usr/bin")
-    seen: list[tuple[list[str], dict[str, str]]] = []
+    seen: list[tuple[list[str], dict[str, str], list[str]]] = []
 
     def run(cmd: list[str], **kwargs: object) -> object:
-        seen.append((cmd, kwargs["env"]))  # type: ignore[arg-type]
+        env = kwargs["env"]  # type: ignore[index]
+        seen.append((cmd, env, os.listdir(env["HOME"])))  # type: ignore[arg-type]
         return type("P", (), {"returncode": 0, "stderr": ""})()
 
     monkeypatch.setattr(subprocess, "run", run)
     git_source.clone_github_source(
         "https://github.com/a/b.git", None, tmp_path / "r", isolated=True
     )
-    cmd, env = seen[0]
+    cmd, env, home_listing = seen[0]
     assert cmd[cmd.index("credential.helper=") - 1] == "-c"
     assert env["GIT_CONFIG_GLOBAL"] == os.devnull and env["GIT_CONFIG_NOSYSTEM"] == "1"
     assert env["GIT_ASKPASS"] == "" and "SSH_AUTH_SOCK" not in env
     assert env["PATH"] == "/usr/bin"
+    # An empty home of its own, gone again after the clone.
+    assert env["HOME"] != str(operator_home) and env["XDG_CONFIG_HOME"] == env["HOME"]
+    assert home_listing == [] and not os.path.exists(env["HOME"])
 
     # The CLI keeps the developer's own setup.
     git_source.clone_github_source("https://github.com/a/b.git", None, tmp_path / "r2")
-    _cmd, env = seen[1]
+    _cmd, env, _listing = seen[1]
     assert env["GIT_CONFIG_GLOBAL"] == "/home/op/.gitconfig" and "credential.helper=" not in _cmd
+    assert env["HOME"] == str(operator_home)
 
 
 def test_tar_untrusted_dir_stops_at_the_limits_before_reading_more(tmp_path: Path) -> None:

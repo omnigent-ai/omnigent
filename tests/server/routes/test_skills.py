@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import asyncio
+import io
+import tarfile
 import time
 from dataclasses import replace
 from pathlib import Path
@@ -35,6 +37,7 @@ from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
+from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
 from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle
 
@@ -74,6 +77,7 @@ def skills_app(db_uri: str, tmp_path: Path):
         HostHelloFrame(version="test", frame_protocol_version=1, name="host"),
         owner="owner",
     )
+    skills = SqlAlchemySkillStore(db_uri)
     app = FastAPI()
     app.state.host_store = hosts
     app.state.agent_cache = AgentCache(artifacts, tmp_path / "cache")
@@ -87,6 +91,8 @@ def skills_app(db_uri: str, tmp_path: Path):
         host_registry=registry,
         auth_provider=_Auth(),
         permission_store=permissions,
+        agent_cache=app.state.agent_cache,
+        skill_store=skills,
     )
     app.include_router(router, prefix="/v1")
     app.include_router(
@@ -98,6 +104,7 @@ def skills_app(db_uri: str, tmp_path: Path):
             agent_cache=app.state.agent_cache,
             auth_provider=_Auth(),
             permission_store=permissions,
+            skill_store=skills,
         ),
         prefix="/v1",
     )
@@ -404,3 +411,105 @@ async def test_managed_host_bundle_token_is_bound_to_session_host(
         assert response.headers["X-Agent-Id"] == agent.id
         assert response.headers["X-Agent-Version"] == str(agent.version)
         assert response.headers["Cache-Control"] == "no-store"
+
+
+def _install_personal_skill(db_uri: str, tmp_path: Path, owner: str, name: str) -> None:
+    """A user-scoped install for *owner* with a stored tarball the bundle route can read."""
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as tf:
+        data = f"---\nname: {name}\ndescription: {name}\n---\n".encode()
+        info = tarfile.TarInfo("SKILL.md")
+        info.size = len(data)
+        tf.addfile(info, io.BytesIO(data))
+    LocalArtifactStore(str(tmp_path / "artifacts")).put(f"skills/{name}.tar.gz", out.getvalue())
+    SqlAlchemySkillStore(db_uri).install(
+        name=name,
+        display_name=None,
+        description=name,
+        source_url="https://github.com/acme/skills.git",
+        ref=None,
+        commit=None,
+        path=f"skills/{name}",
+        scope="user",
+        owner_user_id=owner,
+        bundle_location=f"skills/{name}.tar.gz",
+        installed_by=owner,
+    )
+
+
+@pytest.mark.parametrize("skill_filter", ["all", "none"])
+async def test_session_catalog_lists_the_owners_installed_skills_under_the_agents_filter(
+    skills_app, db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, skill_filter: str
+) -> None:
+    # A shared editor asking for the session's menu gets the owner's installs,
+    # never their own, and only when the session's spec allows skills at all.
+    app, _, conn, conv, agent, _ = skills_app
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
+    _install_personal_skill(db_uri, tmp_path, "editor", "editors-skill")
+    loaded = app.state.agent_cache.load(agent.id, agent.bundle_location)
+    spec = replace(loaded.spec, skills_filter=skill_filter, sub_agents=[])
+    monkeypatch.setattr(app.state.agent_cache, "load", lambda *a, **kw: SimpleNamespace(spec=spec))
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        task = asyncio.create_task(
+            client.get(
+                "/v1/skills", params={"session_id": conv.id}, headers={"x-test-user": "editor"}
+            )
+        )
+        frame = decode_host_frame(
+            (await asyncio.wait_for(conn.outbound_queue.get(), budget(2))).data
+        )
+        assert isinstance(frame, HostSkillsFrame)
+        conn.pending_skills[frame.request_id].set_result(
+            HostSkillsResultFrame(
+                frame.request_id,
+                "ok",
+                skills=[{"name": "child-review", "description": "Review"}],
+                session_id=conv.id,
+            )
+        )
+        response = await task
+    assert response.status_code == 200, response.text
+    names = [s["name"] for s in response.json()["skills"]]
+    assert "child-review" in names and "editors-skill" not in names
+    assert ("owners-skill" in names) is (skill_filter == "all")
+    if skill_filter == "all":
+        owners = next(s for s in response.json()["skills"] if s["name"] == "owners-skill")
+        assert owners["source"] == "acme/skills"
+
+
+async def test_bundle_download_carries_personal_skills_only_for_the_runner_and_the_owner(
+    skills_app, db_uri: str, tmp_path: Path
+) -> None:
+    # Personal installs are private: the runner (a managed host, or the owner's
+    # own fetch) gets them in the bundle; a shared reader or editor downloading
+    # the bundle gets the agent's own files only.
+    app, _, _, conv, _, hosts = skills_app
+    _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
+    hosts.register_managed_host(
+        host_id=conv.host_id,
+        name="sandbox",
+        user_id="owner",
+        token="valid",
+        provider="modal",
+        sandbox_id="sandbox",
+        token_expires_at=int(time.time()) + 3600,
+    )
+
+    def names(data: bytes) -> list[str]:
+        with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
+            return tf.getnames()
+
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        for headers, expected in (
+            ({"x-test-user": "owner"}, True),
+            ({MANAGED_HOST_TOKEN_HEADER: "valid"}, True),
+            ({"x-test-user": "editor"}, False),
+            ({"x-test-user": "reader"}, False),
+        ):
+            response = await client.get(f"/v1/sessions/{conv.id}/agent/contents", headers=headers)
+            assert response.status_code == 200, (headers, response.text)
+            assert ("skills/owners-skill/SKILL.md" in names(response.content)) is expected, headers

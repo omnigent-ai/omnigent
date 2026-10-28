@@ -368,15 +368,41 @@ async def test_authorization_boundaries(
 
 
 @pytest.mark.asyncio
-async def test_routes_are_absent_when_the_feature_is_off(
-    db_uri: str, tmp_path: Path, runtime_init: None
+async def test_installs_are_capped_per_owner_and_delivery_is_bounded(
+    market, db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    app, _ = _build(db_uri, tmp_path, enabled=False)
-    transport = httpx.ASGITransport(app=app)
-    async with httpx.AsyncClient(transport=transport, base_url="http://test") as client:
-        assert (await client.get("/v1/installed-skills")).status_code == 404
-        info = (await client.get("/v1/info")).json()
-        assert info["features"]["skills_marketplace"] is False
+    from omnigent.server import skill_injection
+    from omnigent.server.routes import skill_marketplace
+
+    client, _app, artifact_store = market
+    monkeypatch.setattr(skill_marketplace, "MAX_INSTALLED_PER_OWNER", 1)
+    first = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+    )
+    assert first.status_code == 201
+    # Reinstalling the same name replaces it and does not count; a new name is over the cap.
+    assert (
+        await client.post(
+            "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+        )
+    ).status_code == 201
+    capped = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    assert capped.status_code == 400 and "At most 1 skills" in capped.text
+    assert [s["name"] for s in (await client.get("/v1/installed-skills")).json()["data"]] == [
+        "review"
+    ]
+
+    # Delivery has its own byte bound, and exceeding it is an error the caller
+    # sees rather than a skill silently missing from the bundle.
+    session_id = _bind_session(db_uri, artifact_store, _tar({"config.yaml": b"name: bundled\n"}))
+    assert "skills/review/SKILL.md" in _names(
+        (await client.get(f"/v1/sessions/{session_id}/agent/contents")).content
+    )
+    monkeypatch.setattr(skill_injection, "MAX_DELIVERY_BYTES", 10)
+    over = await client.get(f"/v1/sessions/{session_id}/agent/contents")
+    assert over.status_code == 400 and "Installed skills exceed" in over.text
 
 
 # ── bundle injection ──

@@ -88,13 +88,15 @@ class SkillsMarketplacePolicy:
     """The parsed ``skills_marketplace:`` block; the default allows everything."""
 
     sources: tuple[ConfiguredSource, ...] = ()
-    allowed_sources: tuple[str, ...] = ()
+    # ``None`` admits any repository; ``()`` admits none (a list that was
+    # given but unusable fails closed rather than widening to everything).
+    allowed_sources: tuple[str, ...] | None = None
     allow_url_install: bool = True
     credentials: tuple[SourceCredential, ...] = ()
 
     def allows(self, clone_url: str) -> bool:
-        """Whether ``allowed_sources`` admits the repository (an empty list admits any)."""
-        if not self.allowed_sources:
+        """Whether ``allowed_sources`` admits the repository."""
+        if self.allowed_sources is None:
             return True
         key = repository_key(clone_url)
         return key is not None and any(pattern_matches(p, key) for p in self.allowed_sources)
@@ -112,7 +114,9 @@ class SkillsMarketplacePolicy:
         """The token for a repository both ``allowed_sources`` and a credential match.
 
         Read from the credential's environment variable at fetch time; an
-        unset variable sends nothing and is logged.
+        unset variable sends nothing and is logged. The token reaches exactly
+        one clone of that repository's origin (see ``auth_header_env``): it is
+        never stored, cached, logged, or handed to a runner or session.
         """
         key = repository_key(clone_url)
         if key is None or not self.allows(clone_url):
@@ -132,25 +136,37 @@ class SkillsMarketplacePolicy:
 
     @classmethod
     def from_config(cls, raw: Any) -> SkillsMarketplacePolicy:
-        """Parse the config block; an unusable entry is logged and skipped, never fatal."""
+        """Parse the config block; a mistake is logged and fails closed, never open.
+
+        An absent block allows everything. A block that is not a mapping, an
+        ``allowed_sources`` list with no usable entry, or a non-boolean
+        ``allow_url_install`` each refuse rather than widen: a typo must not
+        turn a restriction into none.
+        """
         if raw is None:
             return cls()
         if not isinstance(raw, Mapping):
-            _logger.warning("%s is not a mapping, ignoring it", CONFIG_KEY)
-            return cls()
+            _logger.warning(
+                "%s is not a mapping; refusing every source until it is fixed", CONFIG_KEY
+            )
+            return CLOSED_POLICY
         allow_url_install = raw.get("allow_url_install", True)
         if not isinstance(allow_url_install, bool):
-            _logger.warning("%s.allow_url_install must be true or false", CONFIG_KEY)
-            allow_url_install = True
+            _logger.warning(
+                "%s.allow_url_install must be true or false; treating it as false", CONFIG_KEY
+            )
+            allow_url_install = False
         return cls(
             sources=tuple(_parse_sources(raw.get("sources"))),
-            allowed_sources=tuple(_parse_patterns(raw.get("allowed_sources"))),
+            allowed_sources=_parse_allowed_sources(raw.get("allowed_sources")),
             allow_url_install=allow_url_install,
             credentials=tuple(_parse_credentials(raw.get("credentials"))),
         )
 
 
 DEFAULT_POLICY = SkillsMarketplacePolicy()
+# What an unreadable block yields: no repository and no URL install.
+CLOSED_POLICY = SkillsMarketplacePolicy(allowed_sources=(), allow_url_install=False)
 
 
 def _entries(raw: Any, key: str) -> list[Any]:
@@ -183,9 +199,29 @@ def _parse_sources(raw: Any) -> list[ConfiguredSource]:
     return sources
 
 
+def _parse_allowed_sources(raw: Any) -> tuple[str, ...] | None:
+    """``None`` when the key is absent or an explicit empty list; otherwise the usable globs.
+
+    A list that was given but yields no usable pattern fails closed to ``()``.
+    """
+    if raw is None or raw == []:
+        return None
+    patterns = tuple(_parse_patterns(raw))
+    if not patterns:
+        _logger.warning(
+            "%s.allowed_sources has no usable entry; refusing every source until it is fixed",
+            CONFIG_KEY,
+        )
+    return patterns
+
+
 def _parse_patterns(raw: Any) -> list[str]:
     patterns = []
-    for entry in _entries(raw, "allowed_sources"):
+    entries = [raw] if isinstance(raw, str) else raw
+    if not isinstance(entries, list):
+        _logger.warning("%s.allowed_sources must be a list", CONFIG_KEY)
+        return []
+    for entry in entries:
         pattern = entry.strip().strip("/").lower() if isinstance(entry, str) else ""
         if not pattern or pattern.count("/") > 2:
             _logger.warning(

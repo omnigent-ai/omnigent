@@ -7,6 +7,7 @@ import logging
 import pytest
 
 from omnigent.skills.policy import (
+    CLOSED_POLICY,
     ConfiguredSource,
     SkillPolicyError,
     SkillsMarketplacePolicy,
@@ -50,11 +51,40 @@ def test_from_config_keeps_usable_entries_and_logs_the_rest(
     assert len(skipped) == 5
 
 
-@pytest.mark.parametrize("raw", [None, "nope", {"allow_url_install": "yes", "sources": "x"}])
-def test_an_unusable_block_falls_back_to_allowing_everything(raw: object) -> None:
-    policy = SkillsMarketplacePolicy.from_config(raw)
-    assert policy.allows("https://github.com/anyone/anything.git")
-    assert policy.allow_url_install and not policy.sources and not policy.credentials
+def test_no_block_or_an_explicit_empty_allowlist_allows_everything() -> None:
+    for raw in (None, {}, {"allowed_sources": []}):
+        policy = SkillsMarketplacePolicy.from_config(raw)
+        assert policy.allowed_sources is None
+        assert policy.allows("https://github.com/anyone/anything.git")
+        assert policy.allow_url_install and not policy.sources and not policy.credentials
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "nope",
+        ["github.com/acme/*"],
+        {"allowed_sources": ["a/b/c/d", "", 7]},
+        {"allowed_sources": "a/b/c/d"},
+        {"allowed_sources": {"host": "github.com"}},
+    ],
+)
+def test_a_mistaken_restriction_fails_closed_not_open(
+    raw: object, caplog: pytest.LogCaptureFixture
+) -> None:
+    # A typo in the allowlist must never widen it to every repository.
+    with caplog.at_level(logging.WARNING):
+        policy = SkillsMarketplacePolicy.from_config(raw)
+    assert policy.allowed_sources == ()
+    assert not policy.allows("https://github.com/acme/skills.git")
+    assert "refusing every source" in caplog.text
+    if not isinstance(raw, dict):
+        assert policy == CLOSED_POLICY and policy.allow_url_install is False
+
+
+def test_a_non_boolean_url_install_switch_is_off() -> None:
+    policy = SkillsMarketplacePolicy.from_config({"allow_url_install": "yes"})
+    assert policy.allow_url_install is False
 
 
 @pytest.mark.parametrize(

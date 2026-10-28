@@ -88,7 +88,12 @@ from omnigent.server.schemas import (
     PolicySummary,
     SkillSummary,
 )
-from omnigent.server.skill_injection import _bundle_spec, with_installed_skills
+from omnigent.server.skill_injection import (
+    SkillDeliveryError,
+    bundle_spec,
+    session_spec,
+    with_installed_skills,
+)
 from omnigent.skills.policy import DEFAULT_POLICY
 from omnigent.stores import AgentStore, ConversationStore
 from omnigent.stores.artifact_store import ArtifactStore
@@ -219,6 +224,7 @@ def register_agent_routes(
             not found.
         """
         managed_token = request.headers.get(MANAGED_HOST_TOKEN_HEADER)
+        user_id = None
         if managed_token:
             # A sandbox host can read only bundles for sessions bound to it.
             conv = await asyncio.to_thread(conversation_store.get_conversation, session_id)
@@ -263,17 +269,23 @@ def register_agent_routes(
                 code=ErrorCode.INTERNAL_ERROR,
             )
         if skill_store is not None:
-            # Installed skills follow the session owner, whoever fetches the bundle.
+            # The session owner's installed skills go to the runner (a managed
+            # host, or the owner's own host fetching) and never into a bundle a
+            # shared reader downloads, since personal installs are private.
             owner_id = await asyncio.to_thread(get_session_owner_id, conv.id, permission_store)
-            bundle_bytes = await asyncio.to_thread(
-                with_installed_skills,
-                bundle_bytes,
-                owner_id=owner_id,
-                skill_store=skill_store,
-                artifact_store=artifact_store,
-                spec=_bundle_spec(agent_cache, agent),
-                policy=getattr(request.app.state, "skills_policy", DEFAULT_POLICY),
-            )
+            if managed_token or user_id == owner_id:
+                try:
+                    bundle_bytes = await asyncio.to_thread(
+                        with_installed_skills,
+                        bundle_bytes,
+                        owner_id=owner_id,
+                        skill_store=skill_store,
+                        artifact_store=artifact_store,
+                        spec=session_spec(bundle_spec(agent_cache, agent), conv.sub_agent_name),
+                        policy=getattr(request.app.state, "skills_policy", DEFAULT_POLICY),
+                    )
+                except SkillDeliveryError as exc:
+                    raise OmnigentError(str(exc), code=ErrorCode.INVALID_INPUT) from None
         selection_headers = {}
         if request.headers.get(MCP_SELECTION_HEADER) == "1":
             selection_headers[MCP_SELECTION_HEADER] = json.dumps(

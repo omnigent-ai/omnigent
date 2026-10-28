@@ -14,11 +14,21 @@ from omnigent.host.frames import HostSkillsFrame, HostSkillsResultFrame, encode_
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server.auth import LEVEL_EDIT, AuthProvider
 from omnigent.server.host_registry import HostConnection, HostRegistry
-from omnigent.server.routes._auth_helpers import require_access_and_level, require_user
+from omnigent.server.routes._auth_helpers import (
+    get_session_owner_id,
+    require_access_and_level,
+    require_user,
+)
 from omnigent.server.routes._host_launch import host_absent_error, resolve_host_owner
 from omnigent.server.routes._session_create_validation import validate_session_agent
 from omnigent.server.schemas import SkillSummary
-from omnigent.server.skill_injection import effective_installed_skills, skill_allowed
+from omnigent.server.skill_injection import (
+    SkillDeliveryError,
+    bundle_spec,
+    effective_installed_skills,
+    session_spec,
+    skill_allowed,
+)
 from omnigent.skills.git_source import repository_label
 from omnigent.skills.policy import DEFAULT_POLICY
 from omnigent.spec.types import AgentSpec
@@ -76,6 +86,10 @@ def create_skills_router(
         agent_version = sub_agent_name = None
         spec: AgentSpec | None = None
         host = None
+        # Installed skills belong to a session's owner and follow the spec that
+        # governs the session; pre-session discovery is the caller's own.
+        installed_owner = user_id
+        installed_spec: AgentSpec | None = None
         if session_id is not None:
             if any(value is not None for value in (host_id, harness, path, agent_id)):
                 raise HTTPException(
@@ -105,6 +119,13 @@ def create_skills_router(
                 str(agent.version),
                 conv.sub_agent_name,
             )
+            if skill_store is not None:
+                installed_owner = await asyncio.to_thread(
+                    get_session_owner_id, conv.id, permission_store
+                )
+                installed_spec = session_spec(
+                    await asyncio.to_thread(bundle_spec, agent_cache, agent), sub_agent_name
+                )
         else:
             if host_id is None or harness is None or path is None:
                 raise HTTPException(
@@ -133,6 +154,7 @@ def create_skills_router(
                     expand_env=agent.operator_authored,
                 )
                 spec, agent_version = loaded.spec, str(agent.version)
+                installed_spec = spec
 
         conn = host_registry.get(host_id)
         if conn is None:
@@ -177,13 +199,18 @@ def create_skills_router(
                 if skill.user_invocable
             ] + [skill for skill in skills if skill.name not in reserved]
         if skill_store is not None:
-            installed = await asyncio.to_thread(
-                effective_installed_skills,
-                skill_store,
-                user_id,
-                policy=getattr(request.app.state, "skills_policy", DEFAULT_POLICY),
+            try:
+                installed = await asyncio.to_thread(
+                    effective_installed_skills,
+                    skill_store,
+                    installed_owner,
+                    policy=getattr(request.app.state, "skills_policy", DEFAULT_POLICY),
+                )
+            except SkillDeliveryError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from None
+            skills += installed_skill_summaries(
+                installed, installed_spec, {s.name for s in skills}
             )
-            skills += installed_skill_summaries(installed, spec, {s.name for s in skills})
         return SkillsResponse(skills=skills, warnings=result.warnings)
 
     return router

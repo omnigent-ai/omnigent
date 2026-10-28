@@ -13,13 +13,10 @@ from omnigent.skills.policy import SkillPolicyError, SkillsMarketplacePolicy, So
 from omnigent.skills.service import SkillFetcher, resolve_source
 
 
-def test_resolve_source_accepts_shorthand_and_urls_only_for_github() -> None:
-    assert resolve_source("acme/skills") == ("https://github.com/acme/skills.git", None)
-    assert resolve_source("https://github.com/acme/skills/tree/v2", None) == (
-        "https://github.com/acme/skills.git",
-        "v2",
-    )
-    assert resolve_source("acme/skills", "main")[1] == "main"
+def test_resolve_source_prefers_an_explicit_ref_and_names_the_restriction() -> None:
+    # Parsing itself is covered with the shared helper; this is the service's part.
+    assert resolve_source("https://github.com/acme/skills/tree/v2", "main")[1] == "main"
+    assert resolve_source("https://github.com/acme/skills/tree/v2")[1] == "v2"
     with pytest.raises(GitSourceError, match="Only GitHub"):
         resolve_source("https://gitlab.com/acme/skills")
 
@@ -39,6 +36,26 @@ def test_catalog_is_cached_per_source_until_refreshed(plain_repo: Path, fake_clo
     assert len(clone.calls) == 3
 
 
+def test_catalog_cache_is_bounded_and_drops_expired_entries_first(
+    plain_repo: Path, fake_clone, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.skills import service
+
+    clock = {"now": 1_000.0}
+    monkeypatch.setattr(service.time, "monotonic", lambda: clock["now"])
+    fetcher = SkillFetcher(clone=fake_clone(plain_repo), ttl_s=100, max_cached=2)
+
+    for index in range(3):
+        fetcher.catalog(f"acme/r{index}")
+    # Any signed-in user can preview repositories; retention never exceeds the cap.
+    assert fetcher.cached_catalogs == 2
+    assert fetcher.catalog("acme/r0").fetched_at == clock["now"]  # evicted, so refetched
+
+    clock["now"] += 200
+    fetcher.catalog("acme/r9")
+    assert fetcher.cached_catalogs == 1  # the expired ones went before the cap was applied
+
+
 def test_package_clones_once_and_tars_each_named_skill(plain_repo: Path, fake_clone) -> None:
     clone = fake_clone(plain_repo)
     fetcher = SkillFetcher(clone=clone)
@@ -47,7 +64,7 @@ def test_package_clones_once_and_tars_each_named_skill(plain_repo: Path, fake_cl
 
     assert commit is None  # the fixture copy is not a git checkout
     assert [p.entry.name for p in packaged] == ["triage", "review"]
-    assert packaged[1].markdown.startswith("---\nname: Code Review")
+    assert packaged[1].entry.display_name == "Code Review"
     with tarfile.open(fileobj=io.BytesIO(packaged[0].tarball), mode="r:gz") as tf:
         assert sorted(tf.getnames()) == ["SKILL.md", "notes.txt"]
     assert len(clone.calls) == 1

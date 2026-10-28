@@ -108,3 +108,16 @@ def test_namespaced_and_reserved_names_keep_bundle_precedence() -> None:
         "skills/fresh/notes.txt",
         "skills/team/triage/SKILL.md",
     ]
+
+
+def test_overlay_bytes_do_not_depend_on_the_clock(monkeypatch: pytest.MonkeyPatch) -> None:
+    # The runner caches by the hash of the response, so the same inputs must
+    # give the same bytes whenever they are built.
+    import time
+
+    monkeypatch.setattr(time, "time", lambda: 1_000.0)
+    first = overlay_skills(BUNDLE, [("review", SKILL)])
+    monkeypatch.setattr(time, "time", lambda: 2_000.0)
+    second = overlay_skills(BUNDLE, [("review", SKILL)])
+    assert first == second
+    assert _names(first) == _names(second) and "skills/review/SKILL.md" in _names(first)

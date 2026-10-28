@@ -51,7 +51,15 @@ include them.
 
 - A user's installs are visible only to them. An administrator can install
   for **Everyone**, which every user receives. When a user and the org both
-  have a skill of the same name, the user's copy wins for that user.
+  have a skill of the same name, the user's copy wins for that user. A
+  session's bundle carries its owner's installs only when the runner fetches
+  it (a managed host, or the owner's own host); someone the session is
+  shared with downloads the agent's own files without them, and sees the
+  owner's installs, not their own, in that session's slash menu.
+- Each user can hold at most 200 installed skills, and so can **Everyone**,
+  so a session's bundle is built from a known number of rows; a bundle whose
+  installed skills would exceed 200 MB together is refused with a message
+  rather than silently thinned.
 - Only administrators add or remove browsable sources. Deleting a source does
   not remove skills already installed from it.
 - Anyone can preview a repository by URL and install from it for themselves,
@@ -89,15 +97,25 @@ skills_marketplace:
 - `allowed_sources` lists `host/owner/repo` patterns; `*` matches within one
   segment, and a shorter pattern such as `github.acme.internal` covers the
   rest. A repository outside the list cannot be added, previewed, installed
-  or updated, and an installed skill from one is no longer served.
+  or updated, and an installed skill from one is no longer served. The list
+  fails closed: a block that is not a mapping, or a list whose entries are
+  all unusable, refuses every repository (with a warning in the log) rather
+  than widening to all of them. Only an absent key, or an explicit empty
+  list, means any repository.
 - `allow_url_install: false` removes **Add from URL** and refuses installs
-  (and updates) from any repository that is not a listed source.
+  (and updates) from any repository that is not a listed source. A value
+  that is not `true` or `false` counts as `false`.
 - `credentials` let the server reach private repositories without borrowing
-  the operator's own git setup: the token named by `token_env` is read from
-  the environment at fetch time and sent only to a repository that matches
-  both `allowed_sources` and `match`, as an authorization header through
-  `GIT_CONFIG_COUNT` (git 2.31 or newer), never on the command line. The
-  file itself never holds a secret.
+  the operator's own git setup. The token named by `token_env` is read from
+  the environment at fetch time and reaches exactly this far: one clone of a
+  repository that matches both `allowed_sources` and `match`, sent as a
+  basic-auth header (`x-access-token:<token>`) bound to that repository's
+  origin through `GIT_CONFIG_COUNT` (git 2.31 or newer) and never on the
+  command line, so a redirect to another host does not carry it. It is not
+  stored, not logged, not part of the catalog cache, and never reaches a
+  runner, a session or a user; what it can read on that host is whatever
+  the token itself grants, so issue one scoped to read-only contents of the
+  repositories you list. The file itself never holds a secret.
 
 `GET /v1/info` reports `skills_marketplace.url_install` so the Settings page
 can hide the URL form.
@@ -111,12 +129,17 @@ references. A skill is markdown and supporting files the harness reads; it
 runs with whatever the harness already allows. Every card and installed entry
 shows the repository and the commit it was taken from.
 
-The server's clone is isolated from its own git configuration and credential
-helpers, so a user cannot reach a private repository through the operator's
-credentials. Limits are checked while packing, before more is read: at most
-20 skills per request, 20 MB and 2,000 files per skill, 100 MB per request,
-and two fetches at a time. Repository metadata that would not fit its column
-is rejected before anything is stored.
+The server's clone runs with an empty temporary home and no inherited git,
+ssh or gpg settings, so neither git nor libcurl can find the operator's
+`.netrc`, `.config/git` or credential helpers: a user cannot reach a private
+repository through the operator's credentials, only through a token the
+[operator policy](#operator-policy) scopes to it. Limits are checked while
+packing, before more is read: at most 20 skills per request, 20 MB and 2,000
+files per skill, 100 MB per request, and two fetches at a time; a catalog
+holds at most 500 skills and the server keeps at most 64 catalogs in memory.
+Repository metadata that would not fit its column is rejected before
+anything is stored, and the served bundle is rebuilt with a fixed timestamp
+so the same skills give the same bytes and the runner's cache hits.
 
 ## API
 

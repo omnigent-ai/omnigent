@@ -5,6 +5,8 @@ from __future__ import annotations
 import shutil
 from pathlib import Path
 
+import pytest
+
 from omnigent.skills.catalog import index_checkout
 
 
@@ -26,18 +28,26 @@ def test_marketplace_indexes_in_repo_plugins_and_reports_the_rest(marketplace_re
     assert any("'remote'" in note and "another repository" in note for note in skipped)
     assert any("'escape'" in note and "not a directory" in note for note in skipped)
 
-
-def test_marketplace_plugin_skills_are_attributed(marketplace_repo: Path) -> None:
     # Without the shadowing root skill, the plugin's own skill is listed under it.
     shutil.rmtree(marketplace_repo / "skills")
-    entries = index_checkout(marketplace_repo)
-    assert [(e.name, e.plugin, e.path) for e in entries] == [
+    assert [(e.name, e.plugin, e.path) for e in index_checkout(marketplace_repo)] == [
         ("changelog", "docs", "plugins/docs/skills/changelog"),
     ]
 
 
 def test_empty_or_missing_layouts_index_nothing(tmp_path: Path) -> None:
     assert index_checkout(tmp_path) == []
+
+
+def test_a_catalog_stops_at_its_entry_cap(
+    plain_repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from omnigent.skills import catalog
+
+    monkeypatch.setattr(catalog, "MAX_CATALOG_ENTRIES", 1)
+    skipped: list[str] = []
+    assert [e.name for e in index_checkout(plain_repo, skipped=skipped)] == ["review"]
+    assert "catalog truncated at 1 skills" in skipped
 
 
 def test_links_are_never_followed(plain_repo: Path, tmp_path: Path) -> None:

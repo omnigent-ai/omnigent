@@ -1,0 +1,40 @@
+"""The marketplace's size and count limits, in one place.
+
+The column bounds mirror the ``String(n)`` declarations on
+``SqlInstalledSkill`` and ``SqlSkillSource``; a test pins the two together.
+Every column stays far below the 16 KiB stored-value limit even at four
+bytes a character.
+"""
+
+MIB = 1024 * 1024
+
+# Indexing a checkout.
+MAX_CATALOG_ENTRIES = 500
+MAX_SKILL_MD_BYTES = MIB
+MAX_MANIFEST_BYTES = MIB
+
+# Packaging: per skill, checked while walking, and per install request.
+MAX_SKILL_BYTES = 20 * MIB
+MAX_SKILL_ENTRIES = 2_000
+MAX_INSTALL_BYTES = 100 * MIB
+MAX_NAMES_PER_INSTALL = 20
+
+# Installed rows per user and for the org, so delivery reads a known number of
+# pages; and the most a served bundle may carry.
+MAX_INSTALLED_PER_OWNER = 200
+MAX_DELIVERY_BYTES = 200 * MIB
+
+# Paging.
+MAX_PAGE = 200
+DEFAULT_PAGE = 50
+
+# Stored-column bounds, in characters.
+MAX_NAME_CHARS = 255
+MAX_DISPLAY_NAME_CHARS = 256
+MAX_DESCRIPTION_CHARS = 1024
+MAX_URL_CHARS = 255
+MAX_REF_CHARS = 255
+MAX_COMMIT_CHARS = 64
+MAX_PATH_CHARS = 1024
+MAX_LOCATION_CHARS = 512
+MAX_USER_ID_CHARS = 128

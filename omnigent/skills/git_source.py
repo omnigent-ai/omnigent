@@ -14,6 +14,7 @@ import os
 import re
 import subprocess
 import tarfile
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -111,20 +112,25 @@ def auth_header_env(clone_url: str, token: str) -> dict[str, str]:
     }
 
 
-def isolated_git_env() -> dict[str, str]:
+def isolated_git_env(home: str) -> dict[str, str]:
     """An environment for a server-side clone: no inherited git, ssh or gpg settings.
 
-    Global and system git config are pointed at empty files and credential
-    helpers are disabled on the command line, so the clone can only reach
-    what an anonymous HTTPS client can.
+    Global and system git config are pointed at empty files, credential
+    helpers are disabled on the command line, and ``HOME`` is *home*, an
+    empty directory, so neither git nor libcurl finds the operator's
+    ``.netrc`` or ``.config/git``. The clone can only reach what an anonymous
+    HTTPS client can.
     """
     env = {
         key: value
         for key, value in os.environ.items()
         if not key.startswith(_INHERITED_GIT_ENV_PREFIXES)
+        and key not in ("XDG_CONFIG_HOME", "CURL_HOME", "NETRC")
     }
     env.update(
         {
+            "HOME": home,
+            "XDG_CONFIG_HOME": home,
             "GIT_TERMINAL_PROMPT": "0",
             "GIT_LFS_SKIP_SMUDGE": "1",
             "GIT_CONFIG_NOSYSTEM": "1",
@@ -161,26 +167,27 @@ def clone_github_source(
     cmd += ["clone", "--depth", "1", "--no-recurse-submodules", "--quiet"]
     if ref:
         cmd += ["--branch", ref]
-    env = (
-        isolated_git_env()
-        if isolated
-        else {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
-    )
-    if token:
-        env.update(auth_header_env(clone_url, token))
-    try:
-        proc = subprocess.run(
-            [*cmd, "--", clone_url, str(dest)],
-            capture_output=True,
-            text=True,
-            env=env,
-            check=False,
-            timeout=CLONE_TIMEOUT_S,
+    with tempfile.TemporaryDirectory(prefix="omnigent-git-home-") as home:
+        env = (
+            isolated_git_env(home)
+            if isolated
+            else {**os.environ, "GIT_TERMINAL_PROMPT": "0", "GIT_LFS_SKIP_SMUDGE": "1"}
         )
-    except FileNotFoundError:
-        raise GitSourceError("Installing from GitHub needs git on your PATH.") from None
-    except subprocess.TimeoutExpired:
-        raise GitSourceError(f"Timed out cloning {clone_url}.") from None
+        if token:
+            env.update(auth_header_env(clone_url, token))
+        try:
+            proc = subprocess.run(
+                [*cmd, "--", clone_url, str(dest)],
+                capture_output=True,
+                text=True,
+                env=env,
+                check=False,
+                timeout=CLONE_TIMEOUT_S,
+            )
+        except FileNotFoundError:
+            raise GitSourceError("Installing from GitHub needs git on your PATH.") from None
+        except subprocess.TimeoutExpired:
+            raise GitSourceError(f"Timed out cloning {clone_url}.") from None
     if proc.returncode != 0:
         hint = (
             "\n(Only branch and tag names work as a ref, not commit SHAs.)"

@@ -24,6 +24,7 @@ from omnigent.server.routes._auth_helpers import require_user
 from omnigent.server.routes._content_type import require_json_content_type
 from omnigent.server.routes._origin import require_trusted_origin
 from omnigent.skills.git_source import GitSourceError, repository_label
+from omnigent.skills.limits import MAX_INSTALLED_PER_OWNER, MAX_NAMES_PER_INSTALL
 from omnigent.skills.overlay import SkillTarballError, validate_skill_tarball
 from omnigent.skills.policy import DEFAULT_POLICY, SkillPolicyError, SkillsMarketplacePolicy
 from omnigent.skills.service import FetchedCatalog, SkillFetcher, resolve_source
@@ -33,7 +34,6 @@ from omnigent.stores.skill_store import DEFAULT_PAGE, MAX_PAGE, SkillStore, Skil
 
 _logger = logging.getLogger(__name__)
 
-MAX_NAMES_PER_INSTALL = 20
 # Clones and packaging are CPU, disk and network work; bound how many run at once.
 _FETCH_CONCURRENCY = 2
 
@@ -224,19 +224,6 @@ def _invalid(exc: Exception) -> OmnigentError:
     return OmnigentError(str(exc), code=code)
 
 
-async def _listed_source(skill_store: SkillStore, url: str, ref: str | None) -> SkillSource | None:
-    """The browsable source for this exact repository and ref, if there is one."""
-    after: str | None = None
-    while True:
-        page = await asyncio.to_thread(skill_store.list_sources, after=after)
-        for source in page.data:
-            if source.url == url and source.ref == ref:
-                return source
-        if not page.has_more or page.last_id is None:
-            return None
-        after = page.last_id
-
-
 def seed_configured_sources(skill_store: SkillStore, policy: SkillsMarketplacePolicy) -> None:
     """Add the config's ``sources`` to the browse list; an existing row is left as is."""
     for source in policy.sources:
@@ -251,16 +238,12 @@ def seed_configured_sources(skill_store: SkillStore, policy: SkillsMarketplacePo
             _logger.warning("could not seed skill source %s", source.url, exc_info=True)
 
 
-async def _all_installed(skill_store: SkillStore, user_id: str | None) -> list[InstalledSkill]:
-    """Every installed skill the user can see, read page by page."""
-    out: list[InstalledSkill] = []
-    after: str | None = None
-    while True:
-        page = await asyncio.to_thread(skill_store.list_for_user, user_id, after=after)
-        out.extend(page.data)
-        if not page.has_more or page.last_id is None:
-            return out
-        after = page.last_id
+async def _installed_among(
+    skill_store: SkillStore, user_id: str | None, fetched: FetchedCatalog
+) -> list[InstalledSkill]:
+    """The caller's visible installs of the catalog's names: one bounded lookup per name."""
+    names = [entry.name for entry in fetched.entries]
+    return await asyncio.to_thread(skill_store.find_for_user, user_id, names)
 
 
 # ── router ───────────────────────────────────────────────────────────────
@@ -292,11 +275,25 @@ def create_skill_marketplace_router(
         policy.require_allowed(url)
         return url, ref
 
+    async def require_room_for(user_id: str | None, scope: str, names: list[str]) -> None:
+        """Hold each owner to the per-owner cap, so delivery reads a known number of rows."""
+        present = await asyncio.to_thread(skill_store.find_for_user, user_id, names)
+        replacing = {skill.name for skill in present if skill.scope == scope}
+        adding = len([name for name in names if name not in replacing])
+        count = await asyncio.to_thread(skill_store.count_installed, scope, user_id)
+        if count + adding > MAX_INSTALLED_PER_OWNER:
+            who = "everyone" if scope == "org" else "a user"
+            raise OmnigentError(
+                f"At most {MAX_INSTALLED_PER_OWNER} skills can be installed for {who}; "
+                "remove some first.",
+                code=ErrorCode.INVALID_INPUT,
+            )
+
     async def require_browsable(url: str, ref: str | None) -> None:
         """With URL installs off, a repository must be a listed source to fetch from."""
         if policy.allow_url_install:
             return
-        if await _listed_source(skill_store, url, ref) is None:
+        if await asyncio.to_thread(skill_store.find_source, url, ref) is None:
             raise OmnigentError(
                 "Installing from a URL is disabled on this server; "
                 "choose a repository from the sources list.",
@@ -378,7 +375,7 @@ def create_skill_marketplace_router(
             )
         except GitSourceError as exc:
             raise _invalid(exc) from None
-        return _catalog_response(fetched, await _all_installed(skill_store, user_id))
+        return _catalog_response(fetched, await _installed_among(skill_store, user_id, fetched))
 
     @router.post("/skill-catalog", dependencies=mutating)
     async def preview_skill_catalog(
@@ -392,7 +389,7 @@ def create_skill_marketplace_router(
             fetched = await fetch(fetcher(request).catalog, url, ref)
         except GitSourceError as exc:
             raise _invalid(exc) from None
-        return _catalog_response(fetched, await _all_installed(skill_store, user_id))
+        return _catalog_response(fetched, await _installed_among(skill_store, user_id, fetched))
 
     # ── installed skills ──
 
@@ -426,6 +423,7 @@ def create_skill_marketplace_router(
         try:
             url, ref = resolve_allowed(body.source, body.ref)
             await require_browsable(url, ref)
+            await require_room_for(user_id, body.scope, names)
             commit, packaged = await fetch(fetcher(request).package, url, ref, names)
         except GitSourceError as exc:
             raise _invalid(exc) from None
@@ -512,6 +510,7 @@ def create_skill_marketplace_router(
                 bundle_location=location,
                 description=fresh.entry.description,
                 display_name=fresh.entry.display_name,
+                path=fresh.entry.path,
             )
         except SkillValueError as exc:
             _drop_artifact(artifact_store, location)

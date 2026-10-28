@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Protocol
 
-from omnigent.skills.catalog import CatalogEntry, index_checkout, skill_markdown
+from omnigent.skills.catalog import CatalogEntry, index_checkout
 from omnigent.skills.git_source import (
     GitSourceError,
     checkout_commit,
@@ -23,13 +23,13 @@ from omnigent.skills.git_source import (
     parse_github_source,
     tar_untrusted_dir,
 )
+from omnigent.skills.limits import MAX_INSTALL_BYTES, MAX_SKILL_BYTES, MAX_SKILL_ENTRIES
 from omnigent.skills.policy import DEFAULT_POLICY, SkillsMarketplacePolicy
 
 CATALOG_TTL_S = 600.0
-# Per skill and per install request; checked while packing, before reading more.
-MAX_SKILL_BYTES = 20 * 1024 * 1024
-MAX_SKILL_ENTRIES = 2_000
-MAX_INSTALL_BYTES = 100 * 1024 * 1024
+# Catalogs retained at once; any signed-in user can preview a repository, so
+# the cache is bounded as well as expiring.
+MAX_CACHED_CATALOGS = 64
 
 
 class Cloner(Protocol):
@@ -59,11 +59,10 @@ class FetchedCatalog:
 
 @dataclass(frozen=True)
 class PackagedSkill:
-    """One skill ready to store: its catalog entry, its tarball, and its ``SKILL.md``."""
+    """One skill ready to store: its catalog entry and its tarball."""
 
     entry: CatalogEntry
     tarball: bytes
-    markdown: str
 
 
 def resolve_source(source: str, ref: str | None = None) -> tuple[str, str | None]:
@@ -89,12 +88,34 @@ class SkillFetcher:
         clone: Cloner = server_clone,
         ttl_s: float = CATALOG_TTL_S,
         policy: SkillsMarketplacePolicy = DEFAULT_POLICY,
+        max_cached: int = MAX_CACHED_CATALOGS,
     ):
         self._clone = clone
         self._ttl_s = ttl_s
         self._policy = policy
+        self._max_cached = max_cached
         self._catalogs: dict[tuple[str, str | None], FetchedCatalog] = {}
         self._lock = threading.Lock()
+
+    def _remember(self, key: tuple[str, str | None], fetched: FetchedCatalog) -> None:
+        """Cache *fetched*, dropping expired entries first and then the oldest past the cap."""
+        with self._lock:
+            now = time.monotonic()
+            for stale in [
+                k for k, v in self._catalogs.items() if now - v.fetched_at >= self._ttl_s
+            ]:
+                del self._catalogs[stale]
+            self._catalogs.pop(key, None)
+            while len(self._catalogs) >= self._max_cached:
+                oldest = min(self._catalogs, key=lambda k: self._catalogs[k].fetched_at)
+                del self._catalogs[oldest]
+            self._catalogs[key] = fetched
+
+    @property
+    def cached_catalogs(self) -> int:
+        """How many catalogs are held right now."""
+        with self._lock:
+            return len(self._catalogs)
 
     def resolve(self, source: str, ref: str | None = None) -> tuple[str, str | None]:
         """``(clone_url, ref)`` for a source the policy allows.
@@ -135,8 +156,7 @@ class SkillFetcher:
                 skipped=tuple(skipped),
                 fetched_at=time.monotonic(),
             )
-        with self._lock:
-            self._catalogs[key] = fetched
+        self._remember(key, fetched)
         return fetched
 
     def package(
@@ -172,7 +192,5 @@ class SkillFetcher:
                         f"The requested skills exceed {MAX_INSTALL_BYTES // (1024 * 1024)} MB "
                         "together; install fewer at a time."
                     )
-                packaged.append(
-                    PackagedSkill(entry=entry, tarball=tarball, markdown=skill_markdown(skill_dir))
-                )
+                packaged.append(PackagedSkill(entry=entry, tarball=tarball))
             return checkout_commit(checkout), packaged

@@ -8,13 +8,13 @@ harness change. The bundle's own skills always win a name collision.
 
 from __future__ import annotations
 
+import gzip
 import io
 import tarfile
 from collections.abc import Collection, Sequence
 from pathlib import PurePosixPath
 
-MAX_SKILL_BYTES = 20 * 1024 * 1024
-MAX_SKILL_ENTRIES = 2_000
+from omnigent.skills.limits import MAX_SKILL_BYTES, MAX_SKILL_ENTRIES
 
 
 class SkillTarballError(Exception):
@@ -86,14 +86,20 @@ def overlay_skills(
 
     A name the bundle already has, or one in *reserved* (the parsed spec's
     canonical skill names), is left alone. The archive is rebuilt once for
-    all skills. An unsafe tarball raises rather than being skipped, so a bad
-    row is noticed instead of silently missing from the menu.
+    all skills, with a fixed gzip timestamp so the same inputs give the same
+    bytes and the runner's content-addressed cache hits. An unsafe tarball
+    raises rather than being skipped, so a bad row is noticed instead of
+    silently missing from the menu.
     """
     if not skills:
         return bundle_bytes
     present = bundle_skill_names(bundle_bytes) | set(reserved)
     out = io.BytesIO()
-    with _open(bundle_bytes) as src, tarfile.open(fileobj=out, mode="w:gz") as dst:
+    with (
+        _open(bundle_bytes) as src,
+        gzip.GzipFile(fileobj=out, mode="wb", mtime=0) as packed,
+        tarfile.open(fileobj=packed, mode="w") as dst,
+    ):
         for member in src:
             dst.addfile(member, src.extractfile(member) if member.isfile() else None)
         for name, data in skills:

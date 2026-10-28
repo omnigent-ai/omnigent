@@ -3,24 +3,43 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import Generic, TypeVar
 
 from omnigent.entities import InstalledSkill, SkillSource
 from omnigent.entities.skill import SkillScope
+from omnigent.skills.limits import (
+    DEFAULT_PAGE,
+    MAX_DESCRIPTION_CHARS,
+    MAX_DISPLAY_NAME_CHARS,
+    MAX_INSTALLED_PER_OWNER,
+    MAX_LOCATION_CHARS,
+    MAX_NAME_CHARS,
+    MAX_PAGE,
+    MAX_PATH_CHARS,
+    MAX_REF_CHARS,
+    MAX_URL_CHARS,
+    MAX_USER_ID_CHARS,
+)
 
-# Every list read is a page of at most this many rows.
-MAX_PAGE = 200
-DEFAULT_PAGE = 50
-
-# Stored-column bounds in characters (see SqlInstalledSkill / SqlSkillSource).
-MAX_NAME_CHARS = 255
-MAX_DISPLAY_NAME_CHARS = 256
-MAX_DESCRIPTION_CHARS = 1024
-MAX_URL_CHARS = 512
-MAX_REF_CHARS = 255
-MAX_PATH_CHARS = 1024
-MAX_LOCATION_CHARS = 512
+__all__ = [
+    "DEFAULT_PAGE",
+    "MAX_DESCRIPTION_CHARS",
+    "MAX_DISPLAY_NAME_CHARS",
+    "MAX_INSTALLED_PER_OWNER",
+    "MAX_LOCATION_CHARS",
+    "MAX_NAME_CHARS",
+    "MAX_PAGE",
+    "MAX_PATH_CHARS",
+    "MAX_REF_CHARS",
+    "MAX_URL_CHARS",
+    "MAX_USER_ID_CHARS",
+    "SkillPage",
+    "SkillStore",
+    "SkillValueError",
+    "check_bound",
+]
 
 T = TypeVar("T")
 
@@ -50,7 +69,11 @@ def check_bound(field: str, value: str | None, limit: int) -> None:
 
 
 class SkillStore(ABC):
-    """Abstract store for marketplace sources and installed skills."""
+    """Abstract store for marketplace sources and installed skills.
+
+    Every read is bounded: lists are keyset pages, lookups take a finite set
+    of names, and counts stop at :data:`MAX_INSTALLED_PER_OWNER`.
+    """
 
     # ── sources ──────────────────────────────────────────────────────────
 
@@ -59,6 +82,10 @@ class SkillStore(ABC):
         self, *, url: str, ref: str | None, name: str, created_by: str | None
     ) -> SkillSource:
         """Add a repository to browse; the same ``(url, ref)`` twice returns the existing row."""
+
+    @abstractmethod
+    def find_source(self, url: str, ref: str | None) -> SkillSource | None:
+        """The source for this exact ``(url, ref)``, if any."""
 
     @abstractmethod
     def list_sources(
@@ -105,6 +132,14 @@ class SkillStore(ABC):
         """A page of the org-scoped skills plus *user_id*'s own, oldest first."""
 
     @abstractmethod
+    def find_for_user(self, user_id: str | None, names: Collection[str]) -> list[InstalledSkill]:
+        """The visible installs among *names* (org-scoped plus the user's own)."""
+
+    @abstractmethod
+    def count_installed(self, scope: SkillScope, owner_user_id: str | None) -> int:
+        """Rows in one scope for one owner, counted no further than the per-owner cap."""
+
+    @abstractmethod
     def update(
         self,
         skill_id: str,
@@ -113,6 +148,7 @@ class SkillStore(ABC):
         bundle_location: str,
         description: str,
         display_name: str | None,
+        path: str | None = None,
     ) -> InstalledSkill | None:
         """Replace the stored package after a refetch; ``None`` when absent."""
 

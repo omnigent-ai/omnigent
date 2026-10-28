@@ -2296,7 +2296,6 @@ def create_app(
     app.state.host_store = host_store
     app.state.skill_store = active_skill_store
     app.state.skills_policy = skills_policy
-    # Tests swap in a fetcher whose clone copies a fixture repository.
     app.state.skill_fetcher = SkillFetcher(policy=skills_policy)
     if active_skill_store is not None:
         from omnigent.server.routes.skill_marketplace import create_skill_marketplace_router

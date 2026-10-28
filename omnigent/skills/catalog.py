@@ -19,21 +19,21 @@ import re
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
+from omnigent.skills.limits import (
+    MAX_CATALOG_ENTRIES,
+    MAX_DESCRIPTION_CHARS,
+    MAX_DISPLAY_NAME_CHARS,
+    MAX_MANIFEST_BYTES,
+    MAX_NAME_CHARS,
+    MAX_PATH_CHARS,
+    MAX_SKILL_MD_BYTES,
+)
 from omnigent.spec.parser import _parse_skill
 
 MARKETPLACE_MANIFEST = ".claude-plugin/marketplace.json"
 SKILL_ROOTS = ("skills", ".agents/skills", ".claude/skills")
-MAX_CATALOG_ENTRIES = 500
-MAX_SKILL_MD_BYTES = 1024 * 1024
-MAX_MANIFEST_BYTES = 1024 * 1024
-# Stored-column bounds (omnigent.db.db_models.SqlInstalledSkill), in characters;
-# every column is far below the 16 KiB stored-value limit even at 4 bytes a char.
-MAX_NAME_CHARS = 255
-MAX_DISPLAY_NAME_CHARS = 256
-MAX_DESCRIPTION_CHARS = 1024
-MAX_PATH_CHARS = 1024
 # Portable command names become directory names in the launch overlay.
-_NAME_RE = re.compile(r"[A-Za-z0-9_-]{1,255}")
+_NAME_RE = re.compile(rf"[A-Za-z0-9_-]{{1,{MAX_NAME_CHARS}}}")
 
 
 @dataclass(frozen=True)
@@ -203,8 +203,3 @@ def index_checkout(root: Path, *, skipped: list[str] | None = None) -> list[Cata
     for plugin, plugin_dir in _plugin_dirs(root, notes):
         add(_entries_under(plugin_dir / "skills", root, plugin, notes))
     return out
-
-
-def skill_markdown(skill_dir: Path) -> str:
-    """The skill's ``SKILL.md`` text (a regular file, as the catalog already checked)."""
-    return (skill_dir / "SKILL.md").read_text(encoding="utf-8")
