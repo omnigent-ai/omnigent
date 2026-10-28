@@ -28,6 +28,8 @@ record omissions rather than treating unselected checks as passed.
 | `images` | P1 | A supported image reaches the model and its reply uses the image; unsupported inputs are rejected without losing the draft. |
 | `fork` | P1 | A supported fork uses copied history on its first turn and remains separate from its parent. |
 | `mcp` | P1 | A configured, supported Omnigent MCP connection can call a harmless tool and show its result. |
+| `user-resources` | P1 | Supported user skills, extensions, prompts and packages remain available after launch/resume; relative paths, disabled resources and owner context controls retain their meaning. |
+| `interactive-input` | P1 | Supported questions and editor dialogs preserve literal/empty answers, settle cancellation, and allow a later turn to complete. |
 
 ## How to get to it (user POV)
 
@@ -69,6 +71,39 @@ consumers of shared code. A capability declaration selects relevant checks; it
 does not prove behavior. Missing credentials or an unobservable transport are
 blocked/missing evidence, not reasons to mark a supported feature N/A.
 
+### Compare harnesses by user journey
+
+Keep a dated comparison with the project's evidence, using one column per
+harness and separate SDK/native rows when their behavior differs. Start with
+Claude, Codex and Pi using the existing declared matrix:
+
+```sh
+uv run --no-sync python -m tests.harness_bench --no-live --markdown \
+  --harness claude-sdk --harness claude-native \
+  --harness codex --harness codex-native --harness pi --harness pi-native
+```
+
+Omit the harness filters to include every official bench profile. Read the
+[capability registry](../omnigent/harness_plugins.py) and owning recipes for
+axes the bench does not measure, such as model families, resources, native
+child discovery and startup settings. Do not duplicate the registry as a
+second maintained capability matrix here.
+
+Each comparison cell needs two independent statements:
+
+| Dimension | What to record |
+| --- | --- |
+| Product behavior | Implemented, limited, known gap, or not established; name the surface and provider/version limits. |
+| Verification | Declaration/source review, mapped test, or observed pass/failure at a specific revision and transport. An unrun test is available coverage, not a pass. |
+
+Unknown declarations are not unsupported features. In particular, a generic
+elicitation flag does not describe every policy bridge or extension dialog;
+Omnigent subagent tools and vendor-child discovery are different journeys.
+Compare like-for-like observations before calling one harness more reliable.
+Keep OSS, live-gateway and Managed evidence separate. For a short CUJ table,
+include core turns, model/effort choice, history recovery, user resources,
+interactive input, native child visibility and remaining acceptance gaps.
+
 ### Existing coverage and gaps
 
 Bench dimensions below are reusable checks, not complete coverage of a row.
@@ -92,6 +127,8 @@ no harness-specific tests exist. No passing per-harness results are implied.
 | `images` | — | No shared probe. Attachment UI alone does not establish delivery to a real harness/model. |
 | `fork` | `fork_replay` | Copied-history use through server/runner; fork dialog, alternate targets and parent isolation need the Sessions recipe. |
 | `mcp` | `omnigent_mcp` | Read-only relay tool for supported natives; Settings inventory alone is not a tool-execution check. |
+| `user-resources` | — | Use the Pi resource recipes below and the native skill/plugin recipes. No shared cross-harness resource-loading probe; file linking alone does not prove runtime discovery or marketplace compatibility. |
+| `interactive-input` | — | `tests/e2e/test_pi_extension_ui_round_trip.py` drives SDK/native Pi through the approval API. The [native dialog recipe](./native-harnesses.md#driving-it-with-the-repro-environment) separately covers browser answers. No shared cross-harness dialog probe. |
 
 Start the tool/history/effort continuity work by extending compatible scenarios,
 not by copying their server/runner setup:
@@ -132,7 +169,7 @@ uv run --no-sync pytest tests/e2e/omnigent/test_pi_bundle_extensions_cwd_e2e.py 
 
 ### Pi user resources (own environments)
 
-For `launch-reply` and `reload-resume`, configure Pi skills/extensions in the
+For `user-resources`, `launch-reply` and `reload-resume`, configure Pi skills/extensions in the
 user agent root, with relative local-package paths and disabled-resource patterns.
 `tests/e2e/omnigent/test_pi_managed_extensions_e2e.py` drives SDK CLI startup with
 default and relative custom roots; inspect provider requests for loaded skills,

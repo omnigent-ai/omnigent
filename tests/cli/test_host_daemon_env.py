@@ -35,7 +35,9 @@ _PROXY_ENV: Final = {
 
 
 @pytest.mark.parametrize("server_url", [None, _REMOTE_SERVER_URL])
-@pytest.mark.parametrize("path_env", ["OMNIGENT_CODEX_PATH", "OMNIGENT_PI_PATH"])
+@pytest.mark.parametrize(
+    "path_env", ["OMNIGENT_CLAUDE_PATH", "OMNIGENT_CODEX_PATH", "OMNIGENT_PI_PATH"]
+)
 @pytest.mark.parametrize("executable_path", [None, "/selected install/bin/harness"])
 def test_executable_selection_survives_daemon_and_runner_boundaries(
     monkeypatch: pytest.MonkeyPatch,
