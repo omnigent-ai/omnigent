@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import sqlite3
 import subprocess
 from collections.abc import Sequence
+from datetime import UTC, datetime
 from hashlib import sha256
 from pathlib import Path
 from typing import get_args
@@ -66,6 +68,34 @@ def _exceeds_compaction_trim_size(path: Path) -> bool:
         return path.stat().st_size > _IMPORT_COMPACT_TRIM_BYTES
     except OSError:
         return False
+
+
+def _source_epoch(value: object) -> int | None:
+    """Parse a source timestamp to Unix seconds, or return None if unusable."""
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        try:
+            number = float(value)
+        except OverflowError:
+            return None
+        if not math.isfinite(number):
+            return None
+        seconds = number / 1000 if number > 1e12 else number
+    elif isinstance(value, str) and value:
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=UTC)
+        try:
+            seconds = parsed.timestamp()
+        except (OverflowError, OSError):
+            return None
+    else:
+        return None
+    return int(seconds) if seconds > 0 else None
 
 
 def _bounded_response_id(response_id: str) -> str:
@@ -579,6 +609,11 @@ def load_claude_session(
             type=item.item_type,
             response_id=item.response_id,
             data=parse_item_data(item.item_type, _claude_import_item_data(item)),
+            created_at=(
+                int(item.created_at)
+                if item.created_at is not None and item.created_at > 0
+                else None
+            ),
         )
         for item in source_items
     )
@@ -664,6 +699,7 @@ def _codex_response_item(
     payload: dict[str, object],
     *,
     response_id: str,
+    created_at: int | None = None,
 ) -> NewConversationItem | None:
     """Convert one supported Codex response item to an Omnigent item."""
     item_type = payload.get("type")
@@ -698,6 +734,7 @@ def _codex_response_item(
         type=normalized_type,
         response_id=response_id[:64],
         data=parse_item_data(normalized_type, data),
+        created_at=created_at,
     )
 
 
@@ -785,7 +822,11 @@ def _codex_native_title(home: Path, session_id: str) -> str | None:
     return None
 
 
-def _codex_compacted_baseline_items(payload: dict[str, object]) -> list[NewConversationItem]:
+def _codex_compacted_baseline_items(
+    payload: dict[str, object],
+    *,
+    created_at: int | None = None,
+) -> list[NewConversationItem]:
     """Convert a Codex ``compacted`` record's replacement_history into items.
 
     Codex appends ``{type: "compacted", payload: {replacement_history: [...]}}``
@@ -801,7 +842,8 @@ def _codex_compacted_baseline_items(payload: dict[str, object]) -> list[NewConve
     for entry in history:
         if not isinstance(entry, dict):
             continue
-        item = _codex_response_item(entry, response_id="codex:compaction")
+        # Replacement-history entries inherit the compaction record's time.
+        item = _codex_response_item(entry, response_id="codex:compaction", created_at=created_at)
         if item is not None:
             baseline.append(item)
     return baseline
@@ -835,6 +877,7 @@ def load_codex_session(
             if not isinstance(record, dict) or not isinstance(record.get("payload"), dict):
                 continue
             payload = record["payload"]
+            recorded_at = _source_epoch(record.get("timestamp"))
             if record.get("type") == "session_meta":
                 cwd = payload.get("cwd")
                 if isinstance(cwd, str) and cwd.strip():
@@ -852,13 +895,15 @@ def load_codex_session(
                 # boundary with no usable baseline is ignored rather than wiping
                 # history to nothing (matches _read_compacted_history's guard).
                 if trim_at_compaction:
-                    baseline = _codex_compacted_baseline_items(payload)
+                    baseline = _codex_compacted_baseline_items(payload, created_at=recorded_at)
                     if baseline:
                         items = baseline
                 continue
             if record.get("type") != "response_item":
                 continue
-            item = _codex_response_item(payload, response_id=f"codex:{turn_id}")
+            item = _codex_response_item(
+                payload, response_id=f"codex:{turn_id}", created_at=recorded_at
+            )
             if item is not None:
                 items.append(item)
 
@@ -985,6 +1030,7 @@ def load_qwen_session(
                 type="message",
                 response_id=_bounded_response_id(response_id),
                 data=parse_item_data("message", data),
+                created_at=_source_epoch(record.get("timestamp")),
             )
         )
     if not items:
@@ -1159,6 +1205,7 @@ def _pi_active_branch(records: list[dict[str, object]]) -> list[dict[str, object
 
 def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, ...]:
     """Convert one Pi message entry to visible Omnigent items."""
+    created_at = _source_epoch(record.get("timestamp"))
     if record.get("type") == "branch_summary":
         summary = record.get("summary")
         if not isinstance(summary, str) or not summary:
@@ -1169,6 +1216,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
             NewConversationItem(
                 type="message",
                 response_id=_bounded_response_id(response_id),
+                created_at=created_at,
                 data=parse_item_data(
                     "message",
                     {
@@ -1202,6 +1250,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
             NewConversationItem(
                 type="function_call_output",
                 response_id=_bounded_response_id(response_id),
+                created_at=created_at,
                 data=parse_item_data(
                     "function_call_output",
                     {"call_id": call_id, "output": _pi_text(message.get("content"))},
@@ -1221,6 +1270,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
             NewConversationItem(
                 type="message",
                 response_id=_bounded_response_id(response_id),
+                created_at=created_at,
                 data=parse_item_data(
                     "message",
                     {"role": "user", "content": normalized},
@@ -1245,6 +1295,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
             NewConversationItem(
                 type="message",
                 response_id=_bounded_response_id(response_id),
+                created_at=created_at,
                 data=parse_item_data("message", data),
             )
         )
@@ -1283,6 +1334,7 @@ def _pi_message_items(record: dict[str, object]) -> tuple[NewConversationItem, .
                 NewConversationItem(
                     type="function_call",
                     response_id=_bounded_response_id(response_id),
+                    created_at=created_at,
                     data=parse_item_data(
                         "function_call",
                         {
@@ -1441,6 +1493,9 @@ def _opencode_message_items(
     message_id = info.get("id")
     native_id = message_id if isinstance(message_id, str) and message_id else str(message_number)
     response_id = _bounded_response_id(f"opencode:{native_id}")
+    # OpenCode stamps each message's creation in ``info.time.created`` (ms).
+    time_info = info.get("time")
+    created_at = _source_epoch(time_info.get("created")) if isinstance(time_info, dict) else None
     items: list[NewConversationItem] = []
     pending_content: list[dict[str, object]] = []
 
@@ -1454,6 +1509,7 @@ def _opencode_message_items(
             NewConversationItem(
                 type="message",
                 response_id=response_id,
+                created_at=created_at,
                 data=parse_item_data("message", data),
             )
         )
@@ -1510,6 +1566,7 @@ def _opencode_message_items(
             NewConversationItem(
                 type="function_call",
                 response_id=response_id,
+                created_at=created_at,
                 data=parse_item_data(
                     "function_call",
                     {
@@ -1533,6 +1590,7 @@ def _opencode_message_items(
                 NewConversationItem(
                     type="function_call_output",
                     response_id=response_id,
+                    created_at=created_at,
                     data=parse_item_data(
                         "function_call_output",
                         {"call_id": call_id, "output": output},

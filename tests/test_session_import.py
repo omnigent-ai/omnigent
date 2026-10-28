@@ -5,6 +5,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import time
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -234,7 +236,7 @@ def test_load_opencode_session_preserves_messages_files_and_tools(
         },
         "messages": [
             {
-                "info": {"id": "msg_user", "role": "user"},
+                "info": {"id": "msg_user", "role": "user", "time": {"created": 1781514000123}},
                 "parts": [
                     {"type": "text", "text": "inspect TODO.md"},
                     {
@@ -245,7 +247,11 @@ def test_load_opencode_session_preserves_messages_files_and_tools(
                 ],
             },
             {
-                "info": {"id": "msg_assistant", "role": "assistant"},
+                "info": {
+                    "id": "msg_assistant",
+                    "role": "assistant",
+                    "time": {"created": 1781514060456},
+                },
                 "parts": [
                     {"type": "reasoning", "text": "private reasoning"},
                     {"type": "text", "text": "Checking."},
@@ -306,6 +312,14 @@ def test_load_opencode_session_preserves_messages_files_and_tools(
     assert dumped[3] == {"call_id": "call_1", "output": "TODO.md:1:item"}
     assert dumped[4]["content"] == [{"type": "output_text", "text": "Done."}]
     assert {item.response_id for item in imported.items[1:]} == {"opencode:msg_assistant"}
+    # info.time.created is epoch milliseconds; every part of a message shares it.
+    assert [item.created_at for item in imported.items] == [
+        1781514000,
+        1781514060,
+        1781514060,
+        1781514060,
+        1781514060,
+    ]
 
 
 def test_load_opencode_session_rejects_invalid_or_mismatched_ids(
@@ -400,6 +414,164 @@ def test_load_claude_session_normalizes_parent_transcript(tmp_path: Path) -> Non
     ]
     assert imported.items[1].data.model_dump()["call_id"] == "toolu_read_1"
     assert imported.items[3].data.model_dump()["agent"] == "claude-native-ui"
+
+
+def _iso_epoch(iso_timestamp: str) -> int:
+    """Unix seconds for an ISO-8601 transcript timestamp."""
+    return int(datetime.fromisoformat(iso_timestamp.replace("Z", "+00:00")).timestamp())
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        ("2026-06-15T09:00:00.000Z", 1781514000),
+        ("2026-06-15T09:00:00+00:00", 1781514000),
+        (1781514000, 1781514000),
+        (1781514000.9, 1781514000),
+        (1781514000123, 1781514000),
+        (0, None),
+        (-1, None),
+        (10**400, None),
+        (-(10**400), None),
+        (float("inf"), None),
+        (float("nan"), None),
+        (True, None),
+        ("1969-12-31T23:59:59Z", None),
+        ("not a timestamp", None),
+        ("", None),
+        (None, None),
+    ],
+)
+def test_source_epoch_normalizes_record_times(value: object, expected: int | None) -> None:
+    """Seconds, milliseconds, and ISO-8601 strings all become whole Unix seconds."""
+    assert local_import._source_epoch(value) == expected
+
+
+@pytest.fixture
+def east_of_utc(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Run the process clock nine hours ahead of UTC (a POSIX TZ string needs no tzdata)."""
+    if not hasattr(time, "tzset"):
+        pytest.skip("time.tzset is POSIX-only")
+    monkeypatch.setenv("TZ", "JST-9")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+@pytest.mark.usefixtures("east_of_utc")
+def test_source_epoch_reads_naive_iso_as_utc() -> None:
+    """A record time without an offset means UTC, whatever zone the importing host runs in."""
+    assert local_import._source_epoch("2026-06-15T09:00:00") == 1781514000
+
+
+@pytest.mark.usefixtures("east_of_utc")
+def test_load_claude_session_reads_naive_record_times_as_utc(tmp_path: Path) -> None:
+    """Claude records without an offset are dated in UTC, not the importing host's zone."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    transcript.write_text(
+        json.dumps(
+            {
+                "type": "user",
+                "uuid": "user-1",
+                "cwd": "/repo",
+                "timestamp": "2026-06-15T09:00:00",
+                "message": {"role": "user", "content": "inspect TODO.md"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert [item.created_at for item in imported.items] == [1781514000]
+
+
+def test_load_claude_session_preserves_record_timestamps(tmp_path: Path) -> None:
+    """Each item keeps its record's own time; an untimed record maps to None."""
+    session_id = "a1b2c3d4-1234-5678-9abc-def012345678"
+    transcript = tmp_path / "projects" / "-repo" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    first_iso, last_iso = "2026-06-15T09:00:00.000Z", "2026-06-15T09:05:00.000Z"
+    records = [
+        {
+            "type": "user",
+            "uuid": "user-1",
+            "cwd": "/repo",
+            "timestamp": first_iso,
+            "message": {"role": "user", "content": "inspect TODO.md"},
+        },
+        {
+            "type": "assistant",
+            "uuid": "assistant-1",
+            "timestamp": last_iso,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+        },
+        {
+            "type": "user",
+            "uuid": "user-2",
+            "message": {"role": "user", "content": "thanks"},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    imported = load_claude_session(session_id, claude_home=tmp_path)
+
+    assert [item.created_at for item in imported.items] == [
+        _iso_epoch(first_iso),
+        _iso_epoch(last_iso),
+        None,
+    ]
+
+
+def test_load_codex_session_preserves_record_timestamps(tmp_path: Path) -> None:
+    """Codex rollout lines' own wall-clock times ride into the items."""
+    session_id = "11111111-2222-4333-8444-555555555555"
+    rollout = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "15"
+        / f"rollout-2026-07-15T12-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    first_iso, last_iso = "2026-07-15T12:00:00.000Z", "2026-07-15T12:10:00.000Z"
+    records = [
+        {"type": "session_meta", "payload": {"id": session_id, "cwd": "/repo"}},
+        {
+            "type": "response_item",
+            "timestamp": first_iso,
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "inspect TODO.md"}],
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": last_iso,
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "Done."}],
+            },
+        },
+    ]
+    rollout.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    assert [item.created_at for item in imported.items] == [
+        _iso_epoch(first_iso),
+        _iso_epoch(last_iso),
+    ]
 
 
 def _write_claude_transcript_with_titles(
@@ -1114,6 +1286,68 @@ def test_load_codex_session_trims_to_last_compaction_when_large(
     assert "post compaction answer" in texts
 
 
+def test_load_codex_session_dates_compaction_baseline_from_record_time(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A trimmed compaction baseline's items inherit the compacted record's own time."""
+    session_id = "019e96aa-0be2-7343-8d3b-6f914d60936b"
+    rollout = (
+        tmp_path
+        / "sessions"
+        / "2026"
+        / "07"
+        / "15"
+        / f"rollout-2026-07-15T12-00-00-{session_id}.jsonl"
+    )
+    rollout.parent.mkdir(parents=True)
+    compaction_iso, post_iso = "2026-07-15T12:30:00.000Z", "2026-07-15T12:40:00.000Z"
+    records = [
+        {"type": "session_meta", "payload": {"id": session_id, "cwd": "/repo"}},
+        {"type": "turn_context", "payload": {"turn_id": "turn_1", "cwd": "/repo"}},
+        {
+            "type": "response_item",
+            "timestamp": "2026-07-15T12:00:00.000Z",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{"type": "input_text", "text": "pre compaction question"}],
+            },
+        },
+        {
+            "type": "compacted",
+            "timestamp": compaction_iso,
+            "payload": {
+                "replacement_history": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "compaction summary baseline"}],
+                    }
+                ]
+            },
+        },
+        {
+            "type": "response_item",
+            "timestamp": post_iso,
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": "post compaction answer"}],
+            },
+        },
+    ]
+    rollout.write_text("".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8")
+    monkeypatch.setattr(local_import, "_IMPORT_COMPACT_TRIM_BYTES", 0)
+
+    imported = load_codex_session(session_id, codex_home=tmp_path)
+
+    assert [item.created_at for item in imported.items] == [
+        _iso_epoch(compaction_iso),
+        _iso_epoch(post_iso),
+    ]
+
+
 def test_load_codex_session_trims_to_final_compaction_with_multiple(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -1599,6 +1833,42 @@ def test_load_qwen_session_normalizes_recorded_messages(tmp_path: Path) -> None:
     assert imported.items[1].data.model_dump()["agent"] == "qwen-native-ui"
 
 
+def test_load_qwen_session_preserves_record_timestamps(tmp_path: Path) -> None:
+    """Each Qwen record's own time rides into its imported item."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    transcript = tmp_path / "projects" / "-repo" / "chats" / f"{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    first_iso, last_iso = "2026-06-15T09:00:00.000Z", "2026-06-15T09:05:00.000Z"
+    records = [
+        {
+            "uuid": "user-1",
+            "sessionId": session_id,
+            "type": "user",
+            "cwd": "/repo",
+            "timestamp": first_iso,
+            "message": {"role": "user", "parts": [{"text": "inspect TODO.md"}]},
+        },
+        {
+            "uuid": "assistant-1",
+            "sessionId": session_id,
+            "type": "assistant",
+            "timestamp": last_iso,
+            "message": {"role": "model", "parts": [{"text": "Done."}]},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records),
+        encoding="utf-8",
+    )
+
+    imported = load_qwen_session(session_id, qwen_home=tmp_path)
+
+    assert [item.created_at for item in imported.items] == [
+        _iso_epoch(first_iso),
+        _iso_epoch(last_iso),
+    ]
+
+
 def test_load_qwen_session_follows_the_current_branch(tmp_path: Path) -> None:
     """Qwen import excludes stale siblings from its linked recording."""
     session_id = "019f8648-2797-7170-bf73-837f2655c47e"
@@ -1874,6 +2144,41 @@ def test_load_pi_session_follows_the_current_branch(tmp_path: Path) -> None:
         "start",
         "take another approach",
         "active answer",
+    ]
+
+
+def test_load_pi_session_preserves_record_timestamps(tmp_path: Path) -> None:
+    """Each Pi message record's own time rides into its imported item."""
+    session_id = "019f8648-2797-7170-bf73-837f2655c47e"
+    transcript = tmp_path / "sessions" / "--repo--" / f"stamp_{session_id}.jsonl"
+    transcript.parent.mkdir(parents=True)
+    first_iso, last_iso = "2026-06-15T09:00:00.000Z", "2026-06-15T09:05:00.000Z"
+    records = [
+        {"type": "session", "version": 3, "id": session_id, "cwd": "/repo"},
+        {
+            "type": "message",
+            "id": "user-1",
+            "parentId": None,
+            "timestamp": first_iso,
+            "message": {"role": "user", "content": [{"type": "text", "text": "inspect TODO.md"}]},
+        },
+        {
+            "type": "message",
+            "id": "assistant-1",
+            "parentId": "user-1",
+            "timestamp": last_iso,
+            "message": {"role": "assistant", "content": [{"type": "text", "text": "Done."}]},
+        },
+    ]
+    transcript.write_text(
+        "".join(f"{json.dumps(record)}\n" for record in records), encoding="utf-8"
+    )
+
+    imported = load_pi_session(session_id, pi_home=tmp_path)
+
+    assert [item.created_at for item in imported.items] == [
+        _iso_epoch(first_iso),
+        _iso_epoch(last_iso),
     ]
 
 

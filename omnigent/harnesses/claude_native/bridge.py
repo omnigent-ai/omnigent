@@ -56,8 +56,8 @@ import unicodedata
 import urllib.parse
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from contextvars import ContextVar
-from dataclasses import dataclass
-from datetime import datetime
+from dataclasses import dataclass, replace
+from datetime import UTC, datetime
 from http import HTTPStatus
 from http.client import HTTPConnection, HTTPException
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -904,6 +904,7 @@ class ClaudeTranscriptItem:
         must correlate it by text without draining unrelated pending input.
     :param failure_context: Explicit API-error evidence for diagnostic logging;
         kept outside model-visible conversation content.
+    :param created_at: Source record time, or ``None`` when unavailable.
     """
 
     source_id: str
@@ -915,6 +916,7 @@ class ClaudeTranscriptItem:
     subagent_return_id: str | None = None
     agent_message_candidate: bool = False
     failure_context: FailureContext | None = None
+    created_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -3236,9 +3238,12 @@ def _transcript_timestamp(value: object) -> float | None:
     if not isinstance(value, str) or not value:
         return None
     try:
-        return datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
     except ValueError:
         return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=UTC)
+    return parsed.timestamp()
 
 
 def _local_command_name(content: str) -> str | None:
@@ -3523,6 +3528,9 @@ def read_transcript_items_from_offset(
         )
         if legacy_agent_messages and any(item.agent_message_candidate for item in parsed):
             active_response_id = previous_response_id
+        recorded_at = _transcript_timestamp(entry.get("timestamp"))
+        if recorded_at is not None:
+            parsed = [replace(item, created_at=recorded_at) for item in parsed]
         items.extend(parsed)
         # Post-compaction output continues the SAME turn: a batch holding
         # the compact summary AND the resumed output must not parse the

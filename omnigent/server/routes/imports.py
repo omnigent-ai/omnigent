@@ -16,7 +16,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, Response
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from omnigent.db.utils import builtin_agent_id
+from omnigent.db.utils import builtin_agent_id, now_epoch
 from omnigent.db.workspace_cache import WorkspaceScopedCache
 from omnigent.entities import NewConversationItem, parse_item_data
 from omnigent.errors import ErrorCode, OmnigentError
@@ -64,17 +64,27 @@ def _record_local_import_failure(error: OmnigentError) -> tuple[str, str]:
 
 
 class ImportItemInput(BaseModel):
-    """One normalized existing Omnigent item received from the CLI."""
+    """One normalized existing Omnigent item received from the CLI.
+
+    ``created_at`` is the source record's own time (Unix seconds), or ``None``
+    when the source carries no per-record time.
+    """
 
     type: str
     response_id: str = Field(min_length=1, max_length=64)
     data: dict[str, object]
+    created_at: int | None = Field(default=None, ge=0)
 
     def to_item(self) -> NewConversationItem:
         """Validate the type-specific payload and return a new item entity."""
         try:
             data = parse_item_data(self.type, self.data)
-            return NewConversationItem(type=self.type, response_id=self.response_id, data=data)
+            return NewConversationItem(
+                type=self.type,
+                response_id=self.response_id,
+                data=data,
+                created_at=self.created_at,
+            )
         except (TypeError, ValueError) as exc:
             raise OmnigentError(
                 f"Invalid imported {self.type!r} item: {exc}",
@@ -210,6 +220,37 @@ _IMPORT_LOCKS: WorkspaceScopedCache[tuple[ImportSource, str], _ImportLockEntry] 
     WorkspaceScopedCache()
 )
 _IMPORT_LOCKS_GUARD = threading.Lock()
+
+
+def _settle_item_times(
+    items: list[NewConversationItem], import_time: int
+) -> list[NewConversationItem]:
+    """Keep source times that predate the import; date the rest from a timed neighbour.
+
+    An untimed record in an otherwise timed transcript happened between its
+    neighbours, not at import time, and a time after the import is unusable.
+    Only a transcript with no usable time keeps the store's import-time stamps.
+    """
+    usable = [
+        item.created_at if item.created_at is not None and item.created_at <= import_time else None
+        for item in items
+    ]
+    timed = [stamp for stamp in usable if stamp is not None]
+    if not timed:
+        return [
+            item.model_copy(update={"created_at": None}) if item.created_at is not None else item
+            for item in items
+        ]
+    settled: list[NewConversationItem] = []
+    previous = timed[0]
+    for item, stamp in zip(items, usable, strict=True):
+        previous = previous if stamp is None else stamp
+        settled.append(
+            item
+            if item.created_at == previous
+            else item.model_copy(update={"created_at": previous})
+        )
+    return settled
 
 
 def _import_conversation_id(source: ImportSource, external_session_id: str) -> str:
@@ -408,6 +449,7 @@ def create_imports_router(
         workspace = resolved_create.body.workspace
         resolved_host_id = resolved_create.body.host_id
         title = (native_title or "").strip() or title_from_items(items)
+        items = _settle_item_times(items, now_epoch())
         if replace_conversation_id is not None:
             await conversation_store.delete_conversation(replace_conversation_id)
         try:
@@ -431,7 +473,15 @@ def create_imports_router(
                 conversation.id,
                 external_session_id,
             )
-            await asyncio.to_thread(conversation_store.append, conversation.id, items)
+            persisted = await asyncio.to_thread(conversation_store.append, conversation.id, items)
+            if any(item.created_at is not None for item in items):
+                stamps = [row.created_at for row in persisted]
+                await asyncio.to_thread(
+                    conversation_store.set_conversation_timestamps,
+                    conversation.id,
+                    created_at=min(stamps),
+                    updated_at=max(stamps),
+                )
             labels = {
                 **native_agent.presentation_labels,
                 IMPORT_SOURCE_LABEL_KEY: source,
