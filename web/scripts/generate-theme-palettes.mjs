@@ -34,6 +34,16 @@ const androidRoles = {
 
 function androidColor(value, role) {
   if (/^#[0-9a-f]{6}$/i.test(value)) return value.toLowerCase();
+  const alphaRgb = /^rgb\(\s*(\d+)\s+(\d+)\s+(\d+)\s*\/\s*(\d+(?:\.\d+)?)%\s*\)$/i.exec(value);
+  if (alphaRgb) {
+    const [red, green, blue] = alphaRgb
+      .slice(1, 4)
+      .map((channel) => Number(channel).toString(16).padStart(2, "0"));
+    const alpha = Math.round((Number(alphaRgb[4]) / 100) * 255)
+      .toString(16)
+      .padStart(2, "0");
+    return `#${alpha}${red}${green}${blue}`;
+  }
 
   const component = "([+-]?(?:\\d+(?:\\.\\d*)?|\\.\\d+))";
   const match = value.match(

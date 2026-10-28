@@ -25,13 +25,13 @@ it("generates Android colours from the default Omni palette", () => {
     const light = readFileSync(lightPath, "utf8");
     const dark = readFileSync(darkPath, "utf8");
     expect(light).toContain('<color name="brand_foreground">#27272a</color>');
-    expect(dark).toContain('<color name="brand_background">#0e1013</color>');
-    expect(dark).toContain('<color name="brand_foreground">#f2f4f5</color>');
+    expect(dark).toContain('<color name="brand_background">#0e0b19</color>');
+    expect(dark).toContain('<color name="brand_foreground">#f5f5f4</color>');
     expect(dark).toContain('<color name="brand_border">#27292b</color>');
     expect(light.match(/<color name=/g)).toHaveLength(6);
     expect(dark.match(/<color name=/g)).toHaveLength(6);
 
-    writeFileSync(darkPath, dark.replace("#0e1013", "#0e1014"));
+    writeFileSync(darkPath, dark.replace("#0e0b19", "#0e0b1a"));
     const stale = spawnSync(process.execPath, [...args, "--check"], { encoding: "utf8" });
     expect(stale.status).toBe(1);
     expect(stale.stderr).toContain(`${darkPath} is stale`);
