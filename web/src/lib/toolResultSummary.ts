@@ -1,5 +1,5 @@
-// One-line outcome shown under a tool call's row, so a collapsed transcript
-// reads as "did X, got Y" and failures are visible without expanding.
+// One-line outcome for a tool call. Only successful results appear under the
+// collapsed row; failures stay inside the expanded card.
 
 import { stripAnsi } from "@/lib/ansi";
 import type { ToolState } from "@/lib/renderItems";
@@ -91,7 +91,7 @@ export function summarizeToolResult(call: ToolCall): ToolResultSummary | null {
 /**
  * A finished edit's added and removed line counts, e.g. "Updated with 2
  * additions and 3 removals" with the numbers in diff colors; a replace-all edit
- * counts each match. Failures keep the usual error line; running, cancelled and
+ * counts each match. Failures return an error summary; running, cancelled and
  * unchanged edits (including pure renames) show none, as do inexact counts.
  */
 export function summarizeFileEdit(call: ToolCall): ToolResultSummary | null {

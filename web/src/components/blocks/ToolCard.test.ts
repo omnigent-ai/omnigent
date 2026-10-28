@@ -135,8 +135,8 @@ describe("ToolCard rendering", () => {
     expect(screen.getByTestId("tool-result-line")).toHaveClass("text-sm");
   });
 
-  it("tags an MCP tool with its server and reports its failure on the result line", () => {
-    renderCard({
+  it("tags an MCP tool with its server and shows its failure only when expanded", () => {
+    const { container } = renderCard({
       name: "mcp__github__create_pull_request",
       arguments: { owner: "omnigent-ai", repo: "omnigent", draft: true },
       output: "Error: 422 Validation Failed: A pull request already exists",
@@ -146,9 +146,16 @@ describe("ToolCard rendering", () => {
     // A known server shows its brand spelling rather than the config name.
     expect(screen.getByText("GitHub")).toBeInTheDocument();
     expect(screen.queryByText("github")).toBeNull();
-    const line = screen.getByTestId("tool-result-line");
-    expect(line.textContent).toBe("Error: 422 Validation Failed: A pull request already exists");
-    expect(line.className).toContain("text-destructive");
+    const error = "Error: 422 Validation Failed: A pull request already exists";
+    const trigger = container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!;
+    expect(screen.queryByTestId("tool-result-line")).toBeNull();
+    expect(screen.queryByText(error)).toBeNull();
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
+    fireEvent.click(trigger);
+    expect(screen.queryByText(error)).toBeNull();
+    fireEvent.click(trigger);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
   });
 
   it("expands to labeled Input and Result fields, with the raw JSON behind a Fields | Raw switch", () => {
@@ -288,7 +295,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getAllByText(error)).toHaveLength(2);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
     expect(screen.getByTestId("tool-value-view").textContent).toBe(fields);
   });
 
@@ -336,7 +343,7 @@ describe("ToolCard rendering", () => {
       state: "output-available",
     });
     fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-    expect(screen.getAllByText("permission denied")).toHaveLength(2);
+    expect(screen.getByTestId("tool-error-box")).toHaveTextContent("permission denied");
   });
 
   it("renders a pending output placeholder while input-available with no output", () => {
@@ -560,7 +567,7 @@ describe("ToolCard registered views", () => {
       diffText: "+y",
     },
   ])(
-    "shows a $producer's error on the result line and above its diff",
+    "shows a $producer's error only inside its expanded diff",
     async ({ name, args, output, error, diffText }) => {
       await registerRealView(name);
       const { container } = renderCard({
@@ -569,11 +576,10 @@ describe("ToolCard registered views", () => {
         output,
         state: "output-available",
       });
-      const line = screen.getByTestId("tool-result-line");
-      expect(line.textContent).toBe(error);
-      expect(line).toHaveClass("text-destructive");
+      expect(screen.queryByTestId("tool-result-line")).toBeNull();
+      expect(screen.queryByText(error)).toBeNull();
       fireEvent.click(container.querySelector<HTMLElement>('[data-slot="collapsible-trigger"]')!);
-      // The expanded body repeats the error in a box, then labels the diff as not applied.
+      // The expanded body shows the error, then labels the diff as not applied.
       expect(screen.getByTestId("tool-error-box")).toHaveTextContent(error);
       expect(screen.getByText("Requested change, not applied:")).toBeInTheDocument();
       expect(container.textContent).toContain(diffText);
@@ -798,6 +804,33 @@ describe("ToolCard shell terminal panel", () => {
     expect(screen.getByRole("button", { name: "Copy result" })).toBeInTheDocument();
     expect(screen.queryByText("Parameters")).toBeNull();
     expect(container.textContent).toContain("\\u001b[1ma.txt\\u001b[0m");
+  });
+
+  it.each([
+    { name: "shell", output: "missing\n[exit code: 1]", detail: "exit 1" },
+    {
+      name: "sys_os_shell",
+      output: JSON.stringify({ stdout: "", stderr: "", exit_code: null, timed_out: true }),
+      detail: "timed out",
+    },
+    {
+      name: "Bash",
+      output: "<tool_use_error>Permission to use Bash was denied.</tool_use_error>",
+      detail: "Permission to use Bash was denied.",
+    },
+  ])("shows a $name failure only inside the expanded terminal", ({ name, output, detail }) => {
+    const { container } = renderCard({
+      name,
+      arguments: { command: "make" },
+      output,
+      state: "output-available",
+    });
+    expect(screen.queryByTestId("tool-result-line")).toBeNull();
+    expect(container).not.toHaveTextContent(detail);
+    expand(container);
+    expect(screen.getByTestId("shell-tool-terminal")).toHaveTextContent(detail);
+    expand(container);
+    expect(container).not.toHaveTextContent(detail);
   });
 
   it("reads the exit code in the output format of the tool that ran", () => {

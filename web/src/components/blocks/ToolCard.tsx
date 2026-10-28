@@ -521,7 +521,7 @@ function ToolTriggerRow({
         )}
         <ChevronRightIcon className="size-3.5 shrink-0 transition-transform group-data-[state=open]:rotate-90" />
       </span>
-      {summary !== null && <ToolResultLine summary={summary} />}
+      {summary !== null && !summary.isError && <ToolResultLine summary={summary} />}
     </CollapsibleTrigger>
   );
 }

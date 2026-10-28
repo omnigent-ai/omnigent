@@ -147,7 +147,7 @@ export const McpJsonResultExpanded: Story = {
   play: async ({ canvasElement }) => expand(canvasElement),
 };
 
-// A failure the tool reported reads in red on the collapsed row.
+// A failure stays out of the collapsed row; expand to inspect its result.
 export const McpFailureCollapsed: Story = {
   args: {
     name: "mcp__github__create_pull_request",

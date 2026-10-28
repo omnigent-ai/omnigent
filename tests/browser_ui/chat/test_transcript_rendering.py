@@ -580,10 +580,12 @@ def test_tool_rows_read_as_actions_with_their_outcome(
     expect(issue.get_by_test_id("tool-result-line")).to_have_text(f"{_ISSUE_TITLE} · In Review")
     failure = page.get_by_role("button", name=re.compile(r"^Create pull request"))
     expect(failure.get_by_text("GitHub", exact=True)).to_be_visible()
-    failure_result = failure.get_by_test_id("tool-result-line")
-    expect(failure_result).to_have_text(_PR_ERROR)
-    color = "el => getComputedStyle(el).color"
-    assert failure_result.evaluate(color) != plan_result.evaluate(color)
+    expect(failure.get_by_test_id("tool-result-line")).to_have_count(0)
+    expect(page.get_by_text(_PR_ERROR, exact=True)).not_to_be_visible()
+    failure.click()
+    expect(failure.locator("xpath=..").get_by_test_id("tool-error-box")).to_have_text(_PR_ERROR)
+    failure.click()
+    expect(page.get_by_text(_PR_ERROR, exact=True)).not_to_be_visible()
 
     transcript = page.locator('[role="log"]')
     expect(transcript).not_to_contain_text("mcp__linear__")
@@ -735,21 +737,27 @@ def test_failed_edit_rows_show_their_error(
     page: Page,
     chat_session_contract: ChatSessionContract,
 ) -> None:
-    """Missed and declined edits show their error instead of line counts."""
+    """Missed and declined edits show their errors only after expansion."""
     _open_edit_rows(page, chat_session_contract)
 
     missed = page.get_by_role("button", name=re.compile(r"^Edit .*README\.md"))
-    expect(missed.get_by_test_id("tool-result-line")).to_have_text(
+    expect(missed.get_by_test_id("tool-result-line")).to_have_count(0)
+    expect(
+        page.get_by_text("String to replace not found in file.", exact=True)
+    ).not_to_be_visible()
+    missed.click()
+    expect(missed.locator("xpath=..").get_by_test_id("tool-error-box")).to_have_text(
         "String to replace not found in file."
     )
+    missed.click()
+    expect(
+        page.get_by_text("String to replace not found in file.", exact=True)
+    ).not_to_be_visible()
     declined = page.get_by_role("button", name=re.compile(r"^Edit .*config\.py"))
-    declined_result = declined.get_by_test_id("tool-result-line")
-    expect(declined_result).to_have_text("Error: File change ended with status declined.")
-    applied_result = page.get_by_role("button", name=re.compile(r"^Edit 3 files")).get_by_test_id(
-        "tool-result-line"
-    )
-    color = "el => getComputedStyle(el).color"
-    assert declined_result.evaluate(color) != applied_result.evaluate(color)
+    expect(declined.get_by_test_id("tool-result-line")).to_have_count(0)
+    expect(
+        page.get_by_text("Error: File change ended with status declined.", exact=True)
+    ).not_to_be_visible()
 
     declined.click()
     body = declined.locator("xpath=..")
@@ -758,3 +766,5 @@ def test_failed_edit_rows_show_their_error(
     )
     expect(body.get_by_text("Requested change, not applied:")).to_be_visible()
     expect(body.locator('[data-language="diff"]')).to_contain_text("+DEBUG = True")
+    declined.click()
+    expect(body.get_by_test_id("tool-error-box")).not_to_be_visible()

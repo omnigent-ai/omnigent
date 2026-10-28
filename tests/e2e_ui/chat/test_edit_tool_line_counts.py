@@ -1,6 +1,6 @@
 """E2E: real ``sys_os_edit`` outcomes cross the server and runner into edit rows.
 
-An applied and a missed edit check the result lines, their colors and the Diff | Raw view.
+An applied edit shows line counts; a missed edit shows its error only when expanded.
 """
 
 from __future__ import annotations
@@ -147,11 +147,7 @@ def test_edit_rows_show_line_counts_and_diff(
     applied_result = applied.get_by_test_id("tool-result-line")
     expect(applied_result).to_have_text("Updated with 2 additions and 3 removals")
     failed = page.locator('[data-slot="collapsible-trigger"]', has_text="settings.py").first
-    failed_result = failed.get_by_test_id("tool-result-line")
-    expect(failed_result).to_contain_text(
-        re.compile(r"Could not find oldText in '.*settings\.py'")
-    )
-    expect(failed_result).not_to_contain_text("Updated")
+    expect(failed.get_by_test_id("tool-result-line")).to_have_count(0)
     color = "el => getComputedStyle(el).color"
     plain = applied_result.evaluate(color)
     added = applied_result.get_by_text("2", exact=True).evaluate(color)
@@ -160,7 +156,6 @@ def test_edit_rows_show_line_counts_and_diff(
     # The counts use diff colors; the words around them keep the line's plain color.
     assert len({plain, added, removed}) == 3
     assert noun == plain
-    assert failed_result.evaluate(color) != plain
 
     applied.click()
     card = applied.locator("xpath=..")
@@ -177,3 +172,9 @@ def test_edit_rows_show_line_counts_and_diff(
     expect(diff).to_have_count(0)
     diff_tab.click()
     expect(diff).to_be_visible()
+
+    failed.click()
+    failure = failed.locator("xpath=..").get_by_test_id("tool-error-box")
+    expect(failure).to_contain_text(re.compile(r"Could not find oldText in '.*settings\.py'"))
+    failed.click()
+    expect(failure).not_to_be_visible()
