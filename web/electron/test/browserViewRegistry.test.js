@@ -451,11 +451,11 @@ function makeEventCapturingRegistry(extra = {}) {
 }
 
 describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every hop)", () => {
-  it("uses the same live Arca context for initial URL, redirect, frame and popup", () => {
+  it("uses the same live local context for initial URL, redirect, frame and popup", () => {
     let eligible = true;
     const context = { serverTarget: "selected-server", sourceHostId: "actual-host" };
     const { registry, fire, windowOpen, loaded } = makeEventCapturingRegistry({
-      isArcaAgentContext: (ctx) => eligible && ctx === context,
+      isLocalAgentContext: (ctx) => eligible && ctx === context,
     });
     assert.equal(
       registry.openOrNavigate("arca", "http://localhost:5173", undefined, {
@@ -466,19 +466,19 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     );
     for (const event of ["will-navigate", "will-redirect", "will-frame-navigate"]) {
       assert.equal(fire(event, "http://127.0.0.1:5173").prevented, false);
-      assert.equal(fire(event, "http://169.254.169.254").prevented, true);
-      assert.equal(fire(event, "http://192.168.1.1").prevented, true);
+      assert.equal(fire(event, "http://169.254.169.254").prevented, false);
+      assert.equal(fire(event, "http://192.168.1.1").prevented, false);
     }
     const before = loaded.length;
     windowOpen("http://[::1]:5173");
     assert.equal(loaded.length, before + 1);
     windowOpen("file:///tmp/test");
     windowOpen("http://10.0.0.1");
-    assert.equal(loaded.length, before + 1);
+    assert.equal(loaded.length, before + 2);
     eligible = false;
     assert.equal(fire("will-redirect", "http://localhost:5173").prevented, true);
     windowOpen("http://localhost:5173");
-    assert.equal(loaded.length, before + 1);
+    assert.equal(loaded.length, before + 2);
     assert.equal(
       registry.openOrNavigate("unknown", "http://localhost:5173", undefined, {
         agent: true,
@@ -489,9 +489,9 @@ describe("browserViewRegistry — redirect/nav guard (SSRF: allowlist on every h
     assert.equal(registry.has("unknown"), false);
   });
 
-  it("does not carry a previous Arca context into another navigation or registry", () => {
+  it("does not carry a previous local context into another navigation or registry", () => {
     const context = {};
-    const options = { isArcaAgentContext: (ctx) => ctx === context };
+    const options = { isLocalAgentContext: (ctx) => ctx === context };
     const first = makeEventCapturingRegistry(options);
     const second = makeEventCapturingRegistry();
     assert.equal(
@@ -697,10 +697,10 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.deepEqual(lookups, []);
   });
 
-  it("keeps the Arca loopback exception for exact hosts but not DNS aliases", async () => {
+  it("keeps the local access for loopback, private destinations and DNS aliases", async () => {
     const context = { sourceHostId: "arca-host" };
     const { registry, idOf } = makeNetworkGuardRegistry({
-      isArcaAgentContext: (ctx) => ctx === context,
+      isLocalAgentContext: (ctx) => ctx === context,
     });
     registry.openOrNavigate("arca", "http://localhost:5173/", undefined, {
       agent: true,
@@ -711,8 +711,8 @@ describe("browserViewRegistry — network-layer agent guard (DNS + connected add
     assert.equal(await registry.shouldCancelAgentRequest(localhost), false);
     assert.equal(await registry.shouldCancelAgentResponse(localhost), false);
     const alias = { webContentsId, url: "http://lvh.me:5173/", ip: "127.0.0.1" };
-    assert.equal(await registry.shouldCancelAgentRequest(alias), true);
-    assert.equal(await registry.shouldCancelAgentResponse(alias), true);
+    assert.equal(await registry.shouldCancelAgentRequest(alias), false);
+    assert.equal(await registry.shouldCancelAgentResponse(alias), false);
   });
 });
 

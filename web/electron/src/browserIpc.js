@@ -8,6 +8,7 @@
 "use strict";
 
 const crypto = require("node:crypto");
+const { browserViewOwnerId } = require("./browserViewRegistry");
 const { buildBrowserActionScript } = require("./browserActionScript.mjs");
 const chromeCookieStoreModule = require("./chromeCookieStore");
 const { decodeLegacyBrowserAction } = require("./browserLegacyAction");
@@ -353,8 +354,7 @@ function registerBrowserIpc({
   isPinnedOriginSender,
   getRegistryForEvent,
   getAgentContextForEvent = () => null,
-  recoverAgentNavigationForEvent = async () => false,
-  getAgentNavigationHintForEvent = () => null,
+  isLocalAgentContext = () => false,
   // Injected so native dialogs can be parented to the sender's window.
   getWindowForEvent = () => null,
   chromeCookieStore = chromeCookieStoreModule,
@@ -377,6 +377,11 @@ function registerBrowserIpc({
     return { registry };
   };
 
+  const localAgentError = (event, context) =>
+    isLocalAgentContext(event, context)
+      ? null
+      : "Browser tools require a session running on this desktop. Remote or unverified sessions cannot access the laptop browser.";
+
   /** A window-scoped sender for the event's own webContents. Used to push
    *  url/nav-state pings back to exactly the renderer that drives the view. */
   const senderFor = (event) => (channel, payload) => {
@@ -397,13 +402,22 @@ function registerBrowserIpc({
     if (typeof conversationId !== "string" || !conversationId) {
       return { ok: false, error: "conversationId is required" };
     }
+    const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
+    // Agent tools target the reserved session view; user tabs have separate IDs.
+    // Omitting opts.agent cannot turn a tool request into a human navigation.
+    const requiresLocalAgent =
+      browserViewOwnerId(conversationId) === conversationId || !!opts?.agent;
+    const accessError = requiresLocalAgent && localAgentError(event, agentContext);
+    if (accessError) return { ok: false, error: accessError };
     const isCurrentNavigation = g.registry.beginAgentNavigation(conversationId);
     const cancelled = { ok: false, created: false, error: "navigation superseded or closed" };
-    const isCurrent = () => isCurrentNavigation() && isPinnedOriginSender(event);
+    const isCurrent = () =>
+      isCurrentNavigation() &&
+      isPinnedOriginSender(event) &&
+      (!requiresLocalAgent || !localAgentError(event, agentContext));
     const navigate = async (registry) => {
       // The first-party renderer supplies the source-session host; main owns
       // the target and eligibility. Caller exception flags never establish identity.
-      const agentContext = getAgentContextForEvent(event, opts?.sourceHostId);
       if (url) {
         const verdict = await registry.checkAgentNavigation(conversationId, url, agentContext);
         if (!isCurrent()) return cancelled;
@@ -416,31 +430,8 @@ function registerBrowserIpc({
         agentContext,
       });
     };
-    let r = await navigate(g.registry);
+    const r = await navigate(g.registry);
     if (!isCurrent()) return cancelled;
-    let recovered = false;
-    if (!r.ok && opts?.agent) {
-      try {
-        recovered = await recoverAgentNavigationForEvent(
-          event,
-          url,
-          opts?.sourceHostId,
-          opts?.rememberedArcaHostId,
-          opts?.sourceIsArcaHost,
-        );
-      } catch {
-        recovered = false;
-      }
-    }
-    if (!isCurrent()) return cancelled;
-    if (recovered) {
-      // Recovery updates main-owned identity, so rebuild the context and ask
-      // the registry to evaluate the same navigation once more.
-      const refreshed = gateRegistry(event);
-      if (refreshed.error || refreshed.registry !== g.registry) return cancelled;
-      r = await navigate(refreshed.registry);
-      if (!isCurrent()) return cancelled;
-    }
     // On first creation, wire nav listeners here (not in the registry factory,
     // which stays Electron-free) so the URL bar can live-track the real url.
     if (r.ok && r.created && r.entry) {
@@ -451,21 +442,7 @@ function registerBrowserIpc({
       });
     }
     // Strip the non-serializable `entry` before it crosses the IPC boundary.
-    const hint =
-      !r.ok && opts?.agent
-        ? getAgentNavigationHintForEvent(
-            event,
-            url,
-            opts?.sourceHostId,
-            opts?.rememberedArcaHostId,
-            opts?.sourceIsArcaHost,
-          )
-        : null;
-    return {
-      ok: r.ok,
-      created: r.created ?? false,
-      error: hint ? `${r.error} ${hint}` : r.error,
-    };
+    return { ok: r.ok, created: r.created ?? false, error: r.error };
   });
 
   // Attach the named conversation's view to the host window (detaching the
@@ -521,6 +498,8 @@ function registerBrowserIpc({
   ipcMain.handle("omnigent:browser-screenshot", async (event, args) => {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
+    const error = localAgentError(event, getAgentContextForEvent(event, args?.sourceHostId));
+    if (error) return { ok: false, error };
     const { conversationId } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };
@@ -537,6 +516,8 @@ function registerBrowserIpc({
   async function performBrowserAction(event, args, legacy = false) {
     const g = gateRegistry(event);
     if (g.error) return { ok: false, error: g.error };
+    const error = localAgentError(event, getAgentContextForEvent(event, args?.sourceHostId));
+    if (error) return { ok: false, error };
     const { conversationId } = args ?? {};
     const entry = g.registry.get(conversationId);
     if (!entry) return { ok: false, error: "No browser view" };

@@ -5,8 +5,6 @@ const assert = require("node:assert/strict");
 const {
   arcaTarget,
   readArcaIdentity,
-  createArcaIdentityStore,
-  isArcaAgentContext,
   IDENTITY_START,
   IDENTITY_END,
 } = require("../src/arcaIdentity");
@@ -99,62 +97,5 @@ describe("Arca daemon identity", () => {
       identity,
     );
     assert.deepEqual(reasons, []);
-  });
-
-  it("requires recapture after relaunch and keeps a failed reconnect denied", () => {
-    const context = { serverTarget: arcaTarget(SERVER), sourceHostId: HOST };
-    const gates = { enabled: true, managed: true, serverTarget: SERVER };
-    const first = createArcaIdentityStore();
-    first.begin(SERVER)({ ok: true, alreadyRunning: true, identity });
-    assert.equal(isArcaAgentContext(first.get(SERVER), context, gates), true);
-    const relaunched = createArcaIdentityStore();
-    assert.equal(isArcaAgentContext(relaunched.get(SERVER), context, gates), false);
-    relaunched.begin(SERVER)({ ok: false });
-    assert.equal(isArcaAgentContext(relaunched.get(SERVER), context, gates), false);
-    relaunched.begin(SERVER)({ ok: true, alreadyRunning: true, identity });
-    assert.equal(isArcaAgentContext(relaunched.get(SERVER), context, gates), true);
-  });
-
-  it("does not let a stale connect restore identity after a newer unknown or failed run", () => {
-    const store = createArcaIdentityStore();
-    const old = store.begin(SERVER);
-    const current = store.begin(SERVER);
-    old({ ok: true, identity });
-    assert.equal(store.get(SERVER), null);
-    current({ ok: true, identity });
-    assert.deepEqual(store.get(SERVER), identity);
-    const failed = store.begin(SERVER);
-    assert.equal(store.get(SERVER), null);
-    failed({ ok: false, identity });
-    assert.equal(store.get(SERVER), null);
-    store.begin(SERVER)({ ok: true });
-    assert.equal(store.get(SERVER), null);
-  });
-
-  it("isolates workspace targets and refuses a result belonging to another target", () => {
-    const store = createArcaIdentityStore();
-    store.begin(SERVER)({ ok: true, identity });
-    const other = SERVER.replace("123", "456");
-    store.begin(other)({ ok: true, identity });
-    assert.equal(store.get(other), null);
-    assert.deepEqual(store.get(SERVER), identity);
-  });
-
-  it("requires main-owned identity, actual source host, and live feature/server gates", () => {
-    const context = { serverTarget: arcaTarget(SERVER), sourceHostId: HOST };
-    const gates = { enabled: true, managed: true, serverTarget: SERVER };
-    assert.equal(isArcaAgentContext(identity, context, gates), true);
-    for (const [id, ctx, gate] of [
-      [null, context, gates],
-      [identity, null, gates],
-      [identity, { ...context, sourceHostId: null }, gates],
-      [identity, { ...context, sourceHostId: "b".repeat(32) }, gates],
-      [identity, { ...context, serverTarget: arcaTarget(SERVER.replace("123", "456")) }, gates],
-      [identity, context, { ...gates, enabled: false }],
-      [identity, context, { ...gates, managed: false }],
-      [identity, context, { ...gates, serverTarget: SERVER.replace("123", "456") }],
-    ]) {
-      assert.equal(isArcaAgentContext(id, ctx, gate), false);
-    }
   });
 });
