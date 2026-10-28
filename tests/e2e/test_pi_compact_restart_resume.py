@@ -1,19 +1,13 @@
-"""E2E: a Pi session that Pi compacted must resume compacted after a server/runner restart.
-
-A loopback proxy enforces a 32k window with an OpenAI-style context-length 400, so the
-real Pi CLI runs its own overflow compaction against the scripted mock model.
-"""
+"""Real Pi compaction survives server/runner restart and fork under a scripted 32k limit."""
 
 from __future__ import annotations
 
-import contextlib
-import http.server
 import json
 import math
 import threading
-import time
 import uuid
 from collections.abc import Iterator
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
@@ -23,7 +17,7 @@ import yaml
 
 from omnigent.testing.process_reaper import reap_leaked_omnigent_processes
 from tests._helpers.live_server import terminate_process
-from tests._helpers.server_runner import ServerRunner, server_runner
+from tests._helpers.server_runner import server_runner
 from tests._helpers.session import bind_session_runner, bundle_files, post_session_bundle
 from tests.e2e._harness_probes import skip_if_harness_cli_missing
 from tests.e2e.conftest import (
@@ -36,110 +30,11 @@ from tests.e2e.omnigent._pi_mock_gateway import write_pi_gateway_config
 
 _MODEL = "local-vllm-32k"
 _CONTEXT_LIMIT = 32_768
-_BIND_TIMEOUT_S = 180.0
-# Pi keeps ~20k recent tokens on overflow; small parts let the retry fit the window.
-_PART_CHARS = 4_000
-_MAX_FILL_TURNS = 40
-# Keep going after Pi's first compaction until raw history is ~48k tokens, well over the window.
-_TURNS_AFTER_FIRST_COMPACTION = 15
 _SUMMARY_PROMPTS = (
     "Create a structured context checkpoint summary",
     "Create a concise checkpoint of the user's request",
     "incorporate into the existing summary",
 )
-
-
-def _estimated_tokens(body: dict[str, Any]) -> int:
-    text = json.dumps(body.get("messages", [])) + json.dumps(body.get("tools", []))
-    return math.ceil(len(text) / 4)
-
-
-class _ContextLimitProxy:
-    """Forward to the mock model, rejecting prompts over the window like vLLM."""
-
-    def __init__(self, upstream: str, log_path: Path) -> None:
-        self.requests: list[dict[str, Any]] = []
-        self._upstream = upstream
-        self._log_path = log_path
-        self._lock = threading.Lock()
-        proxy = self
-
-        class Handler(http.server.BaseHTTPRequestHandler):
-            def do_POST(self) -> None:
-                proxy._handle(self)
-
-            def log_message(self, *args: object) -> None:
-                pass
-
-        self._server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-        self.url = f"http://127.0.0.1:{self._server.server_port}"
-
-    def _handle(self, handler: http.server.BaseHTTPRequestHandler) -> None:
-        raw = handler.rfile.read(int(handler.headers.get("content-length") or 0))
-        body = json.loads(raw or b"{}")
-        tokens = _estimated_tokens(body)
-        if tokens > _CONTEXT_LIMIT:
-            status = 400
-            content_type = "application/json"
-            payload = json.dumps(
-                {
-                    "error": {
-                        "message": (
-                            f"This model's maximum context length is {_CONTEXT_LIMIT} tokens, "
-                            f"however you requested {tokens} tokens"
-                        ),
-                        "type": "BadRequestError",
-                        "param": None,
-                        "code": 400,
-                    }
-                }
-            ).encode()
-        else:
-            try:
-                upstream = httpx.post(
-                    f"{self._upstream}{handler.path}",
-                    content=raw,
-                    headers={"content-type": "application/json"},
-                    timeout=120.0,
-                    trust_env=False,
-                )
-                status = upstream.status_code
-                content_type = upstream.headers.get("content-type", "application/json")
-                payload = upstream.content
-            except httpx.HTTPError as exc:
-                status, content_type = 502, "application/json"
-                payload = json.dumps(
-                    {"error": {"message": f"proxy upstream error: {exc!r}"}}
-                ).encode()
-        with self._lock:
-            entry = {
-                "seq": len(self.requests),
-                "at": round(time.time(), 3),
-                "path": handler.path,
-                "estimated_tokens": tokens,
-                "status": status,
-                "body": body,
-            }
-            self.requests.append(entry)
-            with self._log_path.open("a", encoding="utf-8") as log:
-                summary = {key: value for key, value in entry.items() if key != "body"}
-                summary["user_text_head"] = _user_text(body)[:160]
-                log.write(json.dumps(summary) + "\n")
-        handler.send_response(status)
-        handler.send_header("content-type", content_type)
-        handler.send_header("content-length", str(len(payload)))
-        handler.end_headers()
-        handler.wfile.write(payload)
-
-    @contextlib.contextmanager
-    def running(self) -> Iterator[_ContextLimitProxy]:
-        thread = threading.Thread(target=self._server.serve_forever, daemon=True)
-        thread.start()
-        try:
-            yield self
-        finally:
-            self._server.shutdown()
-            self._server.server_close()
 
 
 def _user_text(body: dict[str, Any]) -> str:
@@ -155,188 +50,187 @@ def _user_text(body: dict[str, Any]) -> str:
     return "\n".join(texts)
 
 
-def _log_part(index: int) -> str:
-    lines: list[str] = []
-    size = 0
-    line_number = 0
-    while size < _PART_CHARS:
-        line = (
-            f"[part{index:02d}:{line_number:03d}] worker-{line_number % 7} compiled "
-            f"src/pkg_{index}/module_{line_number}.py in {(line_number * 37) % 997}ms; "
-            f"cache {'hit' if line_number % 3 else 'miss'}, rss {(line_number * 53) % 900}MB"
-        )
-        lines.append(line)
-        size += len(line) + 1
-        line_number += 1
-    return "\n".join(lines)
-
-
-def _runner_env(stack: ServerRunner, model_url: str) -> dict[str, str | None]:
-    config_home = stack.runner_home / ".omnigent-config"
-    write_pi_gateway_config(config_home, mock_url=model_url, model=_MODEL)
-    return {
-        "OMNIGENT_CONFIG_HOME": str(config_home),
-        "OPENAI_API_KEY": None,
-        "OPENAI_BASE_URL": None,
-    }
-
-
-def _create_pi_session(client: httpx.Client, stack: ServerRunner) -> str:
-    spec = {
-        "spec_version": 1,
-        "name": "pi-long-session",
-        "prompt": "You are a concise assistant.",
-        "executor": {"model": _MODEL, "config": {"harness": "pi"}},
-    }
-    response = post_session_bundle(
-        client.post,
-        f"{stack.base_url}/v1/sessions",
-        bundle_files({"config.yaml": yaml.safe_dump(spec).encode()}),
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    session_id = str(response.json()["session_id"])
-    bind_session_runner(
-        client.patch, stack.base_url, session_id, stack.runner_id, timeout=_BIND_TIMEOUT_S
-    )
-    return session_id
-
-
-def _items(client: httpx.Client, base_url: str, session_id: str) -> list[dict[str, Any]]:
-    response = client.get(
-        f"{base_url}/v1/sessions/{session_id}/items",
-        params={"limit": 500, "order": "asc"},
-        timeout=30.0,
-    )
-    response.raise_for_status()
-    return list(response.json()["data"])
-
-
-def _send_turn(client: httpx.Client, session_id: str, text: str, reply: str) -> None:
-    response_id = send_user_message_to_session(client, session_id=session_id, content=text)
-    result = poll_session_until_terminal(
-        client, session_id=session_id, response_id=response_id, timeout=180
-    )
-    assert result["status"] == "completed", result
-    assert reply in json.dumps(result["output"]), result
-
-
 def _is_summarization(entry: dict[str, Any]) -> bool:
-    text = _user_text(entry["body"])
-    return any(prompt in text for prompt in _SUMMARY_PROMPTS)
+    return any(prompt in _user_text(entry["body"]) for prompt in _SUMMARY_PROMPTS)
 
 
-def _restart_stack(stack: ServerRunner, runner_env: dict[str, str | None]) -> None:
-    terminate_process(stack.runner)
-    stack.runner = None
-    reap_leaked_omnigent_processes(stack.runner_home / ".omnigent")
-    stack.restart_server()
-    stack.start_runner(env=runner_env)
+@pytest.fixture
+def context_limited_gateway(
+    mock_llm_server_url: str,
+) -> Iterator[tuple[str, list[dict[str, Any]]]]:
+    """Reject over-window requests before forwarding to the shared scripted provider."""
+    requests: list[dict[str, Any]] = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def log_message(self, *args: object) -> None:
+            pass
+
+        def do_POST(self) -> None:
+            raw = self.rfile.read(int(self.headers["Content-Length"]))
+            body = json.loads(raw)
+            tokens = math.ceil(
+                len(json.dumps(body.get("messages", [])) + json.dumps(body.get("tools", []))) / 4
+            )
+            if tokens > _CONTEXT_LIMIT:
+                status, content_type = 400, "application/json"
+                payload = json.dumps(
+                    {
+                        "error": {
+                            "message": (
+                                f"This model's maximum context length is {_CONTEXT_LIMIT} tokens, "
+                                f"however you requested {tokens} tokens"
+                            )
+                        }
+                    }
+                ).encode()
+            else:
+                try:
+                    response = httpx.post(
+                        mock_llm_server_url + self.path,
+                        content=raw,
+                        headers={"Content-Type": "application/json"},
+                        timeout=120,
+                        trust_env=False,
+                    )
+                    status, payload = response.status_code, response.content
+                    content_type = response.headers["Content-Type"]
+                except httpx.HTTPError as exc:
+                    status, content_type = 502, "application/json"
+                    payload = json.dumps({"error": {"message": repr(exc)}}).encode()
+            requests.append({"body": body, "status": status, "estimated_tokens": tokens})
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(payload)))
+            self.end_headers()
+            self.wfile.write(payload)
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        yield f"http://127.0.0.1:{server.server_port}", requests
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)
+
+
+def _items(client: httpx.Client, session_id: str) -> list[dict[str, Any]]:
+    response = client.get(
+        f"/v1/sessions/{session_id}/items", params={"limit": 500, "order": "asc"}
+    )
+    response.raise_for_status()
+    return response.json()["data"]
 
 
 @pytest.mark.nightly
 @pytest.mark.timeout(900)
 def test_pi_compacted_session_resumes_compacted_after_restart(
     mock_llm_server_url: str,
+    context_limited_gateway: tuple[str, list[dict[str, Any]]],
     tmp_path: Path,
 ) -> None:
-    """Restart and fork preserve Pi's summary and the recent context it kept."""
+    """Both continuations use the saved summary/tail; the fork leaves its parent alone."""
     skip_if_harness_cli_missing("pi")
+    gateway_url, requests = context_limited_gateway
     nonce = uuid.uuid4().hex[:8]
     post_marker, resume_marker, fork_marker = (
         f"{stage}-01-{nonce}" for stage in ("POST", "NEXT", "FORK")
     )
     summary = f"SUMMARY-{nonce} the user shared build log parts; nothing failed yet."
     reset_mock_llm(mock_llm_server_url)
-
-    def script_reply(marker: str) -> None:
-        configure_mock_llm(
-            mock_llm_server_url,
-            [{"text": f"ack-{marker}: noted."}],
-            match=marker,
-            required_tools=["read"],
-        )
-
     for prompt in _SUMMARY_PROMPTS:
         configure_mock_llm(mock_llm_server_url, [{"text": summary}] * 60, match=prompt)
 
-    proxy = _ContextLimitProxy(mock_llm_server_url, tmp_path / "proxy-requests.jsonl")
     pre_markers: list[str] = []
     compacting_markers: list[str] = []
     with (
-        proxy.running(),
         server_runner(tmp_path / "stack") as stack,
         httpx.Client(base_url=stack.base_url, timeout=30, trust_env=False) as client,
     ):
-        runner_env = _runner_env(stack, proxy.url)
+        config_home = stack.runner_home / ".omnigent-config"
+        write_pi_gateway_config(config_home, mock_url=gateway_url, model=_MODEL)
+        runner_env = {
+            "OMNIGENT_CONFIG_HOME": str(config_home),
+            "OPENAI_API_KEY": None,
+            "OPENAI_BASE_URL": None,
+        }
         stack.start_runner(env=runner_env)
-        session_id = _create_pi_session(client, stack)
-        first_compaction_turn: int | None = None
-        for index in range(1, _MAX_FILL_TURNS + 1):
+        spec = {
+            "spec_version": 1,
+            "name": "pi-long-session",
+            "prompt": "You are a concise assistant.",
+            "executor": {"model": _MODEL, "config": {"harness": "pi"}},
+        }
+        response = post_session_bundle(
+            client.post,
+            "/v1/sessions",
+            bundle_files({"config.yaml": yaml.safe_dump(spec).encode()}),
+        )
+        response.raise_for_status()
+        session_id = response.json()["session_id"]
+        bind_session_runner(client.patch, stack.base_url, session_id, stack.runner_id, timeout=180)
+
+        def send_turn(session: str, marker: str, prompt: str) -> None:
+            configure_mock_llm(
+                mock_llm_server_url,
+                [{"text": f"ack-{marker}: noted."}],
+                match=marker,
+                required_tools=["read"],
+            )
+            response_id = send_user_message_to_session(
+                client, session_id=session, content=f"Turn {marker}: {prompt}"
+            )
+            result = poll_session_until_terminal(
+                client, session_id=session, response_id=response_id, timeout=180
+            )
+            assert result["status"] == "completed", result
+            assert f"ack-{marker}" in json.dumps(result["output"]), result
+
+        first_compaction_turn = None
+        for index in range(1, 41):
             marker = f"PRE-{index:02d}-{nonce}"
             pre_markers.append(marker)
-            script_reply(marker)
-            sent_at = len(proxy.requests)
-            _send_turn(
-                client,
-                session_id,
-                f"Turn {marker}: here is part {index} of the build log I am debugging. "
-                f"Keep it in mind.\n{_log_part(index)}",
-                f"ack-{marker}",
-            )
-            if any(_is_summarization(entry) for entry in proxy.requests[sent_at:]):
+            sent_at = len(requests)
+            # ~1k tokens per turn leaves room for Pi's ~20k retained tail after overflow.
+            log = (f"Build log part {index}: worker compiled module; cache miss.\n" * 80)[:4_000]
+            send_turn(session_id, marker, f"Keep this build log in mind.\n{log}")
+            if any(_is_summarization(entry) for entry in requests[sent_at:]):
                 compacting_markers.append(marker)
                 if first_compaction_turn is None:
                     first_compaction_turn = index
-            if (
-                first_compaction_turn is not None
-                and index >= first_compaction_turn + _TURNS_AFTER_FIRST_COMPACTION
-            ):
+            # Grow raw history well beyond 32k so an uncompacted restart must fail.
+            if first_compaction_turn is not None and index >= first_compaction_turn + 15:
                 break
         assert first_compaction_turn is not None
-        assert len(pre_markers) >= first_compaction_turn + _TURNS_AFTER_FIRST_COMPACTION
-        script_reply(post_marker)
-        sent_at = len(proxy.requests)
-        _send_turn(
-            client,
-            session_id,
-            f"Turn {post_marker}: does anything stand out so far?",
-            f"ack-{post_marker}",
-        )
-        if any(_is_summarization(entry) for entry in proxy.requests[sent_at:]):
+        assert len(pre_markers) >= first_compaction_turn + 15
+        sent_at = len(requests)
+        send_turn(session_id, post_marker, "Does anything stand out so far?")
+        if any(_is_summarization(entry) for entry in requests[sent_at:]):
             compacting_markers.append(post_marker)
-        restart_seq = len(proxy.requests)
-        _restart_stack(stack, runner_env)
-        # Read from the restarted server, rather than an in-memory session cache.
-        assert f"ack-{post_marker}" in json.dumps(_items(client, stack.base_url, session_id))
-        script_reply(resume_marker)
-        _send_turn(
-            client,
-            session_id,
-            f"Turn {resume_marker}: which worker was slowest?",
-            f"ack-{resume_marker}",
-        )
+        restart_seq = len(requests)
+        terminate_process(stack.runner)
+        stack.runner = None
+        reap_leaked_omnigent_processes(stack.runner_home / ".omnigent")
+        stack.restart_server()
+        stack.start_runner(env=runner_env)
+        assert f"ack-{post_marker}" in json.dumps(_items(client, session_id))
+        send_turn(session_id, resume_marker, "Which worker was slowest?")
         response = client.post(f"/v1/sessions/{session_id}/fork", json={})
         response.raise_for_status()
         fork_id = response.json()["id"]
         assert fork_id != session_id
         bind_session_runner(client.patch, stack.base_url, fork_id, stack.runner_id)
-        script_reply(fork_marker)
-        _send_turn(
-            client,
-            fork_id,
-            f"Turn {fork_marker}: continue investigating the build.",
-            f"ack-{fork_marker}",
-        )
-        assert fork_marker not in json.dumps(_items(client, stack.base_url, session_id))
+        send_turn(fork_id, fork_marker, "Continue investigating the build.")
+        assert fork_marker not in json.dumps(_items(client, session_id))
 
-    summarization = [entry for entry in proxy.requests[:restart_seq] if _is_summarization(entry)]
-    summarized_text = "\n".join(_user_text(entry["body"]) for entry in summarization)
-    assert compacting_markers, "Pi never compacted before the restart"
+    summarized_text = "\n".join(
+        _user_text(entry["body"]) for entry in requests[:restart_seq] if _is_summarization(entry)
+    )
     for marker in (resume_marker, fork_marker):
         resumed = [
             entry
-            for entry in proxy.requests[restart_seq:]
+            for entry in requests[restart_seq:]
             if f"Turn {marker}:" in _user_text(entry["body"])
         ]
         assert resumed, "no model request carried the continuation"

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
-import copy
 import dataclasses
 import json
 import logging
@@ -48,6 +47,7 @@ from tests.runner.conftest import (
     _ReadTimeoutTransport,
     _runner_client,
     _ScriptedHarnessClient,
+    _spec_resolver_returning,
     _sse,
 )
 from tests.runner.helpers import NullServerClient
@@ -3003,103 +3003,41 @@ async def test_native_session_create_seeds_harness_compaction_anchor(
     assert compactions[0]["data"]["last_item_id"] == "item_latest"
 
 
-class _SnapshotHarnessClient(_ScriptedHarnessClient):
-    """Records each harness request body as it was when sent."""
-
-    def stream(self, method: str, url: str, *, json: dict[str, Any], timeout: Any) -> Any:
-        return super().stream(method, url, json=copy.deepcopy(json), timeout=timeout)
-
-
-def _history_shape(item: dict[str, Any]) -> tuple[str, str]:
-    if item["type"] == "message":
-        return item["role"], "".join(part["text"] for part in item["content"])
-    return item["type"], item["call_id"]
-
-
-def _text_message(role: str, text: str) -> dict[str, Any]:
-    part_type = "output_text" if role == "assistant" else "input_text"
-    return {"type": "message", "role": role, "content": [{"type": part_type, "text": text}]}
-
-
-_COMPACTED_SNAPSHOT = [
-    _text_message("user", "SUMMARY"),
-    _text_message("user", "hi"),
-    _text_message("assistant", "Reading notes."),
-]
-
-
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("stored_items", "compacted_messages", "expected_history"),
+    ("has_anchor", "full_context"),
     [
-        pytest.param(
-            [{"id": "item_latest"}],
-            _COMPACTED_SNAPSHOT,
-            [
-                ("user", "SUMMARY"),
-                ("user", "hi"),
-                ("assistant", "Reading notes."),
-                ("assistant", "RECOVERED"),
-                ("user", "next"),
-            ],
-            id="compacted",
-        ),
-        pytest.param(
-            [{"id": "item_latest"}],
-            None,
-            [
-                (
-                    "user",
-                    "[Automatically generated summary of prior conversation context.]\n\n"
-                    "Please provide a summary of our conversation so far.",
-                ),
-                ("assistant", "SUMMARY"),
-                ("assistant", "RECOVERED"),
-                ("user", "next"),
-            ],
-            id="summary-only",
-        ),
-        pytest.param(
-            [],
-            _COMPACTED_SNAPSHOT,
-            [
-                ("user", "hi"),
-                ("function_call", "call_1"),
-                ("function_call_output", "call_1"),
-                ("assistant", "Reading notes.RECOVERED"),
-                ("user", "next"),
-            ],
-            id="compaction-not-persisted",
-        ),
+        pytest.param(True, True, id="compacted"),
+        pytest.param(True, False, id="summary-only"),
+        pytest.param(False, True, id="compaction-not-persisted"),
     ],
 )
 async def test_harness_compaction_after_tool_call_keeps_turn_text_once(
-    stored_items: list[dict[str, Any]],
-    compacted_messages: list[dict[str, Any]] | None,
-    expected_history: list[tuple[str, str]],
+    has_anchor: bool,
+    full_context: bool,
 ) -> None:
-    """The next harness request matches the stored replay after a compaction.
-
-    The server stores the turn's pre-tool text before the compaction item, so only the
-    text after the tool call follows the compacted history. When the compaction is not
-    persisted, the history is unchanged.
-    """
+    """Replay pre-tool text once; leave history intact if compaction lacks an anchor."""
     spec = AgentSpec(
         spec_version=1,
         name="t",
         executor=ExecutorSpec(type="omnigent", config={"harness": "runner-test-default"}),
     )
 
-    async def _resolver(agent_id: str, session_id: str | None = None) -> AgentSpec:
-        del agent_id, session_id
-        return spec
-
+    compacted_messages = [
+        {"type": "message", "role": role, "content": [{"type": block_type, "text": text}]}
+        for role, block_type, text in [
+            ("user", "input_text", "SUMMARY"),
+            ("user", "input_text", "hi"),
+            ("assistant", "output_text", "Reading notes."),
+        ]
+    ]
     stream_finished = asyncio.Event()
-    harness_client = _SnapshotHarnessClient(
+    harness_client = _ScriptedHarnessClient(
         [
-            _sse({"type": "response.created", "response": {"id": "resp_1"}}),
-            _sse({"type": "response.output_text.delta", "delta": "Reading notes."}),
-            _sse(
+            _sse(event)
+            for event in [
+                {"type": "response.created", "response": {"id": "resp_1"}},
+                {"type": "response.output_text.delta", "delta": "Reading notes."},
                 {
                     "type": "response.output_item.done",
                     "item": {
@@ -3109,31 +3047,27 @@ async def test_harness_compaction_after_tool_call_keeps_turn_text_once(
                         "arguments": "{}",
                         "status": "completed",
                     },
-                }
-            ),
-            _sse(
+                },
                 {
                     "type": "response.output_item.done",
                     "item": {"type": "function_call_output", "call_id": "call_1", "output": "ok"},
-                }
-            ),
-            _sse({"type": "response.output_text.delta", "delta": "RECOVERED"}),
-            _sse(
+                },
+                {"type": "response.output_text.delta", "delta": "RECOVERED"},
                 {
                     "type": "response.compaction.completed",
                     "summary": "SUMMARY",
                     "total_tokens": 5,
-                    "compacted_messages": compacted_messages,
-                }
-            ),
-            _sse({"type": "response.completed", "response": {"id": "resp_1"}}),
+                    "compacted_messages": compacted_messages if full_context else None,
+                },
+                {"type": "response.completed", "response": {"id": "resp_1"}},
+            ]
         ],
         stream_finished=stream_finished,
     )
     app = create_runner_app(
         process_manager=_FakeProcessManager(harness_client),  # type: ignore[arg-type]
-        spec_resolver=_resolver,
-        server_client=_NativeSeedServerClient(stored_items),  # type: ignore[arg-type]
+        spec_resolver=await _spec_resolver_returning(spec),
+        server_client=_NativeSeedServerClient([{"id": "item_latest"}] if has_anchor else []),  # type: ignore[arg-type]
     )
 
     session_id = uuid.uuid4().hex
@@ -3157,10 +3091,43 @@ async def test_harness_compaction_after_tool_call_keeps_turn_text_once(
             assert turn.status_code == 202, turn.text
             await asyncio.wait_for(stream_finished.wait(), timeout=5.0)
             stream_finished.clear()
+            # The follow-up only captures history; no second reply mutates the recorded body.
+            harness_client._sse_frames = [
+                _sse({"type": "response.completed", "response": {"id": "resp_2"}})
+            ]
 
+    if not has_anchor:
+        expected_history = [
+            ("user", "hi"),
+            ("function_call", "call_1"),
+            ("function_call_output", "call_1"),
+            ("assistant", "Reading notes.RECOVERED"),
+        ]
+    elif full_context:
+        expected_history = [
+            ("user", "SUMMARY"),
+            ("user", "hi"),
+            ("assistant", "Reading notes."),
+            ("assistant", "RECOVERED"),
+        ]
+    else:
+        expected_history = [
+            (
+                "user",
+                "[Automatically generated summary of prior conversation context.]\n\n"
+                "Please provide a summary of our conversation so far.",
+            ),
+            ("assistant", "SUMMARY"),
+            ("assistant", "RECOVERED"),
+        ]
     assert len(harness_client.posted_bodies) == 2
     next_request = harness_client.posted_bodies[1]["content"]
-    assert [_history_shape(item) for item in next_request] == expected_history
+    assert [
+        (item["role"], "".join(part["text"] for part in item["content"]))
+        if item["type"] == "message"
+        else (item["type"], item["call_id"])
+        for item in next_request
+    ] == [*expected_history, ("user", "next")]
 
 
 def test_kimi_auto_create_clears_forwarder_state_before_supervising() -> None:
