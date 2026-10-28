@@ -1820,13 +1820,13 @@ function WorkspacePanelImpl({
               />
             </div>
           )}
+          {/* A shown shell renders in RailTerminals above, so its branch is null. */}
           {pending ? (
             <div className="flex min-h-0 flex-1 flex-col items-center justify-center gap-2 text-muted-foreground">
               <Spinner />
               <span className="text-ui">Starting workspace…</span>
             </div>
-          ) : terminalShown ? // RailTerminals above renders the shown shell.
-          null : selectedFilePath !== null ? (
+          ) : terminalShown ? null : selectedFilePath !== null ? (
             <ResponsiveViewerSlot mobile={isMobile} mobileTarget={mobileFileTarget}>
               <FileViewer
                 syncUrl={!contained}
