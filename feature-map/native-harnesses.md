@@ -21,6 +21,12 @@ implements them separately, so a fix for one harness does not reach the others.
   host has not configured can be hidden from the picker. When harness repair is
   enabled, Settings → Harnesses shows the missing credential as an actionable
   card; its Reconfigure control and full-card click replace a separate banner action.
+- `new-chat-setup`: with `harness_install` enabled, New Chat’s **Set up**
+  action opens the shared Reconfigure flow in place for native agents on
+  connected user hosts when a fix is available. Missing binaries install before
+  authentication; success refreshes readiness without leaving the composer. SDK
+  agents and managed-host agents keep the setup checklist. With the flag off,
+  New Chat shows the CLI setup guidance.
 - `account-management`: Settings harness cards show the non-secret account label
   reported by the connected host (email, plan, organization, or provider names).
   An expired Codex account offers **Sign in again**. Codex sign-in opens a
@@ -55,8 +61,9 @@ implements them separately, so a fix for one harness does not reach the others.
 - `chat-render`: the harness's output renders in chat like other harnesses.
   A single-file tool row (Read, Write, Edit) shows its path as a dotted link;
   clicking it opens that file in the workspace viewer without expanding the
-  row. Absolute paths open workspace-relative under the session root and
-  host-absolute outside it; they stay plain text until the root is known.
+  row. Absolute paths show and open workspace-relative under the session root
+  and host-absolute outside it; they stay plain text until the root is known.
+  Other tool rows follow [Tool calls in chat](./tool-calls.md).
   Shell commands and multi-file patches have no file link. A shell row shows
   the command (a script's first line and "+N lines") and expands to a
   terminal panel with the command, its output and exit status, in the
@@ -85,6 +92,8 @@ implements them separately, so a fix for one harness does not reach the others.
   Env wrappers are split into these fields, without a duplicate raw invocation.
   Sessions can add to or override these host defaults. Project config can
   choose the default harness, but commands and arguments come only from user config.
+  Codex's `harness.codex-native.app_server` (`command` plus `args`) is a separate,
+  config-file-only wrapper for its session app-servers; unset runs Codex directly.
   Other harnesses keep their credential card only.
 - `skill-contents`: open plain or plugin skills to read their SKILL.md markdown,
   with loading, truncation, unavailable-host, and older-server states.
@@ -381,7 +390,8 @@ Cross-harness journeys:
   `tests/e2e_ui/chat/test_native_codex_side_chat.py::test_native_codex_side_chat_inherits_context_and_closes_independently`
   uses a real Codex CLI/app-server and the local mock model. It verifies inherited
   model context, distinct native threads on one runner, transcript isolation,
-  follow-ups, and a working parent after side-chat closure.
+  follow-ups that switch model and effort on the same thread, and a working
+  parent after side-chat closure.
 - **`harness-settings-navigation`:** run
   `web/src/components/onboarding/ImportContextModal.test.tsx` and
   `web/src/pages/SettingsPage.test.tsx`, plus
@@ -613,6 +623,12 @@ Cross-harness journeys:
   terminal. Check retained history and cumulative input usage 1,000 → 1,100 →
   1,200. The provider replies and usage are scripted; this does not prove live
   billing or recovery after the runner deletes the bridge directory.
+- **`resume`, Pi user setup (own environment):**
+  `tests/e2e/test_pi_native_cold_resume_model_rewrite_e2e.py` drives native startup
+  and process resume through the server/host/runner. User skills/extensions and
+  relative settings must survive relocation of the agent root, including a
+  relative custom root. Existing context/prompt opt-outs remain independent.
+  This is not Claude marketplace or Managed deployment coverage.
 - **`resume`, Pi cost reporting (component boundaries):**
   `tests/harnesses/pi_native/test_pi_native_extension.py` exercises Pi-reported
   dollars, duplicate callbacks, local/server restart baselines and missing pricing.

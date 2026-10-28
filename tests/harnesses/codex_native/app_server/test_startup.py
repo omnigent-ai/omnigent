@@ -1081,3 +1081,53 @@ async def test_readiness_failure_records_app_server_state_before_cleanup(
     assert snapshot["stderr_reader_state"] == "running"
     assert snapshot["codex_version"] == "0.158.0"
     assert "--listen" not in repr(snapshot)
+
+
+async def test_session_app_server_launches_through_the_configured_wrapper(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A configured wrapper replaces the Codex executable; Omnigent's argv follows its args."""
+    from omnigent.harnesses.codex_native import app_server as codex_native_app_server
+
+    spawned: dict[str, object] = {}
+
+    async def _fake_create_subprocess_exec(*args: object, **kwargs: object) -> object:
+        spawned["argv"] = args
+        spawned["executable"] = kwargs["executable"]
+        stderr = asyncio.StreamReader()
+        stderr.feed_eof()
+        proc = AsyncMock()
+        proc.stderr = stderr
+        return proc
+
+    monkeypatch.setattr(asyncio, "create_subprocess_exec", _fake_create_subprocess_exec)
+    monkeypatch.setattr(
+        codex_native_app_server, "acquire_codex_native_process_owner_lock", lambda: None
+    )
+    workspace = tmp_path / "work"
+    workspace.mkdir()
+    server = _test_app_server(tmp_path, tmp_path / "codex-home", tmp_path / "bridge", workspace)
+    server.app_server_command = ("env", "MODE=omni", "isaac", "codex", "--")
+    server.config_overrides = ['model_provider="p"', 'model="m"']
+
+    await server._spawn_app_server_process("unix:///tmp/codex.sock")
+    if server.stderr_task is not None:
+        await server.stderr_task
+
+    assert spawned["executable"] == "env"
+    # Wrapper args, then Omnigent's -c (joining the wrapper's top-level group), then app-server.
+    assert spawned["argv"][1:] == (
+        "MODE=omni",
+        "isaac",
+        "codex",
+        "--",
+        "-c",
+        'model_provider="p"',
+        "-c",
+        'model="m"',
+        "app-server",
+        "--listen",
+        "unix:///tmp/codex.sock",
+    )
+    # The terminal keeps attaching through Codex itself, not the wrapper.
+    assert server.codex_path == sys.executable

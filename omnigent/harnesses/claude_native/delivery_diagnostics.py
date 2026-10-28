@@ -12,7 +12,7 @@ from collections.abc import Callable
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, ParamSpec, TypedDict, TypeVar, cast
+from typing import Any, Literal, ParamSpec, TypedDict, TypeVar, cast
 
 _logger = logging.getLogger(__name__)
 _InjectionFunction = TypeVar("_InjectionFunction", bound=Callable[..., Any])
@@ -46,6 +46,7 @@ class _PromptDeliveryTrace:
     attempts: list[dict[str, object]] = field(default_factory=list)
     input_attributes: dict[str, object] = field(default_factory=dict)
     tmux_failure: dict[str, object] = field(default_factory=dict)
+    input_guard: dict[str, object] = field(default_factory=dict)
 
 
 @_best_effort
@@ -71,6 +72,89 @@ def record_details(**attributes: object) -> None:
     trace = _prompt_delivery_trace.get()
     if trace is not None and trace.attempts:
         trace.attempts[-1].update(attributes)
+
+
+@_best_effort
+def record_restore_observation(*, pane: str, surface: str | None) -> None:
+    """Keep bounded restoration evidence even before a paste attempt exists."""
+    trace = _prompt_delivery_trace.get()
+    if trace is None:
+        return
+    fields = trace.input_guard
+    label = {
+        None: "none",
+        "shell mode": "shell_mode",
+        "an overlay": "overlay",
+        "the prompt-history search": "history_search",
+        "a draft taller than the terminal": "scrolled_draft",
+    }.get(surface, "other")
+    fields.setdefault("restore_first_surface", label)
+    fields["restore_last_surface"] = label
+    fields["restore_captures"] = cast(int, fields.get("restore_captures", 0)) + 1
+    lines = pane.splitlines()
+    fields.update(
+        restore_capture_empty=not pane.strip(),
+        restore_pane_rows=len(lines),
+        restore_pane_max_columns=max((len(line) for line in lines), default=0),
+    )
+
+
+@_best_effort
+def record_restore_action(
+    action: Literal["escape", "shell_clear", "scrolled_draft_clear"],
+) -> None:
+    trace = _prompt_delivery_trace.get()
+    if trace is not None:
+        key = f"restore_{action}_attempts"
+        trace.input_guard[key] = cast(int, trace.input_guard.get(key, 0)) + 1
+
+
+@_best_effort
+def record_pending_prompt(
+    source: Literal["hook_wait", "visible_prompt", "billing_consent"],
+) -> None:
+    trace = _prompt_delivery_trace.get()
+    if trace is not None:
+        attempt = trace.attempts[-1] if trace.attempts else {}
+        trace.input_guard.update(
+            pending_prompt_source=source,
+            pending_prompt_stage=trace.stage,
+            pending_prompt_after_paste=bool(attempt.get("paste_sent", False)),
+            pending_prompt_after_submit=bool(attempt.get("submit_sent", False)),
+        )
+
+
+@_best_effort
+def record_submit_composer(
+    *,
+    pane: str,
+    box_reader: Callable[[str], tuple[list[str], bool] | None],
+    baseline: bool = False,
+) -> None:
+    """Compare composer sizes across Enter attempts without retaining its text."""
+    trace = _prompt_delivery_trace.get()
+    if trace is None or not trace.attempts:
+        return
+    box = box_reader(pane)
+    if box is None:
+        return
+    rows, framed = box
+    shape = {
+        "framed": framed,
+        "rows": len(rows),
+        "blank_rows": sum(not row.strip() for row in rows),
+        "characters": sum(len(row) for row in rows),
+    }
+    attempt = trace.attempts[-1]
+    attempt.setdefault("submit_composer_shape_changes", 0)
+    if baseline:
+        attempt.update({f"submit_composer_initial_{key}": value for key, value in shape.items()})
+    previous = {key: attempt.get(f"submit_composer_last_{key}") for key in shape}
+    if previous["rows"] is not None and previous != shape:
+        attempt["submit_composer_shape_changes"] = (
+            cast(int, attempt.get("submit_composer_shape_changes", 0)) + 1
+        )
+    attempt.update({f"submit_composer_last_{key}": value for key, value in shape.items()})
 
 
 @_best_effort
@@ -169,6 +253,7 @@ def trace_delivery(
                                 for stage, seconds in trace.stage_seconds.items()
                             },
                             **trace.tmux_failure,
+                            **trace.input_guard,
                         }
                         if error_type is not None:
                             fields["error_type"] = error_type

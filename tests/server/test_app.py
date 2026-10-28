@@ -27,6 +27,7 @@ from omnigent.native.native_coding_agents import (
 )
 from omnigent.runtime.agent_cache import AgentCache
 from omnigent.server import app as server_app
+from omnigent.server.seeded_agents import SEEDED_AGENTS_ENV
 from omnigent.stores.agent_store.sqlalchemy_store import SqlAlchemyAgentStore
 from omnigent.stores.artifact_store.local import LocalArtifactStore
 from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConversationStore
@@ -1343,14 +1344,19 @@ def test_ensure_default_native_agents_seeds_every_native_agent(
         assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
 
 
+@pytest.mark.parametrize("allowlist", [None, frozenset()], ids=["unset", "empty-allowlist"])
 def test_ensure_default_acp_agents_seeds_configured_agent(
-    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+    seed_stores: _SeedStores,
+    monkeypatch: pytest.MonkeyPatch,
+    allowlist: frozenset[str] | None,
 ) -> None:
     """A configured ``acp:<slug>`` agent becomes a picker-renderable built-in.
 
     This is the ACP analogue of the native seeding: the New-Session picker reads
     built-ins from ``GET /v1/agents``, so a configured ACP agent must seed to
-    appear — the same way ``opencode-native-ui`` etc. do.
+    appear — the same way ``opencode-native-ui`` etc. do. It is the operator's
+    own agent, so an ``OMNIGENT_SEEDED_AGENTS`` allowlist never trims it; the
+    packaged ACP rows do obey the allowlist.
 
     **What breaks if this fails**: a user with Devin (or any ``acp:`` agent) set
     up on their machine never sees it in the web picker.
@@ -1367,8 +1373,8 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     # No builtin ACP CLI installed, so only the configured agent seeds.
     monkeypatch.setattr("omnigent._platform.resolve_cli_binary", lambda _b, **k: None)
 
-    server_app._ensure_default_acp_agents(
-        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    owned = server_app._ensure_default_acp_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache, allowlist
     )
 
     # Keyed by the slug, not the label.
@@ -1380,6 +1386,9 @@ def test_ensure_default_acp_agents_seeds_configured_agent(
     assert seeded.id == builtin_agent_id("gemini-cli")
     assert seeded.session_id is None, "built-ins must be session-scope NULL"
     assert seed_stores.artifact_store.get(seeded.bundle_location) is not None
+    assert "gemini-cli" not in owned
+    assert "grok" in owned
+    assert (seed_stores.agent_store.get_by_name("grok") is not None) == (allowlist is None)
 
 
 def test_ensure_default_acp_agents_seeds_builtin_cli_rows_without_a_local_binary(
@@ -2039,6 +2048,98 @@ def test_ensure_default_debby_agent_skips_when_bundle_absent(
     )
 
     assert seed_stores.agent_store.get_by_name(server_app._DEBBY_AGENT_NAME) is None
+
+
+@pytest.mark.parametrize(
+    "seeder",
+    [server_app._ensure_default_polly_agent, server_app._ensure_default_debby_agent],
+    ids=["polly", "debby"],
+)
+def test_bundle_agent_seeders_skip_when_not_allowlisted(
+    seed_stores: _SeedStores, seeder: Callable[..., frozenset[str]]
+) -> None:
+    """Polly and Debby are gated like the native rows and still return their name."""
+    (name,) = seeder(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache, frozenset()
+    )
+
+    assert seed_stores.agent_store.get_by_name(name) is None
+
+
+def test_ensure_default_agents_hides_trimmed_rows_without_deleting_them(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A trimmed boot still seeds native rows; unset hides nothing; trimming again keeps rows."""
+    stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native-ui")
+    suppressed = server_app._ensure_default_agents(*stores)
+    # Imports and smart routing bind native rows by id, so trimming only hides them.
+    assert seed_stores.agent_store.get_by_name("codex-native-ui") is not None
+    assert "codex-native-ui" in suppressed
+
+    monkeypatch.delenv(SEEDED_AGENTS_ENV, raising=False)
+    assert server_app._ensure_default_agents(*stores) == frozenset()
+    polly = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert polly is not None
+
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native-ui")
+    suppressed = server_app._ensure_default_agents(*stores)
+
+    assert {server_app._POLLY_AGENT_NAME, "codex-native-ui"} <= suppressed
+    assert "claude-native-ui" not in suppressed
+    kept = seed_stores.agent_store.get_by_name(server_app._POLLY_AGENT_NAME)
+    assert kept is not None and kept.id == polly.id
+
+
+@pytest.mark.parametrize("name", ["house-agent", "polly"], ids=["own-name", "packaged-name"])
+def test_ensure_default_agents_never_suppresses_operator_extras(
+    seed_stores: _SeedStores, tmp_path: Path, monkeypatch: pytest.MonkeyPatch, name: str
+) -> None:
+    """Operator extras survive an empty allowlist, even under a packaged name."""
+    spec = tmp_path / f"{name}.yaml"
+    spec.write_text(f"name: {name}\nexecutor:\n  harness: claude-sdk\nprompt: hi\n")
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
+    monkeypatch.setenv(server_app._EXTRA_BUILTIN_AGENTS_ENV, str(spec))
+
+    suppressed = server_app._ensure_default_agents(
+        seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+    )
+
+    assert seed_stores.agent_store.get_by_name(name) is not None
+    assert name not in suppressed
+    assert server_app._DEBBY_AGENT_NAME in suppressed
+
+
+def test_ensure_default_agents_warns_on_unknown_allowlist_names(
+    seed_stores: _SeedStores,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A typo hides every packaged agent, so the warning names it and the real roster."""
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "claude-native")
+    with caplog.at_level("WARNING", logger=server_app.__name__):
+        server_app._ensure_default_agents(
+            seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache
+        )
+
+    warning = next(r.getMessage() for r in caplog.records if SEEDED_AGENTS_ENV in r.getMessage())
+    assert "built-in: claude-native (" in warning
+    assert "claude-native-ui" in warning
+
+
+def test_ensure_default_agents_allowlist_recognizes_every_packaged_name(
+    seed_stores: _SeedStores, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An empty allowlist hides every packaged row; naming them all hides none."""
+    monkeypatch.setattr("omnigent.onboarding.acp_auth.acp_agents", lambda *a, **k: [])
+    stores = (seed_stores.agent_store, seed_stores.artifact_store, seed_stores.agent_cache)
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, "")
+    packaged = server_app._ensure_default_agents(*stores)
+    assert {a.name for a in seed_stores.agent_store.list(limit=200).data} <= packaged
+
+    monkeypatch.setenv(SEEDED_AGENTS_ENV, ",".join(sorted(packaged)))
+    assert server_app._ensure_default_agents(*stores) == frozenset()
+    assert {a.name for a in seed_stores.agent_store.list(limit=200).data} == packaged
 
 
 def _build_api_only_app(db_uri: str, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> FastAPI:

@@ -15,6 +15,8 @@ and the recording protocol for comparing revisions.
 - `responsive`: desktop and mobile show the file and retain edits and drafts.
 - `load`: fixed mixed-content documents expose parsing and rendering costs.
 - `offline`: unsaved edits remain guarded when the workspace cannot save.
+- `live-refresh`: an open file shows saves from other sessions and processes
+  in place, keeping the caret; unsaved edits raise a conflict instead.
 - `large-files`: files above 1 MiB open as editable source; truncated files
   remain read-only, with full-file download available.
 
@@ -136,6 +138,16 @@ This does not cover every Markdown shape or establish a safe 1 MiB limit.
   `tests/e2e_ui/files/test_file_autosave.py::test_markdown_edit_autosaves`
   confirms the edit, undo, and redo through fresh filesystem API reads from
   the real server, then reloads the saved edit.
+- `direct-link`, `live-refresh`:
+  `tests/e2e_ui/files/test_file_autosave.py::test_open_markdown_follows_other_writers`
+  leaves an idle session's editor open while another process replaces the file
+  and another session saves it. Both edits appear without a reload, and typing
+  at the parked caret saves beside them. With saves failing, a later external
+  change raises the conflict instead of replacing unsaved text, and Keep mine
+  saves it. Edits typed during a save, the pre-save conflict check, undo, and
+  caret mapping are covered by component tests
+  (`MarkdownRichTextViewer.integration.test.tsx`,
+  `MonacoCodeEditor.autosave.test.tsx`, `TipTapEditorHelpers.test.ts`).
 - `files`, `review`:
   `tests/e2e_ui/comments/test_markdown_editor_comments.py::test_markdown_rich_text_editor_add_comment`
   submits a comment and checks its stored anchor. The heading variant is
@@ -230,6 +242,18 @@ instead of treating one comparison clip as complete feature verification.
   when upstream handles long lines without exhausting the regex stack.
 - Browser-contract saves update an in-memory mock filesystem. A successful
   reload there does not prove server/runner persistence or external-file edits.
+- Live refresh polls only an on-screen UTF-8 file up to 256 KiB, every two
+  seconds; hidden browser tabs pause. Larger and binary files, and the diff
+  view, refresh when shown again or when the session finishes a turn.
+- Every autosave re-reads the file first and raises the conflict if another
+  writer changed it. Saves are still last-writer-wins: a write landing between
+  that read and the save can be overwritten.
+- A failed refresh keeps the last loaded content, shows a notice, and re-checks
+  every 30 seconds; saving a file that was deleted meanwhile recreates it.
+- An external update replaces the document as `setContent` would, maps the
+  caret through the changed range, and clears undo history, as Monaco does. A
+  caret inside that range, or between separately changed regions, moves to its
+  end. Monaco keeps the caret's line and column instead of mapping it.
 - Desktop and mobile can have hidden viewer instances on older revisions.
   Interact with the visible viewer and report total editor count separately.
 - Resizing saved content is not evidence that unsaved edits or comments survive.

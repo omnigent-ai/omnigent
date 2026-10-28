@@ -1125,6 +1125,7 @@ class CodexAppServerClient:
         # ``None`` marks the end of the event stream (reader exited).
         self._events: asyncio.Queue[CodexMessage | None] = asyncio.Queue()
         self._next_id = 1
+        self._subscribed_thread_ids: set[str] = set()
 
     async def connect(self) -> None:
         """
@@ -1148,6 +1149,7 @@ class CodexAppServerClient:
         # Fresh queue per connection so a previous stream's end marker
         # cannot end this connection's consumers.
         self._events = asyncio.Queue()
+        self._subscribed_thread_ids = set()
         self._reader_task = asyncio.create_task(
             self._reader_loop(),
             name="codex-native-app-server-reader",
@@ -1232,7 +1234,26 @@ class CodexAppServerClient:
             exc = CodexAppServerResponseError(error)
             exc.add_note(f"Codex app-server RPC: method={method} request_id={request_id}")
             raise exc
+        if method in {"thread/start", "thread/resume"}:
+            result = response.get("result")
+            thread = result.get("thread") if isinstance(result, dict) else None
+            thread_id = thread.get("id") if isinstance(thread, dict) else params.get("threadId")
+            if isinstance(thread_id, str) and thread_id:
+                self._subscribed_thread_ids.add(thread_id)
         return response
+
+    def is_subscribed_to_thread(self, thread_id: str) -> bool:
+        """
+        Return whether this connection already receives a thread's notifications.
+
+        Codex sends turn and item notifications only to connections that
+        started or resumed the thread.
+
+        :param thread_id: Codex thread id, e.g. ``"thread_123"``.
+        :returns: ``True`` after a successful ``thread/start`` or
+            ``thread/resume`` for the thread on this connection.
+        """
+        return thread_id in self._subscribed_thread_ids
 
     async def notify(self, method: str, params: CodexParams | None = None) -> None:
         """
@@ -1977,6 +1998,14 @@ async def codex_launch_catalog_is_stale(
     )
 
 
+def _configured_app_server_command() -> tuple[str, ...]:
+    """The configured app-server wrapper, ``harness.codex-native.app_server``, or ``()``."""
+    from omnigent.config import load_effective_config
+    from omnigent.harness_startup_config import resolve_codex_app_server_command
+
+    return resolve_codex_app_server_command(load_effective_config())
+
+
 def _tagged_codex_argv0(codex_path: str, registry_tag: str) -> str:
     """Return the argv[0] carrying the crash-reap tag for a registered app-server."""
     return f"{Path(codex_path).name} {codex_native_session_tag_cmdline_arg(registry_tag)}"
@@ -1987,12 +2016,19 @@ def _build_native_codex_app_server_argv(
     tagged_argv0: str,
     listen_url: str,
     config_overrides: Sequence[str],
+    launch_args: Sequence[str] = (),
 ) -> list[str]:
-    """Build argv for the native Codex app-server subprocess."""
-    argv = [tagged_argv0, "app-server", "--listen", listen_url]
-    for override in config_overrides:
-        argv.extend(["-c", override])
-    return argv
+    """Build argv for the native Codex app-server subprocess.
+
+    The ``-c`` overrides go before ``app-server``: Codex ignores top-level ``-c``
+    once the subcommand has its own, so a wrapper that passes its own top-level
+    ``-c`` (e.g. ucode) keeps it only if these join that group.
+
+    :param launch_args: Args of a configured app-server wrapper, placed before
+        everything else (see :func:`_configured_app_server_command`).
+    """
+    overrides = [arg for override in config_overrides for arg in ("-c", override)]
+    return [tagged_argv0, *launch_args, *overrides, "app-server", "--listen", listen_url]
 
 
 @dataclass
@@ -2098,6 +2134,7 @@ class CodexNativeAppServer:
     config_profile: str | None = None
     session_id: str | None = None
     writable_roots: tuple[str, ...] = ()
+    app_server_command: tuple[str, ...] = ()
     stderr_capture_error_type: str | None = field(default=None, init=False)
     # First TLS certificate failure the launcher printed; mirrored into the
     # bridge so the forwarder can fail a stuck turn with the cause.
@@ -2112,10 +2149,12 @@ class CodexNativeAppServer:
         :returns: None.
         """
         self.process_registry_tag = f"codex-native-{uuid.uuid4().hex}"
+        executable, *launch_args = self.app_server_command or (self.codex_path,)
         argv = _build_native_codex_app_server_argv(
-            tagged_argv0=_tagged_codex_argv0(self.codex_path, self.process_registry_tag),
+            tagged_argv0=_tagged_codex_argv0(executable, self.process_registry_tag),
             listen_url=resolved_listen,
             config_overrides=self.config_overrides,
+            launch_args=launch_args,
         )
         proc_env = codex_app_server_diagnostic_env(
             {**self.env, "CODEX_HOME": str(self.codex_home)}
@@ -2129,7 +2168,7 @@ class CodexNativeAppServer:
                 stderr=asyncio.subprocess.PIPE,
                 env=proc_env,
                 cwd=str(self.cwd),
-                executable=self.codex_path,
+                executable=executable,
                 **_proc.spawn_kwargs(),
             )
         except BaseException:
@@ -3698,6 +3737,7 @@ def build_codex_native_server(
         trust_all_hooks=trust_all_hooks,
         reconcile_process_registry=reconcile_process_registry,
         writable_roots=tuple(codex_workspace_roots(terminal_launch_args, cwd)[1]),
+        app_server_command=_configured_app_server_command(),
     )
 
 

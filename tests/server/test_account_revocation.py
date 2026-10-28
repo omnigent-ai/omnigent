@@ -694,7 +694,11 @@ def test_account_deletion_prevents_future_persistent_dispatch(setup_app, monkeyp
     clock = FakeClock(task.next_run_at + 1)
     dispatch = stores["scheduled_task_dispatch"]
     scheduler = PersistentTaskScheduler(
-        tasks, dispatch.on_fire, dispatch.on_expired, owns_host=dispatch.owns_host, now=clock.now
+        tasks,
+        dispatch.on_fire,
+        dispatch.on_expired,
+        owned_hosts=dispatch.owned_hosts,
+        now=clock.now,
     )
     list_tasks = Mock(wraps=tasks.list)
     monkeypatch.setattr(tasks, "list", list_tasks)

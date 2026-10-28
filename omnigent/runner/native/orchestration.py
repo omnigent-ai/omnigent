@@ -2737,8 +2737,8 @@ async def _auto_create_pi_terminal(
     # already have. Skipped when the user pinned their own provider/model via
     # terminal_launch_args. When no usable provider is configured Pi falls
     # back to its own login, but a spec/session-pinned model still passes
-    # through as ``--model``. Writes a managed per-session Pi config dir,
-    # never touching the user's global ``~/.pi/agent``.
+    # through as ``--model``. Session model configuration stays separate;
+    # supported user resources are linked into the session agent directory.
     credential_warning: str | None = None
     effort_notice: str | None = None
     model_notice: str | None = None
@@ -2773,6 +2773,7 @@ async def _auto_create_pi_terminal(
                 provider,
                 launch_config.reasoning_effort,
                 selection=spec_model,
+                global_agent_dir=global_pi_agent_dir(workspace=launch_config.workspace),
             )
             pi_env.update(launch.env)
             provider_args.extend(launch.args)
@@ -8808,7 +8809,8 @@ async def _auto_create_claude_terminal(
         agent ships a ``skills/`` directory, resolved by the caller
         (which has the runner's spec resolver). Threaded to
         :func:`augment_claude_args` so Claude Code discovers bundled
-        skills via ``--plugin-dir``. ``None`` adds no plugin args.
+        skills via ``--plugin-dir``. ``None`` uses a bridge-owned bundle
+        for the built-in skill.
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
@@ -9495,6 +9497,11 @@ async def _auto_create_claude_terminal(
         launch_metadata.auto_harness,
         router_started=subagent_router_dir is not None,
     )
+    if bundle_dir is None:
+        # Reuse the bridge's owned directory across retries and terminal transfers.
+        # Its dead-owner cleanup also reclaims these generated skill links.
+        bundle_dir = bridge_dir / "skill-bundle"
+        _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,

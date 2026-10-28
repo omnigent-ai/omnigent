@@ -416,10 +416,10 @@ async def test_executor_error_terminates_with_response_failed(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("preserve_session", [False, True])
-async def test_executor_error_preserves_only_explicitly_idle_sessions(
+async def test_executor_error_preserves_only_explicitly_reusable_sessions(
     preserve_session: bool,
 ) -> None:
-    """Ordinary errors still tear down; pre-prompt failures can retain an idle executor."""
+    """Ordinary errors still tear down; explicitly reusable executors can be retained."""
     import asyncio
     from unittest.mock import AsyncMock, Mock
 
@@ -1047,7 +1047,7 @@ def test_classify_anthropic_exception_maps_known_types(
     monkeypatch arranges.
 
     Regression: Phase 1d/1e wires
-    ``ANTHROPIC_MAX_RETRIES`` into the Claude CLI subprocess,
+    ``CLAUDE_CODE_MAX_RETRIES`` into the Claude CLI subprocess,
     which can still surface raw :class:`anthropic.RateLimitError`
     upward when the SDK's framing layer fails. Without this
     classifier, those would render as ``[llm] RateLimitError``

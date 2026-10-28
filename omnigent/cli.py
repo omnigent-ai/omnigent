@@ -4862,15 +4862,20 @@ def server(
     )
 
     # Refresh built-ins first so explicit --agent bundles take precedence.
+    suppressed_agent_names: frozenset[str] = frozenset()
     if agent_dirs:
-        _ensure_default_agents(agent_store, artifact_store, agent_cache)
+        suppressed_agent_names = _ensure_default_agents(agent_store, artifact_store, agent_cache)
     for agent_dir in agent_dirs:
-        _preregister_agent(
+        agent_id = _preregister_agent(
             Path(agent_dir),
             agent_store,
             artifact_store,
             agent_cache,
         )
+        # An explicit bundle is the operator's own agent, even under a packaged name.
+        registered = agent_store.get(agent_id) if agent_id is not None else None
+        if registered is not None:
+            suppressed_agent_names -= {registered.name}
 
     from omnigent.stores.host_store import HostStore
 
@@ -4998,6 +5003,7 @@ def server(
         artifact_store=artifact_store,
         agent_cache=agent_cache,
         default_agents_seeded=bool(agent_dirs),
+        suppressed_agent_names=suppressed_agent_names,
         runner_tunnel_tokens=_runner_tunnel_tokens,
         permission_store=permission_store,
         scheduled_task_store=scheduled_task_store,

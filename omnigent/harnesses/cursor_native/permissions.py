@@ -150,7 +150,7 @@ async def _send_cursor_keys(bridge_dir: Path, session_id: str, *keys: str) -> bo
             await asyncio.sleep(_KEY_ENTER_SETTLE_S)
         try:
             await asyncio.to_thread(send_cursor_pane_keys, bridge_dir, key)
-        except RuntimeError:
+        except (RuntimeError, OSError):
             _logger.exception(
                 "failed to send cursor keystroke %r (of %r); session=%s", key, keys, session_id
             )
@@ -917,6 +917,7 @@ async def supervise_cursor_transcript_elicitations(
     first_seen: dict[str, float] = {}
     auto_accept_attempts: dict[str, _YoloAcceptRetry] = {}
     next_auto_accept_at = 0.0
+    failure_output: str | None = None
     store_path: Path | None = None
     loop = asyncio.get_running_loop()
     timeout = httpx.Timeout(_POST_TIMEOUT_S, connect=10.0)
@@ -925,6 +926,15 @@ async def supervise_cursor_transcript_elicitations(
     async with open_server_client(base_url, headers=headers, auth=auth, timeout=timeout) as client:
         while True:
             try:
+                if failure_output is not None:
+                    await _post_external_session_status(
+                        client,
+                        session_id=session_id,
+                        status="failed",
+                        turn_outcome="failed",
+                        output=failure_output,
+                    )
+                    return
                 if store_path is None or not store_path.exists():
                     store_path = await asyncio.to_thread(
                         _resolve_elicitation_store, bridge_dir, workspace, launch_epoch_ms
@@ -1036,20 +1046,12 @@ async def supervise_cursor_transcript_elicitations(
             except asyncio.CancelledError:
                 raise
             except _YoloAutoAcceptError as exc:
-                message = f"Error: {exc}"
+                failure_output = f"Error: {exc}"
                 _logger.error(
                     "cursor elicitation: %s; failing YOLO turn; session=%s",
                     exc,
                     session_id,
                 )
-                await _post_external_session_status(
-                    client,
-                    session_id=session_id,
-                    status="failed",
-                    turn_outcome="failed",
-                    output=message,
-                )
-                return
             except Exception:
                 _logger.exception(
                     "cursor transcript elicitation poll failed; session=%s bridge_dir=%s",

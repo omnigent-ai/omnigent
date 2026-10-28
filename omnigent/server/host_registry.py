@@ -28,7 +28,7 @@ from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol
+from typing import Any, Literal, Protocol, TypedDict
 
 from cachetools import TTLCache
 
@@ -189,6 +189,16 @@ def _fail_pending_skills(conn: HostConnection) -> None:
 def _fail_pending_mcp_servers(conn: HostConnection) -> None:
     """Fail MCP inventory requests as soon as their host disappears."""
     _fail_pending_inventory(conn.pending_mcp_servers, conn.host_id)
+
+
+def _fail_pending_worktrees(conn: HostConnection) -> None:
+    """Fail worktree requests as soon as their host disappears."""
+    for pending in (
+        conn.pending_create_worktrees,
+        conn.pending_remove_worktrees,
+        conn.pending_list_worktrees,
+    ):
+        _fail_pending_inventory(pending, conn.host_id)
 
 
 def _fail_pending_harness_rpcs(conn: HostConnection) -> None:
@@ -352,6 +362,22 @@ class WebSocketLike(Protocol):
         ...
 
 
+class HostLaunchResult(TypedDict, total=False):
+    """
+    Resolved fields of a ``host.launch_runner_result`` awaited by launch callers.
+
+    Mirrors :class:`omnigent.host.frames.HostLaunchRunnerResultFrame`; a
+    caller-synthesized failure (lost connection, timeout) carries only
+    ``status`` and ``error``.
+    """
+
+    status: str
+    runner_id: str | None
+    error: str | None
+    error_code: str | None
+    workspace_recreated: bool
+
+
 @dataclass
 class HostConnection:
     """Per-host state while the tunnel is open.
@@ -477,7 +503,7 @@ class HostConnection:
     # user machine reusing a managed host's id under ordinary login. Read by the
     # default-public policy so only genuine sandboxes count as managed.
     registered_with_managed_token: bool = False
-    pending_launches: dict[str, asyncio.Future[dict[str, str | None]]] = field(
+    pending_launches: dict[str, asyncio.Future[HostLaunchResult]] = field(
         default_factory=dict,
     )
     pending_stops: dict[str, asyncio.Future[dict[str, str | None]]] = field(
@@ -675,6 +701,7 @@ class HostRegistry:
                 _fail_pending_mcp_tools(old)
                 _fail_pending_skills(old)
                 _fail_pending_mcp_servers(old)
+                _fail_pending_worktrees(old)
                 _fail_pending_harness_rpcs(old)
             self._hosts[key] = conn
             if hello.interactive_shells is not None:
@@ -725,6 +752,7 @@ class HostRegistry:
         _fail_pending_mcp_tools(removed)
         _fail_pending_skills(removed)
         _fail_pending_mcp_servers(removed)
+        _fail_pending_worktrees(removed)
         _fail_pending_harness_rpcs(removed)
         return True
 

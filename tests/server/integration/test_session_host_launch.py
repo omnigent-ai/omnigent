@@ -211,6 +211,7 @@ async def _serve_one_launch(
     launch_status: str,
     launch_error: str | None = None,
     launch_error_code: str | None = None,
+    workspace_recreated: bool = False,
 ) -> HostLaunchRunnerFrame:
     """Answer the host round-trips for a single inline session launch.
 
@@ -229,6 +230,9 @@ async def _serve_one_launch(
     :param launch_error_code: Structured failure category to attach,
         e.g. ``"harness_not_configured"``; ``None`` reports an
         uncategorized failure (legacy host behavior).
+    :param workspace_recreated: Report that the host recreated a deleted
+        workspace before spawning. Added as the raw wire key so the test
+        exercises the server's decoding of an upgraded host's payload.
     :returns: The ``host.launch_runner`` frame the server sent, so
         callers can assert on its fields (e.g. ``harness``).
     """
@@ -260,20 +264,18 @@ async def _serve_one_launch(
                 }
             )
         elif isinstance(frame, HostLaunchRunnerFrame):
-            await comm.send_input(
-                {
-                    "type": "websocket.receive",
-                    "text": encode_host_frame(
-                        HostLaunchRunnerResultFrame(
-                            request_id=frame.request_id,
-                            status=launch_status,
-                            runner_id="runner_from_host" if launch_status == "launched" else None,
-                            error=launch_error,
-                            error_code=launch_error_code,
-                        )
-                    ),
-                }
+            result_text = encode_host_frame(
+                HostLaunchRunnerResultFrame(
+                    request_id=frame.request_id,
+                    status=launch_status,
+                    runner_id="runner_from_host" if launch_status == "launched" else None,
+                    error=launch_error,
+                    error_code=launch_error_code,
+                )
             )
+            if workspace_recreated:
+                result_text = json.dumps({**json.loads(result_text), "workspace_recreated": True})
+            await comm.send_input({"type": "websocket.receive", "text": result_text})
             return frame
     raise AssertionError("host never received a launch frame from the inline path")
 
@@ -3676,6 +3678,64 @@ async def test_message_relaunch_workspace_missing_persists_error_turn(
     assert conv.host_id == _HOST_ID
 
 
+async def test_message_relaunch_recreated_workspace_continues_with_notice(
+    client: httpx.AsyncClient,
+    app: FastAPI,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A relaunch whose host recreated the deleted workspace is not a refusal.
+
+    The host recreates a missing workspace directory and reports it with
+    ``workspace_recreated`` on its ``launched`` result. The server must treat
+    that as a normal launch — no ``workspace_missing`` error turn, no blocked
+    send — and leave exactly one info-level notice in the transcript so the
+    user learns the directory is now empty.
+
+    No runner connects in this harness, so the send itself ends in the
+    generic never-connected 503; the assertions pin which path the launch
+    took, not the runner outcome.
+    """
+    from omnigent.runtime import set_runner_client
+    from omnigent.server.routes import sessions as sessions_module
+    from omnigent.server.routes.sessions import routes_events
+
+    monkeypatch.setattr(sessions_module, "_HOST_BOUND_RUNNER_CONNECT_GRACE_S", 0.0)
+    monkeypatch.setattr(routes_events, "_HOST_RELAUNCH_RUNNER_CONNECT_TIMEOUT_S", 0.2)
+
+    comm = await _connect_host(app)
+    session = await _inline_launch_session(client, comm)
+    session_id = session["id"]
+
+    set_runner_client(None)
+    relaunch_responder = asyncio.create_task(
+        _serve_one_launch(comm, launch_status="launched", workspace_recreated=True)
+    )
+    try:
+        msg_resp = await client.post(
+            f"/v1/sessions/{session_id}/events",
+            json={
+                "type": "message",
+                "data": {"role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+            },
+        )
+    finally:
+        await relaunch_responder
+        set_runner_client(None)
+
+    assert msg_resp.status_code == 503, msg_resp.text
+    assert msg_resp.json()["error"]["code"] == "runner_unavailable", msg_resp.text
+
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    error_items = [item for item in items.json()["data"] if item.get("type") == "error"]
+    assert [item["code"] for item in error_items] == ["workspace_recreated"], (
+        f"expected only the recreated-workspace notice, got {error_items!r}"
+    )
+    notice = error_items[0]
+    assert notice.get("level") == "info", f"the notice must not render as a failure: {notice!r}"
+    assert _WORKSPACE in notice["message"], notice["message"]
+
+
 async def test_retry_session_relaunches_dead_runner_without_mutating_history(
     client: httpx.AsyncClient,
     app: FastAPI,
@@ -3997,7 +4057,9 @@ async def test_concurrent_relaunches_are_single_flight(
     the #5182 incident) — every extra spawn a leaked generation.
 
     Mutation check: remove the relaunch lock / re-read short-circuit and
-    two launch frames arrive — the exactly-one assertion fails.
+    two launch frames arrive — the exactly-one assertion fails. The host
+    reports ``workspace_recreated`` so the same lock must also leave exactly
+    one recovery notice, never one per rider.
     """
     from omnigent.runtime import set_runner_client
     from omnigent.server.routes import sessions as sessions_module
@@ -4066,6 +4128,7 @@ async def test_concurrent_relaunches_are_single_flight(
                                     request_id=frame.request_id,
                                     status="launched",
                                     runner_id="runner_from_host",
+                                    workspace_recreated=True,
                                 )
                             ),
                         }
@@ -4092,6 +4155,20 @@ async def test_concurrent_relaunches_are_single_flight(
     assert len(launches) == 1, (
         f"concurrent relaunches must single-flight into ONE host.launch_runner; "
         f"got {len(launches)} — each extra spawn is a leaked runner (#5182)"
+    )
+
+    # The one launch recreated the workspace; the notice persists under the
+    # relaunch lock, so the rider must not duplicate it.
+    items = await client.get(f"/v1/sessions/{session_id}/items")
+    assert items.status_code == 200, items.text
+    recreated = [
+        item
+        for item in items.json()["data"]
+        if item.get("type") == "error" and item.get("code") == "workspace_recreated"
+    ]
+    assert len(recreated) == 1, (
+        f"concurrent relaunches must leave exactly one workspace-recreated notice; "
+        f"got {len(recreated)}"
     )
 
 

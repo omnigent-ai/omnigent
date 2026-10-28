@@ -177,6 +177,9 @@ ARCHIVED_AT_LABEL_KEY = "omnigent.archived_at"
 # Server-owned origin, retained when a schedule's run history is deleted.
 SCHEDULED_TASK_ORIGIN_LABEL_KEY = "omnigent.scheduled_task_origin"
 
+# Creation provenance only; this does not confer parentage or permissions.
+CREATED_BY_SESSION_LABEL_KEY = "omnigent.created_by_session_id"
+
 
 # Labels that must NOT cross into a new session context — deliberately
 # dropped both when forking (not copied to the clone) and on an in-place
@@ -229,6 +232,7 @@ _SANDBOX_REPO_LABEL_KEY = "omnigent.sandbox.repo"
 # ``REQUESTED_HOST_ID_LABEL_KEY`` (cross-checked by a store test).
 _SANDBOX_REQUESTED_HOST_ID_LABEL_KEY = "omnigent.sandbox.requested_host_id"
 _FORK_ONLY_DROPPED_LABEL_KEYS = IMPORT_PROVENANCE_LABEL_KEYS | {
+    CREATED_BY_SESSION_LABEL_KEY,
     ARCHIVED_AT_LABEL_KEY,
     SIDE_CHAT_LABEL_KEY,
     SIDE_CHAT_SOURCE_LABEL_KEY,
@@ -307,6 +311,24 @@ class SessionConnectivity:
     needs_workspace: bool
     imported: bool = False
     runner_last_seen: int | None = None
+
+
+@dataclass(frozen=True)
+class SessionActivity:
+    """
+    When a session last changed and what it is doing now.
+
+    Returned by :meth:`ConversationStore.get_session_activity` for callers
+    that list sessions alongside other records (an automation's runs) and
+    need only these fields, not labels or content.
+
+    :param updated_at: Epoch seconds of the session's last update.
+    :param live_status: The persisted live status (``"idle"``, ``"running"``,
+        ``"waiting"``, ``"failed"``), or ``None`` when none is recorded.
+    """
+
+    updated_at: int
+    live_status: str | None
 
 
 # Freshness window for ``omnigent_conversation_metadata.runner_last_seen``. The tunnel
@@ -652,6 +674,20 @@ class ConversationStore(ABC):
         :returns: Mapping ``conversation_id -> SessionConnectivity``.
             Ids with no conversation row are absent (callers treat a
             missing id as reachable, mirroring the single-row path).
+        """
+        ...
+
+    @abstractmethod
+    def get_session_activity(self, conversation_ids: list[str]) -> dict[str, SessionActivity]:
+        """
+        Return each session's last update time and live status in one batch.
+
+        Reads two columns per id and no labels, so the cost is bounded by the
+        id count. Missing ids are omitted from the result.
+
+        :param conversation_ids: Conversation ids, e.g. ``["conv_abc123"]``.
+            Duplicates are tolerated; empty input returns ``{}`` without a query.
+        :returns: Mapping ``conversation_id -> SessionActivity``.
         """
         ...
 
@@ -1094,8 +1130,12 @@ class ConversationStore(ABC):
         terminal_launch_args: list[str] | None = None,
         archived: bool | None = None,
         reported_model: str | None = None,
+        label_updates: dict[str, str] | None = None,
     ) -> ConversationUpdateResult | None:
         """Update a conversation and report requested model-setting changes.
+
+        ``label_updates`` merges labels atomically with model and effort
+        settings; omitted labels remain unchanged.
 
         The returned change flags describe only the explicitly requested
         ``reasoning_effort`` and ``model_override`` updates. A request that

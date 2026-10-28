@@ -434,8 +434,11 @@ function FileViewerBody({
   // keyboard inset so the comments panel and its (auto-focused) textarea stay
   // visible. No-op off iOS / with the keyboard closed or in the desktop rail.
   const keyboardInset = useIOSNativeKeyboardInset((!frameless || mobileOverlay) && open);
+  const onScreen = open && isActiveViewport && mediaActive;
   // Video playback reads the complete binary on demand, never the capped JSON preview.
-  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path);
+  const fileQuery = useFileContent(conversationId, isVideoFile(path) ? null : path, {
+    visible: onScreen,
+  });
   const changedFiles = useWorkspaceChangedFiles(conversationId);
 
   // Build the navigable file list from all changed files (including deleted),
@@ -1726,6 +1729,19 @@ function FileViewerBody({
         </div>
       </div>
 
+      {fileQuery.isRefetchError && !isDeletedFile && (
+        <div
+          role="status"
+          className="flex shrink-0 items-center gap-2 border-b border-border bg-warning/10 px-4 py-1.5 text-sm text-foreground"
+        >
+          <AlertTriangleIcon className="size-3.5 shrink-0 text-warning" />
+          <span>
+            Couldn&apos;t refresh this file (
+            {fileQuery.error instanceof Error ? fileQuery.error.message : String(fileQuery.error)}
+            ). Showing the last loaded version.
+          </span>
+        </div>
+      )}
       <div className="min-h-0 flex-1 flex flex-col md:flex-row overflow-hidden">
         <div
           ref={contentAreaRef}
@@ -1811,7 +1827,7 @@ function FileViewerBody({
               onSetActiveSelection={handleSetActiveSelection}
               pendingBodyRef={pendingBodyRef}
               panelOpen={open}
-              mediaActive={open && isActiveViewport && mediaActive}
+              mediaActive={onScreen}
               searchOpen={searchOpen}
               setSearchOpen={setSearchOpen}
               searchFocusNonce={searchFocusNonce}

@@ -779,8 +779,9 @@ async def test_supervise_transcript_yolo_waits_through_stale_pending_burst(
     assert keys_sent == [("y",)] * (3 if delay == "backoff" else 1)
 
 
+@pytest.mark.parametrize("post_failure", [None, "connection", "503"])
 async def test_supervise_transcript_yolo_times_out_then_fails_turn(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, post_failure: str | None
 ) -> None:
     """A visible gate that never clears fails without an unattended card."""
     # Stays pending no matter how many times we accept it.
@@ -790,6 +791,24 @@ async def test_supervise_transcript_yolo_times_out_then_fails_turn(
     )
     polls = 0
     sent_at: list[float] = []
+    status_attempts: list[dict[str, str]] = []
+    post_status = cnp._post_external_session_status
+
+    async def post_with_transient_failure(client: httpx.AsyncClient, **kwargs: str) -> None:
+        status_attempts.append(kwargs)
+        if post_failure is not None and len(status_attempts) == 1:
+            pending_now.clear()
+            request = httpx.Request("POST", "http://x/events")
+            if post_failure == "connection":
+                raise httpx.ConnectError("temporarily unavailable", request=request)
+            raise httpx.HTTPStatusError(
+                "temporarily unavailable",
+                request=request,
+                response=httpx.Response(503, request=request),
+            )
+        await post_status(client, **kwargs)
+
+    monkeypatch.setattr(cnp, "_post_external_session_status", post_with_transient_failure)
 
     def read_pending(_store: Path) -> list[CursorPendingToolCall]:
         nonlocal polls
@@ -815,28 +834,43 @@ async def test_supervise_transcript_yolo_times_out_then_fails_turn(
 
     assert sent_at == [0, 2, 6, 11, 16, 21, 26]
     assert keys_sent == [("y",)] * 7
+    assert len(status_attempts) == (2 if post_failure is not None else 1)
+    assert all(attempt == status_attempts[0] for attempt in status_attempts)
     assert _hook_posts(posts) == []
     assert posts[-1][1]["data"]["status"] == "failed"
     assert "accept did not clear Shell" in posts[-1][1]["data"]["output"]
 
 
 @pytest.mark.parametrize(
-    "capture_gap",
+    ("capture_gap", "send_error"),
     [
-        pytest.param(None, id="pane-unavailable"),
-        pytest.param("", id="capture-failure"),
-        pytest.param(" \n ", id="blank-frame"),
+        pytest.param(None, None, id="pane-unavailable"),
+        pytest.param("", None, id="capture-failure"),
+        pytest.param(" \n ", None, id="blank-frame"),
+        pytest.param(_ACCEPT_PANE, RuntimeError, id="rejected-send"),
+        pytest.param(_ACCEPT_PANE, OSError, id="send-os-error"),
     ],
 )
-async def test_yolo_auto_accept_recovers_after_transient_capture_failure(
+async def test_yolo_auto_accept_recovers_after_transient_failure(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
     capture_gap: str | None,
+    send_error: type[Exception] | None,
 ) -> None:
-    """A temporary pane lookup or capture failure is retried without a card."""
+    """A temporary capture or send failure is retried without a card."""
+    send_keys = cnp._send_cursor_keys
     _, keys_sent = _install_supervisor_fakes(
         monkeypatch, tmp_path, pending=[_SHELL_CALL], pane=_ACCEPT_PANE
     )
+    if send_error is not None:
+
+        def send_with_transient_failure(_bridge: Path, key: str) -> None:
+            keys_sent.append((key,))
+            if len(keys_sent) == 1:
+                raise send_error("tmux send unavailable")
+
+        monkeypatch.setattr(cnp, "_send_cursor_keys", send_keys)
+        monkeypatch.setattr(cnp, "send_cursor_pane_keys", send_with_transient_failure)
     panes = iter([capture_gap, _ACCEPT_PANE])
     monkeypatch.setattr(cnp, "capture_cursor_pane", lambda _bridge: next(panes))
     attempts: dict[str, cnp._YoloAcceptRetry] = {}
@@ -852,7 +886,7 @@ async def test_yolo_auto_accept_recovers_after_transient_capture_failure(
         for now in (0.0, 2.0)
     ]
     assert outcomes == [cnp._YoloAccept.SKIP, cnp._YoloAccept.SENT]
-    assert keys_sent == [("y",)]
+    assert keys_sent == [("y",)] * (2 if send_error is not None else 1)
 
 
 async def test_supervise_transcript_yolo_never_types_when_no_prompt_on_screen(
@@ -899,13 +933,15 @@ async def test_supervise_transcript_yolo_fails_when_pane_stays_unavailable(
     assert "tmux target was not advertised" in posts[-1][1]["data"]["output"]
 
 
+@pytest.mark.parametrize("send_error", [None, RuntimeError, OSError])
 async def test_supervise_transcript_yolo_fails_when_keystroke_stays_undelivered(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, send_error: type[Exception] | None
 ) -> None:
     """A rejected send is retried, then fails without surfacing a card."""
-    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_TIMEOUT_S", 0.02)
+    monkeypatch.setattr(cnp, "_YOLO_ACCEPT_TIMEOUT_S", 2.0)
     monkeypatch.setattr(cnp, "_YOLO_ACCEPT_RETRY_S", 0.0)
     monkeypatch.setattr(cnp, "_YOLO_ACCEPT_MAX_RETRY_S", 0.0)
+    send_keys = cnp._send_cursor_keys
     posts, keys_sent = _install_supervisor_fakes(
         monkeypatch,
         tmp_path,
@@ -913,6 +949,18 @@ async def test_supervise_transcript_yolo_fails_when_keystroke_stays_undelivered(
         pane=_ACCEPT_PANE,
         deliver_keys=False,
     )
+    clock = SimpleNamespace(time=lambda: float(len(keys_sent)))
+    async_facade = SimpleNamespace(**vars(asyncio))
+    async_facade.get_running_loop = lambda: clock
+    monkeypatch.setattr(cnp, "asyncio", async_facade)
+    if send_error is not None:
+
+        def reject_send(_bridge: Path, key: str) -> None:
+            keys_sent.append((key,))
+            raise send_error("tmux send unavailable")
+
+        monkeypatch.setattr(cnp, "_send_cursor_keys", send_keys)
+        monkeypatch.setattr(cnp, "send_cursor_pane_keys", reject_send)
 
     task = _start_supervisor(
         tmp_path, session_id="conv_yolo_undelivered", auto_accept_approvals=True
@@ -991,13 +1039,14 @@ def test_pane_shows_accept_prompt(pane: str, expected: bool) -> None:
     assert cnp._pane_shows_accept_prompt(pane) is expected
 
 
+@pytest.mark.parametrize("send_error", [RuntimeError, OSError])
 async def test_send_cursor_keys_reports_undelivered_keystroke(
-    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, send_error: type[Exception]
 ) -> None:
     """A tmux send that raises reports failure rather than a silent success."""
 
     def _boom(_bridge: Path, _key: str) -> None:
-        raise RuntimeError("cursor-native tmux target not advertised")
+        raise send_error("cursor-native tmux target not advertised")
 
     monkeypatch.setattr(cnp, "send_cursor_pane_keys", _boom)
     assert await cnp._send_cursor_keys(tmp_path, "conv_dead", "y") is False

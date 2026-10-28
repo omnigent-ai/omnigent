@@ -2,15 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 import threading
 from collections.abc import Callable
 
+from omnigent.debug_logging import debug_event
 from omnigent.harnesses.claude_native.status_file import SessionStatusPoller
 from omnigent.terminals.program_status import (
     ProgramStatus,
     ProgramStatusReader,
     blocked_reason,
 )
+
+_logger = logging.getLogger(__name__)
 
 
 class ClaudeProgramStatusPoller:
@@ -21,10 +25,18 @@ class ClaudeProgramStatusPoller:
         reader: ProgramStatusReader,
         fallback: SessionStatusPoller,
         on_status: Callable[[str, str | None], None],
+        *,
+        omnigent_session_id: str | None = None,
+        terminal_instance_id: str | None = None,
+        terminal_launch_id: str | None = None,
     ) -> None:
         self._reader = reader
         self._fallback = fallback
         self._on_status = on_status
+        self._omnigent_session_id = omnigent_session_id
+        self._terminal_instance_id = terminal_instance_id
+        self._terminal_launch_id = terminal_launch_id
+        self._error_observed = False
         self._last: ProgramStatus | None = None
         self._using_osc = False
         self._retired = False
@@ -54,6 +66,21 @@ class ClaudeProgramStatusPoller:
         if requested:
             self._last = None
         report = self._reader.status
+        is_error = report is not None and report.state == "error"
+        # Resync must not turn a standing error into repeated observations.
+        if is_error and not self._error_observed:
+            _logger.info(
+                "Claude program error observed; deferring failed status to StopFailure",
+                extra=debug_event(
+                    "claude_program_error_observed",
+                    session_id=self._omnigent_session_id,
+                    terminal_instance_id=self._terminal_instance_id,
+                    terminal_launch_id=self._terminal_launch_id,
+                    status_source="program_status",
+                    status_publication="deferred_to_stop_failure",
+                ),
+            )
+        self._error_observed = is_error
         if report is not None:
             self._using_osc = True
             if report != self._last:

@@ -109,6 +109,33 @@ def test_classifies_missing_binary_by_output() -> None:
     assert diagnosis.title == "Agent command not found"
 
 
+def test_classifies_gateway_claude_version_failure() -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=0,
+        output=(
+            "! ug requires Claude Code 2.1.290 or newer. Your current version is Claude "
+            "Code 2.1.185.\nERROR ug requires Claude Code 2.1.290 or newer."
+        ),
+    )
+    assert diagnosis is not None
+    assert diagnosis.title == "Claude Code is too old for the Databricks gateway"
+    assert diagnosis.remediation is not None
+
+
+def test_gateway_claude_version_remediation_uses_existing_installation_method() -> None:
+    diagnosis = classify_terminal_failure(
+        command="env",
+        exit_status=0,
+        output="ERROR ug requires Claude Code 2.1.290 or newer. Your current version is 2.1.185.",
+    )
+    assert diagnosis is not None
+    assert diagnosis.remediation is not None
+    assert "Update Claude Code" in diagnosis.remediation
+    assert "same installer or package manager you used to install it" in diagnosis.remediation
+    assert "brew upgrade claude-code" not in diagnosis.remediation
+
+
 def test_root_wins_over_generic_auth_when_both_markers_present() -> None:
     # Ordering guard: the root case also reads like a permission problem, so it
     # must be matched before any broader rule.
@@ -297,6 +324,8 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         "API Error: Server error mid-response. The response above may be incomplete.",
         "Connection lost mid-response. The response above may be incomplete.",
         "connection lost mid-response",
+        "API Error: The response stopped arriving. The response above may be incomplete.",
+        "  api error: the response stopped arriving. the response above may be incomplete.  ",
         "API Error: 503 Service Unavailable",
         "HTTP 500 Internal Server Error",
         "HTTP/1.1 502 Bad Gateway",
@@ -334,6 +363,13 @@ def test_classifies_transient_upstream_errors(code: str, message: str) -> None:
         "Request rejected (4990)",
         "API Error: 4991",
         'API Error: 400 {"error_code":"INVALID_PARAMETER_VALUE","message":"query cancelled"}',
+        "The response stopped arriving.",
+        "API Error: The response stopped arriving. Retry the tool.",
+        "Quoted: API Error: The response stopped arriving. The response above may be incomplete.",
+        "API Error: The response stopped arriving. The response above may be incomplete. "
+        "Cancelled.",
+        "API Error: 401 The response stopped arriving. The response above may be incomplete.",
+        "API Error: 403 The response stopped arriving. The response above may be incomplete.",
     ],
 )
 def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> None:
@@ -341,9 +377,16 @@ def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> Non
 
 
 @pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
-def test_gateway_499_does_not_override_specific_failure_codes(code: str) -> None:
+def test_transient_messages_do_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, _GATEWAY_499_OUTPUT) == code
     assert classify_native_turn_error(code, "Request timed out") == code
+    assert (
+        classify_native_turn_error(
+            code,
+            "API Error: The response stopped arriving. The response above may be incomplete.",
+        )
+        == code
+    )
     assert (
         classify_native_turn_error(
             code, "We’re currently experiencing high demand, which may cause temporary errors."
