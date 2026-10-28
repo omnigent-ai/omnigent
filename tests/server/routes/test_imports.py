@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 from types import SimpleNamespace
+from typing import Any
 
 import httpx
 import pytest
@@ -13,8 +14,10 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse
 
 from omnigent.db.utils import builtin_agent_id
+from omnigent.entities import NewConversationItem
+from omnigent.entities.conversation import MessageData
 from omnigent.errors import ErrorCode, OmnigentError
-from omnigent.server.auth import LEVEL_OWNER, UnifiedAuthProvider
+from omnigent.server.auth import LEVEL_EDIT, LEVEL_OWNER, UnifiedAuthProvider
 from omnigent.server.host_registry import HostRegistry
 from omnigent.server.routes.imports import (
     LocalImportRequest,
@@ -475,6 +478,9 @@ def test_exact_local_import_requires_one_harness_and_trims_id() -> None:
     with pytest.raises(ValueError, match="requires a specific harness"):
         LocalImportRequest(host_id="h1", source="all", session_id="exact-id")
 
+    with pytest.raises(ValueError, match="requires an exact session_id"):
+        LocalImportRequest(host_id="h1", source="claude", force=True)
+
 
 async def test_stream_local_sessions_yields_each_then_stops_on_done() -> None:
     """The streaming consumer yields one session per frame, then cleans up on done.
@@ -858,6 +864,13 @@ async def test_local_import_stream_reports_failure_reasons(
             "title": None,
             "source": "claude",
         }
+        yield {
+            "external_session_id": "empty-1",
+            "workspace": None,
+            "items": [],
+            "title": None,
+            "source": "claude",
+        }
         # A session the host enumerated but couldn't read (no frame, only a
         # reason on the terminal done frame).
         if isinstance(stats, dict):
@@ -903,19 +916,16 @@ async def test_local_import_stream_reports_failure_reasons(
     events = [json.loads(line) for line in resp.text.splitlines() if line.strip()]
     assert [e["title"] for e in events if e["event"] == "session"] == ["Good one"]
     failed = [e for e in events if e["event"] == "failed"]
-    assert {f["reason"] for f in failed} == {
-        "This session's transcript was malformed or too large to import.",
-        "No visible messages to import.",
-    }
     # The host-read failure keeps its source-session identity through the wire.
-    assert {(f["external_session_id"], f["source"]) for f in failed} == {
-        ("bad-1", "claude"),
-        ("unreadable-1", "codex"),
+    assert {(f["external_session_id"], f["source"], f["reason"]) for f in failed} == {
+        ("bad-1", "claude", "This session's transcript was malformed or too large to import."),
+        ("empty-1", "claude", "This session has no messages to import."),
+        ("unreadable-1", "codex", "No visible messages to import."),
     }
     done = events[-1]
     assert done["event"] == "done"
-    assert (done["imported"], done["failed"]) == (1, 2)
-    assert len(done["failures"]) == 2
+    assert (done["imported"], done["failed"]) == (1, 3)
+    assert len(done["failures"]) == 3
 
 
 async def test_local_import_id_collision_counts_as_already_imported(
@@ -990,6 +1000,213 @@ async def test_local_import_id_collision_counts_as_already_imported(
     body = resp.json()
     assert (body["imported"], body["already_imported"], body["failed"]) == (0, 1, 0)
     assert body["failures"] == []
+
+
+def _claude_message_records(turns: list[tuple[str, str]]) -> list[dict[str, object]]:
+    """Normalized items for a Claude transcript of ``(role, text)`` turns."""
+    records: list[dict[str, object]] = []
+    for index, (role, text) in enumerate(turns):
+        data: dict[str, object] = {"role": role}
+        if role == "user":
+            data["content"] = [{"type": "input_text", "text": text}]
+        else:
+            data["agent"] = "claude-native-ui"
+            data["content"] = [{"type": "output_text", "text": text}]
+        records.append({"type": "message", "response_id": f"claude:turn-{index}", "data": data})
+    return records
+
+
+async def test_local_import_by_id_force_refreshes_drifted_session(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A plain re-import of a drifted session stays skipped; ``force`` refreshes it in place."""
+    from omnigent.server.routes import imports as imports_module
+
+    _seed_claude_agent(db_uri)
+    store = SqlAlchemyConversationStore(db_uri)
+    external_id = "claude-drift-1"
+    pre_drift = [("user", "draft the release checklist"), ("assistant", "Checklist drafted.")]
+    drifted_turn = "add the rollback step"
+    post_drift = [*pre_drift, ("user", drifted_turn), ("assistant", "Rollback step added.")]
+    host_transcript = {"turns": pre_drift}
+
+    async def _fake_stream(**_kwargs: object):
+        yield {
+            "external_session_id": external_id,
+            "workspace": "/repo",
+            "items": _claude_message_records(host_transcript["turns"]),
+            "title": "draft the release checklist",
+            "source": "claude",
+        }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+
+    host_conn = SimpleNamespace(
+        host_id="host_0123456789abcdef0123456789abcdef", pending_import_local={}
+    )
+    app = FastAPI()
+    app.include_router(
+        imports_module.create_imports_router(
+            store,
+            SqlAlchemyAgentStore(db_uri),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=SimpleNamespace(  # type: ignore[arg-type]
+                get_host=lambda _host_id: SimpleNamespace(user_id=None)
+            ),
+        ),
+        prefix="/v1",
+    )
+
+    def _stored_texts(conversation_id: str) -> list[str]:
+        return [item.data.content[0]["text"] for item in store.list_items(conversation_id).data]
+
+    exact = {"host_id": host_conn.host_id, "source": "claude", "session_id": external_id}
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as c:
+        first = await c.post("/v1/imports/local", json=exact)
+        assert (first.json()["imported"], first.json()["already_imported"]) == (1, 0)
+        conversation = store.find_conversation_by_external_session_id(external_id)
+        assert conversation is not None
+
+        host_transcript["turns"] = post_drift
+        skipped = await c.post("/v1/imports/local", json=exact)
+        assert (skipped.json()["imported"], skipped.json()["already_imported"]) == (0, 1)
+        assert drifted_turn not in _stored_texts(conversation.id)
+
+        refreshed = await c.post("/v1/imports/local", json={**exact, "force": True})
+
+    assert refreshed.status_code == 200
+    tally = refreshed.json()
+    assert (tally["imported"], tally["already_imported"], tally["failed"]) == (1, 0, 0), tally
+    assert tally["sessions"][0]["session_id"] == conversation.id
+    assert _stored_texts(conversation.id) == [text for _role, text in post_drift]
+
+
+_RESUMED_REFUSAL = "This session was resumed in Omnigent, so it can't be replaced."
+
+
+@pytest.mark.parametrize(
+    "case,expected_reason",
+    [
+        ("owner", None),
+        ("resumed_in_omnigent", _RESUMED_REFUSAL),
+        ("resumed_then_unbound", _RESUMED_REFUSAL),
+        ("resumed_during_import", _RESUMED_REFUSAL),
+        ("shared_editor", "Only the owner of the imported session can replace it."),
+        ("no_access", "Only the owner of the imported session can replace it."),
+        ("other_harness", "Only a session imported from this harness can be replaced."),
+    ],
+)
+async def test_forced_local_import_replaces_only_an_unused_import_the_caller_owns(
+    db_uri: str,
+    monkeypatch: pytest.MonkeyPatch,
+    case: str,
+    expected_reason: str | None,
+) -> None:
+    """A forced re-import keeps a session it must not delete and reports why."""
+    from omnigent.server.routes import imports as imports_module
+    from omnigent.session_import import IMPORT_SOURCE_LABEL_KEY
+    from omnigent.stores.conversation_store import (
+        sqlalchemy_store as sqlalchemy_conversation_store,
+    )
+
+    _seed_claude_agent(db_uri)
+    caller = "alice@example.com"
+    host_id = "0123456789abcdef0123456789abcdef"
+    host_store = HostStore(db_uri)
+    host_store.upsert_on_connect(host_id, "laptop", caller)
+    store = SqlAlchemyConversationStore(db_uri)
+    permission_store = SqlAlchemyPermissionStore(db_uri)
+    external_id = "claude-guarded-1"
+    host_transcript = {"turns": [("user", "draft the release checklist")]}
+
+    async def _fake_stream(**_kwargs: object):
+        yield {
+            "external_session_id": external_id,
+            "workspace": "/repo",
+            "items": _claude_message_records(host_transcript["turns"]),
+            "title": None,
+            "source": "claude",
+        }
+
+    monkeypatch.setattr(imports_module, "_stream_local_sessions_from_host", _fake_stream)
+    host_conn = SimpleNamespace(host_id=host_id, pending_import_local={})
+    app = FastAPI()
+    app.include_router(
+        create_imports_router(
+            store,
+            SqlAlchemyAgentStore(db_uri),
+            permission_store=permission_store,
+            auth_provider=UnifiedAuthProvider(source="header", local_single_user=False),
+            host_registry=SimpleNamespace(get=lambda _host_id: host_conn),  # type: ignore[arg-type]
+            host_store=host_store,
+        ),
+        prefix="/v1",
+    )
+    exact = {"host_id": host_id, "source": "claude", "session_id": external_id}
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app),
+        base_url="http://test",
+        headers={"X-Forwarded-Email": caller},
+    ) as c:
+        first = await c.post("/v1/imports/local", json=exact)
+        assert first.json()["imported"] == 1, first.text
+        session_id = first.json()["sessions"][0]["session_id"]
+        if case == "resumed_in_omnigent":
+            assert store.set_runner_id(session_id, "runner_resumed")
+        elif case == "resumed_then_unbound":
+            assert store.set_runner_id(session_id, "runner_resumed")
+            imported_at = store.list_items(session_id).data[0].created_at
+            with monkeypatch.context() as later:
+                later.setattr(sqlalchemy_conversation_store, "now_epoch", lambda: imported_at + 60)
+                store.append(
+                    session_id,
+                    [
+                        NewConversationItem(
+                            type="message",
+                            response_id="claude:omnigent-turn",
+                            data=MessageData(
+                                role="user", content=[{"type": "input_text", "text": "continue"}]
+                            ),
+                        )
+                    ],
+                )
+            store.clear_runner_id(session_id)
+        elif case == "resumed_during_import":
+            resolve_create = imports_module.resolve_project_session_create
+
+            async def _resume_then_resolve(**kwargs: Any) -> Any:
+                assert store.set_runner_id(session_id, "runner_resumed")
+                return await resolve_create(**kwargs)
+
+            monkeypatch.setattr(
+                imports_module, "resolve_project_session_create", _resume_then_resolve
+            )
+        elif case == "shared_editor":
+            permission_store.grant(caller, session_id, LEVEL_EDIT)
+        elif case == "no_access":
+            assert permission_store.revoke(caller, session_id)
+        elif case == "other_harness":
+            store.set_labels(session_id, {IMPORT_SOURCE_LABEL_KEY: "codex"})
+        original_items = store.list_items(session_id).data
+
+        host_transcript["turns"] = [*host_transcript["turns"], ("assistant", "Checklist drafted.")]
+        forced = await c.post("/v1/imports/local", json={**exact, "force": True})
+
+    assert forced.status_code == 200, forced.text
+    tally = forced.json()
+    if expected_reason is None:
+        assert (tally["imported"], tally["already_imported"], tally["failed"]) == (1, 0, 0)
+        assert tally["sessions"][0]["session_id"] == session_id
+        assert len(store.list_items(session_id).data) == 2
+        assert permission_store.get_permission_level(caller, session_id) == LEVEL_OWNER
+    else:
+        assert (tally["imported"], tally["already_imported"], tally["failed"]) == (0, 0, 1)
+        assert tally["failures"] == [
+            {"external_session_id": external_id, "source": "claude", "reason": expected_reason}
+        ]
+        assert store.list_items(session_id).data == original_items
 
 
 @pytest.mark.parametrize("stream", [False, True], ids=["buffered", "stream"])

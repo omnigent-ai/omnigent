@@ -1094,6 +1094,7 @@ describe("getSession", () => {
         agent_id: "agent_xyz",
         status: "idle",
         created_at: 1704067200,
+        updated_at: 1704067260,
         items: [],
         usage_included: false,
         total_cost_usd: null,
@@ -1108,6 +1109,7 @@ describe("getSession", () => {
       "/v1/sessions/conv_abc?include_items=false&include_liveness=false&include_usage=false",
     );
     expect(session.agentId).toBe("agent_xyz");
+    expect(session.updatedAt).toBe(1704067260);
     expect(session.items).toEqual([]);
     expect(session.usageIncluded).toBe(false);
     expect(session.totalCostUsd).toBeNull();
@@ -1850,6 +1852,26 @@ describe("importLocalSessions", () => {
       source: "codex",
       limit: 25,
       session_id: "session-exact",
+    });
+  });
+
+  it("asks the server to replace an earlier import of the exact session", async () => {
+    fetchMock.mockResolvedValueOnce(
+      mockNdjsonResponse([
+        JSON.stringify({ event: "session", session_id: "c1", title: "Exact" }),
+        JSON.stringify({ event: "done", imported: 1, already_imported: 0, failed: 0 }),
+      ]),
+    );
+
+    await importLocalSessions("host_1", "claude", 25, undefined, "session-exact", true);
+
+    const [, init] = fetchMock.mock.calls[0] as [string, RequestInit];
+    expect(JSON.parse(init.body as string)).toEqual({
+      host_id: "host_1",
+      source: "claude",
+      limit: 25,
+      session_id: "session-exact",
+      force: true,
     });
   });
 

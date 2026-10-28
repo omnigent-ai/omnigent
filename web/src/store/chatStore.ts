@@ -545,6 +545,19 @@ export function removeLocalConversation(tempConvId: string): boolean {
   return wasViewing;
 }
 
+/** Drop a conversation's cached copy; if it is on screen, load it again in place. */
+export function reloadConversation(id: string): Promise<void> {
+  if (useChatStore.getState().conversationId !== id) {
+    conversationRegistry.release(id);
+    return Promise.resolve();
+  }
+  const entry = conversationRegistry.peek(id);
+  // A stopped stream sends switchTo down its re-bind path, which keeps unsent messages.
+  if (entry !== undefined) abortConversationStream(entry);
+  void useChatStore.getState().switchTo(null);
+  return useChatStore.getState().switchTo(id);
+}
+
 /**
  * A user message awaiting its `session.input.consumed` event.
  *

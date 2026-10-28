@@ -90,6 +90,7 @@ import {
   type FrameScheduler,
   type PendingUserMessage,
   bindConversationForTest,
+  reloadConversation,
   releaseConversation,
 } from "./chatStore";
 import { conversationRegistry } from "./conversationRegistry";
@@ -1165,6 +1166,39 @@ describe("chatStore — switchTo", () => {
     await tick();
     await tick();
     expect(useChatStore.getState().blocks).toHaveLength(1);
+  });
+
+  it("reloads a replaced conversation in place only when it is on screen", async () => {
+    seedSession("conv_background", [userMessage("resp_bg", "background prompt")]);
+    seedSession("conv_open", [userMessage("resp_old", "first prompt")]);
+    await useChatStore.getState().switchTo("conv_background");
+    await useChatStore.getState().switchTo("conv_open");
+
+    await reloadConversation("conv_background");
+    expect(useChatStore.getState().conversationId).toBe("conv_open");
+    expect(conversationRegistry.peek("conv_background")).toBeUndefined();
+
+    seedSession("conv_open", [
+      userMessage("resp_new_1", "first prompt"),
+      userMessage("resp_new_2", "follow-up"),
+    ]);
+    conversationRegistry.peek("conv_open")!.setState({
+      pendingUserMessages: [
+        { tempId: "pend_unsent", content: [{ type: "input_text", text: "not acknowledged yet" }] },
+      ],
+    });
+    await reloadConversation("conv_open");
+    expect(useChatStore.getState().conversationId).toBe("conv_open");
+    expect(useChatStore.getState().pendingUserMessages.map((p) => p.tempId)).toEqual([
+      "pend_unsent",
+    ]);
+    const contents = useChatStore
+      .getState()
+      .blocks.map((block) => (block as UserMessageBlock).content);
+    expect(contents).toEqual([
+      [{ type: "input_text", text: "first prompt" }],
+      [{ type: "input_text", text: "follow-up" }],
+    ]);
   });
 
   it("scopes the background-task pill state to the active conversation", async () => {
