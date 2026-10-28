@@ -245,7 +245,8 @@ def pi_session_records_from_session_items(
       two ``tool_result`` blocks for one ``tool_use``.
     - latest ``compaction`` -> its snapshot replaces earlier history and is
       converted like the items above. A snapshot with nothing to convert (none,
-      or another harness's native shape) becomes a Pi checkpoint with the summary.
+      or another harness's native shape) restores the summary and turns after
+      ``last_item_id``. An unavailable boundary falls back to full history.
 
     Interrupted assistant turns (and the rest of their response group) are
     skipped so a cancelled turn isn't restored as completed history.
@@ -289,7 +290,23 @@ def pi_session_records_from_session_items(
         if item.get("type") != "compaction" or not isinstance(item.get("summary"), str):
             continue
         snapshot = _compaction_snapshot_items(item)
+        tail_start = index + 1
         if not snapshot:
+            # A summary covers its inclusive boundary, not every item before the checkpoint.
+            last_item_id = item.get("last_item_id")
+            if not isinstance(last_item_id, str) or not last_item_id:
+                break
+            boundary_index = next(
+                (
+                    previous_index
+                    for previous_index in range(index)
+                    if items[previous_index].get("id") == last_item_id
+                ),
+                None,
+            )
+            if boundary_index is None:
+                break
+            tail_start = boundary_index + 1
             checkpoint_id = _synthetic_pi_entry_id(
                 session_id=session_id,
                 external_session_id=external_session_id,
@@ -305,7 +322,7 @@ def pi_session_records_from_session_items(
                 "firstKeptEntryId": checkpoint_id,
                 "tokensBefore": 0,
             }
-        items = [*snapshot, *items[index + 1 :]]
+        items = [*snapshot, *items[tail_start:]]
         break
     skip_response_ids = _interrupted_response_ids(items)
     tool_names = _function_call_names(items)

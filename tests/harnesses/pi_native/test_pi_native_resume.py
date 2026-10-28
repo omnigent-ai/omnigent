@@ -203,15 +203,24 @@ def test_compaction_snapshot_replaces_history_and_replays_retained_tail(with_tai
     ],
     ids=["legacy", "claude", "raw-pi"],
 )
-def test_unconvertible_compaction_snapshot_restores_only_summary(
+@pytest.mark.parametrize("last_item_id", ["boundary", None, "missing", "later"])
+def test_unconvertible_compaction_snapshot_preserves_unsummarized_history(
     compacted_messages: list[dict[str, Any]] | None,
+    last_item_id: str | None,
 ) -> None:
-    compaction: dict[str, Any] = {"id": "compact", "type": "compaction", "summary": "summary"}
+    compaction: dict[str, Any] = {
+        "id": "compact",
+        "type": "compaction",
+        "summary": "summary",
+        "last_item_id": last_item_id,
+    }
     if compacted_messages is not None:
         compaction["compacted_messages"] = compacted_messages
     records = pi_session_records_from_session_items(
         [
-            _user_item("old raw transcript"),
+            _user_item("old raw transcript", item_id="boundary"),
+            _user_item("recent question", item_id="recent-user", response_id="recent"),
+            _assistant_item("recent answer", item_id="recent-answer", response_id="recent"),
             compaction,
             _user_item("after checkpoint", item_id="later", response_id="later"),
         ],
@@ -219,12 +228,23 @@ def test_unconvertible_compaction_snapshot_restores_only_summary(
         external_session_id=_EXTERNAL_ID,
         cwd=Path("/repo"),
     )
-    assert [record["type"] for record in records] == ["session", "compaction", "message"]
-    assert records[1]["summary"] == "summary"
-    assert records[1]["firstKeptEntryId"] == records[1]["id"]
-    assert records[2]["parentId"] == records[1]["id"]
-    assert records[2]["message"]["content"][0]["text"] == "after checkpoint"
-    assert "old raw transcript" not in json.dumps(records)
+    if last_item_id == "boundary":
+        assert records[1]["type"] == "compaction"
+        assert records[1]["summary"] == "summary"
+        assert records[1]["firstKeptEntryId"] == records[1]["id"]
+        messages = records[2:]
+        expected_text = ["recent question", "recent answer", "after checkpoint"]
+    else:
+        messages = records[1:]
+        expected_text = [
+            "old raw transcript",
+            "recent question",
+            "recent answer",
+            "after checkpoint",
+        ]
+    assert [record["message"]["content"][0]["text"] for record in messages] == expected_text
+    for previous, current in itertools.pairwise(records[1:]):
+        assert current["parentId"] == previous["id"]
     assert "foreign" not in json.dumps(records)
 
 

@@ -633,6 +633,9 @@ Cross-harness journeys:
   live forwarding, in the item shapes other harnesses replay. The parent
   transcript stays unchanged; resume keeps its native identity and forks mint
   one.
+  Summary-only or unsupported checkpoints preserve turns after their recorded
+  summary boundary, including turns before the checkpoint itself. If that boundary
+  is unavailable, reconstruction conservatively keeps the full history.
   A scripted provider enforces the same 16,384 serialized-message-byte limit from
   the first request. Continuation, reconstruction and fork must fit it without
   resurrecting summarized reads or duplicating retained tools/replies.
