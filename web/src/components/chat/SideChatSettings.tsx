@@ -133,11 +133,7 @@ export function SideChatSettings({
     nativeCodingAgentForHarness(session.harness) ??
     (kind ? nativeCodingAgentForHarness(`${kind}-native`) : undefined);
   const harnessLabel = nativeAgent?.displayName ?? session.agentName ?? "Session";
-  const modelLabel =
-    (fusionModel ? formatStatusModelLabel(model, options) : null) ??
-    (selectedModel ? nativeModelLabel(selectedModel) : null) ??
-    model ??
-    defaultModelLabel(options);
+  const modelLabel = formatStatusModelLabel(model, options) ?? defaultModelLabel(options);
   const effort =
     draft?.settings?.reasoningEffort !== undefined
       ? draft.settings.reasoningEffort
