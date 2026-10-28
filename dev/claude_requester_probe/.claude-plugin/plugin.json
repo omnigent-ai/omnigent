@@ -1,0 +1,5 @@
+{
+  "name": "omnigent-requester-probe",
+  "version": "0.1.0",
+  "description": "Opt-in diagnostic probe for Claude prompt, turn and tool-call correlation. Grants no requester authority."
+}

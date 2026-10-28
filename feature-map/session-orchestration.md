@@ -153,6 +153,15 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   | Legacy runner → updated server | Refused without requester | Private/shared sends and creates leave no new task or worker; ordinary child work keeps unknown origin. |
   | Updated runner → older/mixed server replicas | Refuses unsupported receiving routes | Mutations require `/v1/requester/sessions` and its events route, with no legacy fallback. ASGI route-absence tests include servers that already have the older orchestrated endpoint; no released-binary mixed-replica process run. |
 
+- Native Claude mod contract probe: the opt-in developer plugin in
+  [the probe guide](../dev/claude_requester_probe/README.md) observes typed input,
+  turn/tool identifiers and MCP metadata. Run
+  `tests/e2e/test_claude_mod_requester_probe.py` only in its isolated Linux
+  environment; `tests/dev/test_claude_requester_probe.py` covers handler/analyzer
+  contracts without Claude. This is diagnostic evidence, not owner delegation
+  support. No production entry point installs the plugin, and the blocked row
+  above remains unchanged.
+
 - Component compatibility checks: `tests/runtime/harnesses/test_executor_adapter_requester.py`
   exercises retained callbacks with the real SDK parser/dispatcher. The Claude
   scenarios verify retained SDK callback binding and that lost metadata stays
