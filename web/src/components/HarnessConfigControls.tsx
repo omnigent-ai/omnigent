@@ -156,6 +156,12 @@ export const PI_NATIVE_EFFORTS: { value: string; label: string }[] = [
   { value: "max", label: "Max" },
 ];
 
+// Hermes `--reasoning LEVEL` accepts the Pi levels plus `ultra`.
+export const HERMES_NATIVE_EFFORTS: { value: string; label: string }[] = [
+  ...PI_NATIVE_EFFORTS,
+  { value: "ultra", label: "Ultra" },
+];
+
 /**
  * Create-time effort ladder for a native harness (`null` = none). Codex uses
  * `model` or the catalog default; Devin is omitted (no project model default).
