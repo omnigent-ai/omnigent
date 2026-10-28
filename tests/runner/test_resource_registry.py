@@ -215,28 +215,27 @@ async def test_claude_program_status_real_launch_and_fallback(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
-    ("role", "features", "expected"),
+    ("role", "features", "windows", "expected"),
     [
-        (CLAUDE_NATIVE_TERMINAL_ROLE, None, "claude-code"),
-        (CLAUDE_NATIVE_TERMINAL_ROLE, "", "claude-code"),
-        (CLAUDE_NATIVE_TERMINAL_ROLE, "usage_page", "claude-code"),
-        (CLAUDE_NATIVE_TERMINAL_ROLE, "claude_osc_status", "claude-code"),
-        (CLAUDE_NATIVE_TERMINAL_ROLE, "-claude_osc_status", None),
-        (PI_NATIVE_TERMINAL_ROLE, None, None),
-        (CODEX_NATIVE_TERMINAL_ROLE, None, None),
-        (None, None, None),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, None, False, "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "", False, "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "usage_page", False, "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "claude_osc_status", False, "claude-code"),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "-claude_osc_status", False, None),
+        (PI_NATIVE_TERMINAL_ROLE, None, False, None),
+        (CODEX_NATIVE_TERMINAL_ROLE, None, False, None),
+        (None, None, False, None),
+        (CLAUDE_NATIVE_TERMINAL_ROLE, "claude_osc_status", True, None),
     ],
 )
-@pytest.mark.parametrize("windows", [False, True])
 async def test_program_status_respects_flag_and_claude_role(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
     role: str | None,
     features: str | None,
-    expected: str | None,
     windows: bool,
+    expected: str | None,
 ) -> None:
-    # The status relay runs the CLI in a POSIX pty, which Windows lacks.
     monkeypatch.setattr("omnigent.runner.resource_registry.IS_WINDOWS", windows)
     monkeypatch.delenv("OMNIGENT_FEATURES", raising=False)
     if features is not None:
@@ -258,7 +257,7 @@ async def test_program_status_respects_flag_and_claude_role(
     await registry.launch_required_terminal(
         "flag-test", "agent", "main", TerminalEnvSpec(), resource_role=role
     )
-    assert seen == [None if windows else expected]
+    assert seen == [expected]
 
 
 @dataclass

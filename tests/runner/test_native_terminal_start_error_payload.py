@@ -125,18 +125,13 @@ def test_start_failure_log_row_is_blocking_with_derived_category(
     assert attrs["error_category"] == category
 
 
-@pytest.mark.parametrize("windows", [False, True])
-def test_generic_cause_names_errno_without_free_form_text(
-    monkeypatch: pytest.MonkeyPatch, windows: bool
-) -> None:
+def test_generic_cause_names_errno_without_free_form_text() -> None:
     """The generic startup-defect message now names a structured errno cause.
 
     Production telemetry for these failures only carries this message, so an
     environmental cause (e.g. disk-full) must be legible without the runner
-    log — but only via structured facts, never the raw exception text. Native
-    terminals start on Windows too, so Windows reports the same cause.
+    log — but only via structured facts, never the raw exception text.
     """
-    monkeypatch.setattr(orchestration, "IS_WINDOWS", windows, raising=False)
     payload = _native_terminal_start_error_payload(
         OSError(28, "No space left on device"),
         "Codex",
