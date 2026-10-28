@@ -1427,6 +1427,13 @@ export interface ChatActions {
 export interface ChatState extends ConversationState, AppChatState, ChatActions {}
 
 let queryClient: QueryClient | null = null;
+let unsubscribeSettingsMutations: (() => void) | undefined;
+
+function sideChatSettingsPending(conversationId: string): boolean {
+  return (
+    (queryClient?.isMutating({ mutationKey: ["side-chat-settings", conversationId] }) ?? 0) > 0
+  );
+}
 
 // Any semantic stream event makes a snapshot already in flight potentially
 // stale. Heartbeats are filtered before this revision is bumped.
@@ -1922,6 +1929,7 @@ export function bindConversationForTest(
  * conversation is created.
  */
 export function initChatStore(client: QueryClient): void {
+  unsubscribeSettingsMutations?.();
   for (const timer of workspaceInvalidationTimers.values()) {
     clearTimeout(timer);
   }
@@ -1939,6 +1947,14 @@ export function initChatStore(client: QueryClient): void {
   // The send latch is per-conversation state now, cleared with the registry above.
   sendChains.clear();
   queryClient = client;
+  unsubscribeSettingsMutations = client.getMutationCache().subscribe((event) => {
+    if (event.type !== "updated" || !["success", "error"].includes(event.action.type)) return;
+    const [kind, conversationId] = event.mutation.options.mutationKey ?? [];
+    if (kind !== "side-chat-settings" || typeof conversationId !== "string") return;
+    // A pane may be closed when the save settles; the store owns queue resumption.
+    useChatStore.getState().maybeFlushQueuedHead(conversationId);
+    useChatStore.getState().flushBackgroundQueues();
+  });
 }
 
 function scheduleWorkspaceFilesystemInvalidation(sessionId: string): void {
@@ -2261,6 +2277,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     const target = s.queuedMessages.find((m) => m.queueId === queueId);
     const agentId = target?.agentId ?? s.boundAgentId;
     if (target === undefined || agentId === null) return;
+    if (sideChatSettingsPending(target.conversationId)) return;
     if (waitsForHost(s.queuedMessages, target.conversationId)) return;
     if (target.command === "compact" && rejectBusyCompact(target.conversationId)) return;
     // Nothing can be steered past a first message still held for startup; it stays queued.
@@ -2272,6 +2289,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
   },
 
   steerAllQueuedMessages: (conversationId) => {
+    if (sideChatSettingsPending(conversationId)) return;
     const s = get();
     const own = s.queuedMessages.filter((m) => m.conversationId === conversationId);
     if (own.length === 0 || waitsForHost(own, conversationId)) return;
@@ -2347,6 +2365,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // an actively `running` turn gate the flush. No agent → nothing to send to.
     if (
       s.conversationId === null ||
+      sideChatSettingsPending(s.conversationId) ||
       s.boundAgentId === null ||
       s.sessionStatus === "running" ||
       holdsInitialDraft(s)
@@ -2414,6 +2433,7 @@ export const useChatStore = create<ChatState>((_rootSet, get) => ({
     // next idle (via WS/poll) triggers this again for the next message (FIFO).
     const now = Date.now();
     for (const conversationId of candidateIds) {
+      if (sideChatSettingsPending(conversationId)) continue;
       if (statusById.get(conversationId) !== "idle") continue;
       // The sidebar can still say idle while a compact control starts.
       const local = setterForState(conversationId);

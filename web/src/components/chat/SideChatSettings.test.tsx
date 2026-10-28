@@ -255,7 +255,7 @@ it("does not present a catalog default as the side chat's inherited effort", () 
     "Model A",
   );
   expect(screen.getByRole("button", { name: "Side chat model and effort" })).not.toHaveTextContent(
-    "medium",
+    /medium/i,
   );
 });
 
