@@ -195,7 +195,7 @@ def test_compaction_snapshot_replaces_history_and_replays_retained_tail(with_tai
                 "content": [{"type": "tool_use", "id": "toolu_1", "name": "Read", "input": {}}],
             },
         ],
-        # Raw Pi messages, as stored by earlier builds of the Pi extension.
+        # Raw Pi messages without the shared item envelope.
         [
             {"role": "compactionSummary", "summary": "foreign summary", "tokensBefore": 1},
             {"role": "user", "content": [{"type": "text", "text": "foreign retained"}]},

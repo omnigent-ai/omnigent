@@ -787,7 +787,8 @@ function bashExecutionText(message) {
   return text;
 }
 
-// The model-visible projection in the item shapes forwarded live, replayable by any harness.
+// Pi's model context in the item shapes forwarded live, so any harness can replay it.
+// Like live forwarding, it keeps text only: images and tool-result error flags are dropped.
 function compactionSnapshotItems(messages) {
   const items = [];
   const addUserText = (text) => {

@@ -1289,6 +1289,11 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
     { role: "toolResult", toolCallId: "read-1", toolName: "read",
       content: [{type: "text", text: "retained result"}] },
     { role: "bashExecution", command: "ls", output: "in context", exitCode: 0 },
+    { role: "bashExecution", command: "make", output: "", exitCode: 2 },
+    { role: "bashExecution", command: "sleep 9", output: "partial", exitCode: null,
+      cancelled: true },
+    { role: "bashExecution", command: "cat big", output: "head", exitCode: 0, truncated: true,
+      fullOutputPath: "/tmp/full.log" },
     { role: "bashExecution", command: "cat .env", output: "excluded", excludeFromContext: true },
   ];
   const userText = (text) => ({
@@ -1309,6 +1314,9 @@ def test_compaction_snapshot_orders_history_and_tolerates_receipts(
     { type: "function_call", call_id: "read-1", name: "read", arguments: '{"path":"a"}' },
     { type: "function_call_output", call_id: "read-1", output: "retained result" },
     userText("Ran `ls`\n```\nin context\n```"),
+    userText("Ran `make`\n(no output)\n\nCommand exited with code 2"),
+    userText("Ran `sleep 9`\n```\npartial\n```\n\n(command cancelled)"),
+    userText("Ran `cat big`\n```\nhead\n```\n\n[Output truncated. Full output: /tmp/full.log]"),
   ];
   ctx.sessionManager = {
     getSessionId: () => "native-1",
