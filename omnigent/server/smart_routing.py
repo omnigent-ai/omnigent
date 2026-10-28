@@ -619,6 +619,10 @@ class LLMRoutingClient:
             self.last_error = f"routing judge call failed: {failure_detail(exc)}"
             return None
 
+        if not isinstance(verdict, dict):
+            self.last_error = "routing judge returned a non-object verdict"
+            return None
+
         model = verdict.get("model")
         rationale = verdict.get("rationale", "")
         if not model or not isinstance(model, str):

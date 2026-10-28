@@ -47,18 +47,9 @@ import {
 } from "@/lib/harnessSetup";
 import { canonicalNativeHarness, harnessAccountKey } from "@/lib/nativeHarnessModes";
 import { ApiError } from "@/lib/sessionsApi";
+import type { HarnessFixMode, HarnessFixResult } from "@/lib/harnessFix";
 import { cn } from "@/lib/utils";
 import { HarnessCredentialForm } from "@/shell/HarnessCredentialForm";
-
-export type HarnessFixMode = "reconfigure" | "update" | "install" | "switch";
-
-export interface HarnessFixResult {
-  configuredHarnesses: Record<string, boolean | string>;
-  credentialKind?: HarnessCredentialKind;
-  version?: string;
-  gatewayInference?: Record<string, boolean> | null;
-  harnessAccounts?: Record<string, HarnessAccount> | null;
-}
 
 export interface HarnessFixDialogProps {
   open: boolean;

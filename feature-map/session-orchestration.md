@@ -26,9 +26,9 @@ workers on its host or a new managed sandbox. This is enabled by default, with
   Side chats and their children also inherit restrictions from the source chain.
   Accepted work, including tasks saved while a worker starts, continues. Making
   the sender private restores eligibility.
-- `scheduled`: newly scheduled runs, their forks and children cannot use the new sends
-  or independent creates. Ordinary scheduling, child work and reads stay available.
-  An owner can still message a long-lived private manager directly.
+- `scheduled`: scheduled runs, their forks and children use the new sends and
+  independent creates like any private session their owner owns, so an
+  automation can message the owner's other sessions or start workers.
 - `refusal`: disabled flag, another owner, shared sender or wrong runner binding
   refuses the operation. Unsupported servers reject independent creation without
   falling back to ordinary creation. Timeouts, 408/429/5xx responses and invalid
@@ -88,8 +88,9 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   legacy keyless routing and refusal before writes on the wrong replica. A tunnel
   loss after workspace validation leaves one discoverable worker and reports
   uncertainty without retrying creation. Queue tests check refusal before saving
-  and replay after sharing. Scheduled-origin tests include full forks after
-  schedule-history deletion.
+  and replay after sharing. Scheduled-origin tests cover sends and
+  creates from a scheduled run, its full fork after schedule-history deletion,
+  and its children.
 - Browser/terminal manual check: send a distinctive task to a second session;
   open its Chat and confirm the source label and result. Ask the manager to
   read it. Share the manager and repeat: the tool must report refusal and the
@@ -158,11 +159,10 @@ the header states are covered by `web/src/shell/ChatHeader.test.tsx`.
   that POST remains uncertain. Timeouts,
   other refusals and unparseable delivery acknowledgements are never retried.
 - Scheduled origin is recorded before launch, cannot be edited by clients, and
-  survives deletion of the schedule and full forks. Forking a scheduled run to
-  continue interactively intentionally keeps the orchestration restriction in v1.
-  Sessions predating this marker may have no recoverable scheduling origin and
-  remain eligible. There is no historical backfill in this version; deployments
-  requiring that exclusion can keep the kill switch set pending classification.
+  survives deletion of the schedule and full forks. It no longer limits
+  orchestration: an unattended run messages and creates sessions under the same
+  owner, privacy and sharing checks as an interactive turn. The release flag
+  still turns all orchestration off.
 - Existing child creation and `sys_session_send` keep their parent/completion
   semantics. Independent workers use `sys_session_message` for later work.
 - The server enforces the flag even though tool schemas are discoverable while

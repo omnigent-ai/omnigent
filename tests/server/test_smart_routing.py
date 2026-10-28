@@ -411,6 +411,34 @@ async def test_llm_routing_client_returns_none_on_error() -> None:
     assert result is None
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("response_text", "expected_error"),
+    [
+        ("null", "routing judge returned a non-object verdict"),
+        ("[]", "routing judge returned a non-object verdict"),
+        ('"model"', "routing judge returned a non-object verdict"),
+        ("1", "routing judge returned a non-object verdict"),
+        ("true", "routing judge returned a non-object verdict"),
+        ("{", "routing judge call failed:"),
+    ],
+)
+async def test_llm_routing_client_rejects_invalid_verdict_shape(
+    response_text: str, expected_error: str
+) -> None:
+    llm = _FakeLLMClient({})
+    response = _FakeResponse(
+        output=[_FakeMessageOutput(content=[_FakeOutputText(text=response_text)])]
+    )
+    with patch.object(llm, "create", return_value=response):
+        client = LLMRoutingClient(llm)
+        result = await client.route("hello", {"claude-sdk": _TEST_MODELS["claude-sdk"]})
+
+    assert result is None
+    assert client.last_error is not None
+    assert client.last_error.startswith(expected_error)
+
+
 # ── fetch_runner_models ────────────────────────────────────────────
 
 

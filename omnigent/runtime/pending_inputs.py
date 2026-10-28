@@ -228,6 +228,8 @@ class DrainedInput:
     :param interrupted: Whether the person interrupted the turn while this
         entry was queued. Preserved when the entry is restored so it remains
         hidden and settles quietly as an uncertain entry.
+    :param uncertain: Whether a positional drain may already have mirrored
+        this entry. Restore must preserve that evidence even after eviction.
     """
 
     pending_id: str
@@ -244,6 +246,7 @@ class DrainedInput:
     reason_code: str | None = None
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
+    uncertain: bool = False
 
 
 @dataclass
@@ -764,6 +767,8 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
     the FRONT, since it was the oldest when drained. Compensation never
     evicts: a queue that refilled meanwhile may exceed the cap by the
     restored entries until the next :func:`record` trims unheld ones.
+    A reconstructed entry keeps its uncertainty so a later mirror cannot
+    declare a possibly recorded message undelivered.
 
     :param conversation_id: Conversation/session id, e.g.
         ``"conv_abc123"``.
@@ -777,6 +782,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
+        uncertain=drained.uncertain,
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
         delivery_attempt_id=drained.delivery_attempt_id,
         last_delivery_stage=drained.last_delivery_stage,
@@ -990,6 +996,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
+        uncertain=entry.uncertain,
         input_enqueued_at_ms=entry.input_enqueued_at_ms,
         delivery_attempt_id=entry.delivery_attempt_id,
         last_delivery_stage=entry.last_delivery_stage,

@@ -8809,7 +8809,8 @@ async def _auto_create_claude_terminal(
         agent ships a ``skills/`` directory, resolved by the caller
         (which has the runner's spec resolver). Threaded to
         :func:`augment_claude_args` so Claude Code discovers bundled
-        skills via ``--plugin-dir``. ``None`` adds no plugin args.
+        skills via ``--plugin-dir``. ``None`` uses a bridge-owned bundle
+        for the built-in skill.
     :param agent_name: Agent display name for the bundle's plugin
         manifest, e.g. ``"researcher"``. ``None`` falls back to the
         bundle directory's basename.
@@ -9496,6 +9497,11 @@ async def _auto_create_claude_terminal(
         launch_metadata.auto_harness,
         router_started=subagent_router_dir is not None,
     )
+    if bundle_dir is None:
+        # Reuse the bridge's owned directory across retries and terminal transfers.
+        # Its dead-owner cleanup also reclaims these generated skill links.
+        bundle_dir = bridge_dir / "skill-bundle"
+        _ensure_orchestrator_skills_in_bundle(bundle_dir, agent_spec)
     claude_args = augment_claude_args(
         base_claude_args,
         bridge_dir=bridge_dir,

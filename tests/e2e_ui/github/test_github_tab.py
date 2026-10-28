@@ -33,6 +33,7 @@ from playwright.sync_api import Page, Route, expect
 from tests.e2e_ui.conftest import (
     fetch_with_retry,
     open_right_rail,
+    stub_session_pull_requests,
     workspace_bar_needs_collapse,
 )
 
@@ -156,6 +157,9 @@ def _stub_github(page: Page, *, pr_count: int = 1) -> None:
             ],
         }
     page.route(re.compile(r"/resources/github(?:\?|$)"), lambda r: r.fulfill(json=info))
+    if pr_count > 1:
+        # The server's stored list matches the live payload it would have answered.
+        stub_session_pull_requests(page, lambda: info["prs"], lambda _url: None)
     page.route(re.compile(r"/resources/github/changes"), lambda r: r.fulfill(json=_CHANGES))
     page.route(re.compile(r"/resources/github/diff(?:\?|$)"), lambda r: r.fulfill(json=_PR_DIFF))
     page.route(

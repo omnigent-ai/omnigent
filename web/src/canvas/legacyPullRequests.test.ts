@@ -14,8 +14,8 @@ import {
   PULL_REQUEST_REFRESH_MS,
   PULL_REQUEST_RETRY_MS,
   PullRequestQueue,
-  usePullRequests,
-} from "./pullRequests";
+  useLivePullRequests,
+} from "./legacyPullRequests";
 
 vi.mock("@/hooks/usePullRequests", () => ({ fetchPullRequestInfo: vi.fn() }));
 
@@ -106,7 +106,7 @@ describe("PullRequestQueue", () => {
   });
 });
 
-describe("usePullRequests", () => {
+describe("useLivePullRequests", () => {
   beforeEach(() => {
     vi.mocked(pullRequestHooks.fetchPullRequestInfo).mockReset();
   });
@@ -130,7 +130,7 @@ describe("usePullRequests", () => {
       session("plain", null),
     ];
 
-    const { result } = renderHook(() => usePullRequests(sessions), { wrapper });
+    const { result } = renderHook(() => useLivePullRequests(sessions), { wrapper });
 
     await waitFor(() =>
       expect(pullRequestHooks.fetchPullRequestInfo).toHaveBeenCalledTimes(PULL_REQUEST_CONCURRENCY),
@@ -187,7 +187,7 @@ describe("usePullRequests", () => {
         }),
       );
     const sessions = [session("s", "main")];
-    const { result } = renderHook(() => usePullRequests(sessions), { wrapper });
+    const { result } = renderHook(() => useLivePullRequests(sessions), { wrapper });
     await waitFor(() => expect(pullRequestHooks.fetchPullRequestInfo).toHaveBeenCalledTimes(1));
 
     await act(async () => {
@@ -222,7 +222,7 @@ describe("usePullRequests", () => {
         checks: NO_CHECKS,
       }),
     );
-    const { result } = renderHook(() => usePullRequests([session("s", "main")]), { wrapper });
+    const { result } = renderHook(() => useLivePullRequests([session("s", "main")]), { wrapper });
     await waitFor(() => expect(result.current.s).toBeNull());
   });
 
@@ -269,7 +269,7 @@ describe("usePullRequests", () => {
       vi.mocked(pullRequestHooks.fetchPullRequestInfo).mockResolvedValue(
         info(openPr(FORGE_URL), { prs, provider, provider_display }),
       );
-      const { result } = renderHook(() => usePullRequests([session("s", "main")]), { wrapper });
+      const { result } = renderHook(() => useLivePullRequests([session("s", "main")]), { wrapper });
       await waitFor(() => expect(result.current.s).toMatchObject({ number: 7 }));
       expect(result.current.s?.provider).toBe(expected);
     },
@@ -280,13 +280,34 @@ describe("usePullRequests", () => {
     vi.mocked(pullRequestHooks.fetchPullRequestInfo)
       .mockResolvedValueOnce(info(openPr(FORGE_URL), { provider: "github" }))
       .mockResolvedValue(info(openPr(FORGE_URL), { provider: "example_forge" }));
-    const { result } = renderHook(() => usePullRequests([session("s", "main")]), { wrapper });
+    const { result } = renderHook(() => useLivePullRequests([session("s", "main")]), { wrapper });
     await waitFor(() => expect(result.current.s?.provider).toBe("github"));
 
     await act(async () => {
       await vi.advanceTimersByTimeAsync(PULL_REQUEST_REFRESH_MS + PULL_REQUEST_RETRY_MS + 50);
     });
     await waitFor(() => expect(result.current.s?.provider).toBe("example_forge"));
+    vi.useRealTimers();
+  });
+
+  it("stays idle while disabled, as it is on servers that store PRs", async () => {
+    vi.useFakeTimers({ shouldAdvanceTime: true });
+    let renders = 0;
+    const sessions = [session("s", "main")];
+    renderHook(
+      () => {
+        renders += 1;
+        return useLivePullRequests(sessions, false);
+      },
+      { wrapper },
+    );
+    const settled = renders;
+
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(3 * PULL_REQUEST_RETRY_MS);
+    });
+    expect(renders).toBe(settled);
+    expect(pullRequestHooks.fetchPullRequestInfo).not.toHaveBeenCalled();
     vi.useRealTimers();
   });
 });

@@ -35,7 +35,7 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event";
 import { Profiler, type ProfilerOnRenderCallback } from "react";
 import { MemoryRouter, useLocation, useNavigate } from "react-router-dom";
-import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
+import { QueryClient, QueryClientProvider, useQuery } from "@tanstack/react-query";
 
 import {
   composeSandboxWorkspace,
@@ -62,6 +62,34 @@ import {
   useSandboxUnsupportedAgents,
   type SandboxModelOptions,
 } from "@/hooks/useSandboxModelOptions";
+import type { HarnessFixDialogProps } from "@/pages/settings/HarnessFixDialog";
+
+let fixDialogProps: HarnessFixDialogProps | null = null;
+vi.mock("@/pages/settings/HarnessFixDialog", () => ({
+  HarnessFixDialog: (props: HarnessFixDialogProps) => {
+    fixDialogProps = props;
+    return (
+      <div data-testid="new-chat-fix-dialog">
+        <button
+          type="button"
+          onClick={() => {
+            props.onFixed({
+              configuredHarnesses: { "codex-native": true },
+              harnessAccounts: { codex: { kind: "chatgpt", email: "demo@example.test" } },
+              gatewayInference: { codex: false },
+            });
+            props.onOpenChange(false);
+          }}
+        >
+          Finish harness setup
+        </button>
+        <button type="button" onClick={() => props.onOpenChange(false)}>
+          Cancel
+        </button>
+      </div>
+    );
+  },
+}));
 import { ComposerAddMenu } from "@/components/composer/ComposerAddMenu";
 import { CapabilitiesProvider } from "@/lib/CapabilitiesContext";
 import type { ServerInfo } from "@/lib/capabilities";
@@ -1193,6 +1221,7 @@ function mockModelQueries(
 // directory-session / runner-health / filesystem stubs, and a persisted
 // recent workspace so the working-directory field seeds to a known path.
 function setupLandingMocks() {
+  fixDialogProps = null;
   authenticatedFetchMock.mockReset();
   getCurrentUserIdMock.mockReset();
   getCurrentUserIdMock.mockReturnValue(null);
@@ -1640,11 +1669,17 @@ function selectUnconfiguredAgent(agentId: string): void {
   closeMenu();
 }
 
-function breakSelectedHarness(agentId: string, harness: string, readiness: boolean | string): void {
+function breakSelectedHarness(
+  agentId: string,
+  harness: string,
+  readiness: boolean | string,
+  hostOverrides: Partial<Host> = {},
+): void {
   selectAgent(agentId);
   mockHosts([
     {
       ...host("online"),
+      ...hostOverrides,
       configured_harnesses: {
         "claude-native": true,
         "codex-native": true,
@@ -6943,7 +6978,114 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("new-chat-landing-branch-chip")).toBeVisible();
   });
 
-  it("opens the setup dialog and installs an installable harness from it", () => {
+  it.each([
+    ["binary-missing", "install"],
+    [false, "install"],
+    ["needs-auth", "reconfigure"],
+    ["version-too-low", "update"],
+    ["future-error", "reconfigure"],
+  ] as const)("opens repair over the composer for %s", (readiness, mode) => {
+    renderLanding({ harness_install_enabled: true });
+    breakSelectedHarness("a2", "codex-native", readiness);
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.getByTestId("new-chat-fix-dialog")).toBeVisible();
+    expect(fixDialogProps).toMatchObject({
+      mode,
+      harness: "codex-native",
+      harnessLabel: "Codex",
+      host: { host_id: "host_1" },
+    });
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Harness readiness changed");
+    expect(screen.queryByTestId("harness-setup-install")).toBeNull();
+  });
+
+  it("normalizes Codex aliases before opening repair", () => {
+    mockAgents([
+      testAgent("alias", "codex-native-ui", { display_name: "Codex", harness: "codex" }),
+    ]);
+    renderLanding({ harness_install_enabled: true });
+    breakSelectedHarness("alias", "codex-native", "binary-missing");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(fixDialogProps).toMatchObject({ harness: "codex-native", mode: "install" });
+  });
+
+  it("uses the native display name for a custom agent's repair", () => {
+    mockAgents([
+      testAgent("custom", "my-bot", { display_name: "My Bot", harness: "codex-native" }),
+    ]);
+    renderLanding({ harness_install_enabled: true });
+    breakSelectedHarness("custom", "codex-native", "needs-auth");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(fixDialogProps?.harnessLabel).toBe("Codex");
+  });
+
+  it("keeps the setup checklist for an SDK Claude agent needing authentication", () => {
+    mockAgents([testAgent("sdk", "claude", { display_name: "Claude SDK", harness: "claude" })]);
+    renderLanding({ harness_install_enabled: true });
+    mockHosts([{ ...host("online"), configured_harnesses: { claude: "needs-auth" } } as Host]);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "SDK setup" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.queryByTestId("new-chat-fix-dialog")).toBeNull();
+    expect(screen.getByTestId("harness-setup-dialog")).toBeVisible();
+  });
+
+  it("keeps the setup checklist when an older host reports no readiness for the harness", () => {
+    renderLanding({ harness_install_enabled: true });
+    selectAgent("a2");
+    mockHosts([{ ...host("online"), configured_harnesses: { "claude-native": true } } as Host]);
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Unknown readiness" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.queryByTestId("new-chat-fix-dialog")).toBeNull();
+    expect(screen.getByTestId("harness-setup-dialog")).toBeVisible();
+  });
+
+  it("keeps the notice after Cancel and reopens repair from Set up", () => {
+    renderLanding({ harness_install_enabled: true });
+    breakSelectedHarness("a2", "codex-native", "needs-auth");
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    fireEvent.click(screen.getByRole("button", { name: "Cancel" }));
+    expect(screen.queryByTestId("new-chat-fix-dialog")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-harness-warning")).toBeVisible();
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    expect(screen.getByTestId("new-chat-fix-dialog")).toBeVisible();
+  });
+
+  it("refreshes readiness and preserves the draft after repair succeeds", async () => {
+    const unreadyHost = {
+      ...host("online"),
+      configured_harnesses: { "codex-native": "needs-auth" },
+    };
+    useHostsMock.mockImplementation(
+      () =>
+        useQuery({
+          queryKey: ["hosts"],
+          queryFn: async () => [unreadyHost],
+          initialData: [unreadyHost],
+          staleTime: Infinity,
+        }) as ReturnType<typeof useHosts>,
+    );
+    mockAgents([
+      testAgent("a2", "codex-native-ui", { display_name: "Codex", harness: "codex-native" }),
+    ]);
+    renderLanding({ harness_install_enabled: true });
+    fireEvent.change(screen.getByTestId("new-chat-landing-input"), {
+      target: { value: "Keep my draft" },
+    });
+    fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
+    fireEvent.click(screen.getByRole("button", { name: "Finish harness setup" }));
+    await waitFor(() =>
+      expect(screen.queryByTestId("new-chat-landing-harness-warning")).toBeNull(),
+    );
+    expect(screen.queryByTestId("new-chat-fix-dialog")).toBeNull();
+    expect(screen.getByTestId("new-chat-landing-input")).toHaveValue("Keep my draft");
+    expect(screen.getByTestId("new-chat-landing-submit")).toBeEnabled();
+  });
+
+  it("managed host: opens the setup dialog and installs an installable harness from it", () => {
     // host_1 reports codex-native (agent a2) as not set up; the server accepts
     // that harness, so the composer notice offers a "Set up Codex" action that
     // opens the dialog, and the dialog's Install button fires the install.
@@ -6956,7 +7098,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     // The composer action is labelled with the agent, not "the harness".
     const setup = screen.getByTestId("new-chat-landing-harness-setup");
@@ -7138,7 +7280,7 @@ describe("NewChatLandingScreen", () => {
     );
   });
 
-  it("gates Set up auth until the harness is installed (no auth-before-install)", () => {
+  it("managed host: gates Set up auth until the harness is installed (no auth-before-install)", () => {
     // codex-native not installed: the credential form must NOT be available
     // yet — the auth row shows a DISABLED "Set up auth" (install first).
     // Clicking it does nothing / the form doesn't expand, so an auth-first write
@@ -7147,7 +7289,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
 
     // Install is offered; the auth row's control is present but disabled.
@@ -7159,14 +7301,14 @@ describe("NewChatLandingScreen", () => {
     expect(screen.queryByTestId("harness-credential-form")).toBeNull();
   });
 
-  it("enables Set up auth once the harness is installed (needs-auth)", () => {
+  it("managed host: enables Set up auth once the harness is installed (needs-auth)", () => {
     // Installed but no credential → the auth row's "Set up auth" is enabled and
     // expands the credential form.
     renderLanding({
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", "needs-auth");
+    breakSelectedHarness("a2", "codex-native", "needs-auth", { sandbox_provider: "modal" });
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
 
     const setUpAuth = screen.getByTestId("harness-setup-add-credential") as HTMLButtonElement;
@@ -7176,7 +7318,7 @@ describe("NewChatLandingScreen", () => {
     expect(screen.getByTestId("harness-credential-form")).toBeTruthy();
   });
 
-  it("marks its Install button loading while THIS harness's install is pending", () => {
+  it("managed host: marks its Install button loading while THIS harness's install is pending", () => {
     // The dialog derives the in-flight indicator from React Query's mutation
     // state via useInstallingHarnesses (observer-independent, so a concurrent
     // install can't strand it). When that reports codex-native pending, the
@@ -7186,7 +7328,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect((screen.getByTestId("harness-setup-install") as HTMLButtonElement).disabled).toBe(true);
@@ -7197,7 +7339,7 @@ describe("NewChatLandingScreen", () => {
     expect(installStep.contains(installingCaption)).toBe(true);
   });
 
-  it("offers the inline credential form (not an install) for codex needs-auth", async () => {
+  it("managed host: offers the inline credential form (not an install) for codex needs-auth", async () => {
     // Binary present, just not authed → the auth step offers "Set up auth",
     // which expands the inline credential form. Never an Install button (a
     // reinstall wouldn't add the credential). The subscription `codex login` is
@@ -7207,7 +7349,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", "needs-auth");
+    breakSelectedHarness("a2", "codex-native", "needs-auth", { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
@@ -7222,7 +7364,7 @@ describe("NewChatLandingScreen", () => {
     await waitFor(() => expect(copyTextMock).toHaveBeenCalledWith("codex login"));
   });
 
-  it("hides the Install button when the server doesn't list the harness as installable", () => {
+  it("managed host: hides the Install button when the server doesn't list the harness as installable", () => {
     // Defence in depth: the server published an install step for codex-native,
     // but the harness is NOT in installable_harnesses (a catalog/allowlist
     // drift). The Install button must not render — offering it would drive a
@@ -7232,13 +7374,13 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: [], // step catalog says install; allowlist disagrees
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect(screen.queryByTestId("harness-setup-install")).toBeNull();
   });
 
-  it("toast says 'ready' only when the install returns a launchable harness", () => {
+  it("managed host: toast says 'ready' only when the install returns a launchable harness", () => {
     // The install POST returns the refreshed readiness. codex-native comes back
     // true (ready) → the success toast says ready.
     showToastMock.mockClear();
@@ -7255,14 +7397,14 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     fireEvent.click(screen.getByTestId("harness-setup-install"));
     expect(showToastMock).toHaveBeenCalledWith(expect.stringContaining("is ready on"));
   });
 
-  it("toast says 'one more step' when the install leaves the harness needing auth", () => {
+  it("managed host: toast says 'one more step' when the install leaves the harness needing auth", () => {
     // codex installs but still needs a login → readiness comes back
     // "needs-auth", not true. The toast must not claim "ready" (which would
     // contradict the sign-in row the checklist still shows).
@@ -7280,7 +7422,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["codex", "codex-native"],
     });
-    breakSelectedHarness("a2", "codex-native", false);
+    breakSelectedHarness("a2", "codex-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     fireEvent.click(screen.getByTestId("harness-setup-install"));
@@ -7288,7 +7430,7 @@ describe("NewChatLandingScreen", () => {
     expect(showToastMock).not.toHaveBeenCalledWith(expect.stringContaining("is ready"));
   });
 
-  it("shows a fallback message when the server published no steps for the spelling", () => {
+  it("managed host: shows a fallback message when the server published no steps for the spelling", () => {
     // Feature on, harness unconfigured, but no setup_steps for this spelling
     // (a1 = claude-native, which the stubbed useHarnessSetupSteps doesn't
     // cover). The dialog must not be an empty dead-end — it points at the CLI.
@@ -7296,7 +7438,7 @@ describe("NewChatLandingScreen", () => {
       harness_install_enabled: true,
       installable_harnesses: ["claude", "claude-native"],
     });
-    breakSelectedHarness("a1", "claude-native", false);
+    breakSelectedHarness("a1", "claude-native", false, { sandbox_provider: "modal" });
 
     fireEvent.click(screen.getByTestId("new-chat-landing-harness-setup"));
     expect(screen.getByTestId("harness-setup-empty").textContent).toContain("omni setup");

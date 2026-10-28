@@ -218,7 +218,8 @@ async def test_category_only_failure_retains_current_api_error_after_restart(
     }.get(scenario, "matched")
     assert context["transcript_error_context_state"] == expected_context_state
     assert len(checkpoint_reads) == (
-        0 if scenario in {"explicit_hook_detail", "missing_native_session"} else len(failures)
+        (0 if scenario in {"explicit_hook_detail", "missing_native_session"} else len(failures))
+        + (1 if failures[-1].get("response_id") is not None else 0)
     )
     assert failure["status"] == "failed"
     assert failure.get("response_id") == response_id

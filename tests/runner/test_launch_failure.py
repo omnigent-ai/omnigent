@@ -324,6 +324,8 @@ def test_genuine_reauth_codex_reauth_required_is_preserved() -> None:
         "API Error: Server error mid-response. The response above may be incomplete.",
         "Connection lost mid-response. The response above may be incomplete.",
         "connection lost mid-response",
+        "API Error: The response stopped arriving. The response above may be incomplete.",
+        "  api error: the response stopped arriving. the response above may be incomplete.  ",
         "API Error: 503 Service Unavailable",
         "HTTP 500 Internal Server Error",
         "HTTP/1.1 502 Bad Gateway",
@@ -361,6 +363,13 @@ def test_classifies_transient_upstream_errors(code: str, message: str) -> None:
         "Request rejected (4990)",
         "API Error: 4991",
         'API Error: 400 {"error_code":"INVALID_PARAMETER_VALUE","message":"query cancelled"}',
+        "The response stopped arriving.",
+        "API Error: The response stopped arriving. Retry the tool.",
+        "Quoted: API Error: The response stopped arriving. The response above may be incomplete.",
+        "API Error: The response stopped arriving. The response above may be incomplete. "
+        "Cancelled.",
+        "API Error: 401 The response stopped arriving. The response above may be incomplete.",
+        "API Error: 403 The response stopped arriving. The response above may be incomplete.",
     ],
 )
 def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> None:
@@ -368,9 +377,16 @@ def test_interrupts_and_aborts_are_not_transient(code: str, message: str) -> Non
 
 
 @pytest.mark.parametrize("code", ["workspace_missing", "codex_reauth_required"])
-def test_gateway_499_does_not_override_specific_failure_codes(code: str) -> None:
+def test_transient_messages_do_not_override_specific_failure_codes(code: str) -> None:
     assert classify_native_turn_error(code, _GATEWAY_499_OUTPUT) == code
     assert classify_native_turn_error(code, "Request timed out") == code
+    assert (
+        classify_native_turn_error(
+            code,
+            "API Error: The response stopped arriving. The response above may be incomplete.",
+        )
+        == code
+    )
     assert (
         classify_native_turn_error(
             code, "We’re currently experiencing high demand, which may cause temporary errors."
