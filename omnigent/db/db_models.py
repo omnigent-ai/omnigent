@@ -1855,10 +1855,14 @@ class SqlSkillPrincipal(OmnigentBase):
 
     One row per principal that has installed skills (see
     :class:`SqlInstalledSkill`). The store locks this row for the length of
-    an install, so a principal's quota is checked and its rows written under
-    one lock on every engine, including a principal with no rows yet.
+    a write, so a principal's quota is checked and its rows written under one
+    lock on every engine, including a principal with no rows yet. The totals
+    live here, maintained by the same transactions, so a quota check is one
+    locked read rather than a scan of the principal's rows.
 
     :param principal: ``"org"``, ``"local"`` or ``"user:<owner_user_id>"``.
+    :param installed_count: Rows the principal holds in ``installed_skills``.
+    :param enabled_bytes: Sum of ``bundle_bytes`` over its enabled rows.
     :param created_at: Unix epoch seconds at row creation.
     """
 
@@ -1870,6 +1874,8 @@ class SqlSkillPrincipal(OmnigentBase):
         default=current_workspace_id,
     )
     principal: Mapped[str] = mapped_column(String(133), primary_key=True)
+    installed_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    enabled_bytes: Mapped[int] = mapped_column(BigInteger, nullable=False)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
 
     @validates("principal")

@@ -57,6 +57,8 @@ def test_upgrade_creates_the_tables_and_downgrade_removes_them(tmp_path: Path) -
         assert [c["name"] for c in inspector.get_columns("skill_principals")] == [
             "workspace_id",
             "principal",
+            "installed_count",
+            "enabled_bytes",
             "created_at",
         ]
 
@@ -94,7 +96,9 @@ def test_declared_lengths_are_enforced_on_every_orm_write(db_uri: str) -> None:
                 created_at=0,
             )
         with pytest.raises(ValueError, match="principal is longer than 133"):
-            SqlSkillPrincipal(principal="user:" + "u" * 129, created_at=0)
+            SqlSkillPrincipal(
+                principal="user:" + "u" * 129, installed_count=0, enabled_bytes=0, created_at=0
+            )
         row = SqlInstalledSkill(
             id=uuid.uuid4().hex,
             name="review",

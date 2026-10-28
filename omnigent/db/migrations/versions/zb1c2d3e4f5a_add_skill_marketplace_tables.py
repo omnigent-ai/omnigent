@@ -7,7 +7,8 @@ Create Date: 2026-10-28 00:00:00.000000
 Creates ``skill_sources`` (repositories the marketplace browses),
 ``installed_skills`` (skills fetched from a repository and stored as tarballs
 in the artifact store) and ``skill_principals`` (one lock row per principal
-that installs, so a quota is checked and written under one lock). All are
+that installs, carrying its row count and enabled bytes, so a quota is
+checked and written under one lock without scanning its rows). All are
 workspace-partitioned like the other application tables, carry no database
 foreign keys (schema Rule R032), and declare no SQL defaults: the
 application supplies every value.
@@ -75,6 +76,9 @@ def _skill_principals_columns() -> list[sa.Column]:
     return [
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         sa.Column("principal", sa.String(133), nullable=False),
+        # Maintained under the row's lock: a quota check reads these, never the rows.
+        sa.Column("installed_count", sa.Integer(), nullable=False),
+        sa.Column("enabled_bytes", sa.BigInteger(), nullable=False),
         sa.Column("created_at", sa.Integer(), nullable=False),
     ]
 
