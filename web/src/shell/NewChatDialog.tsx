@@ -35,7 +35,11 @@ import {
   HarnessMenuNavigationLabel,
   PickerSectionHeader,
 } from "@/components/composer/HarnessMenuRow";
-import { ComposerConfigSections } from "@/components/composer/ComposerConfigSections";
+import {
+  ComposerConfigSections,
+  type ComposerConfigSection,
+} from "@/components/composer/ComposerConfigSections";
+import { useComposerConfigCycleHotkeys } from "@/hooks/useComposerConfigCycleHotkeys";
 import { buildFusionSections } from "@/components/composer/fusionSections";
 import {
   compactModelTriggerLabel,
@@ -125,6 +129,8 @@ import {
   CommandList,
 } from "@/components/ui/command";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
+import { HarnessFixDialog } from "@/pages/settings/HarnessFixDialog";
+import { applyHarnessFixResult, harnessFixMode, harnessStatus } from "@/lib/harnessFix";
 import { HarnessSetupDialog } from "@/shell/HarnessSetupDialog";
 import {
   harnessReadinessOnHost,
@@ -274,7 +280,7 @@ import {
 } from "@/hooks/useSandboxModelOptions";
 import { useSkills } from "@/hooks/useSkills";
 import { useOnboardingRunnerHost } from "@/hooks/useOnboardingRunnerHost";
-import { readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
+import { findConnectedArcaHost, readArcaHostId, writeArcaHostId } from "@/lib/arcaHost";
 import {
   connectArcaHost,
   controlHost,
@@ -863,7 +869,8 @@ function harnessWarningMessage(
  *
  * Gated on the setup feature: when OFF, renders the original "run omnigent
  * setup" guidance so the flag-off UI is unchanged. When ON, offers a "Set up
- * <agent>" action that opens the shared {@link HarnessSetupDialog}.
+ * <agent>" action that repairs native agents on user hosts in place, or opens
+ * the setup checklist for other agents and managed hosts.
  */
 function HarnessSetupNotice({
   agentName,
@@ -1343,6 +1350,15 @@ function visibleModelLabel(label: string): string {
 const EMPTY_HARNESS_TRIGGER_DETAILS: readonly { label: string; value: string }[] = [];
 type ModelCatalogAvailability = "available" | "unavailable" | "unknown";
 
+// Harness icon kinds preferred for the picker's inline list, in display order.
+// A deployment that seeds none of these (OMNIGENT_SEEDED_AGENTS) backfills the
+// list from whatever is launchable rather than showing an empty group.
+const PRIMARY_HARNESS_ORDER: readonly string[] = ["claude", "cursor", "codex"];
+// Preferred order within the "Other..." submenu.
+const SECONDARY_HARNESS_ORDER: readonly string[] = ["opencode", "pi"];
+// How many rows the backfill promotes — matches the inline list's usual size.
+const INLINE_HARNESS_FALLBACK = PRIMARY_HARNESS_ORDER.length;
+
 function agentHasModelSettings(agent: AvailableAgent | undefined): boolean {
   return (
     nativeAgentHasCapability(agent, "modelPicker") ||
@@ -1438,6 +1454,8 @@ export function AgentHarnessPicker({
   autoHarnessActive = false,
   onSelectAutoHarness,
   openNonce = 0,
+  cyclePreview,
+  onDismissCyclePreview,
   blockedReasons,
   onPrefetchEntries,
 }: {
@@ -1514,6 +1532,8 @@ export function AgentHarnessPicker({
   onSelectAutoHarness?: () => void;
   /** Bump to open the menu imperatively (the landing's model-picker hotkey). */
   openNonce?: number;
+  cyclePreview?: ComposerConfigSection;
+  onDismissCyclePreview?: () => void;
   /** Agent id → why the target can't run it; those rows render disabled. */
   blockedReasons?: ReadonlyMap<string, string>;
   /** Called with the ids of rows the menu is about to show. */
@@ -1737,28 +1757,46 @@ export function AgentHarnessPicker({
   const hideUnconfigured = useMemo(() => readHideUnconfiguredHarnesses(), []);
   const { readyHarnessEntries, moreHarnessEntries } = useMemo(() => {
     const ready: AvailableAgent[] = [];
-    const more: AvailableAgent[] = [];
-    const primaryOrder = ["claude", "cursor", "codex"];
-    const secondaryOrder = ["opencode", "pi"];
+    let more: AvailableAgent[] = [];
+    // Recorded during the split so the backfill below asks the same question
+    // rather than restating it inverted.
+    const unavailableIds = new Set<string>();
     for (const agent of harnessEntries) {
       const selected = agent.id === effectiveAgentId;
       const readiness = harnessReadinessOnHost(agent.harness, host);
       const unavailable = !readiness.selectable && readiness.fallbackRelevant;
       if (!selected && hideUnconfigured && unavailable) continue;
+      if (unavailable) unavailableIds.add(agent.id);
       const key = nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "";
-      const primary = primaryOrder.includes(key) || agent.id === promotedHarnessId;
+      const primary = PRIMARY_HARNESS_ORDER.includes(key) || agent.id === promotedHarnessId;
       // Unavailable primaries demote to "Other..." — the main list stays
       // launch-ready; the selected harness always keeps its slot.
       if (primary && (selected || !unavailable)) {
         ready.push(agent);
       } else more.push(agent);
     }
-    const rank = (agent: AvailableAgent, order: string[]) => {
+    const rank = (agent: AvailableAgent, order: readonly string[]) => {
       const index = order.indexOf(nativeCodingAgentForAvailableAgent(agent)?.iconKind ?? "");
       return index < 0 ? order.length : index;
     };
-    ready.sort((first, second) => rank(first, primaryOrder) - rank(second, primaryOrder));
-    more.sort((first, second) => rank(first, secondaryOrder) - rank(second, secondaryOrder));
+    ready.sort(
+      (first, second) => rank(first, PRIMARY_HARNESS_ORDER) - rank(second, PRIMARY_HARNESS_ORDER),
+    );
+    more.sort(
+      (first, second) =>
+        rank(first, SECONDARY_HARNESS_ORDER) - rank(second, SECONDARY_HARNESS_ORDER),
+    );
+    // No preferred harness survived: promote the best launchable ones inline.
+    if (ready.length === 0) {
+      const promoted = more
+        .filter((agent) => !unavailableIds.has(agent.id))
+        .slice(0, INLINE_HARNESS_FALLBACK);
+      if (promoted.length > 0) {
+        ready.push(...promoted);
+        const promotedIds = new Set(promoted.map((agent) => agent.id));
+        more = more.filter((agent) => !promotedIds.has(agent.id));
+      }
+    }
     return { readyHarnessEntries: ready, moreHarnessEntries: more };
   }, [harnessEntries, host, hideUnconfigured, effectiveAgentId, promotedHarnessId]);
   // Opening by hotkey skips onOpenChange, so prefetch here like a pointer open.
@@ -1865,6 +1903,8 @@ export function AgentHarnessPicker({
   return (
     <HarnessPicker
       modal={dropdownModal}
+      cyclePreview={cyclePreview}
+      onDismissCyclePreview={onDismissCyclePreview}
       open={open}
       onOpenChange={(next) => {
         if (!next) {
@@ -2063,11 +2103,18 @@ export function AgentHarnessPicker({
                     </HarnessPickerSubContent>
                   </DropdownMenuSub>
                 ))}
-              <DropdownMenuSeparator />
+              {/* Only when something follows it. A trimmed deployment can have
+                no bundle agents and no custom group, and a rule closing the
+                menu with nothing under it is the same leftover the Agents
+                header below avoids. */}
+              {(bundleEntries.length > 0 || hasCustomGroup) && <DropdownMenuSeparator />}
             </>
           )}
-          {/* Agents group — built-in bundle agents (Polly / Debby) inline. */}
-          <PickerSectionHeader>Agents</PickerSectionHeader>
+          {/* Agents group — bundle agents inline; header only when the group
+            has content, like "Harnesses" above. */}
+          {(bundleEntries.length > 0 || hasCustomGroup) && (
+            <PickerSectionHeader>Agents</PickerSectionHeader>
+          )}
           {bundleEntries.map(renderEntry)}
           {/* Existing custom agents fold into an "Other..." submenu (with
             the pending upload and the create action). With no custom agents the
@@ -2713,9 +2760,27 @@ export function NewChatLandingScreen() {
   // row; null when closed. One dialog serves every entry point.
   const [setupTarget, setSetupTarget] = useState<{
     agentName: string | undefined;
+    nativeAgent: ReturnType<typeof nativeCodingAgentForAvailableAgent>;
     harness: string | null;
     host: Host | undefined | null;
   } | null>(null);
+
+  const fixStatus = setupTarget?.nativeAgent
+    ? harnessStatus(setupTarget.nativeAgent.harness, setupTarget.host ?? null)
+    : null;
+  const fixTarget =
+    harnessInstallEnabled &&
+    setupTarget?.host &&
+    !setupTarget.host.sandbox_provider &&
+    setupTarget.nativeAgent &&
+    fixStatus?.needsSetup
+      ? {
+          host: setupTarget.host,
+          harness: setupTarget.nativeAgent.harness,
+          label: setupTarget.nativeAgent.displayName,
+          mode: harnessFixMode(fixStatus.reason),
+        }
+      : null;
 
   // Ctrl+Shift+M opens the agent/model picker here, the keyboard equivalent of the
   // existing-chat model-picker shortcut. The picker owns model selection on the
@@ -3930,6 +3995,128 @@ export function NewChatLandingScreen() {
     setCostControlMode(null);
     rememberPickerOptions(selectedNativeHarness, { model: modelUid, effort: "", routing: "off" });
   };
+  const modelSection: ComposerConfigSection | undefined =
+    sandboxHasModelCatalog ||
+    supportsModelPicker ||
+    supportsPermissionMode ||
+    supportsDevinMode ||
+    selectedNativeHarness === "codex-native"
+      ? {
+          testId: "new-chat-landing-agent-models",
+          header: "Models",
+          leading: (
+            <>
+              {sandboxHasModelCatalog &&
+                !sandboxSelectedUnsupported &&
+                sandboxModels.data?.provider_label && (
+                  <div
+                    className="px-2 py-1 text-xs text-muted-foreground"
+                    data-testid="sandbox-model-provider"
+                  >
+                    {sandboxModels.data.provider_label}
+                  </div>
+                )}
+              {selectedNativeHarness === "pi-native" && (
+                <Input
+                  aria-label="Search models"
+                  placeholder="Search models…"
+                  value={pickerModelSearch}
+                  onChange={(event) => setPickerModelSearch(event.target.value)}
+                  onKeyDown={(event) => event.stopPropagation()}
+                  data-testid="new-chat-landing-agent-model-search"
+                />
+              )}
+              {pickerModelsLoading && pickerModelOptions.length === 0 && (
+                <div className="px-2 py-1 text-xs text-muted-foreground">Loading models…</div>
+              )}
+              {!pickerModelsLoading && pickerModelOptions.length === 0 && (
+                <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
+                  {pickerModelsError?.message ?? "Models unavailable"}
+                </div>
+              )}
+            </>
+          ),
+          choices: [
+            // Default can't launch once the provider rules the harness out.
+            ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
+            (!sandboxInferenceConfigured &&
+              pickerModelOptions.length > 0 &&
+              !pickerModelOptions.some((option) => option.isDefault))
+              ? [
+                  {
+                    key: "__default__",
+                    label: "Default",
+                    checked: !routingOn && pickedModel === "",
+                    onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
+                    testId: "new-chat-landing-agent-model-default",
+                  },
+                ]
+              : []),
+            ...pickerModelOptions.map((option) => ({
+              key: option.id,
+              label: visibleModelLabel(nativeModelLabel(option)),
+              checked:
+                !routingOn &&
+                (option.fusion !== undefined
+                  ? isFusionModelUid(pickedModel) ||
+                    (pickedModel === "" && option.isDefault === true)
+                  : pickedModel === option.id || (pickedModel === "" && option.isDefault === true)),
+              // The Fusion row always opens its Lead/Sidekick selectors,
+              // even when Fusion is the catalog default (routing it
+              // through MODEL_SELECT_DEFAULT would hide them).
+              onSelect: option.fusion
+                ? () => selectFusionModel(option.fusion!.default)
+                : () => selectPickerModel(option.isDefault ? MODEL_SELECT_DEFAULT : option.id),
+              testId: `new-chat-landing-agent-model-${option.id}`,
+              title: nativeModelTooltip(option),
+              className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
+            })),
+          ],
+        }
+      : undefined;
+  const effortSection: ComposerConfigSection | undefined =
+    pickerEffortOptions.length > 0
+      ? {
+          testId: "new-chat-landing-agent-efforts",
+          header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
+          choices: [
+            {
+              key: "__default__",
+              label: "Default",
+              checked: !routingOn && pickedEffort === "",
+              disabled: routingOn,
+              onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
+              testId: "new-chat-landing-agent-effort-default",
+            },
+            ...pickerEffortOptions.map((option) => ({
+              key: option.value,
+              label: option.label,
+              checked: !routingOn && pickedEffort === option.value,
+              disabled: routingOn,
+              onSelect: () => selectPickerEffort(option.value),
+              testId: `new-chat-landing-agent-effort-${option.value}`,
+            })),
+          ],
+        }
+      : undefined;
+  const fusionSections: readonly ComposerConfigSection[] | undefined =
+    pickerFusion !== undefined && fusionSelected && !routingOn
+      ? buildFusionSections({
+          descriptor: pickerFusion,
+          modelUid: fusionModelUid,
+          testIdPrefix: "new-chat-landing-agent",
+          onChange: selectFusionModel,
+        })
+      : undefined;
+  const { preview, dismissPreview } = useComposerConfigCycleHotkeys(
+    modelSection?.choices,
+    effortSection?.choices ?? fusionSections?.[1]?.choices.filter(({ key }) => key !== "__fast__"),
+    !!selectedAgent &&
+      isEntryConfigurable(selectedAgent) &&
+      !noExecutionTargetSelected &&
+      !creating &&
+      (!pickerLoading || pickerInteractiveWhileLoading),
+  );
   const selectedConfigContent =
     selectedAgent && isEntryConfigurable(selectedAgent) ? (
       <>
@@ -3937,7 +4124,11 @@ export function NewChatLandingScreen() {
           <>
             <DropdownMenuCheckboxItem
               checked={routingOn}
-              onCheckedChange={() => selectPickerModel(MODEL_SELECT_SMART)}
+              // Unchecking returns to the harness default, so the pick stays
+              // reversible even when the Models list below has no row to click.
+              onCheckedChange={(checked) =>
+                selectPickerModel(checked ? MODEL_SELECT_SMART : MODEL_SELECT_DEFAULT)
+              }
               onSelect={(event) => event.preventDefault()}
               data-testid="new-chat-landing-agent-model-smart-routing"
             >
@@ -3990,137 +4181,21 @@ export function NewChatLandingScreen() {
               : undefined
           }
           models={
-            sandboxHasModelCatalog ||
-            supportsModelPicker ||
-            supportsPermissionMode ||
-            supportsDevinMode ||
-            selectedNativeHarness === "codex-native"
-              ? {
-                  testId: "new-chat-landing-agent-models",
-                  header: "Models",
-                  leading: (
-                    <>
-                      {sandboxHasModelCatalog &&
-                        !sandboxSelectedUnsupported &&
-                        sandboxModels.data?.provider_label && (
-                          <div
-                            className="px-2 py-1 text-xs text-muted-foreground"
-                            data-testid="sandbox-model-provider"
-                          >
-                            {sandboxModels.data.provider_label}
-                          </div>
-                        )}
-                      {selectedNativeHarness === "pi-native" && (
-                        <Input
-                          aria-label="Search models"
-                          placeholder="Search models…"
-                          value={pickerModelSearch}
-                          onChange={(event) => setPickerModelSearch(event.target.value)}
-                          onKeyDown={(event) => event.stopPropagation()}
-                          data-testid="new-chat-landing-agent-model-search"
-                        />
-                      )}
-                      {pickerModelsLoading && pickerModelOptions.length === 0 && (
-                        <div className="px-2 py-1 text-xs text-muted-foreground">
-                          Loading models…
-                        </div>
-                      )}
-                      {!pickerModelsLoading && pickerModelOptions.length === 0 && (
-                        <div className="whitespace-normal px-2 py-1 text-xs text-muted-foreground">
-                          {pickerModelsError?.message ?? "Models unavailable"}
-                        </div>
-                      )}
-                    </>
-                  ),
-                  choices: [
-                    // Default can't launch once the provider rules the harness out.
-                    ...((sandboxDefaultModelsEnabled && !sandboxSelectedUnsupported) ||
-                    (!sandboxInferenceConfigured &&
-                      pickerModelOptions.length > 0 &&
-                      !pickerModelOptions.some((option) => option.isDefault))
-                      ? [
-                          {
-                            key: "__default__",
-                            label: "Default",
-                            checked: !routingOn && pickedModel === "",
-                            onSelect: () => selectPickerModel(MODEL_SELECT_DEFAULT),
-                            testId: "new-chat-landing-agent-model-default",
-                          },
-                        ]
-                      : []),
-                    ...pickerModelOptions
-                      .filter((option) =>
-                        pickerModelSearch
-                          .toLowerCase()
-                          .trim()
-                          .split(/\s+/)
-                          .every((term) =>
-                            `${option.id} ${nativeModelLabel(option)}`.toLowerCase().includes(term),
-                          ),
-                      )
-                      .map((option) => ({
-                        key: option.id,
-                        label: visibleModelLabel(nativeModelLabel(option)),
-                        checked:
-                          !routingOn &&
-                          (option.fusion !== undefined
-                            ? isFusionModelUid(pickedModel) ||
-                              (pickedModel === "" && option.isDefault === true)
-                            : pickedModel === option.id ||
-                              (pickedModel === "" && option.isDefault === true)),
-                        // The Fusion row always opens its Lead/Sidekick selectors,
-                        // even when Fusion is the catalog default (routing it
-                        // through MODEL_SELECT_DEFAULT would hide them).
-                        onSelect: option.fusion
-                          ? () => selectFusionModel(option.fusion!.default)
-                          : () =>
-                              selectPickerModel(
-                                option.isDefault ? MODEL_SELECT_DEFAULT : option.id,
-                              ),
-                        testId: `new-chat-landing-agent-model-${option.id}`,
-                        title: nativeModelTooltip(option),
-                        className: "whitespace-normal break-words [&>span:last-child]:min-w-0",
-                      })),
-                  ],
-                }
-              : undefined
+            modelSection && {
+              ...modelSection,
+              choices: modelSection.choices.filter(
+                (choice) =>
+                  choice.key === "__default__" ||
+                  pickerModelSearch
+                    .toLowerCase()
+                    .trim()
+                    .split(/\s+/)
+                    .every((term) => `${choice.key} ${choice.label}`.toLowerCase().includes(term)),
+              ),
+            }
           }
-          efforts={
-            pickerEffortOptions.length > 0
-              ? {
-                  testId: "new-chat-landing-agent-efforts",
-                  header: selectedNativeHarness === "pi-native" ? "Thinking level" : "Effort",
-                  choices: [
-                    {
-                      key: "__default__",
-                      label: "Default",
-                      checked: !routingOn && pickedEffort === "",
-                      disabled: routingOn,
-                      onSelect: () => selectPickerEffort(EFFORT_SELECT_NONE),
-                      testId: "new-chat-landing-agent-effort-default",
-                    },
-                    ...pickerEffortOptions.map((option) => ({
-                      key: option.value,
-                      label: option.label,
-                      checked: !routingOn && pickedEffort === option.value,
-                      disabled: routingOn,
-                      onSelect: () => selectPickerEffort(option.value),
-                      testId: `new-chat-landing-agent-effort-${option.value}`,
-                    })),
-                  ],
-                }
-              : undefined
-          }
-          extra={
-            pickerFusion !== undefined && fusionSelected && !routingOn
-              ? buildFusionSections({
-                  descriptor: pickerFusion,
-                  modelUid: fusionModelUid,
-                  testIdPrefix: "new-chat-landing-agent",
-                  onChange: selectFusionModel,
-                })
-              : undefined
-          }
+          efforts={effortSection}
+          extra={fusionSections}
         />
       </>
     ) : null;
@@ -4889,19 +4964,38 @@ export function NewChatLandingScreen() {
   const skillsHarness = autoRoutingSelected
     ? null
     : (selectedNativeHarness ?? pickedHarness ?? selectedAgent?.harness ?? null);
-  const skillsUnavailableMessage = sandboxSelected
-    ? "Host skills will be available after the sandbox starts."
-    : selectedAgent?.id === PENDING_AGENT_ID
-      ? "Skills will be available after this session starts."
-      : !selectedHostId
-        ? "Choose a host to discover skills."
-        : selectedHost?.status !== "online"
-          ? "Skills unavailable while the host is offline."
-          : !workspaceValid
-            ? "Choose a working directory to discover skills."
-            : !skillsHarness
-              ? "Choose a harness to discover host skills."
-              : undefined;
+  // Native prompts stay plain text; SDK skill invocations require the sandbox's catalog.
+  const arcletSkills =
+    sandboxSelected && effectiveSandboxProvider === "arclet" && isNativeTerminalAgent;
+  function getSkillsHost() {
+    if (!sandboxSelected) return selectedHost;
+    if (arcletSkills) return findConnectedArcaHost(allHosts, readArcaHostId());
+    return undefined;
+  }
+  const skillsHost = getSkillsHost();
+  const skillsHostId = sandboxSelected ? skillsHost?.host_id : selectedHostId;
+  const skillsPath = sandboxSelected ? "~" : workspaceTrimmed;
+  function getSkillsUnavailableMessage() {
+    if (sandboxSelected && !arcletSkills) {
+      return "Host skills will be available after the sandbox starts.";
+    }
+    if (selectedAgent?.id === PENDING_AGENT_ID) {
+      return "Skills will be available after this session starts.";
+    }
+    if (!skillsHostId) {
+      if (arcletSkills) return "Connect your Arca to discover skills before the sandbox starts.";
+      return "Choose a host to discover skills.";
+    }
+    if (!sandboxSelected && skillsHost?.status !== "online") {
+      return "Skills unavailable while the host is offline.";
+    }
+    if (!sandboxSelected && !workspaceValid) {
+      return "Choose a working directory to discover skills.";
+    }
+    if (!skillsHarness) return "Choose a harness to discover host skills.";
+    return undefined;
+  }
+  const skillsUnavailableMessage = getSkillsUnavailableMessage();
   const canDiscoverHostSkills = skillsUnavailableMessage === undefined;
   const {
     skills: hostSkills,
@@ -4909,16 +5003,16 @@ export function NewChatLandingScreen() {
     refetch: refreshSkills,
   } = useSkills({
     target:
-      selectedHostId && skillsHarness && workspaceTrimmed
+      skillsHostId && skillsHarness && skillsPath
         ? {
-            hostId: selectedHostId,
+            hostId: skillsHostId,
             harness: skillsHarness,
-            path: workspaceTrimmed,
+            path: skillsPath,
             agentId: selectedAgent?.id,
           }
         : null,
     enabled: canDiscoverHostSkills,
-    starting: !sandboxSelected && (hostsLoading || agentsLoading),
+    starting: (!sandboxSelected || arcletSkills) && (hostsLoading || agentsLoading),
   });
   const availableSkills = useMemo(
     () => (skillsStatus === "ready" ? hostSkills : (selectedAgent?.skills ?? [])),
@@ -6809,7 +6903,7 @@ export function NewChatLandingScreen() {
               e.preventDefault();
               void handleCreate();
             }}
-            className="relative z-10"
+            className="relative z-30"
           >
             <ChatComposer
               keyboard={{ submitWithModEnter, preventsKeyboardSubmit }}
@@ -7276,6 +7370,14 @@ export function NewChatLandingScreen() {
                     the selected entry's submenu owns run configuration. */}
                       <AgentHarnessPicker
                         openNonce={modelPickerOpenNonce}
+                        cyclePreview={
+                          preview === "models"
+                            ? modelSection
+                            : preview === "efforts"
+                              ? (effortSection ?? fusionSections?.[1])
+                              : undefined
+                        }
+                        onDismissCyclePreview={dismissPreview}
                         agentEntries={agentEntries}
                         harnessEntries={harnessEntries}
                         blockedReasons={sandboxSelected ? sandboxBlockedReasons : undefined}
@@ -7464,6 +7566,7 @@ export function NewChatLandingScreen() {
               onSetup={() =>
                 setSetupTarget({
                   agentName: selectedAgent?.display_name,
+                  nativeAgent: nativeCodingAgentForAvailableAgent(selectedAgent),
                   harness: selectedAgent?.harness ?? null,
                   host: harnessWarningHost,
                 })
@@ -7631,18 +7734,27 @@ export function NewChatLandingScreen() {
         </DialogContent>
       </Dialog>
 
-      {/* Harness "Set up" dialog — the single home for install/login (and later
-          API key / gateway) setup, opened from the composer notice or a picker
-          row's "Set up →". */}
-      <HarnessSetupDialog
-        open={setupTarget !== null}
-        onOpenChange={(open) => {
-          if (!open) setSetupTarget(null);
-        }}
-        agentName={setupTarget?.agentName}
-        harness={setupTarget?.harness ?? null}
-        host={setupTarget?.host}
-      />
+      {fixTarget ? (
+        <HarnessFixDialog
+          open
+          onOpenChange={(open) => !open && setSetupTarget(null)}
+          mode={fixTarget.mode}
+          host={fixTarget.host}
+          harness={fixTarget.harness}
+          harnessLabel={fixTarget.label}
+          onFixed={(result) => applyHarnessFixResult(queryClient, fixTarget.host.host_id, result)}
+        />
+      ) : (
+        <HarnessSetupDialog
+          open={setupTarget !== null}
+          onOpenChange={(open) => {
+            if (!open) setSetupTarget(null);
+          }}
+          agentName={setupTarget?.agentName}
+          harness={setupTarget?.harness ?? null}
+          host={setupTarget?.host}
+        />
+      )}
 
       {/* Create custom agent dialog — opened from the agent picker dropdown. */}
       <CreateAgentDialog

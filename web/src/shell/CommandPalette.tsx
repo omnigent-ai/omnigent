@@ -22,6 +22,7 @@ import {
   useSessionSearch,
 } from "@/hooks/useConversations";
 import { useIsMobileViewport } from "@/hooks/useIsMobileViewport";
+import { BOOT_PROBE_TIMEOUT_MS } from "@/lib/bootCapabilities";
 import { useServerInfo } from "@/lib/CapabilitiesContext";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -221,7 +222,20 @@ export function CommandPalette({
   // Older servers ignore `search_scope`, so they get one mixed group instead.
   const groupedSearch = serverInfo !== "loading" && serverInfo.session_search_scope === true;
   const searching = !sessionsOnly && debouncedQuery !== "";
-  const searchOptions = { enabled: open && searching, limit: SEARCH_GROUP_PAGE_SIZE };
+  // Wait briefly for server info so a supporting server never gets the mixed
+  // request; if it stalls, fall back to that request rather than never searching.
+  const serverInfoLoading = serverInfo === "loading";
+  const [serverInfoWaitExpired, setServerInfoWaitExpired] = useState(false);
+  useEffect(() => {
+    if (!serverInfoLoading || !searching || serverInfoWaitExpired) return;
+    const timer = setTimeout(() => setServerInfoWaitExpired(true), BOOT_PROBE_TIMEOUT_MS);
+    return () => clearTimeout(timer);
+  }, [serverInfoLoading, searching, serverInfoWaitExpired]);
+  const awaitingServerInfo = serverInfoLoading && !serverInfoWaitExpired;
+  const searchOptions = {
+    enabled: open && searching && !awaitingServerInfo,
+    limit: SEARCH_GROUP_PAGE_SIZE,
+  };
   const titleSearch = useSessionSearch(
     debouncedQuery,
     groupedSearch ? "title" : "all",
@@ -286,7 +300,8 @@ export function CommandPalette({
   const loadMoreError = searching
     ? searchGroups.some((group) => group.isFetchNextPageError)
     : isFetchNextPageError;
-  const searchFetching = searchGroups.some((group) => group.isFetching);
+  const searchFetching =
+    (searching && awaitingServerInfo) || searchGroups.some((group) => group.isFetching);
   const retrying = searching
     ? searchGroups.some((group) => group.isError && group.isFetching)
     : isFetching;

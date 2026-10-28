@@ -631,6 +631,66 @@ describe("CommandPalette — title and content groups", () => {
     expect(navigate).toHaveBeenCalledWith("/c/c3");
   });
 
+  it("holds the search until server info loads, then sends only the grouped requests", () => {
+    serverInfo.mockReturnValue("loading");
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    search("deploy");
+
+    // Nothing is enabled yet, and the palette shows it is still searching.
+    const enabledScopes = () =>
+      useSessionSearch.mock.calls
+        .filter(([query, , options]) => query === "deploy" && options.enabled)
+        .map(([, scope]) => scope);
+    expect(enabledScopes()).toEqual([]);
+    expect(screen.getByText("Searching…")).toBeTruthy();
+    expect(screen.queryByText("No results found")).toBeNull();
+
+    serverInfo.mockReturnValue({ session_search_scope: true });
+    rerender(<CommandPalette {...props} />);
+    expect(new Set(enabledScopes())).toEqual(new Set(["title", "content"]));
+  });
+
+  it("falls back to the mixed search when server info stalls", () => {
+    serverInfo.mockReturnValue("loading");
+    setSearchGroups({ all: searchPages([conv("t1", "Deploy plan")]) });
+    const props = {
+      open: true,
+      onOpenChange: vi.fn(),
+      onToggleLeftSidebar: vi.fn(),
+      onToggleRightSidebar: vi.fn(),
+    };
+    const { rerender } = render(<CommandPalette {...props} />);
+    search("deploy");
+    const enabledScopes = () =>
+      new Set(
+        useSessionSearch.mock.calls
+          .filter(([query, , options]) => query === "deploy" && options.enabled)
+          .map(([, scope]) => scope),
+      );
+    act(() => {
+      vi.advanceTimersByTime(1499);
+    });
+    expect(enabledScopes()).toEqual(new Set());
+
+    act(() => {
+      vi.advanceTimersByTime(1);
+    });
+    expect(enabledScopes()).toEqual(new Set(["all"]));
+    expect(labelRow("Deploy plan")).toBeTruthy();
+
+    // A late answer still switches to the grouped requests.
+    useSessionSearch.mockClear();
+    serverInfo.mockReturnValue({ session_search_scope: true });
+    rerender(<CommandPalette {...props} />);
+    expect(enabledScopes()).toEqual(new Set(["title", "content"]));
+  });
+
   it("lists one mixed group on an older server that ignores search_scope", () => {
     serverInfo.mockReturnValue({});
     setSearchGroups({

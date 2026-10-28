@@ -228,6 +228,8 @@ class DrainedInput:
     :param interrupted: Whether the person interrupted the turn while this
         entry was queued. Preserved when the entry is restored so it remains
         hidden and settles quietly as an uncertain entry.
+    :param uncertain: Whether a positional drain may already have mirrored
+        this entry. Restore must preserve that evidence even after eviction.
     """
 
     pending_id: str
@@ -244,6 +246,7 @@ class DrainedInput:
     reason_code: str | None = None
     native_turn_id: str | None = None
     lifecycle_response_id: str | None = None
+    uncertain: bool = False
 
 
 @dataclass
@@ -522,8 +525,10 @@ def mark_delivery_stage(
 
 def mark_lifecycle(
     conversation_id: str,
-    stable_id: str,
+    stable_id: str | None = None,
     *,
+    pending_id: str | None = None,
+    delivery_attempt_id: str | None = None,
     stage: NativeInputDeliveryStage,
     cause_class: NativeInputCauseClass | None = None,
     reason_code: str | None = None,
@@ -531,8 +536,18 @@ def mark_lifecycle(
     lifecycle_response_id: str | None = None,
 ) -> str | None:
     """Attach one identity-linked runner lifecycle edge to a queued input."""
-    stable = input_attributes({"input_stable_id": stable_id}).get("input_stable_id")
-    if not isinstance(stable, str) or stage not in _DELIVERY_STAGES:
+    identity = {
+        key: value
+        for key, value in {
+            "input_stable_id": stable_id,
+            "pending_id": pending_id,
+            "delivery_attempt_id": delivery_attempt_id,
+        }.items()
+        if value is not None
+    }
+    if input_attributes(identity) != identity or stage not in _DELIVERY_STAGES:
+        return None
+    if stable_id is None and (pending_id is None or delivery_attempt_id is None):
         return None
     if cause_class is not None and cause_class not in _CAUSE_CLASSES:
         cause_class = None
@@ -547,7 +562,14 @@ def mark_lifecycle(
     with _lock:
         _evict_stale_locked(conversation_id, _now())
         for entry in _pending.get(conversation_id, {}).values():
-            if entry.stable_id != stable:
+            if stable_id is not None and entry.stable_id != stable_id:
+                continue
+            if pending_id is not None and entry.pending_id != pending_id:
+                continue
+            if (
+                delivery_attempt_id is not None
+                and entry.delivery_attempt_id != delivery_attempt_id
+            ):
                 continue
             entry.last_delivery_stage = stage
             if cause_class is not None:
@@ -745,6 +767,8 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
     the FRONT, since it was the oldest when drained. Compensation never
     evicts: a queue that refilled meanwhile may exceed the cap by the
     restored entries until the next :func:`record` trims unheld ones.
+    A reconstructed entry keeps its uncertainty so a later mirror cannot
+    declare a possibly recorded message undelivered.
 
     :param conversation_id: Conversation/session id, e.g.
         ``"conv_abc123"``.
@@ -758,6 +782,7 @@ def restore(conversation_id: str, drained: DrainedInput) -> None:
         stable_id=drained.stable_id,
         background_titles_enabled=drained.background_titles_enabled,
         interrupted=drained.interrupted,
+        uncertain=drained.uncertain,
         input_enqueued_at_ms=drained.input_enqueued_at_ms,
         delivery_attempt_id=drained.delivery_attempt_id,
         last_delivery_stage=drained.last_delivery_stage,
@@ -971,6 +996,7 @@ def _drained_input(entry: _Entry) -> DrainedInput:
         stable_id=entry.stable_id,
         background_titles_enabled=entry.background_titles_enabled,
         interrupted=entry.interrupted,
+        uncertain=entry.uncertain,
         input_enqueued_at_ms=entry.input_enqueued_at_ms,
         delivery_attempt_id=entry.delivery_attempt_id,
         last_delivery_stage=entry.last_delivery_stage,
