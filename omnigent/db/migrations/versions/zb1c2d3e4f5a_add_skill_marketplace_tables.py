@@ -4,11 +4,13 @@ Revision ID: zb1c2d3e4f5a
 Revises: d0a1f879a01d
 Create Date: 2026-10-28 00:00:00.000000
 
-Creates ``skill_sources`` (repositories the marketplace browses) and
+Creates ``skill_sources`` (repositories the marketplace browses),
 ``installed_skills`` (skills fetched from a repository and stored as tarballs
-in the artifact store). Both are workspace-partitioned like the other
-application tables, carry no database foreign keys (schema Rule R032), and
-declare no SQL defaults: the application supplies every value.
+in the artifact store) and ``skill_principals`` (one lock row per principal
+that installs, so a quota is checked and written under one lock). All are
+workspace-partitioned like the other application tables, carry no database
+foreign keys (schema Rule R032), and declare no SQL defaults: the
+application supplies every value.
 
 Additive. No existing data is touched. Tables and indexes are checked and
 created independently, so a run interrupted between the two is repaired by
@@ -36,7 +38,8 @@ def _skill_sources_columns() -> list[sa.Column]:
         sa.Column("workspace_id", sa.BigInteger(), nullable=False),
         sa.Column("id", Uuid16(), nullable=False),
         sa.Column("url", sa.String(255), nullable=False),
-        sa.Column("ref", sa.String(255), nullable=True),
+        # "HEAD", git's name for the remote's default branch, when none was chosen.
+        sa.Column("ref", sa.String(255), nullable=False),
         sa.Column("name", sa.String(256), nullable=False),
         sa.Column("created_by", sa.String(128), nullable=True),
         sa.Column("created_at", sa.Integer(), nullable=False),
@@ -56,9 +59,11 @@ def _installed_skills_columns() -> list[sa.Column]:
         sa.Column("path", sa.String(1024), nullable=False),
         # Stable int code (omnigent.db.enum_codecs INSTALLED_SKILL_SCOPE: user=1, org=2).
         sa.Column("scope", sa.SmallInteger(), nullable=False),
-        # "" for an org-scoped row, never NULL, so the identity index is unique everywhere.
-        sa.Column("owner_user_id", sa.String(128), nullable=False),
+        # "org", "local" or "user:<owner_user_id>": never absent, partitions every read.
+        sa.Column("principal", sa.String(133), nullable=False),
+        sa.Column("owner_user_id", sa.String(128), nullable=True),
         sa.Column("bundle_location", sa.String(512), nullable=False),
+        sa.Column("bundle_bytes", sa.Integer(), nullable=False),
         sa.Column("enabled", sa.Boolean(), nullable=False),
         sa.Column("installed_by", sa.String(128), nullable=True),
         sa.Column("installed_at", sa.Integer(), nullable=False),
@@ -66,33 +71,46 @@ def _installed_skills_columns() -> list[sa.Column]:
     ]
 
 
-# (table, columns, extra constraints, indexes as (name, columns, unique))
+def _skill_principals_columns() -> list[sa.Column]:
+    return [
+        sa.Column("workspace_id", sa.BigInteger(), nullable=False),
+        sa.Column("principal", sa.String(133), nullable=False),
+        sa.Column("created_at", sa.Integer(), nullable=False),
+    ]
+
+
+# (table, columns, primary key, extra constraints, indexes as (name, columns, unique))
 _TABLES = [
     (
         "skill_sources",
         _skill_sources_columns,
+        ("workspace_id", "id"),
         (),
         [
             ("ix_skill_sources_order", ["workspace_id", "created_at", "id"], False),
-            ("ix_skill_sources_identity", ["workspace_id", "url", "ref", "id"], False),
+            ("ux_skill_sources_identity", ["workspace_id", "url", "ref"], True),
         ],
     ),
     (
         "installed_skills",
         _installed_skills_columns,
+        ("workspace_id", "id"),
         (sa.CheckConstraint("scope IN (1, 2)", name="ck_installed_skills_scope"),),
         [
+            ("ux_installed_skills_identity", ["workspace_id", "principal", "name"], True),
             (
-                "ux_installed_skills_identity",
-                ["workspace_id", "owner_user_id", "name", "scope"],
-                True,
-            ),
-            (
-                "ix_installed_skills_owner_order",
-                ["workspace_id", "owner_user_id", "installed_at", "id"],
+                "ix_installed_skills_principal_order",
+                ["workspace_id", "principal", "installed_at", "id"],
                 False,
             ),
         ],
+    ),
+    (
+        "skill_principals",
+        _skill_principals_columns,
+        ("workspace_id", "principal"),
+        (),
+        [],
     ),
 ]
 
@@ -110,14 +128,12 @@ def _existing_indexes(table: str) -> set[str]:
 
 
 def upgrade() -> None:
-    """Create ``skill_sources`` and ``installed_skills`` and their indexes."""
-    for table, columns, constraints, indexes in _TABLES:
+    """Create the three tables and their indexes."""
+    for table, columns, primary_key, constraints, indexes in _TABLES:
         wanted = columns()
         existing = _existing_columns(table)
         if existing is None:
-            op.create_table(
-                table, *wanted, *constraints, sa.PrimaryKeyConstraint("workspace_id", "id")
-            )
+            op.create_table(table, *wanted, *constraints, sa.PrimaryKeyConstraint(*primary_key))
         elif existing != {column.name for column in wanted}:
             raise RuntimeError(
                 f"table {table} already exists with columns {sorted(existing)}; "
@@ -131,7 +147,7 @@ def upgrade() -> None:
 
 def downgrade() -> None:
     """Drop the skills marketplace tables; tolerates a partially applied upgrade."""
-    for table, _columns, _constraints, indexes in reversed(_TABLES):
+    for table, _columns, _primary_key, _constraints, indexes in reversed(_TABLES):
         if _existing_columns(table) is None:
             continue
         present = _existing_indexes(table)

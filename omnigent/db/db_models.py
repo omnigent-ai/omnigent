@@ -1715,7 +1715,8 @@ class SqlSkillSource(OmnigentBase):
 
     :param id: UUID primary key stored as 16 raw bytes (see :class:`Uuid16`).
     :param url: Clone URL, e.g. ``"https://github.com/acme/skills.git"``.
-    :param ref: Branch or tag to fetch, or ``None`` for the default branch.
+    :param ref: Branch or tag to fetch; ``"HEAD"`` (git's name for the
+        remote's default branch) when none was chosen, so the identity is unique.
     :param name: Label shown in the UI.
     :param created_by: User who added the source, or ``None`` in single-user mode.
     :param created_at: Unix epoch seconds at row creation.
@@ -1723,10 +1724,11 @@ class SqlSkillSource(OmnigentBase):
 
     __tablename__ = "skill_sources"
     __table_args__ = (
-        # Keyset pagination over (created_at, id), and the add-source dedup
-        # lookup by (url, ref); both end in the primary key.
+        # Keyset pagination over (created_at, id); ends in the primary key.
         Index("ix_skill_sources_order", "workspace_id", "created_at", "id"),
-        Index("ix_skill_sources_identity", "workspace_id", "url", "ref", "id"),
+        # One row per repository and ref: replicas seeding the same source at
+        # startup collide here instead of leaving a duplicate.
+        Index("ux_skill_sources_identity", "workspace_id", "url", "ref", unique=True),
     )
 
     workspace_id: Mapped[int] = mapped_column(
@@ -1736,7 +1738,7 @@ class SqlSkillSource(OmnigentBase):
     )
     id: Mapped[str] = mapped_column(Uuid16, primary_key=True)
     url: Mapped[str] = mapped_column(String(255), nullable=False)
-    ref: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    ref: Mapped[str] = mapped_column(String(255), nullable=False)
     name: Mapped[str] = mapped_column(String(256), nullable=False)
     created_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -1777,10 +1779,14 @@ class SqlInstalledSkill(OmnigentBase):
     :param scope: ``"user"`` (one user's install) or ``"org"`` (everyone).
         Stored as a stable int code (see omnigent.db.enum_codecs
         INSTALLED_SKILL_SCOPE); the store converts at the row↔entity boundary.
-    :param owner_user_id: The installing user for a user-scoped row; ``""`` for
-        an org-scoped row (and for the single local user), never NULL, so the
-        identity index is unique on every engine.
+    :param principal: Who the row belongs to, never absent: ``"org"`` for an
+        org-scoped row, ``"local"`` for the single local user's own, or
+        ``"user:<owner_user_id>"``. Partitions every read and makes the identity
+        unique on every engine; ``owner_user_id`` stays the plain, nullable id.
+    :param owner_user_id: The installing user for a user-scoped row, else ``None``.
     :param bundle_location: Artifact-store key of the skill tarball.
+    :param bundle_bytes: Size of that tarball, so a principal's delivery budget
+        is a bounded sum rather than a read of every artifact.
     :param enabled: Whether sessions receive the skill.
     :param installed_by: User who installed it, or ``None`` in single-user mode.
     :param installed_at: Unix epoch seconds at row creation.
@@ -1789,21 +1795,14 @@ class SqlInstalledSkill(OmnigentBase):
 
     __tablename__ = "installed_skills"
     __table_args__ = (
-        # One row per (owner, name, scope): concurrent installs collide here
+        # One row per (principal, name): concurrent installs collide here
         # instead of leaving a duplicate; its prefix also serves the lookups by name.
+        Index("ux_installed_skills_identity", "workspace_id", "principal", "name", unique=True),
+        # Principal-scoped keyset pagination over (installed_at, id); ends in the primary key.
         Index(
-            "ux_installed_skills_identity",
+            "ix_installed_skills_principal_order",
             "workspace_id",
-            "owner_user_id",
-            "name",
-            "scope",
-            unique=True,
-        ),
-        # Owner-scoped keyset pagination over (installed_at, id); ends in the primary key.
-        Index(
-            "ix_installed_skills_owner_order",
-            "workspace_id",
-            "owner_user_id",
+            "principal",
             "installed_at",
             "id",
         ),
@@ -1824,8 +1823,10 @@ class SqlInstalledSkill(OmnigentBase):
     commit: Mapped[str | None] = mapped_column(String(64), nullable=True)
     path: Mapped[str] = mapped_column(String(1024), nullable=False)
     scope: Mapped[int] = mapped_column(SmallInteger, nullable=False)
-    owner_user_id: Mapped[str] = mapped_column(String(128), nullable=False)
+    principal: Mapped[str] = mapped_column(String(133), nullable=False)
+    owner_user_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     bundle_location: Mapped[str] = mapped_column(String(512), nullable=False)
+    bundle_bytes: Mapped[int] = mapped_column(Integer, nullable=False)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False)
     installed_by: Mapped[str | None] = mapped_column(String(128), nullable=True)
     installed_at: Mapped[int] = mapped_column(Integer, nullable=False)
@@ -1839,9 +1840,38 @@ class SqlInstalledSkill(OmnigentBase):
         "ref",
         "commit",
         "path",
+        "principal",
         "owner_user_id",
         "bundle_location",
         "installed_by",
     )
+    def _within_declared_length(self, key: str, value: str | None) -> str | None:
+        return _within_declared_length(self, key, value)
+
+
+class SqlSkillPrincipal(OmnigentBase):
+    """
+    SQLAlchemy model for the ``skill_principals`` table.
+
+    One row per principal that has installed skills (see
+    :class:`SqlInstalledSkill`). The store locks this row for the length of
+    an install, so a principal's quota is checked and its rows written under
+    one lock on every engine, including a principal with no rows yet.
+
+    :param principal: ``"org"``, ``"local"`` or ``"user:<owner_user_id>"``.
+    :param created_at: Unix epoch seconds at row creation.
+    """
+
+    __tablename__ = "skill_principals"
+
+    workspace_id: Mapped[int] = mapped_column(
+        BigInteger,
+        primary_key=True,
+        default=current_workspace_id,
+    )
+    principal: Mapped[str] = mapped_column(String(133), primary_key=True)
+    created_at: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    @validates("principal")
     def _within_declared_length(self, key: str, value: str | None) -> str | None:
         return _within_declared_length(self, key, value)
