@@ -13,7 +13,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock
+from unittest.mock import Mock, call
 
 import pytest
 
@@ -242,6 +242,9 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
         )
         instance = terminals.get("osc-test", "claude", "main")
         assert instance is not None and instance.program_status is not None
+        poller = registry._status_pollers["osc-test"]
+        raw_status = Mock(wraps=poller._on_status)
+        monkeypatch.setattr(poller, "_on_status", raw_status)
         async with asyncio.timeout(5):
             while instance.program_status.child_pid is None:
                 await asyncio.sleep(0.02)
@@ -252,6 +255,7 @@ async def test_claude_osc_error_without_a_hook_fails_the_turn_once(
         await _wait_for_status_edge(statuses, ("failed", None), timeout=15)
         await asyncio.sleep(0.5)
         assert statuses.count(("failed", None)) == 1
+        assert raw_status.call_args_list.count(call("failed", None)) == 1
     finally:
         await terminals.shutdown()
 
@@ -277,6 +281,9 @@ async def test_claude_osc_error_is_not_failed_again_once_the_hook_lands(
         )
         instance = terminals.get("osc-test", "claude", "main")
         assert instance is not None and instance.program_status is not None
+        poller = registry._status_pollers["osc-test"]
+        raw_status = Mock(wraps=poller._on_status)
+        monkeypatch.setattr(poller, "_on_status", raw_status)
         async with asyncio.timeout(5):
             while instance.program_status.child_pid is None:
                 await asyncio.sleep(0.02)
@@ -293,6 +300,7 @@ async def test_claude_osc_error_is_not_failed_again_once_the_hook_lands(
         await asyncio.sleep(6.0)  # Past the production grace period.
         assert statuses[-1] == ("running", None)
         assert ("failed", None) not in statuses
+        assert call("failed", None) not in raw_status.call_args_list
     finally:
         await terminals.shutdown()
 
