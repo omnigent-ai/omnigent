@@ -337,7 +337,7 @@ def test_reinstall_replaces_in_place_and_reports_the_old_tarball(
 def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
     row = _install(store, "review")
 
-    updated = store.update(
+    result = store.update(
         row.id,
         commit="c" * 40,
         bundle_location="skills/review-2.tar.gz",
@@ -346,7 +346,8 @@ def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
         display_name="Review",
         path="skills/moved/review",
     )
-    assert updated is not None
+    assert result is not None
+    updated = result.skill
     assert (
         updated.commit,
         updated.bundle_location,
@@ -354,6 +355,18 @@ def test_update_toggle_and_delete(store: SqlAlchemySkillStore) -> None:
         updated.display_name,
         updated.path,
     ) == ("c" * 40, "skills/review-2.tar.gz", 42, "Review", "skills/moved/review")
+    # The tarball to drop is the one the row held under the lock; the same
+    # location again replaces nothing.
+    assert result.replaced_location == "skills/review.tar.gz"
+    same = store.update(
+        row.id,
+        commit="c" * 40,
+        bundle_location="skills/review-2.tar.gz",
+        bundle_bytes=42,
+        description="d2",
+        display_name="Review",
+    )
+    assert same is not None and same.replaced_location is None
 
     disabled = store.set_enabled(row.id, False)
     assert disabled is not None and disabled.enabled is False
@@ -388,9 +401,12 @@ def test_list_pages_continue_without_omissions_or_duplicates(store: SqlAlchemySk
         pages += 1
         seen.extend(s.name for s in page.data)
         assert len(page.data) <= 3
+        assert (page.last_id is None) == (not page.data)
         if not page.has_more:
-            assert page.last_id == (page.data[-1].id if page.data else None)
             break
+        # The cursor row is removed before the next page is read: the walk
+        # carries on from its position instead of failing or stopping short.
+        store.delete(page.data[-1].id)
         after = page.last_id
     assert pages == 3
     assert sorted(seen) == [f"s{i:02d}" for i in range(7)] and len(seen) == len(set(seen))
@@ -400,12 +416,16 @@ def test_list_pages_continue_without_omissions_or_duplicates(store: SqlAlchemySk
             url=f"https://github.com/acme/r{i}.git", ref=None, name=f"r{i}", created_by=None
         )
     first = store.list_sources(limit=3)
+    assert store.delete_source(first.data[-1].id)
     rest = store.list_sources(limit=3, after=first.last_id)
     assert first.has_more and not rest.has_more
     assert len(first.data) + len(rest.data) == 4
     assert len({s.id for s in first.data + rest.data}) == 4
-    with pytest.raises(SkillValueError, match="unknown cursor"):
-        store.list_sources(after="0" * 32)
+    for bad in ("0" * 32, "1.zz", "x", "-1." + "0" * 32):
+        with pytest.raises(SkillValueError, match="invalid cursor"):
+            store.list_sources(after=bad)
+        with pytest.raises(SkillValueError, match="invalid cursor"):
+            store.list_for_user("alice", after=bad)
 
 
 def test_page_size_is_clamped(store: SqlAlchemySkillStore) -> None:

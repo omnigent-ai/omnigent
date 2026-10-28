@@ -39,6 +39,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.host_store import HostStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
+from tests._helpers.skill_repos import skill_tarball
 from tests.budgets import budget
 from tests.server.helpers import build_agent_bundle
 
@@ -433,16 +434,19 @@ async def test_managed_host_bundle_token_is_bound_to_session_host(
 
 
 def _install_personal_skill(
-    db_uri: str, tmp_path: Path, owner: str, name: str, *, description: str | None = None
+    db_uri: str,
+    tmp_path: Path,
+    owner: str | None,
+    name: str,
+    *,
+    description: str | None = None,
+    scope: str = "user",
 ) -> None:
-    """A user-scoped install for *owner* with a stored tarball the bundle route can read."""
-    out = io.BytesIO()
-    with tarfile.open(fileobj=out, mode="w:gz") as tf:
-        data = f"---\nname: {name}\ndescription: {name}\n---\n".encode()
-        info = tarfile.TarInfo("SKILL.md")
-        info.size = len(data)
-        tf.addfile(info, io.BytesIO(data))
-    LocalArtifactStore(str(tmp_path / "artifacts")).put(f"skills/{name}.tar.gz", out.getvalue())
+    """An install for *owner* (``None``: the local user, or everyone with ``scope="org"``)."""
+    LocalArtifactStore(str(tmp_path / "artifacts")).put(
+        f"skills/{name}.tar.gz",
+        skill_tarball({"SKILL.md": f"---\nname: {name}\ndescription: {name}\n---\n".encode()}),
+    )
     SqlAlchemySkillStore(db_uri).install(
         name=name,
         display_name=None,
@@ -451,7 +455,7 @@ def _install_personal_skill(
         ref=None,
         commit=None,
         path=f"skills/{name}",
-        scope="user",
+        scope=scope,  # type: ignore[arg-type]
         owner_user_id=owner,
         bundle_location=f"skills/{name}.tar.gz",
         bundle_bytes=1,
@@ -486,13 +490,10 @@ def _child_session(skills_app, db_uri: str, tmp_path: Path):  # type: ignore[no-
         sub_agent_name="child",
     )
     permissions = SqlAlchemyPermissionStore(db_uri)
-    # Far more readers than one grant page, all sorting before the owner, so
-    # a lookup that walked the first page by user id would miss the owner.
-    for index in range(1_001):
-        permissions.ensure_user(f"a{index:04d}")
-        permissions.grant(f"a{index:04d}", conv.id, LEVEL_READ)
-    permissions.grant("owner", conv.id, LEVEL_OWNER)
+    # The reader is granted first; the owner lookup ranks by level, not order
+    # (the store's own tests cover that ranking at scale).
     permissions.grant("reader", conv.id, LEVEL_READ)
+    permissions.grant("owner", conv.id, LEVEL_OWNER)
     permissions.grant("editor", conv.id, LEVEL_EDIT)
     return agent, conv
 
@@ -553,8 +554,18 @@ async def test_bundle_download_carries_personal_skills_only_for_the_runner_and_t
     # the bundle gets the agent's own files only. The session runs a child, so
     # the skills land where the runner reads that child's spec from.
     app, _, _, _, _, hosts = skills_app
-    _agent, conv = _child_session(skills_app, db_uri, tmp_path)
+    agent, conv = _child_session(skills_app, db_uri, tmp_path)
     _install_personal_skill(db_uri, tmp_path, "owner", "owners-skill")
+    _install_personal_skill(db_uri, tmp_path, None, "shared-skill", scope="org")
+    _install_personal_skill(db_uri, tmp_path, None, "local-skill")
+    # A session nobody owns (shared with an editor only) on the same child agent.
+    unowned = SqlAlchemyConversationStore(db_uri).create_conversation(
+        agent_id=agent.id,
+        host_id=conv.host_id,
+        workspace="/actual/workspace",
+        sub_agent_name="child",
+    )
+    SqlAlchemyPermissionStore(db_uri).grant("editor", unowned.id, LEVEL_EDIT)
     hosts.register_managed_host(
         host_id=conv.host_id,
         name="sandbox",
@@ -582,9 +593,25 @@ async def test_bundle_download_carries_personal_skills_only_for_the_runner_and_t
             assert response.status_code == 200, (headers, response.text)
             delivered = names(response.content)
             assert ("agents/child/skills/owners-skill/SKILL.md" in delivered) is expected, headers
+            assert ("agents/child/skills/shared-skill/SKILL.md" in delivered) is expected, headers
             assert "skills/owners-skill/SKILL.md" not in delivered
+            # The local user's own install is nobody's on a multi-user server.
+            assert "agents/child/skills/local-skill/SKILL.md" not in delivered
             if expected:
                 # The child the runner loads from this bundle discovers the skill itself.
                 loaded = load(response.content, dest=tmp_path / "extract" / str(len(headers)))
                 child = next(s for s in loaded.sub_agents if s.name == "child")
                 assert "owners-skill" in {skill.name for skill in child.skills}
+        # With no owner to resolve, even the runner's fetch carries no installs:
+        # neither the local user's nor everyone's, rather than guessing an owner.
+        response = await client.get(
+            f"/v1/sessions/{unowned.id}/agent/contents",
+            headers={MANAGED_HOST_TOKEN_HEADER: "valid"},
+        )
+        assert response.status_code == 200, response.text
+        delivered = names(response.content)
+        assert "agents/child/skills/kid/SKILL.md" in delivered  # the bundle's own
+        assert not any(
+            f"agents/child/skills/{name}/SKILL.md" in delivered
+            for name in ("owners-skill", "shared-skill", "local-skill")
+        )

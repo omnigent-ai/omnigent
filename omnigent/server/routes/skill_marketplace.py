@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import io
 import logging
+import tarfile
 from typing import Literal
 
 from fastapi import APIRouter, Depends, Query, Request, Response
@@ -62,7 +64,7 @@ class SkillSourceObject(BaseModel):
 
 
 class SkillSourceList(BaseModel):
-    """One page; pass ``last_id`` as ``after`` for the next."""
+    """One page; pass ``last_id``, an opaque cursor, as ``after`` for the next."""
 
     data: list[SkillSourceObject]
     has_more: bool = False
@@ -125,7 +127,7 @@ class InstalledSkillObject(BaseModel):
 
 
 class InstalledSkillList(BaseModel):
-    """One page; pass ``last_id`` as ``after`` for the next."""
+    """One page; pass ``last_id``, an opaque cursor, as ``after`` for the next."""
 
     data: list[InstalledSkillObject]
     has_more: bool = False
@@ -528,8 +530,22 @@ def create_skill_marketplace_router(
         """The stored ``SKILL.md`` of an installed skill."""
         user_id = require_user(request, auth_provider)
         skill = await _load(skill_id, user_id)
-        tarball = await asyncio.to_thread(artifact_store.get, skill.bundle_location)
-        return InstalledSkillContentResponse(markdown=_read_skill_markdown(tarball))
+        try:
+            tarball = await asyncio.to_thread(artifact_store.get, skill.bundle_location)
+        except KeyError:
+            # Removed, or its object dropped, since the row was read.
+            raise OmnigentError(
+                "The stored copy of this skill is gone; update or remove it.",
+                code=ErrorCode.NOT_FOUND,
+            ) from None
+        try:
+            markdown = _read_skill_markdown(tarball)
+        except (tarfile.TarError, OSError, ValueError):
+            raise OmnigentError(
+                "The stored copy of this skill cannot be read; update or remove it.",
+                code=ErrorCode.CONFLICT,
+            ) from None
+        return InstalledSkillContentResponse(markdown=markdown)
 
     @router.post("/installed-skills/{skill_id}/update", dependencies=mutating[:1])
     async def update_installed_skill(request: Request, skill_id: str) -> InstalledSkillObject:
@@ -565,10 +581,14 @@ def create_skill_marketplace_router(
                 _drop_artifact(artifact_store, location)
             raise _invalid(exc) from None
         if updated is None:
+            # Removed while the fetch ran: the object just stored belongs to no row.
+            _drop_artifact(artifact_store, location)
             raise OmnigentError("Installed skill not found", code=ErrorCode.NOT_FOUND)
-        if location != skill.bundle_location:
-            _drop_artifact(artifact_store, skill.bundle_location)
-        return _skill_object(updated)
+        # Drop what the row pointed at under the lock, not what this request read
+        # before fetching: a concurrent update may have moved it since.
+        if updated.replaced_location is not None:
+            _drop_artifact(artifact_store, updated.replaced_location)
+        return _skill_object(updated.skill)
 
     @router.patch("/installed-skills/{skill_id}", dependencies=mutating)
     async def patch_installed_skill(
@@ -622,9 +642,7 @@ def _drop_artifact(artifact_store: ArtifactStore, location: str) -> None:
 
 
 def _read_skill_markdown(tarball: bytes) -> str:
-    import io
-    import tarfile
-
+    """The archive's ``SKILL.md``, or ``""``; raises like :mod:`tarfile` on a bad archive."""
     with tarfile.open(fileobj=io.BytesIO(tarball), mode="r:*") as tf:
         for member in tf:
             if member.isfile() and member.name.lstrip("./") == "SKILL.md":

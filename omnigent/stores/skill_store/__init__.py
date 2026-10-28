@@ -63,7 +63,9 @@ class SkillPage(Generic[T]):
 
     :param data: The rows, in a stable order.
     :param has_more: Whether a page follows.
-    :param last_id: Cursor for the next page (``after=``), or ``None``.
+    :param last_id: Opaque cursor for the next page (``after=``), or ``None``
+        when the page is empty. It carries the last row's ordering values,
+        so a row deleted between two pages cannot stall or truncate the walk.
     """
 
     data: list[T]
@@ -219,8 +221,11 @@ class SkillStore(ABC):
         display_name: str | None,
         path: str | None = None,
         max_bytes: int | None = None,
-    ) -> InstalledSkill | None:
+    ) -> InstallResult | None:
         """Replace the stored package after a refetch; ``None`` when absent.
+
+        The result names the tarball the row pointed at under the lock, so a
+        caller drops what this write replaced and not what it read earlier.
 
         :raises SkillQuotaError: When the new size would exceed the principal's budget.
         """

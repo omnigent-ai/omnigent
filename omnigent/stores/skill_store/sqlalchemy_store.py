@@ -12,6 +12,7 @@ and writes everything in that one transaction.
 from __future__ import annotations
 
 import contextlib
+import re
 import uuid
 from collections.abc import Collection, Iterable, Sequence
 
@@ -62,6 +63,24 @@ LOCAL_PRINCIPAL = "local"
 DEFAULT_REF = "HEAD"
 # Names per IN-list, under every supported engine's parameter limit.
 _NAMES_PER_QUERY = 100
+# A page cursor: the last row's ordering epoch and its id, so the next page
+# needs no lookup of a row that may since have been deleted.
+_CURSOR = re.compile(r"^(\d{1,19})\.([0-9a-f]{32})$")
+
+
+def _encode_cursor(sort_value: int, row_id: str) -> str:
+    return f"{sort_value}.{row_id}"
+
+
+def _decode_cursor(after: str) -> tuple[int, str]:
+    """``(sort_value, row_id)`` from a cursor this store produced.
+
+    :raises SkillValueError: When *after* is not one of ours.
+    """
+    match = _CURSOR.match(after)
+    if match is None:
+        raise SkillValueError("invalid cursor")
+    return int(match.group(1)), match.group(2)
 
 
 def principal_for(scope: SkillScope, owner_user_id: str | None) -> str:
@@ -191,24 +210,21 @@ class SqlAlchemySkillStore(SkillStore):
                 .limit(limit + 1)
             )
             if after is not None:
-                cursor = session.get(SqlSkillSource, (current_workspace_id(), after))
-                if cursor is None:
-                    raise SkillValueError("unknown cursor")
+                created_at, row_id = _decode_cursor(after)
                 # Compared column by column so each bind takes the column's type
                 # (the id is 16 raw bytes, not its hex spelling).
                 stmt = stmt.where(
                     or_(
-                        SqlSkillSource.created_at > cursor.created_at,
-                        and_(
-                            SqlSkillSource.created_at == cursor.created_at,
-                            SqlSkillSource.id > cursor.id,
-                        ),
+                        SqlSkillSource.created_at > created_at,
+                        and_(SqlSkillSource.created_at == created_at, SqlSkillSource.id > row_id),
                     )
                 )
             rows = session.scalars(stmt).all()
-            page = [_source_entity(row) for row in rows[:limit]]
+            page = rows[:limit]
             return SkillPage(
-                data=page, has_more=len(rows) > limit, last_id=page[-1].id if page else None
+                data=[_source_entity(row) for row in page],
+                has_more=len(rows) > limit,
+                last_id=_encode_cursor(page[-1].created_at, page[-1].id) if page else None,
             )
 
     def get_source(self, source_id: str) -> SkillSource | None:
@@ -402,12 +418,8 @@ class SqlAlchemySkillStore(SkillStore):
         are at most ``2 * (limit + 1)``.
         """
         limit = max(1, min(limit, MAX_PAGE))
+        cursor = None if after is None else _decode_cursor(after)
         with self._session("list_installed_skills") as session:
-            cursor = None
-            if after is not None:
-                cursor = session.get(SqlInstalledSkill, (current_workspace_id(), after))
-                if cursor is None:
-                    raise SkillValueError("unknown cursor")
             rows: list[SqlInstalledSkill] = []
             for principal in _visible_principals(user_id):
                 stmt = (
@@ -420,20 +432,23 @@ class SqlAlchemySkillStore(SkillStore):
                     .limit(limit + 1)
                 )
                 if cursor is not None:
+                    installed_at, row_id = cursor
                     stmt = stmt.where(
                         or_(
-                            SqlInstalledSkill.installed_at > cursor.installed_at,
+                            SqlInstalledSkill.installed_at > installed_at,
                             and_(
-                                SqlInstalledSkill.installed_at == cursor.installed_at,
-                                SqlInstalledSkill.id > cursor.id,
+                                SqlInstalledSkill.installed_at == installed_at,
+                                SqlInstalledSkill.id > row_id,
                             ),
                         )
                     )
                 rows.extend(session.scalars(stmt).all())
             rows.sort(key=lambda row: (row.installed_at, row.id))
-            page = [_skill_entity(row) for row in rows[:limit]]
+            page = rows[:limit]
             return SkillPage(
-                data=page, has_more=len(rows) > limit, last_id=page[-1].id if page else None
+                data=[_skill_entity(row) for row in page],
+                has_more=len(rows) > limit,
+                last_id=_encode_cursor(page[-1].installed_at, page[-1].id) if page else None,
             )
 
     def find_for_user(self, user_id: str | None, names: Collection[str]) -> list[InstalledSkill]:
@@ -468,18 +483,19 @@ class SqlAlchemySkillStore(SkillStore):
         display_name: str | None,
         path: str | None = None,
         max_bytes: int | None = None,
-    ) -> InstalledSkill | None:
+    ) -> InstallResult | None:
         max_bytes = MAX_DELIVERY_BYTES_PER_SCOPE if max_bytes is None else max_bytes
         check_bound("display_name", display_name, MAX_DISPLAY_NAME_CHARS)
         check_bound("description", description, MAX_DESCRIPTION_CHARS)
         check_bound("bundle_location", bundle_location, MAX_LOCATION_CHARS)
         check_bound("path", path, MAX_PATH_CHARS)
 
-        def write(session: Session) -> InstalledSkill | None:
+        def write(session: Session) -> InstallResult | None:
             locked = self._locked_skill(session, skill_id)
             if locked is None:
                 return None
             lock, row = locked
+            replaced = row.bundle_location if row.bundle_location != bundle_location else None
             if row.enabled:
                 after = lock.enabled_bytes - row.bundle_bytes + bundle_bytes
                 if after > max_bytes:
@@ -497,7 +513,7 @@ class SqlAlchemySkillStore(SkillStore):
                 row.path = path
             row.updated_at = now_epoch()
             session.flush()
-            return _skill_entity(row)
+            return InstallResult(skill=_skill_entity(row), replaced_location=replaced)
 
         return run_write_transaction(self._session_immediate, "update_installed_skill", write)
 

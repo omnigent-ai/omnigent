@@ -3722,7 +3722,7 @@
         "type": "object"
       },
       "InstalledSkillList": {
-        "description": "One page; pass `last_id` as `after` for the next.",
+        "description": "One page; pass `last_id`, an opaque cursor, as `after` for the next.",
         "properties": {
           "data": {
             "items": {
@@ -10195,7 +10195,7 @@
         "type": "object"
       },
       "SkillSourceList": {
-        "description": "One page; pass `last_id` as `after` for the next.",
+        "description": "One page; pass `last_id`, an opaque cursor, as `after` for the next.",
         "properties": {
           "data": {
             "items": {

@@ -165,7 +165,7 @@ Under `/v1`, mounted only when the feature is on:
 | `GET/POST/DELETE /skill-sources` | Browsable repositories, paged (POST and DELETE are admin-only) |
 | `GET /skill-sources/{id}/catalog` | The skills a source offers; `?refresh=true` re-fetches |
 | `POST /skill-catalog` | Index any GitHub repository (the Add-from-URL path; a listed source only when `allow_url_install` is off) |
-| `GET/POST /installed-skills` | List (paged with `limit` and `after`), and install by name from a repository |
+| `GET/POST /installed-skills` | List (paged: `limit`, and `after` set to the previous page's `last_id`, an opaque cursor that survives the row's removal), and install by name from a repository |
 | `PATCH/DELETE /installed-skills/{id}` | Enable or disable, and remove |
 | `POST /installed-skills/{id}/update` | Refetch at the same ref |
 | `GET /installed-skills/{id}/content` | The stored `SKILL.md` |

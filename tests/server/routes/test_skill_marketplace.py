@@ -28,7 +28,7 @@ from omnigent.stores.conversation_store.sqlalchemy_store import SqlAlchemyConver
 from omnigent.stores.file_store.sqlalchemy_store import SqlAlchemyFileStore
 from omnigent.stores.permission_store.sqlalchemy_store import SqlAlchemyPermissionStore
 from omnigent.stores.skill_store.sqlalchemy_store import SqlAlchemySkillStore
-from tests._helpers.skill_repos import copying_cloner, write_skill
+from tests._helpers.skill_repos import copying_cloner, skill_tarball, write_skill
 
 ALICE = {"X-Forwarded-Email": "alice@example.com"}
 BOB = {"X-Forwarded-Email": "bob@example.com"}
@@ -198,8 +198,91 @@ async def test_lists_paginate_with_a_continuation_cursor(market) -> None:
     second = (await client.get(f"/v1/installed-skills?limit=1&after={first['last_id']}")).json()
     assert len(second["data"]) == 1 and second["has_more"] is False
     assert {first["data"][0]["name"], second["data"][0]["name"]} == {"review", "triage"}
+    # The cursor row removed between the two reads: the next page still follows.
+    assert (
+        await client.delete(f"/v1/installed-skills/{first['data'][0]['id']}")
+    ).status_code == 204
+    again = (await client.get(f"/v1/installed-skills?limit=1&after={first['last_id']}")).json()
+    assert [s["name"] for s in again["data"]] == [second["data"][0]["name"]]
     assert (await client.get("/v1/installed-skills?after=" + "0" * 32)).status_code == 400
     assert (await client.get("/v1/installed-skills?limit=0")).status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_update_cleans_up_after_a_removal_or_another_update_wins(market) -> None:
+    client, app, artifact_store = market
+    store = app.state.skill_store
+    installed = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["triage"]}
+    )
+    skill_id = installed.json()["data"][0]["id"]
+    first_location = await _location(app, skill_id)
+    real_update = store.update
+    stored: list[str] = []
+    real_put = artifact_store.put
+
+    def recording_put(key: str, data: bytes) -> None:
+        stored.append(key)
+        real_put(key, data)
+
+    artifact_store.put = recording_put  # type: ignore[method-assign]
+
+    # Another request moved the row's tarball while this update was fetching:
+    # the object replaced under the lock is dropped, not the one read earlier.
+    def update_after_a_rival(skill: str, **kwargs):  # type: ignore[no-untyped-def]
+        rival = real_update(
+            skill,
+            commit=None,
+            bundle_location="skills/rival.tar.gz",
+            bundle_bytes=1,
+            description="d",
+            display_name=None,
+        )
+        assert rival is not None and rival.replaced_location == first_location
+        artifact_store.put("skills/rival.tar.gz", b"rival")
+        return real_update(skill, **kwargs)
+
+    store.update = update_after_a_rival
+    (app.state.skill_fetcher_repo / "skills" / "triage" / "notes.txt").write_text("v2\n")
+    updated = await client.post(f"/v1/installed-skills/{skill_id}/update")
+    assert updated.status_code == 200, updated.text
+    final_location = await _location(app, skill_id)
+    assert final_location not in {first_location, "skills/rival.tar.gz"}
+    assert not artifact_store.exists("skills/rival.tar.gz") and artifact_store.exists(
+        final_location
+    )
+
+    # The row was removed while this update was fetching: 404, and the object
+    # the request had already stored is not left behind.
+    def update_after_a_removal(skill: str, **kwargs):  # type: ignore[no-untyped-def]
+        assert store.delete(skill) is not None
+        return real_update(skill, **kwargs)
+
+    store.update = update_after_a_removal
+    (app.state.skill_fetcher_repo / "skills" / "triage" / "notes.txt").write_text("v3\n")
+    stored.clear()
+    assert (await client.post(f"/v1/installed-skills/{skill_id}/update")).status_code == 404
+    assert len(stored) == 1 and not artifact_store.exists(stored[0])
+
+
+@pytest.mark.asyncio
+async def test_content_names_a_missing_or_unreadable_stored_copy(market) -> None:
+    client, app, artifact_store = market
+    installed = await client.post(
+        "/v1/installed-skills", json={"source": "acme/skills", "names": ["review"]}
+    )
+    skill_id = installed.json()["data"][0]["id"]
+    location = await _location(app, skill_id)
+
+    artifact_store.put(location, b"not a tarball")
+    unreadable = await client.get(f"/v1/installed-skills/{skill_id}/content")
+    assert unreadable.status_code == 409
+    assert "cannot be read" in unreadable.json()["error"]["message"]
+
+    artifact_store.delete(location)
+    missing = await client.get(f"/v1/installed-skills/{skill_id}/content")
+    assert missing.status_code == 404
+    assert "update or remove" in missing.json()["error"]["message"]
 
 
 @pytest.mark.asyncio
@@ -232,7 +315,9 @@ async def test_feature_off_hides_routes_discovery_and_delivery_for_existing_inst
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
     artifacts.put(
         "skills/review.tar.gz",
-        _tar({"SKILL.md": b"---\nname: review\n---\n", "notes.txt": b"supporting file\n"}),
+        skill_tarball(
+            {"SKILL.md": b"---\nname: review\n---\n", "notes.txt": b"supporting file\n"}
+        ),
     )
     store.install(
         name="review",
@@ -248,7 +333,7 @@ async def test_feature_off_hides_routes_discovery_and_delivery_for_existing_inst
         bundle_bytes=1,
         installed_by=None,
     )
-    bundle = _tar(
+    bundle = skill_tarball(
         {"config.yaml": b"name: bundled\n", "skills/own/SKILL.md": b"---\nname: own\n---\n"}
     )
     session_id = _bind_session(db_uri, artifacts, bundle)
@@ -418,7 +503,9 @@ async def test_installs_are_capped_per_owner_and_delivery_is_bounded(
 
     # Delivery keeps a backstop: exceeding it is an error the caller sees
     # rather than a skill silently missing from the bundle.
-    session_id = _bind_session(db_uri, artifact_store, _tar({"config.yaml": b"name: bundled\n"}))
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
     assert "skills/triage/SKILL.md" in _names(
         (await client.get(f"/v1/sessions/{session_id}/agent/contents")).content
     )
@@ -483,9 +570,30 @@ def test_effective_skills_read_every_page_and_stop_at_the_delivery_limit(
     assert sorted(s.name for s in effective_installed_skills(store, "alice")) == [
         f"s{i}" for i in range(5)
     ]
+    # The last row of page one is removed before page two is read, as a
+    # concurrent removal would: the walk still reaches every remaining row.
+    real_list = store.list_for_user
+    removed: list[str] = []
+
+    def list_then_remove_the_cursor_row(user_id, *, limit, after=None):  # type: ignore[no-untyped-def]
+        page = real_list(user_id, limit=limit, after=after)
+        if after is None:
+            removed.append(page.data[-1].name)
+            assert store.delete(page.data[-1].id) is not None
+        return page
+
+    store.list_for_user = list_then_remove_the_cursor_row  # type: ignore[method-assign]
+    delivered = sorted(s.name for s in effective_installed_skills(store, "alice"))
+    del store.list_for_user
+    assert len(removed) == 1 and delivered == [f"s{i}" for i in range(5)]
     # One row past the delivery limit raises instead of silently stopping.
     store.install_many(
-        [replace(items[0], name="s5", path="skills/s5", bundle_location="skills/s5.tar.gz")],
+        [
+            replace(
+                items[0], name=name, path=f"skills/{name}", bundle_location=f"skills/{name}.tar.gz"
+            )
+            for name in (removed[0], "s5")
+        ],
         scope="org",
         owner_user_id=None,
         installed_by=None,
@@ -497,16 +605,6 @@ def test_effective_skills_read_every_page_and_stop_at_the_delivery_limit(
 # ── bundle injection ──
 
 
-def _tar(files: dict[str, bytes]) -> bytes:
-    out = io.BytesIO()
-    with tarfile.open(fileobj=out, mode="w:gz") as tf:
-        for name, data in files.items():
-            info = tarfile.TarInfo(name)
-            info.size = len(data)
-            tf.addfile(info, io.BytesIO(data))
-    return out.getvalue()
-
-
 def _names(data: bytes) -> list[str]:
     with tarfile.open(fileobj=io.BytesIO(data), mode="r:gz") as tf:
         return sorted(tf.getnames())
@@ -515,11 +613,14 @@ def _names(data: bytes) -> list[str]:
 def test_served_bundle_carries_the_owners_enabled_skills(db_uri: str, tmp_path: Path) -> None:
     store = SqlAlchemySkillStore(db_uri)
     artifacts = LocalArtifactStore(str(tmp_path / "artifacts"))
-    bundle = _tar({"config.yaml": b"name: a\n", "skills/own/SKILL.md": b"---\nname: own\n---\n"})
+    bundle = skill_tarball(
+        {"config.yaml": b"name: a\n", "skills/own/SKILL.md": b"---\nname: own\n---\n"}
+    )
 
     def install(name: str, owner: str | None, scope: str = "user", enabled: bool = True) -> None:
         artifacts.put(
-            f"skills/{name}.tar.gz", _tar({"SKILL.md": f"---\nname: {name}\n---\n".encode()})
+            f"skills/{name}.tar.gz",
+            skill_tarball({"SKILL.md": f"---\nname: {name}\n---\n".encode()}),
         )
         row = store.install(
             name=name,
@@ -544,7 +645,7 @@ def test_served_bundle_carries_the_owners_enabled_skills(db_uri: str, tmp_path: 
     install("off", "alice", enabled=False)
     install("own", "alice")  # collides with the bundle's own skill; the bundle wins
     install("deep", "alice")  # collides with a namespaced bundle skill; the bundle wins too
-    bundle = _tar(
+    bundle = skill_tarball(
         {
             "config.yaml": b"name: a\n",
             "skills/own/SKILL.md": b"---\nname: own\n---\n",
@@ -619,7 +720,9 @@ async def test_server_policy_binds_sources_url_installs_and_delivery(
     }
     app, artifact_store = _build(db_uri, tmp_path, server_config=config)
     app.state.skill_fetcher = _fetcher(repo)
-    session_id = _bind_session(db_uri, artifact_store, _tar({"config.yaml": b"name: bundled\n"}))
+    session_id = _bind_session(
+        db_uri, artifact_store, skill_tarball({"config.yaml": b"name: bundled\n"})
+    )
     transport = httpx.ASGITransport(app=app)
     async with (
         app.router.lifespan_context(app),

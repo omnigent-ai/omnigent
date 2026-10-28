@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import io
 import shutil
+import tarfile
 from pathlib import Path
 
 
@@ -19,6 +21,17 @@ def write_skill(
     (skill / "SKILL.md").write_text(f"---\n{front}description: {description}\n---\nDo {name}.\n")
     (skill / "notes.txt").write_text("supporting file\n")
     return skill
+
+
+def skill_tarball(files: dict[str, bytes]) -> bytes:
+    """A gzipped tar of *files* (``{"SKILL.md": b"..."}``), as the artifact store holds a skill."""
+    out = io.BytesIO()
+    with tarfile.open(fileobj=out, mode="w:gz") as tf:
+        for name, data in files.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(data)
+            tf.addfile(info, io.BytesIO(data))
+    return out.getvalue()
 
 
 def copying_cloner(repo: Path):  # type: ignore[no-untyped-def]  # a Cloner

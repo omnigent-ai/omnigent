@@ -24,7 +24,7 @@ retain configuration, fault injection and behavioral assertions.
 | Provider resolution without the developer's config, overlay or ambient credentials | `isolate_provider_resolution` in [providers.py](providers.py) | [Host model options](../host/test_connect.py) |
 | Hermetic stdio ACP agent process | `FAKE_ACP_AGENT_SCRIPT`, `FAKE_ACP_AGENT_REPLY` in [acp_agent.py](acp_agent.py) | [Files tab survives an ACP reply](../e2e_ui/files/test_files_tab_survives_acp_reply.py) |
 | Codex home with rollouts, `history_base` lineage and thread store | `CodexRollout`, `write_codex_thread_store` in [codex_rollout.py](codex_rollout.py) | [Codex import history](../e2e/test_host_import_codex_history_e2e.py) |
-| Skill repository on disk and a cloner that copies it instead of running git | `write_skill`, `copying_cloner` in [skill_repos.py](skill_repos.py) | [Catalog layouts](../skills/conftest.py), [marketplace routes](../server/routes/test_skill_marketplace.py) |
+| Skill repository on disk, a cloner that copies it instead of running git, and a stored-skill tarball | `write_skill`, `copying_cloner`, `skill_tarball` in [skill_repos.py](skill_repos.py) | [Catalog layouts](../skills/conftest.py), [marketplace routes](../server/routes/test_skill_marketplace.py), [session skills](../server/routes/test_skills.py) |
 
 ## Session inputs stay explicit
 
