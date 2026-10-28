@@ -970,6 +970,276 @@ describe("NewChatLandingScreen project prefill", () => {
     expect(body.cost_control_mode_override).not.toBe("on");
   });
 
+  // ── Project default effort ── the stored `effort` seeds the composer's effort
+  // pick (→ create-body reasoning_effort) on the project's configured agent,
+  // validated against that harness's ladder like the model.
+  function openAgentConfig(agentId: string): void {
+    fireEvent.pointerDown(screen.getByTestId("new-chat-landing-agent-select"), { button: 0 });
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-select"));
+    fireEvent.click(screen.getByTestId(`new-chat-landing-agent-config-${agentId}`));
+  }
+
+  function closeAgentConfig(): void {
+    fireEvent.keyDown(screen.getByTestId("new-chat-landing-agent-models"), { key: "Escape" });
+  }
+
+  const CODEX_AGENT_ID = "ag_codex";
+  const ladder = (...efforts: string[]) => efforts.map((reasoningEffort) => ({ reasoningEffort }));
+
+  // Codex with a default model offering `defaultLadder` and a `gpt-mini` offering only low.
+  function setCodexAgentAndModels(defaultLadder: string[]): void {
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({
+          id: CODEX_AGENT_ID,
+          name: "codex-native-ui",
+          display_name: "Codex",
+          harness: "codex-native",
+        }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    vi.mocked(useHostModelOptions).mockReturnValue({
+      data: [
+        {
+          id: "gpt-5.5",
+          displayName: "GPT-5.5",
+          isDefault: true,
+          supportedReasoningEfforts: ladder(...defaultLadder),
+        },
+        { id: "gpt-mini", displayName: "GPT mini", supportedReasoningEfforts: ladder("low") },
+      ],
+    } as ReturnType<typeof useHostModelOptions>);
+  }
+
+  async function waitForCodexAgent(): Promise<void> {
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Codex/),
+    );
+  }
+
+  async function waitForClaudeAgent(): Promise<void> {
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(
+        /Claude Code/,
+      ),
+    );
+  }
+
+  it("seeds reasoning_effort from the project default, outranking the remembered effort", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderLanding();
+
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+  });
+
+  it("treats a project effort outside the harness ladder as no default", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "minimal" });
+    renderLanding();
+
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("low");
+  });
+
+  it("keeps a user's committed effort pick when the project config changes afterwards", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { rerender } = renderLanding();
+    await waitForClaudeAgent();
+
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-medium"));
+    closeAgentConfig();
+
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "max" });
+    rerender(<NewChatLandingScreen />);
+
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("medium");
+  });
+
+  it("lets a project effort without a model outrank remembered Smart Routing", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on", effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderRoutingLanding();
+
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.cost_control_mode_override).not.toBe("on");
+  });
+
+  it("keeps remembered Smart Routing off after an explicit effort pick over the project effort", async () => {
+    setClaudeAgentAndModels();
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "claude-native": { routing: "on", effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderRoutingLanding();
+    await waitForClaudeAgent();
+
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByTestId("new-chat-landing-agent-effort-medium"));
+    closeAgentConfig();
+
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("medium");
+    expect(body.cost_control_mode_override).not.toBe("on");
+  });
+
+  it("lets a project effort win over a landing draft that restored Smart Routing on", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+    const { unmount } = renderRoutingLanding();
+    await waitForClaudeAgent();
+    openAgentConfig(CLAUDE_AGENT_ID);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
+    closeAgentConfig();
+    unmount();
+
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderRoutingLanding();
+    await waitForClaudeAgent();
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBe("high");
+    expect(body.cost_control_mode_override).not.toBe("on");
+  });
+
+  it.each([
+    { pick: "Smart Routing", sent: { cost_control_mode_override: "on" } },
+    { pick: "Sonnet", sent: { model_override: "sonnet" } },
+  ])(
+    "keeps an explicit $pick pick when a project effort arrives afterwards",
+    async ({ pick, sent }) => {
+      setClaudeAgentAndModels();
+      setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID });
+      const { rerender } = renderRoutingLanding();
+      await waitForClaudeAgent();
+      openAgentConfig(CLAUDE_AGENT_ID);
+      fireEvent.click(screen.getByRole("menuitemcheckbox", { name: pick }));
+      closeAgentConfig();
+
+      setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+      rerender(<NewChatLandingScreen />);
+
+      const body = await submitAndReadBody();
+      expect(body).toMatchObject(sent);
+      expect(body.reasoning_effort).toBeUndefined();
+    },
+  );
+
+  it("leaves the project effort off when the user switches to another agent", async () => {
+    setClaudeAgentAndModels();
+    setProjectConfig({ host_id: "host_1", agent_id: CLAUDE_AGENT_ID, effort: "high" });
+    renderLanding();
+    await waitForClaudeAgent();
+    selectAgent("ag_hello");
+
+    const body = await submitAndReadBody();
+    expect(body.reasoning_effort).toBeUndefined();
+  });
+
+  it.each([
+    { label: "the catalog default", model: undefined, sentModel: undefined, sentEffort: "xhigh" },
+    { label: "a pinned model", model: "gpt-mini", sentModel: "gpt-mini", sentEffort: undefined },
+  ])(
+    "checks a Codex project effort against $label's ladder",
+    async ({ model, sentModel, sentEffort }) => {
+      setCodexAgentAndModels(["low", "medium", "high", "xhigh"]);
+      setProjectConfig({
+        host_id: "host_1",
+        agent_id: CODEX_AGENT_ID,
+        effort: "xhigh",
+        ...(model ? { model } : {}),
+      });
+      renderLanding();
+      await waitForCodexAgent();
+      const body = await submitAndReadBody();
+      expect(body.model_override).toBe(sentModel);
+      expect(body.reasoning_effort).toBe(sentEffort);
+    },
+  );
+
+  it.each([
+    { routing: "off", sentModel: "gpt-mini", sentEffort: "low" },
+    // Remembered routing drops the remembered model, so the default model's ladder applies.
+    { routing: "on", sentModel: undefined, sentEffort: "xhigh" },
+  ])(
+    "checks a modelless Codex project effort against the seeded model (remembered routing $routing)",
+    async ({ routing, sentModel, sentEffort }) => {
+      setCodexAgentAndModels(["low", "high", "xhigh"]);
+      localStorage.setItem(
+        HARNESS_OPTIONS_KEY,
+        JSON.stringify({ "codex-native": { routing, model: "gpt-mini", effort: "low" } }),
+      );
+      setProjectConfig({ host_id: "host_1", agent_id: CODEX_AGENT_ID, effort: "xhigh" });
+      renderRoutingLanding();
+      await waitForCodexAgent();
+      const body = await submitAndReadBody();
+      expect(body.cost_control_mode_override).not.toBe("on");
+      expect(body.model_override).toBe(sentModel);
+      expect(body.reasoning_effort).toBe(sentEffort);
+    },
+  );
+
+  it("turns off a Smart Routing draft when the remembered Codex model runs instead", async () => {
+    setCodexAgentAndModels(["low", "high", "xhigh"]);
+    setProjectConfig({ host_id: "host_1", agent_id: CODEX_AGENT_ID });
+    const { unmount } = renderRoutingLanding();
+    await waitForCodexAgent();
+    openAgentConfig(CODEX_AGENT_ID);
+    fireEvent.click(screen.getByRole("menuitemcheckbox", { name: "Smart Routing" }));
+    closeAgentConfig();
+    unmount();
+
+    // A later pick elsewhere remembered a model with routing off; the parked draft still says on.
+    // That model can't run the project effort, so the seed pins the model, not the effort.
+    localStorage.setItem(
+      HARNESS_OPTIONS_KEY,
+      JSON.stringify({ "codex-native": { routing: "off", model: "gpt-mini", effort: "low" } }),
+    );
+    setProjectConfig({ host_id: "host_1", agent_id: CODEX_AGENT_ID, effort: "xhigh" });
+    renderRoutingLanding();
+    await waitForCodexAgent();
+    const body = await submitAndReadBody();
+    expect(body.cost_control_mode_override).not.toBe("on");
+    expect(body.model_override).toBe("gpt-mini");
+    expect(body.reasoning_effort).toBe("low");
+  });
+
+  it("seeds a Pi-only project effort for a Pi agent", async () => {
+    vi.mocked(useAvailableAgents).mockReturnValue({
+      data: [
+        agent(),
+        agent({ id: "ag_pi", name: "pi-native-ui", display_name: "Pi", harness: "pi-native" }),
+      ],
+    } as ReturnType<typeof useAvailableAgents>);
+    setProjectConfig({ host_id: "host_1", agent_id: "ag_pi", effort: "minimal" });
+    renderLanding();
+    await waitFor(() =>
+      expect(screen.getByTestId("new-chat-landing-agent-select")).toHaveAccessibleName(/Pi/),
+    );
+    expect((await submitAndReadBody()).reasoning_effort).toBe("minimal");
+  });
+
   it("still seeds the recent workspace when the worktree probe errors", async () => {
     // A non-400 failure from /worktrees leaves the hook's data undefined for
     // good. The seed must fall back to the candidate as-is (treat the probe

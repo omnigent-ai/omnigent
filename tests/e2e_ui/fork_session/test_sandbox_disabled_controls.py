@@ -1,5 +1,6 @@
 """Unsupported sandbox actions stay discoverable without reaching write APIs.
 
+An Arclet source instead forks onto a new Arclet when the server offers one.
 The local server and transcript are real; only the managed source metadata is
 patched because the isolated test environment has no Databricks sandbox providers.
 """
@@ -9,6 +10,7 @@ from __future__ import annotations
 import json
 import re
 from pathlib import Path
+from typing import Any
 
 import pytest
 from playwright.sync_api import Locator, Page, Route, expect
@@ -17,6 +19,7 @@ from tests.e2e_ui.conftest import fetch_with_retry
 
 _FORK_REASON = "Forking this sandbox session is not supported yet."
 _SWITCH_REASON = "Switching hosts is not supported for this sandbox session yet."
+_ASSISTANT = '[data-testid="message-bubble"][data-role="assistant"]'
 
 
 def _patch_sandbox(page: Page, session_id: str, provider: str) -> None:
@@ -104,6 +107,7 @@ def _close_menu(page: Page) -> None:
     expect(page.get_by_role("menu")).to_have_count(0)
 
 
+# This server offers no Arclet sandbox, so an Arclet source has nothing to fork onto.
 @pytest.mark.parametrize(
     "sandbox_provider", ["arclet", "lakebox"], ids=["arclet", "databricks-sandbox"]
 )
@@ -183,3 +187,85 @@ def test_sandbox_fork_and_switch_host_disabled(
     _disabled_menu_action(page, switch_host, _SWITCH_REASON)
     page.screenshot(path=str(tmp_path / f"{sandbox_provider}-switch-host-tooltip.png"))
     assert writes == []
+
+
+def _offer_arclet_sandboxes(page: Page) -> None:
+    def info(route: Route) -> None:
+        response = fetch_with_retry(route)
+        body = response.json()
+        body["managed_sandboxes_enabled"] = True
+        body["sandbox_provider"] = "arclet"
+        body["sandbox_providers"] = ["arclet"]
+        route.fulfill(response=response, body=json.dumps(body))
+
+    page.route("**/v1/info", info)
+
+
+def test_arclet_session_forks_only_onto_a_new_arclet(
+    page: Page,
+    seeded_session: tuple[str, str],
+    mock_llm_server_url: str,
+    tmp_path: Path,
+) -> None:
+    """Fork entry points are enabled, and the header Fork offers only a fresh Arclet."""
+    del mock_llm_server_url
+    base_url, session_id = seeded_session
+    page.goto(f"{base_url}/c/{session_id}")
+    page.get_by_placeholder("Send a message…").fill("Reply with just OK.")
+    page.get_by_role("button", name="Send", exact=True).click()
+    assistant = page.locator(_ASSISTANT)
+    expect(assistant).to_have_count(1, timeout=60_000)
+
+    _patch_sandbox(page, session_id, "arclet")
+    _offer_arclet_sandboxes(page)
+    fork_bodies: list[dict[str, Any]] = []
+
+    def handle_fork(route: Route) -> None:
+        # No sandbox provider runs here, so forward an ordinary fork after recording it.
+        body = json.loads(route.request.post_data or "{}")
+        fork_bodies.append(body)
+        forwarded = {
+            key: value
+            for key, value in body.items()
+            if key not in {"host_type", "sandbox_provider", "workspace", "host_id"}
+        }
+        route.fulfill(response=route.fetch(post_data=json.dumps(forwarded)))
+
+    page.route(re.compile(r"/v1/sessions/[0-9a-f]{32}/fork$"), handle_fork)
+    page.reload()
+
+    row = page.locator(f'li[data-sidebar-session-id="{session_id}"]')
+    row.hover()
+    row.get_by_test_id("conversation-actions").click()
+    expect(page.get_by_test_id("fork-conversation")).to_be_enabled()
+    _close_menu(page)
+    assistant.hover()
+    expect(page.get_by_test_id("fork-from-response")).to_be_enabled()
+    page.get_by_test_id("composer-host-select").click()
+    _disabled_menu_action(page, page.get_by_role("menuitem", name="Switch host…"), _SWITCH_REASON)
+    _close_menu(page)
+
+    page.get_by_test_id("header-conversation-actions").click()
+    page.get_by_test_id("header-fork-conversation").click()
+    dialog = page.get_by_test_id("fork-session-dialog")
+    expect(dialog).to_be_visible()
+    expect(page.get_by_test_id("fork-session-sandbox-only-hint")).to_have_text(
+        "This session can only be cloned onto a new Arclet Sandbox."
+    )
+    host_select = page.get_by_test_id("fork-session-host-select")
+    expect(host_select).to_contain_text("Arclet Sandbox")
+    host_select.click()
+    expect(page.get_by_role("option")).to_have_count(1)
+    sandbox_row = page.get_by_test_id("fork-session-sandbox-option")
+    expect(sandbox_row).to_have_text("Arclet Sandbox")
+    page.screenshot(path=str(tmp_path / "arclet-fork-target.png"))
+    sandbox_row.click()
+    page.get_by_test_id("fork-session-submit").click()
+
+    expect(page).to_have_url(
+        re.compile(rf"/c/(?!{re.escape(session_id)})[0-9a-f]{{32}}"), timeout=30_000
+    )
+    expect(dialog).not_to_be_visible()
+    assert len(fork_bodies) == 1, fork_bodies
+    assert fork_bodies[0]["host_type"] == "managed", fork_bodies[0]
+    assert fork_bodies[0]["sandbox_provider"] == "arclet", fork_bodies[0]
