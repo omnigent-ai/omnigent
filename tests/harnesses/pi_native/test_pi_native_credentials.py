@@ -718,6 +718,35 @@ def test_inline_databricks_gateway_without_default_or_listing_uses_pi_login() ->
     assert creds.resolve_pi_native_provider(config_loader=lambda: config) is None
 
 
+def test_inline_databricks_gateway_without_default_preserves_named_tiers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A tier map without a default is a deliberate shortlist; it is not widened."""
+    listings: list[str] = []
+
+    def _listing(host: str, token: str):
+        listings.append(host)
+        return ([{"id": "system.ai.claude-opus-5"}], [{"id": "system.ai.gpt-5"}], [], [])
+
+    monkeypatch.setattr(creds, "_fetch_pi_model_lists", _listing)
+    config = {
+        "providers": {
+            "gateway": {
+                "kind": "gateway",
+                "default": "pi",
+                "openai": {
+                    "base_url": "https://wkspc.cloud.databricks.com/ai-gateway/codex/v1",
+                    "api_key": "gw-token",
+                    "models": {"fast": "system.ai.gpt-5-mini", "smart": "system.ai.gpt-5"},
+                },
+            }
+        }
+    }
+
+    assert creds.resolve_pi_native_provider(config_loader=lambda: config) is None
+    assert listings == []
+
+
 def test_run_auth_command_uses_the_shell() -> None:
     """An inline ``auth_command`` may use shell syntax; the listing token honors it."""
     assert creds._run_auth_command("printf 'tok' | tr a-z A-Z") == "TOK"
