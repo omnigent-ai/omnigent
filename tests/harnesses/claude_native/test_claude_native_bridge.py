@@ -12,6 +12,7 @@ import queue
 import select
 import shlex
 import socket
+import stat
 import subprocess
 import sys
 import tempfile
@@ -122,6 +123,11 @@ def _composer_pane(draft: str = "") -> str:
 def _load_invocation_settings(args: list[str]) -> dict[str, Any]:
     settings_path = Path(args[args.index("--settings") + 1])
     return json.loads(settings_path.read_text(encoding="utf-8"))
+
+
+def _load_mcp_config(args: list[str]) -> dict[str, Any]:
+    mcp_config_path = Path(args[args.index("--mcp-config") + 1])
+    return json.loads(mcp_config_path.read_text(encoding="utf-8"))
 
 
 @pytest.fixture
@@ -3734,7 +3740,7 @@ def test_augment_claude_args_injects_mcp_and_hooks(tmp_path: Path) -> None:
     )
 
     assert args[:2] == ["--resume", "abc"]
-    mcp_config = json.loads(args[args.index("--mcp-config") + 1])
+    mcp_config = _load_mcp_config(args)
     server = mcp_config["mcpServers"]["omnigent"]
     assert server["command"] == "/venv/bin/python"
     assert server["args"][-2:] == ["--bridge-dir", str(tmp_path)]
@@ -3795,7 +3801,7 @@ def test_generated_claude_subprocesses_pin_runner_tmpdir(
         subagent_router_dir=bridge_dir,
         turn_routing=True,
     )
-    mcp_config = json.loads(args[args.index("--mcp-config") + 1])
+    mcp_config = _load_mcp_config(args)
     settings = _load_invocation_settings(args)
 
     server_env = mcp_config["mcpServers"]["omnigent"]["env"]
@@ -4105,9 +4111,72 @@ def test_augment_claude_args_appends_caller_system_prompt(
         append_system_prompt=framework_instruction,
     )
 
-    assert args.count("--append-system-prompt") == 1
-    index = args.index("--append-system-prompt")
-    assert args[index + 1] == framework_instruction
+    assert args.count("--append-system-prompt-file") == 1
+    index = args.index("--append-system-prompt-file")
+    assert Path(args[index + 1]).read_text(encoding="utf-8") == framework_instruction
+
+
+def test_augment_claude_args_keeps_long_instructions_out_of_argv(tmp_path: Path) -> None:
+    """
+    Long agent instructions reach Claude through owner-only files, not argv.
+
+    The launch runs as one tmux ``new-session`` command, which tmux rejects
+    above 16KB, so instructions this size used to fail every launch.
+    """
+    instructions = "Follow the project conventions carefully.\n" * 2_000
+    args = augment_claude_args(
+        (),
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt=instructions,
+    )
+
+    assert len(shlex.join(args).encode()) < 4_096
+    assert "--append-system-prompt" not in args
+    prompt_path = Path(args[args.index("--append-system-prompt-file") + 1])
+    mcp_config_path = Path(args[args.index("--mcp-config") + 1])
+    assert prompt_path.read_text(encoding="utf-8") == instructions
+    assert prompt_path.parent == mcp_config_path.parent == tmp_path
+    assert _load_mcp_config(args)["mcpServers"]["omnigent"]["command"] == "/venv/bin/python"
+    for path in (prompt_path, mcp_config_path):
+        assert stat.S_IMODE(path.stat().st_mode) == 0o600
+
+
+@pytest.mark.parametrize(
+    "user_args",
+    [
+        ("--append-system-prompt", "User addition"),
+        ("--append-system-prompt=User addition",),
+        ("--append-system-prompt-file", "/home/user/prompt.md"),
+    ],
+)
+def test_augment_claude_args_keeps_inline_prompt_when_user_sets_one(
+    tmp_path: Path,
+    user_args: tuple[str, ...],
+) -> None:
+    """
+    A user-supplied prompt flag keeps the agent's instructions inline.
+
+    Claude Code refuses ``--append-system-prompt`` together with
+    ``--append-system-prompt-file``, so the file form would break this launch.
+    """
+    stale_prompt = tmp_path / "claude-append-system-prompt.md"
+    stale_prompt.write_text("Previous agent", encoding="utf-8")
+
+    args = augment_claude_args(
+        user_args,
+        bridge_dir=tmp_path,
+        python_executable="/venv/bin/python",
+        append_system_prompt="Agent instructions",
+    )
+
+    assert args[args.index("--append-system-prompt", len(user_args)) + 1] == (
+        "Agent instructions"
+    )
+    assert args.count("--append-system-prompt-file") == user_args.count(
+        "--append-system-prompt-file"
+    )
+    assert not stale_prompt.exists()
 
 
 def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None:
@@ -4129,7 +4198,10 @@ def test_augment_claude_args_merges_caller_allowed_tools(tmp_path: Path) -> None
 
 
 def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> None:
-    """The bridge does not invent framework policy on its own."""
+    """The bridge does not invent framework policy, nor keep a prior launch's."""
+    stale_prompt = tmp_path / "claude-append-system-prompt.md"
+    stale_prompt.write_text("Previous agent", encoding="utf-8")
+
     args = augment_claude_args(
         (),
         bridge_dir=tmp_path,
@@ -4137,6 +4209,8 @@ def test_augment_claude_args_omits_unsupplied_system_prompt(tmp_path: Path) -> N
     )
 
     assert "--append-system-prompt" not in args
+    assert "--append-system-prompt-file" not in args
+    assert not stale_prompt.exists()
 
 
 def test_augment_claude_args_merges_user_disallowed_tools(tmp_path: Path) -> None:

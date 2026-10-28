@@ -529,6 +529,9 @@ _TERMINAL_FAILURE_TAIL_LINES = 12
 _TERMINAL_FAILURE_TAIL_CHARS = 800
 _TERMINAL_FAILURE_TAIL_PREFIX = " Last terminal output:\n"
 _INVOCATION_SETTINGS_FILE = "claude-settings.json"
+_INVOCATION_MCP_CONFIG_FILE = "claude-mcp-config.json"
+_APPEND_SYSTEM_PROMPT_FILE = "claude-append-system-prompt.md"
+_APPEND_SYSTEM_PROMPT_FLAGS = ("--append-system-prompt", "--append-system-prompt-file")
 
 ToolExecutor = Callable[[str, _JsonObject], Awaitable[object]]
 
@@ -2807,8 +2810,8 @@ def augment_claude_args(
         ``--setting-sources`` exactly as the SDK executor maps it onto
         ``setting_sources``. Defaults to ``"all"``.
     :param append_system_prompt: Optional raw ``AgentSpec.instructions``
-        (author-supplied, not framework-composed) to append through Claude
-        Code's native ``--append-system-prompt`` flag.
+        (author-supplied, not framework-composed) appended to Claude Code's
+        system prompt; see :func:`_append_system_prompt_args`.
     :param allowed_tools: Optional narrowly scoped Claude tool names to merge
         into ``--allowedTools`` without replacing the user's allowlist.
     :param subagent_router_dir: Directory advertising the runner's
@@ -2840,16 +2843,19 @@ def augment_claude_args(
     args = _merge_allowed_tools(args, allowed_tools)
     settings_path = bridge_dir / _INVOCATION_SETTINGS_FILE
     _write_json_file(settings_path, hook_settings)
+    # Files, not inline values: the whole command must fit in one tmux
+    # ``new-session`` call, which tmux rejects above its 16KB command cap.
+    mcp_config_path = bridge_dir / _INVOCATION_MCP_CONFIG_FILE
+    _write_json_file(mcp_config_path, mcp_config)
     args.extend(
         [
             "--mcp-config",
-            json.dumps(mcp_config, separators=(",", ":")),
+            str(mcp_config_path),
             "--settings",
             str(settings_path),
         ]
     )
-    if append_system_prompt:
-        args.extend(["--append-system-prompt", append_system_prompt])
+    args.extend(_append_system_prompt_args(claude_args, bridge_dir, append_system_prompt))
     # Imported here: bundle-skills parsing rides the spec graph; launch-only.
     from omnigent.inner.bundle_skills import claude_agents_skill_args, claude_native_skill_args
 
@@ -2866,6 +2872,40 @@ def augment_claude_args(
     from omnigent.harnesses.claude_native.diagnostics import augment_claude_debug_args
 
     return augment_claude_debug_args(args, bridge_dir)
+
+
+def _append_system_prompt_args(
+    claude_args: Sequence[str],
+    bridge_dir: Path,
+    append_system_prompt: str | None,
+) -> list[str]:
+    """
+    Return the Claude args that append the agent's instructions.
+
+    The instructions go through an owner-only file so long ones cannot push
+    the launch past tmux's command cap. Claude Code rejects
+    ``--append-system-prompt`` and ``--append-system-prompt-file`` together,
+    so a launch whose own args already carry either flag keeps the inline
+    form.
+
+    :param claude_args: User-provided Claude Code args, e.g.
+        ``("--append-system-prompt", "Reply tersely.")``.
+    :param bridge_dir: Bridge directory that holds the prompt file.
+    :param append_system_prompt: Raw ``AgentSpec.instructions``, or
+        ``None`` when the agent has none.
+    :returns: Args to extend the Claude command with; empty when there are
+        no instructions.
+    """
+    prompt_path = bridge_dir / _APPEND_SYSTEM_PROMPT_FILE
+    user_sets_prompt = any(
+        arg.partition("=")[0] in _APPEND_SYSTEM_PROMPT_FLAGS for arg in claude_args
+    )
+    if not append_system_prompt or user_sets_prompt:
+        # A previous launch's instructions must not outlive this launch's args.
+        prompt_path.unlink(missing_ok=True)
+        return ["--append-system-prompt", append_system_prompt] if append_system_prompt else []
+    _write_private_text_file(prompt_path, append_system_prompt)
+    return ["--append-system-prompt-file", str(prompt_path)]
 
 
 def _arg_value(args: tuple[str, ...], flag: str) -> str | None:
@@ -10464,6 +10504,17 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
     :param payload: JSON-compatible object.
     :returns: None.
     """
+    _write_private_text_file(path, json.dumps(payload, separators=(",", ":")))
+
+
+def _write_private_text_file(path: Path, text: str) -> None:
+    """
+    Atomically write a text file with owner-only permissions.
+
+    :param path: File path inside a bridge directory.
+    :param text: File contents.
+    :returns: None.
+    """
     _ensure_secure_dir(path.parent)
     tmp_path: Path | None = None
     try:
@@ -10476,7 +10527,7 @@ def _write_json_file(path: Path, payload: _JsonObject) -> None:
             delete=False,
         ) as handle:
             tmp_path = Path(handle.name)
-            handle.write(json.dumps(payload, separators=(",", ":")))
+            handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(tmp_path, 0o600)

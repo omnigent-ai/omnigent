@@ -656,7 +656,7 @@ def test_auto_harness_launch_names_the_routed_spawn_tool_and_preapproves_it(
     """
     args = _augmented(bridge_dir, auto_harness=True)
 
-    note = args[args.index("--append-system-prompt") + 1]
+    note = Path(args[args.index("--append-system-prompt-file") + 1]).read_text()
     assert "mcp__omnigent__sys_session_create" in note
     assert "mcp__omnigent__sys_agent_list" in note
     # Bare spellings would send the model looking for a tool Claude does not
@@ -686,6 +686,7 @@ def test_pinned_harness_launch_argv_is_unchanged(bridge_dir: Path) -> None:
 
     assert _augmented(bridge_dir, auto_harness=False) == baseline
     assert "--append-system-prompt" not in baseline
+    assert "--append-system-prompt-file" not in baseline
     assert "--allowedTools" not in baseline
 
 

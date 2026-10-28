@@ -134,7 +134,7 @@ def test_claude_terminal_request_pins_launch_cwd(tmp_path, monkeypatch) -> None:
     args = spec["args"]
     assert args[:4] == ["--resume", "claude-session", "-p", "hi"]
     mcp_index = args.index("--mcp-config")
-    mcp_config = json.loads(args[mcp_index + 1])
+    mcp_config = json.loads(Path(args[mcp_index + 1]).read_text())
     assert mcp_config["mcpServers"]["omnigent"]["args"] == [
         "-I",
         "-m",
