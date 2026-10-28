@@ -227,10 +227,35 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
       vi.advanceTimersByTime(1000);
     });
     expect(serialize).toHaveBeenCalledTimes(1);
-    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: INITIAL + "abc" });
+    // The file ended with a newline, so the save keeps one.
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: `${INITIAL}abc\n` });
     await act(async () => fakeEditor!.emit("blur"));
     expect(serialize).toHaveBeenCalledTimes(1);
     expect(screen.queryByText(/Unsaved changes/)).toBeNull();
+  });
+
+  it("saves one final newline when the editor serialises trailing blank lines", async () => {
+    render(makeViewer());
+    await act(async () => {
+      fakeEditor!.setMarkdown(`${EDITED}\n\n`);
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({ path: PATH, content: EDITED });
+  });
+
+  it("does not add a final newline the file did not have", async () => {
+    const withoutNewline = INITIAL.replace(/\n$/, "");
+    render(makeViewer(withoutNewline));
+    await act(async () => {
+      fakeEditor!.setMarkdown(`${withoutNewline} more`);
+      fakeEditor!.emit("update");
+      vi.advanceTimersByTime(1000);
+    });
+    expect(mutateAsync).toHaveBeenCalledExactlyOnceWith({
+      path: PATH,
+      content: `${withoutNewline} more`,
+    });
   });
 
   it("undo to an equivalent baseline document clears dirty without serializing or writing", async () => {
@@ -291,7 +316,7 @@ describe("MarkdownRichTextViewer auto-save wiring (integration)", () => {
     expect(mutateAsync).toHaveBeenCalledTimes(1);
     expect(serialize).toHaveBeenCalledTimes(1);
     await act(async () => resolveWrite());
-    expect(mutateAsync).toHaveBeenNthCalledWith(2, { path: PATH, content: EDITED + "newer" });
+    expect(mutateAsync).toHaveBeenNthCalledWith(2, { path: PATH, content: `${EDITED}newer\n` });
     expect(serialize).toHaveBeenCalledTimes(2);
     await act(async () => fakeEditor!.emit("blur"));
     expect(mutateAsync).toHaveBeenCalledTimes(2);

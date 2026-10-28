@@ -61,6 +61,14 @@ installMarkdownSerializerPatch();
 // tiptapMarkdownPatches.ts).
 installMarkdownParserPatch();
 
+// TipTap drops a file's final newline, and the empty paragraph it appends after
+// a closing heading, code block or footnote list saves as blank lines. End the
+// file the way it was loaded: with one newline, or none.
+function keepFinalNewline(markdown: string, endsWithNewline: boolean): string {
+  const trimmed = markdown.replace(/\n+$/, "");
+  return endsWithNewline && trimmed !== "" ? `${trimmed}\n` : trimmed;
+}
+
 // ---------------------------------------------------------------------------
 // MarkdownRichTextViewer — outer shell manages the editor key for remounting
 // ---------------------------------------------------------------------------
@@ -270,6 +278,10 @@ function MarkdownRichTextViewerInner({
 
   // Baseline used to detect actual edits vs TipTap normalisation.
   const baselineRef = useRef<string | null>(null);
+  const endsWithNewlineRef = useRef(content.endsWith("\n"));
+  // Every save and baseline reads the editor through this, so they agree on the newline.
+  const readMarkdown = (ed: { getMarkdown: () => string }) =>
+    keepFinalNewline(ed.getMarkdown(), endsWithNewlineRef.current);
   // Immutable snapshots share unchanged subtrees, so dirty checks need no
   // Markdown serialization and undo can still restore a clean document.
   const baselineDocRef = useRef<Node | null>(null);
@@ -304,7 +316,7 @@ function MarkdownRichTextViewerInner({
     const ed = editorRef.current;
     if (!ed) return "";
     savingDocRef.current = ed.state.doc;
-    const markdown = ed.getMarkdown();
+    const markdown = readMarkdown(ed);
     // Document attributes can change without changing the saved Markdown.
     // The shared save hook skips the write (and markSaved) in that case.
     if (markdown === baselineRef.current) baselineDocRef.current = savingDocRef.current;
@@ -373,7 +385,7 @@ function MarkdownRichTextViewerInner({
       // language change is a user edit even though it arrives blurred (the
       // picker holds focus), so isUserEditUpdate also honours its flag.
       if (baselineDocRef.current === null || !isUserEditUpdate(ed.isFocused, transaction)) {
-        baselineRef.current = ed.getMarkdown();
+        baselineRef.current = readMarkdown(ed);
         baselineDocRef.current = ed.state.doc;
         setDirty(false);
         return;
@@ -384,7 +396,7 @@ function MarkdownRichTextViewerInner({
     },
     onCreate: ({ editor: ed }) => {
       // Capture baseline after the initial content has been parsed.
-      baselineRef.current = ed.getMarkdown();
+      baselineRef.current = readMarkdown(ed);
       baselineDocRef.current = ed.state.doc;
     },
   });
@@ -423,7 +435,8 @@ function MarkdownRichTextViewerInner({
       if (editor.isDestroyed) return;
       const savedScroll = scrollContainerRef.current?.scrollTop ?? 0;
       applyExternalMarkdown(editor, newContent);
-      baselineRef.current = editor.getMarkdown();
+      endsWithNewlineRef.current = newContent.endsWith("\n");
+      baselineRef.current = readMarkdown(editor);
       baselineDocRef.current = editor.state.doc;
       // Programmatic replace establishes a fresh baseline — no user edits relative to it.
       hasUserEditedRef.current = false;

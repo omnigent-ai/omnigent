@@ -4,6 +4,7 @@ import { TableRow, TableCell, TableHeader } from "@tiptap/extension-table";
 import { ListItem, TaskItem } from "@tiptap/extension-list";
 import { Markdown } from "@tiptap/markdown";
 import { CodeBlockWithLanguage } from "./TipTapCodeBlockExtension";
+import { FootnoteDefinitions, FootnoteProtection, FootnoteReference } from "./TipTapFootnotes";
 import { GitHubAlertBlockquote } from "./TipTapGitHubAlert";
 import { HtmlPassthrough } from "./TipTapHtmlPassthrough";
 import { SoftBreak } from "./TipTapSoftBreak";
@@ -41,6 +42,9 @@ export function createMarkdownDocumentExtensions(
     ImageAwareLink.configure({ openOnClick: false, autolink: false }),
     GitHubAlertBlockquote,
     HtmlPassthrough,
+    FootnoteDefinitions,
+    FootnoteReference,
+    FootnoteProtection,
     // Soft line breaks in hard-wrapped source render as spaces so Edit mode
     // reflows prose to the viewer width like Preview; see TipTapSoftBreak.ts.
     SoftBreak,

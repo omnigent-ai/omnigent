@@ -22,6 +22,13 @@
 import { MarkdownManager } from "@tiptap/markdown";
 import { marksEqual, type JSONContent } from "@tiptap/core";
 
+import {
+  documentFootnoteLabels,
+  escapeFootnoteReferences,
+  footnoteLabels,
+  stripFootnoteReferenceMarks,
+  withFootnoteLabels,
+} from "./TipTapFootnotes";
 import { toBlockContent } from "./TipTapGitHubAlert";
 import { SOFT_BREAK_NODE } from "./TipTapSoftBreak";
 import { installIterativeSetextHeadings } from "./markdownSetextHeading";
@@ -111,7 +118,10 @@ export function installMarkdownSerializerPatch(): void {
       ...rest: unknown[]
     ) {
       const joined = hasSoftBreakNode(this) ? joinSoftBreaks(content) : content;
-      return originalSerialize.call(this, joined, ...rest);
+      // Literal `[^x]` text needs escaping only when `[^x]:` is defined.
+      return withFootnoteLabels(documentFootnoteLabels(joined), () =>
+        originalSerialize.call(this, stripFootnoteReferenceMarks(joined), ...rest),
+      );
     };
   }
   const proto = MarkdownManager.prototype as unknown as SerializerInternals;
@@ -129,10 +139,12 @@ export function installMarkdownSerializerPatch(): void {
         this.codeTypes.has(typeof mark === "string" ? mark : (mark.type as string)),
       );
     if (insideCode) return text;
-    return text
-      .replace(ENTITY_AMP, "&amp;")
-      .replace(TAG_OPEN, "&lt;")
-      .replace(LINE_START_QUOTE, "$1\\>");
+    return escapeFootnoteReferences(
+      text
+        .replace(ENTITY_AMP, "&amp;")
+        .replace(TAG_OPEN, "&lt;")
+        .replace(LINE_START_QUOTE, "$1\\>"),
+    );
   };
 }
 
@@ -236,7 +248,10 @@ export function installMarkdownParserPatch(): void {
   const originalParse = proto.parse;
   proto.parse = function (this: MarkdownManager, markdown: string): JSONContent {
     installIterativeSetextHeadings(this.instance);
-    const doc = wrapLooseInlineRuns(originalParse.call(this, markdown));
+    // `[^x]` is a footnote reference only when the file defines `[^x]:`.
+    const doc = withFootnoteLabels(footnoteLabels(markdown), () =>
+      wrapLooseInlineRuns(originalParse.call(this, markdown)),
+    );
     if (!hasSoftBreakNode(this)) return doc;
     // Without the manager's code-type registry no node can be proven verbatim,
     // so leave the newlines as text rather than risk splitting code content.
