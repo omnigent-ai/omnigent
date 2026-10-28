@@ -1775,7 +1775,8 @@ function WorkspacePanelImpl({
               .filter((key) => nextWarmRailTerminals.includes(key))
               .map((key) => (
                 <RailTerminalView
-                  key={key}
+                  // Terminal ids repeat across sessions; never reuse one session's xterm in another.
+                  key={`${conversationId}:${key}`}
                   conversationId={conversationId}
                   terminalKey={key}
                   readOnly={!isOwnerLevel(permissionLevel)}
